@@ -500,6 +500,13 @@ def test_resolvable_model_records_pass_for_model_resolution(synced_document_setu
                  "WHERE price_list_version_id=:plv"),
             {"plv": price_list_version_id},
         )
+        # 2026-10-20 product owner rule R5: a deal is priced on its booking
+        # date, never today -- the journey needs one for its SKU to resolve.
+        c.execute(
+            text("UPDATE auditcore.bookings SET booking_date = CURRENT_DATE - 10 "
+                 "WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": tenant_id, "j": journey_id},
+        )
 
     booking_form_id = uuid4()
     _add_evidence(engine, tenant_id, journey_id, customer_id, booking_form_id, "booking_form")

@@ -246,6 +246,90 @@ task_types:
     actions:
     - COMPLETE_ACTION
     - ADD_COMMENT
+  # SKU price check (2026-10-20 product owner rules R3): the documents'
+  # words name one SKU but its master ex-showroom differs from the booking
+  # form's (or a vehicle invoice's). The SKU stays on the Journey as an
+  # automatic match; the PC keeps it (Accept) or picks the right one.
+  SKU_PRICE_MISMATCH:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ACCEPT
+    - ADD_COMMENT
+  # Two vehicle invoices on one Journey name different vehicles: the PC
+  # picks one of their SKUs (ACCEPT, details.skuId) or marks one invoice
+  # cancelled (REJECT, details.documentId: it is voided). Nothing is set from
+  # either on its own.
+  SKU_INVOICES_DISAGREE:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ACCEPT
+    - REJECT
+    - ADD_COMMENT
+  # Two booking forms name different vehicles (never "the newest wins"):
+  # the same two actions as SKU_INVOICES_DISAGREE.
+  SKU_BOOKING_FORMS_DISAGREE:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ACCEPT
+    - REJECT
+    - ADD_COMMENT
+  # No SKU on the Journey and nothing to identify it from yet (2026-10-21:
+  # every Journey without a clear SKU has a PC task). Closes itself.
+  SKU_NOT_SET:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ADD_COMMENT
+  # A booking form names a different SKU from a PC / TL decision: never
+  # overwritten; the PC keeps it (ACCEPT) or proposes a correction.
+  SKU_BOOKING_FORM_DIFFERS:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ACCEPT
+    - ADD_COMMENT
+  # An automatic SKU its documents no longer name (a re-check could not
+  # confirm it): kept on the Journey, the PC confirms it (ACCEPT confirms the
+  # SKU the task names) or sets another in the model picker.
+  SKU_NOT_CONFIRMED:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ACCEPT
+    - ADD_COMMENT
+  # The vehicle invoice names a different SKU (at its master price) from
+  # the one a PC or Team Lead set: never overwritten, the Team Lead decides.
+  SKU_INVOICE_REVIEW:
+    category: CORRECTION_APPROVAL
+    owner: TL
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - ACCEPT
+    - REJECT
+    - ADD_COMMENT
   MODEL_SELECTION_CORRECTION_REVIEW:
     category: CORRECTION_APPROVAL
     owner: TL

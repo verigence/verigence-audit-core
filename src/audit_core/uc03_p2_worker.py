@@ -3758,9 +3758,10 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
         return
     # Re-run the Delivery checks for every delivery in progress: the
     # time-based checks fire without a document event. Idempotent per night.
+    # The nightly SKU retry is switched off (product owner, 2026-10-22): SKU
+    # is run on demand from Administration > Run SKU Resolution.
     from audit_core.uc03_p2_audit_rules import (
         queue_nightly_review,
-        queue_nightly_sku_retry,
     )
 
     try:
@@ -3773,11 +3774,9 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
                 _last_nightly_review[tenant_id] = due
                 return
             queued = queue_nightly_review(connection, tenant_id=tenant_id)
-            sku_retries = queue_nightly_sku_retry(connection, tenant_id=tenant_id)
             swept = queue_nightly_upload_sweep(connection, tenant_id=tenant_id)
         _last_nightly_review[tenant_id] = due
-        logger.info("p2_nightly_review_queued", tenant_id=tenant_id, night=due, journeys=queued,
-                    sku_retries=sku_retries, **swept)
+        logger.info("p2_nightly_review_queued", tenant_id=tenant_id, night=due, journeys=queued, **swept)
     except Exception:
         logger.warning("p2_nightly_review_failed", tenant_id=tenant_id, exc_info=True)
 
@@ -3935,9 +3934,21 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
     started from outside by setting AUDIT_CORE_SKU_RUN_TAG on the worker (no
     browser session to expire part-way). Runs once per tag: a restart with
     the same tag does not run it again. Each Journey's outcome is logged
-    (``sku_run_item``) and kept against the run."""
+    (``sku_run_item``) and kept against the run.
+
+    A tag starting "unresolved" leaves every pinned SKU as it is. A tag
+    starting "reresolve" re-checks every SKU under the words-first rules
+    (``reresolve_all_skus``, review 471 B2): a DRY RUN that writes only the
+    run items and one ``sku_reresolve_item`` line per Journey (old SKU ->
+    proposed SKU, basis, words, prices, the task that would be raised),
+    unless the tag contains "-commit" ("reresolve-2026-10-22-commit"), which
+    writes the decisions. Nothing is cleared first; a SKU a PC or Team Lead
+    set is never touched."""
     from audit_core.uc03_backfill_document_sync_producers import (
+        CommitNotAllowed,
         backfill_sku_resolution_for_tenant,
+        check_numbers_text,
+        reresolve_all_skus,
     )
 
     actor = f"worker:{tag}"[:120]
@@ -3952,22 +3963,38 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
             if done:
                 logger.info("sku_run_already_done", tenant_id=tenant_id, tag=tag)
                 continue
-            offset: int | None = 0
-            run_id = None
             result: dict[str, Any] = {}
-            while offset is not None:
-                result = backfill_sku_resolution_for_tenant(
-                    engine, tenant_id=tenant_id, offset=offset, limit=10, run_id=run_id, actor_id=actor,
-                    # A tag starting "unresolved" leaves every pinned SKU as it is.
-                    only_without_sku=tag.lower().startswith("unresolved"),
-                )
-                run_id = result["runId"]
-                offset = result["nextOffset"]
+            if tag.lower().startswith("reresolve"):
+                result = reresolve_all_skus(engine, tenant_id, actor_id=actor, commit="-commit" in tag.lower())
+                run_id = result.get("runId")
+            else:
+                offset: int | None = 0
+                run_id = None
+                while offset is not None:
+                    result = backfill_sku_resolution_for_tenant(
+                        engine, tenant_id=tenant_id, offset=offset, limit=10, run_id=run_id, actor_id=actor,
+                        # A tag starting "unresolved" leaves every pinned SKU as it is.
+                        only_without_sku=tag.lower().startswith("unresolved"),
+                    )
+                    run_id = result["runId"]
+                    offset = result["nextOffset"]
             logger.info(
                 "sku_run_finished", tenant_id=tenant_id, tag=tag, run_id=str(run_id),
                 journeys=result.get("journeysTotal"), with_sku_before=result.get("withSkuBefore"),
                 with_sku_after=result.get("withSkuAfter"), without_sku_after=result.get("withoutSkuAfter"),
                 failed=len(result.get("journeysFailed") or []),
+            )
+        except CommitNotAllowed as refused:
+            # Nothing was written and no run row was made, so the same tag can
+            # be set again once the check is done.
+            logger.warning(
+                "sku_run_refused", tenant_id=tenant_id, tag=tag, code=refused.detail.get("code"),
+                message=(
+                    f"The SKU Apply run '{tag}' was NOT run for this Project and changed nothing: "
+                    f"{refused.detail['message']} {check_numbers_text(refused.detail.get('check'))} "
+                    "Set a 'reresolve-...' tag without '-commit' to run the check, review it, then set the "
+                    "'-commit' tag again within 24 hours."
+                ).strip(),
             )
         except Exception:
             logger.warning("sku_run_failed", tenant_id=tenant_id, tag=tag, exc_info=True)

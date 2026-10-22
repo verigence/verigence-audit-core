@@ -1,44 +1,49 @@
-"""uc03_model_resolution.py — resolve a booking's SKU against the OEM price
-masters, or raise a ``MODEL_NOT_IDENTIFIED`` finding for the PC.
+"""uc03_model_resolution.py — name a booking's SKU in the OEM price masters
+from the words its documents print, or raise ``MODEL_NOT_IDENTIFIED`` for the
+PC (product owner rules 2026-10-20, R3 and R4).
 
-The V2 booking flow materialises the reviewed model / variant / colour onto
-``journey_products`` but never sets ``product_sku_id`` — so ``_sku_pricing_panel``
-(the master-vs-booking Deal panel) silently returns nothing and the deal is
-never checked against the masters.
+The ladder, run per document (the booking form; each customer vehicle
+invoice on its own -- never the OEM's wholesale invoice; never a model from
+one document with a variant or price from another):
 
-This module closes that gap deterministically, against the OEM *native* price
-list (``price_list_items`` — the one ``oem_price_masters`` ingests from Mahindra's
-own documents), which the older ``uc03_sku_candidates`` resolver does not see
-(it reads ``project_product_master_items``):
+  0. The price list in force on the Journey's pricing date
+     (``journey_pricing_date``: the date the Journey is priced on, else the
+     booking form's date, else the booking date entered by hand -- never
+     today). No date, no resolution.
+  1. Category first (``uc03_sku_words``): EV or ICE, Private or Commercial.
+     Uncertain -> a PC task, nothing pinned.
+  2. Words: model + trim + variant after the spelling normalisation; the
+     distinguishing words must match exactly in both directions. Exactly
+     one price-master row is the word-identified SKU; anything else is a PC
+     task with a shortlist (the shortlist is only *ordered* by closeness,
+     never decided by it).
+  3. Price check (booking): the word-identified SKU's master EX_SHOWROOM
+     against the booking form's ex-showroom, within two rupees. Equal ->
+     pinned as AUTO_MATCHED. Different, or no booking price -> pinned as
+     AUTO_PRICE_MISMATCH (so the deal still shows against it) and a PC task
+     "Confirm the model and price: master X vs booking Y" (2026-10-21).
+  4. Invoice: when one customer vehicle invoice's words name exactly one SKU
+     and its ex-showroom (rule R1: printed selling price before discount +
+     GST at the invoice's printed rate) equals that SKU's master price, the
+     invoice sets the SKU (AUTO_INVOICE_MATCHED). It replaces an automatic
+     pin; a SKU a PC or Team Lead set is never overwritten -- a Team Lead
+     task asks instead. Invoice words naming one SKU at a different price ->
+     a PC task. Several vehicle invoices naming different SKUs -> a PC task.
 
-  1. exact model + exact ``total`` (offered on-road)               -> SKU
-  2. if (1) is 0 or >1 : exact model + exact ``ex_showroom``       -> SKU
-  2b. if the whole-string model match found nothing at all: fall back to
-      ``uc03_model_attribute_matching`` — resolve the model via
-      ``oem_model_aliases`` and re-filter by the variant's own structured
-      fuel/transmission/drive/seater attributes, since a real Booking Form
-      folds trim + those attributes into the same free-text field as the
-      model name (e.g. ``"SCORPIO N Z8 (S)"`` / ``"DAT 2WD 7STR"``).
-  3. one SKU  -> pin ``journey_products.product_sku_id``, resolve any open flag
-  4. zero SKU -> MODEL_NOT_IDENTIFIED "no matching model"
-  5. >1  SKU  -> MODEL_NOT_IDENTIFIED "matched multiple models" (+ candidates)
+Price never picks a variant, fuel, gearbox, Private/Commercial or EV/ICE.
+Automatic pins are TENTATIVE (``journey_products.match_basis`` says how they
+were made, ``match_evidence`` keeps the document, words and prices compared)
+and later evidence or a direct PC pick replaces them; a PC or TL decision is
+CONFIRMED and changes only through a Team Lead reviewed proposal.
 
-No fuzzy matching (``_label_similarity`` is normalised equality only; the
-attribute fallback is exact-per-attribute, never a fuzzy score). Price
-matching is exact everywhere except one narrow, deliberate exception: once a
-real stated attribute fact (fuel/transmission/drive/seater) has already
-narrowed the field to a small candidate set, ``_price_disambiguate`` allows a
-tight 0.5% tolerance to arbitrate within it -- covering real-world rounding
-between the Booking Form's stated total and the master's, without ever doing
-a fuzzy price search across the whole price list (see ``_PRICE_APPROX_
-TOLERANCE``). Idempotent, self-heals on read, never raises.
+Idempotent, never raises (the sync entry points run inside a savepoint).
 """
 from __future__ import annotations
 
 import json
 import logging
 import re
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from typing import Annotated, Any
@@ -64,16 +69,20 @@ from audit_core.uc03_masters_alignment import registration_basis
 from audit_core.uc03_model_attribute_matching import (
     _decompose,
     _master_attributes,
-    fuzzy_match_by_attributes,
-    has_qualifying_signal,
-    match_by_attributes,
     normalized_model_key,
-    resolve_model_via_aliases,
 )
 from audit_core.uc03_sku_candidates import (
     _label_similarity,
-    _normalize_label,
     _price_plan_for_journey,
+    journey_pricing_date,
+)
+from audit_core.uc03_sku_words import (
+    WordResult,
+    clear_suggestion,
+    identify,
+    order_shortlist,
+    price_check,
+    row_registration,
 )
 from audit_core.workflow import create_workflow_task
 
@@ -85,71 +94,88 @@ _outcome_log = structlog.get_logger(__name__)
 _FINDING_TYPE = "MODEL_NOT_IDENTIFIED"
 _RULE_KEY = "MODEL_NOT_IDENTIFIED:BOOKING"
 _STAGE = "BOOKING"
-_SELECTION_METHOD = "MODEL_RESOLUTION_SYNC_V1"
-_PC_PICK_METHOD = "MODEL_RESOLUTION_PC_PICK_V1"
 _EX_SHOWROOM_COMPONENT = "EX_SHOWROOM"
 
-# Confirmed against a real live case: "Scorpio Classic" / "S MT 7S" already
-# had a trustworthy attribute signal (transmission=MT, seater=7) narrowing to
-# two rows differing only by colour, with the Booking Form's offered total
-# a mere 0.01% off the correct row's master total -- real-world rounding
-# (paise-level tax rounding at different calculation stages), not a genuine
-# price disagreement. An exact `==` match sees that as no signal at all and
-# leaves both rows tied. This tolerance is intentionally only used here, in
-# _price_disambiguate -- never in _match's broad, un-narrowed price search --
-# because it only ever arbitrates within a candidate set _attribute_
-# decomposition_fallback has already confirmed via a real stated fact
-# (fuel/transmission/drive/seater), where a coincidental price collision
-# between two actually-different vehicles cannot happen by construction.
-_PRICE_APPROX_TOLERANCE = Decimal("0.005")  # 0.5%, well clear of real rounding noise
+# How a pin was made (selection_method); match_basis below says what it is.
+_SELECTION_METHOD = "MODEL_RESOLUTION_WORDS_V2"  # the booking form's words
+_INVOICE_SELECTION_METHOD = "MODEL_RESOLUTION_INVOICE_V2"  # a vehicle invoice's words + price
+_PC_PICK_METHOD = "MODEL_RESOLUTION_PC_PICK_V1"
+_CORRECTION_SELECTION_METHOD = "MODEL_SELECTION_CORRECTION_V1"
+_INVOICE_TL_METHOD = "MODEL_RESOLUTION_INVOICE_TL_V1"  # a Team Lead applied the invoice's SKU
 
+# journey_products.match_basis (migration 0152). Automatic pins are
+# selection_status TENTATIVE and replaceable; PC / TL decisions CONFIRMED.
+BASIS_AUTO_MATCHED = "AUTO_MATCHED"
+BASIS_AUTO_PRICE_MISMATCH = "AUTO_PRICE_MISMATCH"
+BASIS_AUTO_INVOICE = "AUTO_INVOICE_MATCHED"
+BASIS_AUTO_LEGACY = "AUTO_LEGACY"
+BASIS_AUTO_UNCONFIRMED = "AUTO_UNCONFIRMED"
+BASIS_PC = "PC_CONFIRMED"
+BASIS_TL = "TL_APPROVED"
+AUTOMATIC_BASES = frozenset({BASIS_AUTO_MATCHED, BASIS_AUTO_PRICE_MISMATCH, BASIS_AUTO_INVOICE, BASIS_AUTO_LEGACY,
+                             BASIS_AUTO_UNCONFIRMED})
+HUMAN_BASES = frozenset({BASIS_PC, BASIS_TL})
+# Plain words for the Deal screen (2026-10-20: automatic matches are not
+# "Confirmed"; only a PC / TL decision is).
+BASIS_LABELS = {
+    BASIS_AUTO_MATCHED: "Matched automatically by its words; booking price agrees",
+    BASIS_AUTO_PRICE_MISMATCH: "Matched automatically by its words; price differs from the booking -- PC to set",
+    BASIS_AUTO_INVOICE: "Set by the vehicle invoice (words and price agree)",
+    BASIS_AUTO_LEGACY: "Matched automatically before 20 Oct 2026 -- to be re-checked",
+    BASIS_AUTO_UNCONFIRMED: "Matched automatically, but the documents do not name it -- PC to confirm or set",
+    BASIS_PC: "Confirmed by the PC",
+    BASIS_TL: "Approved by the Team Lead",
+}
 
-def _closest_within_tolerance(
-    rows: list[dict[str, Any]], *, offered: Decimal, field_value: Any
-) -> list[dict[str, Any]]:
-    """Rows whose price (already extracted per-row via ``field_value``) is
-    within ``_PRICE_APPROX_TOLERANCE`` of ``offered``. Ties (more than one row
-    equally within tolerance) are returned as-is -- still genuinely ambiguous,
-    not resolved by guessing which is closer."""
-    if offered == 0:
-        return []
-    candidates = []
-    for row in rows:
-        price = field_value(row)
-        if price is None:
-            continue
-        if abs(price - offered) / abs(offered) <= _PRICE_APPROX_TOLERANCE:
-            candidates.append(row)
-    return candidates
+# The booking form (and docket) names the booked vehicle and its quoted
+# ex-showroom price.
+_BOOKING_DOCUMENT_TYPES = ("booking_form", "booking_docket")
+_BOOKING_FIELD_KEYS = (
+    "vehicle_model", "vehicle_variant", "vehicle_color", "sku_code", "ex_showroom_price", "registration_type",
+)
+# The customer's vehicle invoices: each one on its own (rule R2). The OEM's
+# wholesale invoice bills the dealer, never the customer, and is not read
+# (2026-10-20; it used to be). "tax_invoice_dms" / "tax_invoice" are the
+# DMS / generic spellings the rest of the code base already reads as
+# invoices.
+_VEHICLE_INVOICE_TYPES = (
+    "customer_invoice_dms", "customer_invoice_dms_v2", "tax_invoice_dms", "tax_invoice_tally", "tax_invoice",
+    "invoice_generic",
+)
+_RETAIL_INVOICE_TYPES = frozenset({"customer_invoice_dms", "customer_invoice_dms_v2", "tax_invoice_dms",
+                                   "tax_invoice_tally", "tax_invoice"})
+# An invoice that bills something else (accessories, a warranty...) never
+# names the vehicle, whatever its model box says.
+_NON_VEHICLE_PURPOSES = frozenset({"ACCESSORY", "EXTENDED_WARRANTY", "RSA", "INSURANCE", "VEHICLE_WHOLESALE",
+                                   "SERVICE", "FASTAG"})
+_INVOICE_FIELD_KEYS = (
+    "sku_code", "model_name_raw", "vehicle_description_raw", "variant_raw", "vehicle_color",
+    "invoice_purpose", "invoice_nature", "invoice_number", "invoice_date", "vin_number", "chassis_number",
+    "gross_amount_before_discount", "invoice_discount_amount", "taxable_amount",
+    "cgst_rate", "sgst_rate", "igst_rate", "cgst_amount", "sgst_amount", "igst_amount", "cess_amount",
+    "tcs_amount", "round_off_amount", "grand_total_amount", "line_items",
+)
 
-# Delivery-side fallback (see sync_model_resolution_from_invoice below): DI's
-# generalized invoice schema (verigence-di schemas/invoice.py) never maps
-# these to a master -- "exactly as printed", "do not map to a master" -- so
-# this module still does that resolution, deterministically, the same way it
-# already does for the Booking Form.
-_INVOICE_SKU_CODE_FIELD_KEYS = ("sku_code",)
-# The model name printed on its own first; the full printed vehicle
-# description ("XUV 3XO AX5 L 1.2 TGDi MT Everest White") when the invoice
-# has no separate model box -- DI reads it as vehicle_description_raw.
-_INVOICE_MODEL_FIELD_KEYS = ("model_name_raw", "vehicle_description_raw")
-_INVOICE_VARIANT_FIELD_KEYS = ("variant_raw",)
-_INVOICE_COLOUR_FIELD_KEYS = ("vehicle_color",)
-_INVOICE_SELECTION_METHOD = "MODEL_RESOLUTION_INVOICE_FALLBACK_V1"
-# Only the invoices that bill the vehicle itself name it: the retail (DMS)
-# and tax (Tally) invoices first, then a generic invoice, then the OEM's
-# wholesale invoice for the same chassis. An accessory, extended-warranty
-# or RSA invoice's "model" text is never read as the vehicle (it once could
-# be: the field was read off every invoice type, highest confidence first).
-_VEHICLE_INVOICE_TYPES = ("customer_invoice_dms", "tax_invoice_tally", "invoice_generic", "wholesale_invoice")
-
-# A SKU already on the journey (CONFIRMED or merely tentative) is never
-# re-pinned from the invoice -- but the invoice's own implied vehicle can
-# still disagree with it, and that disagreement must not be silently
-# dropped. See check_invoice_sku_mismatch below.
+# A SKU a person set that the vehicle invoice disagrees with (kept for the
+# findings raised before 2026-10-20; they close when the two agree).
 _SKU_MISMATCH_FINDING_TYPE = "INVOICE_SKU_MISMATCH"
 _SKU_MISMATCH_RULE_KEY = "INVOICE_SKU_MISMATCH"
 _SKU_MISMATCH_WORKFLOW_TYPE = "UC03_INVOICE_SKU_MISMATCH"
 _SKU_MISMATCH_TASK_TYPE = "INVOICE_SKU_MISMATCH_REASON"
+
+_CATALOGUE_STAGE = "CATALOGUE_SEARCH"
+# What each word-identification outcome is called on findings and in logs.
+_STAGE_FOR_STATUS = {
+    "IDENTIFIED": "WORDS",
+    "AMBIGUOUS": "WORDS_AMBIGUOUS",
+    "REGISTRATION_UNKNOWN": "REGISTRATION_UNKNOWN",
+    "CATEGORY_UNCERTAIN": "CATEGORY_UNCERTAIN",
+    "CATEGORY_CONFLICT": "CATEGORY_CONFLICT",
+    "UNRECOGNISED_WORD": "WORDS_UNRECOGNISED",
+    "NO_MATCH": "WORDS_NO_MATCH",
+    "NO_MODEL": _CATALOGUE_STAGE,
+    "NO_TEXT": "NONE",
+}
 
 
 def _to_decimal(value: Any) -> Decimal | None:
@@ -161,132 +187,6 @@ def _to_decimal(value: Any) -> Decimal | None:
         return None
 
 
-# ── inputs ────────────────────────────────────────────────────────────────────
-def _resolution_inputs(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, require_model: bool = True
-) -> dict[str, Any] | None:
-    """Reviewed model / offered total / offered ex-showroom for this journey.
-
-    Returns None when there is nothing to resolve yet (no model snapshot) --
-    unless ``require_model=False``. That's sync_model_resolution_from_
-    invoice's own case: it exists SPECIFICALLY for when the Booking side
-    never captured a usable model at all (no journey_products row yet, or
-    one with no model_name_snapshot), substituting the Delivery invoice's
-    own model/sku_code text instead. Bailing out here just because that
-    exact condition is true was a real, confirmed bug: the one caller this
-    was built for could never actually reach its own fallback logic, since
-    it always hit this same early return first -- "resolve from the invoice
-    when the Booking model isn't found" silently never ran for the one case
-    it names. Only the registration/commercial inputs below are genuinely
-    needed by that caller; model_name/variant_name/colour_name/
-    product_sku_id/selection_status all come back None when there's no row,
-    which is exactly what it wants (it overwrites model_name/variant_name
-    from the invoice regardless).
-    """
-    jp = connection.execute(
-        text(
-            """
-            SELECT product_sku_id,
-                   NULLIF(TRIM(model_name_snapshot), '')   AS model_name,
-                   NULLIF(TRIM(variant_name_snapshot), '') AS variant_name,
-                   NULLIF(TRIM(colour_name_snapshot), '')  AS colour_name,
-                   selection_status
-            FROM auditcore.journey_products
-            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one_or_none()
-    if jp is None:
-        if require_model:
-            return None
-        jp = {
-            "product_sku_id": None,
-            "model_name": None,
-            "variant_name": None,
-            "colour_name": None,
-            "selection_status": None,
-        }
-    elif require_model and jp["model_name"] is None:
-        return None
-
-    reg = connection.execute(
-        text(
-            """
-            SELECT cu.customer_type_code AS customer_type_code,
-                   rr.registration_type_code AS registration_type_code
-            FROM auditcore.journeys j
-            LEFT JOIN auditcore.customers cu
-              ON cu.tenant_id = j.tenant_id AND cu.customer_id = j.customer_id
-            LEFT JOIN auditcore.registration_records rr
-              ON rr.tenant_id = j.tenant_id AND rr.journey_id = j.journey_id
-            WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one_or_none() or {}
-    basis = registration_basis(
-        customer_type_code=reg.get("customer_type_code"),
-        registration_type_code=reg.get("registration_type_code"),
-    )
-
-    commercials = connection.execute(
-        text(
-            """
-            SELECT component_key, actual_amount
-            FROM auditcore.commercial_lines
-            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-              AND actual_amount IS NOT NULL
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().all()
-    by_key = {row["component_key"]: _to_decimal(row["actual_amount"]) for row in commercials}
-
-    booking_prices = connection.execute(
-        text(
-            """
-            SELECT NULLIF(regexp_replace(COALESCE(total_price::text, ''), '[^0-9.\\-]', '', 'g'), '')
-                       AS total_price,
-                   NULLIF(regexp_replace(COALESCE(ex_showroom_price::text, ''), '[^0-9.\\-]', '', 'g'), '')
-                       AS ex_showroom_price
-            FROM auditcore.booking_form_review_values
-            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-            ORDER BY reviewed_at_utc DESC NULLS LAST
-            LIMIT 1
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one_or_none() or {}
-
-    offered_total = (
-        by_key.get("total_price")
-        or _to_decimal(booking_prices.get("total_price"))
-    )
-    # commercial_lines is only written once the Booking Form document has
-    # actually finished materializing (see uc03_v2_review_materialization.py
-    # ::_materialize_commercial_lines) -- until then this fell back to None
-    # even when booking_form_review_values.ex_showroom_price itself was
-    # already populated, unlike offered_total above (which has always had
-    # this same fallback). A live journey with 24 model-name-only price-
-    # master matches and a legible ex-showroom price on its Booking Form
-    # still failed to disambiguate for exactly this reason.
-    offered_ex_showroom = (
-        by_key.get("ex_showroom_price")
-        or _to_decimal(booking_prices.get("ex_showroom_price"))
-    )
-
-    return {
-        "product_sku_id": jp["product_sku_id"],
-        "selection_status": jp["selection_status"],
-        "model_name": clean_model_text(jp["model_name"]),
-        "variant_name": jp["variant_name"],
-        "colour_name": jp["colour_name"],
-        "offered_total": offered_total,
-        "offered_ex_showroom": offered_ex_showroom,
-        "registration_basis": basis,
-        "registration_category": registration_category(reg.get("registration_type_code")),
-    }
 
 
 # ── reading the model text the way the price list names it ─────────────────────
@@ -331,17 +231,7 @@ def registration_category(value: str | None) -> str | None:
     return None
 
 
-def _row_registration(row: dict[str, Any]) -> str | None:
-    """The registration a price-list row is for, when the list prices the
-    same vehicle twice (variant "(Private)" / "(Commercial)", code ending
-    ::PRI / ::COM)."""
-    code = str(row.get("sku_code") or "").upper()
-    variant = str(row.get("variant_name") or "").upper()
-    if code.endswith("::COM") or variant.endswith("(COMMERCIAL)"):
-        return "COMMERCIAL"
-    if code.endswith("::PRI") or variant.endswith("(PRIVATE)"):
-        return "PRIVATE"
-    return None
+_row_registration = row_registration
 
 
 def _rows_for_registration(rows: list[dict[str, Any]], category: str | None) -> list[dict[str, Any]]:
@@ -352,76 +242,21 @@ def _rows_for_registration(rows: list[dict[str, Any]], category: str | None) -> 
     return [r for r in rows if _row_registration(r) in (None, category)]
 
 
-def _model_names(rows: list[dict[str, Any]]) -> dict[str, str]:
-    return {normalized_model_key(str(r["model_name"] or "")): str(r["model_name"]) for r in rows}
-
-
-def _normalise_inputs(
-    connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any],
-) -> dict[str, Any]:
-    """Two readings the price list cannot match as printed (2026-10-20):
-
-    * the model split across the two boxes ("Maxx" + "HD 1.7 LX"): when the
-      model box alone names no model of the list (by name or alias) but the
-      two together do, the two together are the model text;
-    * an EV variant of a model the list keeps as its own EV model ("XUV
-      3XO" + "AX5 EV" -> "XUV3XO EV"): the EV model.
-    """
-    model = inputs.get("model_name")
-    if not model:
-        return inputs
-    out = dict(inputs)
-    names = _model_names(rows)
-    oem_code = _oem_code_for_tenant(connection, tenant_id=tenant_id)
-    aliases = _oem_model_aliases(connection, oem_code=oem_code) if oem_code else []
-
-    def named(text_value: str) -> str | None:
-        key = normalized_model_key(text_value)
-        if key in names:
-            return names[key]
-        resolved = resolve_model_via_aliases(model_name=text_value, oem_aliases=aliases)
-        if resolved is not None and normalized_model_key(resolved[0]) in names:
-            return names[normalized_model_key(resolved[0])]
-        prefixes = [n for k, n in names.items() if len(k) >= 3 and key.startswith(k)]
-        return max(prefixes, key=len) if prefixes else None
-
-    variant = inputs.get("variant_name")
-    base = named(model)
-    if base is None and variant:
-        combined = f"{model} {variant}"
-        base = named(combined)
-        if base is not None:
-            # "Maxx" + "HD 1.7 LX": the model is the list's "MAXX HD"; the
-            # variant box keeps what it says.
-            out["model_name"] = base
-    if base is not None:
-        words = set(re.findall(r"[A-Z0-9]+", f"{model} {variant or ''}".upper()))
-        ev_key = normalized_model_key(f"{base} EV")
-        if ("EV" in words or "ELECTRIC" in words) and not normalized_model_key(base).endswith("EV") \
-                and ev_key in names:
-            out["model_name"] = names[ev_key]
-            if variant:
-                out["variant_name"] = re.sub(r"\bEV\b", "", str(variant), flags=re.IGNORECASE).strip() or variant
-    return out
-
-
+# ── the price list's rows ─────────────────────────────────────────────────────
 def _sku_rows_for_version(
     connection: Connection, *, tenant_id: str, price_list_version_id: UUID
 ) -> list[dict[str, Any]]:
-    """SKU rows with on-road totals.
+    """SKU rows with on-road totals and the master ex-showroom.
 
-    An OEM price row carries both REGISTRATION_INDIVIDUAL and REGISTRATION_CORPORATE
-    components, so a naive SUM double-counts registration. ``master_total_individual``
-    excludes the corporate line, ``master_total_corporate`` excludes the individual
-    line — the resolver matches against whichever the buyer's basis selects.
+    An OEM price row carries both REGISTRATION_INDIVIDUAL and
+    REGISTRATION_CORPORATE components, so a naive SUM double-counts
+    registration: ``master_total_individual`` excludes the corporate line,
+    ``master_total_corporate`` the individual one (shown on the PC's
+    shortlist; never used to choose a SKU).
 
-    ``fuel_powertrain``/``transmission``/``drive``/``seater``/``trim`` are the
-    variant's own already-clean structured attributes (populated verbatim from
-    the OEM's price-list columns at ingestion) — unused by ``_match``'s
-    whole-string comparison, but read here for
-    ``uc03_model_attribute_matching``'s decomposition fallback and for the
-    Modify Model picker's own Trim dropdown (uc03ModelResolution.ts).
-    """
+    ``fuel_powertrain`` / ``transmission`` / ``drive`` / ``seater`` / ``trim``
+    are the variant's structured columns; ``category`` / ``segment_code`` say
+    whether it is electric (rule R4)."""
     rows = connection.execute(
         text(
             """
@@ -432,9 +267,11 @@ def _sku_rows_for_version(
                    c.colour_name,
                    pv.fuel_powertrain,
                    pv.transmission,
-                   pv.attributes ->> 'drive'  AS drive,
-                   pv.attributes ->> 'seater' AS seater,
-                   pv.attributes ->> 'trim'   AS trim,
+                   pv.attributes ->> 'drive'    AS drive,
+                   pv.attributes ->> 'seater'   AS seater,
+                   pv.attributes ->> 'trim'     AS trim,
+                   pv.attributes ->> 'category' AS category,
+                   seg.segment_code,
                    SUM(pli.standard_amount) FILTER (WHERE pli.component_key <> 'REGISTRATION_CORPORATE')
                                                                                 AS master_total_individual,
                    SUM(pli.standard_amount) FILTER (WHERE pli.component_key <> 'REGISTRATION_INDIVIDUAL')
@@ -446,6 +283,7 @@ def _sku_rows_for_version(
             JOIN auditcore.product_models pm   ON pm.model_id  = s.model_id
             JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
             LEFT JOIN auditcore.colours c      ON c.colour_id  = s.colour_id
+            LEFT JOIN auditcore.segments seg   ON seg.segment_id = pm.segment_id
             WHERE pli.tenant_id = :tenant_id
               AND pli.price_list_version_id = :plv
               AND s.is_active = true
@@ -453,12 +291,408 @@ def _sku_rows_for_version(
               AND pv.is_active = true
             GROUP BY s.product_sku_id, s.sku_code, pm.model_name, pv.variant_name, c.colour_name,
                      pv.fuel_powertrain, pv.transmission,
-                     pv.attributes ->> 'drive', pv.attributes ->> 'seater', pv.attributes ->> 'trim'
+                     pv.attributes ->> 'drive', pv.attributes ->> 'seater', pv.attributes ->> 'trim',
+                     pv.attributes ->> 'category', seg.segment_code
+            ORDER BY pm.model_name, pv.variant_name, s.sku_code
             """
         ),
         {"tenant_id": tenant_id, "plv": price_list_version_id, "exkey": _EX_SHOWROOM_COMPONENT},
     ).mappings().all()
     return [dict(row) for row in rows]
+
+
+def _current_rows(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                  on: date | None = None) -> dict[str, Any]:
+    """The price list in force on the Journey's pricing date and its SKU rows,
+    or ``{"skipped": True, "reason": ...}``."""
+    on = on or journey_pricing_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if on is None:
+        return {"skipped": True, "reason": "no_pricing_date"}
+    try:
+        plan = _price_plan_for_journey(connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=on)
+    except AuditCoreError:  # no effective price list yet
+        return {"skipped": True, "reason": "no_effective_price_list"}
+    rows = _sku_rows_for_version(connection, tenant_id=tenant_id, price_list_version_id=plan["price_list_version_id"])
+    if not rows:
+        return {"skipped": True, "reason": "empty_price_list"}
+    return {"plan": plan, "rows": rows, "on": on}
+
+
+def _plan_label(plan: dict[str, Any]) -> str:
+    name = plan.get("price_list_name") or plan.get("price_list_code") or "Price list"
+    version = plan.get("version_no")
+    start = plan.get("effective_from")
+    return f"{name}" + (f" v{version}" if version is not None else "") + (f" (from {start})" if start else "")
+
+
+# ── what is on the Journey now ────────────────────────────────────────────────
+def _pin_state(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    row = connection.execute(
+        text(
+            """
+            SELECT jp.product_sku_id, jp.selection_status, jp.selection_method, jp.match_basis,
+                   jp.match_evidence, s.sku_code,
+                   NULLIF(TRIM(jp.model_name_snapshot), '')   AS model_name,
+                   NULLIF(TRIM(jp.variant_name_snapshot), '') AS variant_name,
+                   NULLIF(TRIM(jp.colour_name_snapshot), '')  AS colour_name
+            FROM auditcore.journey_products jp
+            LEFT JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id
+            WHERE jp.tenant_id = :t AND jp.journey_id = :j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one_or_none()
+    return dict(row) if row else {
+        "product_sku_id": None, "selection_status": None, "selection_method": None, "match_basis": None,
+        "match_evidence": None, "sku_code": None, "model_name": None, "variant_name": None, "colour_name": None,
+    }
+
+
+def is_human_decision(state: dict[str, Any]) -> bool:
+    """A SKU a PC or Team Lead set (CONFIRMED). Automatic pins are TENTATIVE
+    since migration 0152; a CONFIRMED row from before it that the resolver
+    made is AUTO_LEGACY there."""
+    return state.get("product_sku_id") is not None and state.get("selection_status") == "CONFIRMED"
+
+
+def _journey_registration(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """The Journey's registration: Private or Commercial decides between the
+    two SKUs of a pickup (rule R4). Several registration records that say
+    different things leave it unknown -- never "the newest wins" (review
+    471 S6)."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT cu.customer_type_code, rr.registration_type_code, rr.registration_category_code
+            FROM auditcore.journeys j
+            LEFT JOIN auditcore.customers cu
+              ON cu.tenant_id = j.tenant_id AND cu.customer_id = j.customer_id
+            LEFT JOIN auditcore.registration_records rr
+              ON rr.tenant_id = j.tenant_id AND rr.journey_id = j.journey_id
+            WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
+            ORDER BY rr.updated_at_utc DESC NULLS LAST
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    reg = dict(rows[0]) if rows else {}
+    categories = {
+        registration_category(r.get("registration_type_code")) or registration_category(r.get("registration_category_code"))
+        for r in rows
+    } - {None}
+    return {
+        "basis": registration_basis(
+            customer_type_code=reg.get("customer_type_code"),
+            registration_type_code=reg.get("registration_type_code"),
+        ),
+        "category": next(iter(categories)) if len(categories) == 1 else None,
+        "conflict": len(categories) > 1,
+    }
+
+
+# ── one document at a time ────────────────────────────────────────────────────
+def _plain(value: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    return value
+
+
+def _document_fields(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, types: tuple[str, ...], keys: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Every document of these types with its fields as the PC left them
+    (the corrected value wins), newest document first. A voided, superseded
+    or unlinked document stops counting (rule R2)."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT f.di_document_id, f.source_document_type_key, f.field_key, f.effective_value,
+                   f.updated_at_utc
+            FROM auditcore.journey_document_extracted_fields f
+            LEFT JOIN auditcore.evidence e
+              ON e.tenant_id = f.tenant_id AND e.di_document_id = f.di_document_id
+            WHERE f.tenant_id = :t AND f.journey_id = :j
+              AND f.source_document_type_key = ANY(:types)
+              AND f.field_key = ANY(:keys)
+              AND f.effective_value IS NOT NULL
+              AND f.effective_value NOT IN ('null'::jsonb, '""'::jsonb)
+              AND (e.evidence_id IS NULL OR e.association_status = 'ACTIVE')
+            ORDER BY f.updated_at_utc, f.extracted_field_id
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "types": list(types), "keys": list(keys)},
+    ).mappings().all()
+    documents: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        doc = documents.setdefault(str(row["di_document_id"]), {
+            "documentId": str(row["di_document_id"]), "documentType": str(row["source_document_type_key"]),
+            "updatedAt": row["updated_at_utc"], "fields": {},
+        })
+        value = _plain(row["effective_value"])
+        if value is not None:
+            doc["fields"][str(row["field_key"])] = value  # the latest reading of a field wins
+        doc["updatedAt"] = max(doc["updatedAt"], row["updated_at_utc"])
+    return sorted(documents.values(), key=lambda d: d["updatedAt"], reverse=True)
+
+
+def _reviewed_overlay(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, table: str, document_id: str, keys: tuple[str, ...],
+) -> dict[str, Any]:
+    """The PC-reviewed copy of the same document (booking_form_review_values /
+    invoice_review_values), when there is one."""
+    columns = connection.execute(
+        text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'auditcore' AND table_name = :table"
+        ),
+        {"table": table},
+    ).scalars().all()
+    wanted = [k for k in keys if k in set(columns)]
+    if not wanted:
+        return {}
+    row = connection.execute(
+        text(
+            f"SELECT {', '.join(wanted)} FROM auditcore.{table} "
+            "WHERE tenant_id = :t AND journey_id = :j AND source_di_document_id = CAST(:d AS uuid)"
+        ),
+        {"t": tenant_id, "j": journey_id, "d": document_id},
+    ).mappings().one_or_none()
+    return {k: v for k, v in (dict(row) if row else {}).items() if _plain(v) is not None}
+
+
+def _booking_doc_reading(fields: dict[str, Any], *, document_id: str | None, document_type: str,
+                         updated_at: Any = None) -> dict[str, Any]:
+    return {
+        "source": "BOOKING", "documentId": document_id, "documentType": document_type,
+        "model": clean_model_text(fields.get("vehicle_model")), "variant": _plain(fields.get("vehicle_variant")),
+        "colour": _plain(fields.get("vehicle_color")), "skuCode": _plain(fields.get("sku_code")),
+        "exShowroom": _money(fields.get("ex_showroom_price")),
+        "registration": registration_category(fields.get("registration_type")),
+        "updatedAt": updated_at,
+    }
+
+
+def _booking_readings(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                      state: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Every booking form that names the vehicle, each read on its own (its
+    words and its quoted ex-showroom), newest first; a docket only when there
+    is no form. Journeys captured by hand, with no booking form on file, fall
+    back to the reviewed booking values and then to the model typed on the
+    Journey -- or, once a SKU was pinned from that typed model, to the words
+    the pin recorded (the snapshot then holds the price master's own names,
+    and reading those back would confirm the pin by itself)."""
+    documents = _document_fields(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+        types=_BOOKING_DOCUMENT_TYPES, keys=_BOOKING_FIELD_KEYS,
+    )
+    documents = [d for d in documents if d["fields"].get("vehicle_model") or d["fields"].get("vehicle_variant")
+                 or d["fields"].get("sku_code")]
+    if documents:
+        forms = [d for d in documents if d["documentType"] == "booking_form"] or documents
+        readings = []
+        for doc in forms:
+            fields = {**doc["fields"], **_reviewed_overlay(
+                connection, tenant_id=tenant_id, journey_id=journey_id, table="booking_form_review_values",
+                document_id=doc["documentId"], keys=_BOOKING_FIELD_KEYS,
+            )}
+            readings.append(_booking_doc_reading(fields, document_id=doc["documentId"],
+                                                 document_type=doc["documentType"], updated_at=doc["updatedAt"]))
+        return readings
+    reviewed = connection.execute(
+        text(
+            """
+            SELECT source_di_document_id, vehicle_model, vehicle_variant, vehicle_color, sku_code,
+                   ex_showroom_price, registration_type
+            FROM auditcore.booking_form_review_values
+            WHERE tenant_id = :t AND journey_id = :j
+            ORDER BY reviewed_at_utc DESC NULLS LAST
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    named = next((r for r in reviewed if _plain(r["vehicle_model"]) or _plain(r["sku_code"])), None)
+    if named is not None:
+        return [_booking_doc_reading(dict(named), document_id=str(named["source_di_document_id"]),
+                                     document_type="booking_form")]
+    state = state or _pin_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+    evidence = state.get("match_evidence") if isinstance(state.get("match_evidence"), dict) else {}
+    if state.get("product_sku_id") is not None:
+        if evidence.get("documentType") == "journey" and evidence.get("modelText"):
+            return [{
+                "source": "BOOKING", "documentId": None, "documentType": "journey",
+                "model": clean_model_text(evidence.get("modelText")), "variant": _plain(evidence.get("variantText")),
+                "colour": state.get("colour_name"), "skuCode": None,
+                "exShowroom": _money(evidence.get("documentExShowroom")), "registration": None,
+            }]
+        return []
+    if not state.get("model_name"):
+        return []
+    # The model typed on the Journey (manual capture). Its quoted price is the
+    # reviewed booking form's, else the Journey's ex-showroom line when no
+    # invoice wrote it.
+    price = next((_money(r["ex_showroom_price"]) for r in reviewed if r["ex_showroom_price"] is not None), None)
+    if price is None:
+        line = connection.execute(
+            text(
+                """
+                SELECT actual_amount, source_reference FROM auditcore.commercial_lines
+                WHERE tenant_id = :t AND journey_id = :j AND component_key = 'ex_showroom_price'
+                  AND actual_amount IS NOT NULL
+                """
+            ),
+            {"t": tenant_id, "j": journey_id},
+        ).mappings().one_or_none()
+        source = str((line or {}).get("source_reference") or "").split(":", 1)[0].strip().lower()
+        if line is not None and "invoice" not in source:
+            price = _money(line["actual_amount"])
+    return [{
+        "source": "BOOKING", "documentId": None, "documentType": "journey",
+        "model": clean_model_text(state["model_name"]), "variant": state.get("variant_name"),
+        "colour": state.get("colour_name"), "skuCode": None, "exShowroom": price, "registration": None,
+    }]
+
+
+def _cancelled_invoice_ids(connection: Connection, *, tenant_id: str, journey_id: UUID) -> set[str]:
+    """Vehicle invoices a credit note reverses in full (PR #470's
+    ``select_invoices``): cancelled, so they name no vehicle any more. One
+    still waiting for the PC's "does this credit note cancel it?" counts."""
+    from audit_core.uc03_invoice_materialization import (
+        load_invoice_readings,
+        select_invoices,
+    )
+
+    selection = select_invoices(load_invoice_readings(connection, tenant_id=tenant_id, journey_id=journey_id))
+    return {str(copy["documentId"]) for group in selection.get("cancelled") or []
+            for copy in group.get("copies") or [] if copy.get("documentId")}
+
+
+def _vehicle_invoice_readings(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """Each customer vehicle invoice on its own: what it names (model,
+    variant, printed SKU code, colour) and its ex-showroom by rule R1, all
+    from that one invoice. A credit note, an accessory / warranty / RSA
+    invoice, the OEM's wholesale invoice, or a vehicle invoice a credit note
+    cancelled is not a vehicle invoice."""
+    readings: list[dict[str, Any]] = []
+    documents = _document_fields(
+        connection, tenant_id=tenant_id, journey_id=journey_id, types=_VEHICLE_INVOICE_TYPES,
+        keys=_INVOICE_FIELD_KEYS,
+    )
+    cancelled = _cancelled_invoice_ids(connection, tenant_id=tenant_id, journey_id=journey_id) if documents else set()
+    for doc in documents:
+        if doc["documentId"] in cancelled:
+            continue
+        fields = {**doc["fields"], **_reviewed_overlay(
+            connection, tenant_id=tenant_id, journey_id=journey_id, table="invoice_review_values",
+            document_id=doc["documentId"], keys=_INVOICE_FIELD_KEYS,
+        )}
+        purpose = str(fields.get("invoice_purpose") or "").strip().upper()
+        nature = str(fields.get("invoice_nature") or "").strip().upper()
+        if purpose in _NON_VEHICLE_PURPOSES or nature in {"CREDIT_NOTE", "DEBIT_NOTE"}:
+            continue
+        if doc["documentType"] == "invoice_generic" and purpose not in ("", "VEHICLE_SALE"):
+            continue
+        model = clean_model_text(fields.get("model_name_raw") or fields.get("vehicle_description_raw"))
+        sku_code = _plain(fields.get("sku_code"))
+        if model is None and sku_code is None:
+            continue
+        ex_showroom, basis = invoice_ex_showroom(fields, doc["documentType"])
+        readings.append({
+            "source": "INVOICE", "documentId": doc["documentId"], "documentType": doc["documentType"],
+            "invoiceNumber": _plain(fields.get("invoice_number")),
+            "retail": doc["documentType"] in _RETAIL_INVOICE_TYPES,
+            "model": model, "variant": _plain(fields.get("variant_raw")),
+            "colour": _plain(fields.get("vehicle_color")), "skuCode": sku_code,
+            "exShowroom": ex_showroom, "exShowroomBasis": basis, "gstRate": basis.get("gstRatePercent"),
+            "updatedAt": doc["updatedAt"],
+        })
+    return readings
+
+
+# ── rule R1: the invoice's ex-showroom ────────────────────────────────────────
+# A rupee amount the way dealers write it: a plain number, Indian (8,52,000) or
+# western (852,000) thousands separators, optionally behind "Rs." / "Rs" / "INR" /
+# the rupee sign and followed by "/-". Nothing else is a price (no scope of error).
+_MONEY_PREFIX = re.compile(r"^(?:rs\.?|inr|\u20b9)\s*", re.IGNORECASE)
+_MONEY_SUFFIX = re.compile(r"\s*/-$")
+_MONEY_NUMBER = re.compile(
+    r"^-?(?:\d+|\d{1,2}(?:,\d{2})*,\d{3}|\d{1,3}(?:,\d{3})+)(?:\.\d+)?$"
+)
+
+
+def _money(value: Any) -> Decimal | None:
+    """A price as a Decimal, or None when it is not read. Strict: text that is
+    not exactly an amount ("852000.00 (incl. GST)", "8.52 lakh", "8,52,00",
+    "Rs. 1.2.3") is NOT a price and gives None -- never a guess from the digits
+    in it (the old version stripped every letter, so "Rs. 8,52,000" read as
+    0.852)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        number = Decimal(str(value))
+        return number if number.is_finite() else None
+    text_value = _MONEY_SUFFIX.sub("", _MONEY_PREFIX.sub("", str(value).strip(), count=1), count=1).strip()
+    if not _MONEY_NUMBER.fullmatch(text_value):
+        return None
+    return Decimal(text_value.replace(",", ""))
+
+
+def invoice_ex_showroom(fields: dict[str, Any], document_type: str = "customer_invoice_dms",
+                        ) -> tuple[Decimal | None, dict[str, Any]]:
+    """Rule R1 (2026-10-20) for one vehicle invoice: its printed selling
+    price (before any discount) times (1 + its printed GST rate). One
+    implementation for the Deal sheet and the SKU check: PR #470's
+    ``uc03_invoice_materialization.vehicle_invoice_ex_showroom`` (review 471
+    S5 -- discounts printed negative or only as lines, the vehicle line's own
+    discount, add-on lines sharing the invoice). Returns (ex-showroom or None,
+    how it was read: the GST rate in percent for the category gate, and the
+    issues that left it unread)."""
+    from audit_core.uc03_invoice_materialization import vehicle_invoice_ex_showroom
+
+    reading = vehicle_invoice_ex_showroom(dict(fields), document_type)
+    rate = reading.get("rate")
+    basis: dict[str, Any] = {
+        "method": "R1_VEHICLE_INVOICE_EX_SHOWROOM",
+        "sellingPrice": reading.get("sellingPrice"),
+        "sellingPriceSource": reading.get("sellingPriceSource"),
+        "gstRatePercent": (Decimal(str(rate)) * 100).quantize(Decimal("0.01")) if rate is not None else None,
+    }
+    issues = [i.get("code") for i in reading.get("issues") or [] if isinstance(i, dict)]
+    if issues:
+        basis["issues"] = issues
+    ex = reading.get("exShowroom")
+    if ex is None:
+        basis["reason"] = " ".join(str(i.get("message")) for i in reading.get("issues") or []
+                                    if isinstance(i, dict) and i.get("message")) or "ex-showroom not read"
+    return (Decimal(str(ex)) if ex is not None else None), basis
+
+
+def _resolution_inputs(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, require_model: bool = True
+) -> dict[str, Any] | None:
+    """The Journey's current vehicle and registration (the model-selection
+    correction flow reads it). None when there is no vehicle row, or no model
+    on it and ``require_model``."""
+    state = _pin_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+    has_row = connection.execute(
+        text("SELECT 1 FROM auditcore.journey_products WHERE tenant_id = :t AND journey_id = :j"),
+        {"t": tenant_id, "j": journey_id},
+    ).first() is not None
+    if require_model and (not has_row or state["model_name"] is None):
+        return None
+    registration = _journey_registration(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return {
+        "product_sku_id": state["product_sku_id"],
+        "selection_status": state["selection_status"],
+        "match_basis": state["match_basis"],
+        "model_name": clean_model_text(state["model_name"]),
+        "variant_name": state["variant_name"],
+        "colour_name": state["colour_name"],
+        "registration_basis": registration["basis"],
+        "registration_category": registration["category"],
+    }
+
+
 
 
 def _oem_code_for_tenant(connection: Connection, *, tenant_id: str) -> str | None:
@@ -504,207 +738,180 @@ def _master_total(row: dict[str, Any], basis: str) -> Decimal | None:
     return _to_decimal(row.get(key))
 
 
-def _strip_new_prefix(name: str) -> str:
-    """``"New Scorpio N"`` -> ``"SCORPIO N"``; a plain name is returned
-    normalised, unchanged."""
-    words = _normalize_label(name).split()
-    if words and words[0] == "NEW":
-        words = words[1:]
-    return " ".join(words)
+
+def _model_identity() -> tuple[Any, dict[str, str]]:
+    """The price masters' own model identity (2026-10-20, PR #468): one
+    vehicle model whatever a month's list called it, the Bolero family split
+    by series, "SCORPIO-N" the new Scorpio N; and the successor a spelling
+    names once its model has left the book ("SCORPIO N" on an October
+    date). The resolver uses the same identity the books are loaded with,
+    so a renamed model is found under either spelling on either date."""
+    try:
+        from audit_core import oem_price_masters as masters
+    except ImportError:  # pragma: no cover
+        return None, {}
+    identity = getattr(masters, "price_list_model_key", None)
+    return identity, dict(getattr(masters, "_SUCCESSOR_IDENTITY", {}) or {})
 
 
-def _generation_sibling_rows(
-    rows: list[dict[str, Any]], model_rows: list[dict[str, Any]], *, model_name: str
-) -> list[dict[str, Any]]:
-    """Rows for the OEM's "New <Model>" refresh of the same nameplate, or vice
-    versa, when the Booking Form's own model text omits that qualifier.
-
-    Confirmed directly against a real ingested Mahindra price list: a
-    generation refresh keeps selling under a name that's the old one with a
-    "New " prefix (``"SCORPIO N"`` -- an ADAS-trim generation still on sale --
-    alongside ``"NEW SCORPIO N"``, a Refresh-trim generation, in the exact
-    same currently-effective price list; ``"THAR"``/``"NEW THAR ..."`` is the
-    same pattern). Real paperwork very often just writes the bare name,
-    which otherwise permanently walls off the refresh generation from ever
-    matching, however exactly its price agrees with what's on the form.
-
-    Exact-per-name only, after the same normalisation ``_label_similarity``
-    already applies (never fuzzy) -- and this list is only ever consulted
-    to arbitrate by an EXACT price match (see ``_match``), never to widen
-    what gets reported as an ambiguous candidate set on its own.
-
-    Computed even when ``model_rows`` is empty -- the tenant's currently
-    effective price list may carry only the refresh generation at all (the
-    old one fully retired), which is exactly the case this exists for.
-    """
-    base = _strip_new_prefix(model_name)
-    if not base:
-        return []
-    already = {r["product_sku_id"] for r in model_rows}
-    return [
-        r
-        for r in rows
-        if r["product_sku_id"] not in already and _strip_new_prefix(str(r["model_name"])) == base
-    ]
+# ── identification on one document ────────────────────────────────────────────
+def _identify(
+    rows: list[dict[str, Any]], reading: dict[str, Any], *, aliases: list[tuple[str, str]],
+    registration: str | None,
+) -> WordResult:
+    """The word-identified SKU of one document (``uc03_sku_words.identify``).
+    A SKU code the document prints that is exactly one row of the list names
+    it too. A colour the same document prints settles rows that differ only
+    by colour."""
+    code = reading.get("skuCode")
+    if code:
+        by_code = [r for r in rows if str(r["sku_code"]).strip().casefold() == str(code).strip().casefold()]
+        if len(by_code) == 1:
+            return WordResult(status="IDENTIFIED", row=by_code[0], candidates=by_code,
+                              detail={"skuCode": code, "via": "SKU_CODE"})
+    identity, successors = _model_identity()
+    result = identify(
+        rows=rows, model_text=reading.get("model"), variant_text=reading.get("variant"), aliases=aliases,
+        registration=registration or reading.get("registration"),
+        gst_rate=_money(reading.get("gstRate")), identity=identity, successors=successors,
+    )
+    if result.status == "AMBIGUOUS" and reading.get("colour") and result.candidates:
+        same_colour = _narrow(result.candidates, variant=None, colour=reading["colour"])
+        if len(same_colour) == 1 and len(same_colour) < len(result.candidates):
+            result.status, result.row, result.candidates = "IDENTIFIED", same_colour[0], same_colour
+            result.detail["colour"] = reading["colour"]
+    return result
 
 
-def _match(
-    rows: list[dict[str, Any]], inputs: dict[str, Any]
-) -> tuple[list[dict[str, Any]], str]:
-    """Return (matched rows, match_stage). match_stage is TOTAL, EX_SHOWROOM or NONE."""
-    model = inputs["model_name"]
-    basis = inputs["registration_basis"]
-    model_rows = [r for r in rows if _label_similarity(model, str(r["model_name"])) == Decimal(1)]
-    sibling_rows = _generation_sibling_rows(rows, model_rows, model_name=model)
-    if not model_rows and not sibling_rows:
-        return [], "NONE"
-
-    total = inputs["offered_total"]
-    if total is not None:
-        by_total = [r for r in model_rows if _master_total(r, basis) == total]
-        by_total = _narrow(by_total, variant=inputs["variant_name"], colour=inputs["colour_name"])
-        if len(by_total) == 1:
-            return by_total, "TOTAL"
-        if not by_total and sibling_rows:
-            sibling_total = [r for r in sibling_rows if _master_total(r, basis) == total]
-            if len(sibling_total) == 1:
-                return sibling_total, "TOTAL"
-        if len(by_total) > 1:
-            model_rows = by_total  # keep the ambiguity for reporting unless ex-showroom disambiguates
-
-    ex = inputs["offered_ex_showroom"]
-    if ex is not None:
-        by_ex = [r for r in model_rows if _to_decimal(r["master_ex_showroom"]) == ex]
-        by_ex = _narrow(by_ex, variant=inputs["variant_name"], colour=inputs["colour_name"])
-        if len(by_ex) == 1:
-            return by_ex, "EX_SHOWROOM"
-        if not by_ex and sibling_rows:
-            sibling_ex = [r for r in sibling_rows if _to_decimal(r["master_ex_showroom"]) == ex]
-            if len(sibling_ex) == 1:
-                return sibling_ex, "EX_SHOWROOM"
-        if len(by_ex) > 1:
-            return by_ex, "EX_SHOWROOM"
-
-    if not model_rows:
-        return [], "NONE"
-    # Price could not decide (none on the form, or nothing agreed with it):
-    # the variant and colour the form states are still exact facts about
-    # the vehicle. A Booking Form that reads "Thar Roxx / AX7L D(MT) /
-    # Stealth Black" but leaves the total blank must not stay unresolved
-    # across every Thar Roxx row in the price list.
-    narrowed = _narrow(model_rows, variant=inputs["variant_name"], colour=inputs["colour_name"])
-    if len(narrowed) < len(model_rows):
-        return narrowed, "VARIANT_COLOUR"
-    return model_rows, "TOTAL" if total is not None else "NONE"
-
-
-def _price_disambiguate(
-    rows: list[dict[str, Any]], inputs: dict[str, Any]
-) -> tuple[list[dict[str, Any]], str]:
-    """Narrow an already-established candidate set to one, purely by an
-    exact price match -- no name/variant/model filtering of its own (the
-    caller has already decided which rows are plausible). Total first, then
-    ex-showroom; never a fuzzy tolerance. Used as the deliberate *last*
-    resort in ``_current_match``, after attribute decomposition has had its
-    chance -- price can coincidentally collide between unrelated SKUs and
-    can legitimately drift for reasons that have nothing to do with which
-    vehicle was actually sold (accessories, discounts, rounding), unlike a
-    stated fuel/transmission/drive/seater fact.
-    """
-    basis = inputs["registration_basis"]
-    total = inputs["offered_total"]
-    if total is not None:
-        by_total = [r for r in rows if _master_total(r, basis) == total]
-        by_total = _narrow(by_total, variant=inputs["variant_name"], colour=inputs["colour_name"])
-        if len(by_total) == 1:
-            return by_total, "TOTAL"
-        if len(by_total) > 1:
-            rows = by_total
-
-    ex = inputs["offered_ex_showroom"]
-    if ex is not None:
-        by_ex = [r for r in rows if _to_decimal(r["master_ex_showroom"]) == ex]
-        by_ex = _narrow(by_ex, variant=inputs["variant_name"], colour=inputs["colour_name"])
-        if by_ex:
-            return by_ex, "EX_SHOWROOM"
-
-    # Exact equality found no usable signal (0 or still >1) on either field --
-    # a real stated attribute fact already narrowed `rows` to this specific
-    # small set, so a tight, symmetric tolerance here is arbitrating within an
-    # already-confirmed vehicle identity, not doing a fresh price search. See
-    # _PRICE_APPROX_TOLERANCE's own comment for the live case this covers.
-    if total is not None:
-        by_total_approx = _closest_within_tolerance(
-            rows, offered=total, field_value=lambda r: _master_total(r, basis)
-        )
-        if len(by_total_approx) == 1:
-            return by_total_approx, "TOTAL_APPROX"
-
-    if ex is not None:
-        by_ex_approx = _closest_within_tolerance(
-            rows, offered=ex, field_value=lambda r: _to_decimal(r["master_ex_showroom"])
-        )
-        if len(by_ex_approx) == 1:
-            return by_ex_approx, "EX_SHOWROOM_APPROX"
-
-    return rows, "TOTAL" if total is not None else "NONE"
+def _evidence(
+    reading: dict[str, Any], result: WordResult, *, check: str | None, plan: dict[str, Any], on: date,
+) -> dict[str, Any]:
+    """What the pin rests on: the document, its words, the prices compared."""
+    row = result.row or {}
+    master = _to_decimal(row.get("master_ex_showroom"))
+    offered = reading.get("exShowroom")
+    return {
+        "source": reading.get("source"),
+        "documentId": reading.get("documentId"),
+        "documentType": reading.get("documentType"),
+        "invoiceNumber": reading.get("invoiceNumber"),
+        "modelText": reading.get("model"),
+        "variantText": reading.get("variant"),
+        "skuCodeText": reading.get("skuCode"),
+        "words": result.detail.get("words"),
+        "stated": result.detail.get("stated"),
+        "category": result.detail.get("category") or result.category,
+        "skuCode": row.get("sku_code"),
+        "masterExShowroom": str(master) if master is not None else None,
+        "documentExShowroom": str(offered) if offered is not None else None,
+        "difference": str(offered - master) if offered is not None and master is not None else None,
+        "priceCheck": check,
+        "exShowroomBasis": {k: str(v) for k, v in (reading.get("exShowroomBasis") or {}).items()},
+        "priceListVersionId": str(plan.get("price_list_version_id")) if plan.get("price_list_version_id") else None,
+        "priceList": _plan_label(plan),
+        "pricingDate": on.isoformat(),
+        "decidedAtUtc": datetime.now(UTC).isoformat(),
+    }
 
 
 # ── persistence ───────────────────────────────────────────────────────────────
+_PIN_SQL = """
+    INSERT INTO auditcore.journey_products (
+        tenant_id, journey_id, product_sku_id,
+        model_code_snapshot, model_name_snapshot,
+        variant_code_snapshot, variant_name_snapshot,
+        colour_code_snapshot, colour_name_snapshot,
+        selection_source, selection_status, selection_method, match_basis, match_evidence
+    )
+    SELECT
+        :tenant_id, :journey_id, s.product_sku_id,
+        pm.model_code, pm.model_name,
+        pv.variant_code, pv.variant_name,
+        c.colour_code, c.colour_name,
+        'EVIDENCE', :status, :method, :basis, CAST(:evidence AS jsonb)
+    FROM auditcore.product_skus s
+    JOIN auditcore.product_models pm ON pm.model_id = s.model_id
+    JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
+    LEFT JOIN auditcore.colours c ON c.colour_id = s.colour_id
+    WHERE s.product_sku_id = :product_sku_id
+    ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
+        product_sku_id = EXCLUDED.product_sku_id,
+        model_code_snapshot = EXCLUDED.model_code_snapshot,
+        model_name_snapshot = EXCLUDED.model_name_snapshot,
+        variant_code_snapshot = EXCLUDED.variant_code_snapshot,
+        variant_name_snapshot = EXCLUDED.variant_name_snapshot,
+        -- A price-list SKU without a colour keeps the colour the
+        -- documents gave (2026-10-20: pinning used to blank it).
+        colour_code_snapshot = COALESCE(EXCLUDED.colour_code_snapshot,
+                                        auditcore.journey_products.colour_code_snapshot),
+        colour_name_snapshot = COALESCE(EXCLUDED.colour_name_snapshot,
+                                        auditcore.journey_products.colour_name_snapshot),
+        selection_source = 'EVIDENCE',
+        selection_status = EXCLUDED.selection_status,
+        selection_method = EXCLUDED.selection_method,
+        match_basis = EXCLUDED.match_basis,
+        match_evidence = EXCLUDED.match_evidence,
+        updated_at_utc = now()
+"""
+
+
 def _pin_sku(
     connection: Connection, *, tenant_id: str, journey_id: UUID, product_sku_id: UUID,
-    method: str = _SELECTION_METHOD,
-) -> None:
-    """Pin the SKU and refresh the Journey's vehicle snapshot (model, variant,
-    colour) from the price master, whichever document named it."""
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.journey_products (
-                tenant_id, journey_id, product_sku_id,
-                model_code_snapshot, model_name_snapshot,
-                variant_code_snapshot, variant_name_snapshot,
-                colour_code_snapshot, colour_name_snapshot,
-                selection_source, selection_status, selection_method
-            )
-            SELECT
-                :tenant_id, :journey_id, s.product_sku_id,
-                pm.model_code, pm.model_name,
-                pv.variant_code, pv.variant_name,
-                c.colour_code, c.colour_name,
-                'EVIDENCE', 'CONFIRMED', :method
-            FROM auditcore.product_skus s
-            JOIN auditcore.product_models pm ON pm.model_id = s.model_id
-            JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
-            LEFT JOIN auditcore.colours c ON c.colour_id = s.colour_id
-            WHERE s.product_sku_id = :product_sku_id
-            ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
-                product_sku_id = EXCLUDED.product_sku_id,
-                model_code_snapshot = EXCLUDED.model_code_snapshot,
-                model_name_snapshot = EXCLUDED.model_name_snapshot,
-                variant_code_snapshot = EXCLUDED.variant_code_snapshot,
-                variant_name_snapshot = EXCLUDED.variant_name_snapshot,
-                -- A price-list SKU without a colour keeps the colour the
-                -- documents gave (2026-10-20: pinning used to blank it).
-                colour_code_snapshot = COALESCE(EXCLUDED.colour_code_snapshot,
-                                                auditcore.journey_products.colour_code_snapshot),
-                colour_name_snapshot = COALESCE(EXCLUDED.colour_name_snapshot,
-                                                auditcore.journey_products.colour_name_snapshot),
-                selection_source = 'EVIDENCE',
-                selection_status = 'CONFIRMED',
-                selection_method = :method,
-                updated_at_utc = now()
-            WHERE auditcore.journey_products.selection_status IS DISTINCT FROM 'CONFIRMED'
-            """
-        ),
+    method: str = _SELECTION_METHOD, basis: str = BASIS_AUTO_MATCHED, evidence: dict[str, Any] | None = None,
+) -> bool:
+    """An automatic pin (TENTATIVE, with how it was made and on what
+    evidence) and the Journey's vehicle snapshot from the price master. Never
+    touches a SKU a PC or Team Lead set. Returns whether it was written."""
+    written = connection.execute(
+        text(_PIN_SQL + " WHERE auditcore.journey_products.selection_status IS DISTINCT FROM 'CONFIRMED' "
+             "RETURNING product_sku_id"),
         {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "product_sku_id": product_sku_id,
-            "method": method,
+            "tenant_id": tenant_id, "journey_id": journey_id, "product_sku_id": product_sku_id,
+            "status": "TENTATIVE", "method": method, "basis": basis,
+            "evidence": json.dumps(evidence or {}, default=str),
+        },
+    ).first() is not None
+    if written:
+        _close_sku_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return written
+
+
+def _pin_human(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, product_sku_id: UUID, method: str, basis: str,
+    evidence: dict[str, Any] | None = None, task_id: Any = None, actor_id: str | None = None,
+) -> None:
+    """A PC's or Team Lead's decision (CONFIRMED): replaces whatever is on
+    the Journey."""
+    connection.execute(
+        text(_PIN_SQL),
+        {
+            "tenant_id": tenant_id, "journey_id": journey_id, "product_sku_id": product_sku_id,
+            "status": "CONFIRMED", "method": method, "basis": basis,
+            "evidence": json.dumps(evidence or {}, default=str),
         },
     )
     _close_sku_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
+    from audit_core.uc03_sku_tasks import resolve_automatic_match_tasks
+
+    resolve_automatic_match_tasks(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                  reason=f"SKU set by {'the Team Lead' if basis == BASIS_TL else 'the PC'}",
+                                  skip_task_id=task_id, actor_id=actor_id)
+
+
+def _update_match(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, basis: str, evidence: dict[str, Any],
+) -> None:
+    """Same automatic SKU, newer evidence (a price corrected on the form)."""
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.journey_products
+            SET match_basis = :basis, match_evidence = CAST(:evidence AS jsonb), updated_at_utc = now()
+            WHERE tenant_id = :t AND journey_id = :j AND selection_status IS DISTINCT FROM 'CONFIRMED'
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "basis": basis, "evidence": json.dumps(evidence, default=str)},
+    )
 
 
 def _close_sku_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
@@ -722,72 +929,6 @@ def _close_sku_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID
         resolve_sku_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, sku_code=str(sku_code))
 
 
-_CORRECTION_SELECTION_METHOD = "MODEL_SELECTION_CORRECTION_V1"
-
-
-def reassign_confirmed_sku(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, product_sku_id: UUID,
-    method: str = _CORRECTION_SELECTION_METHOD,
-) -> None:
-    """Deliberately overwrite an already-CONFIRMED SKU selection.
-
-    ``_pin_sku`` above refuses to touch a row whose ``selection_status`` is
-    already 'CONFIRMED' -- correct for the automatic resolver and the PC's
-    own first-pick "confirm SKU" endpoint, which must never silently flip a
-    locked-in deal. This is the one place that guard is intentionally
-    bypassed: called only from ``uc03_model_selection_corrections.py``'s
-    ``apply_confirmed_model_selection_correction``, itself only reachable
-    after a PC has proposed a specific replacement SKU and a Team Lead has
-    called CONFIRM_BREACH on the finding it raised -- a real human
-    decision, not a routine re-run.
-    """
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.journey_products (
-                tenant_id, journey_id, product_sku_id,
-                model_code_snapshot, model_name_snapshot,
-                variant_code_snapshot, variant_name_snapshot,
-                colour_code_snapshot, colour_name_snapshot,
-                selection_source, selection_status, selection_method
-            )
-            SELECT
-                :tenant_id, :journey_id, s.product_sku_id,
-                pm.model_code, pm.model_name,
-                pv.variant_code, pv.variant_name,
-                c.colour_code, c.colour_name,
-                'EVIDENCE', 'CONFIRMED', :method
-            FROM auditcore.product_skus s
-            JOIN auditcore.product_models pm ON pm.model_id = s.model_id
-            JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
-            LEFT JOIN auditcore.colours c ON c.colour_id = s.colour_id
-            WHERE s.product_sku_id = :product_sku_id
-            ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
-                product_sku_id = EXCLUDED.product_sku_id,
-                model_code_snapshot = EXCLUDED.model_code_snapshot,
-                model_name_snapshot = EXCLUDED.model_name_snapshot,
-                variant_code_snapshot = EXCLUDED.variant_code_snapshot,
-                variant_name_snapshot = EXCLUDED.variant_name_snapshot,
-                -- A price-list SKU without a colour keeps the colour the
-                -- documents gave (2026-10-20: pinning used to blank it).
-                colour_code_snapshot = COALESCE(EXCLUDED.colour_code_snapshot,
-                                                auditcore.journey_products.colour_code_snapshot),
-                colour_name_snapshot = COALESCE(EXCLUDED.colour_name_snapshot,
-                                                auditcore.journey_products.colour_name_snapshot),
-                selection_source = 'EVIDENCE',
-                selection_status = 'CONFIRMED',
-                selection_method = :method,
-                updated_at_utc = now()
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "product_sku_id": product_sku_id,
-            "method": method,
-        },
-    )
-    _close_sku_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
 
 
 def _resolve_open_flag(
@@ -965,138 +1106,6 @@ def _run_deal_reconciliation(
     )
 
 
-def _attribute_decomposition_fallback(
-    connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any]
-) -> tuple[list[dict[str, Any]], str, bool]:
-    """Narrow by decomposed fuel/transmission/drive/seater signal, tried
-    whether or not the whole-string model match already succeeded.
-
-    Booking Forms fold trim/fuel/transmission/drive/seater into the same
-    free-text field as the model name (see ``uc03_model_attribute_matching``);
-    resolve the model via ``oem_model_aliases`` and re-filter by the variant's
-    own structured attributes instead of comparing one flat string. Still
-    zero fuzzy text matching — every check is exact, on a decomposed signal.
-    Returns ``([], "NONE", False)`` (the caller's existing empty case) when
-    this OEM has no alias/vocabulary coverage or nothing survives the
-    filters.
-
-    The third element is whether the result is trustworthy enough to
-    out-rank an exact price match on its own: only when the starting
-    candidate set actually had more than one row (real ambiguity to
-    resolve) *and* the combined text supplied a genuine fuel/transmission/
-    drive/seater signal (``has_qualifying_signal``) -- not a bare trim code,
-    which only "matches" via a loose prefix/suffix check because there was
-    nothing else in the candidate set to eliminate it against, and carries
-    no more certainty than a plain name/variant equality check.
-    """
-    oem_code = _oem_code_for_tenant(connection, tenant_id=tenant_id)
-    if not oem_code:
-        return [], "NONE", False
-
-    aliases = _oem_model_aliases(connection, oem_code=oem_code)
-    resolved = resolve_model_via_aliases(model_name=inputs["model_name"], oem_aliases=aliases)
-    if resolved is None:
-        return [], "NONE", False
-
-    canonical_model, remainder = resolved
-    canonical_key = normalized_model_key(canonical_model)
-    model_rows = [r for r in rows if normalized_model_key(r["model_name"]) == canonical_key]
-    if not model_rows:
-        return [], "NONE", False
-
-    matched = match_by_attributes(
-        model_rows,
-        oem_code=oem_code,
-        model_remainder=remainder,
-        variant_text=inputs["variant_name"],
-    )
-    trustworthy = len(model_rows) > 1 and has_qualifying_signal(
-        oem_code=oem_code,
-        model_remainder=remainder,
-        variant_text=inputs["variant_name"],
-        candidate_rows=model_rows,
-    )
-    return matched, "ATTRIBUTE_DECOMPOSITION", trustworthy
-
-
-# A confident auto-resolve needs both a reasonable absolute combined score
-# AND a real gap over the next-best candidate -- the margin does most of
-# the real safety work here, not the absolute floor. Tuned empirically
-# against SequenceMatcher's own ratio() behavior on short (2-4 character)
-# trim codes, which is what a real Mahindra Trim column actually looks
-# like: a single mid-string character misread (fuzzy_match_by_attributes's
-# own tests) lands the correct candidate's combined score (0.7*trim_sim +
-# 0.3*attribute-confirmation) around 0.75-0.80 with a >=0.2 gap over the
-# next-best candidate, while two genuinely different short trims typically
-# land within 0.1-0.15 of each other -- an absolute floor as high as 0.85
-# (plausible-sounding but unverified) would silently never fire for the
-# single-character-typo case this whole fallback exists for.
-_FUZZY_CONFIDENT_SCORE = 0.70
-_FUZZY_CONFIDENT_MARGIN = 0.15
-
-
-def _fuzzy_decomposition_fallback(
-    connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any]
-) -> list[Any]:
-    """Controlled fuzzy fallback -- tried only once exact attribute
-    decomposition (``match_by_attributes`` above) already failed to
-    produce a unique SKU. Model resolution itself stays exact (see
-    ``fuzzy_match_by_attributes``'s own docstring for why fuzzy-matching
-    the model name is a separate, harder problem, deliberately out of
-    scope here) -- only the trim comparison within that already-resolved
-    model is fuzzy. Returns ``[]`` when the model itself doesn't resolve
-    via the exact alias table at all.
-    """
-    oem_code = _oem_code_for_tenant(connection, tenant_id=tenant_id)
-    if not oem_code:
-        return []
-    aliases = _oem_model_aliases(connection, oem_code=oem_code)
-    resolved = resolve_model_via_aliases(model_name=inputs["model_name"], oem_aliases=aliases)
-    if resolved is None:
-        return []
-    canonical_model, remainder = resolved
-    canonical_key = normalized_model_key(canonical_model)
-    model_rows = [r for r in rows if normalized_model_key(r["model_name"]) == canonical_key]
-    if not model_rows:
-        return []
-    return fuzzy_match_by_attributes(
-        model_rows, oem_code=oem_code, model_remainder=remainder, variant_text=inputs["variant_name"],
-    )
-
-
-# Stand-in for "no existing exact candidate set to beat" (an empty list
-# means unconstrained, not "beat zero") when comparing sizes below --
-# large enough that any real, non-empty fuzzy result always counts as an
-# improvement over nothing.
-_NO_EXISTING_CANDIDATES = 10**9
-
-
-def _fuzzy_or_none(
-    connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any],
-    best_len: int,
-) -> dict[str, Any] | None:
-    """Try the controlled fuzzy trim fallback; return a result only if
-    it's a genuine improvement over whatever the exact passes already
-    found -- either a confident single resolve (clears both the score
-    floor and the margin over the runner-up), or a shortlist strictly
-    smaller than ``best_len``. Returns ``None`` otherwise, so a caller
-    whose exact pass already found an equally-good-or-better result never
-    gets it silently relabeled "fuzzy" just because fuzzy scoring
-    happened to reproduce the same rows.
-    """
-    fuzzy_candidates = _fuzzy_decomposition_fallback(
-        connection, tenant_id=tenant_id, rows=rows, inputs=inputs
-    )
-    if not fuzzy_candidates:
-        return None
-    top = fuzzy_candidates[0]
-    runner_up_score = fuzzy_candidates[1].score if len(fuzzy_candidates) > 1 else 0.0
-    if top.score >= _FUZZY_CONFIDENT_SCORE and (top.score - runner_up_score) >= _FUZZY_CONFIDENT_MARGIN:
-        return {"matched": [top.row], "matchStage": "FUZZY_ATTRIBUTE_DECOMPOSITION"}
-    fuzzy_rows = [c.row for c in fuzzy_candidates]
-    if len(fuzzy_rows) < best_len:
-        return {"matched": fuzzy_rows, "matchStage": "FUZZY_ATTRIBUTE_DECOMPOSITION"}
-    return None
 
 
 # ── catalogue search: the model name itself never resolved ──────────────────
@@ -1110,7 +1119,6 @@ def _fuzzy_or_none(
 # a diesel), an exact price, the model name with the usual OCR confusions
 # folded (O/0, I/1, S/5, B/8, Z/2) and the trim. Pins only a clear winner;
 # otherwise the top few go to the PC as the shortlist to pick from.
-_CATALOGUE_STAGE = "CATALOGUE_SEARCH"
 _CATALOGUE_CONFUSION_FOLD = str.maketrans({"O": "0", "I": "1", "S": "5", "B": "8", "Z": "2", "Q": "0"})
 _CATALOGUE_MODEL_FLOOR = 0.6  # below this the nameplate is simply not this one
 _CATALOGUE_PIN_MODEL = 0.8
@@ -1138,24 +1146,28 @@ def _catalogue_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+
 def _catalogue_search(
-    rows: list[dict[str, Any]], inputs: dict[str, Any], *, oem_code: str | None
-) -> tuple[list[dict[str, Any]], str]:
-    """Last resort once no model matched at all. Returns ``(rows, stage)``:
-    one row when the evidence is unambiguous, a ranked shortlist otherwise,
-    ``([], "NONE")`` when nothing in the list resembles the paperwork."""
-    model_text = str(inputs.get("model_name") or "")
-    variant_text = str(inputs.get("variant_name") or "")
+    rows: list[dict[str, Any]], reading: dict[str, Any], *, oem_code: str | None, with_scores: bool = False,
+) -> Any:
+    """The document's model text names no model of the list (handwriting
+    read as a neighbouring nameplate: "XUV3XO AX7L EV" read as "XUV300" /
+    "W7L EV"). Score every SKU on what the paperwork does say -- the model
+    name with OCR look-alikes folded (O/0, I/1, S/5, B/8, Z/2), the trim, and
+    the stated fuel / gearbox / drive / seats (a hard filter: an "EV" form
+    never lands on a diesel) -- and return the closest few for the PC.
+    Never a pin (2026-10-20: the price no longer settles it either; it only
+    breaks a tie in the order)."""
+    model_text = str(reading.get("model") or "")
+    variant_text = str(reading.get("variant") or "")
     combined = " ".join(part for part in (model_text, variant_text) if part)
     stated = _decompose(combined, oem_code=oem_code) if oem_code else None
     model_key = _catalogue_key(model_text, oem_code=oem_code)
     full_key = _catalogue_key(combined, oem_code=oem_code)
     if not model_key:
-        return [], "NONE"
-
-    basis = inputs["registration_basis"]
-    total, ex = inputs.get("offered_total"), inputs.get("offered_ex_showroom")
-    scored: list[tuple[float, float, float, bool, dict[str, Any]]] = []
+        return ([], []) if with_scores else []
+    offered = reading.get("exShowroom")
+    scored: list[tuple[float, Decimal, dict[str, Any]]] = []
     for row in rows:
         master = _master_attributes(row, oem_code=oem_code) if oem_code else None
         if stated is not None and master is not None and any(
@@ -1181,78 +1193,20 @@ def _catalogue_search(
             if stated is not None and master is not None
             else 0
         )
-        price_exact = (total is not None and _master_total(row, basis) == total) or (
-            ex is not None and _to_decimal(row.get("master_ex_showroom")) == ex
-        )
         score = (
             _CATALOGUE_MODEL_WEIGHT * model_sim
             + _CATALOGUE_TRIM_WEIGHT * trim_sim
             + _CATALOGUE_ATTR_WEIGHT * (confirmed / len(_CATALOGUE_ATTR_KEYS))
         )
-        scored.append((score, model_sim, trim_sim, price_exact, row))
-    if not scored:
-        return [], "NONE"
-    scored.sort(key=lambda item: (item[3], item[0]), reverse=True)
-
-    # A price the form states that equals exactly one plausible SKU settles it.
-    priced = [row for score, _, _, exact, row in scored if exact]
-    if priced:
-        priced = _narrow(priced, variant=None, colour=inputs.get("colour_name"))
-        if len(priced) == 1:
-            return priced, _CATALOGUE_STAGE
-    # A near-certain nameplate with the exact trim stated, or a trim clearly
-    # closer than any other, settles it too.
-    top_score, top_model, top_trim, _, top_row = scored[0]
-    if top_model >= _CATALOGUE_PIN_MODEL:
-        exact_trim = [row for _, m, t, _, row in scored if m >= _CATALOGUE_PIN_MODEL and t == 1.0]
-        exact_trim = _narrow(exact_trim, variant=None, colour=inputs.get("colour_name"))
-        if len(exact_trim) == 1:
-            return exact_trim, _CATALOGUE_STAGE
-        runner_up = scored[1][0] if len(scored) > 1 else 0.0
-        if top_trim >= _CATALOGUE_PIN_TRIM and top_score - runner_up >= _CATALOGUE_PIN_MARGIN:
-            return [top_row], _CATALOGUE_STAGE
-    return [row for *_, row in scored[:_CATALOGUE_SHORTLIST]], _CATALOGUE_STAGE
+        master_ex = _to_decimal(row.get("master_ex_showroom"))
+        gap = abs(master_ex - offered) if master_ex is not None and offered is not None else Decimal("1e12")
+        scored.append((score, gap, row))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    if with_scores:
+        return [row for *_, row in scored[:_CATALOGUE_SHORTLIST]], [score for score, *_ in scored[:2]]
+    return [row for *_, row in scored[:_CATALOGUE_SHORTLIST]]
 
 
-def _latest_invoice_field(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, field_keys: tuple[str, ...]
-) -> str | None:
-    """The value for ``field_keys`` off the vehicle invoice, read from durable
-    storage (never DI directly): the first key in ``field_keys`` that has a
-    value wins, then the retail/tax invoice over the others, then the
-    highest-confidence, most recent reading.
-
-    Not filtered on stage: the unified upload copies a page's facts before
-    its classification moves it to Delivery, so an invoice can sit under
-    BOOKING for a while (or for good, when that move failed) -- it is the
-    vehicle invoice all the same."""
-    value = connection.execute(
-        text(
-            """
-            SELECT effective_value
-            FROM auditcore.journey_document_extracted_fields
-            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-              AND source_document_type_key = ANY(:document_types)
-              AND field_key = ANY(:field_keys)
-              AND effective_value IS NOT NULL
-              AND effective_value NOT IN ('null'::jsonb, '""'::jsonb)
-            ORDER BY array_position(CAST(:field_keys AS text[]), field_key::text),
-                     array_position(CAST(:document_types AS text[]), source_document_type_key::text),
-                     confidence_score DESC NULLS LAST, updated_at_utc DESC
-            LIMIT 1
-            """
-        ),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "document_types": list(_VEHICLE_INVOICE_TYPES),
-            "field_keys": list(field_keys),
-        },
-    ).scalar_one_or_none()
-    if value is None:
-        return None
-    text_value = str(value).strip()
-    return text_value or None
 
 
 def check_invoice_sku_mismatch(
@@ -1357,125 +1311,6 @@ def check_invoice_sku_mismatch(
         )
 
 
-def _invoice_implied_vehicle(
-    matched: list[dict[str, Any]], confirmed_sku_id: UUID
-) -> tuple[UUID, str, str | None] | None:
-    """What the invoice says the vehicle is, for the cross-check against the
-    SKU already on the journey: ``(sku_id, sku_code, label)`` or None when
-    the invoice text settles nothing.
-
-    One match is the answer. Several matches that include the confirmed
-    SKU agree with it (the invoice names the variant, the colour rows are
-    the only spread). Several matches of one model and variant that do
-    not include the confirmed SKU are a different vehicle, whatever the
-    colour (rule 2026-10-01: the invoice's model is checked even when the
-    booking form already pinned one, the customer may have changed it).
-    """
-    if not matched:
-        return None
-    if len(matched) == 1:
-        row = matched[0]
-        return row["product_sku_id"], str(row["sku_code"]), None
-    for row in matched:
-        if row["product_sku_id"] == confirmed_sku_id:
-            return confirmed_sku_id, str(row["sku_code"]), None
-    identities = {(str(r["model_name"]).strip().upper(), str(r["variant_name"] or "").strip().upper()) for r in matched}
-    if len(identities) != 1:
-        return None
-    row = matched[0]
-    label = f"{row['model_name']} {row['variant_name'] or ''}".strip() + " (any colour)"
-    return row["product_sku_id"], str(row["sku_code"]), label
-
-
-# ── the vehicle invoice as the source of the model ─────────────────────────────
-def _invoice_reading(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
-    """What the vehicle invoice says the vehicle is: printed SKU code, model
-    text (the model box, else the full vehicle description), variant,
-    colour, and the ex-showroom price it bills. None when no vehicle invoice
-    names the vehicle at all."""
-    def field(keys: tuple[str, ...]) -> str | None:
-        return _latest_invoice_field(connection, tenant_id=tenant_id, journey_id=journey_id, field_keys=keys)
-
-    sku_code = field(_INVOICE_SKU_CODE_FIELD_KEYS)
-    model = clean_model_text(field(_INVOICE_MODEL_FIELD_KEYS))
-    if sku_code is None and model is None:
-        return None
-    ex_showroom = connection.execute(
-        text(
-            """
-            SELECT amount FROM auditcore.commercial_line_source_values
-            WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-              AND line_kind = 'COMMERCIAL' AND component_key = 'ex_showroom_price'
-              AND source_document_type = ANY(:types) AND amount IS NOT NULL
-            ORDER BY array_position(CAST(:types AS text[]), source_document_type::text), updated_at_utc DESC
-            LIMIT 1
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "types": list(_VEHICLE_INVOICE_TYPES)},
-    ).scalar_one_or_none()
-    retail = connection.execute(
-        text(
-            """
-            SELECT EXISTS (
-              SELECT 1 FROM auditcore.journey_document_extracted_fields
-              WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-                AND source_document_type_key IN ('customer_invoice_dms', 'tax_invoice_tally')
-                AND field_key = ANY(:keys) AND effective_value IS NOT NULL
-            )
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id,
-         "keys": list(_INVOICE_SKU_CODE_FIELD_KEYS + _INVOICE_MODEL_FIELD_KEYS)},
-    ).scalar_one()
-    return {
-        "retail": bool(retail),
-        "sku_code": sku_code,
-        "model_name": model,
-        "variant_name": field(_INVOICE_VARIANT_FIELD_KEYS),
-        "colour_name": field(_INVOICE_COLOUR_FIELD_KEYS),
-        "ex_showroom": _to_decimal(ex_showroom),
-    }
-
-
-def _invoice_inputs(inputs: dict[str, Any], reading: dict[str, Any]) -> dict[str, Any]:
-    """The resolution inputs with the invoice standing in for the Booking
-    Form. The invoice is the source of truth: its model, and its billed
-    ex-showroom price when it prints one (the booking's offered on-road
-    total then says nothing about the vehicle that was actually billed).
-    A variant or colour the invoice does not print falls back to the
-    booking's reading."""
-    out = dict(inputs)
-    out["model_name"] = reading["model_name"]
-    out["variant_name"] = reading["variant_name"] or inputs["variant_name"]
-    out["colour_name"] = reading["colour_name"] or inputs["colour_name"]
-    if reading["ex_showroom"] is not None:
-        out["offered_ex_showroom"] = reading["ex_showroom"]
-        out["offered_total"] = None
-    return out
-
-
-def _invoice_candidates(
-    connection: Connection, *, tenant_id: str, journey_id: UUID,
-    inputs: dict[str, Any], reading: dict[str, Any],
-) -> dict[str, Any]:
-    """The same ladder the Booking Form gets, run on the invoice's reading;
-    a printed SKU code that is exactly one master row decides on its own."""
-    if reading["sku_code"] is not None:
-        current = _current_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
-        if current.get("skipped"):
-            return current
-        by_code = [
-            r for r in current["rows"]
-            if str(r["sku_code"]).strip().casefold() == reading["sku_code"].casefold()
-        ]
-        if len(by_code) == 1 or reading["model_name"] is None:
-            return {
-                "matched": by_code, "matchStage": "INVOICE_SKU_CODE",
-                "priceListVersionId": current["plan"]["price_list_version_id"],
-                "priceList": _plan_label(current["plan"]),
-            }
-    return _current_match(connection, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs)
-
 
 # ── a model in another month's price list ──────────────────────────────────────
 _OTHER_LIST_VERSIONS = 12
@@ -1557,115 +1392,6 @@ def _other_price_list_hits(
     return hits
 
 
-# ── producer ──────────────────────────────────────────────────────────────────
-def sync_model_resolution_from_invoice(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
-) -> dict[str, Any]:
-    """The invoice fallback inside a savepoint (see sync_model_resolution)."""
-    savepoint = connection.begin_nested()
-    result = _sync_model_resolution_from_invoice_unguarded(
-        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
-    )
-    _close_savepoint(savepoint, result, tenant_id=tenant_id, journey_id=journey_id, source="INVOICE")
-    return result
-
-
-def _sync_model_resolution_from_invoice_unguarded(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
-) -> dict[str, Any]:
-    """Delivery-side entry: a Journey with no SKU yet goes through the full
-    resolution (Booking Form first, then the vehicle invoice); a Journey that
-    already has one is checked against the invoice, which wins (see
-    ``_invoice_cross_check``). Idempotent, never raises."""
-    try:
-        already_resolved = connection.execute(
-            text(
-                """
-                SELECT product_sku_id FROM auditcore.journey_products
-                WHERE tenant_id = :tenant_id AND journey_id = :journey_id
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one_or_none()
-        if already_resolved is None:
-            return _sync_model_resolution_unguarded(
-                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
-            )
-        return _invoice_cross_check(
-            connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
-            current_sku_id=already_resolved,
-        )
-    except Exception as exc:
-        logger.warning("sync_model_resolution_from_invoice failed", exc_info=True)
-        return {"error": True, "errorType": type(exc).__name__, "errorMessage": str(exc)[:300]}
-
-
-_INVOICE_OVERRIDE_METHOD = "MODEL_RESOLUTION_INVOICE_OVERRIDE_V1"
-
-
-def _invoice_cross_check(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, current_sku_id: UUID,
-) -> dict[str, Any]:
-    """The Journey has a SKU; the vehicle invoice is the source of truth
-    (decision 2026-10-20). When the invoice names a different vehicle -- one
-    SKU, by name, never a closest-match guess -- the Journey takes the
-    invoice's SKU, is re-priced on it, and a Team Lead is told the model
-    changed. When the invoice names a model and variant but not which
-    colour, the colour on the Journey settles it; otherwise the PC is asked
-    for the reason (INVOICE_SKU_MISMATCH), as before."""
-    reading = _invoice_reading(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if reading is None:
-        return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": False}
-    if reading.get("retail"):
-        _apply_invoice_colour(connection, tenant_id=tenant_id, journey_id=journey_id, colour=reading["colour_name"])
-    inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id, require_model=False)
-    outcome = _invoice_candidates(
-        connection, tenant_id=tenant_id, journey_id=journey_id,
-        inputs=_invoice_inputs(inputs, reading), reading=reading,
-    )
-    if outcome.get("skipped") or outcome.get("guess"):
-        return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": False}
-    matched = outcome["matched"]
-    if len(matched) > 1 and all(r["product_sku_id"] != current_sku_id for r in matched) and inputs["colour_name"]:
-        same_colour = _narrow(matched, variant=None, colour=inputs["colour_name"])
-        if len(same_colour) == 1:
-            matched = same_colour
-    implied = _invoice_implied_vehicle(matched, current_sku_id)
-    if implied is None:
-        return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": False}
-    invoice_sku_id, invoice_sku_code, invoice_label = implied
-    if invoice_sku_id != current_sku_id and invoice_label is None and reading.get("retail"):
-        before = _vehicle_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
-        reassign_confirmed_sku(
-            connection, tenant_id=tenant_id, journey_id=journey_id, product_sku_id=invoice_sku_id,
-            method=_INVOICE_OVERRIDE_METHOD,
-        )
-        after = _vehicle_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
-        # The disagreement is settled by the invoice: any open mismatch closes.
-        check_invoice_sku_mismatch(
-            connection, tenant_id=tenant_id, journey_id=journey_id, confirmed_sku_id=invoice_sku_id,
-            invoice_sku_id=invoice_sku_id, invoice_sku_code=invoice_sku_code, correlation_id=correlation_id,
-        )
-        _resolve_open_flag(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id)
-        _run_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id)
-        from audit_core.uc03_sku_tasks import raise_model_changed_observation
-
-        raise_model_changed_observation(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                        before=before, after=after)
-        return {"resolved": True, "changed": True, "source": "INVOICE", "skuCode": invoice_sku_code,
-                "matchStage": outcome["matchStage"]}
-    mismatch_flagged = invoice_sku_id != current_sku_id
-    check_invoice_sku_mismatch(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        confirmed_sku_id=current_sku_id,
-        invoice_sku_id=invoice_sku_id,
-        invoice_sku_code=invoice_sku_code,
-        correlation_id=correlation_id,
-        invoice_label=invoice_label,
-    )
-    return {"skipped": True, "reason": "already_resolved", "mismatchFlagged": mismatch_flagged, "crossChecked": True}
 
 
 def _apply_invoice_colour(connection: Connection, *, tenant_id: str, journey_id: UUID, colour: str | None) -> None:
@@ -1724,293 +1450,6 @@ def _vehicle_snapshot(connection: Connection, *, tenant_id: str, journey_id: UUI
     }
 
 
-def _current_match(
-    connection: Connection, *, tenant_id: str, journey_id: UUID, inputs: dict[str, Any]
-) -> dict[str, Any]:
-    """Compute today's candidate SKU rows for a journey's reviewed model text
-    against the tenant's current effective price list.
-
-    Returns ``{"skipped": True, "reason": ...}`` when there is nothing to
-    compute against (no effective price list, or an empty one), else
-    ``{"matched": [...], "matchStage": ...}``. Shared by ``sync_model_
-    resolution`` (which pins/raises from this) and the read-only candidates
-    endpoint (``get_model_resolution_candidates``, which never mutates
-    anything) -- one matching implementation, not two that could drift.
-    """
-    current = _current_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if current.get("skipped"):
-        return current
-    out = _ladder(connection, tenant_id=tenant_id, rows=current["rows"], inputs=inputs)
-    out["priceListVersionId"] = current["plan"]["price_list_version_id"]
-    out["priceList"] = _plan_label(current["plan"])
-    return out
-
-
-def _current_rows(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
-    """The Journey's effective price list (by its pricing date) and its SKU
-    rows, or ``{"skipped": True, "reason": ...}``."""
-    effective_on = date.fromisoformat(
-        connection.execute(
-            text(
-                """
-                SELECT COALESCE(b.pricing_effective_on, b.booking_date, CURRENT_DATE)
-                FROM auditcore.journeys j
-                LEFT JOIN auditcore.bookings b
-                  ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
-                WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one().isoformat()
-    )
-    try:
-        plan = _price_plan_for_journey(
-            connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
-        )
-    except AuditCoreError:  # no effective price list yet
-        return {"skipped": True, "reason": "no_effective_price_list"}
-
-    rows = _sku_rows_for_version(
-        connection, tenant_id=tenant_id, price_list_version_id=plan["price_list_version_id"]
-    )
-    if not rows:
-        return {"skipped": True, "reason": "empty_price_list"}
-    return {"plan": plan, "rows": rows}
-
-
-def _plan_label(plan: dict[str, Any]) -> str:
-    name = plan.get("price_list_name") or plan.get("price_list_code") or "Price list"
-    version = plan.get("version_no")
-    start = plan.get("effective_from")
-    return f"{name}" + (f" v{version}" if version is not None else "") + (f" (from {start})" if start else "")
-
-
-def _ladder(
-    connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any]
-) -> dict[str, Any]:
-    """The matching ladder over one price list's SKU rows."""
-    rows = _rows_for_registration(rows, inputs.get("registration_category"))
-    inputs = _normalise_inputs(connection, tenant_id=tenant_id, rows=rows, inputs=inputs)
-
-    # Attribute decomposition first, always attempted -- not only once a
-    # price-based match has already failed. A fuel/transmission/drive/
-    # seater token the Booking Form actually states is a literal fact
-    # about the specific vehicle; price is tried only afterward, as the
-    # deliberate last resort, because it can coincidentally collide
-    # between unrelated SKUs and can legitimately drift for reasons that
-    # have nothing to do with which vehicle was actually sold (accessories,
-    # discounts, rounding). Only trusted to decide on its own when it
-    # actually resolved real ambiguity with a genuine signal -- see
-    # ``_attribute_decomposition_fallback``'s own docstring for why a bare
-    # trim-code match doesn't qualify.
-    attr_matched, attr_stage, attr_trustworthy = _attribute_decomposition_fallback(
-        connection, tenant_id=tenant_id, rows=rows, inputs=inputs
-    )
-    if len(attr_matched) > 1:
-        # The decomposition never looks at colour, so one variant still
-        # leaves one row per colour; the colour on the form settles that.
-        attr_matched = _narrow(attr_matched, variant=inputs["variant_name"], colour=inputs["colour_name"])
-    if len(attr_matched) == 1 and attr_trustworthy:
-        return {"matched": attr_matched, "matchStage": attr_stage}
-
-    def settle(matched: list[dict[str, Any]], stage: str) -> dict[str, Any]:
-        return _settle(connection, tenant_id=tenant_id, rows=rows, inputs=inputs, matched=matched, stage=stage)
-
-    if attr_trustworthy:
-        # attr_matched genuinely narrowed a real ambiguity using a stated
-        # fuel/transmission/drive/seater fact (len > 1 here, since the ==1
-        # case already returned above) -- price arbitrates only *within*
-        # it, never a wider, independent search that could contradict a
-        # signal already confirmed as reliable.
-        price_matched, price_stage = _price_disambiguate(attr_matched, inputs)
-        if len(price_matched) == 1:
-            return {"matched": price_matched, "matchStage": price_stage}
-        if len(price_matched) < len(attr_matched):
-            return settle(price_matched, price_stage)
-        # Neither the exact prefix/suffix check nor price narrowed this --
-        # including the case where attr_matched is itself empty (a
-        # qualifying signal was stated, but nothing survived the exact
-        # trim comparison at all). A confident fuzzy trim match, or a
-        # fuzzy shortlist strictly smaller than what's known so far, is
-        # still worth trying before giving up -- an empty attr_matched
-        # means there's nothing to lose by trying.
-        fuzzy_result = _fuzzy_or_none(
-            connection, tenant_id=tenant_id, rows=rows, inputs=inputs,
-            best_len=len(attr_matched) or _NO_EXISTING_CANDIDATES,
-        )
-        if fuzzy_result is not None:
-            return settle(fuzzy_result["matched"], fuzzy_result["matchStage"])
-        return settle(attr_matched, attr_stage)
-
-    # No trustworthy attribute signal at all (no OEM vocabulary, no
-    # qualifying token, or too little starting ambiguity to mean anything)
-    # -- price is the deciding mechanism, exactly as before, including the
-    # generation-refresh price bridge (see _generation_sibling_rows) for a
-    # nameplate that never matched literally in the first place.
-    matched, stage = _match(rows, inputs)
-    if len(matched) == 1:
-        return {"matched": matched, "matchStage": stage}
-
-    # Both exact passes failed to converge -- a controlled fuzzy trim match
-    # within the already-identified model, tried before giving up to a
-    # human. Only actually used if it's a genuine improvement over
-    # whichever exact pass already did best here (see _fuzzy_or_none) --
-    # never relabels an already-exact-matched ambiguous set as "fuzzy"
-    # merely because fuzzy scoring reproduced the same rows at the same
-    # size.
-    best_len = min(
-        len(matched) or _NO_EXISTING_CANDIDATES,
-        len(attr_matched) or _NO_EXISTING_CANDIDATES,
-    )
-    fuzzy_result = _fuzzy_or_none(
-        connection, tenant_id=tenant_id, rows=rows, inputs=inputs, best_len=best_len,
-    )
-    if fuzzy_result is not None:
-        return settle(fuzzy_result["matched"], fuzzy_result["matchStage"])
-
-    # Neither pass reached exactly one on its own -- report whichever
-    # leaves the smaller, more defensible shortlist; the price may still
-    # settle it, and an empty one goes to the catalogue search (_settle).
-    if attr_matched and (not matched or len(attr_matched) < len(matched)):
-        matched, stage = attr_matched, attr_stage
-    return settle(matched, stage)
-
-
-def _price_pick(rows: list[dict[str, Any]], inputs: dict[str, Any]) -> tuple[list[dict[str, Any]], str] | None:
-    """Decision 2026-10-01: within a shortlist the ladder already scoped to
-    one model, the form's price settles it when exactly one row agrees. Each
-    stated price (ex-showroom, on-road total) is tried exactly, then within
-    the usual 0.5 % tolerance; a price that singles out no row, or several,
-    says nothing. The two prices must not disagree: when each names a
-    different row, nothing is pinned. A "total" no greater than the
-    ex-showroom is not an on-road total (a form that repeats the ex-showroom
-    in the total box, a real DEV case) and is ignored. Returns ``None`` when
-    the price does not settle it."""
-    basis = inputs["registration_basis"]
-    ex, total = inputs.get("offered_ex_showroom"), inputs.get("offered_total")
-    if total is not None and ex is not None and total <= ex:
-        total = None
-
-    def single(offered: Decimal | None, value: Any, exact_stage: str, approx_stage: str):
-        if offered is None:
-            return None
-        exact = _narrow([r for r in rows if value(r) == offered],
-                        variant=inputs.get("variant_name"), colour=inputs.get("colour_name"))
-        if len(exact) == 1:
-            return exact, exact_stage
-        if exact:
-            return None
-        approx = _closest_within_tolerance(rows, offered=offered, field_value=value)
-        return (approx, approx_stage) if len(approx) == 1 else None
-
-    by_ex = single(ex, lambda r: _to_decimal(r.get("master_ex_showroom")), "EX_SHOWROOM", "EX_SHOWROOM_APPROX")
-    by_total = single(total, lambda r: _master_total(r, basis), "TOTAL", "TOTAL_APPROX")
-    if by_ex and by_total and by_ex[0][0]["product_sku_id"] != by_total[0][0]["product_sku_id"]:
-        return None
-    return by_ex or by_total
-
-
-def _settle(
-    connection: Connection, *, tenant_id: str, rows: list[dict[str, Any]], inputs: dict[str, Any],
-    matched: list[dict[str, Any]], stage: str,
-) -> dict[str, Any]:
-    """The one way out of the ladder (decision 2026-10-01). A single
-    candidate stands as found. A wider shortlist is narrowed by the form's
-    price (``_price_pick``) and otherwise reported as it is, for the PC to
-    pick from. Nothing at all goes to the catalogue search: a reading the
-    attribute filter emptied ("XUV3XO" + "AX7L EV" against the petrol and
-    diesel XUV3XO rows, a real DEV case) still names the vehicle the price
-    list holds under a sibling nameplate."""
-    # Only a reading that names the vehicle pins it (2026-10-20). The
-    # closest-match search and a single fuzzy trim reading are guesses: the
-    # PC accepts or rejects them. A price that singles one row out of a fuzzy
-    # shortlist pins it only when nothing the document says contradicts that
-    # row ("MAXX PUP HD 2.0L VXi" was pinned as "MAXX HD 1.7 LX CBC" because
-    # the form's price was within 0.5% of it).
-    fuzzy = stage.startswith("FUZZY")
-    if len(matched) == 1:
-        return {"matched": matched, "matchStage": stage, "guess": fuzzy}
-    if matched:
-        by_words = _variant_words_pick(matched, inputs)
-        if by_words is not None:
-            logger.info(
-                "model_resolution_variant_words_settled tenant=%s shortlist=%d stage=%s sku=%s",
-                tenant_id, len(matched), stage, by_words["sku_code"],
-            )
-            return {"matched": [by_words], "matchStage": "VARIANT_WORDS", "guess": False}
-        picked = _price_pick(matched, inputs)
-        if picked is not None:
-            logger.info(
-                "model_resolution_price_settled_shortlist tenant=%s shortlist=%d stage=%s price_stage=%s sku=%s",
-                tenant_id, len(matched), stage, picked[1], picked[0][0]["sku_code"],
-            )
-            guess = _text_contradicts(picked[0][0], inputs, matched)
-            return {"matched": picked[0], "matchStage": picked[1], "guess": guess}
-        return {"matched": matched, "matchStage": stage, "guess": fuzzy or stage == _CATALOGUE_STAGE}
-    matched, stage = _catalogue_search(rows, inputs, oem_code=_oem_code_for_tenant(connection, tenant_id=tenant_id))
-    return {"matched": matched, "matchStage": stage, "guess": True}
-
-
-# Words a price-list variant name carries that a document never repeats:
-# the emission norm, the refresh tag, the registration it is priced for.
-_VARIANT_NOISE = frozenset({"BS6", "BS6.2", "BSVI", "BS-VI", "VI", "REFRESH", "E", "PRIVATE", "COMMERCIAL"})
-
-
-def _literal_words(value: str | None) -> set[str]:
-    """The words as printed, kept literal: "1.7" and "1.7L" are different
-    words here (in the Maxx HD price list they are different vehicles)."""
-    return {w for w in re.split(r"[^A-Z0-9.+]+", str(value or "").upper()) if w and w != "."}
-
-
-def _variant_words_pick(rows: list[dict[str, Any]], inputs: dict[str, Any]) -> dict[str, Any] | None:
-    """The one row of a shortlist every word of whose variant name the
-    document itself prints (2026-10-20: invoices reading "BOL MAXX PUP HD 1.7
-    LX" were left with 11 Maxx HD rows to pick from although only "MAXX HD
-    1.7 LX BS6.2" is named by every word). Model words and price-list noise
-    (BS6.2, Refresh, Private/Commercial) are set aside; the row naming the
-    most words wins, and only when no other row names as many: a tie (the
-    Private and Commercial lines of one variant) is left to the PC."""
-    said = _literal_words(f"{inputs.get('model_name') or ''} {inputs.get('variant_name') or ''}")
-    if not said:
-        return None
-    best: list[tuple[int, dict[str, Any]]] = []
-    for row in rows:
-        words = _literal_words(row.get("variant_name")) - _literal_words(row.get("model_name")) - _VARIANT_NOISE
-        if not words or not words <= said:
-            continue
-        best.append((len(words), row))
-    if not best:
-        return None
-    top = max(n for n, _ in best)
-    winners = [row for n, row in best if n == top]
-    return winners[0] if len(winners) == 1 else None
-
-
-_DISPLACEMENT = re.compile(r"(\d+\.\d+)\s*L?\b", re.IGNORECASE)
-
-
-def _tokens(value: str | None) -> set[str]:
-    text_value = str(value or "").upper()
-    found = set(_DISPLACEMENT.findall(text_value))
-    found |= set(re.findall(r"[A-Z][A-Z0-9]*|\d+(?!\.)", _DISPLACEMENT.sub(" ", text_value)))
-    return found
-
-
-def _text_contradicts(row: dict[str, Any], inputs: dict[str, Any], shortlist: list[dict[str, Any]]) -> bool:
-    """Something the document states (an engine size, a trim word) that the
-    shortlist uses to tell its rows apart, and that the row lacks."""
-    said_text = f"{inputs.get('model_name') or ''} {inputs.get('variant_name') or ''}"
-    row_text = f"{row['model_name']} {row['variant_name'] or ''}"
-    said = _tokens(said_text)
-    telling = set().union(*(_tokens(f"{r['model_name']} {r['variant_name'] or ''}") for r in shortlist))
-    has = _tokens(row_text)
-    if (said & telling) - has:
-        return True
-    # An engine size the document states and the row does not have ("2.0L"
-    # against "1.7 LX CBC"), even when no row of the shortlist has it.
-    said_size = set(_DISPLACEMENT.findall(said_text.upper()))
-    row_size = set(_DISPLACEMENT.findall(row_text.upper()))
-    return bool(said_size and row_size and not said_size & row_size)
 
 
 def _format_candidate_line(row: dict[str, Any], basis: str) -> str:
@@ -2089,12 +1528,941 @@ def _candidate_task_payload(
     }
 
 
+
+# ── the ladder over a Journey's documents ─────────────────────────────────────
+def _evaluate(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Read every document that names the vehicle and identify the SKU on
+    each one by its own words. No side effects."""
+    state = state or _pin_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+    bookings = _booking_readings(connection, tenant_id=tenant_id, journey_id=journey_id, state=state)
+    invoices = _vehicle_invoice_readings(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if not bookings and not invoices:
+        # No vehicle model read off the Booking Form, no vehicle invoice
+        # naming one.
+        return {"skipped": True, "reason": "no_vehicle_model_read"}
+    current = _current_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if current.get("skipped"):
+        return current
+    rows = current["rows"]
+    oem_code = _oem_code_for_tenant(connection, tenant_id=tenant_id)
+    aliases = _oem_model_aliases(connection, oem_code=oem_code) if oem_code else []
+    registration = _journey_registration(connection, tenant_id=tenant_id, journey_id=journey_id)
+    booking_results = [
+        (b, _identify(rows, b, aliases=aliases, registration=registration["category"])) for b in bookings
+    ]
+    invoice_results = [
+        (inv, _identify(rows, inv, aliases=aliases, registration=registration["category"])) for inv in invoices
+    ]
+    # Several booking forms are compared like the invoices (review 471 S6):
+    # the ones whose words name one SKU decide; naming different SKUs is a
+    # PC task, never "the newest wins".
+    named = [(b, r) for b, r in booking_results if r.identified]
+    booking_disagree = len({str(r.row["product_sku_id"]) for _, r in named}) > 1
+    booking, booking_result = (
+        named[0] if named and not booking_disagree
+        else booking_results[0] if booking_results else (None, None)
+    )
+    return {
+        "plan": current["plan"], "rows": rows, "on": current["on"], "oemCode": oem_code, "aliases": aliases,
+        "registration": registration, "state": state, "booking": booking, "bookingResult": booking_result,
+        "bookings": booking_results, "bookingDisagree": named if booking_disagree else None,
+        "invoices": invoice_results,
+    }
+
+
+def _shortlist(ev: dict[str, Any]) -> dict[str, Any] | None:
+    """The document to report and the PC's shortlist when no document's
+    words name one SKU: a vehicle invoice first (the source of truth), then
+    the booking form. The shortlist is ordered by shared words, then by the
+    nearest master price -- ordering only, nothing is picked from it; a
+    one-click suggestion is offered only when the first row shares more of
+    the document's words than the second (review 471 S8)."""
+    options = [*ev["invoices"]]
+    if ev["booking"] is not None:
+        options.append((ev["booking"], ev["bookingResult"]))
+    if not options:
+        return None
+    informative = [o for o in options if o[1].candidates or o[1].model_rows]
+    reading, result = (informative or options)[0]
+    stage = _STAGE_FOR_STATUS.get(result.status, result.status)
+    if result.status == "NO_MODEL":
+        matched, scores = _catalogue_search(ev["rows"], reading, oem_code=ev["oemCode"], with_scores=True)
+        stage = _CATALOGUE_STAGE if matched else "NONE"
+        # Only a clear best spelling is offered: a tie the price would break
+        # shows the shortlist instead (review 471 S8).
+        suggestion = matched[0] if matched and (len(scores) < 2 or scores[0] > scores[1]) else None
+    else:
+        pool = result.candidates if len(result.candidates) > 1 else result.model_rows
+        matched = order_shortlist(pool, model_text=reading.get("model"), variant_text=reading.get("variant"),
+                                  offered_ex_showroom=reading.get("exShowroom"))
+        suggestion = (
+            clear_suggestion(matched, model_text=reading.get("model"), variant_text=reading.get("variant"))
+            if result.status in {"NO_MATCH", "UNRECOGNISED_WORD"} else None
+        )
+    return {"reading": reading, "result": result, "matched": matched, "stage": stage,
+            "guess": suggestion is not None, "suggestion": suggestion, "source": reading["source"]}
+
+
+def _document_item(reading: dict[str, Any], res: WordResult) -> dict[str, Any]:
+    return {
+        "documentId": reading.get("documentId"), "documentType": reading.get("documentType"),
+        "invoiceNumber": reading.get("invoiceNumber"), "skuId": str(res.row["product_sku_id"]),
+        "skuCode": res.row["sku_code"],
+        "vehicle": f"{res.row['model_name']} {res.row.get('variant_name') or ''}".strip(),
+    }
+
+
+def _invoice_analysis(ev: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    """What the vehicle invoices say (rule R3), without writing anything:
+
+    * ``target`` -- one invoice's words name exactly one SKU and its R1
+      ex-showroom equals that SKU's master price: the invoice sets the SKU;
+    * ``disagree`` -- invoices naming different SKUs (none sets it);
+    * ``priceTasks`` -- the invoices naming the one SKU at a different, or
+      unread, price (each a PC task), and ``fallback`` the newest of them;
+    * ``review`` -- with a PC / TL SKU on the Journey: invoices naming a
+      different SKU at its master price (a Team Lead task). A human decision
+      raises no price or disagreement task for itself (review 471 B4)."""
+    named = [(inv, res) for inv, res in ev["invoices"] if res.identified]
+    by_sku: dict[str, list[tuple[dict[str, Any], WordResult]]] = {}
+    for inv, res in named:
+        by_sku.setdefault(str(res.row["product_sku_id"]), []).append((inv, res))
+    out: dict[str, Any] = {"named": named, "target": None, "disagree": None, "priceTasks": [], "fallback": None,
+                           "review": []}
+
+    def checks(items: list[tuple[dict[str, Any], WordResult]]) -> list[tuple[dict[str, Any], WordResult, str]]:
+        master = _to_decimal(items[0][1].row.get("master_ex_showroom"))
+        return [(inv, res, price_check(master, inv.get("exShowroom"))) for inv, res in items]
+
+    if is_human_decision(state):
+        for sku_id, items in by_sku.items():
+            if sku_id == str(state["product_sku_id"]):
+                continue
+            agreeing = [(inv, res) for inv, res, check in checks(items) if check == "MATCH"]
+            if agreeing:
+                out["review"].append(agreeing[0])
+        return out
+    if len(by_sku) > 1:
+        out["disagree"] = [_document_item(inv, res) for inv, res in named]
+        return out
+    if not by_sku:
+        return out
+    checked = checks(next(iter(by_sku.values())))
+    agreeing = [(inv, res) for inv, res, check in checked if check == "MATCH"]
+    if agreeing:
+        out["target"] = {"reading": agreeing[0][0], "result": agreeing[0][1]}
+        return out
+    out["priceTasks"] = checked
+    inv, res, check = checked[0]  # the newest invoice naming the SKU
+    out["fallback"] = {"reading": inv, "result": res, "check": check}
+    return out
+
+
+def _legacy(state: dict[str, Any]) -> bool:
+    """A pin made by the resolver before the 2026-10-20 rules (it may have
+    been chosen by price): only the ``reresolve`` run re-checks it."""
+    return (state.get("product_sku_id") is not None and not is_human_decision(state)
+            and state.get("match_basis") in (None, BASIS_AUTO_LEGACY))
+
+
+_SKIP_WHY = {
+    "no_vehicle_model_read": "no booking form or vehicle invoice on file names the vehicle",
+    "no_pricing_date": "the Journey has no pricing date (no booking date read or entered)",
+    "no_effective_price_list": "no price list is in force on the Journey's pricing date",
+}
+
+
+def _why_not_named(ev: dict[str, Any]) -> str:
+    """Why the documents do not name the pinned SKU, for the PC."""
+    parts = []
+    booking, res = ev.get("booking"), ev.get("bookingResult")
+    if ev.get("bookingDisagree"):
+        parts.append("the booking forms name different vehicles")
+    elif booking is not None and res is not None:
+        read = " / ".join(v for v in (booking.get("model"), booking.get("variant")) if v) or "-"
+        reason = _REASON_TEXT.get(res.status, "does not name one SKU").format(
+            n=len(res.candidates), model=res.detail.get("model") or booking.get("model"),
+            unrecognised=", ".join(f"'{w}'" for w in res.detail.get("unrecognised") or []) or "a word")
+        parts.append(f"the booking form reads '{read}': {reason}")
+    else:
+        parts.append("no booking form names the vehicle")
+    named = [(inv, r) for inv, r in ev.get("invoices") or [] if r.identified]
+    if named:
+        parts.append("the vehicle invoice names " + ", ".join(sorted({r.row["sku_code"] for _, r in named})))
+    return "; ".join(parts)
+
+
+def _decide(ev: dict[str, Any], state: dict[str, Any], *, recheck_legacy: bool) -> dict[str, Any]:
+    """The ladder's decision for one Journey, without writing anything (the
+    dry run shows exactly this). Actions:
+
+    INVOICE_SET -- a vehicle invoice's words and price name one SKU;
+    KEEP_HUMAN -- a PC / TL SKU stays (Team Lead review tasks may be due);
+    BOOKING_PIN -- the booking form's words name one SKU (price checked);
+    INVOICE_WORDS_PIN -- no SKU yet, an invoice's words name one at a
+      different price: pinned AUTO_PRICE_MISMATCH with its PC task;
+    KEEP -- the automatic SKU stays as it is (an invoice still names it, or
+      a pre-rule pin outside the reresolve run, or nothing to read);
+    UNCONFIRMED -- an automatic SKU the documents do not name: it is KEPT
+      (never cleared: review 471 B2), marked AUTO_UNCONFIRMED, and the PC
+      gets "SKU not clearly identified from the documents";
+    NOT_IDENTIFIED -- no SKU and none named: MODEL_NOT_IDENTIFIED;
+    SKIP -- nothing to resolve."""
+    has_sku = state.get("product_sku_id") is not None
+    human = is_human_decision(state)
+    legacy = _legacy(state)
+    if ev.get("skipped"):
+        if has_sku and not human and legacy and recheck_legacy:
+            return {"action": "UNCONFIRMED", "why": _SKIP_WHY.get(ev.get("reason"), str(ev.get("reason"))),
+                    "invoice": None, "skipped": ev.get("reason")}
+        return {"action": "KEEP" if has_sku else "SKIP", "invoice": None, "skipped": ev.get("reason"),
+                "keepReason": "nothing to read" if has_sku else None}
+    inv = _invoice_analysis(ev, state)
+    plan: dict[str, Any] = {"invoice": inv}
+    if human:
+        return {**plan, "action": "KEEP_HUMAN"}
+    if inv["target"] is not None:
+        return {**plan, "action": "INVOICE_SET", "target": inv["target"]}
+    res = ev["bookingResult"]
+    if res is not None and res.identified and not ev.get("bookingDisagree"):
+        master = _to_decimal(res.row.get("master_ex_showroom"))
+        check = price_check(master, ev["booking"].get("exShowroom"))
+        return {**plan, "action": "BOOKING_PIN", "check": check,
+                "basis": BASIS_AUTO_MATCHED if check == "MATCH" else BASIS_AUTO_PRICE_MISMATCH}
+    if has_sku:
+        fallback = inv.get("fallback")
+        if fallback is not None and str(fallback["result"].row["product_sku_id"]) == str(state["product_sku_id"]):
+            return {**plan, "action": "KEEP", "keepReason": "a vehicle invoice's words name it", "named": True}
+        if legacy and not recheck_legacy:
+            return {**plan, "action": "KEEP", "keepReason": "pinned before the 2026-10-20 rules (reresolve re-checks it)"}
+        return {**plan, "action": "UNCONFIRMED", "why": _why_not_named(ev)}
+    if inv.get("fallback"):
+        return {**plan, "action": "INVOICE_WORDS_PIN", "fallback": inv["fallback"]}
+    return {**plan, "action": "NOT_IDENTIFIED"}
+
+
+def _proposal(ev: dict[str, Any], state: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    """The decision in words, for the dry run and the run items: old SKU ->
+    proposed SKU, basis, the document's words and prices, the task due."""
+    action = plan["action"]
+    row: dict[str, Any] | None = None
+    reading: dict[str, Any] | None = None
+    basis = state.get("match_basis")
+    check = None
+    if action == "INVOICE_SET":
+        reading, row, basis, check = plan["target"]["reading"], plan["target"]["result"].row, BASIS_AUTO_INVOICE, "MATCH"
+    elif action == "BOOKING_PIN":
+        reading, row, basis, check = ev["booking"], ev["bookingResult"].row, plan["basis"], plan["check"]
+    elif action == "INVOICE_WORDS_PIN":
+        fb = plan["fallback"]
+        reading, row, basis, check = fb["reading"], fb["result"].row, BASIS_AUTO_PRICE_MISMATCH, fb["check"]
+    elif action == "UNCONFIRMED":
+        basis = BASIS_AUTO_UNCONFIRMED
+    tasks: list[str] = []
+    inv = plan.get("invoice") or {}
+    if inv.get("disagree"):
+        tasks.append("SKU_INVOICES_DISAGREE")
+    if action == "KEEP_HUMAN":
+        if _booking_forms_differing(ev, state):
+            tasks.append("SKU_BOOKING_FORM_DIFFERS")
+    elif ev.get("bookingDisagree"):
+        tasks.append("SKU_BOOKING_FORMS_DISAGREE")
+    if action == "SKIP":
+        tasks.append({"no_effective_price_list": "PRICE_MASTER_NOT_IN_FORCE",
+                      "no_pricing_date": "PC_BOOKING_DATE_MISSING or SKU_NOT_SET"}.get(
+                          str(plan.get("skipped")), "SKU_NOT_SET"))
+    tasks += ["SKU_PRICE_MISMATCH (invoice)"] * len(inv.get("priceTasks") or [])
+    if inv.get("review"):
+        tasks.append("SKU_INVOICE_REVIEW")
+    if action == "BOOKING_PIN" and basis == BASIS_AUTO_PRICE_MISMATCH:
+        tasks.append("SKU_PRICE_MISMATCH (booking)")
+    if action == "UNCONFIRMED" and not _other_pc_question(ev, plan):
+        tasks.append("SKU_NOT_CONFIRMED")
+    if action == "NOT_IDENTIFIED":
+        tasks.append("MODEL_NOT_IDENTIFIED")
+    master = _to_decimal((row or {}).get("master_ex_showroom"))
+    offered = (reading or {}).get("exShowroom")
+    new_sku = row["sku_code"] if row is not None else state.get("sku_code") if action in {
+        "KEEP", "KEEP_HUMAN", "UNCONFIRMED"} else None
+    invoices = ev.get("invoices") or []
+    proposal = {
+        "action": action,
+        "oldSku": state.get("sku_code"), "oldBasis": state.get("match_basis"),
+        "proposedSku": new_sku, "proposedBasis": basis if new_sku else None,
+        "changes": bool(row is not None and str(row["product_sku_id"]) != str(state.get("product_sku_id"))),
+        "document": (reading or {}).get("documentType"), "documentId": (reading or {}).get("documentId"),
+        "words": " / ".join(v for v in ((reading or {}).get("model"), (reading or {}).get("variant")) if v) or None,
+        "masterExShowroom": str(master) if master is not None else None,
+        "documentExShowroom": str(offered) if offered is not None else None,
+        "priceCheck": check, "why": plan.get("why") or plan.get("keepReason"), "skipped": plan.get("skipped"),
+        "tasks": tasks,
+        # What each kind of document says on its own, so the product owner can
+        # read the booking form against the price list and the invoice.
+        "booking": _document_summary(ev.get("booking"), ev.get("bookingResult")),
+        "invoice": _document_summary(*invoices[0]) if invoices else None,
+        "invoiceCount": len(invoices),
+        "selectionStatus": state.get("selection_status"),
+    }
+    proposal["group"] = proposal_group(proposal)
+    return proposal
+
+
+def _document_summary(reading: dict[str, Any] | None, result: Any) -> dict[str, Any] | None:
+    """One document's words, ex-showroom and the SKU its words name (if one)."""
+    if reading is None:
+        return None
+    row = getattr(result, "row", None) if result is not None and result.identified else None
+    master = _to_decimal((row or {}).get("master_ex_showroom"))
+    offered = reading.get("exShowroom")
+    return {
+        "documentType": reading.get("documentType"), "documentId": reading.get("documentId"),
+        "words": " / ".join(v for v in (reading.get("model"), reading.get("variant")) if v) or None,
+        "exShowroom": str(offered) if offered is not None else None,
+        "sku": row["sku_code"] if row is not None else None,
+        "masterExShowroom": str(master) if master is not None else None,
+    }
+
+
+def proposal_group(proposal: dict[str, Any]) -> str:
+    """Where a Journey sits in the product owner's review (exclusive, in this order):
+
+    LEFT_ALONE -- a SKU a PC or Team Lead set, a review that is complete, a
+                  cancelled booking, or nothing to read yet and nothing to ask;
+    CHANGE     -- the SKU will be set or replaced;
+    CONFIRM    -- the SKU stays (or there is none) and a PC task asks for a decision;
+    KEEP       -- the SKU stays and nothing is asked."""
+    action = proposal.get("action")
+    tasks = proposal.get("tasks") or []
+    if action in {"LEFT_ALONE", "KEEP_HUMAN"} or (action == "SKIP" and not tasks):
+        return "LEFT_ALONE"
+    if proposal.get("changes"):
+        return "CHANGE"
+    return "CONFIRM" if tasks else "KEEP"
+
+
+def _other_pc_question(ev: dict[str, Any], plan: dict[str, Any]) -> bool:
+    """Another PC task already asks which vehicle it is (the documents
+    disagree, or an invoice's price does not check): no second question."""
+    inv = plan.get("invoice") or {}
+    return bool(inv.get("disagree") or ev.get("bookingDisagree") or inv.get("priceTasks"))
+
+
+# ── writing the decision ──────────────────────────────────────────────────────
+def _document_tasks(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, ev: dict[str, Any], state: dict[str, Any],
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Raise the PC / TL tasks the documents call for and close the ones
+    they no longer call for."""
+    from audit_core.uc03_sku_tasks import (
+        raise_booking_form_differs_task,
+        raise_booking_forms_disagree_task,
+        raise_invoice_review_task,
+        raise_invoices_disagree_task,
+        raise_price_mismatch_task,
+        resolve_booking_form_differs_task,
+        resolve_booking_forms_disagree_task,
+        resolve_invoice_review_task,
+        resolve_invoices_disagree_task,
+        resolve_price_mismatch_tasks,
+    )
+
+    inv = plan.get("invoice") or {}
+    info: dict[str, Any] = {}
+    # The SKU the Journey will carry after this run: a price task naming
+    # another vehicle says so in its title (review 471 B3).
+    resulting = (
+        plan["target"]["result"].row["product_sku_id"] if plan["action"] == "INVOICE_SET"
+        else ev["bookingResult"].row["product_sku_id"] if plan["action"] == "BOOKING_PIN"
+        else state.get("product_sku_id")
+    )
+    if inv.get("disagree"):
+        key = raise_invoices_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                           invoices=inv["disagree"])
+        resolve_invoices_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id, keep={key})
+        info["invoicesDisagree"] = True
+    else:
+        resolve_invoices_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+    keep: set[str] = set()
+    for reading, res, check in inv.get("priceTasks") or []:
+        keep.add(raise_price_mismatch_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id, source="INVOICE", reading=reading, row=res.row,
+            master=_to_decimal(res.row.get("master_ex_showroom")), offered=reading.get("exShowroom"),
+            current_sku_id=resulting,
+        ))
+        info["invoicePriceDiffers"] = True
+    if not ev.get("skipped"):
+        resolve_price_mismatch_tasks(
+            connection, tenant_id=tenant_id, journey_id=journey_id, source="INVOICE", keep=keep,
+            reason=("A vehicle invoice's price agrees with the SKU" if inv.get("target")
+                    else "No vehicle invoice names this SKU at this price any more"),
+        )
+    if inv.get("review"):
+        review_keep = {
+            raise_invoice_review_task(
+                connection, tenant_id=tenant_id, journey_id=journey_id, current_sku_code=state["sku_code"],
+                current_basis=state.get("match_basis"), invoice_row=res.row, invoice=reading,
+                evidence=_evidence(reading, res, check="MATCH", plan=ev["plan"], on=ev["on"]),
+            )
+            for reading, res in inv["review"]
+        }
+        # A review of a SKU no invoice names any more closes (an invoice that
+        # was corrected must not leave the old SKU for the Team Lead to accept).
+        resolve_invoice_review_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id, keep=review_keep,
+            reason="No vehicle invoice names this SKU at its master price any more",
+        )
+        info["reviewRaised"] = True
+    elif not ev.get("skipped"):
+        resolve_invoice_review_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if is_human_decision(state):
+        # A PC / TL decision is never overwritten and never re-asked as a
+        # disagreement between forms (review of #471): a booking form naming
+        # another SKU is one PC task that says so and keeps the decision.
+        resolve_booking_forms_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+        differs = _booking_forms_differing(ev, state)
+        if differs:
+            key = raise_booking_form_differs_task(
+                connection, tenant_id=tenant_id, journey_id=journey_id, current_sku_code=state.get("sku_code"),
+                current_basis=state.get("match_basis"), forms=[_document_item(b, r) for b, r in differs],
+            )
+            resolve_booking_form_differs_task(connection, tenant_id=tenant_id, journey_id=journey_id, keep={key})
+            info["bookingFormDiffers"] = True
+        elif not ev.get("skipped"):
+            resolve_booking_form_differs_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+    elif ev.get("bookingDisagree"):
+        key = raise_booking_forms_disagree_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            forms=[_document_item(b, r) for b, r in ev["bookingDisagree"]],
+        )
+        resolve_booking_forms_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id, keep={key})
+        info["bookingFormsDisagree"] = True
+    elif not ev.get("skipped"):
+        resolve_booking_forms_disagree_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return info
+
+
+def _booking_forms_differing(ev: dict[str, Any], state: dict[str, Any]) -> list[tuple[dict[str, Any], WordResult]]:
+    """Booking forms whose words name one SKU other than the PC / TL one."""
+    return [(b, r) for b, r in ev.get("bookings") or []
+            if r.identified and b.get("documentId") and str(r.row["product_sku_id"]) != str(state["product_sku_id"])]
+
+
+_NOT_SET_WHY = {
+    "no_vehicle_model_read": "no booking form or vehicle invoice on file names the vehicle",
+    "no_pricing_date": "the Journey has no booking date to price it on -- enter the booking date",
+}
+
+
+# Pages still on their way into the Journey: a booking form or invoice among
+# them may name the vehicle yet (unclassified pages count as possibly one).
+_IN_FLIGHT_QUEUE = ("QUEUED", "PREPARING_PAGE", "DI_UPLOAD_PREPARING", "DI_UPLOADING", "DI_FINALIZING",
+                    "CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE", "RETRY_WAIT")
+
+
+def _no_sku_gate(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str:
+    """Whether a Journey with no SKU is due a "no SKU" task yet (review of
+    #471: never the moment a PAN or a receipt is read, never while the
+    booking form is still being read, never on a cancelled booking):
+
+    CANCELLED -- the booking was cancelled, is a duplicate, or closed with no
+      delivery: no SKU is due;
+    PENDING -- a booking form / vehicle invoice page (or a page not yet
+      classified) is still queued, being read or waiting to retry;
+    DUE -- a booking form or vehicle invoice has been read and still names no
+      vehicle, or the Journey is past the Booking stage without a SKU;
+    NOT_YET -- neither (only other documents so far)."""
+    row = connection.execute(
+        text(
+            """
+            SELECT
+              EXISTS (SELECT 1 FROM auditcore.journey_stage_states s
+                      WHERE s.tenant_id = :t AND s.journey_id = :j AND s.stage_code = 'BOOKING'
+                        AND (s.business_status IN ('BOOKING_CANCELLED', 'DUPLICATE_BOOKING')
+                             OR s.closure_disposition = 'NO_DELIVERY')) AS cancelled,
+              EXISTS (SELECT 1 FROM auditcore.p2_document_queue q
+                      WHERE q.tenant_id = :t AND q.journey_id = :j AND q.queue_status = ANY(:in_flight)
+                        AND (q.classified_document_type IS NULL
+                             OR q.classified_document_type = ANY(:types))) AS pending,
+              EXISTS (SELECT 1 FROM auditcore.journey_document_extracted_fields f
+                      LEFT JOIN auditcore.evidence e
+                        ON e.tenant_id = f.tenant_id AND e.di_document_id = f.di_document_id
+                      WHERE f.tenant_id = :t AND f.journey_id = :j AND f.source_document_type_key = ANY(:types)
+                        AND (e.evidence_id IS NULL OR e.association_status = 'ACTIVE')) AS read,
+              (EXISTS (SELECT 1 FROM auditcore.journey_stage_states s
+                       WHERE s.tenant_id = :t AND s.journey_id = :j
+                         AND ((s.stage_code = 'BOOKING' AND s.business_completed_at_utc IS NOT NULL)
+                              OR (s.stage_code <> 'BOOKING' AND s.first_started_at_utc IS NOT NULL)))
+               OR EXISTS (SELECT 1 FROM auditcore.journeys j
+                          WHERE j.tenant_id = :t AND j.journey_id = :j AND j.delivery_id IS NOT NULL)) AS past_booking
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "in_flight": list(_IN_FLIGHT_QUEUE),
+         "types": [*_BOOKING_DOCUMENT_TYPES, *_VEHICLE_INVOICE_TYPES]},
+    ).mappings().one()
+    if row["cancelled"]:
+        return "CANCELLED"
+    if row["pending"]:
+        return "PENDING"
+    return "DUE" if row["read"] or row["past_booking"] else "NOT_YET"
+
+
+def booking_cancelled(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """A cancelled or duplicate booking, or one closed with no delivery: the
+    reresolve run leaves it alone (review of #471)."""
+    return _no_sku_gate(connection, tenant_id=tenant_id, journey_id=journey_id) == "CANCELLED"
+
+
+def _no_sku_task(connection: Connection, *, tenant_id: str, journey_id: UUID, ev: dict[str, Any]) -> str | None:
+    """A Journey with no SKU that the ladder could not run on leaves a task
+    once one is due (2026-10-21 product owner rule; ``_no_sku_gate``). No
+    price list in force on the pricing date: the "no price master in force"
+    task says so. No booking date: the booking form's "enter the booking
+    date" task when there is a form, else SKU_NOT_SET. Nothing names the
+    vehicle: SKU_NOT_SET. A SKU_NOT_SET that is no longer due is closed.
+    Returns the task type left open, or None."""
+    from audit_core.uc03_p2_task_producer import resolve_if_open
+    from audit_core.uc03_sku_tasks import raise_not_set_task
+
+    gate = _no_sku_gate(connection, tenant_id=tenant_id, journey_id=journey_id)
+    reason = str(ev.get("reason") or "")
+    if gate != "DUE":
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
+                        dedupe_key=f"sku-not-set:{journey_id}",
+                        evidence={"reason": {"CANCELLED": "The booking is cancelled or a duplicate",
+                                             "PENDING": "A booking form or invoice is still being read",
+                                             "NOT_YET": "No booking form or vehicle invoice read yet"}[gate]})
+        return None
+    if reason == "no_effective_price_list":
+        from audit_core.uc03_sku_candidates import sync_price_master_in_force_task
+
+        sync_price_master_in_force_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+        return "PRICE_MASTER_NOT_IN_FORCE"
+    if reason == "no_pricing_date":
+        from audit_core.uc03_p2_task_producer import sync_booking_date_task
+
+        sync_booking_date_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+        open_task = connection.execute(
+            text("SELECT 1 FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+                 "AND task_type='PC_BOOKING_DATE_MISSING' AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED')"),
+            {"t": tenant_id, "j": journey_id},
+        ).first()
+        if open_task is not None:
+            return "PC_BOOKING_DATE_MISSING"
+    raise_not_set_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                       why=_NOT_SET_WHY.get(reason, reason.replace("_", " ") or "it could not be identified"),
+                       reason=reason or "unknown")
+    return "SKU_NOT_SET"
+
+
+def _note_change(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, state: dict[str, Any], new_sku: str | None,
+    basis: str, why: str, correlation_id: str,
+) -> None:
+    """The Journey's activity log: the SKU changed (or lost its footing) and
+    why -- what the Team Lead reads (review 471 S7)."""
+    from audit_core.uc03_p2_runtime import record_activity
+
+    record_activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="SKU_RESOLUTION_CHANGED",
+        subject_type="JOURNEY", subject_id=str(journey_id),
+        details={"from": state.get("sku_code"), "fromBasis": state.get("match_basis"), "to": new_sku,
+                 "toBasis": basis, "why": why},
+        correlation_id=correlation_id or None,
+    )
+    logger.info("model_resolution_automatic_pin_changed tenant=%s journey=%s from=%s to=%s basis=%s",
+                tenant_id, journey_id, state.get("sku_code"), new_sku, basis)
+
+
+def _invoice_colour_for_pin(connection: Connection, *, tenant_id: str, journey_id: UUID, ev: dict[str, Any]) -> None:
+    """Rule 2026-10-20: the retail invoice decides the colour. The price
+    list carries no colours, so the colour a DMS / Tally invoice prints for
+    the very SKU on the Journey replaces a different booked one."""
+    current = _pin_state(connection, tenant_id=tenant_id, journey_id=journey_id)["product_sku_id"]
+    if current is None:
+        return
+    for inv, res in ev.get("invoices") or []:
+        if inv.get("retail") and inv.get("colour") and res.identified \
+                and str(res.row["product_sku_id"]) == str(current):
+            _apply_invoice_colour(connection, tenant_id=tenant_id, journey_id=journey_id, colour=inv["colour"])
+            return
+
+
+def _keep_pin(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, raise_findings: bool,
+    state: dict[str, Any], info: dict[str, Any] | None = None, checked: bool = False,
+    ev: dict[str, Any] | None = None, named: bool = False, booking_not_naming: bool = False,
+) -> dict[str, Any]:
+    from audit_core.uc03_sku_tasks import (
+        resolve_not_confirmed_task,
+        resolve_price_mismatch_tasks,
+    )
+
+    if ev is not None and not ev.get("skipped"):
+        _invoice_colour_for_pin(connection, tenant_id=tenant_id, journey_id=journey_id, ev=ev)
+    if booking_not_naming:
+        # KEEP: the booking form no longer names this SKU (it fits several, or
+        # none), so its "master X vs booking Y" task has nothing left to ask.
+        resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING",
+                                     keep=set(), reason="The booking form no longer names this SKU")
+    if named:
+        resolve_not_confirmed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                   reason="A document names the SKU again")
+    resolved = _resolve_open_flag(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                  correlation_id=correlation_id)
+    _run_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id,
+                             correlation_id=correlation_id, raise_findings=raise_findings)
+    return {"resolved": True, "flagsResolved": resolved, "skuCode": state.get("sku_code"),
+            "basis": state.get("match_basis"), "crossChecked": checked,
+            "mismatchFlagged": bool((info or {}).get("invoicesDisagree") or (info or {}).get("invoicePriceDiffers")
+                                    or (info or {}).get("reviewRaised") or (info or {}).get("bookingFormsDisagree"))}
+
+
+def _apply_invoice(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, raise_findings: bool,
+    ev: dict[str, Any], target: dict[str, Any],
+) -> dict[str, Any]:
+    """The invoice sets the SKU: it replaces an automatic pin (the Team Lead
+    is told when the vehicle changed). A PC / TL SKU never gets here."""
+    from audit_core.uc03_sku_tasks import (
+        raise_model_changed_observation,
+        resolve_not_confirmed_task,
+        resolve_price_mismatch_tasks,
+    )
+
+    state = ev["state"]
+    inv, res = target["reading"], target["result"]
+    row = res.row
+    evidence = _evidence(inv, res, check="MATCH", plan=ev["plan"], on=ev["on"])
+    before = _vehicle_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
+    previous = state["product_sku_id"]
+    changed = previous is not None and str(previous) != str(row["product_sku_id"])
+    if str(previous) != str(row["product_sku_id"]) or state.get("match_basis") != BASIS_AUTO_INVOICE:
+        _pin_sku(connection, tenant_id=tenant_id, journey_id=journey_id, product_sku_id=row["product_sku_id"],
+                 method=_INVOICE_SELECTION_METHOD, basis=BASIS_AUTO_INVOICE, evidence=evidence)
+    else:
+        _update_match(connection, tenant_id=tenant_id, journey_id=journey_id, basis=BASIS_AUTO_INVOICE,
+                      evidence=evidence)
+    if inv.get("retail"):
+        _apply_invoice_colour(connection, tenant_id=tenant_id, journey_id=journey_id, colour=inv.get("colour"))
+    resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING",
+                                 keep=set(), reason="The vehicle invoice set the SKU (its words and price agree)")
+    resolve_not_confirmed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               reason="The vehicle invoice set the SKU (its words and price agree)")
+    _close_legacy_mismatch(connection, tenant_id=tenant_id, journey_id=journey_id, sku_id=row["product_sku_id"],
+                           correlation_id=correlation_id)
+    _resolve_open_flag(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id)
+    _run_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                             raise_findings=raise_findings)
+    if changed:
+        after = _vehicle_snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
+        raise_model_changed_observation(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                        before=before, after=after)
+        _note_change(connection, tenant_id=tenant_id, journey_id=journey_id, state=state, new_sku=row["sku_code"],
+                     basis=BASIS_AUTO_INVOICE, why="A vehicle invoice's words and price name it",
+                     correlation_id=correlation_id)
+    return {"resolved": True, "changed": changed, "source": "INVOICE", "skuCode": row["sku_code"],
+            "matchStage": "INVOICE_WORDS_AND_PRICE", "basis": BASIS_AUTO_INVOICE, "crossChecked": True,
+            "mismatchFlagged": False}
+
+
+def _apply_booking(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, raise_findings: bool,
+    ev: dict[str, Any], info: dict[str, Any], check: str, basis: str,
+) -> dict[str, Any]:
+    """The booking form's words name one SKU: pin it, and compare its master
+    ex-showroom with the form's (rule R3). A different or missing booking
+    price still pins it -- so the deal shows against the SKU the words name
+    -- but as AUTO_PRICE_MISMATCH, with a PC task to set the SKU."""
+    from audit_core.uc03_sku_tasks import (
+        raise_price_mismatch_task,
+        resolve_not_confirmed_task,
+        resolve_price_mismatch_tasks,
+    )
+
+    state, booking, res = ev["state"], ev["booking"], ev["bookingResult"]
+    row = res.row
+    master = _to_decimal(row.get("master_ex_showroom"))
+    evidence = _evidence(booking, res, check=check, plan=ev["plan"], on=ev["on"])
+    previous = state["product_sku_id"]
+    changed = previous is not None and str(previous) != str(row["product_sku_id"])
+    if str(previous) != str(row["product_sku_id"]) or state.get("match_basis") != basis:
+        _pin_sku(connection, tenant_id=tenant_id, journey_id=journey_id, product_sku_id=row["product_sku_id"],
+                 method=_SELECTION_METHOD, basis=basis, evidence=evidence)
+    else:
+        _update_match(connection, tenant_id=tenant_id, journey_id=journey_id, basis=basis, evidence=evidence)
+    if basis == BASIS_AUTO_PRICE_MISMATCH:
+        key = raise_price_mismatch_task(connection, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING",
+                                        reading=booking, row=row, master=master, offered=booking.get("exShowroom"))
+        resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING",
+                                     keep={key}, reason="Superseded")
+    else:
+        resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING",
+                                     keep=set(), reason="The booking price agrees with the SKU's master price")
+    resolve_not_confirmed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               reason="The booking form's words name the SKU")
+    if changed:
+        _note_change(connection, tenant_id=tenant_id, journey_id=journey_id, state=state, new_sku=row["sku_code"],
+                     basis=basis, why="The booking form's words name it", correlation_id=correlation_id)
+    _invoice_colour_for_pin(connection, tenant_id=tenant_id, journey_id=journey_id, ev=ev)
+    _resolve_open_flag(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id)
+    _run_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                             raise_findings=raise_findings)
+    return {"resolved": True, "changed": changed, "source": "BOOKING", "skuCode": row["sku_code"],
+            "matchStage": "WORDS", "basis": basis, "priceCheck": check, "crossChecked": bool(ev["invoices"]),
+            "mismatchFlagged": bool(info.get("invoicesDisagree") or info.get("invoicePriceDiffers"))}
+
+
+def _apply_invoice_words_only(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, raise_findings: bool,
+    ev: dict[str, Any], fallback: dict[str, Any], info: dict[str, Any],
+) -> dict[str, Any]:
+    """No SKU on the Journey and the booking form names none, but a vehicle
+    invoice's words name exactly one SKU whose price does not agree (or could
+    not be read). Like the booking form's case, the SKU the words name is put
+    on the Journey as AUTO_PRICE_MISMATCH -- so the deal shows against it --
+    and the PC task to set the SKU (raised with the invoice's tasks) stays
+    open. Price chose nothing."""
+    inv, res, check = fallback["reading"], fallback["result"], fallback["check"]
+    row = res.row
+    evidence = _evidence(inv, res, check=check, plan=ev["plan"], on=ev["on"])
+    _pin_sku(connection, tenant_id=tenant_id, journey_id=journey_id, product_sku_id=row["product_sku_id"],
+             method=_INVOICE_SELECTION_METHOD, basis=BASIS_AUTO_PRICE_MISMATCH, evidence=evidence)
+    _resolve_open_flag(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id)
+    _run_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                             raise_findings=raise_findings)
+    return {"resolved": True, "changed": False, "source": "INVOICE", "skuCode": row["sku_code"],
+            "matchStage": "INVOICE_WORDS", "basis": BASIS_AUTO_PRICE_MISMATCH, "priceCheck": check,
+            "crossChecked": True, "mismatchFlagged": True}
+
+
+def _apply_unconfirmed(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, raise_findings: bool,
+    ev: dict[str, Any], state: dict[str, Any], plan: dict[str, Any], info: dict[str, Any],
+) -> dict[str, Any]:
+    """The automatic SKU stays on the Journey (the deal keeps its prices) but
+    its documents do not name it: marked AUTO_UNCONFIRMED with why, and the
+    PC asked to confirm or set it -- unless another PC task already asks
+    which vehicle it is."""
+    from audit_core.uc03_sku_tasks import (
+        raise_not_confirmed_task,
+        resolve_price_mismatch_tasks,
+    )
+
+    why = plan["why"]
+    previous_evidence = state.get("match_evidence") if isinstance(state.get("match_evidence"), dict) else {}
+    if state.get("match_basis") != BASIS_AUTO_UNCONFIRMED or previous_evidence.get("why") != why:
+        _update_match(connection, tenant_id=tenant_id, journey_id=journey_id, basis=BASIS_AUTO_UNCONFIRMED,
+                      evidence={
+                          "source": "RECHECK", "why": why, "skuCode": state.get("sku_code"),
+                          "previousBasis": (previous_evidence.get("previousBasis")
+                                            if state.get("match_basis") == BASIS_AUTO_UNCONFIRMED
+                                            else state.get("match_basis")),
+                          "previousEvidence": (previous_evidence.get("previousEvidence")
+                                               if state.get("match_basis") == BASIS_AUTO_UNCONFIRMED
+                                               else previous_evidence),
+                          "decidedAtUtc": datetime.now(UTC).isoformat(),
+                      })
+        if state.get("match_basis") != BASIS_AUTO_UNCONFIRMED:
+            _note_change(connection, tenant_id=tenant_id, journey_id=journey_id, state=state,
+                         new_sku=state.get("sku_code"), basis=BASIS_AUTO_UNCONFIRMED,
+                         why=f"Kept, but not confirmed by the documents: {why}", correlation_id=correlation_id)
+    if not ev.get("skipped"):
+        resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING",
+                                     keep=set(), reason="The booking form no longer names this SKU")
+    if not _other_pc_question(ev, plan):
+        vehicle = " ".join(v for v in (state.get("model_name"), state.get("variant_name")) if v) or None
+        raise_not_confirmed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                 sku_id=state["product_sku_id"], sku_code=state.get("sku_code"), vehicle=vehicle,
+                                 why=why)
+    _run_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                             raise_findings=raise_findings)
+    return {"resolved": True, "changed": False, "unconfirmed": True, "skuCode": state.get("sku_code"),
+            "basis": BASIS_AUTO_UNCONFIRMED, "reason": plan.get("skipped"), "why": why,
+            "mismatchFlagged": bool(info)}
+
+
+_REASON_TEXT = {
+    "AMBIGUOUS": "its words fit {n} price-master SKUs",
+    "REGISTRATION_UNKNOWN": ("its words fit both the Private and the Commercial SKU and the registration "
+                             "type is not known"),
+    "CATEGORY_UNCERTAIN": ("it does not say whether the vehicle is electric or petrol / diesel / CNG, and the "
+                           "price list has this model as both"),
+    "CATEGORY_CONFLICT": "it says both electric and petrol / diesel / CNG",
+    "UNRECOGNISED_WORD": "it prints {unrecognised}, which no SKU of {model} carries",
+    "NO_MATCH": "no SKU of {model} has these words",
+    "NO_MODEL": "did not match any price-master SKU",
+    "NO_TEXT": "names no vehicle",
+}
+
+
+def _raise_not_identified(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, ev: dict[str, Any],
+    info: dict[str, Any],
+) -> dict[str, Any]:
+    """No document's words name exactly one SKU: MODEL_NOT_IDENTIFIED for the
+    PC with what each document read and the shortlist. Nothing is pinned."""
+    from audit_core.uc03_p2_task_producer import resolve_if_open
+    from audit_core.uc03_sku_tasks import (
+        raise_closest_match_task,
+        raise_other_month_task,
+        resolve_price_mismatch_tasks,
+    )
+
+    picked = _shortlist(ev)
+    if picked is None:
+        return {"skipped": True, "reason": "no_vehicle_model_read"}
+    resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING",
+                                 keep=set(), reason="No SKU is named by the booking form's words")
+    # MODEL_NOT_IDENTIFIED (with its shortlist) is the PC's question now.
+    resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=f"sku-not-set:{journey_id}",
+                    evidence={"reason": "The documents name the vehicle; MODEL_NOT_IDENTIFIED asks which SKU"})
+    reading, result, matched, stage = picked["reading"], picked["result"], picked["matched"], picked["stage"]
+    source = picked["source"]
+    use_invoice = source == "INVOICE"
+    document = "Vehicle invoice" if use_invoice else "Booking"
+    report = _report_inputs(reading, ev)
+    multiple = result.status in {"AMBIGUOUS", "REGISTRATION_UNKNOWN"} and len(matched) > 1
+    not_in_list = result.status == "NO_MODEL"
+    other_lists = (
+        _other_price_list_hits(connection, tenant_id=tenant_id, inputs=report,
+                               current_version_id=ev["plan"]["price_list_version_id"])
+        if not_in_list else []
+    )
+    title = (
+        "Vehicle model matched multiple price-master SKUs" if multiple
+        else "Vehicle category (electric or not) is not certain"
+        if result.status in {"CATEGORY_UNCERTAIN", "CATEGORY_CONFLICT"}
+        else "Vehicle model is in another month's price list, not this Journey's" if other_lists
+        else "Vehicle model could not be matched to the price masters"
+    )
+    reason = _REASON_TEXT.get(result.status, "did not name one SKU").format(
+        n=len(result.candidates), model=result.detail.get("model") or report["model_name"],
+        unrecognised=", ".join(f"'{w}'" for w in result.detail.get("unrecognised") or []) or "a word",
+    )
+    booking = ev["booking"]
+    price_list = _plan_label(ev["plan"])
+    description = (
+        f"{document} model '{report['model_name']}'"
+        + (f" / '{report['variant_name']}'" if report["variant_name"] else "")
+        + (f": {reason}" if result.status != "NO_MODEL" else f" {reason}")
+        + f" in {price_list}. "
+        + (
+            f"Booking model '{booking['model']}' did not settle it either. " if use_invoice and booking is not None
+            else "No model was read off the Booking Form. " if use_invoice
+            else ""
+        )
+        + (
+            "The model is in "
+            + "; ".join(f"{h['priceList']} as '{h['modelName']}' ({h['skuCount']} SKUs)" for h in other_lists)
+            + " -- check the Journey's pricing date or the model name in this month's price list. "
+            if other_lists else ""
+        )
+        + (f"The {len(matched)} closest SKUs are listed on the task. " if stage == _CATALOGUE_STAGE else "")
+        + "A price never picks the SKU: confirm the model so the deal can be checked against the price and "
+        "discount masters."
+    )
+    basis = ev["registration"]["basis"]
+    safe_payload = {
+        "source": source,
+        "documentId": reading.get("documentId"),
+        "modelName": report["model_name"],
+        "variantName": report["variant_name"],
+        "colourName": report["colour_name"],
+        "bookingModelName": booking["model"] if booking else None,
+        "invoiceModelName": next((inv["model"] for inv, _ in ev["invoices"]), None),
+        "invoiceSkuCode": next((inv["skuCode"] for inv, _ in ev["invoices"] if inv.get("skuCode")), None),
+        "priceList": price_list,
+        "otherPriceLists": other_lists,
+        "offeredExShowroom": str(reading["exShowroom"]) if reading.get("exShowroom") is not None else None,
+        "matchStage": stage,
+        "wordStatus": result.status,
+        "words": result.detail.get("words"),
+        "candidateCount": len(matched),
+        "candidates": [
+            {
+                "skuCode": r["sku_code"], "modelName": r["model_name"], "variantName": r["variant_name"],
+                "colourName": r["colour_name"],
+                "masterTotal": str(_master_total(r, basis)) if _master_total(r, basis) is not None else None,
+                "exShowroom": (str(_to_decimal(r.get("master_ex_showroom")))
+                               if _to_decimal(r.get("master_ex_showroom")) is not None else None),
+            }
+            for r in matched[:10]
+        ],
+    }
+    task_payload_extra = _candidate_task_payload(
+        report, matched, multiple=multiple, stage=stage, source=source, other_lists=other_lists,
+    )
+    finding_id = _machine_flag(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=_STAGE, rule_key=_RULE_KEY,
+        finding_type=_FINDING_TYPE, severity="MEDIUM", title=title, description=description,
+        correlation_id=correlation_id, safe_payload=safe_payload, task_payload_extra=task_payload_extra,
+    )
+    _refresh_open_flag(
+        connection, tenant_id=tenant_id, journey_id=journey_id, finding_id=finding_id, title=title,
+        description=description, safe_payload=safe_payload, task_payload_extra=task_payload_extra,
+        correlation_id=correlation_id,
+    )
+    # A closest-SKU suggestion that no longer stands (the words now fit several
+    # SKUs, or the model is in another month's list) is closed: it must not
+    # stay for the PC to accept and pin with no document behind it.
+    if other_lists or not picked["guess"]:
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
+                        dedupe_key=f"sku-closest:{journey_id}",
+                        evidence={"reason": "The documents no longer suggest a closest SKU"})
+    # Model in another month's list: a Team Lead approves pricing on it first.
+    # A closest guess goes to the PC to accept or reject -- never pinned.
+    if not other_lists:
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
+                        dedupe_key=f"sku-other-month:{journey_id}",
+                        evidence={"reason": "The Journey's own price list has the model"})
+        if picked["guess"]:
+            raise_closest_match_task(
+                connection, tenant_id=tenant_id, journey_id=journey_id, source=source,
+                read_model=report["model_name"], read_variant=report["variant_name"], suggestion=picked["suggestion"],
+                price_list=price_list,
+                reason=None if not_in_list else reason,
+            )
+    else:
+        raise_other_month_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id, source=source,
+            read_model=report["model_name"], price_list=price_list, hits=other_lists,
+        )
+    return {
+        "raised": True, "matchStage": stage, "wordStatus": result.status, "candidateCount": len(matched),
+        "source": source, "otherPriceLists": len(other_lists), "crossChecked": bool(ev["invoices"]),
+        "mismatchFlagged": bool(info.get("invoicesDisagree") or info.get("invoicePriceDiffers")),
+    }
+
+
+def _report_inputs(reading: dict[str, Any], ev: dict[str, Any]) -> dict[str, Any]:
+    """A document's reading in the shape the shortlist payload expects."""
+    return {
+        "model_name": reading.get("model"), "variant_name": reading.get("variant"),
+        "colour_name": reading.get("colour"), "registration_basis": ev["registration"]["basis"],
+        "offered_ex_showroom": reading.get("exShowroom"), "offered_total": None,
+    }
+
+
+def _close_legacy_mismatch(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, sku_id: Any, correlation_id: str,
+) -> None:
+    """An INVOICE_SKU_MISMATCH finding raised before 2026-10-20 closes once
+    the invoice and the Journey's SKU agree."""
+    check_invoice_sku_mismatch(
+        connection, tenant_id=tenant_id, journey_id=journey_id, confirmed_sku_id=sku_id, invoice_sku_id=sku_id,
+        invoice_sku_code="", correlation_id=correlation_id,
+    )
+
+
 def get_model_resolution_candidates(
     connection: Connection, *, tenant_id: str, journey_id: UUID
 ) -> dict[str, Any]:
     """Read-only: today's shortlist for an open MODEL_NOT_IDENTIFIED gap,
-    computed fresh against the tenant's current effective price list (never
-    a stale snapshot from whenever the finding/Task was originally raised)."""
+    computed fresh from the documents against the Journey's price list
+    (never a stale snapshot from whenever the finding was raised)."""
     finding_id = connection.execute(
         text(
             """
@@ -2115,33 +2483,24 @@ def get_model_resolution_candidates(
             title="No open model-resolution gap",
             detail="There is no open vehicle-model gap to resolve for this Journey.",
         )
-
-    inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id, require_model=False)
-    reading = _invoice_reading(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if inputs["model_name"] is None and reading is None:
+    ev = _evaluate(connection, tenant_id=tenant_id, journey_id=journey_id)
+    picked = None if ev.get("skipped") else _shortlist(ev)
+    if picked is None:
         raise NotFoundError(
             error_code="VAC-NF-010",
             title="No vehicle model read",
             detail="Neither the Booking Form nor a vehicle invoice names the model yet -- nothing to shortlist.",
         )
-
-    if inputs["model_name"] is not None:
-        outcome = _current_match(connection, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs)
-    if inputs["model_name"] is None or (reading is not None and not outcome.get("matched")):
-        inputs = _invoice_inputs(inputs, reading)
-        outcome = _invoice_candidates(
-            connection, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs, reading=reading,
-        )
-    matched = outcome.get("matched", [])
-    stage = outcome.get("matchStage", "NONE")
-    basis = inputs["registration_basis"]
+    reading, result = picked["reading"], picked["result"]
+    matched = list(result.candidates) if result.identified else picked["matched"]
+    basis = ev["registration"]["basis"]
     return {
         "journeyId": journey_id,
         "findingId": finding_id,
-        "reviewedModelName": inputs["model_name"],
-        "reviewedVariantName": inputs["variant_name"],
-        "reviewedColourName": inputs["colour_name"],
-        "matchStage": stage,
+        "reviewedModelName": reading.get("model"),
+        "reviewedVariantName": reading.get("variant"),
+        "reviewedColourName": reading.get("colour"),
+        "matchStage": "WORDS" if result.identified else picked["stage"],
         "candidates": [
             {
                 "productSkuId": r["product_sku_id"],
@@ -2160,31 +2519,18 @@ def get_model_resolution_candidates(
 def get_model_catalog(
     connection: Connection, *, tenant_id: str, journey_id: UUID, effective_on: date | None = None,
 ) -> dict[str, Any]:
-    """Every SKU in this Journey's currently effective price list, unconditionally.
-
-    Unlike ``get_model_resolution_candidates`` (which requires an OPEN
-    MODEL_NOT_IDENTIFIED finding and raises 404 without one), this exists
-    for the *other* case: a Journey whose SKU is already CONFIRMED, where a
-    PC wants to browse the full catalogue to propose a correction
-    (``uc03_model_selection_corrections.py``). No finding, no gate --
-    just the masters as they stand today.
-    """
-    # ``effective_on`` browses the masters as of another date (Phase 2's
-    # pricing-date choice); by default the Journey's own pricing date.
-    effective_on = effective_on or date.fromisoformat(
-        connection.execute(
-            text(
-                """
-                SELECT COALESCE(b.pricing_effective_on, b.booking_date, CURRENT_DATE)
-                FROM auditcore.journeys j
-                LEFT JOIN auditcore.bookings b
-                  ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
-                WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one().isoformat()
-    )
+    """Every SKU in the price list in force on a date, for the PC's model
+    picker: ``effective_on`` when given, else the Journey's pricing date
+    (never today)."""
+    effective_on = effective_on or journey_pricing_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if effective_on is None:
+        # Never today (rule R5): the PC enters the booking date first.
+        raise AuditCoreError(
+            error_code="VAC-SKU-006",
+            status_code=422,
+            title="No pricing date",
+            detail="The Journey has no booking date yet, so no price list applies. Enter the booking date first.",
+        )
     try:
         plan = _price_plan_for_journey(
             connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
@@ -2200,22 +2546,14 @@ def get_model_catalog(
     rows = _sku_rows_for_version(
         connection, tenant_id=tenant_id, price_list_version_id=plan["price_list_version_id"]
     )
-    inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id)
-    basis = inputs["registration_basis"] if inputs is not None else "INDIVIDUAL"
+    basis = _journey_registration(connection, tenant_id=tenant_id, journey_id=journey_id)["basis"]
     oem_code = _oem_code_for_tenant(connection, tenant_id=tenant_id)
 
     def _catalog_entry(r: dict[str, Any]) -> dict[str, Any]:
-        # Real Mahindra Consolidated Price List exports routinely leave
-        # fuel_powertrain/transmission/drive/seater blank per-row even
-        # though the master has dedicated columns for them -- the same
-        # signal already lives in the free-text Variant column instead.
-        # match_by_attributes/get_model_resolution_candidates already
-        # decompose it that way (_master_attributes, which itself prefers
-        # the raw column when present); reading these raw columns directly
-        # here left this catalogue's own dropdowns empty for every row the
-        # master itself left blank -- the exact "Modify Model" symptom
-        # reported live, repeatedly. No oem_code (tenant has no OEM
-        # mapping yet) falls back to the previous raw-column-only reads.
+        # Real Mahindra price lists often leave the fuel / transmission /
+        # drive / seater columns blank and carry them in the Variant text;
+        # the picker's dropdowns read them from there (_master_attributes).
+        # The trim stays the master's own Trim column, never the matching key.
         attrs = _master_attributes(r, oem_code=oem_code) if oem_code else None
         return {
             "productSkuId": r["product_sku_id"],
@@ -2227,39 +2565,44 @@ def get_model_catalog(
             "transmission": attrs.transmission if attrs else r.get("transmission"),
             "drive": attrs.drive if attrs else r.get("drive"),
             "seater": attrs.seater if attrs else r.get("seater"),
-            # Unlike fuel/transmission/drive/seater above, attrs.trim_key is
-            # a glued/normalized MATCHING key (_master_trim_key), built from
-            # whatever residue is left in variant_name after every
-            # recognized fuel/transmission/drive/seater token is stripped --
-            # e.g. "Classic S11 BS6.2 - E" residues to "CLASSICS11E", which
-            # includes the model name fragment and is never a real trim
-            # value. Confirmed live: using it as this dropdown's fallback
-            # showed exactly that string as a pickable "trim", actively
-            # misleading rather than merely blank. The master's own raw trim
-            # column is the ONLY trustworthy source for a human-facing trim
-            # value; when it's blank, this must stay blank too, not guess.
             "trim": r.get("trim"),
             "exShowroomPrice": _to_decimal(r.get("master_ex_showroom")),
             "totalPrice": _master_total(r, basis),
         }
 
-    confirmed = connection.execute(
-        text(
-            """
-            SELECT product_sku_id FROM auditcore.journey_products
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND selection_status='CONFIRMED' AND product_sku_id IS NOT NULL
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).scalar_one_or_none()
+    state = _pin_state(connection, tenant_id=tenant_id, journey_id=journey_id)
     return {
         "journeyId": journey_id,
-        # Set when the Journey already has a confirmed SKU: a change is then a
-        # Team Lead reviewed proposal; otherwise a pick pins the SKU directly.
-        "confirmedProductSkuId": confirmed,
+        # Set only when a PC or Team Lead confirmed the SKU: a change is then
+        # a Team Lead reviewed proposal. An automatic match (or none) is
+        # replaced by a direct pick (2026-10-20).
+        "confirmedProductSkuId": state["product_sku_id"] if is_human_decision(state) else None,
         "skus": [_catalog_entry(r) for r in rows],
     }
+
+
+def _published_sku_row(connection: Connection, *, tenant_id: str, product_sku_id: UUID) -> dict[str, Any] | None:
+    """The SKU when it is active in any published price list of the tenant
+    (a pick on a Journey that has no pricing date yet)."""
+    row = connection.execute(
+        text(
+            """
+            SELECT s.product_sku_id, s.sku_code, pm.model_name, pv.variant_name, c.colour_name
+            FROM auditcore.product_skus s
+            JOIN auditcore.product_models pm ON pm.model_id = s.model_id
+            JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
+            LEFT JOIN auditcore.colours c ON c.colour_id = s.colour_id
+            WHERE s.product_sku_id = :sku AND s.is_active
+              AND EXISTS (SELECT 1 FROM auditcore.price_list_items pli
+                          JOIN auditcore.price_list_versions plv
+                            ON plv.tenant_id = pli.tenant_id AND plv.price_list_version_id = pli.price_list_version_id
+                          WHERE pli.tenant_id = :t AND pli.product_sku_id = s.product_sku_id
+                            AND plv.lifecycle_status = 'PUBLISHED')
+            """
+        ),
+        {"t": tenant_id, "sku": product_sku_id},
+    ).mappings().one_or_none()
+    return dict(row) if row else None
 
 
 def confirm_model_resolution_sku(
@@ -2270,67 +2613,38 @@ def confirm_model_resolution_sku(
     product_sku_id: UUID,
     actor_id: str,
     correlation_id: str,
+    task_id: Any = None,
 ) -> dict[str, Any]:
-    """A PC's manual pick when MODEL_NOT_IDENTIFIED could not auto-resolve.
+    """A PC's pick of the SKU: on a Journey with no SKU, or one the resolver
+    matched automatically (2026-10-20: an automatic match is not a decision,
+    the PC replaces it directly). A SKU a PC or Team Lead already confirmed
+    changes only through a Team Lead reviewed proposal (409 here).
 
-    Validates the chosen SKU against the same tenant-scoped, currently-
-    effective price-list rows the shortlist itself is built from (never
-    trusts a client-supplied id blindly), pins it, resolves the open
-    finding, completes its linked Task, and runs deal reconciliation -- the
-    same closing sequence an automatic match runs.
-    """
-    # A pick from the catalogue defines the vehicle by itself: it no longer
-    # needs a model already read from the Booking Form (found live
-    # 2026-10-20: a journey whose model was never read could not be given a
-    # SKU at all -- every pick path answered 404 "No reviewed booking
-    # model"). _pin_sku writes the master's own model/variant/colour.
-    already = connection.execute(
-        text(
-            """
-            SELECT product_sku_id FROM auditcore.journey_products
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND selection_status='CONFIRMED'
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).scalar_one_or_none()
-    if already is not None and str(already) != str(product_sku_id):
+    The pick is validated against the price list in force on the Journey's
+    pricing date (never a client-supplied id blindly), pinned as
+    PC_CONFIRMED, closes the open finding and the SKU tasks, and re-prices
+    the deal."""
+    state = _pin_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if is_human_decision(state) and str(state["product_sku_id"]) != str(product_sku_id):
         raise AuditCoreError(
             error_code="VAC-SKU-005",
             status_code=409,
             title="SKU already confirmed",
             detail="This Journey already has a confirmed SKU. Propose a correction for the Team Lead instead.",
         )
-
-    effective_on = date.fromisoformat(
-        connection.execute(
-            text(
-                """
-                SELECT COALESCE(b.pricing_effective_on, b.booking_date, CURRENT_DATE)
-                FROM auditcore.journeys j
-                LEFT JOIN auditcore.bookings b
-                  ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
-                WHERE j.tenant_id = :tenant_id AND j.journey_id = :journey_id
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one().isoformat()
-    )
-    try:
-        plan = _price_plan_for_journey(
-            connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=effective_on
-        )
-    except AuditCoreError as exc:
-        raise AuditCoreError(
-            error_code="VAC-SKU-003",
-            status_code=422,
-            title="No effective price list",
-            detail="There is no effective price list for this Journey to confirm a SKU against.",
-        ) from exc
-
-    rows = _sku_rows_for_version(
-        connection, tenant_id=tenant_id, price_list_version_id=plan["price_list_version_id"]
-    )
-    row = next((r for r in rows if str(r["product_sku_id"]) == str(product_sku_id)), None)
+    on = journey_pricing_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if on is not None:
+        current = _current_rows(connection, tenant_id=tenant_id, journey_id=journey_id, on=on)
+        if current.get("skipped"):
+            raise AuditCoreError(
+                error_code="VAC-SKU-003",
+                status_code=422,
+                title="No effective price list",
+                detail="There is no effective price list for this Journey to confirm a SKU against.",
+            )
+        row = next((r for r in current["rows"] if str(r["product_sku_id"]) == str(product_sku_id)), None)
+    else:
+        row = _published_sku_row(connection, tenant_id=tenant_id, product_sku_id=product_sku_id)
     if row is None:
         raise AuditCoreError(
             error_code="VAC-SKU-002",
@@ -2339,16 +2653,20 @@ def confirm_model_resolution_sku(
             detail="The selected SKU is not in this Journey's current effective price list.",
         )
 
-    # Recorded as a person's pick, not the resolver's (2026-10-20: the two
-    # were indistinguishable when checking which SKUs the system chose).
-    _pin_sku(connection, tenant_id=tenant_id, journey_id=journey_id, product_sku_id=product_sku_id,
-             method=_PC_PICK_METHOD)
+    _pin_human(
+        connection, tenant_id=tenant_id, journey_id=journey_id, product_sku_id=product_sku_id,
+        method=_PC_PICK_METHOD, basis=BASIS_PC,
+        evidence={
+            "source": "PC", "actorId": actor_id, "skuCode": row["sku_code"],
+            "replaced": {"skuCode": state.get("sku_code"), "basis": state.get("match_basis")}
+            if state.get("product_sku_id") else None,
+            "pricingDate": on.isoformat() if on else None, "decidedAtUtc": datetime.now(UTC).isoformat(),
+            "taskId": str(task_id) if task_id else None,
+        },
+        task_id=task_id, actor_id=actor_id,
+    )
     resolved = _resolve_open_flag(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        correlation_id=correlation_id,
-        actor_id=actor_id,
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id, actor_id=actor_id,
     )
     _run_deal_reconciliation(
         connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
@@ -2362,6 +2680,21 @@ def confirm_model_resolution_sku(
         "variantName": row["variant_name"],
         "colourName": row["colour_name"],
     }
+
+
+def reassign_confirmed_sku(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, product_sku_id: UUID,
+    method: str = _CORRECTION_SELECTION_METHOD, basis: str = BASIS_TL, evidence: dict[str, Any] | None = None,
+) -> None:
+    """A Team Lead's decision replaces the Journey's SKU, whoever set it:
+    the model-selection correction the TL approved
+    (``uc03_model_selection_corrections``) or the invoice's SKU the TL
+    applied (``uc03_sku_tasks``). Saved as TL_APPROVED."""
+    _pin_human(connection, tenant_id=tenant_id, journey_id=journey_id, product_sku_id=product_sku_id,
+               method=method, basis=basis, evidence=evidence or {"source": "TL",
+                                                                 "decidedAtUtc": datetime.now(UTC).isoformat()})
+
+
 
 
 router = APIRouter(
@@ -2507,6 +2840,7 @@ def confirm_model_resolution_sku_endpoint(
     )
 
 
+
 def sync_model_resolution(
     connection: Connection,
     *,
@@ -2524,12 +2858,67 @@ def sync_model_resolution(
     attempt vanished without a trace. The savepoint undoes only this attempt;
     the caller's transaction stays usable, the failure is escalated, and one
     structured line says what happened."""
+    return _guarded(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                    raise_findings=raise_findings, source="BOOKING")
+
+
+def sync_model_resolution_from_invoice(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
+) -> dict[str, Any]:
+    """The Delivery-side entry (a vehicle invoice was read or corrected): the
+    same ladder over every document, inside a savepoint."""
+    return _guarded(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                    raise_findings=True, source="INVOICE")
+
+
+def recheck_model_resolution(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, commit: bool,
+) -> dict[str, Any]:
+    """The ``reresolve`` run for one Journey (review 471 B2). Nothing is
+    cleared first: the ladder decides from the documents, and
+
+    * a SKU a PC or Team Lead set is never touched;
+    * an automatic SKU (the pre-rule AUTO_LEGACY ones included) is replaced
+      only when the documents now name a different SKU; the same SKU gets
+      its new basis and evidence;
+    * when the documents do not name it (or cannot be read: no pricing date,
+      no price list in force, no document), the SKU is KEPT, marked
+      AUTO_UNCONFIRMED and the PC asked to confirm or set it.
+
+    ``commit=False`` (the dry run) writes nothing: the result carries the
+    ``proposal`` (old SKU -> proposed SKU, basis, words, prices, the tasks
+    that would be raised). With ``commit`` the decision is written inside a
+    savepoint around the whole Journey: an error leaves it untouched."""
+    try:
+        state = _pin_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+        ev = _evaluate(connection, tenant_id=tenant_id, journey_id=journey_id, state=state)
+        proposal = _proposal(ev, state, _decide(ev, state, recheck_legacy=True))
+    except Exception as exc:
+        logger.warning("recheck_model_resolution failed", exc_info=True)
+        return {"error": True, "errorType": type(exc).__name__, "errorMessage": str(exc)[:300]}
+    if proposal["action"] == "SKIP":
+        gate = _no_sku_gate(connection, tenant_id=tenant_id, journey_id=journey_id)
+        proposal["noSkuGate"] = gate
+        if gate != "DUE":
+            proposal["tasks"] = []
+        proposal["group"] = proposal_group(proposal)
+    if not commit:
+        return {"dryRun": True, "proposal": proposal}
+    result = _guarded(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                      raise_findings=True, source="RERESOLVE", recheck_legacy=True)
+    return {**result, "proposal": proposal}
+
+
+def _guarded(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str, raise_findings: bool,
+    source: str, recheck_legacy: bool = False,
+) -> dict[str, Any]:
     savepoint = connection.begin_nested()
     result = _sync_model_resolution_unguarded(
-        connection, tenant_id=tenant_id, journey_id=journey_id,
-        correlation_id=correlation_id, raise_findings=raise_findings,
+        connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+        raise_findings=raise_findings, recheck_legacy=recheck_legacy,
     )
-    _close_savepoint(savepoint, result, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING")
+    _close_savepoint(savepoint, result, tenant_id=tenant_id, journey_id=journey_id, source=source)
     return result
 
 
@@ -2545,6 +2934,7 @@ def _close_savepoint(savepoint: Any, result: dict[str, Any], *, tenant_id: str, 
         source=source,
         outcome=(
             "ERROR" if result.get("error")
+            else "UNCONFIRMED" if result.get("unconfirmed")
             else "RESOLVED" if result.get("resolved") or result.get("pinned")
             else "NOT_MATCHED" if result.get("raised")
             else "SKIPPED" if result.get("skipped")
@@ -2552,6 +2942,11 @@ def _close_savepoint(savepoint: Any, result: dict[str, Any], *, tenant_id: str, 
         ),
         reason=result.get("reason"),
         match_stage=result.get("matchStage"),
+        word_status=result.get("wordStatus"),
+        basis=result.get("basis"),
+        sku_code=result.get("skuCode"),
+        price_check=result.get("priceCheck"),
+        decided_by=result.get("source"),
         candidate_count=result.get("candidateCount"),
         error_type=result.get("errorType"),
         error=result.get("errorMessage"),
@@ -2565,250 +2960,88 @@ def _sync_model_resolution_unguarded(
     journey_id: UUID,
     correlation_id: str,
     raise_findings: bool = True,
+    recheck_legacy: bool = False,
 ) -> dict[str, Any]:
-    """Resolve the SKU or raise MODEL_NOT_IDENTIFIED. Idempotent; never raises.
+    """The ladder (see the module docstring and ``_decide``). Idempotent;
+    never raises.
 
-    The Booking Form's model is tried first. When it names no single SKU --
-    or no model was read off it at all -- the vehicle invoice, once
-    uploaded, names the vehicle instead (rule 2026-10-20: "if you are not
-    able to find model variant from Booking ... find it from Invoice"). It
-    used to run only from Delivery-side events, and only on the invoice's
-    model box, so a Journey whose Booking Form had no readable model never
-    tried its invoice from the Booking checks or the nightly retry.
+    1. A SKU a PC or Team Lead set stays (an invoice naming another SKU at
+       its master price is put to the Team Lead).
+    2. A vehicle invoice whose words name one SKU at its master price sets
+       it, replacing an automatic pin.
+    3. The booking form's words name one SKU: pinned, AUTO_MATCHED or
+       AUTO_PRICE_MISMATCH (+ PC task) by the price check.
+    4. An automatic pin the documents do not name is kept, marked
+       AUTO_UNCONFIRMED, with a PC task -- except a pre-rule AUTO_LEGACY pin,
+       which only the reresolve run (``recheck_legacy``) re-checks.
+    5. No SKU: an invoice's words naming one SKU at another price pin it as
+       AUTO_PRICE_MISMATCH (PC task); otherwise MODEL_NOT_IDENTIFIED.
 
-    When neither names one SKU the finding says what each document read and,
-    when the Journey's own price list does not hold the model, which other
-    month's published price list does.
-
-    ``raise_findings=False`` is for the read-only self-heal on every Journey
-    Overview page view: still pins/resolves the SKU itself (cheap, and
-    genuinely needed so the Deal panel reflects it), but skips the deal
-    reconciliation's evidence/total-variance checks, which real
-    document-sync events already keep current -- see
-    uc03_deal_reconciliation.sync_deal_reconciliation's own docstring for
-    why running those on every page view was a measured regression.
-    """
+    ``raise_findings=False`` (a read-only self-heal) leaves a Journey that
+    has a SKU as it is and skips the deal's evidence / variance checks."""
     try:
-        inputs = _resolution_inputs(connection, tenant_id=tenant_id, journey_id=journey_id, require_model=False)
-
-        if inputs["product_sku_id"] is not None:
+        state = _pin_state(connection, tenant_id=tenant_id, journey_id=journey_id)
+        has_sku = state["product_sku_id"] is not None
+        if has_sku and not raise_findings:
+            return {"resolved": True, "flagsResolved": 0, "skuCode": state["sku_code"],
+                    "basis": state["match_basis"]}
+        ev = _evaluate(connection, tenant_id=tenant_id, journey_id=journey_id, state=state)
+        plan = _decide(ev, state, recheck_legacy=recheck_legacy)
+        common = {"tenant_id": tenant_id, "journey_id": journey_id, "correlation_id": correlation_id,
+                  "raise_findings": raise_findings}
+        action = plan["action"]
+        if action == "SKIP":
             if raise_findings:
-                # The invoice is the source of truth: a SKU already on the
-                # Journey gives way to the one the invoice names.
-                checked = _invoice_cross_check(
-                    connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
-                    current_sku_id=inputs["product_sku_id"],
-                )
-                if checked.get("changed"):
-                    return checked
-            resolved = _resolve_open_flag(
-                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
-            )
-            _run_deal_reconciliation(
-                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
-                raise_findings=raise_findings,
-            )
-            return {"resolved": True, "flagsResolved": resolved}
+                if ev.get("reason") == "no_vehicle_model_read":
+                    # No document names a model any more: a closest-SKU
+                    # suggestion made from the old text must not stay to be
+                    # accepted and pinned with no document behind it.
+                    from audit_core.uc03_p2_task_producer import resolve_if_open
 
-        def pin(row: dict[str, Any], stage: str, source: str, method: str) -> dict[str, Any]:
-            _pin_sku(
-                connection, tenant_id=tenant_id, journey_id=journey_id,
-                product_sku_id=row["product_sku_id"], method=method,
-            )
-            _resolve_open_flag(
-                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
-            )
-            _run_deal_reconciliation(
-                connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
-                raise_findings=raise_findings,
-            )
-            return {"resolved": True, "skuCode": row["sku_code"], "matchStage": stage, "source": source}
-
-        booking: dict[str, Any] | None = None
-        if inputs["model_name"] is not None:
-            booking = _current_match(connection, tenant_id=tenant_id, journey_id=journey_id, inputs=inputs)
-            if booking.get("skipped"):
-                return booking
-            # A closest-match guess (the catalogue search) is never pinned on
-            # its own: the PC accepts or rejects it (decision 2026-10-20).
-            if len(booking["matched"]) == 1 and not booking.get("guess"):
-                return pin(booking["matched"][0], booking["matchStage"], "BOOKING", _SELECTION_METHOD)
-
-        reading = _invoice_reading(connection, tenant_id=tenant_id, journey_id=journey_id)
-        invoice: dict[str, Any] | None = None
-        invoice_inputs: dict[str, Any] | None = None
-        if reading is not None:
-            invoice_inputs = _invoice_inputs(inputs, reading)
-            invoice = _invoice_candidates(
-                connection, tenant_id=tenant_id, journey_id=journey_id, inputs=invoice_inputs, reading=reading,
-            )
-            if invoice.get("skipped"):
-                if booking is None:
-                    return invoice
-                invoice = None
-            elif len(invoice["matched"]) == 1 and not invoice.get("guess"):
-                return pin(invoice["matched"][0], invoice["matchStage"], "INVOICE", _INVOICE_SELECTION_METHOD)
-
-        if booking is None and invoice is None:
-            # No vehicle model read off the Booking Form, no vehicle invoice
-            # naming one.
-            return {"skipped": True, "reason": "no_vehicle_model_read"}
-
-        # The invoice's shortlist when it has one (it is the source of
-        # truth), else the booking's -- a name match over a closest guess.
-        def named(o: dict[str, Any] | None) -> bool:
-            return o is not None and bool(o["matched"]) and not o.get("guess")
-
-        use_invoice = invoice is not None and (
-            booking is None or named(invoice) or (not named(booking) and (bool(invoice["matched"]) or not booking["matched"]))
-        )
-        source = "INVOICE" if use_invoice else "BOOKING"
-        outcome = invoice if use_invoice else booking
-        report = invoice_inputs if use_invoice else inputs
-        matched, stage = outcome["matched"], outcome["matchStage"]
-        document = "Vehicle invoice" if use_invoice else "Booking"
-
-        multiple = len(matched) > 1 and stage != _CATALOGUE_STAGE
-        not_in_list = not matched or stage == _CATALOGUE_STAGE
-        other_lists = (
-            _other_price_list_hits(
-                connection, tenant_id=tenant_id, inputs=report,
-                current_version_id=outcome.get("priceListVersionId"),
-            )
-            if not_in_list else []
-        )
-        title = (
-            "Vehicle model matched multiple price-master SKUs"
-            if multiple
-            else "Vehicle model is in another month's price list, not this Journey's"
-            if other_lists
-            else "Vehicle model could not be matched to the price masters"
-        )
-        description = (
-            f"{document} model '{report['model_name']}'"
-            + (f" / '{report['variant_name']}'" if report["variant_name"] else "")
-            + (
-                f" matched {len(matched)} price-master SKUs"
-                if multiple
-                else " did not match any price-master SKU"
-            )
-            + (f" in {outcome['priceList']}" if outcome.get("priceList") else "")
-            + " on model, on-road total or ex-showroom price. "
-            + (
-                f"Booking model '{inputs['model_name']}' did not settle it either. "
-                if use_invoice and booking is not None
-                else "No model was read off the Booking Form. " if use_invoice
-                else ""
-            )
-            + (
-                "The model is in "
-                + "; ".join(f"{h['priceList']} as '{h['modelName']}' ({h['skuCount']} SKUs)" for h in other_lists)
-                + " -- check the Journey's pricing date or the model name in this month's price list. "
-                if other_lists
-                else ""
-            )
-            + (
-                f"The {len(matched)} closest SKUs are listed on the task. "
-                if stage == _CATALOGUE_STAGE
-                else ""
-            )
-            + "Confirm the model so the deal can be checked against the price and discount masters."
-        )
-        safe_payload = {
-            "source": source,
-            "modelName": report["model_name"],
-            "variantName": report["variant_name"],
-            "colourName": report["colour_name"],
-            "bookingModelName": inputs["model_name"],
-            "invoiceModelName": reading["model_name"] if reading else None,
-            "invoiceSkuCode": reading["sku_code"] if reading else None,
-            "priceList": outcome.get("priceList"),
-            "otherPriceLists": other_lists,
-            "offeredTotal": str(report["offered_total"]) if report["offered_total"] is not None else None,
-            "offeredExShowroom": (
-                str(report["offered_ex_showroom"]) if report["offered_ex_showroom"] is not None else None
-            ),
-            "matchStage": stage,
-            "candidateCount": len(matched),
-            "candidates": [
-                {
-                    "skuCode": r["sku_code"],
-                    "modelName": r["model_name"],
-                    "variantName": r["variant_name"],
-                    "colourName": r["colour_name"],
-                    "masterTotal": (
-                        str(_master_total(r, report["registration_basis"]))
-                        if _master_total(r, report["registration_basis"]) is not None
-                        else None
-                    ),
-                    "exShowroom": (
-                        str(_to_decimal(r.get("master_ex_showroom")))
-                        if _to_decimal(r.get("master_ex_showroom")) is not None
-                        else None
-                    ),
-                }
-                for r in matched[:10]
-            ],
-        }
-        task_payload_extra = _candidate_task_payload(
-            report, matched, multiple=multiple, stage=stage, source=source, other_lists=other_lists,
-        )
-        finding_id = _machine_flag(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            stage_code=_STAGE,
-            rule_key=_RULE_KEY,
-            finding_type=_FINDING_TYPE,
-            severity="MEDIUM",
-            title=title,
-            description=description,
-            correlation_id=correlation_id,
-            safe_payload=safe_payload,
-            task_payload_extra=task_payload_extra,
-        )
-        _refresh_open_flag(
-            connection, tenant_id=tenant_id, journey_id=journey_id, finding_id=finding_id,
-            title=title, description=description, safe_payload=safe_payload,
-            task_payload_extra=task_payload_extra, correlation_id=correlation_id,
-        )
-        # Model in another month's list: a Team Lead approves pricing on it
-        # first, nothing is suggested or resolved until then. Otherwise a
-        # closest-match guess goes to the PC to accept or reject.
-        from audit_core.uc03_sku_tasks import (
-            raise_closest_match_task,
-            raise_other_month_task,
-        )
-
-        if not other_lists:
-            from audit_core.uc03_p2_task_producer import resolve_if_open
-
-            resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
-                            dedupe_key=f"sku-other-month:{journey_id}",
-                            evidence={"reason": "The Journey's own price list has the model"})
-        if other_lists:
-            raise_other_month_task(
-                connection, tenant_id=tenant_id, journey_id=journey_id, source=source,
-                read_model=report["model_name"], price_list=outcome.get("priceList"), hits=other_lists,
-            )
-        elif outcome.get("guess") and matched:
-            raise_closest_match_task(
-                connection, tenant_id=tenant_id, journey_id=journey_id, source=source,
-                read_model=report["model_name"], read_variant=report["variant_name"], suggestion=matched[0],
-                price_list=outcome.get("priceList"),
-            )
-        return {
-            "raised": True, "matchStage": stage, "candidateCount": len(matched), "source": source,
-            "otherPriceLists": len(other_lists),
-        }
+                    resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                    dedupe_key=f"sku-closest:{journey_id}",
+                                    evidence={"reason": "The documents no longer suggest a closest SKU"})
+                return {**ev, "taskOpen": _no_sku_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                                       ev=ev)}
+            return ev
+        if action == "UNCONFIRMED" and ev.get("skipped"):
+            return _apply_unconfirmed(connection, ev=ev, state=state, plan=plan, info={}, **common)
+        if action == "KEEP" and ev.get("skipped"):
+            return _keep_pin(connection, state=state, **common)
+        info = _document_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, ev=ev, state=state,
+                               plan=plan)
+        if action == "INVOICE_SET":
+            return _apply_invoice(connection, ev=ev, target=plan["target"], **common)
+        if action == "KEEP_HUMAN":
+            return _keep_pin(connection, state=state, info=info, checked=bool(ev["invoices"]), ev=ev, **common)
+        if action == "BOOKING_PIN":
+            return _apply_booking(connection, ev=ev, info=info, check=plan["check"], basis=plan["basis"], **common)
+        if action == "KEEP":
+            return _keep_pin(connection, state=state, info=info, checked=bool(ev["invoices"]), ev=ev,
+                             named=bool(plan.get("named")), booking_not_naming=True, **common)
+        if action == "UNCONFIRMED":
+            return _apply_unconfirmed(connection, ev=ev, state=state, plan=plan, info=info, **common)
+        if action == "INVOICE_WORDS_PIN":
+            return _apply_invoice_words_only(connection, ev=ev, fallback=plan["fallback"], info=info, **common)
+        return _raise_not_identified(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                     correlation_id=correlation_id, ev=ev, info=info)
     except Exception as exc:
         logger.warning("sync_model_resolution failed", exc_info=True)
         return {"error": True, "errorType": type(exc).__name__, "errorMessage": str(exc)[:300]}
 
 
 __all__ = [
+    "AUTOMATIC_BASES",
+    "BASIS_LABELS",
+    "HUMAN_BASES",
+    "booking_cancelled",
     "check_invoice_sku_mismatch",
+    "invoice_ex_showroom",
+    "is_human_decision",
+    "journey_pricing_date",
+    "proposal_group",
     "reassign_confirmed_sku",
+    "recheck_model_resolution",
     "sync_model_resolution",
     "sync_model_resolution_from_invoice",
 ]

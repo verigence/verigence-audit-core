@@ -26,8 +26,8 @@ still exact, on a decomposed signal instead of the whole string:
      zero-candidate behaviour for it).
   3. Filter that model's variants to the ones whose own structured attributes
      agree with every signal the Booking Form actually supplied, and whose
-     trim is a normalized prefix/suffix of the Booking Form's own trim
-     residue -- the master's real, stored Trim
+     trim equals the Booking Form's own trim residue (2026-10-20: no longer
+     a prefix/suffix match) -- the master's real, stored Trim
      (``product_variants.attributes->>'trim'``, the masters sheet's own Trim
      column, populated by ``oem_price_masters.py``) when present, falling
      back to a variant-name "trim residue" (the same tokenizer applied to
@@ -332,7 +332,7 @@ def match_by_attributes(
     """``rows`` already narrowed to one resolved model. Decompose the
     Booking Form's remaining text and keep only variants whose own
     structured attributes agree with every signal supplied, and whose trim
-    residue is a normalized prefix/suffix match — never a fuzzy score."""
+    residue is the same — never a prefix, suffix or fuzzy score."""
     combined = " ".join(w for w in (model_remainder, variant_text) if w)
     booking = _decompose(combined, oem_code=oem_code)
     if booking is None or not booking.trim_key:
@@ -350,13 +350,37 @@ def match_by_attributes(
         if booking.seater and master.seater and booking.seater != master.seater:
             continue
 
-        master_key = master.trim_key
-        if not master_key:
+        if not master.trim_key:
             continue
-        if not (booking.trim_key.startswith(master_key) or master_key.startswith(booking.trim_key)):
+        # 2026-10-20 product owner rule R3: the trim words must be the same,
+        # not a prefix or suffix ("MX3 PRO" never reaches "MX3", "AX7L"
+        # never "AX7"); the prefix match put rows the words exclude into the
+        # shortlist and price then picked among them. Compared as the
+        # normalised trim words of uc03_sku_words (model words and noise such
+        # as the list's "- N" / "Refresh" tags set aside), which the SKU
+        # resolver itself now uses.
+        if _trim_words(combined, row) != _row_trim_words(row):
             continue
         matched.append(row)
     return matched
+
+
+def _row_trim_words(row: dict[str, Any]) -> frozenset[str]:
+    """The master's trim words: its own Trim column when the masters sheet
+    carried one (``row["trim"]``), else read off the variant name. Since
+    2026-10-21 "NEW" / "Refresh" are words of a variant name (review 471
+    S2), so the stored Trim column matters here."""
+    from audit_core.uc03_sku_words import row_words
+
+    if str(row.get("trim") or "").strip():
+        return _trim_words(str(row["trim"]), row)
+    return frozenset(w for w in row_words(row).words if ":" not in w)
+
+
+def _trim_words(text_value: str, row: dict[str, Any]) -> frozenset[str]:
+    from audit_core.uc03_sku_words import raw_tokens, read_words
+
+    return read_words(raw_tokens(text_value), model_name=row.get("model_name")).trim
 
 
 # ── controlled fuzzy fallback (trim text only; attributes stay exact) ──────
