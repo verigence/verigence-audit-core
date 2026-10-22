@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from audit_core.uc03_p2_runtime import swept_pending_sql
+
 PC_VIEWS = ("needs_action", "processing", "with_tl", "closed", "all")
 TL_VIEWS = ("needs_tl", "high_risk", "overdue", "stuck", "all", "closed")
 ALL_VIEWS = frozenset((*PC_VIEWS, *TL_VIEWS, "open"))
@@ -52,10 +54,10 @@ SCOPED_SQL = f"""
     pages AS (
         SELECT q.journey_id,
                bool_or(q.queue_status IN ({_IN_FLIGHT_SQL})) AS processing,
-               bool_or(q.queue_status IN ('FAILED', 'DEAD_LETTER')) AS stuck
+               bool_or(q.queue_status IN ('FAILED', 'DEAD_LETTER') OR {swept_pending_sql("q")}) AS stuck
         FROM auditcore.p2_document_queue q
         WHERE q.tenant_id = :tenant_id
-          AND q.queue_status IN ({_IN_FLIGHT_SQL}, 'FAILED', 'DEAD_LETTER')
+          AND (q.queue_status IN ({_IN_FLIGHT_SQL}, 'FAILED', 'DEAD_LETTER') OR {swept_pending_sql("q")})
         GROUP BY q.journey_id
         UNION ALL
         SELECT b.journey_id, false, true

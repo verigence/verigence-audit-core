@@ -283,42 +283,29 @@ def test_read_again_of_a_page_di_never_received_goes_through_recovery(journey):
 
 # -------------------------------------------------------------- nightly sweep
 
-def test_nightly_sweep_asks_again_for_every_classified_page_held_or_settled_unread(journey):
+def test_nightly_sweep_no_longer_asks_for_any_page_to_be_read_again(journey):
+    """Decision 2026-10-01 had the sweep ask DI to read a classified page
+    held or settled unread again tonight. Product owner 2026-10-22: nothing is
+    read again at night. The same pages are now left as they are, and no
+    PAGE_REREAD is queued, however often the sweep runs."""
     _, stuck_q, _ = add_page(journey, page_number=1, status="CLASSIFYING", submitted_minutes_ago=9 * 60)
     _, fresh_q, _ = add_page(journey, page_number=2, status="EXTRACTING", submitted_minutes_ago=60)
-    _, untyped_q, _ = add_page(journey, page_number=3, status="EXTRACTING", submitted_minutes_ago=9 * 60)
-    _, unread_q, _ = add_page(journey, page_number=4, status="SUPPORTING")
-    _, others_q, _ = add_page(journey, page_number=5, status="SUPPORTING")
-    _, retyped_q, _ = add_page(journey, page_number=6, status="SUPPORTING")
-    _, ready_q, _ = add_page(journey, page_number=7, status="READY")
+    _, unread_q, _ = add_page(journey, page_number=3, status="SUPPORTING")
+    _, ready_q, _ = add_page(journey, page_number=4, status="READY")
     _set_template(journey, stuck_q, "booking_docket")
     _set_template(journey, fresh_q, "booking_docket")
     _set_template(journey, unread_q, "pan_card")
-    _set_template(journey, others_q, "supporting_document", overridden_by="pc-1")
-    _set_template(journey, retyped_q, "pan_card", overridden_by="pc-1")
     _set_template(journey, ready_q, "booking_docket")
-    for queue_id in (unread_q, others_q, retyped_q, ready_q):
+    for queue_id in (unread_q, ready_q):
         _age_page(journey, queue_id, hours=9)
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        swept = worker.queue_nightly_upload_sweep(connection, tenant_id=journey.tenant_id)
-    assert swept["reread"] == 2 and swept["journeys"] == 1
-    assert queue_row(journey, "PAGE_REREAD", str(stuck_q))["work_status"] == "PENDING"
-    assert queue_row(journey, "PAGE_REREAD", str(unread_q))["work_status"] == "PENDING"
-    for queue_id in (fresh_q, untyped_q, others_q, retyped_q, ready_q):
+    for _ in range(2):
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            swept = worker.queue_nightly_upload_sweep(connection, tenant_id=journey.tenant_id)
+        assert "reread" not in swept and "retried" not in swept
+    for queue_id in (stuck_q, fresh_q, unread_q, ready_q):
         assert queue_row(journey, "PAGE_REREAD", str(queue_id)) is None, queue_id
-    # Asking twice (the sweep ran again) coalesces on the same pending work.
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        swept = worker.queue_nightly_upload_sweep(connection, tenant_id=journey.tenant_id)
-    assert swept["reread"] == 2
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        pending = connection.execute(
-            text("SELECT COUNT(*) FROM auditcore.p2_work_queue WHERE tenant_id=:t AND work_type='PAGE_REREAD'"),
-            {"t": journey.tenant_id},
-        ).scalar_one()
-    assert pending == 2
+    assert _page_status(journey, unread_q) == "SUPPORTING" and _page_status(journey, stuck_q) == "CLASSIFYING"
 
 
 # ---------------------------------------------------- the file's status tasks

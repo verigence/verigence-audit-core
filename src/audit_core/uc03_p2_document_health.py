@@ -6,8 +6,9 @@ within eight hours, hold values in Audit Core or carry a reason and an
 action a person can take. This module computes that state from the facts
 both sides hold (the page queue, DI's last reported state, the evidence
 lineage) -- never from a timer alone -- and is read by the Upload / Edit
-Documents screen, the file status tasks, the journey Re-sync and the
-nightly sweep, so all four agree.
+Documents screen, the file status tasks and the journey Re-sync, so all
+three agree. (The nightly sweep also read it until 2026-10-22; it no longer
+asks DI to read a page again at night.)
 
 States and the one action each offers:
 

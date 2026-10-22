@@ -285,7 +285,7 @@ def cancel_stuck_journey(
     Returns CANCELLED, COMPLETED (booking already complete), ALREADY_CLOSED
     or NOT_STUCK.
     """
-    from audit_core.uc03_p2_runtime import record_activity
+    from audit_core.uc03_p2_runtime import record_activity, swept_pending_sql
     from audit_core.uc03_p2_task_producer import raise_or_refresh
 
     state = connection.execute(
@@ -302,12 +302,15 @@ def cancel_stuck_journey(
         return "COMPLETED"
     if status in CANCELLED_BOOKING:
         return "ALREADY_CLOSED"
+    # A page the day-end sweep cleared is still a failed page until it is
+    # resubmitted or removed (swept_pending_sql): the sweep is only a clean-up.
     failed = connection.execute(
         text(
-            """
+            f"""
             SELECT
-              (SELECT COUNT(*) FROM auditcore.p2_document_queue
-                WHERE tenant_id=:t AND journey_id=:j AND queue_status IN ('FAILED','DEAD_LETTER')) AS pages,
+              (SELECT COUNT(*) FROM auditcore.p2_document_queue q
+                WHERE q.tenant_id=:t AND q.journey_id=:j
+                  AND (q.queue_status IN ('FAILED','DEAD_LETTER') OR {swept_pending_sql("q")})) AS pages,
               (SELECT COUNT(*) FROM auditcore.p2_upload_batches
                 WHERE tenant_id=:t AND journey_id=:j AND batch_status='FAILED') AS uploads
             """
