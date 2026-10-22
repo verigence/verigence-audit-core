@@ -24,11 +24,10 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import Connection, text
 
-from audit_core.uc03_p2_document_health import STUCK_AFTER_SECONDS, TL_AFTER_SECONDS
+from audit_core.uc03_p2_document_health import TL_AFTER_SECONDS
 from audit_core.uc03_p2_names import display_name, same_organisation, same_person
 from audit_core.uc03_p2_registry import ControlTemplate, Registry, get_registry
 from audit_core.uc03_p2_stage import unreviewed_fields
@@ -577,12 +576,11 @@ def _resolve_prefix_except(connection: Connection, *, tenant_id: str, journey_id
     return closed
 
 
-# A file still being worked on this long after upload gets a status task:
-# "check back after 1 hour". A page is never failed for taking long (a burst
-# or a quota is waited out); after an hour the PC is simply told how far the
-# file is, and the task updates itself until the file is done.
+# A file still being worked on this long after upload gets an Info status
+# task. Since 2026-10-21 no page takes more than 30 minutes (the worker fails
+# it: uc03_p2_worker.fail_unsettled_pages), so this is a safety net for a
+# file whose read pages are still being copied, or a worker that was down.
 _UPLOAD_STATUS_AFTER_SECONDS = int(os.environ.get("P2_UPLOAD_STATUS_AFTER_SECONDS", str(60 * 60)))
-_IST = ZoneInfo("Asia/Kolkata")
 _SETTLED_PAGE_STATES = ("READY", "SUPPORTING", "NEEDS_REVIEW", "CANCELLED", "MERGED")
 _FAILED_PAGE_STATES = ("FAILED", "DEAD_LETTER")
 
@@ -597,54 +595,48 @@ _REASON_WORDS = {"faded": "too faded", "blurred": "blurred", "tooSmall": "too sm
                  "unreadable": "unreadable", "other": "not clear enough"}
 
 
-def _failed_pages_text(filename: str, failed_errors: list[str], failed_pages: list[int],
-                       failed_reason: str | None) -> tuple[str, str]:
-    """The task for a file with pages that were not read, saying which were
-    rejected at upload by the scan-quality check (and why) and which failed
-    otherwise (product owner 2026-10-20: the task must say the document was
-    rejected, not leave the PC to find out on the card)."""
+def resubmit_page_reason(code: str | None, status_reason: str | None) -> str:
+    """Why a failed page is to be resubmitted, in plain words, for the
+    file's "Document to resubmit" task. A page the scan-quality check
+    rejected says so and why (product owner 2026-10-20: the task must say
+    the document was rejected, not leave the PC to find out on the card);
+    a page our setup refused says there is no need to re-upload; any other
+    page carries the reason its card shows."""
     from audit_core.uc03_p2_daily_report import rejection_reason
 
-    rejected: dict[str, list[int]] = {}
-    other: list[int] = []
-    for item in failed_errors:
-        page_text, _, error = str(item).partition("|")
-        page = int(page_text)
-        reason = rejection_reason(error)
-        if reason is None:
-            if page not in other:
-                other.append(page)
-        elif page not in rejected.setdefault(reason, []):
-            rejected[reason].append(page)
-    if not failed_errors:
-        other = list(failed_pages)
-    n_rejected = sum(len(v) for v in rejected.values())
-    parts = []
-    if n_rejected:
-        parts.append(f"{n_rejected} page{'' if n_rejected == 1 else 's'} rejected at upload")
-    if other:
-        parts.append(f"{len(other)} page{'' if len(other) == 1 else 's'} could not be processed")
-    title = f"{filename}: " + ", ".join(parts)
-    sentences = []
-    if n_rejected:
-        why = "; ".join(f"{_pages_text(pages).capitalize()} {'is' if len(pages) == 1 else 'are'} "
-                        f"{_REASON_WORDS.get(reason, 'not clear enough')}"
-                        for reason, pages in rejected.items())
-        sentences.append(f"Rejected by the scan-quality check and not read: {why}. Scan "
-                         f"{'it' if n_rejected == 1 else 'them'} again in good light, flat and in focus, and "
-                         "upload from Upload / Edit Documents.")
-    if other:
-        reason = (failed_reason or "").strip() if not n_rejected else ""
-        sentences.append((f"{reason} " if reason else "")
-                         + f"{_pages_text(other).capitalize()} could not be processed: upload "
-                         f"{'it' if len(other) == 1 else 'them'} on {'its' if len(other) == 1 else 'their'} own "
-                         "from Upload / Edit Documents (or retry from the card).")
-    sentences.append("This task closes itself once the pages are processed; delete this booking if nothing on "
-                     "it can be used.")
-    return title, " ".join(sentences)
+    if str(code or "") == SETUP_FAILURE_CODE:
+        return _SETUP_PAGE_TEXT
+    rejected = rejection_reason(code)
+    if rejected is not None:
+        return (f"Rejected by the scan-quality check: {_REASON_WORDS.get(rejected, 'not clear enough')}. Scan it "
+                "again in good light, flat and in focus, and upload it again.")
+    return (status_reason or "").strip() or "It could not be read. Upload it again."
 
 
-_QUALITY_PREFIX = "DI_QUALITY_"
+# Product owner 2026-10-21: every FAILED page raises a "Document to resubmit"
+# task (category key DOCUMENT_RESUBMIT), one per uploaded file, listing its
+# failed pages, each with the reason in plain words and a link that opens the
+# page from storage (a short-lived link issued when it is opened, never a raw
+# bucket address).
+RESUBMIT_TASK_TYPE = "DOCUMENT_RESUBMIT"
+RESUBMIT_CATEGORY = "DOCUMENT_RESUBMIT"
+# Gemini refused our key or model: our setup, not the page (2026-10-21).
+SETUP_FAILURE_CODE = "DOCUMENT_AI_NOT_CONFIGURED"
+_SETUP_PAGE_TEXT = "Our setup problem — will be re-read once fixed; no need to re-upload."
+# Why a file failed as a whole under the 30-minute ceiling
+# (uc03_p2_worker.fail_unsettled_pages); stored on the upload batch.
+FILE_NOT_UPLOADED_IN_TIME_REASON = ("The file did not finish uploading within 30 minutes. "
+                                    "Please upload the file again.")
+FILE_NOT_SPLIT_IN_TIME_REASON = ("The file was not split into pages within 30 minutes. "
+                                 "Please upload the file again.")
+
+
+def page_open_path(tenant_id: str, journey_id: UUID, queue_id: UUID | str) -> str:
+    """The app endpoint that issues a short-lived link to a page's file
+    (uc03_p2_api.get_page_file): stored in the resubmit task as filePath,
+    since a storage link itself would expire."""
+    return f"/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/pages/{queue_id}/file"
+
 
 
 # Why the quality task closed. There is no time rule: an upload of some
@@ -734,50 +726,57 @@ def sync_processing_failure_tasks(
 ) -> dict[str, int]:
     """One task (PC) per uploaded file that is not done, never one per page.
 
+    A file with failed pages (or one that could not be split) raises the
+    PC's "Document to resubmit" task (DOCUMENT_RESUBMIT, product owner
+    2026-10-21): each failed page, its reason and a link to open it. A page
+    that failed only because of our setup (Gemini refused our key or model)
+    says so -- no need to re-upload -- and the Team Lead is alerted. A file
+    still being worked on an hour after upload gets the Info status task
+    (rare now that no file takes more than 30 minutes). Every task refreshes
+    as the pages change and closes itself when the file is done or
+    removed.
+
     ``removal`` (a page a person just removed from the Journey: batchId,
     pages, filename, removedBy, removedRole, reason) is named in the closing
-    evidence of that file's tasks.
-
-    Info, an hour after upload, while pages are still being identified or
-    waiting for an automatic retry: how far the file is and "check back
-    after 1 hour". High once the retries are spent (or the document service
-    refused a page): which pages to upload on their own. The task refreshes
-    its counts as they change and closes itself when the file is done or
-    removed."""
+    evidence of that file's tasks."""
     registry = registry or get_registry()
     now = now or datetime.now(UTC)
     wanted: set[str] = set()
     tl_wanted: set[str] = set()
+    cfg_wanted: set[str] = set()
     quality_wanted: set[str] = set()
     counts: dict[str, int] = {}
     batches = connection.execute(
         text(
             """
             SELECT b.batch_id, b.original_filename, b.page_count, b.batch_status, b.created_at_utc,
+                   b.failure_reason,
                    COUNT(q.queue_id) FILTER (WHERE q.queue_status NOT IN ('CANCELLED','MERGED')) AS total,
                    COUNT(q.queue_id) FILTER (WHERE q.queue_status IN ('READY','SUPPORTING','NEEDS_REVIEW')) AS done,
                    COUNT(q.queue_id) FILTER (WHERE q.queue_status='RETRY_WAIT') AS retrying,
                    COUNT(q.queue_id) FILTER (WHERE q.queue_status NOT IN
                      ('READY','SUPPORTING','NEEDS_REVIEW','CANCELLED','MERGED','RETRY_WAIT','FAILED','DEAD_LETTER'))
                      AS working,
-                   COALESCE(array_agg(DISTINCT p.page ORDER BY p.page)
-                            FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')), ARRAY[]::int[]) AS failed_pages,
-                   MIN(q.status_reason) FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
-                                                  AND COALESCE(q.last_error, '') NOT LIKE 'DI_QUALITY_%')
-                     AS failed_reason,
-                   COALESCE(array_agg(p.page::text || '|' || COALESCE(q.last_error, '') ORDER BY p.page)
-                            FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')), ARRAY[]::text[])
-                     AS failed_errors,
-                   COALESCE(jsonb_agg(jsonb_build_object('page', p.page, 'code', q.last_error,
-                                                         'queueId', q.queue_id) ORDER BY p.page)
+                   COALESCE(jsonb_agg(jsonb_build_object(
+                       'queueId', q.queue_id,
+                       'pages', COALESCE(q.page_numbers, ARRAY[q.page_number]),
+                       'reason', q.status_reason,
+                       'code', q.last_error) ORDER BY q.page_number)
+                     FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
+                                     AND COALESCE(q.last_error, '') NOT LIKE 'DI_QUALITY_%'), '[]'::jsonb)
+                     AS failed_units,
+                   -- Pages the scan-quality check refused have their own task
+                   -- (#479, PC_PAGE_QUALITY_REJECTED), never the resubmit task.
+                   COALESCE(jsonb_agg(jsonb_build_object('page', q.page_number, 'code', q.last_error,
+                                                         'queueId', q.queue_id) ORDER BY q.page_number)
                             FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
                                       AND q.last_error LIKE 'DI_QUALITY_%'), '[]'::jsonb) AS quality_pages
             FROM auditcore.p2_upload_batches b
             LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id
-            LEFT JOIN LATERAL unnest(COALESCE(q.page_numbers, ARRAY[q.page_number])) AS p(page) ON true
             WHERE b.tenant_id=:t AND b.journey_id=:j
               AND b.batch_status NOT IN ('CANCELLED','COMPLETED')
-            GROUP BY b.batch_id, b.original_filename, b.page_count, b.batch_status, b.created_at_utc
+            GROUP BY b.batch_id, b.original_filename, b.page_count, b.batch_status, b.created_at_utc,
+                     b.failure_reason
             ORDER BY b.created_at_utc
             """
         ),
@@ -787,16 +786,12 @@ def sync_processing_failure_tasks(
         filename = row["original_filename"]
         total, done = int(row["total"] or 0), int(row["done"] or 0)
         retrying, working = int(row["retrying"] or 0), int(row["working"] or 0)
-        # Pages refused for image quality have their own task (product owner
-        # 2026-10-21); this file's status task speaks only of the others.
-        failed_errors = [str(e) for e in (row["failed_errors"] or [])
-                         if not str(e).partition("|")[2].upper().startswith(_QUALITY_PREFIX)]
-        failed_pages = [int(p) for p in (row["failed_pages"] or [])]
+        failed_units = list(row["failed_units"] or [])
+        failed_pages = sorted({int(p) for unit in failed_units for p in (unit.get("pages") or [])})
         quality = [dict(q) for q in (row["quality_pages"] or [])]
         if quality:
-            # Every refused page lands in the file's quality task in this
-            # same pass, so nothing leaves the status task uncovered.
-            failed_pages = sorted({int(str(e).partition("|")[0]) for e in failed_errors})
+            # A page refused for image quality has the file's quality task
+            # only (product owner 2026-10-21): one task per page, never two.
             outcome = _sync_quality_task(
                 connection, tenant_id=tenant_id, journey_id=journey_id, batch_id=row["batch_id"],
                 filename=filename, quality=quality, registry=registry,
@@ -807,40 +802,74 @@ def sync_processing_failure_tasks(
         split_failed = row["batch_status"] == "FAILED" and int(row["page_count"] or 0) == 0
         in_progress = retrying + working > 0 or row["batch_status"] in ("AWAITING_UPLOAD", "UPLOADED", "SPLITTING")
         age = (now - row["created_at_utc"]).total_seconds() if row["created_at_utc"] else 0.0
-        if split_failed or (failed_pages and not in_progress):
-            severity = "HIGH"
+        setup_units = [u for u in failed_units if str(u.get("code") or "") == SETUP_FAILURE_CODE]
+        if setup_units:
+            cfg_key = f"ai-config-tl:{journey_id}:{row['batch_id']}"
+            cfg_wanted.add(cfg_key)
+            _, cfg_outcome = raise_or_refresh(
+                connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=cfg_key,
+                task_type="TL_DOCUMENT_STUCK", source_type="DOCUMENT", source_code=SETUP_FAILURE_CODE,
+                title=f"{filename}: the AI service refused our credentials",
+                description=(f"The AI service (Gemini) refused Document Intelligence's key or model while reading "
+                             f"{filename}. This is a configuration problem on our side, not the PC's: raise it "
+                             "with support now. The pages are read again overnight once it is fixed (or press "
+                             "Retry on a page once support confirms); the PC has been told there is no need to "
+                             "re-upload. This task closes itself when the pages are read."),
+                reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": SETUP_FAILURE_CODE,
+                           "batchId": str(row["batch_id"]), "filename": filename},
+                severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
+            )
+            counts[cfg_outcome] = counts.get(cfg_outcome, 0) + 1
+        if split_failed or failed_units:
+            key = f"resubmit:{journey_id}:{row['batch_id']}"
+            wanted.add(key)
+            pages = [
+                {"queueId": str(u["queueId"]), "pageNumbers": [int(p) for p in (u.get("pages") or [])],
+                 "reason": resubmit_page_reason(u.get("code"), u.get("reason")),
+                 "code": u.get("code"),
+                 "filePath": page_open_path(tenant_id, journey_id, u["queueId"])}
+                for u in failed_units
+            ]
+            only_setup = bool(pages) and len(setup_units) == len(failed_units) and not split_failed
             if split_failed:
-                title = f"{filename} could not be processed"
-                description = (f"{row['failed_reason'] or 'The file could not be split into pages.'} Upload the file "
-                               "again from Upload / Edit Documents, or delete this booking if nothing on it can be "
-                               "used. This task closes itself once the file is processed.")
+                title = f"{filename}: upload the file again"
+                # Not uploaded, or not split into pages, within 30 minutes
+                # (fail_unsettled_pages), or the split itself failed.
+                why = (row["failure_reason"] or "").strip() or "It could not be split into pages."
+                lines = [f"{filename}: {why}" + ("" if "upload the file again" in why.lower()
+                                                     else " Upload the file again from Upload / Edit Documents.")]
+            elif only_setup:
+                title = f"{filename}: {_pages_text(failed_pages)} not read — our setup problem, no need to re-upload"
+                lines = [(f"{_pages_text(failed_pages).capitalize()}: {_SETUP_PAGE_TEXT} Your Team Lead has been "
+                          "alerted.")]
             else:
-                title, description = _failed_pages_text(filename, failed_errors,
-                                                        failed_pages, row["failed_reason"])
-        elif in_progress and age >= _UPLOAD_STATUS_AFTER_SECONDS:
-            severity = "INFO"
-            title = f"{filename}: {done} of {total} pages read, still working"
-            parts = [f"{done} of {total} pages read"]
-            if working:
-                parts.append(f"{working} being identified or read")
-            if retrying:
-                parts.append(f"{retrying} waiting for an automatic retry")
-            if failed_pages:
-                parts.append(f"{_pages_text(failed_pages)} could not be processed so far")
-            if age >= STUCK_AFTER_SECONDS:
-                # Decision 2026-10-01: after eight hours the PC is told the
-                # truth, and what will happen next, instead of "check back".
-                since = row["created_at_utc"].astimezone(_IST).strftime("%H:%M on %d %b")
-                description = (", ".join(parts) + f". Waiting for the document service since {since}. It is "
-                               "retried automatically tonight; Re-sync on Upload / Edit Documents asks for it "
-                               "again now. This task updates itself and closes when the file is done.")
-            else:
-                description = (", ".join(parts) + ". Nothing to do yet: check back after 1 hour. This task "
-                               "updates itself, and closes when the file is done or tells you which pages to "
-                               "upload on their own if any cannot be processed.")
-        else:
+                n = len(failed_pages)
+                title = f"{filename}: {n} page{'' if n == 1 else 's'} to resubmit"
+                lines = [f"{_pages_text(p['pageNumbers']).capitalize()}: {p['reason']}" for p in pages]
+                lines.append("Upload the failed pages again from Upload / Edit Documents (on their own, or the "
+                             "whole file again; each page's link opens it). This task closes itself once the "
+                             "pages are read again or uploaded again.")
+            _, outcome = raise_or_refresh(
+                connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                task_type=RESUBMIT_TASK_TYPE, source_type="DOCUMENT", source_code="DOCUMENT_PROCESSING_FAILED",
+                title=title, description=" ".join(lines),
+                reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT",
+                           "sourceCode": "DOCUMENT_PROCESSING_FAILED", "category": RESUBMIT_CATEGORY,
+                           "batchId": str(row["batch_id"]), "filename": filename, "pageNumbers": failed_pages,
+                           "pages": pages, "setupOnly": only_setup},
+                severity="INFO" if only_setup else "HIGH", registry=registry,
+                evaluation_started_at=evaluation_started_at,
+            )
+            counts[outcome] = counts.get(outcome, 0) + 1
             continue
-        if in_progress and age >= TL_AFTER_SECONDS:
+        if not (in_progress and age >= _UPLOAD_STATUS_AFTER_SECONDS):
+            continue
+        parts = [f"{done} of {total} pages read"]
+        if working:
+            parts.append(f"{working} being identified or read")
+        if retrying:
+            parts.append(f"{retrying} waiting for an automatic retry")
+        if age >= TL_AFTER_SECONDS:
             # Decision 2026-10-01: a file still not read after a day is the
             # Team Lead's to know about, with what the PC has already been told.
             tl_key = f"upload-stuck-tl:{journey_id}:{row['batch_id']}"
@@ -850,9 +879,8 @@ def sync_processing_failure_tasks(
                 task_type="TL_DOCUMENT_STUCK", source_type="DOCUMENT", source_code="DOCUMENT_PROCESSING_STUCK",
                 title=f"{filename}: not read for more than a day ({done} of {total} pages read)",
                 description=(f"{filename} was uploaded more than 24 hours ago and {total - done} of its pages "
-                             "are still not read. The PC has the file's own status task; the document service "
-                             "is asked again every night. If it stays unread, raise it with support. This task "
-                             "closes itself when the file is done."),
+                             "are still not read. The PC has the file's own status task. If it stays unread, "
+                             "raise it with support. This task closes itself when the file is done."),
                 reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT",
                            "sourceCode": "DOCUMENT_PROCESSING_STUCK", "batchId": str(row["batch_id"]),
                            "filename": filename,
@@ -864,16 +892,15 @@ def sync_processing_failure_tasks(
         wanted.add(key)
         _, outcome = raise_or_refresh(
             connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
-            task_type="PC_UPLOAD_STATUS", source_type="DOCUMENT",
-            source_code="DOCUMENT_PROCESSING_FAILED" if severity == "HIGH" else "DOCUMENT_PROCESSING_SLOW",
-            title=title, description=description,
-            reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT",
-                       "sourceCode": "DOCUMENT_PROCESSING_FAILED" if severity == "HIGH" else "DOCUMENT_PROCESSING_SLOW",
-                       "batchId": str(row["batch_id"]), "filename": filename, "pageNumbers": failed_pages,
-                       "pages": {"total": total, "read": done, "working": working, "retrying": retrying,
-                                 "failed": len(failed_pages)},
-                       "retrying": severity != "HIGH"},
-            severity=severity, registry=registry, evaluation_started_at=evaluation_started_at,
+            task_type="PC_UPLOAD_STATUS", source_type="DOCUMENT", source_code="DOCUMENT_PROCESSING_SLOW",
+            title=f"{filename}: {done} of {total} pages read, still working",
+            description=(", ".join(parts) + ". Nothing to do yet. This task updates itself, and closes when the "
+                         "file is done or turns into a resubmit task for any page that cannot be read."),
+            reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "DOCUMENT_PROCESSING_SLOW",
+                       "batchId": str(row["batch_id"]), "filename": filename, "pageNumbers": [],
+                       "pages": {"total": total, "read": done, "working": working, "retrying": retrying},
+                       "retrying": True},
+            severity="INFO", registry=registry, evaluation_started_at=evaluation_started_at,
         )
         counts[outcome] = counts.get(outcome, 0) + 1
     quality_batches = {key.rsplit(":", 1)[-1] for key in quality_wanted}
@@ -890,31 +917,111 @@ def sync_processing_failure_tasks(
                               "image-quality task."}
         return {"reason": "The file was processed or removed."}
 
+    def removal_or(key: str, reason: str) -> dict[str, Any]:
+        if removal_evidence and key.rsplit(":", 1)[-1] == str(removal["batchId"]):
+            return removal_evidence
+        return {"reason": reason}
+
     def quality_evidence(key: str) -> dict[str, Any]:
         if removal_evidence and key.rsplit(":", 1)[-1] == str(removal["batchId"]):
             return removal_evidence
         return _QUALITY_CLOSED_EVIDENCE
 
-    closed = _resolve_prefix_except(
-        connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"upload-status:{journey_id}:",
-        keep=wanted, evidence=status_evidence,
-    )
-    closed += _resolve_prefix_except(
-        connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"upload-stuck-tl:{journey_id}:",
-        keep=tl_wanted, evidence={"reason": "The file was processed or removed."},
-    )
-    closed += _resolve_prefix_except(
-        connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"upload-quality:{journey_id}:",
-        keep=quality_wanted, evidence=quality_evidence,
-    )
-    # The per-page tasks this replaced (one per failed page) close too.
-    closed += _resolve_prefix_except(
-        connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"processing-failed:{journey_id}:",
-        keep=set(), evidence={"reason": "Replaced by the file's own status task."},
-    )
+    closed = 0
+    for prefix, keep, evidence in (
+        (f"upload-status:{journey_id}:", wanted, status_evidence),
+        (f"resubmit:{journey_id}:", wanted,
+         lambda k: removal_or(k, "The pages were read again, uploaded again or removed.")),
+        (f"upload-stuck-tl:{journey_id}:", tl_wanted, {"reason": "The file was processed or removed."}),
+        (f"ai-config-tl:{journey_id}:", cfg_wanted,
+         lambda k: removal_or(k, "The pages were read, or are no longer waiting.")),
+        (f"upload-quality:{journey_id}:", quality_wanted, quality_evidence),
+        # The per-page tasks the file's task replaced close too.
+        (f"processing-failed:{journey_id}:", set(), {"reason": "Replaced by the file's own task."}),
+    ):
+        closed += _resolve_prefix_except(connection, tenant_id=tenant_id, journey_id=journey_id, prefix=prefix,
+                                         keep=keep, evidence=evidence)
+    closed += sync_dead_work_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, registry=registry)
     if closed:
         counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed
     return counts
+
+
+def sync_dead_work_tasks(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, registry: Registry | None = None,
+) -> int:
+    """Close the tasks a stopped step raised once their condition is gone
+    (2026-10-20 re-review, R2), and hand back one a person marked done while
+    the condition still holds -- never left waiting in VERIFYING:
+    - work-dead:{journey}:{work type} (Team Lead): that step of the journey
+      is no longer dead-lettered (Re-sync ran it, or it was asked again);
+    - group-failed:{journey}:{batch} (PC): the upload was grouped, removed,
+      or uploaded again (a later upload of the same file).
+    Returns the number of tasks closed."""
+    registry = registry or get_registry()
+    tasks = connection.execute(
+        text(
+            """
+            SELECT dedupe_key, task_status, task_type, source_type, source_code, title, description,
+                   reference, severity
+            FROM auditcore.p2_tasks
+            WHERE tenant_id=:t AND journey_id=:j AND task_status = ANY(:open)
+              AND (dedupe_key LIKE :dead OR dedupe_key LIKE :group)
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "open": list(_OPEN), "dead": f"work-dead:{journey_id}:%",
+         "group": f"group-failed:{journey_id}:%"},
+    ).mappings().all()
+    closed = 0
+    for task in tasks:
+        key = str(task["dedupe_key"])
+        kind, _, rest = key.partition(f":{journey_id}:")
+        if kind == "work-dead":
+            holds = connection.execute(
+                text(
+                    """
+                    SELECT EXISTS (SELECT 1 FROM auditcore.p2_work_queue
+                                   WHERE tenant_id=:t AND journey_id=:j AND work_type=:w
+                                     AND work_status='DEAD_LETTER')
+                    """
+                ),
+                {"t": tenant_id, "j": journey_id, "w": rest},
+            ).scalar_one()
+            reason = "The step ran again."
+        else:
+            holds = connection.execute(
+                text(
+                    """
+                    SELECT EXISTS (
+                      SELECT 1 FROM auditcore.p2_upload_batches b
+                      WHERE b.tenant_id=:t AND b.batch_id=CAST(:b AS uuid) AND b.grouping_status='FAILED'
+                        AND b.batch_status <> 'CANCELLED'
+                        AND NOT EXISTS (
+                          SELECT 1 FROM auditcore.p2_upload_batches later
+                          WHERE later.tenant_id=b.tenant_id AND later.journey_id=b.journey_id
+                            AND later.original_filename=b.original_filename
+                            AND later.created_at_utc > b.created_at_utc
+                            AND later.batch_status <> 'CANCELLED'))
+                    """
+                ),
+                {"t": tenant_id, "b": rest},
+            ).scalar_one()
+            reason = "The upload was grouped, removed or uploaded again."
+        if not holds:
+            resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                            evidence={"reason": reason})
+            closed += 1
+        elif task["task_status"] == "VERIFYING":
+            # Marked done while the step is still stopped: back to the assignee.
+            raise_or_refresh(
+                connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                task_type=str(task["task_type"]), source_type=str(task["source_type"]),
+                source_code=str(task["source_code"]), title=str(task["title"]),
+                description=str(task["description"]),
+                reference={k: v for k, v in dict(task["reference"] or {}).items() if k != "issueHash"},
+                severity=str(task["severity"]), registry=registry, evaluation_started_at=datetime.now(UTC),
+            )
+    return closed
 
 
 def sync_unclassified_page_tasks(

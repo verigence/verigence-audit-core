@@ -114,6 +114,12 @@ def test_sku_resolves_on_the_same_sync_call_that_first_introduces_the_model() ->
             {"t": tenant_id, "j": journey_id},
         )
         # journeys insert already creates a bookings row via trigger; no manual insert here.
+        # 2026-10-20 product owner rule R5: priced on the booking date, never today.
+        c.execute(
+            text("UPDATE auditcore.bookings SET booking_date = CURRENT_DATE - 10 "
+                 "WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": tenant_id, "j": journey_id},
+        )
         booking_form_id = uuid4()
         c.execute(
             text("""INSERT INTO auditcore.evidence
@@ -193,4 +199,5 @@ def test_sku_resolves_on_the_same_sync_call_that_first_introduces_the_model() ->
         ).mappings().one()
 
     assert row["product_sku_id"] == sku_id
-    assert row["selection_status"] == "CONFIRMED"
+    # An automatic match is not "Confirmed" (2026-10-20, rule R3).
+    assert row["selection_status"] == "TENTATIVE"

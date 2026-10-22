@@ -74,7 +74,10 @@ from audit_core.uc03_p2_storage import (
     get_p2_document_storage,
 )
 from audit_core.uc03_p2_submission import upload_status
-from audit_core.uc03_p2_task_producer import sync_unclassified_page_tasks
+from audit_core.uc03_p2_task_producer import (
+    SETUP_FAILURE_CODE,
+    sync_unclassified_page_tasks,
+)
 from audit_core.uc03_p2_tasks import (
     TaskPermissionError,
     TaskStateError,
@@ -1754,7 +1757,7 @@ def _page_unit(connection: Connection, *, tenant_id: str, journey_id: UUID, queu
         text(
             """
             SELECT queue_id, batch_id, page_number, page_numbers, unit_kind, queue_status, last_error,
-                   client_upload_id, di_document_id, page_object_key, page_sha256, business_stage
+                   client_upload_id, di_document_id, di_state, page_object_key, page_sha256, business_stage
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND queue_id=:queue_id
             FOR UPDATE
@@ -2075,6 +2078,14 @@ def retry_page(
             status_code=409,
             detail="This page was rejected for scan quality; retrying will not help. Re-scan it and upload it again.",
         )
+    if unit.get("last_error") == SETUP_FAILURE_CODE and unit.get("di_state") != "CLASSIFIED":
+        # Our setup refused the page while it was being identified: the
+        # document service identifies it again overnight, once (final check
+        # F1, 2026-10-21) -- a Retry now would stack a second upload on it.
+        raise HTTPException(
+            status_code=409,
+            detail="The document service will read this page overnight now that the setup is fixed — nothing to do.",
+        )
     request_page_recovery(
         connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=queue_id,
         marker="r", requested_by=human_principal.subject, correlation_id=get_correlation_id(request),
@@ -2085,6 +2096,54 @@ def retry_page(
         correlation_id=get_correlation_id(request),
     )
     return {"queueId": str(queue_id), "status": "QUEUED"}
+
+
+_PAGE_LINK_SECONDS = 1800
+
+
+@router.get("/journeys/{journey_id}/pages/{queue_id}/file")
+def get_page_file(
+    tenant_id: str,
+    journey_id: UUID,
+    queue_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """A short-lived link that opens one page's file as uploaded (the page
+    Audit Core cut from the file and stored), issued to a reader of the
+    journey. The PC's "Document to resubmit" task and the failure report
+    point here (product owner 2026-10-21): a presigned storage link, never
+    a raw bucket address."""
+    _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_READ_PERMISSION,
+    )
+    row = connection.execute(
+        text(
+            """
+            SELECT page_object_key, page_number, page_numbers, queue_status
+            FROM auditcore.p2_document_queue
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND queue_id=:queue_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "queue_id": queue_id},
+    ).mappings().one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Page was not found.")
+    try:
+        url = get_p2_document_storage().presign_get(str(row["page_object_key"]), expires_seconds=_PAGE_LINK_SECONDS)
+    except (RuntimeError, P2DocumentStorageError) as exc:
+        raise HTTPException(status_code=503, detail="The page file cannot be opened right now. Try again.") from exc
+    return {
+        "queueId": str(queue_id),
+        "pageNumbers": list(row["page_numbers"] or [row["page_number"]]),
+        "status": row["queue_status"],
+        "url": url,
+        "expiresInSeconds": _PAGE_LINK_SECONDS,
+    }
 
 
 _REMOVABLE_PAGE_STATES = ("FAILED", "DEAD_LETTER")

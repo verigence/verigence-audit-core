@@ -107,7 +107,8 @@ def _pricing_row(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
             """
             SELECT b.booking_date, b.pricing_effective_on, b.pricing_basis, b.pricing_reason,
                    b.pricing_set_by_actor_id, b.pricing_set_at_utc,
-                   jp.product_sku_id, jp.selection_status, jp.model_name_snapshot, jp.variant_name_snapshot,
+                   jp.product_sku_id, jp.selection_status, jp.match_basis, jp.model_name_snapshot,
+                   jp.variant_name_snapshot,
                    jp.colour_name_snapshot, jp.vehicle_category, s.sku_code, s.model_id, s.variant_id,
                    cu.customer_type_code, rr.registration_type_code
             FROM auditcore.journeys j
@@ -182,11 +183,32 @@ def pricing_summary(connection: Connection, *, tenant_id: str, journey_id: UUID)
             "variant": row["variant_name_snapshot"],
             "colour": row["colour_name_snapshot"],
             "selectionStatus": row["selection_status"],
+            # How the SKU was set (2026-10-20, rule R3): automatic matches are
+            # not "Confirmed"; only a PC / Team Lead decision is.
+            "matchBasis": row["match_basis"],
+            "matchLabel": _match_label(row),
         },
-        # A confirmed SKU is changed through a Team Lead reviewed proposal;
-        # an unconfirmed one is picked directly (existing Phase 1 flows).
-        "modelChange": "PROPOSE_CORRECTION" if row["selection_status"] == "CONFIRMED" else "CONFIRM_SKU",
+        # A SKU a PC or Team Lead confirmed is changed through a Team Lead
+        # reviewed proposal; an automatic match (or none) is picked directly.
+        "modelChange": "PROPOSE_CORRECTION" if _human_decision(row) else "CONFIRM_SKU",
     }
+
+
+def _human_decision(row: dict[str, Any]) -> bool:
+    from audit_core.uc03_model_resolution import is_human_decision
+
+    return is_human_decision(row)
+
+
+def _match_label(row: dict[str, Any]) -> str | None:
+    """Plain words for how the Journey's SKU was set."""
+    from audit_core.uc03_model_resolution import BASIS_LABELS
+
+    if row.get("product_sku_id") is None:
+        return None
+    if row.get("match_basis") in BASIS_LABELS:
+        return BASIS_LABELS[row["match_basis"]]
+    return "Confirmed" if row.get("selection_status") == "CONFIRMED" else "Matched automatically"
 
 
 @router.get("/journeys/{journey_id}/pricing")

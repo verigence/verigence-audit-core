@@ -36,7 +36,7 @@ _refuse_non_local_database()
 # of this shape must now call delete_tenant_data(engine, tenant_id) after
 # its own yield.
 _TENANT_DATA_DELETE_ORDER = (
-    "delivery_vehicle_photos", "activity_records", "administrative_operations", "audit_chain_heads", "audit_events",
+    "sku_resolution_run_items", "sku_resolution_runs", "delivery_vehicle_photos", "activity_records", "administrative_operations", "audit_chain_heads", "audit_events",
     "audit_finding_events", "audit_state_events", "booking_form_review_values", "business_assignments",
     "commercial_line_source_values", "commercial_lines", "crm_interactions", "customer_identity_index",
     "customer_identity_review_values", "daily_ops_items", "dealer_receipt_review_values",
@@ -67,7 +67,7 @@ _TENANT_DATA_DELETE_ORDER = (
     "evidence", "journey_document_requirements", "document_requirement_items",
     "document_requirement_profile_versions", "document_requirement_profiles", "journeys", "customers",
     "dealer_outlets", "dealers", "price_list_versions", "price_lists", "project_policy_versions",
-    "business_status_codes", "projects",
+    "business_status_codes", "p2_scheduled_runs", "projects",
 )
 
 

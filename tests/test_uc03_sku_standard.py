@@ -95,7 +95,14 @@ def test_the_standard_answers_every_block_for_one_vehicle_on_a_date(connection) 
     assert price["version"] == 1 and len(price["components"]) == 10
     ex = next(c for c in price["components"] if c["key"] == "EX_SHOWROOM")
     assert ex["amount"] == "1000000.00" and ex["priceSince"] == "2026-09-01" and ex["commercialKey"] == "ex_showroom_price"
-    assert price["onRoad"] == {"individual": "1006600.00", "corporate": "1006600.00", "basis": "INDIVIDUAL", "amount": "1006600.00"}
+    # One extended-warranty tier only: the 4th-year 300 is counted, the 4th + 5th-year 400 is not,
+    # so the live figure is 400 below the OEM sheet's own on-road, which is kept as "book".
+    assert price["onRoad"] == {
+        "individual": "1006200.00", "corporate": "1006200.00", "basis": "INDIVIDUAL", "amount": "1006200.00",
+        "book": {"individual": "1006600.00", "corporate": "1006600.00"},
+    }
+    counted = {c["key"]: c["countedInOnRoad"] for c in price["components"]}
+    assert counted["EXT_WARRANTY_4TH_YR"] is True and counted["EXT_WARRANTY_4TH_5TH_YR"] is False
     assert standard["consumerScheme"]["total"] == "35000.00"
     assert {b["key"] for b in standard["consumerScheme"]["benefits"]} == {"CASH_DISCOUNT", "ACCESSORIES_KIT"}
 
@@ -119,12 +126,12 @@ def test_the_standard_answers_every_block_for_one_vehicle_on_a_date(connection) 
 
     # The price stands exactly as the price list states it: no benefit is
     # netted off and there is no "net" figure to mistake for one.
-    assert standard["summary"] == {"onRoad": "1006600.00"}
+    assert standard["summary"] == {"onRoad": "1006200.00"}
 
     # No corporate named: the range still stands, and the price is unchanged.
     plain = standard_for_sku(connection, tenant_id=tenant_id, on=ON, row=found["row"], version=version)
     assert plain["corporate"]["exact"] is None and plain["corporate"]["range"] == {"min": "6000.00", "max": "15000.00"}
-    assert plain["summary"] == {"onRoad": "1006600.00"}
+    assert plain["summary"] == {"onRoad": "1006200.00"}
     # A model no scheme or grid names: the blocks are named unknown, never guessed.
     xuv = search_sku(rows, alias_map=aliases, model="XUV 3XO", variant="MX1")["row"]
     assert standard_for_sku(connection, tenant_id=tenant_id, on=ON, row=xuv, version=version)["unknown"] == [
@@ -368,7 +375,7 @@ def test_the_standard_routes_answer_over_http(connection) -> None:  # noqa: F811
         body = answer.json()
         assert body["matched"] == "UNIQUE" and body["priceList"]["onRoad"]["basis"] == "CORPORATE"
         # The price list's own corporate on-road, with nothing netted off it.
-        assert body["summary"] == {"onRoad": "1006600.00"}
+        assert body["summary"] == {"onRoad": "1006200.00"}
         # Scrappage is answered without the caller naming a scenario.
         assert body["exchangeScheme"]["byScenario"]["SCRAPPAGE_DEALER"]["best"] == "35000.00"
         nothing = client.get(f"{base}/sku", params={"on": "2026-01-15", "model": "Thar Roxx"})

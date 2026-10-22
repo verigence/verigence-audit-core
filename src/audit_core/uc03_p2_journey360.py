@@ -2337,7 +2337,7 @@ def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
                    jp.colour_name_snapshot AS colour, jp.model_code_snapshot AS model_code,
                    jp.variant_code_snapshot AS variant_code, jp.colour_code_snapshot AS colour_code,
                    jp.selection_status, jp.selection_method, jp.selection_score,
-                   jp.sku_resolution_remarks, jp.vehicle_category, sku.sku_code
+                   jp.sku_resolution_remarks, jp.vehicle_category, sku.sku_code, jp.match_basis
             FROM auditcore.journey_products jp
             LEFT JOIN auditcore.product_skus sku ON sku.product_sku_id=jp.product_sku_id
             WHERE jp.tenant_id=:t AND jp.journey_id=:j
@@ -2345,6 +2345,12 @@ def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
         ),
         params,
     ).mappings().first()
+    if product is not None:
+        # How the SKU was set, in words (review 471 N1: automatic matches are
+        # not "Confirmed"; only a PC / TL decision is).
+        from audit_core.uc03_model_resolution import BASIS_LABELS
+
+        product = {**dict(product), "match_label": BASIS_LABELS.get(str(product["match_basis"] or ""))}
     units = _rows(connection, """
         SELECT vin, chassis_number, dms_reference, invoice_reference, allocated_at_utc, source_kind
         FROM auditcore.vehicle_records WHERE tenant_id=:t AND journey_id=:j

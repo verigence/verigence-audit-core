@@ -78,6 +78,7 @@ from audit_core.uc03_p2_price_variance import (
 )
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_runtime import (
+    claim_scheduled_run,
     enqueue_work,
     fact_fingerprint,
     note_facts_changed,
@@ -89,8 +90,13 @@ from audit_core.uc03_p2_runtime import (
 from audit_core.uc03_p2_stage import recompute_journey_stage
 from audit_core.uc03_p2_storage import get_p2_document_storage
 from audit_core.uc03_p2_task_producer import (
+    FILE_NOT_SPLIT_IN_TIME_REASON,
+    FILE_NOT_UPLOADED_IN_TIME_REASON,
+    SETUP_FAILURE_CODE,
     apply_control_transitions,
+    raise_or_refresh,
     sync_booking_date_task,
+    sync_dead_work_tasks,
     sync_delivery_review_task,
     sync_document_missing_tasks,
     sync_field_review_tasks,
@@ -116,22 +122,69 @@ logger = structlog.get_logger(__name__)
 # refused the request, an unreadable file) is told at once.
 _RETRY_DELAYS_SECONDS = (900, 1800, 3600, 7200)
 _MAX_ATTEMPTS = int(os.environ.get("P2_WORKER_MAX_ATTEMPTS", str(len(_RETRY_DELAYS_SECONDS) + 1)))
+# A document's own processing steps -- splitting the upload into pages,
+# sending a page to Document Intelligence, asking DI to read a page again,
+# sending a merged document -- follow the product owner's rule of
+# 2026-10-21 instead: a technical failure (the document service or storage
+# not answering or answering with an error, a timeout) is tried at T0, again
+# at T0+10 and T0+20 minutes, and then the page FAILS and the PC gets the
+# "Document to resubmit" task. No file takes more than 30 minutes
+# (fail_unsettled_pages).
+_DOCUMENT_WORK_TYPES = frozenset({"DOCUMENT_INGEST", "SPLIT_BATCH", "PAGE_REREAD", "BATCH_GROUP"})
+_DOCUMENT_RETRY_DELAYS_SECONDS = (600, 600)
+_DOCUMENT_MAX_ATTEMPTS = len(_DOCUMENT_RETRY_DELAYS_SECONDS) + 1
+# Polling DI for results (the journey reconcile) and the nightly look-up of
+# a page our setup refused never stretch to hours on a few DI
+# timeouts (2026-10-20 review): 1, 2, then every 5 minutes, and a poll that
+# works resets the count (_reschedule). After an hour of failures in a row
+# the step stops and the Team Lead is told (_mark_dead).
+_POLL_WORK_TYPES = frozenset({"JOURNEY_RECONCILE", "DOCUMENT_RECONCILE"})
+# A page failed on the clock, or uploaded again, has its DI document deleted
+# (review of #469, 2026-10-21): DI stops reading it, nothing is read twice.
+WITHDRAW_WORK_TYPE = "DI_DOCUMENT_WITHDRAW"
+_POLL_RETRY_DELAYS_SECONDS = (60, 120, 300)
+_POLL_MAX_ATTEMPTS = 13
+
+
+def _is_night_lookup(work_type: str, payload: dict[str, Any] | None) -> bool:
+    """The nightly sweep's look-up of a page our setup refused (DI re-reads
+    those once at night)."""
+    return work_type == "DOCUMENT_INGEST" and (payload or {}).get("recover") == "n"
+
+
+def _ladder(work_type: str, payload: dict[str, Any] | None = None) -> tuple[tuple[int, ...], int]:
+    # Deleting a given-up page at DI is retried like a poll: soon, then
+    # every 5 minutes, for about an hour (then the Team Lead is told).
+    if work_type in _POLL_WORK_TYPES or work_type == WITHDRAW_WORK_TYPE or _is_night_lookup(work_type, payload):
+        return _POLL_RETRY_DELAYS_SECONDS, _POLL_MAX_ATTEMPTS
+    if work_type in _DOCUMENT_WORK_TYPES:
+        return _DOCUMENT_RETRY_DELAYS_SECONDS, _DOCUMENT_MAX_ATTEMPTS
+    # Background recomputation (stage, task verification, controls) keeps
+    # the spread-out ladder of 2026-10-01: the PC does not wait on it.
+    return _RETRY_DELAYS_SECONDS, _MAX_ATTEMPTS
+
+
+def _max_attempts(work_type: str, payload: dict[str, Any] | None = None) -> int:
+    return _ladder(work_type, payload)[1]
+
+
+def _retry_delay(work_type: str, attempts: int, payload: dict[str, Any] | None = None) -> int:
+    """Seconds to wait after failed attempt ``attempts`` (numbered from 1)."""
+    delays = _ladder(work_type, payload)[0]
+    return delays[min(attempts, len(delays)) - 1]
 _POLL_SECONDS = float(os.environ.get("P2_WORKER_POLL_SECONDS", "1.0"))
 _MAX_PDF_PAGES = int(os.environ.get("P2_MAX_PDF_PAGES", "100"))
 _WORKER_CONCURRENCY = max(1, int(os.environ.get("P2_WORKER_CONCURRENCY", "6")))
 _PER_JOURNEY_CONCURRENCY = max(1, int(os.environ.get("P2_PER_JOURNEY_CONCURRENCY", "3")))
 _LEASE_SECONDS = int(os.environ.get("P2_WORKER_LEASE_SECONDS", "600"))
 _LEASE_RENEW_SECONDS = max(5, _LEASE_SECONDS // 3)
-# A page is never failed for taking long (decision 2026-09-30: load is
-# never a failure). While Document Intelligence still has it in hand it is
-# polled, ever more slowly (_reconcile_delay); the file's status task tells
-# the PC after an hour, and the nightly sweep looks again after a day. Only
-# DI's own verdict, or DI no longer knowing the page, fails it.
+# While Document Intelligence still has a page in hand it is polled
+# (_reconcile_delay); DI's own verdict, or DI no longer knowing the page,
+# settles it. Product owner 2026-10-21 (replacing "load is never a failure"
+# of 2026-09-30): a page still not settled 30 minutes after upload is failed
+# (fail_unsettled_pages) and the PC resubmits it.
 # A page the PC or the nightly sweep asked to recover from FAILED is looked
-# up at DI first (_recover_page); a technical extraction failure is left to
-# DI's own nightly reprocessing for this long before the page is uploaded
-# once more.
-_RECOVERY_REUPLOAD_AFTER_SECONDS = 4 * 24 * 3600
+# up at DI first (_recover_page); only a PC's Retry ever sends it again.
 # DI reports PROCESSED before the document-link sync has copied facts into
 # Audit Core. Allow the sync this long before treating "no facts" as a result.
 _FACT_SWEEP_SECONDS = float(os.environ.get("P2_FACT_SWEEP_SECONDS", "30"))
@@ -254,7 +307,7 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
             # looping item eventually dead-letters instead of cycling forever.
             attempts = int(row["attempt_count"] or 0) + (1 if row["reclaimed"] else 0)
             item = _work_item(row, attempts=attempts, token=token)
-            if row["reclaimed"] and attempts >= _MAX_ATTEMPTS:
+            if row["reclaimed"] and attempts >= _max_attempts(str(row["work_type"]), dict(row["payload"] or {})):
                 connection.execute(
                     text(
                         """
@@ -394,6 +447,10 @@ def _complete(engine: Engine, work: WorkItem) -> None:
                 "processed_version": processed,
             },
         )
+        if not stale_after_run:
+            # A step that stopped earlier ran again: its task closes itself
+            # (2026-10-20 re-review, R2).
+            sync_dead_work_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
 
 
 def _reschedule(engine: Engine, work: WorkItem, exc: RescheduleWork) -> None:
@@ -413,6 +470,9 @@ def _reschedule(engine: Engine, work: WorkItem, exc: RescheduleWork) -> None:
                       WHEN :immediate THEN NULL
                       ELSE now() + (:delay_seconds * interval '1 second')
                     END,
+                    -- the step ran and only has to wait: earlier failures no
+                    -- longer count toward its limit (2026-10-20 review)
+                    attempt_count=0,
                     lease_token=NULL,
                     lease_expires_at_utc=NULL,
                     last_error=:last_error,
@@ -474,12 +534,36 @@ def _delay_text(seconds: int) -> str:
     return f"{max(1, seconds // 60)} minute" + ("" if seconds < 120 else "s")
 
 
+def _technical_cause(exc: Exception) -> str:
+    """What failed, in the PC's words, for a fault that trying again can fix
+    (product owner's rule 2026-10-20: say which case it is)."""
+    if isinstance(exc, TransportError) or (
+        isinstance(exc, DiCaptureV2Error) and str(exc.detail).startswith("DI V2 request failed")
+    ):
+        return "Document service didn't respond"
+    if isinstance(exc, DiCaptureV2Error):
+        return "Document service returned an error"
+    if isinstance(exc, HTTPStatusError):
+        return "Document storage returned an error"
+    return "A system problem stopped this page"
+
+
+_ATTEMPT_WORDS = {1: "once", 2: "twice", 3: "3 times (at once, then 10 and 20 minutes later)"}
+
+
 def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
     attempts = work.attempt_count + 1
     retryable = _is_retryable(exc)
-    terminal = (not retryable) or attempts >= _MAX_ATTEMPTS
-    delay = _RETRY_DELAYS_SECONDS[min(attempts, len(_RETRY_DELAYS_SECONDS)) - 1]
-    cause = _plain_cause(exc)
+    terminal = (not retryable) or attempts >= _max_attempts(work.work_type, work.payload)
+    delay = _retry_delay(work.work_type, attempts, work.payload)
+    # A technical fault on a document's own step is told as such once its
+    # three attempts (T0, +10, +20 minutes) are spent (2026-10-21); a
+    # refusal keeps its own reason.
+    cause = (
+        f"{_technical_cause(exc)} — tried {_ATTEMPT_WORDS.get(attempts, f'{attempts} times')}."
+        if retryable and work.work_type in _DOCUMENT_WORK_TYPES
+        else _plain_cause(exc)
+    )
     summary = exception_summary(exc)
     # Stored and shown in the batch view: class + redacted message + where it failed.
     error = summary["exc_type"] + (f": {summary['exc_message']}" if "exc_message" in summary else "")
@@ -523,19 +607,20 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
             },
         )
         if not terminal:
-            if work.work_type == "DOCUMENT_INGEST":
+            # The nightly look-up of a page our setup refused keeps the page
+            # as it is (code and reason) while it retries.
+            if work.work_type == "DOCUMENT_INGEST" and not _is_night_lookup(work.work_type, work.payload):
                 _settle_page(
                     connection,
                     tenant_id=work.tenant_id,
                     queue_id=UUID(work.work_key),
                     status="RETRY_WAIT",
-                    reason=(f"{cause} Retrying automatically in {_delay_text(delay)} (attempt {attempts} of "
-                            f"{_MAX_ATTEMPTS}). You can leave this page and check back later."),
+                    reason=(f"{_technical_cause(exc)} — trying again in {_delay_text(delay)} "
+                            f"(attempt {attempts} of {_max_attempts(work.work_type)}). Nothing to do yet."),
                     last_error=error,
                 )
-                # The PC is told at once: check back in an hour; the same
-                # task turns into "upload this page on its own" if the
-                # retries run out, and closes itself if one succeeds.
+                # The file's task turns into "Document to resubmit" if the
+                # last attempt fails too, and closes itself if it works.
                 sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
             return
         _mark_dead(connection, work, attempts=attempts, retryable=retryable, cause=cause, error=error)
@@ -554,17 +639,57 @@ def _failure_category(exc: Exception) -> str:
 
 
 def _mark_dead(connection, work: WorkItem, *, attempts: int, retryable: bool, cause: str, error: str) -> None:
-    """Terminal outcome for a work item: settle what it was working on, raise the PC's
-    processing-failure task and record the activity."""
-    if work.work_type == "DOCUMENT_INGEST":
+    """Terminal outcome for a work item: settle what it was working on, tell the PC
+    (or, for a background step, the Team Lead) and record the activity. No dead
+    letter is silent (2026-10-20 review)."""
+    if _is_night_lookup(work.work_type, work.payload):
+        # The nightly look-up of a page our setup refused could not reach DI
+        # (2026-10-20 review, S2): the page goes back to FAILED as it was
+        # (its reason and code were kept) and the next night looks again.
+        batch_id = connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_document_queue
+                SET queue_status='FAILED', updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND queue_id=:queue_id AND queue_status='QUEUED'
+                RETURNING batch_id
+                """
+            ),
+            {"tenant_id": work.tenant_id, "queue_id": UUID(work.work_key)},
+        ).scalar_one_or_none()
+        if batch_id is not None:
+            _refresh_batch_status(connection, work.tenant_id, UUID(str(batch_id)))
+        sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
+    elif work.work_type == "PAGE_REREAD":
         _settle_page(
             connection,
             tenant_id=work.tenant_id,
             queue_id=UUID(work.work_key),
             status="FAILED",
-            reason=(f"{cause} " + (f"Not processed after {attempts} attempts. " if retryable else "")
-                    + "Retry the page, remove the upload, or delete this booking."),
+            reason=f"{cause} \"Read again\" could not be sent. Retry the page from the card, or upload it again.",
             last_error=error,
+        )
+        sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
+    elif work.work_type == "BATCH_GROUP":
+        # Grouping stopped (review of #469, 2026-10-21): the pages waiting to
+        # be put together fail, and the file's "Document to resubmit" task
+        # names them -- never a task of its own kind.
+        for page in _fail_grouping(connection, tenant_id=work.tenant_id, batch_id=UUID(work.work_key),
+                                   why="BATCH_GROUP_DEAD"):
+            withdraw_at_di(connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                           queue_id=page["queue_id"], di_document_id=page["di_document_id"],
+                           why=GROUPING_FAILED_CODE)
+        sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
+    elif work.work_type == "DOCUMENT_INGEST":
+        _settle_page(
+            connection,
+            tenant_id=work.tenant_id,
+            queue_id=UUID(work.work_key),
+            status="FAILED",
+            reason=(f"{cause} " + ("Retry the page from the card, or upload it again."
+                                   if retryable else "Retry the page, remove the upload, or delete this booking.")),
+            last_error=error,
+            attempts=attempts,
         )
         sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
     elif work.work_type == "CONTROL_EVALUATE" and work.payload.get("unit"):
@@ -588,6 +713,20 @@ def _mark_dead(connection, work: WorkItem, *, attempts: int, retryable: bool, ca
             {"tenant_id": work.tenant_id, "batch_id": UUID(work.work_key)},
         )
         sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
+    if work.work_type not in ("DOCUMENT_INGEST", "SPLIT_BATCH", "PAGE_REREAD", "BATCH_GROUP"):
+        # A background step (checking DI for results, recomputing the stage,
+        # verifying tasks, evaluating controls) stopped: the Team Lead is told.
+        label = _BACKGROUND_STEP_WORDS.get(work.work_type, work.work_type.replace("_", " ").lower())
+        _raise_dead_work_task(
+            connection, work, task_type="TL_DOCUMENT_STUCK",
+            dedupe_key=f"work-dead:{work.journey_id}:{work.work_type}",
+            title=f"Background step stopped: {label}",
+            description=(f"Audit Core stopped {label} for this booking after {attempts} failed "
+                         f"attempt{'' if attempts == 1 else 's'}. {_BACKGROUND_STEP_EFFECT.get(work.work_type, '')}"
+                         "Use Re-sync on Upload / Edit Documents to start it again; if it stops again, "
+                         "raise it with support (the error is recorded on the work item)."),
+            error=error,
+        )
     record_activity(
         connection,
         tenant_id=work.tenant_id,
@@ -605,6 +744,43 @@ def _mark_dead(connection, work: WorkItem, *, attempts: int, retryable: bool, ca
     )
 
 
+_BACKGROUND_STEP_WORDS = {
+    "JOURNEY_RECONCILE": "checking the document service for this booking's pages",
+    "DOCUMENT_RECONCILE": "checking the document service for this booking's pages",
+    "STAGE_RECOMPUTE": "recomputing this booking's stage",
+    "TASK_VERIFY": "verifying this booking's tasks",
+    "CONTROL_EVALUATE": "evaluating this booking's checks",
+    "DI_DOCUMENT_WITHDRAW": "withdrawing a failed or replaced page from the document service",
+}
+_BACKGROUND_STEP_EFFECT = {
+    "JOURNEY_RECONCILE": "Pages may show as still being read although the document service has finished. ",
+    "DOCUMENT_RECONCILE": "Pages may show as still being read although the document service has finished. ",
+    "STAGE_RECOMPUTE": "The booking's stage may be out of date. ",
+    "CONTROL_EVALUATE": "Some checks may show as not evaluated. ",
+    "DI_DOCUMENT_WITHDRAW": "The document service may still be reading a page Audit Core has already failed or replaced. ",
+}
+
+
+def _raise_dead_work_task(
+    connection, work: WorkItem, *, task_type: str, dedupe_key: str, title: str, description: str, error: str,
+) -> None:
+    """The task that says a step stopped for good (2026-10-20 review: no dead
+    letter is silent). Logged and skipped if the task cannot be raised, so
+    the dead letter itself is still recorded."""
+    try:
+        with connection.begin_nested():
+            raise_or_refresh(
+                connection, tenant_id=work.tenant_id, journey_id=work.journey_id, dedupe_key=dedupe_key,
+                task_type=task_type, source_type="DOCUMENT", source_code="P2_WORK_DEAD_LETTER",
+                title=title, description=description,
+                reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "P2_WORK_DEAD_LETTER",
+                           "workType": work.work_type, "workKey": work.work_key, "error": error[:300]},
+                severity="HIGH", registry=get_registry(),
+            )
+    except Exception:  # the dead letter must still be recorded
+        logger.warning("p2_dead_letter_task_not_raised", **_work_fields(work), exc_info=True)
+
+
 _enqueue = enqueue_work
 
 
@@ -616,6 +792,7 @@ def _settle_page(
     status: str,
     reason: str | None,
     last_error: str | None = None,
+    attempts: int | None = None,
 ) -> UUID | None:
     batch_id = connection.execute(
         text(
@@ -624,9 +801,14 @@ def _settle_page(
             SET queue_status=:status,
                 status_reason=:reason,
                 last_error=COALESCE(:last_error, last_error),
+                -- the attempts made, for the failure report (2026-10-21)
+                attempt_count=COALESCE(:attempts, attempt_count),
                 updated_at_utc=now()
             WHERE tenant_id=:tenant_id AND queue_id=:queue_id
-              AND queue_status <> 'MERGED'
+              -- running work never writes over a page settled meanwhile:
+              -- merged, removed, or failed (by the 30-minute clock among
+              -- others; review of #469, 2026-10-21)
+              AND queue_status NOT IN ('MERGED','FAILED','DEAD_LETTER','CANCELLED')
             RETURNING batch_id
             """
         ),
@@ -636,6 +818,7 @@ def _settle_page(
             "status": status,
             "reason": reason,
             "last_error": last_error,
+            "attempts": attempts,
         },
     ).scalar_one_or_none()
     if batch_id is not None:
@@ -674,7 +857,10 @@ def _single_page_pdf(page) -> bytes:
 def _refuse_duplicate_upload(engine: Engine, work: WorkItem, *, batch_id: UUID, digest: str) -> bool:
     """The same file uploaded again (byte for byte) is refused: the batch is
     cancelled before any page is queued, and the Journey's history says
-    which earlier upload it repeats. True when refused."""
+    which earlier upload it repeats. True when refused. A file some of whose
+    pages failed may be uploaded again whole (the PC's "Document to
+    resubmit", 2026-10-21): its failed pages are replaced by the fresh
+    copies and its pages already read are not sent again (_split_batch)."""
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         earlier = connection.execute(
@@ -683,7 +869,7 @@ def _refuse_duplicate_upload(engine: Engine, work: WorkItem, *, batch_id: UUID, 
                 SELECT batch_id, original_filename, created_at_utc
                 FROM auditcore.p2_upload_batches
                 WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND sha256=:sha256
-                  AND batch_id<>:batch_id AND batch_status NOT IN ('FAILED','CANCELLED')
+                  AND batch_id<>:batch_id AND batch_status NOT IN ('FAILED','PARTIAL_FAILURE','CANCELLED')
                 ORDER BY created_at_utc ASC LIMIT 1
                 """
             ),
@@ -801,8 +987,17 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         _owned(connection, work)
+        # One split at a time per journey (review of #469, 2026-10-21): two
+        # re-uploads of the same failed file arriving together must not both
+        # queue a fresh copy of the same page; the second sees the first's.
+        connection.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
+            {"k": f"p2-split:{work.tenant_id}:{work.journey_id}"},
+        )
         # The same scan already on this Journey (an earlier upload, or an
-        # earlier page of this file) is recorded, shown, and not sent again.
+        # earlier page of this file) is recorded, shown, and not sent again --
+        # unless that copy failed: a failed page, or a page merged into a
+        # document that failed (review of #469), is replaced below.
         already = {
             str(r["page_sha256"]): (int(r["page_number"]), str(r["original_filename"]))
             for r in connection.execute(
@@ -814,6 +1009,10 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                     WHERE q.tenant_id=:tenant_id AND q.journey_id=:journey_id AND q.batch_id<>:batch_id
                       AND q.unit_kind='PAGE' AND q.page_sha256 = ANY(:shas)
                       AND q.queue_status NOT IN ('FAILED','DEAD_LETTER','CANCELLED')
+                      AND NOT (q.queue_status='MERGED' AND EXISTS (
+                          SELECT 1 FROM auditcore.p2_document_queue g
+                          WHERE g.tenant_id=q.tenant_id AND g.queue_id=q.merged_into_queue_id
+                            AND g.queue_status IN ('FAILED','DEAD_LETTER','CANCELLED')))
                     ORDER BY q.page_sha256, q.created_at_utc
                     """
                 ),
@@ -826,6 +1025,7 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
         # superseded, so its file's task closes on its own, and the new page
         # is processed.
         superseded_batches: set[str] = set()
+        fresh_shas = [r["pageSha"] for r in page_records if r["pageSha"] not in already]
         for record in page_records:
             if record["pageSha"] in already:
                 continue
@@ -837,7 +1037,7 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                         updated_at_utc=now()
                     WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND batch_id<>:batch_id
                       AND unit_kind='PAGE' AND page_sha256=:sha AND queue_status IN ('FAILED','DEAD_LETTER')
-                    RETURNING batch_id
+                    RETURNING batch_id, queue_id, di_document_id
                     """
                 ),
                 {"tenant_id": work.tenant_id, "journey_id": work.journey_id, "batch_id": batch["batch_id"],
@@ -846,6 +1046,35 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                             "this copy is replaced.")},
             ).mappings().all():
                 superseded_batches.add(str(row["batch_id"]))
+                withdraw_at_di(connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                               queue_id=row["queue_id"], di_document_id=row["di_document_id"],
+                               why="SUPERSEDED_PAGE")
+        # A failed document made from several pages (a GROUP unit) is replaced
+        # once every one of its pages has come in again (review of #469).
+        for row in connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_document_queue AS g
+                SET queue_status='CANCELLED', last_error='SUPERSEDED_PAGE', status_reason=:reason,
+                    updated_at_utc=now()
+                WHERE g.tenant_id=:tenant_id AND g.journey_id=:journey_id AND g.batch_id<>:batch_id
+                  AND g.unit_kind='GROUP' AND g.queue_status IN ('FAILED','DEAD_LETTER')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM auditcore.p2_document_queue m
+                      WHERE m.tenant_id=g.tenant_id AND m.merged_into_queue_id=g.queue_id
+                        AND m.unit_kind='PAGE' AND NOT (m.page_sha256 = ANY(:shas)))
+                  AND EXISTS (
+                      SELECT 1 FROM auditcore.p2_document_queue m
+                      WHERE m.tenant_id=g.tenant_id AND m.merged_into_queue_id=g.queue_id AND m.unit_kind='PAGE')
+                RETURNING g.batch_id, g.queue_id, g.di_document_id
+                """
+            ),
+            {"tenant_id": work.tenant_id, "journey_id": work.journey_id, "batch_id": batch["batch_id"],
+             "shas": fresh_shas, "reason": f"Uploaded again in {batch['original_filename']}; this copy is replaced."},
+        ).mappings().all():
+            superseded_batches.add(str(row["batch_id"]))
+            withdraw_at_di(connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                           queue_id=row["queue_id"], di_document_id=row["di_document_id"], why="SUPERSEDED_PAGE")
         for superseded_batch in superseded_batches:
             _refresh_batch_status(connection, work.tenant_id, UUID(superseded_batch))
         if superseded_batches:
@@ -1163,16 +1392,20 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
         return
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
-        connection.execute(
+        preparing = connection.execute(
             text(
                 """
                 UPDATE auditcore.p2_document_queue
                 SET queue_status='DI_UPLOAD_PREPARING', updated_at_utc=now()
                 WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+                  AND queue_status NOT IN ('MERGED','FAILED','DEAD_LETTER','CANCELLED')
+                RETURNING queue_id
                 """
             ),
             {"tenant_id": work.tenant_id, "queue_id": queue_id},
-        )
+        ).scalar_one_or_none()
+    if preparing is None:
+        return  # settled meanwhile (failed on the clock, removed): nothing to send
 
     storage = get_p2_document_storage()
     page_payload = storage.get_object(str(row["page_object_key"]))
@@ -1239,6 +1472,11 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
         # on every retry; only a technical failure is worth trying again
         # (2026-10-20: 83 CONFLICT retries on 21 pages in one day).
         business = bool(codes) and codes <= {"CONFLICT", "INVALID_REQUEST", "VALIDATION_ERROR"}
+        if "CONFLICT" in codes and _adopt_stored_upload(
+            engine, work, row, v2_client=v2_client, token=token, context_ref=context_ref, queue_id=queue_id,
+            filename=filename, content_type=content_type,
+        ):
+            return
         raise DiCaptureV2Error(
             status_code=409 if business else 503,
             detail=json.dumps({
@@ -1265,8 +1503,47 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
         document_id=str(di_document_id),
     )
 
+    _record_submitted_page(engine, work, row, queue_id=queue_id, di_document_id=di_document_id,
+                           filename=filename, content_type=content_type)
+
+
+def _record_submitted_page(
+    engine: Engine, work: WorkItem, row: Any, *, queue_id: UUID, di_document_id: UUID, filename: str,
+    content_type: str,
+) -> None:
+    """Record that DI holds this page as ``di_document_id`` and start polling
+    it -- unless the page was settled while it was being sent (failed by
+    the 30-minute clock, removed): then DI's new document is withdrawn at
+    once, so DI does not read a page Audit Core has given up (review of
+    #469, 2026-10-21)."""
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
+        recorded = connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_document_queue
+                SET di_document_id=:document_id,
+                    queue_status='CLASSIFYING',
+                    di_state='STORED',
+                    di_submitted_at_utc=now(),
+                    status_reason=NULL,
+                    updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+                  AND queue_status NOT IN ('MERGED','FAILED','DEAD_LETTER','CANCELLED')
+                RETURNING queue_id
+                """
+            ),
+            {
+                "tenant_id": work.tenant_id,
+                "queue_id": queue_id,
+                "document_id": di_document_id,
+            },
+        ).scalar_one_or_none()
+        if recorded is None:
+            withdraw_at_di(connection, tenant_id=work.tenant_id, journey_id=work.journey_id, queue_id=queue_id,
+                           di_document_id=di_document_id, why="SENT_AFTER_THE_PAGE_WAS_SETTLED")
+            logger.info("p2_sent_page_already_settled", di_document_id=str(di_document_id), **_work_fields(work))
+            return
         connection.execute(
             text(
                 """
@@ -1296,26 +1573,31 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
                 "actor_id": str(row["uploaded_by_actor_id"]),
             },
         )
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.p2_document_queue
-                SET di_document_id=:document_id,
-                    queue_status='CLASSIFYING',
-                    di_state='STORED',
-                    di_submitted_at_utc=now(),
-                    status_reason=NULL,
-                    updated_at_utc=now()
-                WHERE tenant_id=:tenant_id AND queue_id=:queue_id
-                """
-            ),
-            {
-                "tenant_id": work.tenant_id,
-                "queue_id": queue_id,
-                "document_id": di_document_id,
-            },
-        )
         _enqueue_journey_reconcile(connection, work=work)
+
+
+def _adopt_stored_upload(
+    engine: Engine, work: WorkItem, row: Any, *, v2_client: Any, token: str, context_ref: str, queue_id: UUID,
+    filename: str, content_type: str,
+) -> bool:
+    """DI answered CONFLICT for a client upload id Audit Core itself issued:
+    an earlier attempt's file was stored even though its finalize call timed
+    out, and DI is reading it (2026-10-20 review, S7). Adopt that document
+    instead of failing the page. False when DI holds no such document."""
+    for phase in ("BOOKING", "DELIVERY"):
+        listing = v2_client.list_documents(
+            token=token, tenant_id=work.tenant_id, external_context_ref=context_ref, phase=phase,
+        )
+        for item in listing.get("documents") or []:
+            if (str(item.get("clientUploadId")) == str(row["client_upload_id"]) and item.get("documentId")
+                    and str(item.get("state") or "") not in ("RECEIVING", "DELETED")):
+                logger.info("p2_conflict_upload_adopted", di_document_id=str(item["documentId"]),
+                            di_state=item.get("state"), **_work_fields(work))
+                _record_submitted_page(engine, work, row, queue_id=queue_id,
+                                       di_document_id=UUID(str(item["documentId"])),
+                                       filename=filename, content_type=content_type)
+                return True
+    return False
 
 
 def _enqueue_journey_reconcile(connection, *, work: WorkItem, delay_seconds: int = 2) -> None:
@@ -1338,43 +1620,175 @@ def _enqueue_journey_reconcile(connection, *, work: WorkItem, delay_seconds: int
 class PageOutcome:
     status: str
     reason: str | None
+    # What to store as the page's last_error when it settles FAILED (the
+    # failure code); None: DI's failureCode.
+    last_error: str | None = None
+    # How many attempts DI made (its attemptsMade), kept for the failure report.
+    attempts: int | None = None
 
 
 _QUALITY_FAILURE_PREFIX = "DI_QUALITY_"
 _UNREADABLE_FAILURE_CODES = frozenset({"FILE_EMPTY", "INVALID_FILE_CONTENT", "CORRUPT", "UPLOAD_FAILED"})
+
+# Product owner's retry rule (2026-10-21 12:24 IST, replacing the night
+# attempt of 2026-10-20). Document Intelligence makes every retry itself
+# (verigence-di retry_policy.py: T0, T0+10 and T0+20 minutes, then FAILED)
+# and reports, per page, what failed (failureKind: AI / TECHNICAL / DOCUMENT
+# / CONFIGURATION), whether the page passed its upload scan (scanPassed),
+# whether it holds another attempt (nextAttemptAtUtc) and how many attempts
+# it made (attemptsMade). Audit Core never stacks retries of its own on top;
+# a FAILED page raises the PC's "Document to resubmit" task with the reason
+# in plain words, and no file takes more than 30 minutes
+# (fail_unsettled_pages). The only night re-read left is for our own setup
+# (Gemini refused our key or model): the PC is told there is no need to
+# re-upload and the Team Lead is alerted.
+# DI codes for an AI failure that a later attempt can fix (DI's
+# AI_RETRYABLE_FAILURE_CODES).
+_AI_RETRYABLE_CODES = frozenset({
+    "DOCUMENT_AI_RATE_LIMITED", "DOCUMENT_AI_UNAVAILABLE", "DOCUMENT_AI_RESPONSE_INVALID",
+    "CLASSIFICATION_PROVIDER_ERROR", "EXTRACTION_PROVIDER_ERROR",
+})
+# The PC was told: "again after 10 minutes, and again after 20 minutes".
+_AI_RETRYING_REASON = ("AI reading failed — it is tried again 10 and 20 minutes after the first try. "
+                       "Nothing to do now.")
+_TECHNICAL_RETRYING_REASON = ("Document service had a problem with this page — it is tried again 10 and 20 "
+                              "minutes after the first try. Nothing to do yet.")
+# A further attempt DI holds for a page whose reading had failed for good: a
+# "Read again" -- one attempt (2026-10-20 re-review).
+_READ_AGAIN_REASON = "Being read again (one attempt). Nothing to do now."
+_SETUP_NIGHT_RUNNING_REASON = "Our setup problem — being read again now that it is fixed. Nothing to do now."
+_AI_REFUSED_REASON = "AI couldn't read this page — please upload it again."
+_NOT_SCANNED_REASON = "File couldn't be scanned — please reload it."
+# Gemini refused our key or model (2026-10-21): never the PC's to fix.
+_SETUP_REASON = "Our setup problem — will be re-read once fixed; no need to re-upload."
+_CONFIG_REASON = ("Document Intelligence is not set up to read this page on our side. Ask your Team Lead to "
+                  "raise it with support, then retry the page from the card once it is fixed.")
+_DI_GONE_CODE = "DI_DOCUMENT_GONE"
+_DI_GONE_REASON = "The document service no longer holds this page. Please upload it again."
+NOT_READ_IN_TIME_CODE = "NOT_READ_IN_30_MIN"
+NOT_READ_IN_TIME_REASON = "Not read within 30 minutes. Please upload this page again."
+
+
+def _attempts_text(di_item: dict[str, Any]) -> str:
+    """How many times the step was tried, as DI counted it (2026-10-21).
+    One attempt -- or a count DI does not report -- says "tried once": DI
+    refuses a retry that would start more than 25 minutes after it received
+    the page, so a page that failed late (queued behind a burst) fails after
+    one attempt, and "tried again automatically" would be untrue (review of
+    #469, second review)."""
+    attempts = di_item.get("attemptsMade")
+    if isinstance(attempts, int) and attempts > 1:
+        return f"tried {attempts} times (at once, then 10 and 20 minutes later)" if attempts == 3 \
+            else f"tried {attempts} times"
+    return "tried once"
+
+
+def _di_failure_code(di_item: dict[str, Any]) -> str:
+    """The code behind DI's verdict on a page: the reading failure's when
+    reading failed, else the upload / classification failure's."""
+    if str(di_item.get("processingStatus") or "") in ("FAILED", "RETRY_PENDING"):
+        code = di_item.get("processingFailureCode") or di_item.get("failureCode")
+    else:
+        code = di_item.get("failureCode") or di_item.get("processingFailureCode")
+    return str(code or "").upper()
+
+
+def _failed_page_outcome(di_item: dict[str, Any]) -> PageOutcome:
+    """A page DI has FAILED, told to the PC in plain words (product owner's
+    rule 2026-10-21). A DI that does not report failureKind yet keeps the
+    earlier wording."""
+    kind = di_item.get("failureKind")
+    code = _di_failure_code(di_item)
+    attempts = di_item.get("attemptsMade") if isinstance(di_item.get("attemptsMade"), int) else None
+    if kind == "CONFIGURATION":
+        if code == SETUP_FAILURE_CODE:
+            return PageOutcome("FAILED", _SETUP_REASON, code, attempts)
+        return PageOutcome("FAILED", _CONFIG_REASON, code or None, attempts)
+    if kind == "AI":
+        if di_item.get("scanPassed") is not True:
+            return PageOutcome("FAILED", _NOT_SCANNED_REASON, code or None, attempts)
+        if code in _AI_RETRYABLE_CODES:
+            return PageOutcome("FAILED", f"AI reading failed — {_attempts_text(di_item)}. Please upload this page "
+                                         "again.", code, attempts)
+        return PageOutcome("FAILED", _AI_REFUSED_REASON, code or None, attempts)
+    if kind == "TECHNICAL":
+        return PageOutcome("FAILED", f"Document service couldn't process this page — {_attempts_text(di_item)}. "
+                                     "Retry the page from the card, or upload it again.", code or None, attempts)
+    return PageOutcome("FAILED", _di_failure_reason(di_item), code or None, attempts)
+
+
+def _in_hand_reason(di_item: dict[str, Any] | None) -> str | None:
+    """Why a page DI still has in hand is waiting, when an attempt already
+    failed and DI has scheduled the next."""
+    kind = (di_item or {}).get("failureKind")
+    if (di_item or {}).get("inNightAttempt"):
+        return _SETUP_NIGHT_RUNNING_REASON
+    if (di_item or {}).get("nextAttemptAtUtc") and str((di_item or {}).get("processingStatus") or "") == "FAILED":
+        # DI's retries leave the document RETRY_PENDING; a document still
+        # FAILED with an attempt queued is a Read again.
+        return _READ_AGAIN_REASON
+    if kind == "AI":
+        return _AI_RETRYING_REASON
+    if kind == "TECHNICAL":
+        return _TECHNICAL_RETRYING_REASON
+    return None
+
+
+def _in_hand_state(di_item: dict[str, Any]) -> str:
+    return "EXTRACTING" if str(di_item.get("state") or "") == "CLASSIFIED" else "CLASSIFYING"
 
 
 def recovery_decision(
     *,
     di_item: dict[str, Any] | None,
     marker: str,
-    submitted_at: datetime | None,
-    now: datetime,
+    submitted_at: datetime | None = None,
+    now: datetime | None = None,
 ) -> str:
     """What to do with a page the PC (marker "r") or the nightly sweep
     (marker "n") asked to recover, given what Document Intelligence holds
     for it: a page state to poll from ("SYNCING_TO_AUDIT_CORE" when DI has
     read it, so the worker copies; "EXTRACTING" or "CLASSIFYING" while DI
-    still has it in hand), "REUPLOAD" when DI has given it up or no longer
-    knows it, or "LEAVE" for the nightly sweep meeting a technical
-    extraction failure DI's own nightly reprocessing is still going to
-    retry (for _RECOVERY_REUPLOAD_AFTER_SECONDS after submission)."""
-    if di_item is None:
-        return "REUPLOAD"
-    state = str(di_item.get("state") or "")
-    processing = str(di_item.get("processingStatus") or "")
-    if state in ("FAILED", "DELETED"):
+    still has it in hand), "REUPLOAD" (Retry only) when DI has given it up or
+    no longer knows it, "REREAD" for a PC's Retry of a page our setup
+    refused that DI had identified (one more reading of the copy DI holds),
+    "LEAVE" for a page our setup refused whose night re-read is still to
+    come, "TELL_PC" for the nightly look-up meeting a failure no attempt is
+    left for, or "GONE" for the nightly look-up of a page DI no longer
+    holds. The nightly look-up never sends a page again (2026-10-21; review
+    of #469: its last REUPLOAD path is gone too) -- a failed page is the
+    PC's to resubmit. ``submitted_at`` and ``now`` are no longer used."""
+    del submitted_at, now
+    state = str((di_item or {}).get("state") or "")
+    processing = str((di_item or {}).get("processingStatus") or "")
+    failed = state == "FAILED" or (state == "CLASSIFIED" and processing == "FAILED")
+    if di_item is not None and failed and di_item.get("nextAttemptAtUtc"):
+        # DI holds another attempt, queued or running (the night re-read, a
+        # Read again): poll and copy its result, never tell the PC the page
+        # failed (2026-10-20 review, B1).
+        return _in_hand_state(di_item)
+    if marker == "n":
+        if di_item is None or state == "DELETED":
+            return "GONE"
+        if failed:
+            if (di_item.get("failureKind") == "CONFIGURATION" and di_item.get("retryTonight")
+                    and di_item.get("scanPassed") is True):
+                return "LEAVE"
+            return "TELL_PC"
+    elif di_item is None or state in ("FAILED", "DELETED"):
+        if failed and di_item is not None and di_item.get("failureKind") == "CONFIGURATION":
+            # Retry after the AI credentials were fixed (2026-10-20 re-review,
+            # R4): one more reading of the document DI holds, never a second
+            # upload stacked on DI's night re-read. A page refused while being
+            # identified keeps waiting for it (final check F1; the API
+            # refuses this Retry already).
+            return "LEAVE"
         return "REUPLOAD"
     if state == "CLASSIFIED":
         if processing == "PROCESSED":
             return "SYNCING_TO_AUDIT_CORE"
         if processing == "FAILED":
-            code = str(di_item.get("failureCode") or "").upper()
-            final = code.startswith(_QUALITY_FAILURE_PREFIX) or code in _UNREADABLE_FAILURE_CODES
-            if final or marker != "n":
-                return "REUPLOAD"
-            age = (now - submitted_at).total_seconds() if submitted_at else float("inf")
-            return "REUPLOAD" if age > _RECOVERY_REUPLOAD_AFTER_SECONDS else "LEAVE"
+            return "REREAD" if di_item is not None and di_item.get("failureKind") == "CONFIGURATION" else "REUPLOAD"
         return "EXTRACTING"
     return "CLASSIFYING"
 
@@ -1409,29 +1823,55 @@ def _recover_page(engine: Engine, work: WorkItem, row: dict[str, Any]) -> None:
         di_processing_status=(di_item or {}).get("processingStatus"),
         decision=decision,
     )
+    if decision == "REUPLOAD" and di_item is not None and str(di_item.get("state") or "") != "DELETED":
+        # The page is sent again as a new DI document: the old one is deleted
+        # first (as a retired fragment is), so no night attempt can revive it
+        # and leave the journey with two documents for one page (final check
+        # F1, 2026-10-21). A failure here fails the look-up, which retries.
+        v2_client.delete_document(
+            token=token, tenant_id=work.tenant_id, external_context_ref=context_ref,
+            document_id=str(row["di_document_id"]),
+        )
+        logger.info("p2_page_recovery_old_document_deleted", di_document_id=str(row["di_document_id"]),
+                    **_work_fields(work))
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
-        if decision == "REUPLOAD":
+        if decision == "REREAD":
+            request_page_reread(
+                connection, tenant_id=work.tenant_id, journey_id=work.journey_id, queue_id=queue_id,
+                requested_by=str(work.payload.get("uploadedBy") or "SYSTEM"), correlation_id=work.correlation_id,
+            )
+        elif decision == "REUPLOAD":
             requeue_page_for_ingest(
                 connection, tenant_id=work.tenant_id, journey_id=work.journey_id, queue_id=queue_id,
                 client_upload_id=str(row["client_upload_id"]), marker=marker,
                 requested_by=str(work.payload.get("uploadedBy") or "SYSTEM"), correlation_id=work.correlation_id,
             )
-        elif decision == "LEAVE":
+        elif decision in ("LEAVE", "TELL_PC", "GONE"):
+            # Settled FAILED either way, with DI's reason; the file's resubmit
+            # task says so (and that there is no need to re-upload when it is
+            # our setup). A page DI no longer holds is the PC's to resubmit:
+            # the nightly look-up never sends it again (review of #469).
+            outcome = (PageOutcome("FAILED", _DI_GONE_REASON, _DI_GONE_CODE) if decision == "GONE"
+                       else _failed_page_outcome(di_item or {}))
             _settle_page(
                 connection, tenant_id=work.tenant_id, queue_id=queue_id, status="FAILED",
-                reason=_di_failure_reason(di_item),
+                reason=outcome.reason, last_error=outcome.last_error or "DI_FAILED", attempts=outcome.attempts,
             )
+            sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
         else:
+            # DI has the page in hand or has read it: poll and copy.
             connection.execute(
                 text(
                     """
                     UPDATE auditcore.p2_document_queue
-                    SET queue_status=:status, status_reason=NULL, updated_at_utc=now()
+                    SET queue_status=:status, status_reason=:reason, last_error=NULL, updated_at_utc=now()
                     WHERE tenant_id=:tenant_id AND queue_id=:queue_id
+                      AND queue_status NOT IN ('MERGED','FAILED','DEAD_LETTER','CANCELLED')
                     """
                 ),
-                {"tenant_id": work.tenant_id, "queue_id": queue_id, "status": decision},
+                {"tenant_id": work.tenant_id, "queue_id": queue_id, "status": decision,
+                 "reason": _in_hand_reason(di_item) if decision != "SYNCING_TO_AUDIT_CORE" else None},
             )
             _enqueue_journey_reconcile(connection, work=work)
 
@@ -1439,13 +1879,16 @@ def _recover_page(engine: Engine, work: WorkItem, row: dict[str, Any]) -> None:
 def _di_failure_reason(di_item: dict[str, Any] | None) -> str:
     """Why the document service failed a page, as the PC should read it: a
     scan-quality rejection is final and needs a re-scan, not a retry."""
-    code = str((di_item or {}).get("failureCode") or "").upper()
+    code = _di_failure_code(di_item or {})
     detail = str((di_item or {}).get("failureDetail") or "").strip().rstrip(".")
     if code.startswith(_QUALITY_FAILURE_PREFIX):
         return (f"Page rejected: {detail or 'it did not pass the scan quality check'}. "
                 "Re-scan this page and upload it again; retrying will not help.")
     if code in _UNREADABLE_FAILURE_CODES:
-        return f"The file could not be read{': ' + detail if detail else ''}. Upload it again."
+        # The file failed DI's upload scan (2026-10-20 wording).
+        return f"{_NOT_SCANNED_REASON[:-1]}{' (' + detail + ')' if detail else ''}."
+    if code == "DOCUMENT_AI_CONTENT_BLOCKED":
+        return "AI declined to read this page's content — check the page and upload it again."
     return "Document Intelligence could not read this page. Retry or re-upload it." + (f" ({detail})" if detail else "")
 
 
@@ -1492,7 +1935,10 @@ def classify_page_outcome(
     if state == "DELETED":
         return PageOutcome("CANCELLED", "The page was removed from Document Intelligence.")
     if state == "FAILED" or processing == "FAILED":
-        return PageOutcome("FAILED", _di_failure_reason(di_item))
+        if di_item.get("nextAttemptAtUtc"):
+            # DI has another attempt queued or running (2026-10-20 review, B1).
+            return PageOutcome(_in_hand_state(di_item), _in_hand_reason(di_item))
+        return _failed_page_outcome(di_item)
     if state == "UNKNOWN":
         # Docket covers, letters, e-mails, printouts: evidence, never a blocker.
         return PageOutcome(
@@ -1515,8 +1961,8 @@ def classify_page_outcome(
             # going to read it: settle it now rather than show "reading"
             # for ever (seen live 2026-10-01, a file stuck for 12 hours).
             return PageOutcome("SUPPORTING", _NOT_QUEUED_REASON)
-        return PageOutcome("EXTRACTING", None)
-    return PageOutcome("CLASSIFYING", None)
+        return PageOutcome("EXTRACTING", _in_hand_reason(di_item))
+    return PageOutcome("CLASSIFYING", _in_hand_reason(di_item))
 
 
 def _copy_page_facts(
@@ -2070,6 +2516,21 @@ def _group_batch(engine: Engine, work: WorkItem) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         _owned(connection, work)
+        # Grouping may have been failed on the clock while the pages were
+        # being merged (fail_unsettled_pages): then nothing is written.
+        still_grouping = connection.execute(
+            text(
+                """
+                SELECT 1 FROM auditcore.p2_upload_batches
+                WHERE tenant_id=:tenant_id AND batch_id=:batch_id AND grouping_status IN ('GROUPING','PENDING')
+                FOR UPDATE
+                """
+            ),
+            {"tenant_id": work.tenant_id, "batch_id": batch_id},
+        ).scalar_one_or_none()
+        if still_grouping is None:
+            logger.info("p2_grouping_already_settled", **_work_fields(work))
+            return
         summary = []
         for document in grouped:
             key, digest = merged_keys[document.page_numbers]
@@ -2131,7 +2592,8 @@ def _group_batch(engine: Engine, work: WorkItem) -> None:
                     SET queue_status='MERGED', merged_into_queue_id=:group_id,
                         status_reason=:reason, updated_at_utc=now()
                     WHERE tenant_id=:tenant_id AND batch_id=:batch_id AND unit_kind='PAGE'
-                      AND page_number = ANY(:page_numbers) AND queue_status <> 'MERGED'
+                      AND page_number = ANY(:page_numbers)
+                      AND queue_status NOT IN ('MERGED','FAILED','DEAD_LETTER','CANCELLED')
                     """
                 ),
                 {
@@ -2276,11 +2738,13 @@ def _reconcile_page(
                 di_processing_status=:di_processing_status,
                 di_processed_seen_at_utc=:processed_seen_at,
                 last_error=COALESCE(:failure_code, last_error),
+                attempt_count=COALESCE(:attempts, attempt_count),
                 updated_at_utc=now()
             WHERE tenant_id=:tenant_id AND queue_id=:queue_id
               -- grouping may merge the page while this reconcile runs: a
-              -- merged page is final and never gets a stale DI state back
-              AND queue_status <> 'MERGED'
+              -- merged page is final and never gets a stale DI state back;
+              -- nor does a page the 30-minute clock failed meanwhile
+              AND queue_status NOT IN ('MERGED','FAILED','DEAD_LETTER','CANCELLED')
               AND (
                 queue_status IS DISTINCT FROM :status
                 OR status_reason IS DISTINCT FROM :reason
@@ -2306,7 +2770,11 @@ def _reconcile_page(
             "di_state": (di_item or {}).get("state"),
             "di_processing_status": (di_item or {}).get("processingStatus"),
             "processed_seen_at": processed_seen_at,
-            "failure_code": (di_item or {}).get("failureCode") if outcome.status == "FAILED" else None,
+            "failure_code": (
+                (outcome.last_error or (di_item or {}).get("failureCode")) if outcome.status == "FAILED" else None
+            ),
+            # How many attempts DI made, for the failure report (2026-10-21).
+            "attempts": outcome.attempts if outcome.status == "FAILED" else None,
         },
     )
 
@@ -2350,7 +2818,10 @@ def _page_reread(engine: Engine, work: WorkItem) -> None:
             ),
             {"tenant_id": work.tenant_id, "queue_id": queue_id},
         ).mappings().one_or_none()
-    if row is None or row["queue_status"] in ("MERGED", "CANCELLED", "READY") or row["di_document_id"] is None:
+    # A failed page is queued again by the request itself (request_page_reread);
+    # one still FAILED here was failed again meanwhile (the 30-minute clock).
+    if (row is None or row["queue_status"] in ("MERGED", "CANCELLED", "READY", "FAILED", "DEAD_LETTER")
+            or row["di_document_id"] is None):
         logger.info("p2_page_reread_skipped", queue_id=str(queue_id),
                     queue_status=row["queue_status"] if row else None, **_work_fields(work))
         return
@@ -2386,7 +2857,7 @@ def _page_reread(engine: Engine, work: WorkItem) -> None:
                     SET queue_status=:status, status_reason=NULL, last_error=NULL,
                         di_submitted_at_utc=now(), updated_at_utc=now()
                     WHERE tenant_id=:tenant_id AND queue_id=:queue_id
-                      AND queue_status NOT IN ('MERGED', 'CANCELLED', 'READY')
+                      AND queue_status NOT IN ('MERGED', 'CANCELLED', 'READY', 'FAILED', 'DEAD_LETTER')
                     """
                 ),
                 {"tenant_id": work.tenant_id, "queue_id": queue_id, "status": status},
@@ -2399,6 +2870,37 @@ def _page_reread(engine: Engine, work: WorkItem) -> None:
             correlation_id=work.correlation_id,
         )
         _enqueue_journey_reconcile(connection, work=work, delay_seconds=5)
+
+
+def withdraw_at_di(
+    connection, *, tenant_id: str, journey_id: UUID, queue_id: Any, di_document_id: Any, why: str,
+) -> None:
+    """Queue the deletion of a page's Document Intelligence document: the
+    page was failed on the 30-minute clock, uploaded again (superseded), or
+    DI stored it after Audit Core had already given it up (review of #469,
+    2026-10-21). DI stops working on it and nothing is read twice -- the
+    same deletion _recover_page makes before it sends a page again (F1).
+    A later Retry finds no DI document and sends the page afresh."""
+    if di_document_id is None:
+        return
+    enqueue_work(
+        connection, tenant_id=tenant_id, journey_id=journey_id, work_type=WITHDRAW_WORK_TYPE,
+        work_key=str(di_document_id),
+        payload={"queueId": str(queue_id), "diDocumentId": str(di_document_id), "why": why},
+        correlation_id=None,
+    )
+
+
+def _withdraw_di_document(engine: Engine, work: WorkItem) -> None:
+    """Delete one given-up page's document at DI (withdraw_at_di). DI answers
+    the same whether or not it still holds the document."""
+    context_ref, token, _, _ = _di_context_and_requirements(engine, work)
+    get_di_capture_v2_client().delete_document(
+        token=token, tenant_id=work.tenant_id, external_context_ref=context_ref,
+        document_id=str(work.payload["diDocumentId"]),
+    )
+    logger.info("p2_di_document_withdrawn", di_document_id=str(work.payload["diDocumentId"]),
+                queue_id=str(work.payload.get("queueId")), why=work.payload.get("why"), **_work_fields(work))
 
 
 def _legacy_document_reconcile(engine: Engine, work: WorkItem) -> None:
@@ -2653,19 +3155,22 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     return {**settled, "transitions": transitions}
 
 
-# A page still not settled this long after its last change is re-driven
-# once by the nightly sweep; after that only the PC's own Retry moves it.
+# A page still in flight this long after its last change is reconciled by
+# the nightly sweep (a status read, never a new attempt: 2026-10-20).
 _NIGHTLY_SWEEP_AFTER_SECONDS = int(os.environ.get("P2_NIGHTLY_SWEEP_AFTER_SECONDS", str(24 * 60 * 60)))
 
 
 def queue_nightly_upload_sweep(connection, *, tenant_id: str, now: datetime | None = None) -> dict[str, int]:
-    """Every night, give every page that has been stuck for a day one more
-    go, then refresh the file's status task so the PC sees the morning
-    state: a failed page (other than a scan-quality rejection, which a
-    retry cannot fix) is recovered through what Document Intelligence
-    already holds for it (_recover_page), and sent again only if DI gave it
-    up, once; a page still in flight after a day is reconciled so it settles
-    one way or the other. Safe to call more than once."""
+    """Every night, look again at every page our setup refused (Gemini
+    refused our key or model; DI re-reads those once that night), then
+    refresh the file's tasks so the PC sees the morning state, and reconcile
+    any page still in flight after a day so it settles one way or the other.
+    Safe to call more than once.
+
+    Product owner's rule (2026-10-21): a failed page is never sent again by
+    the sweep; it is the PC's to resubmit (their task says so). A page our
+    setup refused is looked up at DI (_recover_page): copied when DI's night
+    re-read read it, left while that re-read is still to come."""
     now = now or datetime.now(UTC)
     cutoff = now - timedelta(seconds=_NIGHTLY_SWEEP_AFTER_SECONDS)
     failed = connection.execute(
@@ -2674,12 +3179,10 @@ def queue_nightly_upload_sweep(connection, *, tenant_id: str, now: datetime | No
             SELECT queue_id, journey_id, client_upload_id
             FROM auditcore.p2_document_queue
             WHERE tenant_id=:t AND queue_status IN ('FAILED','DEAD_LETTER')
-              AND updated_at_utc < :cutoff
-              AND COALESCE(last_error, '') NOT LIKE 'DI_QUALITY_%'
-              AND client_upload_id NOT LIKE '%~n%'
+              AND last_error = :setup AND di_document_id IS NOT NULL
             """
         ),
-        {"t": tenant_id, "cutoff": cutoff},
+        {"t": tenant_id, "setup": SETUP_FAILURE_CODE},
     ).mappings().all()
     journeys: set[UUID] = set()
     for row in failed:
@@ -2915,6 +3418,7 @@ def process_work(engine: Engine, work: WorkItem) -> None:
         "JOURNEY_RECONCILE": _journey_reconcile,
         "PAGE_REREAD": _page_reread,
         "BATCH_GROUP": _group_batch,
+        WITHDRAW_WORK_TYPE: _withdraw_di_document,
         "STAGE_RECOMPUTE": _stage_recompute,
         "TASK_VERIFY": _task_verify,
         "CONTROL_EVALUATE": _control_evaluate,
@@ -2979,7 +3483,225 @@ def _fact_sweep(engine: Engine, tenant_id: str) -> int:
 
 
 _last_sweep_at: dict[str, float] = {}
+# A cache only: the durable claim is p2_scheduled_runs (claim_scheduled_run).
 _last_nightly_review: dict[str, str] = {}
+_rollout_done: set[str] = set()
+_last_watchdog_at: dict[str, float] = {}
+_WATCHDOG_SECONDS = 60
+_RETRY_POLICY_RUN = "RETRY_POLICY_2026_10_21"
+_ROLLOUT_REASON = ("Retrying now (the automatic retries were shortened to three attempts within 20 minutes). "
+                   "Nothing to do yet.")
+
+
+def apply_retry_policy_rollout(connection, *, tenant_id: str) -> int | None:
+    """One-time deploy step of the retry rule (2026-10-20 review, S5), claimed
+    durably so it runs once per tenant: a page or upload waiting on an older,
+    longer ladder is retried now, under the rule of 2026-10-21 (three
+    attempts within 20 minutes), with a reason that says so. Returns how many
+    waits were pulled forward, or None when the step already ran."""
+    if not claim_scheduled_run(connection, tenant_id=tenant_id, run_name=_RETRY_POLICY_RUN, run_key="rollout",
+                               claimed_by=_WORKER_ID):
+        return None
+    pulled = connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_work_queue
+            SET next_attempt_at_utc=now(), updated_at_utc=now()
+            WHERE tenant_id=:t AND work_type IN ('DOCUMENT_INGEST','SPLIT_BATCH')
+              AND work_status='RETRY_WAIT'
+            RETURNING work_type, work_key
+            """
+        ),
+        {"t": tenant_id},
+    ).mappings().all()
+    pages = [UUID(r["work_key"]) for r in pulled if r["work_type"] == "DOCUMENT_INGEST"]
+    if pages:
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_document_queue
+                SET status_reason=:reason, updated_at_utc=now()
+                WHERE tenant_id=:t AND queue_id = ANY(:pages) AND queue_status='RETRY_WAIT'
+                """
+            ),
+            {"t": tenant_id, "pages": pages, "reason": _ROLLOUT_REASON},
+        )
+    return len(pulled)
+
+
+# Product owner, 2026-10-21: "No file should take more than 30 mins". A page
+# (or a file not yet split into pages) still not settled 30 minutes after it
+# was uploaded -- or after a person's Retry / Read again restarted its clock
+# -- is failed, polling included, and the PC is asked to resubmit it. A page
+# Document Intelligence has read (SYNCING_TO_AUDIT_CORE: Audit Core is
+# copying its values) counts as read.
+READ_CEILING = timedelta(minutes=30)
+# Grouping (review of #469, 2026-10-21): the pages of one document are put
+# together only once every page of the file is identified. That gets no extra
+# time: a document made by grouping is bound by the same 30 minutes from the
+# upload ("No file should take more than 30 mins"), so a file never waits
+# longer than that before it is read or failed and resubmitted. (An earlier
+# draft gave grouping 40 minutes; the independent review found that broke the
+# rule.) GROUPING_CEILING stays a named constant so the rule is read in one
+# place, and is tied to READ_CEILING so the two cannot drift apart.
+GROUPING_CEILING = READ_CEILING
+_UNSETTLED_PAGE_STATES = tuple(s for s in _PAGE_ACTIVE_STATES if s != "SYNCING_TO_AUDIT_CORE")
+_UNSETTLED_BATCH_STATES = ("AWAITING_UPLOAD", "UPLOADED", "SPLITTING")
+GROUPING_FAILED_CODE = "GROUPING_FAILED"
+GROUPING_FAILED_REASON = ("The pages of this document could not be put together and read. "
+                          "Please upload the file again.")
+
+
+def _fail_grouping(connection, *, tenant_id: str, batch_id: UUID, why: str) -> list[dict[str, Any]]:
+    """Grouping of a file stopped (it ran out of time, or its work stopped):
+    the pages that were waiting to be put together into one document -- a
+    type only ever read whole, identified but not read -- are FAILED, so the
+    file's "Document to resubmit" task names them (review of #469). Returns
+    the pages failed."""
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_upload_batches
+            SET grouping_status='FAILED', updated_at_utc=now()
+            WHERE tenant_id=:t AND batch_id=:b AND grouping_status IN ('PENDING','GROUPING')
+            """
+        ),
+        {"t": tenant_id, "b": batch_id},
+    )
+    pages = connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status='FAILED', status_reason=:reason, last_error=:code, updated_at_utc=now()
+            WHERE tenant_id=:t AND batch_id=:b AND unit_kind='PAGE' AND queue_status='SUPPORTING'
+              AND type_overridden_by_actor_id IS NULL AND classified_document_type = ANY(:types)
+            RETURNING queue_id, journey_id, batch_id, di_document_id, last_error
+            """
+        ),
+        {"t": tenant_id, "b": batch_id, "reason": GROUPING_FAILED_REASON, "code": GROUPING_FAILED_CODE,
+         "types": sorted(read_once_di_types(get_registry()))},
+    ).mappings().all()
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_work_queue
+            SET work_status='CANCELLED', next_attempt_at_utc=NULL, last_error=:why, updated_at_utc=now()
+            WHERE tenant_id=:t AND work_type='BATCH_GROUP' AND work_key=:k AND work_status IN ('PENDING','RETRY_WAIT')
+            """
+        ),
+        {"t": tenant_id, "k": str(batch_id), "why": why},
+    )
+    _refresh_batch_status(connection, tenant_id, batch_id)
+    return [dict(r) for r in pages]
+
+
+def fail_unsettled_pages(connection, *, tenant_id: str, now: datetime | None = None) -> int:
+    """The 30-minute ceiling (product owner 2026-10-21; review of #469).
+
+    - Every page still not settled 30 minutes after its clock started is
+      FAILED with "Not read within 30 minutes" (a page our setup refused
+      keeps that reason: the night re-read of it is what ran out of time).
+      A document made by grouping several pages gets the same 30 minutes
+      from the upload (GROUPING_CEILING is READ_CEILING).
+    - Every file not uploaded or split into pages within 30 minutes is
+      FAILED; grouping not done within 30 minutes fails the pages that
+      waited for it (_fail_grouping).
+    - Their pending send / read-again / split / grouping work is cancelled,
+      and the DI document of every page failed here is withdrawn (deleted at
+      DI: it stops reading it, nothing is read twice) -- except a page our
+      setup refused, which DI re-reads once at night.
+    - Work already running never writes over these FAILED pages (every page
+      write from running work is guarded); a page it sends to DI meanwhile
+      is withdrawn at once (_record_submitted_page).
+    - The file's resubmit task is raised for the PC.
+    Returns the number of pages and files failed."""
+    now = now or datetime.now(UTC)
+    cutoff = now - READ_CEILING
+    group_cutoff = now - GROUPING_CEILING
+    pages = [dict(r) for r in connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue AS q
+            SET queue_status='FAILED',
+                status_reason=CASE WHEN q.last_error = :setup AND q.status_reason IS NOT NULL
+                                   THEN q.status_reason ELSE :reason END,
+                last_error=CASE WHEN q.last_error = :setup THEN q.last_error ELSE :code END,
+                next_attempt_at_utc=NULL,
+                updated_at_utc=now()
+            FROM auditcore.p2_upload_batches AS b
+            WHERE q.tenant_id=:t AND b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
+              AND q.queue_status = ANY(:states)
+              AND (
+                (q.read_clock_started_at_utc IS NOT NULL AND q.read_clock_started_at_utc < :cutoff)
+                OR (q.read_clock_started_at_utc IS NULL AND q.unit_kind <> 'GROUP' AND b.created_at_utc < :cutoff)
+                OR (q.read_clock_started_at_utc IS NULL AND q.unit_kind = 'GROUP' AND b.created_at_utc < :group_cutoff)
+              )
+            RETURNING q.queue_id, q.journey_id, q.batch_id, q.di_document_id, q.last_error
+            """
+        ),
+        {"t": tenant_id, "states": list(_UNSETTLED_PAGE_STATES), "cutoff": cutoff, "group_cutoff": group_cutoff,
+         "setup": SETUP_FAILURE_CODE, "reason": NOT_READ_IN_TIME_REASON, "code": NOT_READ_IN_TIME_CODE},
+    ).mappings().all()]
+    files = connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_upload_batches
+            SET batch_status='FAILED',
+                failure_reason=CASE WHEN batch_status='AWAITING_UPLOAD' THEN :not_uploaded ELSE :not_split END,
+                updated_at_utc=now()
+            WHERE tenant_id=:t AND batch_status = ANY(:states) AND page_count=0 AND created_at_utc < :cutoff
+            RETURNING batch_id, journey_id
+            """
+        ),
+        {"t": tenant_id, "states": list(_UNSETTLED_BATCH_STATES), "cutoff": cutoff,
+         "not_uploaded": FILE_NOT_UPLOADED_IN_TIME_REASON, "not_split": FILE_NOT_SPLIT_IN_TIME_REASON},
+    ).mappings().all()
+    late_groupings = connection.execute(
+        text(
+            """
+            SELECT batch_id, journey_id FROM auditcore.p2_upload_batches
+            WHERE tenant_id=:t AND grouping_status IN ('PENDING','GROUPING') AND created_at_utc < :cutoff
+            FOR UPDATE SKIP LOCKED
+            """
+        ),
+        {"t": tenant_id, "cutoff": group_cutoff},
+    ).mappings().all()
+    grouping_pages: list[dict[str, Any]] = []
+    for batch in late_groupings:
+        grouping_pages += _fail_grouping(connection, tenant_id=tenant_id, batch_id=UUID(str(batch["batch_id"])),
+                                         why=NOT_READ_IN_TIME_CODE)
+    if not pages and not files and not late_groupings:
+        return 0
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_work_queue
+            SET work_status='CANCELLED', next_attempt_at_utc=NULL, last_error=:why, updated_at_utc=now()
+            WHERE tenant_id=:t AND work_status IN ('PENDING','RETRY_WAIT')
+              AND ((work_type IN ('DOCUMENT_INGEST','PAGE_REREAD') AND work_key = ANY(:pages))
+                   OR (work_type IN ('SPLIT_BATCH','BATCH_GROUP') AND work_key = ANY(:files)))
+            """
+        ),
+        {"t": tenant_id, "why": NOT_READ_IN_TIME_CODE,
+         "pages": [str(r["queue_id"]) for r in pages], "files": [str(r["batch_id"]) for r in files]},
+    )
+    for batch_id in dict.fromkeys(UUID(str(r["batch_id"])) for r in pages):
+        _refresh_batch_status(connection, tenant_id, batch_id)
+    for row in [*pages, *grouping_pages]:
+        if str(row["last_error"] or "") != SETUP_FAILURE_CODE:
+            withdraw_at_di(connection, tenant_id=tenant_id, journey_id=UUID(str(row["journey_id"])),
+                           queue_id=row["queue_id"], di_document_id=row["di_document_id"],
+                           why=NOT_READ_IN_TIME_CODE)
+    journeys = dict.fromkeys(UUID(str(row["journey_id"])) for row in [*pages, *files, *late_groupings])
+    for row in [*pages, *grouping_pages]:
+        record_activity(
+            connection, tenant_id=tenant_id, journey_id=UUID(str(row["journey_id"])),
+            event_type="PAGE_NOT_READ_IN_TIME", subject_type="DOCUMENT_PAGE", subject_id=str(row["queue_id"]),
+            details={"ceilingMinutes": 30}, correlation_id=None,
+        )
+    for journey_id in journeys:
+        sync_processing_failure_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return len(pages) + len(files) + len(grouping_pages)
 
 
 def _nightly_review_due(tenant_id: str, now: datetime | None = None) -> str | None:
@@ -3011,25 +3733,50 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
             logger.info("p2_price_variance_backfilled", tenant_id=tenant_id, journeys=filled)
     except Exception:
         logger.warning("p2_price_variance_backfill_failed", tenant_id=tenant_id, exc_info=True)
+    if tenant_id not in _rollout_done:
+        try:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                pulled = apply_retry_policy_rollout(connection, tenant_id=tenant_id)
+            _rollout_done.add(tenant_id)
+            if pulled is not None:
+                logger.info("p2_retry_policy_rollout", tenant_id=tenant_id, retries_pulled_forward=pulled)
+        except Exception:
+            logger.warning("p2_retry_policy_rollout_failed", tenant_id=tenant_id, exc_info=True)
+    if now - _last_watchdog_at.get(tenant_id, 0.0) >= _WATCHDOG_SECONDS:
+        _last_watchdog_at[tenant_id] = now
+        try:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                failed = fail_unsettled_pages(connection, tenant_id=tenant_id)
+            if failed:
+                logger.info("p2_not_read_in_time", tenant_id=tenant_id, pages=failed)
+        except Exception:
+            logger.warning("p2_watchdog_failed", tenant_id=tenant_id, exc_info=True)
     due = _nightly_review_due(tenant_id)
     if due is None:
         return
     # Re-run the Delivery checks for every delivery in progress: the
     # time-based checks fire without a document event. Idempotent per night.
+    # The nightly SKU retry is switched off (product owner, 2026-10-22): SKU
+    # is run on demand from Administration > Run SKU Resolution.
     from audit_core.uc03_p2_audit_rules import (
         queue_nightly_review,
-        queue_nightly_sku_retry,
     )
 
     try:
         with engine.begin() as connection:
             set_tenant_context(connection, tenant_id)
+            # Claimed durably with the work it guards (2026-10-20 review): a
+            # worker restart later the same night never runs the night again.
+            if not claim_scheduled_run(connection, tenant_id=tenant_id, run_name="P2_NIGHTLY_REVIEW",
+                                       run_key=due, claimed_by=_WORKER_ID):
+                _last_nightly_review[tenant_id] = due
+                return
             queued = queue_nightly_review(connection, tenant_id=tenant_id)
-            sku_retries = queue_nightly_sku_retry(connection, tenant_id=tenant_id)
             swept = queue_nightly_upload_sweep(connection, tenant_id=tenant_id)
         _last_nightly_review[tenant_id] = due
-        logger.info("p2_nightly_review_queued", tenant_id=tenant_id, night=due, journeys=queued,
-                    sku_retries=sku_retries, **swept)
+        logger.info("p2_nightly_review_queued", tenant_id=tenant_id, night=due, journeys=queued, **swept)
     except Exception:
         logger.warning("p2_nightly_review_failed", tenant_id=tenant_id, exc_info=True)
 
@@ -3187,9 +3934,21 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
     started from outside by setting AUDIT_CORE_SKU_RUN_TAG on the worker (no
     browser session to expire part-way). Runs once per tag: a restart with
     the same tag does not run it again. Each Journey's outcome is logged
-    (``sku_run_item``) and kept against the run."""
+    (``sku_run_item``) and kept against the run.
+
+    A tag starting "unresolved" leaves every pinned SKU as it is. A tag
+    starting "reresolve" re-checks every SKU under the words-first rules
+    (``reresolve_all_skus``, review 471 B2): a DRY RUN that writes only the
+    run items and one ``sku_reresolve_item`` line per Journey (old SKU ->
+    proposed SKU, basis, words, prices, the task that would be raised),
+    unless the tag contains "-commit" ("reresolve-2026-10-22-commit"), which
+    writes the decisions. Nothing is cleared first; a SKU a PC or Team Lead
+    set is never touched."""
     from audit_core.uc03_backfill_document_sync_producers import (
+        CommitNotAllowed,
         backfill_sku_resolution_for_tenant,
+        check_numbers_text,
+        reresolve_all_skus,
     )
 
     actor = f"worker:{tag}"[:120]
@@ -3204,22 +3963,38 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
             if done:
                 logger.info("sku_run_already_done", tenant_id=tenant_id, tag=tag)
                 continue
-            offset: int | None = 0
-            run_id = None
             result: dict[str, Any] = {}
-            while offset is not None:
-                result = backfill_sku_resolution_for_tenant(
-                    engine, tenant_id=tenant_id, offset=offset, limit=10, run_id=run_id, actor_id=actor,
-                    # A tag starting "unresolved" leaves every pinned SKU as it is.
-                    only_without_sku=tag.lower().startswith("unresolved"),
-                )
-                run_id = result["runId"]
-                offset = result["nextOffset"]
+            if tag.lower().startswith("reresolve"):
+                result = reresolve_all_skus(engine, tenant_id, actor_id=actor, commit="-commit" in tag.lower())
+                run_id = result.get("runId")
+            else:
+                offset: int | None = 0
+                run_id = None
+                while offset is not None:
+                    result = backfill_sku_resolution_for_tenant(
+                        engine, tenant_id=tenant_id, offset=offset, limit=10, run_id=run_id, actor_id=actor,
+                        # A tag starting "unresolved" leaves every pinned SKU as it is.
+                        only_without_sku=tag.lower().startswith("unresolved"),
+                    )
+                    run_id = result["runId"]
+                    offset = result["nextOffset"]
             logger.info(
                 "sku_run_finished", tenant_id=tenant_id, tag=tag, run_id=str(run_id),
                 journeys=result.get("journeysTotal"), with_sku_before=result.get("withSkuBefore"),
                 with_sku_after=result.get("withSkuAfter"), without_sku_after=result.get("withoutSkuAfter"),
                 failed=len(result.get("journeysFailed") or []),
+            )
+        except CommitNotAllowed as refused:
+            # Nothing was written and no run row was made, so the same tag can
+            # be set again once the check is done.
+            logger.warning(
+                "sku_run_refused", tenant_id=tenant_id, tag=tag, code=refused.detail.get("code"),
+                message=(
+                    f"The SKU Apply run '{tag}' was NOT run for this Project and changed nothing: "
+                    f"{refused.detail['message']} {check_numbers_text(refused.detail.get('check'))} "
+                    "Set a 'reresolve-...' tag without '-commit' to run the check, review it, then set the "
+                    "'-commit' tag again within 24 hours."
+                ).strip(),
             )
         except Exception:
             logger.warning("sku_run_failed", tenant_id=tenant_id, tag=tag, exc_info=True)

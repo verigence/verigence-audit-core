@@ -37,7 +37,7 @@ def _failing_inputs(connection, **_kwargs):
 
 
 def test_a_database_error_is_contained_and_escalated(journey, monkeypatch):
-    monkeypatch.setattr(resolution, "_resolution_inputs", _failing_inputs)
+    monkeypatch.setattr(resolution, "_pin_state", _failing_inputs)
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         # Something the caller wrote before resolution ran in the same transaction.
@@ -69,4 +69,4 @@ def test_no_vehicle_model_read_is_a_named_skip(journey):
         result = resolution.sync_model_resolution(
             connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, correlation_id="t",
         )
-    assert result == {"skipped": True, "reason": "no_vehicle_model_read"}
+    assert (result["skipped"], result["reason"]) == (True, "no_vehicle_model_read")  # and a task is left open (2026-10-21)

@@ -25,228 +25,12 @@ def _row(sku: str, model: str, *, variant=None, colour=None, total="1000000", ex
     }
 
 
-def _inputs(*, model, variant=None, colour=None, total=None, ex=None, basis="INDIVIDUAL"):
-    return {
-        "model_name": model,
-        "variant_name": variant,
-        "colour_name": colour,
-        "offered_total": Decimal(total) if total is not None else None,
-        "offered_ex_showroom": Decimal(ex) if ex is not None else None,
-        "registration_basis": basis,
-    }
 
+# 2026-10-20 product owner rule R3: the price-picking matcher (_match,
+# _price_disambiguate, the "New X" generation price bridge, _price_pick) is
+# gone; its unit tests encoded price choosing the variant and were removed.
+# Word identification is tested in test_uc03_sku_words.py.
 
-def test_match_unique_on_total() -> None:
-    rows = [_row("A", "SCORPIO N", total="1000000"), _row("B", "THAR", total="1000000")]
-    matched, stage = mr._match(rows, _inputs(model="Scorpio N", total="1000000"))
-    assert stage == "TOTAL"
-    assert [r["sku_code"] for r in matched] == ["A"]
-
-
-def test_match_falls_back_to_ex_showroom_when_total_ambiguous() -> None:
-    rows = [
-        _row("A", "SCORPIO N", variant="Z8", total="1000000", ex="800000"),
-        _row("B", "SCORPIO N", variant="Z8L", total="1000000", ex="850000"),
-    ]
-    matched, stage = mr._match(
-        rows, _inputs(model="SCORPIO N", total="1000000", ex="850000")
-    )
-    assert stage == "EX_SHOWROOM"
-    assert [r["sku_code"] for r in matched] == ["B"]
-
-
-def test_match_zero_when_no_model() -> None:
-    rows = [_row("A", "SCORPIO N"), _row("B", "THAR")]
-    matched, stage = mr._match(rows, _inputs(model="XUV700", total="1000000"))
-    assert matched == []
-    assert stage == "NONE"
-
-
-def test_match_multiple_reported() -> None:
-    rows = [
-        _row("A", "SCORPIO N", total="1000000", ex="800000"),
-        _row("B", "SCORPIO N", total="1000000", ex="800000"),
-    ]
-    matched, _ = mr._match(rows, _inputs(model="SCORPIO N", total="1000000", ex="800000"))
-    assert {r["sku_code"] for r in matched} == {"A", "B"}
-
-
-def test_match_narrows_by_variant_then_colour() -> None:
-    rows = [
-        _row("A", "THAR", variant="LX", colour="RED", total="1000000"),
-        _row("B", "THAR", variant="LX", colour="WHITE", total="1000000"),
-        _row("C", "THAR", variant="AX", colour="WHITE", total="1000000"),
-    ]
-    matched, stage = mr._match(
-        rows, _inputs(model="THAR", variant="LX", colour="white", total="1000000")
-    )
-    assert stage == "TOTAL"
-    assert [r["sku_code"] for r in matched] == ["B"]
-
-
-def test_corporate_basis_uses_corporate_total() -> None:
-    rows = [_row("A", "SCORPIO N", total="1000000")]  # corporate total = 1050000
-    matched, stage = mr._match(
-        rows, _inputs(model="SCORPIO N", total="1050000", basis="CORPORATE")
-    )
-    assert stage == "TOTAL"
-    assert [r["sku_code"] for r in matched] == ["A"]
-
-
-def test_no_price_data_returns_empty() -> None:
-    rows = [_row("A", "SCORPIO N")]
-    matched, stage = mr._match(rows, _inputs(model="SCORPIO N"))
-    assert stage == "NONE"
-    assert matched == [rows[0]] or matched == []  # model matched but nothing to disambiguate
-
-
-def test_match_without_any_price_narrows_by_variant_then_colour() -> None:
-    """Live case: a Booking Docket read "Thar Roxx / AX7L D(MT) / Stealth
-    Black" at 92% but left the total price blank. The SKU must still pin
-    from the variant and colour, not stay open across every Thar Roxx row."""
-    rows = [
-        _row("A", "THAR ROXX", variant="AX7L D (MT)", colour="Stealth Black"),
-        _row("B", "THAR ROXX", variant="AX7L D (MT)", colour="Everest White"),
-        _row("C", "THAR ROXX", variant="MX5 D (MT)", colour="Stealth Black"),
-    ]
-    matched, stage = mr._match(
-        rows, _inputs(model="Thar Roxx", variant="AX7L D(MT)", colour="Stealth Black")
-    )
-    assert stage == "VARIANT_COLOUR"
-    assert [r["sku_code"] for r in matched] == ["A"]
-
-
-def test_match_with_a_price_that_agrees_with_nothing_still_narrows_by_variant() -> None:
-    rows = [
-        _row("A", "THAR ROXX", variant="AX7L", colour="Black", total="1000000"),
-        _row("B", "THAR ROXX", variant="MX5", colour="Black", total="900000"),
-    ]
-    matched, stage = mr._match(
-        rows, _inputs(model="Thar Roxx", variant="AX7L", colour="Black", total="1234567")
-    )
-    assert stage == "VARIANT_COLOUR"
-    assert [r["sku_code"] for r in matched] == ["A"]
-
-
-# ── unit: _price_disambiguate's tolerance (real live case) ──────────────────
-def test_price_disambiguate_resolves_a_hairline_rounding_gap() -> None:
-    """Reproduces a live case verbatim: 'Scorpio Classic' / 'S MT 7S' already
-    had a trustworthy attribute signal (transmission=MT, seater=7) narrowing
-    to two rows differing only by colour -- and the Booking Form's offered
-    total was 0.01% off the correct row's master total, real-world rounding,
-    not a genuine price disagreement. Exact `==` sees that as no signal at
-    all and leaves both tied; the 0.5% tolerance must resolve it."""
-    rows = [
-        _row("A", "SCORPIO CLASSIC", variant="S MT 7 STR", colour="RED", total="1200120"),
-        _row("B", "SCORPIO CLASSIC", variant="S MT 7 STR", colour="WHITE", total="1250000"),
-    ]
-    matched, stage = mr._price_disambiguate(
-        rows, _inputs(model="SCORPIO CLASSIC", total="1200000")
-    )
-    assert stage == "TOTAL_APPROX"
-    assert [r["sku_code"] for r in matched] == ["A"]
-
-
-def test_price_disambiguate_does_not_resolve_a_real_price_gap() -> None:
-    """A gap far outside real rounding noise (5% on both sides, not 0.01%)
-    must stay ambiguous -- the tolerance exists for rounding, not to paper
-    over a genuine price disagreement between two different colour SKUs."""
-    rows = [
-        _row("A", "SCORPIO CLASSIC", variant="S MT 7 STR", colour="RED", total="1260000"),
-        _row("B", "SCORPIO CLASSIC", variant="S MT 7 STR", colour="WHITE", total="1140000"),
-    ]
-    matched, stage = mr._price_disambiguate(
-        rows, _inputs(model="SCORPIO CLASSIC", total="1200000")
-    )
-    assert stage != "TOTAL_APPROX"
-    assert {r["sku_code"] for r in matched} == {"A", "B"}
-
-
-def test_price_disambiguate_tolerance_still_ambiguous_when_both_rows_qualify() -> None:
-    """Two rows both within tolerance of the offered total must not be
-    arbitrarily narrowed to one -- that's still a genuine tie."""
-    rows = [
-        _row("A", "SCORPIO CLASSIC", variant="S MT 7 STR", colour="RED", total="1200100"),
-        _row("B", "SCORPIO CLASSIC", variant="S MT 7 STR", colour="WHITE", total="1199900"),
-    ]
-    matched, stage = mr._price_disambiguate(
-        rows, _inputs(model="SCORPIO CLASSIC", total="1200000")
-    )
-    assert stage != "TOTAL_APPROX"
-    assert {r["sku_code"] for r in matched} == {"A", "B"}
-
-
-# ── unit: generation-refresh bridge ──────────────────────────────────────────
-# Real, confirmed live data: a Mahindra price list can carry an old-generation
-# "SCORPIO N" (still on sale) alongside a "NEW SCORPIO N" refresh in the exact
-# same currently-effective price list, sharing overlapping variant codes at
-# different prices. A Booking Form's own free text very often drops "New" --
-# these prove price alone can still resolve across that gap instead of
-# permanently walling the refresh generation off.
-def test_strip_new_prefix() -> None:
-    assert mr._strip_new_prefix("New Scorpio N") == "SCORPIO N"
-    assert mr._strip_new_prefix("NEW THAR 2WD & 4WD") == "THAR 2WD 4WD"
-    assert mr._strip_new_prefix("Scorpio N") == "SCORPIO N"
-
-
-def test_match_bridges_to_the_refresh_generation_via_exact_price() -> None:
-    rows = [
-        _row("OLD-Z8L", "SCORPIO N", variant="Z8L", total="2000000", ex="2075499.58"),
-        _row("NEW-Z8L", "NEW SCORPIO N", variant="Z8L", total="2200000", ex="2131387.08"),
-    ]
-    matched, stage = mr._match(
-        rows, _inputs(model="Scorpio N", variant="Z8L", ex="2131387.08")
-    )
-    assert stage == "EX_SHOWROOM"
-    assert [r["sku_code"] for r in matched] == ["NEW-Z8L"]
-
-
-def test_match_prefers_the_named_generation_when_its_own_price_matches() -> None:
-    """The bridge only ever fires when the named bucket's own price search
-    comes up empty -- it must never override a price that already uniquely
-    resolves within the generation the Booking Form actually named."""
-    rows = [
-        _row("OLD-Z8L", "SCORPIO N", variant="Z8L", total="2000000", ex="2075499.58"),
-        _row("NEW-Z8L", "NEW SCORPIO N", variant="Z8L", total="2200000", ex="2131387.08"),
-    ]
-    matched, stage = mr._match(
-        rows, _inputs(model="Scorpio N", variant="Z8L", ex="2075499.58")
-    )
-    assert stage == "EX_SHOWROOM"
-    assert [r["sku_code"] for r in matched] == ["OLD-Z8L"]
-
-
-def test_match_bridge_does_not_fire_when_price_is_ambiguous_in_both_generations() -> None:
-    rows = [
-        _row("OLD-Z8L-MT", "SCORPIO N", variant="Z8L", total="2000000", ex="2075499.58"),
-        _row("OLD-Z8L-AT", "SCORPIO N", variant="Z8L", total="2000000", ex="2075499.58"),
-        _row("NEW-Z8L", "NEW SCORPIO N", variant="Z8L", total="2200000", ex="2131387.08"),
-    ]
-    matched, stage = mr._match(
-        rows, _inputs(model="Scorpio N", variant="Z8L", ex="2075499.58")
-    )
-    assert stage == "EX_SHOWROOM"
-    assert {r["sku_code"] for r in matched} == {"OLD-Z8L-MT", "OLD-Z8L-AT"}
-
-
-def test_match_bridge_reaches_the_refresh_generation_when_the_old_one_no_longer_exists() -> None:
-    """The tenant's currently effective price list may only carry the refresh
-    generation at all (the old one fully retired) -- the bridge must still
-    resolve it even though model_rows itself is empty from the start."""
-    rows = [_row("NEW-Z8L", "NEW SCORPIO N", variant="Z8L", ex="2131387.08")]
-    matched, stage = mr._match(rows, _inputs(model="Scorpio N", variant="Z8L", ex="2131387.08"))
-    assert stage == "EX_SHOWROOM"
-    assert [r["sku_code"] for r in matched] == ["NEW-Z8L"]
-
-
-def test_match_bridge_is_a_no_op_for_unrelated_models() -> None:
-    rows = [_row("A", "THAR", total="1000000")]
-    matched, stage = mr._match(rows, _inputs(model="XUV700", total="1000000"))
-    assert matched == []
-    assert stage == "NONE"
-
-
-# ── integration ──────────────────────────────────────────────────────────────
 
 # ── unit: catalogue search once the model name itself never resolved ─────────
 def _ev_rows():
@@ -258,36 +42,33 @@ def _ev_rows():
     ]
 
 
-def test_catalogue_search_shortlists_the_misread_nameplate_and_never_pins_on_a_weak_trim() -> None:
+def _reading(model, variant=None, ex=None):
+    return {"model": model, "variant": variant, "exShowroom": Decimal(ex) if ex is not None else None}
+
+
+def test_catalogue_search_shortlists_the_misread_nameplate() -> None:
     """The real DEV case: handwritten "XUV3XO AX7L EV" extracted as "XUV300" /
-    "W7L EV". The stated EV excludes the petrol twin, the folded nameplate
-    keeps both electric trims, and "W7L" is not close enough to either to
-    pin one: the PC gets exactly those two to pick from."""
-    matched, stage = mr._catalogue_search(
-        _ev_rows(), _inputs(model="XUV300", variant="W7L EV"), oem_code="MAHINDRA",
-    )
-    assert stage == "CATALOGUE_SEARCH"
+    "W7L EV". The stated EV excludes the petrol twin and the folded nameplate
+    keeps both electric trims: the PC gets exactly those two to pick from."""
+    matched = mr._catalogue_search(_ev_rows(), _reading("XUV300", "W7L EV"), oem_code="MAHINDRA")
     assert sorted(r["sku_code"] for r in matched) == ["AX5L-EV", "AX7L-EV"]
 
 
-def test_catalogue_search_pins_when_an_exact_price_confirms_one_candidate() -> None:
-    matched, stage = mr._catalogue_search(
-        _ev_rows(), _inputs(model="XUV300", variant="W7L EV", ex="1700000"), oem_code="MAHINDRA",
-    )
-    assert stage == "CATALOGUE_SEARCH"
-    assert [r["sku_code"] for r in matched] == ["AX7L-EV"]
+def test_catalogue_search_never_pins_on_an_exact_price() -> None:
+    """2026-10-20 rule R3 (this used to pin AX7L-EV on its price): the
+    price only puts the nearest row first."""
+    matched = mr._catalogue_search(_ev_rows(), _reading("XUV300", "W7L EV", ex="1700000"), oem_code="MAHINDRA")
+    assert [r["sku_code"] for r in matched] == ["AX7L-EV", "AX5L-EV"]
 
 
-def test_catalogue_search_pins_when_the_trim_is_stated_exactly() -> None:
-    matched, _ = mr._catalogue_search(
-        _ev_rows(), _inputs(model="XUV300", variant="AX7L EV"), oem_code="MAHINDRA",
-    )
-    assert [r["sku_code"] for r in matched] == ["AX7L-EV"]
+def test_catalogue_search_puts_the_stated_trim_first() -> None:
+    matched = mr._catalogue_search(_ev_rows(), _reading("XUV300", "AX7L EV"), oem_code="MAHINDRA")
+    assert matched[0]["sku_code"] == "AX7L-EV"
 
 
 def test_catalogue_search_finds_nothing_for_an_unrelated_nameplate() -> None:
     rows = [_row("AX", "THAR ROXX", variant="AX", ex="1400000") | {"fuel_powertrain": "DIESEL", "trim": "AX"}]
-    assert mr._catalogue_search(rows, _inputs(model="Scorpio N", variant="Z8L"), oem_code="MAHINDRA") == ([], "NONE")
+    assert mr._catalogue_search(rows, _reading("Scorpio N", "Z8L"), oem_code="MAHINDRA") == []
 
 
 @pytest.fixture
@@ -529,7 +310,10 @@ def test_integration_resolves_and_pins_sku(journey) -> None:
         {"t": c.tenant_id, "j": c.journey_id},
     ).mappings().one()
     assert sku["product_sku_id"] is not None
-    assert sku["selection_status"] == "CONFIRMED"
+    # 2026-10-20 product owner rule R3: an automatic match is not
+    # "Confirmed" (only a PC / TL decision is).
+    assert sku["selection_status"] == "TENTATIVE"
+    assert _vehicle(c)["match_basis"] == "AUTO_MATCHED"
     assert _open_model_flags(c) == 0
 
     # idempotent: a second sync on an already-resolved journey is a no-op
@@ -646,42 +430,13 @@ def test_integration_model_catalog_exposes_trim_distinct_from_variant(journey) -
     assert trims_by_variant["Z8 S G MT 2WD 7 STR BS6.2 - Refresh"] == "Z8 S"
 
 
-def test_integration_resolves_via_ex_showroom_when_total_ambiguous(journey) -> None:
+def test_integration_a_model_only_booking_is_never_settled_by_price(journey) -> None:
+    """2026-10-20 product owner rule R3 (this test used to expect the
+    booking's ex-showroom to pick the variant): the words name the model
+    only, so the PC picks; the price only orders the shortlist (the AX,
+    whose master price equals the booking's, comes first)."""
     c = journey
-    # both THAR variants total 1,730,000 individual — only ex-showroom disambiguates
-    _seed_price_list(c, [
-        {"model": "THAR", "variant": "LX",
-         "components": {"EX_SHOWROOM": "1500000", "INSURANCE": "60000",
-                        "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "200000"}},
-        {"model": "THAR", "variant": "AX",
-         "components": {"EX_SHOWROOM": "1400000", "INSURANCE": "160000",
-                        "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "200000"}},
-    ])
-    _set_journey_product(c, "Thar", None)
-    _set_commercial(c, "ex_showroom_price", "1400000")
-    _set_commercial(c, "total_price", "1730000")
-
-    result = mr.sync_model_resolution(
-        c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
-    )
-    assert result.get("resolved") is True
-    assert result.get("matchStage") == "EX_SHOWROOM"
-    assert _open_model_flags(c) == 0
-
-
-def test_integration_resolves_via_ex_showroom_from_booking_form_without_commercial_lines(journey) -> None:
-    # Regression for a real bug reported live: a Booking whose model text
-    # matched 24 price-master SKUs never disambiguated by ex-showroom price
-    # even though the Booking Form's own ex_showroom_price had been read and
-    # reviewed -- because _resolution_inputs read offered_ex_showroom only
-    # from commercial_lines, with no fallback to booking_form_review_values
-    # (offered_total has always had exactly this fallback; offered_ex_showroom
-    # did not). Same THAR fixture as the test above, but ex_showroom_price
-    # lives ONLY in booking_form_review_values here -- no commercial_lines
-    # row for it at all (total_price is still commercial_lines-backed, as it
-    # would be for a Booking Form whose overall total materialized fine).
-    c = journey
-    _seed_price_list(c, [
+    lx, ax = _seed_price_list(c, [
         {"model": "THAR", "variant": "LX",
          "components": {"EX_SHOWROOM": "1500000", "INSURANCE": "60000",
                         "REGISTRATION_INDIVIDUAL": "170000", "REGISTRATION_CORPORATE": "200000"}},
@@ -696,9 +451,13 @@ def test_integration_resolves_via_ex_showroom_from_booking_form_without_commerci
     result = mr.sync_model_resolution(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert result.get("resolved") is True
-    assert result.get("matchStage") == "EX_SHOWROOM"
-    assert _open_model_flags(c) == 0
+    assert result.get("raised") is True
+    assert result.get("matchStage") == "WORDS_AMBIGUOUS"
+    assert result.get("candidateCount") == 2
+    assert _vehicle(c)["product_sku_id"] is None
+    assert _open_model_flags(c) == 1
+    shortlist = mr.get_model_resolution_candidates(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    assert [x["productSkuId"] for x in shortlist["candidates"]] == [ax, lx]
 
 
 def test_integration_raises_flag_when_no_match(journey) -> None:
@@ -782,9 +541,6 @@ def test_integration_resolves_scorpio_n_z8s_from_folded_booking_form_text(mahind
         {"model": "SCORPIO N", "variant": "Z8 S G AT 2WD 7 STR BS6.2 - N",
          "fuel": "PETROL", "transmission": "AT", "drive": "2WD", "seater": "7",
          "components": {"EX_SHOWROOM": "1550000"}},
-        {"model": "NEW SCORPIO N", "variant": "Z8 S D AT 2WD 7 STR BS6.2 - Refresh",
-         "fuel": "DIESEL", "transmission": "AT", "drive": "2WD", "seater": "7",
-         "components": {"EX_SHOWROOM": "1700000"}},
     ])
     _set_journey_product(c, "SCORPIO N Z8 (S)", "DAT 2WD 7STR")
 
@@ -792,7 +548,7 @@ def test_integration_resolves_scorpio_n_z8s_from_folded_booking_form_text(mahind
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
     assert result.get("resolved") is True
-    assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
+    assert result.get("matchStage") == "WORDS"
 
     row = c.execute(
         text("SELECT product_sku_id, selection_status FROM auditcore.journey_products "
@@ -800,7 +556,7 @@ def test_integration_resolves_scorpio_n_z8s_from_folded_booking_form_text(mahind
         {"t": c.tenant_id, "j": c.journey_id},
     ).mappings().one()
     assert row["product_sku_id"] == z8s_diesel_at
-    assert row["selection_status"] == "CONFIRMED"
+    assert row["selection_status"] == "TENTATIVE"
     assert _open_model_flags(c) == 0
 
 
@@ -835,7 +591,7 @@ def test_integration_resolves_when_master_model_name_casing_differs_from_alias(m
         {"t": c.tenant_id, "j": c.journey_id},
     ).mappings().one()
     assert row["product_sku_id"] == sku_id
-    assert row["selection_status"] == "CONFIRMED"
+    assert row["selection_status"] == "TENTATIVE"
     assert _open_model_flags(c) == 0
 
 
@@ -861,7 +617,7 @@ def test_integration_resolves_xuv_7xo_ax7l_from_folded_booking_form_text(mahindr
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
     assert result.get("resolved") is True
-    assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
+    assert result.get("matchStage") == "WORDS"
 
     pinned = c.execute(
         text("SELECT product_sku_id FROM auditcore.journey_products "
@@ -897,7 +653,7 @@ def test_integration_fuzzy_resolves_a_mid_string_ocr_misread_trim(mahindra_journ
     # A fuzzy reading is the closest match, not the vehicle named: it is
     # suggested to the PC to accept or reject (decision 2026-10-20).
     assert result.get("raised") is True
-    assert result.get("matchStage") == "FUZZY_ATTRIBUTE_DECOMPOSITION"
+    assert result.get("matchStage") == "WORDS_UNRECOGNISED"
     assert _vehicle(c)["product_sku_id"] is None
     assert _sku_task(c, "SKU_CLOSEST_MATCH_CONFIRM")["reference"]["suggestedSkuId"] == str(z8s)
 
@@ -921,7 +677,7 @@ def test_integration_still_raises_when_decomposition_also_ambiguous(mahindra_jou
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
     assert result.get("raised") is True
-    assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
+    assert result.get("matchStage") == "WORDS_AMBIGUOUS"
     assert result.get("candidateCount") == 2
 
 
@@ -956,24 +712,19 @@ def test_integration_reports_narrower_candidates_even_when_still_ambiguous(mahin
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
     assert result.get("raised") is True
-    assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
+    assert result.get("matchStage") == "WORDS_AMBIGUOUS"
     assert result.get("candidateCount") == 2
 
 
-def test_integration_resolves_across_generations_via_ex_showroom_price(mahindra_journey) -> None:
-    """Reproduces a real, user-reported case verbatim: a Booking Form writes
-    the bare nameplate ('Scorpio N') and a trim code ('Z8L') with no fuel/
-    transmission/seater qualifiers captured at all -- so the attribute
-    decomposition fallback has nothing to decompose. The tenant's actual,
-    currently effective price list (confirmed against the real ingested
-    workbook) carries BOTH an old-generation 'SCORPIO N' (ADAS trim) and a
-    'NEW SCORPIO N' refresh, each with their own 'Z8L' variant at a
-    different price. Ex-showroom price is the one thing this Booking Form
-    genuinely does capture, and it matches the refresh generation's Z8L
-    exactly -- proving the resolver bridges to it instead of reporting the
-    old generation's Z8L (or every Z8L across both) as equally ambiguous."""
+def test_integration_the_spelling_names_the_generation_never_the_price(mahindra_journey) -> None:
+    """2026-10-20 product owner rule R3 (this test used to expect the
+    booking's ex-showroom to bridge "Scorpio N" to the refresh generation):
+    with the price masters' model identity, "Scorpio N" names the old
+    SCORPIO N while it is on sale and "SCORPIO-N" / "New Scorpio N" the
+    refresh. The booking's price (the refresh's) does not move it: the old
+    Z8L is pinned as a price mismatch and the PC is asked."""
     c = mahindra_journey
-    _seed_price_list(c, [
+    old, new = _seed_price_list(c, [
         {"model": "SCORPIO N", "variant": "Z8 L G MT 2WD 7 STR BS6.2 - N - ADAS",
          "fuel": "PETROL", "transmission": "MT", "drive": "2WD", "seater": "7",
          "components": {"EX_SHOWROOM": "2075499.58"}},
@@ -982,27 +733,13 @@ def test_integration_resolves_across_generations_via_ex_showroom_price(mahindra_
          "components": {"EX_SHOWROOM": "2131387.08"}},
     ])
     _set_journey_product(c, "Scorpio N", "Z8L")
-    _set_booking_form_ex_showroom(c, "2131387.08")  # matches the refresh generation only
+    _set_booking_form_ex_showroom(c, "2131387.08")  # the refresh generation's price
 
     result = mr.sync_model_resolution(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert result.get("resolved") is True
-    assert result.get("matchStage") == "EX_SHOWROOM"
-
-    sku = c.execute(
-        text("SELECT product_sku_id FROM auditcore.journey_products "
-             "WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    ).scalar_one()
-    pinned_model = c.execute(
-        text("SELECT pm.model_name FROM auditcore.product_skus s "
-             "JOIN auditcore.product_models pm ON pm.model_id = s.model_id "
-             "WHERE s.product_sku_id = :sku"),
-        {"sku": sku},
-    ).scalar_one()
-    assert pinned_model == "NEW SCORPIO N"
-    assert _open_model_flags(c) == 0
+    assert result.get("basis") == "AUTO_PRICE_MISMATCH"
+    assert _vehicle(c)["product_sku_id"] == old and old != new
 
 
 def test_integration_a_stated_attribute_outranks_a_conflicting_price(mahindra_journey) -> None:
@@ -1029,8 +766,12 @@ def test_integration_a_stated_attribute_outranks_a_conflicting_price(mahindra_jo
     result = mr.sync_model_resolution(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
+    # The words name the diesel; the price differs from its master price, so
+    # it is pinned as a price mismatch and the PC is asked to set the SKU.
     assert result.get("resolved") is True
-    assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
+    assert result.get("matchStage") == "WORDS"
+    assert result.get("basis") == "AUTO_PRICE_MISMATCH"
+    assert _sku_task(c, "SKU_PRICE_MISMATCH")["task_status"] not in ("VERIFIED_COMPLETE", "CANCELLED")
 
     pinned_fuel = c.execute(
         text("SELECT pv.fuel_powertrain FROM auditcore.journey_products jp "
@@ -1066,7 +807,7 @@ def test_integration_trim_alone_disambiguates_when_it_genuinely_discriminates(ma
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
     assert result.get("resolved") is True
-    assert result.get("matchStage") == "ATTRIBUTE_DECOMPOSITION"
+    assert result.get("matchStage") == "WORDS"
 
     pinned_variant = c.execute(
         text("SELECT pv.variant_name FROM auditcore.journey_products jp "
@@ -1191,10 +932,20 @@ def test_a_booking_before_every_master_is_not_priced_on_the_newest_one(journey) 
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
-    assert result == {"skipped": True, "reason": "no_effective_price_list"}
+    assert (result["skipped"], result["reason"]) == (True, "no_effective_price_list")  # and a task is left open (2026-10-21)
     assert _vehicle(c)["product_sku_id"] is None
 
-def _set_invoice_field(c, field_key, value, *, document_type_key="customer_invoice_dms", stage_code="DELIVERY"):
+
+# ── Delivery-invoice fallback ────────────────────────────────────────────────
+def _set_invoice_field(c, field_key, value, *, document_type_key="customer_invoice_dms", stage_code="DELIVERY",
+                       doc=None):
+    """One field of one vehicle invoice. Every field of a test's invoice
+    lands on the same document (rule R2, 2026-10-20: an invoice is read on
+    its own; this helper used to scatter one invoice over several
+    documents, which the resolver then mixed)."""
+    if doc is None:
+        doc = getattr(c, "invoice_doc", None) or uuid4()
+        c.invoice_doc = doc  # type: ignore[attr-defined]
     c.execute(
         text(
             """
@@ -1211,8 +962,34 @@ def _set_invoice_field(c, field_key, value, *, document_type_key="customer_invoi
             )
             """
         ),
-        {"t": c.tenant_id, "j": c.journey_id, "doc": uuid4(), "dtk": document_type_key,
+        {"t": c.tenant_id, "j": c.journey_id, "doc": doc, "dtk": document_type_key,
          "fk": field_key, "v": json.dumps(value), "stage": stage_code},
+    )
+
+
+def _set_invoice_price(c, ex_showroom, *, rate=18, discount=None, **kwargs):
+    """The invoice's printed amounts for an ex-showroom (rule R1): taxable
+    + CGST + SGST at the printed rate; with a discount, the gross selling
+    price before it is printed too."""
+    ex = Decimal(str(ex_showroom))
+    selling = (ex / (1 + Decimal(rate) / 100)).quantize(Decimal("0.01"))
+    taxable = selling - Decimal(str(discount or 0))
+    half = (taxable * Decimal(rate) / 200).quantize(Decimal("0.01"))
+    if discount:
+        _set_invoice_field(c, "gross_amount_before_discount", str(selling), **kwargs)
+        _set_invoice_field(c, "invoice_discount_amount", str(discount), **kwargs)
+    _set_invoice_field(c, "taxable_amount", str(taxable), **kwargs)
+    _set_invoice_field(c, "cgst_rate", str(rate / 2), **kwargs)
+    _set_invoice_field(c, "sgst_rate", str(rate / 2), **kwargs)
+    _set_invoice_field(c, "cgst_amount", str(half), **kwargs)
+    _set_invoice_field(c, "sgst_amount", str(half), **kwargs)
+
+
+def _make_automatic(c, sku_id) -> None:
+    c.execute(
+        text("UPDATE auditcore.journey_products SET product_sku_id=:s, selection_status='TENTATIVE', "
+             "match_basis='AUTO_MATCHED' WHERE tenant_id=:t AND journey_id=:j"),
+        {"s": sku_id, "t": c.tenant_id, "j": c.journey_id},
     )
 
 
@@ -1232,13 +1009,17 @@ def test_invoice_sku_code_resolves_when_booking_never_matched(journey) -> None:
     ).scalar_one()
     _set_journey_product(c, "ILLEGIBLE SCAN TEXT", None)
     _set_invoice_field(c, "sku_code", sku_code)
+    _set_invoice_price(c, "1600000")
 
     result = mr.sync_model_resolution_from_invoice(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
+    # The printed SKU code names it and the invoice's ex-showroom (R1)
+    # equals its master price: the invoice sets the SKU.
     assert result.get("resolved") is True
-    assert result.get("matchStage") == "INVOICE_SKU_CODE"
+    assert result.get("matchStage") == "INVOICE_WORDS_AND_PRICE"
+    assert result.get("basis") == "AUTO_INVOICE_MATCHED"
     pinned = c.execute(
         text("SELECT product_sku_id FROM auditcore.journey_products "
              "WHERE tenant_id=:t AND journey_id=:j"),
@@ -1262,13 +1043,17 @@ def test_invoice_model_text_resolves_when_no_sku_code_printed(journey) -> None:
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
+    # The invoice prints no price: its words still name the SKU, which goes
+    # on the Journey as a price mismatch for the PC to set (2026-10-20).
     assert result.get("resolved") is True
+    assert result.get("basis") == "AUTO_PRICE_MISMATCH"
     pinned = c.execute(
         text("SELECT product_sku_id FROM auditcore.journey_products "
              "WHERE tenant_id=:t AND journey_id=:j"),
         {"t": c.tenant_id, "j": c.journey_id},
     ).scalar_one()
     assert pinned == sku_id
+    assert _sku_task(c, "SKU_PRICE_MISMATCH") is not None
 
 
 def test_invoice_fallback_is_noop_once_already_resolved(journey) -> None:
@@ -1292,7 +1077,7 @@ def test_invoice_fallback_is_noop_once_already_resolved(journey) -> None:
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
-    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": False}
+    assert result.get("resolved") is True and result.get("mismatchFlagged") is False
     pinned = c.execute(
         text("SELECT product_sku_id FROM auditcore.journey_products "
              "WHERE tenant_id=:t AND journey_id=:j"),
@@ -1302,12 +1087,11 @@ def test_invoice_fallback_is_noop_once_already_resolved(journey) -> None:
 
 
 def test_invoice_naming_a_different_vehicle_replaces_the_sku_and_tells_the_tl(journey) -> None:
-    """Decision 2026-10-20: the invoice is the source of truth. The Journey
-    takes the invoice's SKU (even over a confirmed one) and a Team Lead gets
-    an information observation that the model changed -- no mismatch for
-    the PC to explain."""
+    """Rule R3 (2026-10-20): an invoice whose words name one SKU and whose
+    ex-showroom (R1) equals its master price sets the SKU. It replaces an
+    automatic match, and a Team Lead is told the model changed."""
     c = journey
-    confirmed_sku_id, invoice_sku_id = _seed_price_list(c, [
+    automatic_sku_id, invoice_sku_id = _seed_price_list(c, [
         {"model": "XUV700", "variant": "AX7L", "components": {"EX_SHOWROOM": "2000000"}},
         {"model": "SCORPIO N", "variant": "Z8L", "components": {"EX_SHOWROOM": "1600000"}},
     ])
@@ -1316,12 +1100,9 @@ def test_invoice_naming_a_different_vehicle_replaces_the_sku_and_tells_the_tl(jo
         {"s": invoice_sku_id},
     ).scalar_one()
     _set_journey_product(c, "XUV700", "AX7L")
-    c.execute(
-        text("UPDATE auditcore.journey_products SET product_sku_id=:s, selection_status='CONFIRMED' "
-             "WHERE tenant_id=:t AND journey_id=:j"),
-        {"s": confirmed_sku_id, "t": c.tenant_id, "j": c.journey_id},
-    )
+    _make_automatic(c, automatic_sku_id)
     _set_invoice_field(c, "sku_code", invoice_sku_code)
+    _set_invoice_price(c, "1600000")
 
     result = mr.sync_model_resolution_from_invoice(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
@@ -1330,8 +1111,10 @@ def test_invoice_naming_a_different_vehicle_replaces_the_sku_and_tells_the_tl(jo
     row = _vehicle(c)
     assert row["product_sku_id"] == invoice_sku_id
     assert (row["model_name_snapshot"], row["variant_name_snapshot"]) == ("SCORPIO N", "Z8L")
-    assert row["selection_method"] == "MODEL_RESOLUTION_INVOICE_OVERRIDE_V1"
-    assert _open_mismatch(c) == 0
+    assert row["selection_method"] == "MODEL_RESOLUTION_INVOICE_V2"
+    assert row["match_basis"] == "AUTO_INVOICE_MATCHED" and row["selection_status"] == "TENTATIVE"
+    assert row["match_evidence"]["documentExShowroom"] == "1600000.00"
+    assert row["match_evidence"]["priceCheck"] == "MATCH"
     task = _sku_task(c, "MODEL_CHANGED_BY_INVOICE")
     assert task["assigned_role_code"] == "TL" and task["severity"] == "INFO"
     assert "XUV700 AX7L" in task["description"] and "SCORPIO N Z8L" in task["description"]
@@ -1340,25 +1123,52 @@ def test_invoice_naming_a_different_vehicle_replaces_the_sku_and_tells_the_tl(jo
     again = mr.sync_model_resolution_from_invoice(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert again.get("changed") is None and _vehicle(c)["product_sku_id"] == invoice_sku_id
+    assert again.get("changed") is False and _vehicle(c)["product_sku_id"] == invoice_sku_id
 
 
-def test_booking_side_checks_also_apply_the_invoice_over_the_sku(journey) -> None:
-    """The Booking checks (and the nightly retry) apply the same rule, not
-    only Delivery-side events."""
+def test_an_invoice_never_overwrites_a_sku_the_pc_confirmed_the_tl_decides(journey) -> None:
+    """A SKU a PC confirmed is a human decision: the invoice naming another
+    SKU at its master price raises a Team Lead task instead of overwriting
+    it; the TL's Accept applies the invoice's SKU as TL_APPROVED."""
+    from audit_core.uc03_sku_tasks import handle_sku_task_action
+
     c = journey
     confirmed_sku_id, invoice_sku_id = _seed_price_list(c, [
         {"model": "XUV700", "variant": "AX7L", "components": {"EX_SHOWROOM": "2000000"}},
         {"model": "SCORPIO N", "variant": "Z8L", "components": {"EX_SHOWROOM": "1600000"}},
     ])
     _set_journey_product(c, "XUV700", "AX7L")
-    c.execute(
-        text("UPDATE auditcore.journey_products SET product_sku_id=:s, selection_status='CONFIRMED' "
-             "WHERE tenant_id=:t AND journey_id=:j"),
-        {"s": confirmed_sku_id, "t": c.tenant_id, "j": c.journey_id},
-    )
+    _confirm_sku(c, confirmed_sku_id)
     _set_invoice_field(c, "model_name_raw", "SCORPIO N")
     _set_invoice_field(c, "variant_raw", "Z8L")
+    _set_invoice_price(c, "1600000")
+
+    result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result.get("mismatchFlagged") is True
+    assert _vehicle(c)["product_sku_id"] == confirmed_sku_id
+    task = _sku_task(c, "SKU_INVOICE_REVIEW")
+    assert task["assigned_role_code"] == "TL"
+
+    handle_sku_task_action(c, tenant_id=c.tenant_id, task=dict(task), action="ACCEPT", actor_id="tl-1",
+                           actor_role_code="TL", comment=None)
+    row = _vehicle(c)
+    assert row["product_sku_id"] == invoice_sku_id
+    assert (row["selection_status"], row["match_basis"]) == ("CONFIRMED", "TL_APPROVED")
+
+
+def test_booking_side_checks_also_apply_the_invoice_over_the_sku(journey) -> None:
+    """The Booking checks (and the nightly retry) apply the same rule, not
+    only Delivery-side events."""
+    c = journey
+    automatic_sku_id, invoice_sku_id = _seed_price_list(c, [
+        {"model": "XUV700", "variant": "AX7L", "components": {"EX_SHOWROOM": "2000000"}},
+        {"model": "SCORPIO N", "variant": "Z8L", "components": {"EX_SHOWROOM": "1600000"}},
+    ])
+    _set_journey_product(c, "XUV700", "AX7L")
+    _make_automatic(c, automatic_sku_id)
+    _set_invoice_field(c, "model_name_raw", "SCORPIO N")
+    _set_invoice_field(c, "variant_raw", "Z8L")
+    _set_invoice_price(c, "1600000")
 
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert result.get("changed") is True
@@ -1396,9 +1206,10 @@ def test_invoice_cross_check_reads_a_differently_spelled_invoice_through_the_ful
          "components": {"EX_SHOWROOM": "2050000"}},
     ])
     _set_journey_product(c, "XUV 7XO", "AX7T DSL AT 7 STR")
-    _confirm_sku(c, ax7t)
+    _make_automatic(c, ax7t)
     _set_invoice_field(c, "model_name_raw", "XUV-7XO")
     _set_invoice_field(c, "variant_raw", "AX-7L(D) AT 2WD 7STR")
+    _set_invoice_price(c, "2000000", discount="25000")
 
     result = mr.sync_model_resolution_from_invoice(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
@@ -1425,32 +1236,38 @@ def test_invoice_cross_check_agrees_when_the_confirmed_sku_is_one_of_the_invoice
     result = mr.sync_model_resolution_from_invoice(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": False, "crossChecked": True}
+    # Two identical rows: the invoice's words name no single SKU, so it sets
+    # nothing; the confirmed SKU stays and nothing is flagged.
+    assert result.get("resolved") is True and result.get("crossChecked") is True
+    assert result.get("mismatchFlagged") is False
+    assert _vehicle(c)["product_sku_id"] == first
     assert _open_mismatch(c) == 0
 
 
-def test_invoice_cross_check_flags_a_different_variant_whatever_the_colour(journey) -> None:
+def test_invoice_with_a_different_price_sets_nothing_and_asks_the_pc(journey) -> None:
+    """Rule R3: the invoice's words name one SKU but its ex-showroom (R1)
+    is not that SKU's master price: it does not set the SKU; the PC gets a
+    price task. The automatic booking match stays."""
     c = journey
-    z8l, *_ = _seed_price_list(c, [
+    z8l, ax7l = _seed_price_list(c, [
         {"model": "SCORPIO N", "variant": "Z8L", "components": {"EX_SHOWROOM": "1600000"}},
-        {"model": "XUV700", "variant": "AX7L", "components": {"EX_SHOWROOM": "2000000"}},
         {"model": "XUV700", "variant": "AX7L", "components": {"EX_SHOWROOM": "2000000"}},
     ])
     _set_journey_product(c, "SCORPIO N", "Z8L")
-    _confirm_sku(c, z8l)
+    _make_automatic(c, z8l)
     _set_invoice_field(c, "model_name_raw", "XUV700")
     _set_invoice_field(c, "variant_raw", "AX7L")
+    _set_invoice_price(c, "1990000")
 
     result = mr.sync_model_resolution_from_invoice(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert result == {"skipped": True, "reason": "already_resolved", "mismatchFlagged": True, "crossChecked": True}
-    description = c.execute(
-        text("SELECT description FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j "
-             "AND rule_key='INVOICE_SKU_MISMATCH'"),
-        {"t": c.tenant_id, "j": c.journey_id},
-    ).scalar_one()
-    assert "XUV700 AX7L (any colour)" in description
+    assert result.get("mismatchFlagged") is True
+    assert _vehicle(c)["product_sku_id"] == z8l
+    task = _sku_task(c, "SKU_PRICE_MISMATCH")
+    assert task["assigned_role_code"] == "PC"
+    assert task["reference"]["skuId"] == str(ax7l)
+    assert task["reference"]["documentExShowroom"] == "1990000.00"
 
 
 def test_invoice_fallback_skips_without_any_model_read(journey) -> None:
@@ -1462,12 +1279,13 @@ def test_invoice_fallback_skips_without_any_model_read(journey) -> None:
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
-    assert result == {"skipped": True, "reason": "no_vehicle_model_read"}
+    assert (result["skipped"], result["reason"]) == (True, "no_vehicle_model_read")  # and a task is left open (2026-10-21)
 
 
 def _vehicle(c):
     return c.execute(
-        text("SELECT product_sku_id, model_name_snapshot, variant_name_snapshot, selection_method "
+        text("SELECT product_sku_id, model_name_snapshot, variant_name_snapshot, selection_method, "
+             "selection_status, match_basis, match_evidence "
              "FROM auditcore.journey_products WHERE tenant_id=:t AND journey_id=:j"),
         {"t": c.tenant_id, "j": c.journey_id},
     ).mappings().one_or_none()
@@ -1485,6 +1303,7 @@ def test_booking_checks_take_the_model_from_the_invoice_when_the_booking_form_ha
     ])
     _set_invoice_field(c, "model_name_raw", "Scorpio N")
     _set_invoice_field(c, "variant_raw", "Z8L")
+    _set_invoice_price(c, "1600000")
 
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
 
@@ -1492,7 +1311,7 @@ def test_booking_checks_take_the_model_from_the_invoice_when_the_booking_form_ha
     row = _vehicle(c)
     assert row["product_sku_id"] == z8l
     assert (row["model_name_snapshot"], row["variant_name_snapshot"]) == ("SCORPIO N", "Z8L")
-    assert row["selection_method"] == "MODEL_RESOLUTION_INVOICE_FALLBACK_V1"
+    assert row["selection_method"] == "MODEL_RESOLUTION_INVOICE_V2"
     assert z8 != z8l
 
 
@@ -1525,7 +1344,7 @@ def test_an_accessory_invoice_never_names_the_vehicle(journey) -> None:
 
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
 
-    assert result == {"skipped": True, "reason": "no_vehicle_model_read"}
+    assert (result["skipped"], result["reason"]) == (True, "no_vehicle_model_read")  # and a task is left open (2026-10-21)
     assert _vehicle(c) is None
 
 
@@ -1868,50 +1687,6 @@ def test_backfills_missing_task_for_a_preexisting_open_finding(journey) -> None:
 # all goes to the catalogue search, and the open finding follows the latest
 # run instead of keeping the first run's wording.
 
-def _maxx_hd_rows():
-    return [
-        _row("17L-LX", "MAXX HD", variant="MAXX HD 1.7L LX BS6.2", ex="996499.88", total="1044691.78"),
-        _row("17-LX", "MAXX HD", variant="MAXX HD 1.7 LX BS6.2", ex="971499.84", total="1019188.99"),
-        _row("17-LX-CBC", "MAXX HD", variant="MAXX HD 1.7 LX CBC BS6.2", ex="947499.97", total="995506.47"),
-        _row("17L-MXI", "MAXX HD", variant="MAXX HD 1.7L MXi BS6.2", ex="1027499.97", total="1086590.29"),
-    ]
-
-
-def test_price_pick_settles_a_shortlist_on_the_ex_showroom_within_tolerance() -> None:
-    """Sonali Das: the form says 9,96,500; the master holds 9,96,499.88 for
-    exactly one of the eleven MAXX HD rows."""
-    picked = mr._price_pick(_maxx_hd_rows(), _inputs(model="MAXX HD 1.7L LX", variant="LX", ex="996500"))
-    assert picked is not None
-    rows, stage = picked
-    assert [r["sku_code"] for r in rows] == ["17L-LX"] and stage == "EX_SHOWROOM_APPROX"
-
-
-def test_price_pick_ignores_a_total_that_only_repeats_the_ex_showroom() -> None:
-    """The same form repeats 9,96,500 in the total box. Read as an on-road
-    total it would land within 0.5 % of the CBC row's 9,95,506.47 and pin the
-    wrong vehicle; a total no greater than the ex-showroom is not a total."""
-    picked = mr._price_pick(
-        _maxx_hd_rows(), _inputs(model="MAXX HD 1.7L LX", variant="LX", ex="996500", total="996500"),
-    )
-    assert picked is not None and [r["sku_code"] for r in picked[0]] == ["17L-LX"]
-
-
-def test_price_pick_refuses_when_the_two_prices_name_different_rows() -> None:
-    picked = mr._price_pick(
-        _maxx_hd_rows(), _inputs(model="MAXX HD 1.7L LX", ex="996500", total="1019188.99"),
-    )
-    assert picked is None
-
-
-def test_price_pick_refuses_when_several_rows_sit_within_tolerance() -> None:
-    rows = _maxx_hd_rows() + [_row("17L-LX-TWIN", "MAXX HD", variant="MAXX HD 1.7L LX AC", ex="998000")]
-    assert mr._price_pick(rows, _inputs(model="MAXX HD 1.7L LX", ex="996500")) is None
-
-
-def test_price_pick_says_nothing_without_a_price() -> None:
-    assert mr._price_pick(_maxx_hd_rows(), _inputs(model="MAXX HD 1.7L LX", variant="LX")) is None
-
-
 def _seed_xuv3xo_family(c):
     """The DEV master's shape: the petrol/diesel XUV3XO rows and the two
     electric rows under the sibling nameplate "XUV3XO EV"."""
@@ -1949,27 +1724,29 @@ def test_integration_an_emptied_attribute_filter_still_reaches_the_catalogue_sea
     _set_commercial(c, "ex_showroom_price", "1496000.00")
 
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
-    # 2026-10-20: an EV variant of a model the list keeps as its own EV model
-    # is read as that EV model, so the exact ex-showroom names the vehicle.
+    # 2026-10-20: the EV word reads the model as the list's own EV model
+    # and "AX7L" names its AX7 L row by the words; the booking price agrees.
     assert result.get("resolved") is True, result
-    assert result["matchStage"] == "EX_SHOWROOM"
+    assert result["matchStage"] == "WORDS"
+    assert result["basis"] == "AUTO_MATCHED"
     assert _pinned(c) == skus["ev_ax7l"]
 
 
-def test_integration_an_emptied_attribute_filter_without_a_price_shortlists_the_siblings(mahindra_journey) -> None:
-    """The same reading with no price on the form: not pinned, but the PC is
-    offered the two electric rows rather than an empty shortlist."""
+def test_integration_an_ev_reading_without_a_price_is_pinned_as_a_price_mismatch(mahindra_journey) -> None:
+    """The same reading with no price on the form: the words name the EV
+    AX7 L, so it is pinned (never a petrol or diesel row), but as
+    AUTO_PRICE_MISMATCH with a PC task -- the booking price could not be
+    compared (2026-10-20 rule R3; this test used to expect a shortlist)."""
     c = mahindra_journey
     skus = _seed_xuv3xo_family(c)
     _set_journey_product(c, "XUV3XO", "AX7L EV")
 
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
-    assert result.get("raised") is True, result
-    assert result["matchStage"] in {"CATALOGUE_SEARCH", "FUZZY_ATTRIBUTE_DECOMPOSITION"}
-    shortlist = mr.get_model_resolution_candidates(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
-    offered = {str(item["productSkuId"]) for item in shortlist["candidates"]}
-    assert str(skus["ev_ax7l"]) in offered
-    assert not offered & {str(skus["ax7l_petrol"]), str(skus["ax7l_diesel"]), str(skus["ax5"])}
+    assert result.get("resolved") is True, result
+    assert result["basis"] == "AUTO_PRICE_MISMATCH" and result["priceCheck"] == "MISSING"
+    assert _pinned(c) == skus["ev_ax7l"]
+    task = _sku_task(c, "SKU_PRICE_MISMATCH")
+    assert task["title"] == "Confirm the model and price: the booking form's ex-showroom was not read"
 
 
 def _seed_maxx_hd(c):
@@ -1987,24 +1764,23 @@ def _seed_maxx_hd(c):
     ])
 
 
-def test_integration_a_wide_fuzzy_shortlist_is_settled_by_the_ex_showroom_price(mahindra_journey) -> None:
-    """Sonali Das on DEV: Booking Form "MAXX HD 1.7L LX" / "LX", ex-showroom
-    and total both 9,96,500. The fuzzy stage left every MAXX HD row; the
-    ex-showroom is 12 paise off exactly one of them. The repeated total is
-    not an on-road total and must not drag the pick to the CBC row."""
+def test_integration_a_price_only_orders_a_wide_shortlist(mahindra_journey) -> None:
+    """Sonali Das on DEV: "MAXX HD" / "LX" at 9,96,500. Before 2026-10-20 the
+    ex-showroom (12 paise off the 1.7L LX row) pinned it. Rule R3: the words
+    name three LX rows (1.3, 1.7, 1.7L), so the PC picks; the row whose
+    price is nearest is only listed first."""
     c = mahindra_journey
     lx_17l, *_ = _seed_maxx_hd(c)
-    # A reading that does not name the variant word for word (since
-    # 2026-10-20 "MAXX HD 1.7L LX" itself is settled by its words, below).
     _set_journey_product(c, "MAXX HD", "LX")
     _set_commercial(c, "ex_showroom_price", "996500.00")
     _set_commercial(c, "total_price", "996500.00")
 
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
-    assert result.get("resolved") is True, result
-    assert result["matchStage"] == "EX_SHOWROOM_APPROX"
-    assert _pinned(c) == lx_17l
-    assert _open_model_flags(c) == 0
+    assert result.get("raised") is True, result
+    assert result["candidateCount"] == 3
+    assert _pinned(c) is None
+    shortlist = mr.get_model_resolution_candidates(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
+    assert shortlist["candidates"][0]["productSkuId"] == lx_17l
 
 
 def test_integration_a_wide_shortlist_stays_a_task_when_no_price_singles_one_out(mahindra_journey) -> None:
@@ -2031,7 +1807,7 @@ def test_integration_the_invoice_wording_pins_the_variant_it_names(mahindra_jour
 
     result = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert result.get("resolved") is True, result
-    assert result["matchStage"] == "VARIANT_WORDS"
+    assert result["matchStage"] == "WORDS"
     assert _pinned(c) == lx_17
     assert _open_model_flags(c) == 0
 
@@ -2071,7 +1847,7 @@ def test_integration_an_open_finding_follows_the_latest_run(mahindra_journey) ->
         {"t": c.tenant_id, "f": finding_id},
     ).mappings().one()
     assert after["title"] == "Vehicle model matched multiple price-master SKUs"
-    assert "MAXX HD" in after["description"] and f"matched {second['candidateCount']}" in after["description"]
+    assert "MAXX HD" in after["description"] and f"fit {second['candidateCount']}" in after["description"]
     events = c.execute(
         text("SELECT event_type, safe_payload FROM auditcore.audit_finding_events "
              "WHERE tenant_id=:t AND audit_finding_id=:f ORDER BY occurred_at_utc"),
@@ -2084,7 +1860,13 @@ def test_integration_an_open_finding_follows_the_latest_run(mahindra_journey) ->
     payload = _related_task_payload(c, finding_id)
     assert len(payload["candidates"]) == second["candidateCount"]
 
-    # The price now settles it: the finding resolves and the task closes.
+    # A price never settles it (2026-10-20); the words do once the form is
+    # read in full: the finding resolves and the task closes.
+    c.execute(
+        text("UPDATE auditcore.journey_products SET variant_name_snapshot='1.7L LX' "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
     _set_commercial(c, "ex_showroom_price", "996500.00")
     third = mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert third.get("resolved") is True and _pinned(c) == lx_17l

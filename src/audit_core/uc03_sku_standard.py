@@ -187,29 +187,50 @@ def search_sku(
 
 
 # ── the blocks ──────────────────────────────────────────────────────────────────
+# The OEM's own on-road column adds BOTH extended-warranty tiers (4th year,
+# and 4th + 5th year), but a customer takes one tier at most. Decision
+# 2026-10-22 (product owner): the live on-road counts the 4th-year tier only.
+# The book's own figure, both tiers in, is kept beside it as ``book`` so a
+# reader can still reconcile to the OEM sheet.
+NOT_COUNTED_IN_ON_ROAD: frozenset[str] = frozenset({"EXT_WARRANTY_4TH_5TH_YR"})
+
+
 def _price_block(row: dict[str, Any], version: dict[str, Any], basis: str) -> dict[str, Any]:
     components = []
     total_individual = Decimal(0)
     total_corporate = Decimal(0)
+    book_individual = Decimal(0)
+    book_corporate = Decimal(0)
     for item in row["components"]:
         amount = Decimal(str(item["amount"]))
         key = str(item["key"])
+        counted = key not in NOT_COUNTED_IN_ON_ROAD
         if key != "REGISTRATION_CORPORATE":
-            total_individual += amount
+            book_individual += amount
+            if counted:
+                total_individual += amount
         if key != "REGISTRATION_INDIVIDUAL":
-            total_corporate += amount
+            book_corporate += amount
+            if counted:
+                total_corporate += amount
         components.append({
             "key": key,
             "label": COMPONENT_LABELS.get(key, key.replace("_", " ").title()),
             "commercialKey": commercial_key_for_price_component(key, basis=basis),  # type: ignore[arg-type]
             "amount": _money(amount),
             "priceSince": item.get("priceSince"),
+            "countedInOnRoad": counted,
         })
     on_road = {"individual": _money(total_individual), "corporate": _money(total_corporate)}
     return {
         **version,
         "components": components,
-        "onRoad": {**on_road, "basis": basis, "amount": on_road["corporate" if basis == "CORPORATE" else "individual"]},
+        "onRoad": {
+            **on_road,
+            "basis": basis,
+            "amount": on_road["corporate" if basis == "CORPORATE" else "individual"],
+            "book": {"individual": _money(book_individual), "corporate": _money(book_corporate)},
+        },
     }
 
 
@@ -483,10 +504,11 @@ def standard_for_sku(
     and the two must not be confused -- so there is deliberately no "net"
     figure here (decision 2026-10-18).
 
-    Note the price list's on-road is itself a fully loaded figure: Mahindra
-    prices both extended-warranty tiers, the accessories kit, RSA and
-    FASTag into it, and every October row reconciles to the OEM's own
-    on-road column on that basis. It is a ceiling, not an expected price.
+    Note the on-road is a fully loaded figure: the accessories kit, RSA,
+    FASTag and ONE extended-warranty tier (the 4th year) are priced into
+    it. The OEM's own on-road column also adds the 4th + 5th-year tier;
+    that column is kept as ``onRoad.book`` and is not the live figure, as a
+    customer takes one tier at most. It is a ceiling, not an expected price.
 
     ``unknown`` names the blocks no master answers on the date.
     """
