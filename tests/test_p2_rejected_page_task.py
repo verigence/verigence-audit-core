@@ -1,31 +1,25 @@
-"""The processing task says which pages were rejected at upload and why
-(product owner 2026-10-20)."""
+"""The resubmit task says which pages were rejected at upload and why
+(product owner 2026-10-20), page by page (2026-10-21)."""
 from __future__ import annotations
 
-from audit_core.uc03_p2_task_producer import _failed_pages_text
+from audit_core.uc03_p2_task_producer import resubmit_page_reason
 
 
 def test_rejected_pages_are_named_with_their_reason():
-    title, text = _failed_pages_text(
-        "RJ.pdf", ["3|DI_QUALITY_IMAGE_CONTRAST", "5|DI_QUALITY_IMAGE_BLUR_SCORE", "7|DI_QUALITY_IMAGE_BLUR_SCORE"],
-        [3, 5, 7], "The page is faded.",
-    )
-    assert title == "RJ.pdf: 3 pages rejected at upload"
-    assert "Page 3 is too faded" in text
-    assert "Pages 5 and 7 are blurred" in text
-    assert "Scan them again" in text
+    assert resubmit_page_reason("DI_QUALITY_IMAGE_CONTRAST", "Page rejected: contrast 0.1.") == (
+        "Rejected by the scan-quality check: too faded. Scan it again in good light, flat and in focus, and upload "
+        "it again.")
+    assert resubmit_page_reason("DI_QUALITY_IMAGE_BLUR_SCORE", None).startswith(
+        "Rejected by the scan-quality check: blurred.")
+    assert resubmit_page_reason("CORRUPT", None).startswith("Rejected by the scan-quality check: unreadable.")
 
 
-def test_rejected_and_failed_pages_are_told_apart():
-    title, text = _failed_pages_text(
-        "RJ.pdf", ["2|DI_QUALITY_IMAGE_CONTRAST", "12|DOCUMENT_AI_RESPONSE_INVALID"], [2, 12], None,
-    )
-    assert title == "RJ.pdf: 1 page rejected at upload, 1 page could not be processed"
-    assert "Page 2 is too faded" in text
-    assert "Page 12 could not be processed" in text
+def test_other_failures_keep_the_reason_on_the_card():
+    assert resubmit_page_reason("DOCUMENT_AI_RESPONSE_INVALID", "AI reading failed — tried 3 times.") == (
+        "AI reading failed — tried 3 times.")
+    assert resubmit_page_reason(None, None) == "It could not be read. Upload it again."
 
 
-def test_a_failure_with_no_error_keeps_the_old_wording():
-    title, text = _failed_pages_text("scan.pdf", [], [2], "The document service refused it.")
-    assert title == "scan.pdf: 1 page could not be processed"
-    assert text.startswith("The document service refused it. Page 2 could not be processed")
+def test_our_setup_problem_needs_no_re_upload():
+    assert resubmit_page_reason("DOCUMENT_AI_NOT_CONFIGURED", "anything") == (
+        "Our setup problem — will be re-read once fixed; no need to re-upload.")

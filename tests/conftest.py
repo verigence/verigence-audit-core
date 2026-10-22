@@ -66,7 +66,7 @@ _TENANT_DATA_DELETE_ORDER = (
     "evidence", "journey_document_requirements", "document_requirement_items",
     "document_requirement_profile_versions", "document_requirement_profiles", "journeys", "customers",
     "dealer_outlets", "dealers", "price_list_versions", "price_lists", "project_policy_versions",
-    "business_status_codes", "projects",
+    "business_status_codes", "p2_scheduled_runs", "projects",
 )
 
 

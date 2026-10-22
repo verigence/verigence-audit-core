@@ -343,7 +343,7 @@ def _tasks(journey, prefix):
         ).mappings().all()]
 
 
-def test_file_status_task_tells_the_truth_after_eight_hours_and_the_tl_after_a_day(journey):
+def test_a_file_still_in_flight_after_hours_has_an_info_task_and_the_tl_after_a_day(journey):
     batch_id, queue_id, _ = add_page(journey, status="EXTRACTING", submitted_minutes_ago=9 * 60)
     _age_batch(journey, batch_id, hours=9)
     with journey.engine.begin() as connection:
@@ -352,10 +352,11 @@ def test_file_status_task_tells_the_truth_after_eight_hours_and_the_tl_after_a_d
                                              journey_id=journey.journey_id) == {"RAISED": 1}
     [pc_task] = _tasks(journey, "upload-status:")
     assert pc_task["task_type"] == "PC_UPLOAD_STATUS" and pc_task["severity"] == "INFO"
-    assert "Waiting for the document service since" in pc_task["description"]
-    assert "retried automatically tonight" in pc_task["description"]
-    assert "Re-sync on Upload / Edit Documents" in pc_task["description"]
-    assert "check back after 1 hour" not in pc_task["description"]
+    # 2026-10-21: no night retry is promised; the worker's 30-minute ceiling
+    # fails such a page (this task is the safety net if it did not run).
+    assert pc_task["description"] == ("0 of 1 pages read, 1 being identified or read. Nothing to do yet. This "
+                                      "task updates itself, and closes when the file is done or turns into a "
+                                      "resubmit task for any page that cannot be read.")
     assert _tasks(journey, "upload-stuck-tl:") == []
 
     _age_batch(journey, batch_id, hours=25)
