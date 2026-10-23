@@ -48,7 +48,7 @@ _TENANT_DATA_DELETE_ORDER = (
     "journey_attribute_review_decisions", "journey_capture_proposals", "journey_delivery_audit_facts",
     "journey_document_assessments", "journey_document_field_correction_proposals", "journey_products",
     "journey_stage_states", "journey_workflow_events", "model_selection_correction_proposals",
-    "corporate_registry_entries", "oem_master_uploads", "outbox_events", "payment_bank_matches",
+    "corporate_registry_entries", "p2_journey_deletions", "oem_master_uploads", "outbox_events", "payment_bank_matches",
     "payment_verification_events",
     "pc_daily_notes", "project_master_import_rows", "project_product_master_items", "project_segments",
     "registration_records", "review_decisions", "rule_executions", "scrappage_certificate_review_values",
