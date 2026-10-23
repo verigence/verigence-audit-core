@@ -23,7 +23,9 @@ _MAX_ROWS = int(os.environ.get("AUDIT_CORE_DIAG_MAX_ROWS", "600"))
 REPORTS: dict[str, str] = {
     # Every Journey's vehicle: what was read, the SKU pinned, how and when.
     "sku_pins": """
-        SELECT j.journey_id, COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
+        SELECT j.journey_id, j.journey_reference, j.created_by_display_name AS pc_name,
+               o.outlet_name,
+               COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
                jp.model_name_snapshot AS model, jp.variant_name_snapshot AS variant,
                jp.colour_name_snapshot AS colour, s.sku_code, pm.model_name AS master_model,
                pv.variant_name AS master_variant, jp.selection_status, jp.selection_method,
@@ -39,11 +41,44 @@ REPORTS: dict[str, str] = {
                    AND f.finding_type_code = 'MODEL_NOT_IDENTIFIED') AS model_finding_events
         FROM auditcore.journeys j
         LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+        LEFT JOIN auditcore.dealer_outlets o
+          ON o.tenant_id = j.tenant_id AND o.dealer_id = j.dealer_id AND o.outlet_id = j.outlet_id
         LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
         LEFT JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id
         LEFT JOIN auditcore.product_models pm ON pm.model_id = s.model_id
         LEFT JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
         WHERE j.tenant_id = :t
+        ORDER BY j.created_at_utc
+    """,
+    # Every Journey with no SKU pinned: who captured it, and where the model
+    # text actually came from (2026-10-23: journeys whose booked model reads
+    # "Access", "Baleno", "Dost" or a Hyundai, while the variant is a genuine
+    # Mahindra variant -- the question is whether the EXCHANGE vehicle's make
+    # and model is landing in the booked vehicle's field).
+    "unresolved_models": """
+        SELECT j.journey_reference, j.created_by_display_name AS pc_name, o.outlet_name,
+               COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
+               jp.model_name_snapshot AS booked_model, jp.variant_name_snapshot AS booked_variant,
+               jp.selection_source, jp.selection_method,
+               ti.old_vehicle_make_model AS exchange_vehicle,
+               ti.old_vehicle_registration AS exchange_registration,
+               (SELECT string_agg(DISTINCT dt.classified_document_type_key || '.' || f.field_key || '=' || f.effective_value, ' | ')
+                  FROM auditcore.journey_document_extracted_fields f
+                  LEFT JOIN auditcore.document_capture_v2_documents dt
+                    ON dt.tenant_id = f.tenant_id AND dt.journey_id = f.journey_id
+                   AND dt.di_document_id = f.di_document_id
+                 WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+                   AND f.field_key IN ('vehicle_model', 'vehicle_variant', 'model_name_raw', 'variant_raw')
+                   AND f.effective_value IS NOT NULL) AS model_fields_read,
+               j.created_at_utc
+        FROM auditcore.journeys j
+        LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+        LEFT JOIN auditcore.dealer_outlets o
+          ON o.tenant_id = j.tenant_id AND o.dealer_id = j.dealer_id AND o.outlet_id = j.outlet_id
+        LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+        LEFT JOIN auditcore.trade_in_cases ti
+          ON ti.tenant_id = j.tenant_id AND ti.journey_id = j.journey_id
+        WHERE j.tenant_id = :t AND jp.product_sku_id IS NULL
         ORDER BY j.created_at_utc
     """,
     # What the documents say the vehicle is, per Journey and document.
