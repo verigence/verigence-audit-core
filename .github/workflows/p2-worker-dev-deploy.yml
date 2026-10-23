@@ -2,6 +2,13 @@ name: Deploy Phase 2 Worker DEV
 
 on:
   workflow_call:
+  # A one-shot job on the worker (a SKU run, a diagnostics report) is started
+  # by setting its variable and restarting the worker. Without a dispatch
+  # trigger the only way to restart it was to merge something, and a second
+  # merge landing while a run is in flight replaces the container and cuts the
+  # run short -- which is exactly how the SKU run of 2026-10-23 stopped part
+  # way through the largest Project and could not be resumed under its tag.
+  workflow_dispatch:
 
 permissions:
   contents: read
