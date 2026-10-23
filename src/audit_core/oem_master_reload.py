@@ -305,13 +305,15 @@ def _standing_rows(connection: Connection, tenant_id: str, on: date) -> list[dic
     return [dict(r) for r in connection.execute(text(
         """
         WITH started AS (
-            SELECT DISTINCT ON (v.discount_scheme_id) v.discount_scheme_version_id, v.effective_to
+            SELECT DISTINCT ON (v.discount_scheme_id) v.discount_scheme_id, v.discount_scheme_version_id, v.effective_to
             FROM auditcore.discount_scheme_versions v
             WHERE v.tenant_id = :t AND v.lifecycle_status = 'PUBLISHED' AND v.effective_from <= :on
             ORDER BY v.discount_scheme_id, v.effective_from DESC, v.created_at_utc DESC
         )
-        SELECT pm.model_name, e.variant_id, e.criteria
+        SELECT pm.model_name, e.variant_id, e.criteria, ds.scheme_code, ds.scheme_name
         FROM started s
+        JOIN auditcore.discount_schemes ds
+          ON ds.tenant_id = :t AND ds.discount_scheme_id = s.discount_scheme_id
         JOIN auditcore.discount_scheme_eligibility e
           ON e.tenant_id = :t AND e.discount_scheme_version_id = s.discount_scheme_version_id
         JOIN auditcore.product_models pm ON pm.model_id = e.model_id
@@ -426,6 +428,12 @@ def reload_schemes_tenant(connection: Connection, *, tenant_id: str, tag: str, s
             if row["variant_id"] is None and criteria.get("scope") != "UNRESOLVED" and criteria.get(
                     "unresolvedVariantTexts"):
                 model_wide_unresolved += 1
+                # The check reports a count; the rows say which schemes and variant texts they are.
+                logger.info("oem_master_reload_model_wide_unresolved_row", tenant_id=tenant_id, tag=tag,
+                            on=str(on), model=row["model_name"], scheme_code=row["scheme_code"],
+                            scheme_name=row["scheme_name"],
+                            unresolved_variant_texts=str(criteria.get("unresolvedVariantTexts")),
+                            criteria=str(criteria))
             if criteria.get("scope") == "UNRESOLVED":
                 continue
             per_model[row["model_name"]] = per_model.get(row["model_name"], 0) + 1
