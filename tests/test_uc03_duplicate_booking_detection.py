@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy import text as sa_text
 
 from audit_core import uc03_duplicate_booking_detection as dbd
 
@@ -161,8 +162,10 @@ def test_exact_pan_match_flags_exactly_one_journey_as_the_others_duplicate(two_j
 
 def test_exact_aadhaar_match_flags_exactly_one_journey_as_the_others_duplicate(two_journeys) -> None:
     c = two_journeys
-    _set_field(c, journey_id=c.journey_a, document_type_key="aadhaar", field_key="aadhaar_number", value="123456789012")
-    _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_number", value="123456789012")
+    # A real Aadhaar: UIDAI issues none beginning 0 or 1, so the old fixture
+    # ("123456789012") is now correctly rejected as not an Aadhaar at all.
+    _set_field(c, journey_id=c.journey_a, document_type_key="aadhaar", field_key="aadhaar_number", value="234567890123")
+    _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_number", value="234567890123")
 
     _assert_exactly_one_flagged_as_duplicate_of_the_other(c)
 
@@ -514,3 +517,146 @@ def test_a_pair_carries_one_finding_after_the_booking_dates_change(two_journeys)
     dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="")
     assert len(_open_findings(c, c.journey_b)) == 1
     assert _open_findings(c, c.journey_a) == []
+
+
+def _raised_payload(c) -> dict:
+    """The RAISED payload of the single DUPLICATE_BOOKING finding in play."""
+    return c.execute(
+        sa_text(
+            """
+            SELECT e.safe_payload
+            FROM auditcore.audit_finding_events e
+            JOIN auditcore.audit_findings f
+              ON f.tenant_id = e.tenant_id AND f.audit_finding_id = e.audit_finding_id
+            WHERE e.tenant_id = :t AND e.event_type = 'RAISED'
+              AND f.finding_type_code = 'DUPLICATE_BOOKING'
+              AND f.finding_status IN ('OPEN', 'ACKNOWLEDGED')
+            ORDER BY e.occurred_at_utc DESC LIMIT 1
+            """
+        ),
+        {"t": c.tenant_id},
+    ).scalar_one()
+
+
+# ── a placeholder is not an identifier (2026-10-23) ──────────────────────────
+def test_a_placeholder_buyer_gstin_never_pairs_two_bookings(two_journeys) -> None:
+    """The reported bug: an individual buying a Thar was paired with an LLP
+    on "GSTIN · 75%", because the Tax Invoice of each carried "No" in the
+    buyer GSTIN field. Two absences are not a match."""
+    c = two_journeys
+    _set_buyer_gstin(c, journey_id=c.journey_a, gstin="No")
+    _set_buyer_gstin(c, journey_id=c.journey_b, gstin="No")
+    _set_field(c, journey_id=c.journey_a, document_type_key="aadhaar", field_key="aadhaar_name", value="Ramesh Gupta")
+    _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_name", value="Giftsy Corporates")
+
+    result_a = dbd.sync_duplicate_booking_detection(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="",
+    )
+    result_b = dbd.sync_duplicate_booking_detection(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="",
+    )
+    assert (result_a["raised"], result_b["raised"]) == (0, 0)
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+
+
+def test_a_malformed_gstin_is_not_a_gstin(two_journeys) -> None:
+    """A bare number in the buyer GSTIN field is not a GSTIN, however
+    identical the two sides are."""
+    c = two_journeys
+    _set_buyer_gstin(c, journey_id=c.journey_a, gstin="123456")
+    _set_buyer_gstin(c, journey_id=c.journey_b, gstin="123456")
+
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="")
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+
+
+def test_placeholder_pan_and_aadhaar_never_pair_two_bookings(two_journeys) -> None:
+    c = two_journeys
+    for journey_id in (c.journey_a, c.journey_b):
+        _set_field(c, journey_id=journey_id, document_type_key="pan_card", field_key="pan_number", value="NA")
+        _set_field(c, journey_id=journey_id, document_type_key="aadhaar", field_key="aadhaar_number", value="000000000000")
+
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="")
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+
+
+def test_a_placeholder_address_and_pincode_never_pair_two_bookings(two_journeys) -> None:
+    """"NA" equals "NA" exactly, which used to raise SIMILAR_ADDRESS; and
+    "000000" is not a pincode."""
+    c = two_journeys
+    for journey_id in (c.journey_a, c.journey_b):
+        _set_field(c, journey_id=journey_id, document_type_key="aadhaar", field_key="aadhaar_address", value="NA")
+        _set_field(c, journey_id=journey_id, document_type_key="aadhaar", field_key="address_pincode", value="000000")
+        _set_field(c, journey_id=journey_id, document_type_key="aadhaar", field_key="aadhaar_name", value="Ramesh Gupta")
+
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="")
+    # The names do match each other, but with no usable pincode there is no
+    # NAME_AND_ADDRESS basis, and the placeholder address raises nothing.
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+
+
+def test_a_repeated_digit_mobile_is_not_a_mobile(two_journeys) -> None:
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="booking_form", field_key="customer_phone", value="9999999999")
+    _set_field(c, journey_id=c.journey_b, document_type_key="booking_form", field_key="customer_phone", value="9999999999")
+
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="")
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+
+
+def test_a_real_gstin_still_pairs_and_records_what_matched(two_journeys) -> None:
+    """The genuine case still works, and now carries its evidence."""
+    c = two_journeys
+    _set_buyer_gstin(c, journey_id=c.journey_a, gstin="27ABCDE1234F1Z5")
+    _set_buyer_gstin(c, journey_id=c.journey_b, gstin="27abcde1234f1z5")  # case/spacing normalised
+
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="")
+    findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
+    assert len(findings) == 1
+
+    payload = _raised_payload(c)
+    fields = payload["matchedFields"]
+    assert [f["field"] for f in fields] == ["gst"]
+    assert fields[0]["label"] == "Buyer GSTIN"
+    assert fields[0]["thisValue"] == "27ABCDE1234F1Z5" and fields[0]["otherValue"] == "27ABCDE1234F1Z5"
+    assert fields[0]["exact"] is True
+
+
+def test_matched_fields_mask_a_pan(two_journeys) -> None:
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="pan_card", field_key="pan_number", value="ABCDE1234F")
+    _set_field(c, journey_id=c.journey_b, document_type_key="pan_card", field_key="pan_number", value="ABCDE1234F")
+
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="")
+    assert len(_open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)) == 1
+    payload = _raised_payload(c)
+    (field,) = payload["matchedFields"]
+    # Last four only: enough to recognise the document, not to copy it down.
+    assert field["thisValue"] == "XXXXXX234F"
+
+
+def test_an_open_finding_on_a_placeholder_resolves_itself(two_journeys) -> None:
+    """The findings already raised on "No" must clear themselves once the
+    value stops counting -- nobody should have to close them by hand."""
+    c = two_journeys
+    _set_buyer_gstin(c, journey_id=c.journey_a, gstin="27ABCDE1234F1Z5")
+    _set_buyer_gstin(c, journey_id=c.journey_b, gstin="27ABCDE1234F1Z5")
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="")
+    assert len(_open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)) == 1
+
+    for journey_id in (c.journey_a, c.journey_b):
+        c.execute(
+            sa_text("UPDATE auditcore.invoice_review_values SET buyer_gstin = 'No' "
+                    "WHERE tenant_id = :t AND journey_id = :j"),
+            {"t": c.tenant_id, "j": journey_id},
+        )
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
+    dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="")
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
