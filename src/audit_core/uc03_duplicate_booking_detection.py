@@ -158,11 +158,130 @@ _IDENTITY_FIELD_KEYS: list[str] = [
 ]
 
 
+# ── what counts as an identifier at all (2026-10-23) ──────────────────────────
+# Every match basis below compares one journey's extracted value with
+# another's. Until now any non-empty string counted, so two journeys whose
+# Tax Invoice carried "No" (or "NA", or a bare number) in the buyer GSTIN
+# field matched each other on GSTIN at 75% confidence -- an individual buying
+# a Thar paired with an LLP, because neither has a GSTIN and the extractor
+# wrote the same placeholder on both. The same held for PAN, Aadhaar, pincode
+# and address: a shared placeholder is the ABSENCE of an identifier, and two
+# absences are not a match.
+#
+# So a value is now only usable as a signal when it is the right SHAPE for
+# what it claims to be. A wrongly-shaped value is dropped (the journey simply
+# has no value for that field) rather than compared.
+_PLACEHOLDER_TOKENS: frozenset[str] = frozenset({
+    "", "NA", "NAN", "NIL", "NO", "NONE", "NOTAVAILABLE", "NOTAPPLICABLE",
+    "NOTFOUND", "NOTMENTIONED", "NOTPROVIDED", "NOTGIVEN", "UNKNOWN", "UNAVAILABLE",
+    "NULL", "BLANK", "EMPTY", "YES", "TEST", "DUMMY", "SAMPLE", "ABSENT",
+})
+_NON_ALNUM = re.compile(r"[^A-Z0-9]+")
+# 15 chars: 2-digit state code, 10-char PAN, 1 entity digit/letter, 'Z', 1 check char.
+_GSTIN_RE = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][0-9A-Z]Z[0-9A-Z]$")
+# 5 letters, 4 digits, 1 letter. The 4th letter is the holder type and the 5th
+# the surname initial; neither is checked, because an OCR slip there would make
+# the value differ from the other side's anyway -- the shape is what rules out
+# "NA" and bare numbers.
+_PAN_RE = re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$")
+_DIGITS_ONLY = re.compile(r"^[0-9]+$")
+# Indian state codes actually issued: 01-38, plus 97 (other territory) and 99 (centre).
+_GSTIN_STATE_CODES: frozenset[str] = frozenset(
+    [f"{n:02d}" for n in range(1, 39)] + ["97", "99"]
+)
+
+
+def _placeholder(value: str | None) -> bool:
+    """True for a value that states the field has no value -- "NA", "No",
+    "-", "0000", "XXXX" and the like, in any spacing or punctuation."""
+    if value is None:
+        return True
+    squashed = _NON_ALNUM.sub("", value.upper())
+    if not squashed:
+        return True
+    if squashed in _PLACEHOLDER_TOKENS:
+        return True
+    # One character repeated ("0000", "XXXXXXXX", "----") says nothing.
+    return len(set(squashed)) == 1
+
+
+def _valid_gstin(value: Any) -> str | None:
+    """A GSTIN in its documented shape, or None. Nothing else is a GSTIN --
+    least of all "No" on an invoice to a customer who has none."""
+    if value is None:
+        return None
+    candidate = _NON_ALNUM.sub("", str(value).upper())
+    if _placeholder(candidate) or not _GSTIN_RE.match(candidate):
+        return None
+    if candidate[:2] not in _GSTIN_STATE_CODES:
+        return None
+    return candidate
+
+
+def _valid_pan(value: Any) -> str | None:
+    if value is None:
+        return None
+    candidate = _NON_ALNUM.sub("", str(value).upper())
+    if _placeholder(candidate) or not _PAN_RE.match(candidate):
+        return None
+    return candidate
+
+
+def _valid_aadhaar(value: Any) -> str | None:
+    """12 digits, not starting 0 or 1 (UIDAI issues none), and not a single
+    repeated digit or a plain 1..9 run."""
+    if value is None:
+        return None
+    candidate = _NON_DIGIT.sub("", str(value))
+    if len(candidate) != 12 or candidate[0] in "01":
+        return None
+    if len(set(candidate)) == 1 or candidate in ("123456789012", "098765432109"):
+        return None
+    return candidate
+
+
+def _valid_pincode(value: Any) -> str | None:
+    """6 digits, first digit 1-8 (the postal circles actually in use)."""
+    if value is None:
+        return None
+    candidate = _NON_DIGIT.sub("", str(value))
+    if len(candidate) != 6 or candidate[0] not in "12345678":
+        return None
+    if len(set(candidate)) == 1:
+        return None
+    return candidate
+
+
+def _meaningful_text(value: Any, *, minimum_length: int) -> str | None:
+    """A name or address with enough substance to compare: not a
+    placeholder, and long enough that a fuzzy ratio means something. "NA"
+    equals "NA" exactly, which used to raise a SIMILAR_ADDRESS pair."""
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    if _placeholder(text_value):
+        return None
+    letters = sum(1 for character in text_value if character.isalpha())
+    if letters < 2 or len(_NON_ALNUM.sub("", text_value.upper())) < minimum_length:
+        return None
+    return text_value
+
+
+_MINIMUM_NAME_LENGTH = 4
+_MINIMUM_ADDRESS_LENGTH = 12
+
+
 def _normalize_mobile(value: Any) -> str | None:
+    """The last 10 digits, when they form a real Indian mobile number.
+    A landline-length string, a repeated digit or a number beginning 0-5 is
+    not a mobile and must not pair two journeys together."""
     digits = _NON_DIGIT.sub("", str(value or ""))
     if len(digits) < 10:
         return None
-    return digits[-10:]  # drops a country code / leading trunk prefix
+    candidate = digits[-10:]  # drops a country code / leading trunk prefix
+    if candidate[0] not in "6789" or len(set(candidate)) == 1:
+        return None
+    return candidate
 
 
 def _surname(name: str | None) -> str | None:
@@ -224,18 +343,33 @@ def _extract_signals(rows: list[Any], *, gst: str | None) -> dict[str, Any] | No
     signal is its buyer GSTIN (no KYC extraction at all yet) must still
     count as having something to compare, not be silently dropped."""
     by_field = {r["field_key"]: str(r["effective_value"] or "").strip() for r in rows}
+    # Every value is validated for its own shape before it can pair two
+    # journeys; a placeholder or wrongly-shaped value counts as absent
+    # (2026-10-23 -- see the validators above).
     name = None
     for kyc_type in _KYC_DOCUMENT_TYPES:
         field_key = _NAME_FIELDS.get(kyc_type)
-        if field_key and by_field.get(field_key):
-            name = by_field[field_key]
-            break
-    relative_name = next((by_field[k] for k in _RELATIONSHIP_NAME_FIELDS if by_field.get(k)), None)
-    address = next((by_field[k] for k in _ADDRESS_FIELDS if by_field.get(k)), None)
+        if field_key:
+            candidate_name = _meaningful_text(by_field.get(field_key), minimum_length=_MINIMUM_NAME_LENGTH)
+            if candidate_name:
+                name = candidate_name
+                break
+    relative_name = next(
+        (value for value in (
+            _meaningful_text(by_field.get(k), minimum_length=_MINIMUM_NAME_LENGTH)
+            for k in _RELATIONSHIP_NAME_FIELDS) if value),
+        None,
+    )
+    address = next(
+        (value for value in (
+            _meaningful_text(by_field.get(k), minimum_length=_MINIMUM_ADDRESS_LENGTH)
+            for k in _ADDRESS_FIELDS) if value),
+        None,
+    )
 
-    pan = by_field.get("pan_number") or None
-    aadhaar = by_field.get("aadhaar_number") or None
-    pincode = by_field.get("address_pincode") or None
+    pan = _valid_pan(by_field.get("pan_number"))
+    aadhaar = _valid_aadhaar(by_field.get("aadhaar_number"))
+    pincode = _valid_pincode(by_field.get("address_pincode"))
     mobile = _normalize_mobile(by_field.get("customer_phone"))
     if not (pan or aadhaar or name or mobile or address or gst):
         return None
@@ -272,7 +406,7 @@ def _identity_signals(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id, "field_keys": _IDENTITY_FIELD_KEYS},
     ).mappings().all()
-    gst = _buyer_gstin(connection, tenant_id=tenant_id, journey_id=journey_id)
+    gst = _valid_gstin(_buyer_gstin(connection, tenant_id=tenant_id, journey_id=journey_id))
     return _extract_signals(rows, gst=gst)
 
 
@@ -342,7 +476,11 @@ def _candidate_journeys(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
-    gst_by_journey = {row["journey_id"]: row["buyer_gstin"] for row in gst_rows}
+    gst_by_journey = {
+        row["journey_id"]: value
+        for row in gst_rows
+        if (value := _valid_gstin(row["buyer_gstin"])) is not None
+    }
     for row in gst_rows:
         created_at_by_journey.setdefault(row["journey_id"], row["created_at_utc"])
 
@@ -388,6 +526,91 @@ def _match_basis(signals: dict[str, Any], candidate: dict[str, Any]) -> str | No
     if _addresses_match(signals["address"], candidate["address"]):
         return "SIMILAR_ADDRESS"
     return None
+
+
+# ── what actually matched, for the reviewer (2026-10-23) ─────────────────────
+# "GSTIN · 75%" tells a reviewer the basis but not the evidence, so a wrong
+# pairing could not be told from a right one without opening both journeys.
+# The values that matched are recorded on the finding when it is raised and
+# shown beside the pair. Numbers that identify a person are masked to their
+# last four; a GSTIN and a pincode are not, because they identify a business
+# or a locality and are what the reviewer has to read to judge the match.
+_MASKED_FIELDS: frozenset[str] = frozenset({"pan", "aadhaar", "mobile"})
+_MATCH_FIELD_LABEL: dict[str, str] = {
+    "pan": "PAN",
+    "aadhaar": "Aadhaar",
+    "gst": "Buyer GSTIN",
+    "mobile": "Mobile",
+    "name": "KYC name",
+    "relative_name": "Relative on KYC",
+    "surname": "Surname",
+    "pincode": "Pincode",
+    "address": "Address",
+}
+# Which signals each basis actually compared, in the order they were compared.
+_BASIS_FIELDS: dict[str, tuple[str, ...]] = {
+    "PAN": ("pan",),
+    "AADHAAR": ("aadhaar",),
+    "CUSTOMER_MATCHES_RELATIVE": ("name", "relative_name"),
+    "NAME_AND_ADDRESS": ("name", "pincode"),
+    "GST": ("gst",),
+    "MOBILE": ("mobile",),
+    "SURNAME_AND_PINCODE": ("surname", "pincode"),
+    "SIMILAR_ADDRESS": ("address",),
+}
+_MAX_SHOWN_LENGTH = 80
+
+
+def _shown(field: str, value: Any) -> str | None:
+    """One value as a reviewer should see it: masked where it identifies a
+    person, trimmed where it is long."""
+    if value is None:
+        return None
+    text_value = str(value).strip()
+    if not text_value:
+        return None
+    if field in _MASKED_FIELDS:
+        return text_value if len(text_value) <= 4 else f"{'X' * (len(text_value) - 4)}{text_value[-4:]}"
+    if len(text_value) > _MAX_SHOWN_LENGTH:
+        return f"{text_value[:_MAX_SHOWN_LENGTH].rstrip()}…"
+    return text_value
+
+
+def _matched_fields(basis: str, signals: dict[str, Any], candidate: dict[str, Any]) -> list[dict[str, Any]]:
+    """The field-by-field evidence behind one pairing: what this booking
+    carried, what the other one carried, and whether the two are identical
+    or merely similar (the fuzzy bases never compare equal strings)."""
+    fields: list[dict[str, Any]] = []
+    for field in _BASIS_FIELDS.get(basis, ()):
+        if basis == "CUSTOMER_MATCHES_RELATIVE":
+            # The comparison crosses the two sides: one booking's customer
+            # against the other's named relative, whichever way round matched.
+            this_value, other_value = (
+                (signals["name"], candidate["relative_name"])
+                if _same_person_by_name(signals["name"], candidate["relative_name"])
+                else (signals["relative_name"], candidate["name"])
+            )
+            if field == "relative_name":
+                continue
+            fields.append({
+                "field": "name_vs_relative",
+                "label": "KYC name vs relative on the other booking",
+                "thisValue": _shown("name", this_value),
+                "otherValue": _shown("name", other_value),
+                "exact": False,
+            })
+            continue
+        this_value, other_value = signals.get(field), candidate.get(field)
+        if this_value is None and other_value is None:
+            continue
+        fields.append({
+            "field": field,
+            "label": _MATCH_FIELD_LABEL.get(field, field),
+            "thisValue": _shown(field, this_value),
+            "otherValue": _shown(field, other_value),
+            "exact": bool(this_value) and str(this_value) == str(other_value),
+        })
+    return fields
 
 
 def _booking_confirm_date(connection: Connection, *, tenant_id: str, journey_id: UUID) -> Any:
@@ -527,10 +750,16 @@ def sync_duplicate_booking_detection(
     Idempotent, self-heals, never raises."""
     try:
         signals = _identity_signals(connection, tenant_id=tenant_id, journey_id=journey_id)
-        if signals is None:
-            return {"raised": 0, "resolved": 0, "examined": 0}
-
-        candidates = _candidate_journeys(connection, tenant_id=tenant_id, journey_id=journey_id)
+        # A journey with nothing identifying left still has to have its own
+        # open findings resolved: 2026-10-23, when placeholder values stopped
+        # counting as identifiers, the journeys whose only "identifier" was a
+        # buyer GSTIN of "No" fell into this branch, and an early return here
+        # would have left every wrong pairing open for ever with no way to
+        # clear it but by hand. Fall through with no candidates instead.
+        candidates = (
+            _candidate_journeys(connection, tenant_id=tenant_id, journey_id=journey_id)
+            if signals is not None else []
+        )
         this_journey_created = connection.execute(
             text("SELECT created_at_utc FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
             {"t": tenant_id, "j": journey_id},
@@ -619,6 +848,9 @@ def sync_duplicate_booking_detection(
                     "holderBookingConfirmDate": other_confirm_date,
                     "matchConfidencePercent": _CONFIDENCE_PERCENT_BY_BASIS[basis],
                     "matchConfidenceLabel": _CONFIDENCE_LABEL_BY_SEVERITY[_SEVERITY_BY_BASIS[basis]],
+                    # The evidence, so the pair can be judged without opening
+                    # both journeys (2026-10-23).
+                    "matchedFields": _matched_fields(basis, signals, candidate),
                 },
             )
             raised += 1

@@ -71,10 +71,22 @@ def _authorize(
         raise AuthorizationError(error_code="VAC-AUTH-002", status_code=403, title="Permission denied")
 
 
+class MatchedField(BaseModel):
+    """One piece of evidence behind a pairing: the field compared and what
+    each side carried (2026-10-23 -- "GSTIN · 75%" alone could not be judged
+    without opening both journeys)."""
+    field: str
+    label: str
+    thisValue: str | None = None
+    otherValue: str | None = None
+    exact: bool = False
+
+
 class DuplicateBookingSide(BaseModel):
     journeyId: UUID | None = None
     journeyReference: str | None = None
     customerName: str | None = None
+    pcName: str | None = None
     dealerName: str | None = None
     outletName: str | None = None
     productLabel: str | None = None
@@ -91,6 +103,9 @@ class DuplicateBookingPair(BaseModel):
     matchBasisLabel: str | None = None
     matchConfidencePercent: int | None = None
     matchConfidenceLabel: str | None = None
+    # What actually matched. Empty for a finding raised before the evidence
+    # was recorded; the UI simply shows nothing extra for those.
+    matchedFields: list[MatchedField] = []
     # The journey the finding lives on -- believed NOT to hold the booking.
     duplicate: DuplicateBookingSide
     # The journey believed to actually hold the booking (whichever paid its
@@ -135,10 +150,12 @@ _DUPLICATE_BOOKINGS_SQL = f"""
         rp.safe_payload ->> 'matchBasis' AS match_basis,
         NULLIF(rp.safe_payload ->> 'matchConfidencePercent', '')::int AS match_confidence_percent,
         rp.safe_payload ->> 'matchConfidenceLabel' AS match_confidence_label,
+        rp.safe_payload -> 'matchedFields' AS matched_fields,
 
         dj.journey_id AS duplicate_journey_id,
         dj.journey_reference AS duplicate_journey_reference,
         CASE WHEN dj_c.legal_name_status = 'VERIFIED' AND btrim(COALESCE(dj_c.legal_name, '')) <> '' THEN dj_c.legal_name ELSE dj_c.display_name END AS duplicate_customer_name,
+        dj.created_by_display_name AS duplicate_pc_name,
         dj_d.dealer_name AS duplicate_dealer_name,
         dj_o.outlet_name AS duplicate_outlet_name,
         dj_b.booking_reference AS duplicate_booking_reference,
@@ -149,6 +166,7 @@ _DUPLICATE_BOOKINGS_SQL = f"""
         hj.journey_id AS holder_journey_id,
         hj.journey_reference AS holder_journey_reference,
         CASE WHEN hj_c.legal_name_status = 'VERIFIED' AND btrim(COALESCE(hj_c.legal_name, '')) <> '' THEN hj_c.legal_name ELSE hj_c.display_name END AS holder_customer_name,
+        hj.created_by_display_name AS holder_pc_name,
         hj_d.dealer_name AS holder_dealer_name,
         hj_o.outlet_name AS holder_outlet_name,
         hj_b.booking_reference AS holder_booking_reference,
@@ -181,11 +199,31 @@ _DUPLICATE_BOOKINGS_SQL = f"""
 """
 
 
+def _matched_fields(payload: Any) -> list[MatchedField]:
+    """The recorded evidence, ignoring anything malformed -- a finding from
+    before this was recorded simply has none."""
+    if not isinstance(payload, list):
+        return []
+    fields: list[MatchedField] = []
+    for item in payload:
+        if not isinstance(item, dict) or not item.get("field"):
+            continue
+        fields.append(MatchedField(
+            field=str(item["field"]),
+            label=str(item.get("label") or item["field"]),
+            thisValue=item.get("thisValue"),
+            otherValue=item.get("otherValue"),
+            exact=bool(item.get("exact")),
+        ))
+    return fields
+
+
 def _side(row: dict[str, Any], prefix: str) -> DuplicateBookingSide:
     return DuplicateBookingSide(
         journeyId=row[f"{prefix}_journey_id"],
         journeyReference=row[f"{prefix}_journey_reference"],
         customerName=row[f"{prefix}_customer_name"],
+        pcName=row[f"{prefix}_pc_name"],
         dealerName=row[f"{prefix}_dealer_name"],
         outletName=row[f"{prefix}_outlet_name"],
         productLabel=row[f"{prefix}_product_label"],
@@ -243,6 +281,7 @@ def get_duplicate_bookings(
             matchBasisLabel=_BASIS_LABEL.get(row["match_basis"] or "", row["match_basis"]),
             matchConfidencePercent=row["match_confidence_percent"],
             matchConfidenceLabel=row["match_confidence_label"],
+            matchedFields=_matched_fields(row["matched_fields"]),
             duplicate=_side(row, "duplicate"),
             holder=_side(row, "holder"),
         )
