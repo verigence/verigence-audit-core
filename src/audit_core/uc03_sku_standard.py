@@ -664,36 +664,72 @@ def master_documents(
         ),
         {"t": tenant_id, "first": first, "next": nxt},
     ).mappings().all()
-    documents = [
-        {
-            "uploadId": str(row["upload_id"]),
-            "oemCode": row["oem_code"],
-            "masterKind": row["master_kind"],
-            "effectiveFrom": row["effective_from"],
-            "fileName": row["source_filename"],
-            "sha256": row["source_sha256"],
-            "status": row["status"],
-            "rowCounts": row["row_counts"] or {},
-            "errorDetail": row["error_detail"],
-            "uploadedBy": row["uploaded_by_actor_id"],
-            "uploadedAtUtc": row["uploaded_at_utc"],
-            "publishedAtUtc": row["published_at_utc"],
-            # False for anything uploaded before the document itself was
-            # kept: those files were never stored and cannot be recovered.
-            "openable": bool(row["source_object_key"]),
-        }
-        for row in rows
-    ]
-    # The kinds a month is expected to carry. DISCOUNT_GRID is deliberately
-    # absent: oem_master_uploads' own CHECK does not allow it, so a grid
-    # upload is never recorded here and claiming it is missing would be a
-    # lie about the data rather than about the month.
-    expected = ("PRICE_LIST", "CONSUMER_SCHEME", "EXCHANGE_SCHEME", "CORPORATE_POLICY")
-    present = {d["masterKind"] for d in documents if d["status"] == "PUBLISHED"}
+    documents = [_master_document(row, carried_forward=False) for row in rows]
+
+    # 2026-10-23 (product owner: "I don't see the price master, discount grid,
+    # consumer offer"): a month is also governed by what was published BEFORE
+    # it and still stands on its first day -- a grid dated 1 Sep with no end,
+    # a price book of 19 Sep until October's arrives. Selecting on the
+    # effective date alone hid those, so the month looked empty of the very
+    # documents its figures come from. The document a kind carries in is the
+    # newest published one dated on or before the day the standing version
+    # started (a re-upload on a date replaces the earlier one on it).
+    from audit_core.uc03_masters_overview import kinds_standing_on
+
+    in_month = {d["masterKind"] for d in documents if d["status"] == "PUBLISHED" and d["effectiveFrom"] == first}
+    carried: list[dict[str, Any]] = []
+    for kind, since in sorted(kinds_standing_on(connection, tenant_id=tenant_id, on=first).items()):
+        if since >= first or kind in in_month:
+            continue
+        row = connection.execute(
+            text(
+                """
+                SELECT upload_id, oem_code, master_kind, effective_from, source_filename, source_sha256,
+                       status, row_counts, error_detail, uploaded_by_actor_id, uploaded_at_utc,
+                       published_at_utc, source_object_key
+                FROM auditcore.oem_master_uploads
+                WHERE tenant_id = :t AND master_kind = :k AND status = 'PUBLISHED' AND effective_from <= :since
+                ORDER BY effective_from DESC, published_at_utc DESC NULLS LAST, uploaded_at_utc DESC
+                LIMIT 1
+                """
+            ),
+            {"t": tenant_id, "k": kind, "since": since},
+        ).mappings().first()
+        if row is not None:
+            carried.append(_master_document(row, carried_forward=True))
+
+    # Every kind a month is expected to carry, the grid included: migration
+    # 0137 lets oem_master_uploads record DISCOUNT_GRID, so leaving it out
+    # (the previous behaviour) hid a month with no grid.
+    expected = ("PRICE_LIST", "CONSUMER_SCHEME", "EXCHANGE_SCHEME", "CORPORATE_POLICY", "DISCOUNT_GRID")
+    present = {d["masterKind"] for d in [*carried, *documents] if d["status"] == "PUBLISHED"}
     return {
         "month": month,
-        "documents": documents,
+        "documents": [*carried, *documents],
         "missingKinds": [kind for kind in expected if kind not in present],
+    }
+
+
+def _master_document(row: Any, *, carried_forward: bool) -> dict[str, Any]:
+    return {
+        "uploadId": str(row["upload_id"]),
+        "oemCode": row["oem_code"],
+        "masterKind": row["master_kind"],
+        "effectiveFrom": row["effective_from"],
+        "fileName": row["source_filename"],
+        "sha256": row["source_sha256"],
+        "status": row["status"],
+        "rowCounts": row["row_counts"] or {},
+        "errorDetail": row["error_detail"],
+        "uploadedBy": row["uploaded_by_actor_id"],
+        "uploadedAtUtc": row["uploaded_at_utc"],
+        "publishedAtUtc": row["published_at_utc"],
+        # False for anything uploaded before the document itself was
+        # kept: those files were never stored and cannot be recovered.
+        "openable": bool(row["source_object_key"]),
+        # Published in an earlier month and still standing on this one's
+        # first day.
+        "carriedForward": carried_forward,
     }
 
 

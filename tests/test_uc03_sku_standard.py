@@ -338,18 +338,23 @@ def test_master_documents_lists_a_months_documents_and_what_is_missing(connectio
         tenant_id=tenant_id, month="2026-10", human_principal=HumanPrincipal(subject="pc-1"),
         authorization_client=AllowAllAuthorization(), connection=connection,
     )
-    # The month is chosen on the document's own effective date, so
-    # September's book does not appear under October.
-    assert [d["masterKind"] for d in book["documents"]] == ["CONSUMER_SCHEME", "EXCHANGE_SCHEME", "PRICE_LIST"]
-    assert all(d["effectiveFrom"] == date(2026, 10, 3) for d in book["documents"])
+    # The month's own documents are those effective in it; before them comes
+    # what was published earlier and still stands on its first day (2026-10-23):
+    # September's book prices 1-2 October, so it is carried in and marked so.
+    assert [(d["masterKind"], d["carriedForward"]) for d in book["documents"]] == [
+        ("PRICE_LIST", True), ("CONSUMER_SCHEME", False), ("EXCHANGE_SCHEME", False), ("PRICE_LIST", False)]
+    carried = book["documents"][0]
+    assert carried["fileName"] == "Mahindra_Consolidated_Price_List_01Sep2026.xlsx"
+    assert all(d["effectiveFrom"] == date(2026, 10, 3) for d in book["documents"][1:])
 
     # A document that failed to publish is exactly what a reader is after.
     failed = next(d for d in book["documents"] if d["masterKind"] == "EXCHANGE_SCHEME")
     assert failed["status"] == "FAILED" and "cash + other" in failed["errorDetail"]
 
-    # Only PUBLISHED counts as present, so the failed exchange scheme and
-    # the corporate policy nobody loaded both read as missing.
-    assert book["missingKinds"] == ["EXCHANGE_SCHEME", "CORPORATE_POLICY"]
+    # Only PUBLISHED counts as present, so the failed exchange scheme, the
+    # corporate policy and the grid nobody uploaded a document for all read as
+    # missing. (The grid used to be left out of the check altogether.)
+    assert book["missingKinds"] == ["EXCHANGE_SCHEME", "CORPORATE_POLICY", "DISCOUNT_GRID"]
 
     september = master_documents(
         tenant_id=tenant_id, month="2026-09", human_principal=HumanPrincipal(subject="pc-1"),
