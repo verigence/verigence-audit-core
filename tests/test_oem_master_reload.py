@@ -106,6 +106,12 @@ def test_the_scheme_reload_dry_runs_then_commits_the_bulletins_on_their_dates(te
             "JOIN auditcore.discount_scheme_benefits b ON b.discount_scheme_version_id = v.discount_scheme_version_id "
             "WHERE v.tenant_id = :t"), {"t": tenant_id}).all())
     assert ends == {date(2026, 9, 3): date(2026, 9, 30), date(2026, 10, 3): date(2026, 10, 31)}
+    # The standing rows name their scheme, so a failed "model-wide rows of unresolved variants"
+    # check can log which schemes and variant texts the rows are.
+    with engine.begin() as conn:
+        conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        standing = oem_master_reload._standing_rows(conn, tenant_id, date(2026, 9, 15))
+    assert standing and all(r["scheme_code"] and r["scheme_name"] for r in standing)
 
 
 def test_the_real_october_grid_binds_scorpio_n_to_the_model_the_october_book_prices(tenant) -> None:
