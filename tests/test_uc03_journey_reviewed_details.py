@@ -361,3 +361,75 @@ def test_semantic_aliases_are_exact_and_not_fuzzy() -> None:
     assert semantic_key("pan_name") == "customer_name"
     assert semantic_key("vin_number") == "vin"
     assert semantic_key("some_future_di_field") == "some_future_di_field"
+
+
+def test_a_document_that_does_not_name_the_booked_vehicle_never_sets_the_model() -> None:
+    """2026-10-23, live: a Booking Docket read "BOL MAXX PUP HD 1.7 VXI" at
+    92%, and the journey carried "Dost". Stage ranked above source priority
+    and a document type absent from the spec's sources still competed, so one
+    DELIVERY-stage document of any type outranked the docket."""
+    rows = [
+        _row(
+            field_key="vehicle_model",
+            value="BOL MAXX PUP HD 1.7 VXI",
+            document_type="booking_docket",
+            stage="BOOKING",
+        ),
+        _row(
+            field_key="vehicle_model",
+            value="Dost",
+            document_type="scrappage_certificate",
+            stage="DELIVERY",
+        ),
+    ]
+
+    _, resolved = annotate_and_resolve_reviewed_fields(rows)
+
+    assert resolved["model"]["value"] == "BOL MAXX PUP HD 1.7 VXI"
+    assert resolved["model"]["documentTypeKey"] == "booking_docket"
+
+
+def test_the_other_document_is_still_shown_even_though_it_cannot_win() -> None:
+    """Nothing is hidden from Journey Details: the value stays visible, it
+    simply does not decide what was booked."""
+    rows = [
+        _row(field_key="vehicle_model", value="BOL MAXX PUP HD 1.7 VXI",
+             document_type="booking_docket", stage="BOOKING"),
+        _row(field_key="vehicle_model", value="Dost",
+             document_type="scrappage_certificate", stage="DELIVERY"),
+    ]
+
+    annotated, _ = annotate_and_resolve_reviewed_fields(rows)
+
+    values = {row["displayValue"] for row in annotated}
+    assert values == {"BOL MAXX PUP HD 1.7 VXI", "Dost"}
+    assert [row["isPreferred"] for row in annotated] == [True, False]
+
+
+def test_the_invoice_still_outranks_the_booking_form_for_the_model() -> None:
+    """The product owner's rule is unchanged: the invoice is the source of
+    truth and updates the model. It wins because the spec lists it first, not
+    because it is DELIVERY-stage."""
+    rows = [
+        _row(field_key="vehicle_model", value="Booking Model",
+             document_type="booking_form", stage="BOOKING"),
+        _row(field_key="vehicle_model", value="Invoiced Model",
+             document_type="customer_invoice_dms", stage="BOOKING"),
+    ]
+
+    _, resolved = annotate_and_resolve_reviewed_fields(rows)
+
+    assert resolved["model"]["value"] == "Invoiced Model"
+
+
+def test_the_booking_form_outranks_the_docket_for_the_model() -> None:
+    rows = [
+        _row(field_key="vehicle_model", value="From the docket",
+             document_type="booking_docket", stage="BOOKING"),
+        _row(field_key="vehicle_model", value="From the form",
+             document_type="booking_form", stage="BOOKING"),
+    ]
+
+    _, resolved = annotate_and_resolve_reviewed_fields(rows)
+
+    assert resolved["model"]["value"] == "From the form"

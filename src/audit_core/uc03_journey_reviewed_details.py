@@ -271,6 +271,47 @@ def load_reviewed_field_details(
     return [dict(row) for row in rows]
 
 
+# The vehicle the deal is for. Only a document that NAMES the booked vehicle
+# may set these: the booking form or docket, the customer's invoice, or the
+# deal sheet -- exactly the sources each spec's own source_priority lists
+# (2026-10-23). Any other document carrying a model-ish field (an exchange or
+# old-vehicle document, a policy, a certificate) is not evidence of what was
+# booked, and used to be able to win: _candidate_rank ranked DELIVERY stage
+# ABOVE source priority, and a document type absent from source_priority still
+# scored len+1 rather than being excluded, so one DELIVERY-stage document of
+# any type outranked the booking docket outright.
+_PRODUCT_SEMANTIC_KEYS = frozenset({"model", "variant", "color"})
+# The canonical field of each product semantic. Several field keys feed one
+# semantic ("model_name_raw" on an invoice is the same fact as "vehicle_model"
+# on a booking form) and only the canonical one carries a spec, so the sources
+# are read from the semantic rather than from whichever key a document used.
+_PRODUCT_CANONICAL_FIELD: dict[str, str] = {
+    "model": "vehicle_model",
+    "variant": "vehicle_variant",
+    "color": "vehicle_color",
+}
+
+
+def _product_sources(semantic: str) -> tuple[str, ...]:
+    spec = spec_for_field(_PRODUCT_CANONICAL_FIELD.get(semantic, ""))
+    return tuple(source.casefold() for source in spec.source_priority) if spec else ()
+
+
+def _names_the_booked_vehicle(item: dict[str, Any], semantic: str) -> bool:
+    """True when this document type is one the semantic's own spec accepts as
+    a source for the booked vehicle."""
+    document_type = str(item.get("documentTypeKey") or "").strip().casefold()
+    return document_type in _product_sources(semantic)
+
+
+def _product_source_rank(item: dict[str, Any], semantic: str) -> int:
+    """Where this document sits in the semantic's own source order (invoice,
+    then deal sheet, then the booking form and docket)."""
+    sources = _product_sources(semantic)
+    document_type = str(item.get("documentTypeKey") or "").strip().casefold()
+    return sources.index(document_type) if document_type in sources else len(sources) + 1
+
+
 def _source_priority_rank(item: dict[str, Any]) -> int:
     spec = spec_for_field(str(item.get("fieldKey") or ""))
     if spec is None:
@@ -315,6 +356,20 @@ def _candidate_rank(item: dict[str, Any], semantic: str) -> tuple[Any, ...]:
             0 if stage == "DELIVERY" else 1,
             _source_priority_rank(item),
             -fact_version,
+            str(item.get("documentId") or ""),
+            str(item.get("reviewedFieldId") or ""),
+        )
+
+    if semantic in _PRODUCT_SEMANTIC_KEYS:
+        # Which document it is decides first, not which stage it arrived at:
+        # the invoice outranks the booking form because the spec says so
+        # (invoice is the source of truth), not because it is DELIVERY-stage.
+        # Stage only breaks a tie between two documents of the same type.
+        return (
+            _product_source_rank(item, semantic),
+            0 if stage == "DELIVERY" else 1,
+            -fact_version,
+            document_type,
             str(item.get("documentId") or ""),
             str(item.get("reviewedFieldId") or ""),
         )
@@ -386,8 +441,14 @@ def annotate_and_resolve_reviewed_fields(
         # again the moment a Team Lead releases the hold (or never, if
         # instead confirmed as the wrong document entirely).
         identity_status = str(item.get("identityCheckStatus") or "PASSED").upper()
-        if item.get("hasEffectiveValue") and identity_status == "PASSED":
-            candidates_by_semantic[semantic].append(item)
+        if not item.get("hasEffectiveValue") or identity_status != "PASSED":
+            continue
+        # A document that does not name the booked vehicle never decides what
+        # was booked. It stays in `annotated` (nothing is hidden from Journey
+        # Details); it simply cannot win the model, variant or colour.
+        if semantic in _PRODUCT_SEMANTIC_KEYS and not _names_the_booked_vehicle(item, semantic):
+            continue
+        candidates_by_semantic[semantic].append(item)
 
     resolved: dict[str, dict[str, Any]] = {}
     for semantic, candidates in candidates_by_semantic.items():
