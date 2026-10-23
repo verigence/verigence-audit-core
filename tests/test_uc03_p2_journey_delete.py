@@ -9,15 +9,25 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from starlette.requests import Request
 from conftest import delete_tenant_data
-from p2_support import AllowAllAuthorization, add_page, create_p2_journey, database_engine
+from p2_support import (
+    AllowAllAuthorization,
+    add_page,
+    create_p2_journey,
+    database_engine,
+)
 from sqlalchemy import text
+from starlette.requests import Request
 
 from audit_core.authorization import AuthorizationError
 from audit_core.db import set_tenant_context
 from audit_core.di_capture_v2_client import DiCaptureV2Error
-from audit_core.errors import BusinessValidationError, ConflictError, DependencyUnavailableError, NotFoundError
+from audit_core.errors import (
+    BusinessValidationError,
+    ConflictError,
+    DependencyUnavailableError,
+    NotFoundError,
+)
 from audit_core.evidence import _external_context_ref
 from audit_core.uc03_p2_journey_delete import (
     DeleteJourneyCommand,

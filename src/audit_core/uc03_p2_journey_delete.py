@@ -392,7 +392,7 @@ def delete_journey(
             security_client=security_client,
             v2_client=v2_client,
         )
-    except Exception as exc:  # noqa: BLE001 - recorded, then reported as the dependency failure
+    except Exception as exc:
         logger.error("p2_journey_delete_di_failed", tenant_id=tenant_id, journey_id=str(journey_id), error=str(exc))
         raise _fail(
             engine, tenant_id=tenant_id, deletion_id=deletion_id, di_documents=di_done, objects=0,
@@ -428,7 +428,7 @@ def delete_journey(
                 engine, tenant_id=tenant_id, deletion_id=deletion_id, status="COMPLETED",
                 di_documents=di_done, objects=object_count, detail=None, connection=connection,
             )
-    except Exception as exc:  # noqa: BLE001 - recorded, then reported
+    except Exception as exc:
         logger.error("p2_journey_delete_db_failed", tenant_id=tenant_id, journey_id=str(journey_id), error=str(exc))
         raise _fail(
             engine, tenant_id=tenant_id, deletion_id=deletion_id, di_documents=di_done, objects=object_count,

@@ -114,9 +114,9 @@ from audit_core.uc03_p2_daily_report import router as uc03_p2_daily_report_route
 from audit_core.uc03_p2_deal_actions import router as uc03_p2_deal_router
 from audit_core.uc03_p2_documents import router as uc03_p2_documents_router
 from audit_core.uc03_p2_journey360_api import router as uc03_p2_journey360_router
+from audit_core.uc03_p2_journey_delete import router as uc03_p2_journey_delete_router
 from audit_core.uc03_p2_live import router as uc03_p2_live_router
 from audit_core.uc03_p2_resplit import router as uc03_p2_resplit_router
-from audit_core.uc03_p2_journey_delete import router as uc03_p2_journey_delete_router
 from audit_core.uc03_p2_reviewer import router as uc03_p2_reviewer_router
 from audit_core.uc03_p2_vehicle_photos import router as uc03_p2_vehicle_photos_router
 from audit_core.uc03_pc_booking_documents import (
