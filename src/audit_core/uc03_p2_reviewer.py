@@ -30,10 +30,11 @@ accident.
 """
 from __future__ import annotations
 
+from datetime import date
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import Connection, text
 
 from audit_core.dependencies import get_connection, get_human_principal
@@ -545,12 +546,23 @@ def list_reviewer_journeys(
     connection: Annotated[Connection, Depends(get_connection)],
     state: str = "open",
     limit: int = 200,
+    outlet_id: Annotated[UUID | None, Query(alias="outletId")] = None,
+    date_from: Annotated[date | None, Query(alias="dateFrom")] = None,
+    date_to: Annotated[date | None, Query(alias="dateTo")] = None,
 ) -> dict[str, Any]:
-    """The Reviewer's board, grouped by dealership and Outlet.
+    """The Reviewer's board, grouped by dealership and Outlet, then by upload date.
 
     ``state``: open (the default -- still being worked) or closed. Closed
     journeys stay available but are asked for separately, because a Reviewer's
     day is the open ones.
+
+    ``outletId`` narrows the board to one Outlet and ``dateFrom``/``dateTo``
+    to a range of upload dates (inclusive, in the Project's timezone). A
+    journey's upload date is the day it was created. Within an Outlet the
+    oldest day comes first for open journeys -- the longest waiting is the
+    first to look at -- and the newest first for closed ones. ``outletOptions``
+    always lists every Outlet the caller covers, with its journey count in this
+    state, so a picker does not shrink to the Outlet already chosen.
     """
     access = _authorize(
         connection,
@@ -561,10 +573,17 @@ def list_reviewer_journeys(
         permission_key=_READ_PERMISSION,
     )
     wanted = state if state in {"open", "closed"} else "open"
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise HTTPException(status_code=422, detail="dateFrom must not be after dateTo.")
+    timezone = _project_timezone(connection, tenant_id=tenant_id)
+    # Open journeys: oldest day first. Closed: newest day first.
+    day_order = "ASC" if wanted == "open" else "DESC"
     rows = connection.execute(
         text(
             f"""
             SELECT j.journey_id, j.journey_reference, j.created_at_utc, j.updated_at_utc,
+                   (j.created_at_utc AT TIME ZONE :timezone)::date AS upload_date,
+                   count(*) OVER () AS total_matching,
                    j.dealer_id, j.outlet_id, d.dealer_name, o.outlet_name, o.outlet_code,
                    COALESCE(c.legal_name, c.display_name) AS customer_name,
                    j.created_by_display_name AS pc_name,
@@ -599,7 +618,13 @@ def list_reviewer_journeys(
             WHERE j.tenant_id=:tenant_id
               AND {_SCOPE_PREDICATE}
               AND (CAST(:state AS varchar) = 'closed') = {_CLOSED_PREDICATE}
-            ORDER BY lower(d.dealer_name), lower(o.outlet_name), j.updated_at_utc DESC
+              AND (CAST(:outlet_id AS uuid) IS NULL OR j.outlet_id = CAST(:outlet_id AS uuid))
+              AND (CAST(:date_from AS date) IS NULL
+                   OR (j.created_at_utc AT TIME ZONE :timezone)::date >= CAST(:date_from AS date))
+              AND (CAST(:date_to AS date) IS NULL
+                   OR (j.created_at_utc AT TIME ZONE :timezone)::date <= CAST(:date_to AS date))
+            ORDER BY lower(d.dealer_name), lower(o.outlet_name), d.dealer_id, o.outlet_id,
+                     upload_date {day_order}, j.created_at_utc {day_order}
             LIMIT :limit
             """
         ),
@@ -608,6 +633,38 @@ def list_reviewer_journeys(
             "actor_id": access.actor_id,
             "state": wanted,
             "limit": max(1, min(limit, 500)),
+            "outlet_id": outlet_id,
+            "date_from": date_from,
+            "date_to": date_to,
+            "timezone": timezone,
+        },
+    ).mappings().all()
+
+    # Every Outlet the caller covers, in this state, ignoring the Outlet and
+    # date filters above, for the picker.
+    option_rows = connection.execute(
+        text(
+            f"""
+            SELECT j.dealer_id, j.outlet_id, d.dealer_name, o.outlet_name, o.outlet_code,
+                   count(*) AS journey_count,
+                   min((j.created_at_utc AT TIME ZONE :timezone)::date) AS oldest_upload_date
+            FROM auditcore.journeys j
+            JOIN auditcore.dealers d
+              ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+            JOIN auditcore.dealer_outlets o
+              ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
+            WHERE j.tenant_id=:tenant_id
+              AND {_SCOPE_PREDICATE}
+              AND (CAST(:state AS varchar) = 'closed') = {_CLOSED_PREDICATE}
+            GROUP BY j.dealer_id, j.outlet_id, d.dealer_name, o.outlet_name, o.outlet_code
+            ORDER BY lower(d.dealer_name), lower(o.outlet_name), j.dealer_id, j.outlet_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "actor_id": access.actor_id,
+            "state": wanted,
+            "timezone": timezone,
         },
     ).mappings().all()
 
@@ -634,6 +691,7 @@ def list_reviewer_journeys(
                 "customerName": row["customer_name"],
                 "pcName": row["pc_name"],
                 "createdAtUtc": row["created_at_utc"],
+                "uploadDate": row["upload_date"].isoformat(),
                 "updatedAtUtc": row["updated_at_utc"],
                 "claimedByActorId": row["claimed_by_actor_id"],
                 "claimedAtUtc": row["claimed_at_utc"],
@@ -654,6 +712,26 @@ def list_reviewer_journeys(
     return {
         "state": wanted,
         "journeyCount": len(rows),
+        # How many matched before the row limit, so a cut-off list can say so.
+        "totalMatching": int(rows[0]["total_matching"]) if rows else 0,
+        "timezone": timezone,
+        "filters": {
+            "outletId": str(outlet_id) if outlet_id else None,
+            "dateFrom": date_from.isoformat() if date_from else None,
+            "dateTo": date_to.isoformat() if date_to else None,
+        },
+        "outletOptions": [
+            {
+                "dealerId": str(row["dealer_id"]),
+                "dealerName": row["dealer_name"],
+                "outletId": str(row["outlet_id"]),
+                "outletName": row["outlet_name"],
+                "outletCode": row["outlet_code"],
+                "journeyCount": int(row["journey_count"]),
+                "oldestUploadDate": row["oldest_upload_date"].isoformat(),
+            }
+            for row in option_rows
+        ],
         "outlets": groups,
     }
 
