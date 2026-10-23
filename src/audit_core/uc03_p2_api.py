@@ -474,12 +474,14 @@ def list_p2_journeys(
     month: str | None = None,
     outlet_id: UUID | None = None,
     pc_actor_id: str | None = None,
+    sort: str | None = None,
 ) -> dict[str, Any]:
     """Bookings / Journey 360 list, one page of one tab (uc03_p2_journey_views):
     ``view`` names the tab (``state`` open / closed / all is the older
     spelling), ``offset`` / ``limit`` the page (50 by default), and ``month``
     (YYYY-MM, the month the journey was started), ``outlet_id`` and
-    ``pc_actor_id`` narrow it. ``nextOffset`` is set when there is more."""
+    ``pc_actor_id`` narrow it. ``sort=outlet`` lists Outlet by Outlet, the
+    tab's own order inside each. ``nextOffset`` is set when there is more."""
     _authorize(
         connection,
         tenant_id=tenant_id,
@@ -490,7 +492,7 @@ def list_p2_journeys(
     )
     search = (q or "").strip()
     chosen = view if view in ALL_VIEWS else (state if state in {"open", "closed", "all"} else "all")
-    where, order = view_sql(chosen)
+    where, order = view_sql(chosen, sort)
     page_size = min(max(limit, 1), 250)
     # The tab's page is chosen from small flag sets joined to the journeys in
     # scope (uc03_p2_journey_views); every figure below is an indexed

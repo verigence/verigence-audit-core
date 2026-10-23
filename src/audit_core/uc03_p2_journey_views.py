@@ -168,10 +168,22 @@ VIEW_ORDER: dict[str, str] = {
 DEFAULT_ORDER = "s.updated_at_utc DESC, s.journey_id DESC"
 
 
-def view_sql(view: str) -> tuple[str, str]:
-    """(WHERE fragment over ``s``, ORDER BY) for a tab; unknown tabs are 'all'."""
+# "outlet" lists a Dealer's Outlets one after another and keeps the tab's own
+# order inside each Outlet; anything else is the tab's own order.
+OUTLET_ORDER_PREFIX = "lower(s.dealer_name), lower(s.outlet_name), s.outlet_id, "
+
+
+def view_sql(view: str, sort: str | None = None) -> tuple[str, str]:
+    """(WHERE fragment over ``s``, ORDER BY) for a tab; unknown tabs are 'all'.
+
+    ``sort`` "outlet" groups the list by Outlet (the TL's list, 2026-10-23); any
+    other value keeps the tab's own order (most urgent first).
+    """
     key = view if view in VIEW_FILTER else "all"
-    return VIEW_FILTER[key], VIEW_ORDER.get(key, DEFAULT_ORDER)
+    order = VIEW_ORDER.get(key, DEFAULT_ORDER)
+    if sort == "outlet":
+        order = OUTLET_ORDER_PREFIX + order
+    return VIEW_FILTER[key], order
 
 
 COUNTS_SQL = "WITH " + SCOPED_SQL + """
