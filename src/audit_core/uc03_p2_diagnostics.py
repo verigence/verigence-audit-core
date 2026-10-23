@@ -92,7 +92,8 @@ REPORTS: dict[str, str] = {
     "master_uploads": """
         SELECT upload_id, oem_code, master_kind, effective_from, source_filename, status,
                row_counts::text AS row_counts, left(error_detail::text, 900) AS error_detail,
-               uploaded_by_actor_id, uploaded_at_utc, published_at_utc
+               uploaded_by_actor_id, uploaded_at_utc, published_at_utc,
+               (source_object_key IS NOT NULL) AS stored, price_list_version_id::text AS price_list_version_id
         FROM auditcore.oem_master_uploads
         WHERE tenant_id = :t
         ORDER BY uploaded_at_utc
