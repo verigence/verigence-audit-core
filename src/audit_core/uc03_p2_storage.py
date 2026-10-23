@@ -94,6 +94,44 @@ class P2DocumentStorage:
         except (BotoCoreError, ClientError) as exc:
             raise P2DocumentStorageError(f"Failed to inspect {object_key}") from exc
 
+    def delete_objects(self, object_keys: list[str]) -> int:
+        """Delete the given keys (a key already gone is not an error). Returns
+        how many keys were sent for deletion."""
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        keys = sorted({key for key in object_keys if key})
+        try:
+            client = self._client()
+            for offset in range(0, len(keys), 1000):
+                batch = keys[offset : offset + 1000]
+                response = client.delete_objects(
+                    Bucket=self._settings.bucket,
+                    Delete={"Objects": [{"Key": key} for key in batch], "Quiet": True},
+                )
+                errors = response.get("Errors") or []
+                if errors:
+                    raise P2DocumentStorageError(
+                        f"Failed to delete {len(errors)} of {len(batch)} stored files"
+                    )
+        except (BotoCoreError, ClientError) as exc:
+            raise P2DocumentStorageError("Failed to delete stored files") from exc
+        return len(keys)
+
+    def list_keys(self, prefix: str) -> list[str]:
+        """Every key under ``prefix`` (which must end with "/")."""
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        if not prefix.endswith("/"):
+            raise ValueError("A storage prefix must end with '/'")
+        keys: list[str] = []
+        try:
+            paginator = self._client().get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self._settings.bucket, Prefix=prefix):
+                keys.extend(str(item["Key"]) for item in page.get("Contents") or [])
+        except (BotoCoreError, ClientError) as exc:
+            raise P2DocumentStorageError(f"Failed to list {prefix}") from exc
+        return keys
+
     def presign_get(self, object_key: str, *, expires_seconds: int = 1800) -> str:
         from botocore.exceptions import BotoCoreError, ClientError
 
