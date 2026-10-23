@@ -634,7 +634,7 @@ def test_matched_fields_mask_a_pan(two_journeys) -> None:
 
     dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
     dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="")
-    findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
+    assert len(_open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)) == 1
     payload = _raised_payload(c)
     (field,) = payload["matchedFields"]
     # Last four only: enough to recognise the document, not to copy it down.
