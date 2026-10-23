@@ -318,6 +318,30 @@ def _current_rows(connection: Connection, *, tenant_id: str, journey_id: UUID,
     return {"plan": plan, "rows": rows, "on": on}
 
 
+_INVOICE_DATE_FALLBACK_REASONS = ("no_pricing_date", "no_effective_price_list")
+
+
+def _rows_on_invoice_date(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, invoices: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """The price list in force on a vehicle invoice's own date, for a Journey
+    whose own pricing date gives none. The earliest invoice date that has a
+    list in force is used, so a later amended invoice cannot move the deal to
+    a newer book. None when no invoice carries a date, or none of them has a
+    list in force either."""
+    dates = sorted({inv["invoiceDate"] for inv in invoices if inv.get("invoiceDate")})
+    for on in dates:
+        try:
+            plan = _price_plan_for_journey(connection, tenant_id=tenant_id, journey_id=journey_id, effective_on=on)
+        except AuditCoreError:
+            continue
+        rows = _sku_rows_for_version(connection, tenant_id=tenant_id,
+                                     price_list_version_id=plan["price_list_version_id"])
+        if rows:
+            return {"plan": plan, "rows": rows, "on": on, "pricingDateFrom": "INVOICE"}
+    return None
+
+
 def _plan_label(plan: dict[str, Any]) -> str:
     name = plan.get("price_list_name") or plan.get("price_list_code") or "Price list"
     version = plan.get("version_no")
@@ -604,9 +628,25 @@ def _vehicle_invoice_readings(connection: Connection, *, tenant_id: str, journey
             "model": model, "variant": _plain(fields.get("variant_raw")),
             "colour": _plain(fields.get("vehicle_color")), "skuCode": sku_code,
             "exShowroom": ex_showroom, "exShowroomBasis": basis, "gstRate": basis.get("gstRatePercent"),
+            # The date the invoice prints. Used only when the Journey itself
+            # has no usable pricing date (2026-10-23) -- see _evaluate.
+            "invoiceDate": _invoice_date(fields.get("invoice_date")),
             "updatedAt": doc["updatedAt"],
         })
     return readings
+
+
+def _invoice_date(value: Any) -> date | None:
+    if isinstance(value, date):
+        return value
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(str(value).strip()[:10])
+    except ValueError:
+        from audit_core.uc03_p2_dates import parse_extracted_date
+
+        return parse_extracted_date(value)
 
 
 # ── rule R1: the invoice's ex-showroom ────────────────────────────────────────
@@ -780,7 +820,61 @@ def _identify(
         if len(same_colour) == 1 and len(same_colour) < len(result.candidates):
             result.status, result.row, result.candidates = "IDENTIFIED", same_colour[0], same_colour
             result.detail["colour"] = reading["colour"]
+    if result.status == "AMBIGUOUS":
+        _suggest_nearest_model_by_price(result, reading)
     return result
+
+
+def _suggest_nearest_model_by_price(result: WordResult, reading: dict[str, Any]) -> None:
+    """When the words fit SKUs of SEVERAL MODELS, the document's own
+    ex-showroom names which model it is (2026-10-23 product owner: price is
+    only for when multiple models come in).
+
+    The price narrows the candidates to that one model and the model is
+    recorded as the suggestion; it never pins the SKU and never picks a
+    variant, fuel, gearbox, registration or EV/ICE within a model -- that
+    stays the rule stated at the top of this module. Still ambiguous after
+    the narrowing means the task now lists one model's variants instead of
+    several models', and the PC confirms.
+    """
+    offered = _to_decimal(reading.get("exShowroom"))
+    if offered is None or not result.candidates:
+        return
+    by_model: dict[str, list[dict[str, Any]]] = {}
+    for row in result.candidates:
+        by_model.setdefault(str(row.get("model_name") or ""), []).append(row)
+    if len(by_model) < 2:
+        return  # one model already: the price has no model to choose between
+    best: tuple[Any, str] | None = None
+    for model_name, rows in by_model.items():
+        prices = [_to_decimal(r.get("master_ex_showroom")) for r in rows]
+        gaps = [abs(price - offered) for price in prices if price is not None]
+        if not gaps:
+            continue
+        nearest = min(gaps)
+        if best is None or nearest < best[0]:
+            best = (nearest, model_name)
+    if best is None:
+        return
+    # A tie between two models on the same gap settles nothing.
+    gap, model_name = best
+    ties = 0
+    for rows in by_model.values():
+        prices = [_to_decimal(r.get("master_ex_showroom")) for r in rows]
+        gaps = [abs(price - offered) for price in prices if price is not None]
+        if gaps and min(gaps) == gap:
+            ties += 1
+    if ties != 1:
+        return
+    result.candidates = by_model[model_name]
+    result.detail["priceNearestModel"] = model_name
+    result.detail["priceOffered"] = str(offered)
+    result.detail["priceGap"] = str(gap)
+    if len(result.candidates) == 1:
+        # One model, one SKU: still a suggestion, not a pin -- the PC confirms
+        # (product owner: "find out a nearest match model and then raise a
+        # Task for PC to confirm").
+        result.detail["priceNearestSku"] = result.candidates[0].get("sku_code")
 
 
 def _evidence(
@@ -1543,6 +1637,22 @@ def _evaluate(
         # naming one.
         return {"skipped": True, "reason": "no_vehicle_model_read"}
     current = _current_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if current.get("skipped") and current.get("reason") in _INVOICE_DATE_FALLBACK_REASONS:
+        # 2026-10-23: a Journey with no booking date, or whose date has no
+        # price list in force, was skipped outright -- the booking form and
+        # the invoices had already been read on the lines above and were
+        # thrown away, because word matching needs price-list rows to match
+        # AGAINST. Seven live Journeys sat unresolved this way while their own
+        # customer invoice named the vehicle (UTK-SA-261023-003 reads "Access"
+        # on the booking and "THAR ROXX MX1 D MT RWD STL BLK" on the invoice).
+        #
+        # The invoice is the source of truth once uploaded, so its own printed
+        # date picks the price list when the Journey has none to offer. The
+        # Journey's pricing date is NOT changed by this: only the list this
+        # resolution reads from, and the evidence records that it did so.
+        fallback = _rows_on_invoice_date(connection, tenant_id=tenant_id, journey_id=journey_id, invoices=invoices)
+        if fallback is not None:
+            current = fallback
     if current.get("skipped"):
         return current
     rows = current["rows"]
@@ -2361,8 +2471,16 @@ def _raise_not_identified(
             if other_lists else ""
         )
         + (f"The {len(matched)} closest SKUs are listed on the task. " if stage == _CATALOGUE_STAGE else "")
-        + "A price never picks the SKU: confirm the model so the deal can be checked against the price and "
-        "discount masters."
+        + (
+            f"The ex-showroom read ({result.detail['priceOffered']}) is nearest "
+            f"{result.detail['priceNearestModel']}"
+            + (f" ({result.detail['priceNearestSku']})" if result.detail.get("priceNearestSku") else "")
+            + ", so the task lists that model; confirm it so the deal can be checked against the price "
+              "and discount masters."
+            if result.detail.get("priceNearestModel")
+            else "A price never picks the SKU: confirm the model so the deal can be checked against the "
+                 "price and discount masters."
+        )
     )
     basis = ev["registration"]["basis"]
     safe_payload = {

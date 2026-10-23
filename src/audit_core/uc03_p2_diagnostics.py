@@ -62,6 +62,12 @@ REPORTS: dict[str, str] = {
                jp.selection_source, jp.selection_method,
                ti.old_vehicle_make_model AS exchange_vehicle,
                ti.old_vehicle_registration AS exchange_registration,
+               b.booking_date, b.pricing_effective_on,
+               (SELECT string_agg(DISTINCT f2.effective_value::text, ' | ')
+                  FROM auditcore.journey_document_extracted_fields f2
+                 WHERE f2.tenant_id = j.tenant_id AND f2.journey_id = j.journey_id
+                   AND f2.field_key = 'ex_showroom_price' AND f2.effective_value IS NOT NULL
+                ) AS ex_showroom_read,
                (SELECT string_agg(DISTINCT dt.classified_document_type_key || '.' || f.field_key || '=' || f.effective_value, ' | ')
                   FROM auditcore.journey_document_extracted_fields f
                   LEFT JOIN auditcore.document_capture_v2_documents dt
@@ -78,6 +84,8 @@ REPORTS: dict[str, str] = {
         LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
         LEFT JOIN auditcore.trade_in_cases ti
           ON ti.tenant_id = j.tenant_id AND ti.journey_id = j.journey_id
+        LEFT JOIN auditcore.bookings b
+          ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
         WHERE j.tenant_id = :t AND jp.product_sku_id IS NULL
         ORDER BY j.created_at_utc
     """,
