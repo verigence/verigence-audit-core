@@ -368,9 +368,16 @@ def test_the_worker_runs_reresolve_for_a_reresolve_tag(monkeypatch) -> None:
             return False
 
         def execute(self, *_args, **_kwargs):
+            # Mirrors what _sku_run_once asks of the database: the last run of
+            # this tag, or none. (This is the third hand-rolled double of the
+            # same connection in the suite -- the reason a query-shape change
+            # breaks them one at a time.)
             class _R:
-                def first(self_inner):
-                    return None
+                def mappings(self_inner):
+                    return self_inner
+
+                def one_or_none(self_inner):
+                    return None  # this tag has never run
             return _R()
 
     class _E:
