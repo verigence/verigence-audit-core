@@ -135,6 +135,102 @@ REPORTS: dict[str, str] = {
         GROUP BY 1, 2
         ORDER BY effective_from DESC, version_no DESC
     """,
+    # Why a deal's invoice is not in its totals. Asked 2026-10-24 with a
+    # screenshot: a MAXX City showing "Net payable, invoice 21,390" while its
+    # Additional dealer discount read 35,000 from that same invoice -- the
+    # discount landed and the vehicle price did not. AUDIT_CORE_DIAG_CUSTOMER
+    # narrows it to one booking (customer name, reference or journey id).
+    #
+    # Every gate an invoice has to pass to reach the deal, as data rather than
+    # as my reading of the code: it must be ACTIVE evidence, classified as an
+    # invoice type the resolver counts, not voided, not a wholesale or dealer
+    # purchase copy, and carry the lines it is meant to carry.
+    "deal_invoices": """
+        SELECT j.journey_reference,
+               COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
+               e.di_document_id,
+               COALESCE(dt.classified_document_type_key, e.document_type_key) AS classified_as,
+               (dt.di_document_id IS NOT NULL) AS has_a_capture_record,
+               e.association_status,
+               e.process_area,
+               (SELECT f.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields f
+                 WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+                   AND f.di_document_id = e.di_document_id AND f.field_key = 'invoice_purpose'
+                 LIMIT 1) AS invoice_purpose,
+               (SELECT f.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields f
+                 WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+                   AND f.di_document_id = e.di_document_id AND f.field_key = 'invoice_nature'
+                 LIMIT 1) AS invoice_nature,
+               (SELECT f.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields f
+                 WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+                   AND f.di_document_id = e.di_document_id AND f.field_key = 'invoice_number'
+                 LIMIT 1) AS invoice_number,
+               (SELECT f.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields f
+                 WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+                   AND f.di_document_id = e.di_document_id AND f.field_key = 'ex_showroom_price'
+                 LIMIT 1) AS ex_showroom_read,
+               (SELECT count(*) FROM auditcore.journey_document_extracted_fields f
+                 WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+                   AND f.di_document_id = e.di_document_id AND f.effective_value IS NOT NULL) AS fields_read,
+               -- and whether anything it says reached the deal
+               (SELECT count(*) FROM auditcore.commercial_line_source_values v
+                 WHERE v.tenant_id = j.tenant_id AND v.journey_id = j.journey_id
+                   AND v.source_document_id = e.di_document_id) AS lines_in_the_deal,
+               (SELECT string_agg(DISTINCT v.component_key, ', ')
+                  FROM auditcore.commercial_line_source_values v
+                 WHERE v.tenant_id = j.tenant_id AND v.journey_id = j.journey_id
+                   AND v.source_document_id = e.di_document_id) AS components_it_priced
+        -- Driven from evidence, not from the capture record: a document with
+        -- evidence and no capture row is itself worth seeing, and joining the
+        -- other way round would hide exactly that.
+        FROM auditcore.journeys j
+        LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+        JOIN auditcore.evidence e
+          ON e.tenant_id = j.tenant_id AND e.journey_id = j.journey_id
+        LEFT JOIN auditcore.document_capture_v2_documents dt
+          ON dt.tenant_id = j.tenant_id AND dt.journey_id = j.journey_id
+         AND dt.di_document_id = e.di_document_id
+        WHERE j.tenant_id = :t
+          AND (c.display_name ILIKE :c OR j.journey_reference ILIKE :c OR j.journey_id::text ILIKE :c)
+          AND COALESCE(dt.classified_document_type_key, e.document_type_key, '') ~* '(invoice|note)'
+        ORDER BY j.journey_reference, COALESCE(dt.classified_document_type_key, e.document_type_key)
+    """,
+    # And the deal's own lines beside them: what the masters price, what the
+    # booking says, what is billed, and which document each billed figure came
+    # from. A line with a standard and a booking but no billed value, on a
+    # Journey whose invoice is on file, is the defect.
+    "deal_lines": """
+        SELECT j.journey_reference,
+               COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
+               cl.component_key, cl.standard_amount, cl.actual_amount, cl.actual_source_kind,
+               (SELECT string_agg(v.source_document_type || '=' || v.amount::text, ' | '
+                                  ORDER BY v.source_document_type)
+                  FROM auditcore.commercial_line_source_values v
+                 WHERE v.tenant_id = cl.tenant_id AND v.journey_id = cl.journey_id
+                   AND v.component_key = cl.component_key
+                   AND NOT EXISTS (SELECT 1 FROM auditcore.evidence e
+                                    WHERE e.tenant_id = v.tenant_id AND e.journey_id = v.journey_id
+                                      AND (e.di_document_id = v.source_document_id
+                                           OR e.evidence_id = v.source_evidence_id)
+                                      AND e.association_status <> 'ACTIVE')
+                ) AS priced_by,
+               (SELECT string_agg(v.source_document_type, ', ')
+                  FROM auditcore.commercial_line_source_values v
+                 WHERE v.tenant_id = cl.tenant_id AND v.journey_id = cl.journey_id
+                   AND v.component_key = cl.component_key
+                   AND EXISTS (SELECT 1 FROM auditcore.evidence e
+                                WHERE e.tenant_id = v.tenant_id AND e.journey_id = v.journey_id
+                                  AND (e.di_document_id = v.source_document_id
+                                       OR e.evidence_id = v.source_evidence_id)
+                                  AND e.association_status <> 'ACTIVE')
+                ) AS priced_by_but_voided
+        FROM auditcore.commercial_lines cl
+        JOIN auditcore.journeys j ON j.tenant_id = cl.tenant_id AND j.journey_id = cl.journey_id
+        LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+        WHERE cl.tenant_id = :t
+          AND (c.display_name ILIKE :c OR j.journey_reference ILIKE :c OR j.journey_id::text ILIKE :c)
+        ORDER BY j.journey_reference, cl.component_key
+    """,
     # One row: does any document print an identifier we could match outright,
     # and does its shape match the codes our own price master holds? Asked
     # 2026-10-24 ("I want 100% identification").

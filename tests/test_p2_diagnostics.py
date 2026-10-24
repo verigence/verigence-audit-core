@@ -496,3 +496,58 @@ def test_a_large_report_gets_no_one_line_answer(journey, monkeypatch):
 
     assert "diag_answer" not in lines
     assert lines.count("diag_row") == 9
+
+
+def test_deal_invoices_shows_an_invoice_whose_lines_never_reached_the_deal(journey):
+    """The fingerprint reported on 2026-10-24: a MAXX City whose Net payable
+    read 21,390 on the invoice column while the same invoice's dealer discount
+    read 35,000. The invoice was on file and read; its ex-showroom never
+    reached the deal's lines. This report makes that visible as data instead
+    of as a theory about which gate dropped it."""
+    from p2_support import add_ready_document
+
+    add_ready_document(journey, "customer_invoice_dms",
+                       ex_showroom_price="848999.65", invoice_number="INV-1",
+                       invoice_purpose="VEHICLE_SALE")
+    with journey.engine.begin() as connection:
+        connection.execute(text("SET TRANSACTION READ ONLY"))
+        set_tenant_context(connection, journey.tenant_id)
+        rows = connection.execute(
+            text(REPORTS["deal_invoices"]), {"t": journey.tenant_id, "c": "%"},
+        ).mappings().all()
+    assert len(rows) == 1, rows
+    [row] = rows
+    assert row["classified_as"] == "customer_invoice_dms"
+    assert row["association_status"] == "ACTIVE"
+    assert row["invoice_purpose"] == "VEHICLE_SALE"
+    assert row["ex_showroom_read"] == "848999.65"
+    assert row["fields_read"] == 3
+    assert row["has_a_capture_record"] is False
+    assert row["lines_in_the_deal"] == 0, "read, active, a vehicle sale -- and priced nothing"
+    assert row["components_it_priced"] is None
+
+
+def test_deal_invoices_shows_the_components_an_invoice_did_price(journey):
+    from uuid import uuid4 as _uuid4
+
+    from p2_support import add_ready_document
+
+    document_id = add_ready_document(journey, "customer_invoice_dms",
+                                     ex_showroom_price="848999.65", invoice_number="INV-2")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.commercial_line_source_values (tenant_id, journey_id, line_kind, "
+                 "component_key, source_document_type, amount, source_document_id) "
+                 "VALUES (:t, :j, 'COMMERCIAL', 'ex_showroom_price', 'customer_invoice_dms', 848999.65, :d)"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "d": document_id},
+        )
+        assert _uuid4 is not None
+    with journey.engine.begin() as connection:
+        connection.execute(text("SET TRANSACTION READ ONLY"))
+        set_tenant_context(connection, journey.tenant_id)
+        [row] = connection.execute(
+            text(REPORTS["deal_invoices"]), {"t": journey.tenant_id, "c": "%"},
+        ).mappings().all()
+    assert row["lines_in_the_deal"] == 1
+    assert row["components_it_priced"] == "ex_showroom_price"
