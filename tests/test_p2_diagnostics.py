@@ -353,3 +353,83 @@ def test_the_verdict_counts_agreement_when_the_price_names_the_pinned_variant(jo
     row = _verdict(journey)
     assert row["resolved_price_agrees"] == 1
     assert row["resolved_price_disagrees"] == 0
+
+
+def test_the_disagreement_report_names_the_journey_and_both_skus(journey):
+    """The gating list for the price key: the SKU the words pinned beside the
+    one the figure names, so each can be read rather than counted."""
+    from datetime import date
+    from uuid import uuid4
+
+    from p2_support import add_extracted_field
+
+    version = _price_book(journey, {
+        ("THAR ROXX", "MX1 D MT RWD"): "1423000.58",
+        ("THAR ROXX", "MX3 D MT RWD"): "1623000.58",
+    }, effective_from=date(2026, 10, 1))
+    _booked_on(journey, date(2026, 10, 15))
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        mx3 = connection.execute(
+            text("SELECT pli.product_sku_id FROM auditcore.price_list_items pli "
+                 "JOIN auditcore.product_skus s ON s.product_sku_id = pli.product_sku_id "
+                 "JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id "
+                 "WHERE pli.price_list_version_id = :v AND pv.variant_name = 'MX3 D MT RWD'"),
+            {"v": version},
+        ).scalar_one()
+        connection.execute(
+            text("INSERT INTO auditcore.journey_products (tenant_id, journey_id, product_sku_id, "
+                 "model_name_snapshot, variant_name_snapshot, selection_source, selection_method) "
+                 "VALUES (:t, :j, :s, 'THAR ROXX', 'MX3 D MT RWD', 'EVIDENCE', 'WORDS_V2')"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "s": mx3},
+        )
+    add_extracted_field(journey, di_document_id=uuid4(), field_key="ex_showroom_price",
+                        value="1423001", document_type="booking_form")
+
+    with journey.engine.begin() as connection:
+        connection.execute(text("SET TRANSACTION READ ONLY"))
+        set_tenant_context(connection, journey.tenant_id)
+        [row] = connection.execute(
+            text(REPORTS["price_disagreements"]), {"t": journey.tenant_id, "c": "%"},
+        ).mappings().all()
+    assert row["words_chose"] == "THAR ROXX ~ MX3 D MT RWD"
+    assert row["price_names"] == "THAR ROXX ~ MX1 D MT RWD"
+    assert float(row["figure_read"]) == 1423001
+    assert float(row["book_price_of_that_sku"]) == 1623000.58
+    assert row["document"] == "booking_form"
+    assert float(row["gap"]) == 0.42
+
+
+def test_the_disagreement_report_stays_silent_when_the_price_agrees(journey):
+    """It must list contradictions only: a report that also lists agreement is
+    a report nobody reads."""
+    from datetime import date
+    from uuid import uuid4
+
+    from p2_support import add_extracted_field
+
+    version = _price_book(journey, {("THAR ROXX", "MX1 D MT RWD"): "1423000.58"},
+                          effective_from=date(2026, 10, 1))
+    _booked_on(journey, date(2026, 10, 15))
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        mx1 = connection.execute(
+            text("SELECT product_sku_id FROM auditcore.price_list_items "
+                 "WHERE price_list_version_id = :v"), {"v": version},
+        ).scalar_one()
+        connection.execute(
+            text("INSERT INTO auditcore.journey_products (tenant_id, journey_id, product_sku_id, "
+                 "model_name_snapshot, variant_name_snapshot, selection_source) "
+                 "VALUES (:t, :j, :s, 'THAR ROXX', 'MX1 D MT RWD', 'EVIDENCE')"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "s": mx1},
+        )
+    add_extracted_field(journey, di_document_id=uuid4(), field_key="ex_showroom_price",
+                        value="1423001", document_type="booking_form")
+
+    with journey.engine.begin() as connection:
+        connection.execute(text("SET TRANSACTION READ ONLY"))
+        set_tenant_context(connection, journey.tenant_id)
+        rows = connection.execute(
+            text(REPORTS["price_disagreements"]), {"t": journey.tenant_id, "c": "%"},
+        ).mappings().all()
+    assert rows == []

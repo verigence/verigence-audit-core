@@ -132,6 +132,149 @@ REPORTS: dict[str, str] = {
         GROUP BY 1, 2
         ORDER BY effective_from DESC, version_no DESC
     """,
+    # Every field the documents of this Project actually carry, with how many
+    # Journeys carry it and what it looks like. Asked 2026-10-24 ("think
+    # differently... I want 100% identification"): before inferring the SKU
+    # from words or from a price, find out whether the vehicle is named
+    # outright somewhere -- an OEM material or model code, a chassis or engine
+    # number, a SKU code printed on the invoice. A printed identifier needs no
+    # matching, no tolerance and no tie-break, so if one is there it beats
+    # everything else we have tried.
+    "field_inventory": """
+        SELECT f.field_key,
+               COUNT(DISTINCT f.journey_id) AS journeys,
+               COUNT(*) AS reads,
+               COUNT(DISTINCT COALESCE(dt.classified_document_type_key,
+                                       f.source_document_type_key)) AS document_types,
+               string_agg(DISTINCT COALESCE(dt.classified_document_type_key,
+                                            f.source_document_type_key), ', ') AS documents,
+               ROUND(AVG(f.confidence_score), 1) AS mean_confidence,
+               left(string_agg(DISTINCT left(f.effective_value #>> '{}', 40), ' | '), 400) AS examples
+        FROM auditcore.journey_document_extracted_fields f
+        LEFT JOIN auditcore.document_capture_v2_documents dt
+          ON dt.tenant_id = f.tenant_id AND dt.journey_id = f.journey_id
+         AND dt.di_document_id = f.di_document_id
+        WHERE f.tenant_id = :t AND f.effective_value IS NOT NULL
+        GROUP BY f.field_key
+        ORDER BY COUNT(DISTINCT f.journey_id) DESC, f.field_key
+    """,
+    # Narrower and sharper: for the Journeys with no SKU, which identifying
+    # field does each one carry? One row per Journey, so the answer to "what is
+    # the surest thing" is a column rather than an argument.
+    "identifiers_per_unresolved": """
+        SELECT j.journey_reference, j.created_by_display_name AS pc_name,
+               COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
+               jp.model_name_snapshot AS booked_model, jp.variant_name_snapshot AS booked_variant,
+               COALESCE(b.pricing_effective_on, b.booking_date) AS priced_on,
+               (SELECT string_agg(DISTINCT f.field_key, ', ' ORDER BY f.field_key)
+                  FROM auditcore.journey_document_extracted_fields f
+                 WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+                   AND f.effective_value IS NOT NULL
+                   AND f.field_key ~ '(chassis|vin|engine|sku|material|model_code|variant_code)'
+                ) AS identifier_fields,
+               (SELECT string_agg(DISTINCT left(f.effective_value #>> '{}', 32), ' | ')
+                  FROM auditcore.journey_document_extracted_fields f
+                 WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+                   AND f.effective_value IS NOT NULL
+                   AND f.field_key ~ '(chassis|vin|engine|sku|material|model_code|variant_code)'
+                ) AS identifier_values,
+               (SELECT COUNT(DISTINCT f.di_document_id)
+                  FROM auditcore.journey_document_extracted_fields f
+                 WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id) AS documents_read
+        FROM auditcore.journeys j
+        LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+        LEFT JOIN auditcore.journey_products jp
+          ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+        LEFT JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+        WHERE j.tenant_id = :t AND jp.product_sku_id IS NULL
+        ORDER BY j.journey_reference
+    """,
+    # The 13 Journeys behind resolved_price_disagrees: the SKU the words pinned
+    # against the one an ex-showroom figure names within a rupee. Each is either
+    # a SKU pinned wrongly today -- an audit error we are blind to -- or a figure
+    # that is not the list price. No price logic may pin until these are read
+    # (2026-10-24).
+    "price_disagreements": """
+        WITH j AS (
+            SELECT j.journey_id, j.journey_reference, j.created_by_display_name AS pc_name,
+                   o.outlet_name,
+                   COALESCE(NULLIF(cu.display_name, ''), j.journey_reference) AS customer,
+                   COALESCE(b.pricing_effective_on, b.booking_date) AS priced_on,
+                   jp.product_sku_id, jp.selection_method, jp.match_basis,
+                   pm.model_name || ' ~ ' || pv.variant_name AS pinned_name
+            FROM auditcore.journeys j
+            LEFT JOIN auditcore.customers cu
+              ON cu.tenant_id = j.tenant_id AND cu.customer_id = j.customer_id
+            LEFT JOIN auditcore.dealer_outlets o
+              ON o.tenant_id = j.tenant_id AND o.dealer_id = j.dealer_id AND o.outlet_id = j.outlet_id
+            LEFT JOIN auditcore.journey_products jp
+              ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+            LEFT JOIN auditcore.bookings b
+              ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+            LEFT JOIN auditcore.product_skus ps ON ps.product_sku_id = jp.product_sku_id
+            LEFT JOIN auditcore.product_models pm ON pm.model_id = ps.model_id
+            LEFT JOIN auditcore.product_variants pv ON pv.variant_id = ps.variant_id
+            WHERE j.tenant_id = :t AND jp.product_sku_id IS NOT NULL
+        ), planned AS (
+            SELECT j.*, (
+                SELECT plv.price_list_version_id
+                FROM auditcore.price_list_versions plv
+                JOIN auditcore.price_lists pl
+                  ON pl.tenant_id = plv.tenant_id AND pl.price_list_id = plv.price_list_id
+                WHERE plv.tenant_id = :t
+                  AND plv.lifecycle_status IN ('PUBLISHED', 'RETIRED')
+                  AND plv.effective_from <= j.priced_on
+                  AND (plv.effective_to IS NULL OR plv.effective_to >= j.priced_on)
+                  AND (pl.price_list_code = 'OEM_NATIVE_PRICE_LIST'
+                       OR NOT EXISTS (SELECT 1 FROM auditcore.price_lists own
+                                       WHERE own.tenant_id = plv.tenant_id
+                                         AND own.price_list_code = 'OEM_NATIVE_PRICE_LIST'))
+                ORDER BY plv.effective_from DESC, plv.version_no DESC, plv.price_list_version_id DESC
+                LIMIT 1) AS plv
+            FROM j
+        ), reads AS (
+            SELECT f.journey_id,
+                   COALESCE(dt.classified_document_type_key, f.source_document_type_key) AS document,
+                   ROUND(replace(COALESCE((regexp_match(f.effective_value #>> '{}',
+                                 '[0-9][0-9,]*(?:\\.[0-9]+)?'))[1], '0'), ',', '')::numeric, 2) AS amount
+            FROM auditcore.journey_document_extracted_fields f
+            LEFT JOIN auditcore.document_capture_v2_documents dt
+              ON dt.tenant_id = f.tenant_id AND dt.journey_id = f.journey_id
+             AND dt.di_document_id = f.di_document_id
+            WHERE f.tenant_id = :t AND f.field_key = 'ex_showroom_price'
+              AND f.effective_value IS NOT NULL
+              AND COALESCE(f.source_document_type_key, '') NOT IN ('wholesale_invoice')
+            GROUP BY 1, 2, 3
+        ), book AS (
+            SELECT pli.price_list_version_id, s.product_sku_id,
+                   pm.model_name || ' ~ ' || pv.variant_name AS name,
+                   SUM(pli.standard_amount) FILTER (WHERE pli.component_key = 'EX_SHOWROOM') AS ex_showroom
+            FROM auditcore.price_list_items pli
+            JOIN auditcore.product_skus s      ON s.product_sku_id = pli.product_sku_id
+            JOIN auditcore.product_models pm   ON pm.model_id = s.model_id
+            JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
+            WHERE pli.tenant_id = :t AND s.is_active AND pm.is_active AND pv.is_active
+            GROUP BY 1, 2, 3
+        )
+        SELECT p.journey_reference, p.pc_name, p.outlet_name, p.customer, p.priced_on,
+               p.pinned_name AS words_chose, p.selection_method, p.match_basis,
+               (SELECT bk.ex_showroom FROM book bk
+                 WHERE bk.price_list_version_id = p.plv AND bk.product_sku_id = p.product_sku_id)
+                 AS book_price_of_that_sku,
+               r.document, r.amount AS figure_read,
+               m.one_name AS price_names, m.gap
+        FROM planned p
+        JOIN reads r ON r.journey_id = p.journey_id
+        JOIN LATERAL (
+            SELECT COUNT(DISTINCT bk.name) AS variants, MIN(bk.name) AS one_name,
+                   MIN(ABS(bk.ex_showroom - r.amount)) AS gap
+            FROM book bk
+            WHERE bk.price_list_version_id = p.plv
+              AND bk.ex_showroom IS NOT NULL
+              AND ABS(bk.ex_showroom - r.amount) <= 1
+        ) m ON m.variants = 1 AND m.one_name <> p.pinned_name
+        ORDER BY p.journey_reference, r.document
+    """,
     # The verdict, aggregated in SQL so the answer is a handful of rows rather
     # than one per figure. Asked 2026-10-24: would a price key resolve what the
     # words cannot, and does it agree where the words already succeed?
