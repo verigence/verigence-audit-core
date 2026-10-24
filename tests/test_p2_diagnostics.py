@@ -195,3 +195,62 @@ def test_the_shape_report_shows_a_figure_the_simulation_could_not_use(journey):
     assert row["reads"] == 1
     assert row["usable_as_a_figure"] == 0
     assert row["shapes_not_usable"] == "as per invoice"
+
+
+def _verdict(journey):
+    with journey.engine.begin() as connection:
+        connection.execute(text("SET TRANSACTION READ ONLY"))
+        set_tenant_context(connection, journey.tenant_id)
+        [row] = connection.execute(
+            text(REPORTS["price_key_verdict"]), {"t": journey.tenant_id, "c": "%"},
+        ).mappings().all()
+    return row
+
+
+def test_the_verdict_counts_a_rounded_rupee_as_a_pin_and_not_an_exact_match(journey):
+    """Measured on the real data 2026-10-24: Mahindra's book carries paisa
+    (2478999.58) while the form prints the rounded rupee (2479000), so matching
+    to the paisa almost never fires and a percentage band is far too wide --
+    0.5% of a 24-lakh car is 12,000 rupees. The verdict reports the tightest
+    band at which a figure names one variant, so the tolerance is chosen from
+    the data rather than guessed."""
+    from datetime import date
+    from uuid import uuid4
+
+    from p2_support import add_extracted_field
+
+    _price_book(journey, {
+        ("THAR ROXX", "MX1 D MT RWD"): "1423000.58",
+        ("THAR ROXX", "MX3 D MT RWD"): "1623000.58",
+    }, effective_from=date(2026, 10, 1))
+    _booked_on(journey, date(2026, 10, 15))
+    add_extracted_field(journey, di_document_id=uuid4(), field_key="ex_showroom_price",
+                        value="1423001", document_type="booking_form")
+
+    row = _verdict(journey)
+    assert row["journeys"] == 1
+    assert row["not_resolved"] == 1
+    assert row["open_pinned_to_the_paisa"] == 0, "the paisa never matches a rounded form"
+    assert row["open_pinned_within_a_rupee"] == 1
+    assert float(row["median_gap"]) == 0.42
+
+
+def test_the_verdict_separates_a_journey_with_no_price_book_from_a_price_that_fails(journey):
+    """The nine Mahindra Orissa bookings priced before the earliest published
+    book are a masters gap, not a matcher failure, and must not be counted as
+    the price key failing."""
+    from datetime import date
+    from uuid import uuid4
+
+    from p2_support import add_extracted_field
+
+    _price_book(journey, {("THAR ROXX", "MX1 D MT RWD"): "1423000.58"},
+                effective_from=date(2026, 10, 1))
+    _booked_on(journey, date(2026, 8, 1))  # before the book exists
+    add_extracted_field(journey, di_document_id=uuid4(), field_key="ex_showroom_price",
+                        value="1423001", document_type="booking_form")
+
+    row = _verdict(journey)
+    assert row["no_price_book_in_force"] == 1
+    assert row["open_price_settles_nothing"] == 0, "no book is not the price failing"
+    assert row["open_pinned_within_a_rupee"] == 0
