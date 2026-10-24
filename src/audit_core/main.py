@@ -132,6 +132,7 @@ from audit_core.uc03_review_value_normalization import (
 from audit_core.uc03_rule_registry import router as uc03_rule_registry_router
 from audit_core.uc03_rule_status_report import router as uc03_rule_status_report_router
 from audit_core.uc03_run_all_rules import router as uc03_run_all_rules_router
+from audit_core.uc03_sku_attention import router as uc03_sku_attention_router
 from audit_core.uc03_sku_standard import router as uc03_sku_standard_router
 from audit_core.uc03_tl_scope_alignment import install_tl_scope_alignment
 from audit_core.uc03_tl_supervisory import router as uc03_tl_supervisory_router
@@ -272,6 +273,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_booking_capture_router)
     application.include_router(uc03_model_resolution_router)
     application.include_router(uc03_model_selection_corrections_router)
+    application.include_router(uc03_sku_attention_router)
     application.include_router(uc03_p2_router)
     application.include_router(uc03_p2_documents_router)
     application.include_router(uc03_p2_resplit_router)
