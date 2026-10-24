@@ -79,3 +79,58 @@ def test_add_ons_sharing_the_total_are_never_guessed_around():
                  "line_items": [{"line_category": "VEHICLE", "gross_amount": "1000000"},
                                 {"line_category": "ACCESSORY_GENUINE", "net_amount": "25000"}]})
     assert "ex_showroom_price" not in out["lines"]
+
+
+# ── a printed rate the invoice's own total contradicts (live data 2026-10-24) ──
+def _printed(gross, discount, rate_each, total, tcs=None, **extra):
+    """CGST and SGST each printed at ``rate_each`` per cent (the reading doubled
+    the rate: 18% printed as 18 + 18)."""
+    raw = {"gross_amount_before_discount": gross, "invoice_discount_amount": discount,
+           "cgst_rate": rate_each, "sgst_rate": rate_each, "grand_total_amount": total, **extra}
+    if tcs:
+        raw["tcs_amount"] = tcs
+    return _read(raw)
+
+
+def test_a_doubled_rate_is_corrected_by_the_total():
+    # 8,55,084.75 - 2,288 = 8,52,796.75 taxable; 18% -> 10,06,300.17; + TCS 10,063
+    out = _printed("855084.75", "2288", "18", "1016363.17", tcs="10063")
+    assert out["vehicle"]["gstBasis"] == "RATE_FROM_TOTAL" and out["vehicle"]["gstRate"] == Decimal("0.1800")
+    assert out["lines"]["ex_showroom_price"] == Decimal("1009000.01")
+    assert out["vehicle"]["saleValue"] == Decimal("1006300.17")
+
+
+def test_eighty_per_cent_is_forty_and_ten_per_cent_is_five():
+    out = _printed("1283571.44", "3571.42", "40", "1809920.03", tcs="17920")
+    assert out["vehicle"]["gstRate"] == Decimal("0.4000")
+    assert out["lines"]["ex_showroom_price"] == Decimal("1797000.02")
+    out = _printed("2923809.52", "0", "5", "3100700", tcs="30700")
+    assert out["vehicle"]["gstRate"] == Decimal("0.0500")
+
+
+def test_a_wrong_rate_that_is_not_a_half_is_corrected_too():
+    out = _read({"gross_amount_before_discount": "815254.24", "cgst_rate": "14", "sgst_rate": "14",
+                 "grand_total_amount": "962000"})
+    assert out["vehicle"]["gstRate"] == Decimal("0.1800")
+    assert out["lines"]["ex_showroom_price"] == Decimal("962000.00")
+
+
+def test_a_rate_that_reproduces_the_total_is_left_alone():
+    out = _printed("857203.43", "21186.20", "9", "986500.33")
+    assert out["vehicle"]["gstBasis"] == "PRINTED_RATE" and out["vehicle"]["gstRate"] == Decimal("0.18")
+    assert out["lines"]["ex_showroom_price"] == Decimal("1011500.05")
+
+
+def test_a_total_that_no_rate_explains_leaves_the_printed_rate():
+    # a discount not read: price after discount x 1.18 is Rs 37,000 over the total
+    out = _read({"gross_amount_before_discount": "802966.10", "cgst_rate": "9", "sgst_rate": "9",
+                 "grand_total_amount": "910499.68"})
+    assert out["vehicle"]["gstBasis"] == "PRINTED_RATE"
+    assert out["lines"]["ex_showroom_price"] == Decimal("947500.00")
+
+
+def test_add_ons_sharing_the_total_never_correct_a_printed_rate():
+    out = _read({"cgst_rate": "9", "sgst_rate": "9", "grand_total_amount": "1400000",
+                 "line_items": [{"line_category": "VEHICLE", "gross_amount": "1000000", "taxable_amount": "1000000"},
+                                {"line_category": "ACCESSORY_GENUINE", "net_amount": "25000"}]})
+    assert out["vehicle"]["gstBasis"] == "PRINTED_RATE"

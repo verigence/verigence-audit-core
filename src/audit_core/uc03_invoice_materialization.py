@@ -575,6 +575,41 @@ def _vin_relation(a: dict[str, Any], b: dict[str, Any]) -> str | None:
 
 
 _MAX_GST_FRACTION = Decimal("0.5")
+_HALF_PER_CENT = Decimal("0.005")
+
+
+def _rate_the_total_confirms(
+    rate: Decimal,
+    selling: Decimal | None,
+    discount_total: Decimal,
+    grand_total: Decimal | None,
+    tcs: Decimal | None,
+    round_off: Decimal,
+    has_addons: bool,
+) -> Decimal | None:
+    """A printed GST rate the invoice's own grand total contradicts.
+
+    Live data (2026-10-24): 16 of 65 invoices read a rate twice what they bill
+    (36% for 18%, 80% for 40%, 28% for 18%), so the Deal showed an
+    ex-showroom price 18 to 40 per cent too high. When the printed rate
+    reproduces the grand total (price after discount x (1 + rate), plus TCS
+    and round-off) to the rupee it stands. When it does not, the rate the
+    total itself gives -- to the nearest half per cent -- replaces it, but only
+    if that rate reproduces the total to within Rs 2. Anything else (a
+    discount not read, charges not on a line) leaves the printed rate and its
+    own flags as they are."""
+    if grand_total is None or selling is None or has_addons:
+        return None
+    after_discount = selling - discount_total
+    if after_discount <= 0:
+        return None
+    target = grand_total - (tcs or Decimal(0)) - round_off
+    if abs(after_discount * (1 + rate) - target) <= _ONE_RUPEE:
+        return None
+    candidate = ((target / after_discount - 1) / _HALF_PER_CENT).quantize(Decimal(1), rounding=ROUND_HALF_UP) * _HALF_PER_CENT
+    if not (0 <= candidate <= _MAX_GST_FRACTION) or candidate == rate:
+        return None
+    return candidate if abs(after_discount * (1 + candidate) - target) <= 2 * _ONE_RUPEE else None
 
 
 def _gst_factor(
@@ -597,6 +632,9 @@ def _gst_factor(
     does -- exactly 1 when the printed price already includes GST. Never
     guessed when add-on lines share the total, and never outside 0 - 50%."""
     if rate is not None:
+        corrected = _rate_the_total_confirms(rate, selling, discount_total, grand_total, tcs, round_off, has_addons)
+        if corrected is not None:
+            return 1 + corrected, "RATE_FROM_TOTAL", None
         return 1 + rate, "PRINTED_RATE", None
     if has_addons:
         return None, None, None
@@ -726,8 +764,6 @@ def _read_vehicle(raw: dict[str, Any], lines: list[dict[str, Any]], out: dict[st
     factor, gst_basis, price_given = _gst_factor(
         rate, selling, discount_total, lines, grand_total, tcs, round_off, bool(addon_lines))
     taxes_read = rate is not None or factor is not None or price_given is not None
-    if rate is not None:
-        gst_basis = "PRINTED_RATE"
     if not taxes_read and not rate_issues:
         issues.append(_issue("TAXES_NOT_READ", "The GST on this invoice (CGST/SGST or IGST) was not read."))
     if factor is not None and selling is not None:
@@ -779,7 +815,7 @@ def _read_vehicle(raw: dict[str, Any], lines: list[dict[str, Any]], out: dict[st
         "sellingPrice": selling,
         "sellingPriceSource": selling_source,
         "taxable": taxable,
-        "gstRate": rate if rate is not None else (
+        "gstRate": rate if gst_basis in (None, "PRINTED_RATE") else (
             (factor - 1).quantize(_RATE_PLACES, rounding=ROUND_HALF_UP) if factor is not None and factor != 1 else None),
         "taxesRead": taxes_read,
         "gstBasis": gst_basis,
