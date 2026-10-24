@@ -180,16 +180,26 @@ _SKU_CORRELATION_ID = "backfill:sku-resolution"
 
 
 def _sku_counts(engine: Engine, *, tenant_id: str) -> tuple[int, int]:
-    """(journeys with a pinned SKU, journeys without one) among Journeys that have a product row."""
+    """(journeys with a pinned SKU, journeys without one) over every Journey.
+
+    Counted from ``journeys``, not from ``journey_products`` (2026-10-24). A
+    Journey whose documents never yielded any vehicle words has no product row
+    at all, so counting from that table left it out of both figures: a run
+    over Mahindra Orissa reported 31 without a SKU where 46 of the 171
+    Journeys had none, and the fifteen missing were exactly the ones nothing
+    was read for -- the hardest cases, hidden from the number meant to show
+    them."""
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
         row = connection.execute(
             text(
                 """
-                SELECT count(DISTINCT journey_id) FILTER (WHERE product_sku_id IS NOT NULL),
-                       count(DISTINCT journey_id) FILTER (WHERE product_sku_id IS NULL)
-                FROM auditcore.journey_products
-                WHERE tenant_id = :tenant_id
+                SELECT count(*) FILTER (WHERE jp.product_sku_id IS NOT NULL),
+                       count(*) FILTER (WHERE jp.product_sku_id IS NULL)
+                FROM auditcore.journeys j
+                LEFT JOIN auditcore.journey_products jp
+                  ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+                WHERE j.tenant_id = :tenant_id
                 """
             ),
             {"tenant_id": tenant_id},
