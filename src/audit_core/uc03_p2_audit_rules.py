@@ -531,6 +531,47 @@ def payment_before_booking(facts: _Facts) -> RuleOutcome:
                        {"findingTitle": "Payment dated before the booking", "paymentIds": [r["paymentId"] for r in early]})
 
 
+def booking_date_unusable(facts: _Facts) -> RuleOutcome:
+    """The booking date cannot price this deal (product owner, 2026-10-24:
+    "for date if the issue is there, make it critical finding").
+
+    A date before the programme began or after today is a misread, not a fact
+    -- ``uc03_p2_dates.before_floor`` says so, and until 2026-10-24 the
+    resolver priced deals on such dates anyway, found no price book and
+    reported a masters gap. A booking form read as 2024-08-21 on a deal booked
+    in October 2026 is the live example.
+
+    This is a CRITICAL finding and not only a task because nothing on the deal
+    can be audited without it: no pricing date means no price book, which means
+    no standard price, which means not one commercial control can run. The task
+    asks a PC to correct the date; the finding records that the deal was not
+    audited, which is the part that matters to an audit.
+    """
+    code = "BOOKING_DATE_UNUSABLE"
+    from audit_core.uc03_p2_dates import unusable_pricing_date_reason
+
+    applied = facts.connection.execute(
+        text("SELECT pricing_effective_on FROM auditcore.bookings WHERE tenant_id=:t AND journey_id=:j"),
+        facts._params,
+    ).scalar_one_or_none()
+    if applied is not None:
+        return RuleOutcome(code, "PASS", f"Priced on {_when(applied)}, applied by a person.")
+    booking = facts.documents("booking_form", "booking_docket")
+    if not booking:
+        return RuleOutcome(code, "SKIPPED", "No booking form or docket has been read yet.")
+    raw = (booking[0]["fields"] or {}).get("booking_date")
+    why = unusable_pricing_date_reason(raw)
+    if why is None:
+        return RuleOutcome(code, "PASS", f"Priced on {_when(_day(raw))}, which the programme can use.")
+    return RuleOutcome(
+        code, "FAIL",
+        f"This deal has no date it can be priced on: {why}. Nothing on it is priced -- no standard "
+        "price, no SKU check and no commercial finding -- until the booking date is corrected.",
+        {"findingTitle": "No usable booking date -- this deal cannot be priced or audited",
+         "readAs": str(raw) if raw is not None else None, "reason": why},
+    )
+
+
 def tcs_short(facts: _Facts) -> RuleOutcome:
     code = "TCS_SHORT"
     rows = {c["key"]: c for g in facts.sheet["categories"] for c in g["components"]}
@@ -1165,6 +1206,7 @@ def self_insurance_declared(facts: _Facts) -> RuleOutcome:
 # Journey-wide checks run with the Booking unit (always evaluated); checks
 # that need a delivery run with the Delivery unit.
 _BOOKING_RULES = (
+    booking_date_unusable,
     deal_undercharged, excess_discount, tcs_short,
     third_party_payment_unconfirmed, third_party_payment_undeclared,
     cash_intimation_unconfirmed, cash_not_intimated, cash_above_limit, payment_before_booking,
@@ -1185,6 +1227,7 @@ RULE_CODES = {
 
 # The Findings catalogue entry each check raises under.
 _FINDING_TYPES = {
+    "BOOKING_DATE_UNUSABLE": "PROCESS_NON_COMPLIANCE",
     "DEAL_UNDERCHARGED": "PRICING_ANOMALY", "TCS_SHORT": "PRICING_ANOMALY", "EXCESS_DISCOUNT": "DISCOUNT_ANOMALY",
     "TRADE_IN_NOT_RESOLD": "COMMERCIAL_EXCEPTION", "TRADE_IN_SOLD_AT_LOSS": "COMMERCIAL_EXCEPTION",
     "DELIVERY_NOT_COMPLETED_IN_TIME": "DELIVERY_EXCEPTION",

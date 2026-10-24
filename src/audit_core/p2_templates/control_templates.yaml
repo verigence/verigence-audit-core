@@ -1527,6 +1527,26 @@ controls:
     task:
       type: FINDING_REVIEW
       owner: TL
+  # CRITICAL: with no usable booking date there is no price book, so no
+  # standard price and not one commercial control can run on the deal. The
+  # severity is the blast radius, not the size of the correction
+  # (product owner, 2026-10-24).
+  BOOKING_DATE_UNUSABLE:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    category: Manual Observations
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: CRITICAL
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
   PAYMENT_BEFORE_BOOKING:
     executor: NATIVE
     mode: RERUN
