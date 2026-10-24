@@ -4140,6 +4140,14 @@ def main() -> None:
 
         threading.Thread(target=run_page_resend, args=(engine, resend_tag, _active_tenants(engine)),
                          name="page-resend", daemon=True).start()
+    # Every Journey's invoices read again with the current reader (2026-10-24):
+    # dry run unless the tag ends with "-commit".
+    rescan_tag = os.environ.get("AUDIT_CORE_INVOICE_RESCAN_TAG", "").strip()
+    if rescan_tag:
+        from audit_core.uc03_invoice_rescan import run_invoice_rescan
+
+        threading.Thread(target=run_invoice_rescan, args=(engine, rescan_tag, _active_tenants(engine)),
+                         name="invoice-rescan", daemon=True).start()
     sku_run_tag = os.environ.get("AUDIT_CORE_SKU_RUN_TAG", "").strip()
     if sku_run_tag:
         threading.Thread(target=_sku_run_once, args=(engine, sku_run_tag), name="sku-run", daemon=True).start()
