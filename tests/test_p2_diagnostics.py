@@ -442,3 +442,57 @@ def test_the_disagreement_report_stays_silent_when_the_price_agrees(journey):
             text(REPORTS["price_disagreements"]), {"t": journey.tenant_id, "c": "%"},
         ).mappings().all()
     assert rows == []
+
+
+def test_a_small_report_logs_its_whole_answer_on_one_line(journey, monkeypatch):
+    """A report returning a handful of rows is the answer to a question, and
+    reading those rows back out of a log API that pages and cannot filter on
+    structured attributes wasted most of a morning on 2026-10-24. The whole
+    answer now goes out on one line as well."""
+    import json as _json
+
+    from audit_core import uc03_p2_diagnostics as diag
+
+    lines: list[tuple[str, dict]] = []
+
+    class _Log:
+        def info(self, event, **kw):
+            lines.append((event, kw))
+
+        def warning(self, event, **kw):
+            lines.append((event, kw))
+
+    monkeypatch.setattr(diag, "logger", _Log())
+    monkeypatch.setattr(diag, "_projects", lambda engine: [
+        {"tenant_id": journey.tenant_id, "project_code": "X", "project_name": "X", "project_status": "ACTIVE"}])
+    monkeypatch.setitem(diag.REPORTS, "_one_row", "SELECT 7 AS answer, NULL AS nothing")
+    diag.run_diagnostics(journey.engine, ["_one_row"])
+
+    [(_, answer)] = [line for line in lines if line[0] == "diag_answer"]
+    assert answer["report"] == "_one_row" and answer["rows"] == 1
+    assert _json.loads(answer["answer"]) == [{"answer": 7, "nothing": None}]
+
+
+def test_a_large_report_gets_no_one_line_answer(journey, monkeypatch):
+    """Only a small report; a page of rows on one line would be unreadable and
+    would be truncated anyway."""
+    from audit_core import uc03_p2_diagnostics as diag
+
+    lines: list[str] = []
+
+    class _Log:
+        def info(self, event, **kw):
+            lines.append(event)
+
+        def warning(self, event, **kw):
+            lines.append(event)
+
+    monkeypatch.setattr(diag, "logger", _Log())
+    monkeypatch.setattr(diag, "_projects", lambda engine: [
+        {"tenant_id": journey.tenant_id, "project_code": "X", "project_name": "X", "project_status": "ACTIVE"}])
+    monkeypatch.setattr(diag, "_ANSWER_ROWS", 2)
+    monkeypatch.setitem(diag.REPORTS, "_many", "SELECT g AS n FROM generate_series(1, 9) g")
+    diag.run_diagnostics(journey.engine, ["_many"])
+
+    assert "diag_answer" not in lines
+    assert lines.count("diag_row") == 9
