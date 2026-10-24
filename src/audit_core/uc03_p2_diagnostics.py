@@ -132,6 +132,100 @@ REPORTS: dict[str, str] = {
         GROUP BY 1, 2
         ORDER BY effective_from DESC, version_no DESC
     """,
+    # The verdict, aggregated in SQL so the answer is a handful of rows rather
+    # than one per figure. Asked 2026-10-24: would a price key resolve what the
+    # words cannot, and does it agree where the words already succeed?
+    "price_key_verdict": """
+        WITH j AS (
+            SELECT j.journey_id, COALESCE(b.pricing_effective_on, b.booking_date) AS priced_on,
+                   jp.product_sku_id
+            FROM auditcore.journeys j
+            LEFT JOIN auditcore.journey_products jp
+              ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+            LEFT JOIN auditcore.bookings b
+              ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+            WHERE j.tenant_id = :t
+        ), planned AS (
+            SELECT j.*, (
+                SELECT plv.price_list_version_id
+                FROM auditcore.price_list_versions plv
+                JOIN auditcore.price_lists pl
+                  ON pl.tenant_id = plv.tenant_id AND pl.price_list_id = plv.price_list_id
+                WHERE plv.tenant_id = :t
+                  AND plv.lifecycle_status IN ('PUBLISHED', 'RETIRED')
+                  AND plv.effective_from <= j.priced_on
+                  AND (plv.effective_to IS NULL OR plv.effective_to >= j.priced_on)
+                  AND (pl.price_list_code = 'OEM_NATIVE_PRICE_LIST'
+                       OR NOT EXISTS (SELECT 1 FROM auditcore.price_lists own
+                                       WHERE own.tenant_id = plv.tenant_id
+                                         AND own.price_list_code = 'OEM_NATIVE_PRICE_LIST'))
+                ORDER BY plv.effective_from DESC, plv.version_no DESC, plv.price_list_version_id DESC
+                LIMIT 1) AS plv
+            FROM j
+        ), reads AS (
+            SELECT f.journey_id,
+                   ROUND(replace(COALESCE((regexp_match(f.effective_value #>> '{}',
+                                 '[0-9][0-9,]*(?:\\.[0-9]+)?'))[1], '0'), ',', '')::numeric, 2) AS amount
+            FROM auditcore.journey_document_extracted_fields f
+            WHERE f.tenant_id = :t AND f.field_key = 'ex_showroom_price'
+              AND f.effective_value IS NOT NULL
+              AND COALESCE(f.source_document_type_key, '') NOT IN ('wholesale_invoice')
+            GROUP BY 1, 2
+        ), book AS (
+            SELECT pli.price_list_version_id, s.product_sku_id, pm.model_name, pv.variant_name,
+                   SUM(pli.standard_amount) FILTER (WHERE pli.component_key = 'EX_SHOWROOM') AS ex_showroom
+            FROM auditcore.price_list_items pli
+            JOIN auditcore.product_skus s      ON s.product_sku_id = pli.product_sku_id
+            JOIN auditcore.product_models pm   ON pm.model_id = s.model_id
+            JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
+            WHERE pli.tenant_id = :t AND s.is_active AND pm.is_active AND pv.is_active
+            GROUP BY 1, 2, 3, 4
+        ), per_journey AS (
+            SELECT p.journey_id,
+                   (p.product_sku_id IS NOT NULL) AS resolved,
+                   (p.plv IS NOT NULL) AS had_book,
+                   (SELECT COUNT(*) FROM reads r WHERE r.journey_id = p.journey_id) AS figures,
+                   -- the tightest band at which some figure names exactly one variant
+                   MIN(CASE WHEN m.variants = 1 THEN m.band END) AS pinning_band,
+                   MIN(CASE WHEN m.models = 1 THEN m.band END) AS model_band,
+                   MIN(m.gap) FILTER (WHERE m.gap IS NOT NULL) AS closest_gap
+            FROM planned p
+            LEFT JOIN reads r ON r.journey_id = p.journey_id
+            LEFT JOIN LATERAL (
+                SELECT band,
+                       COUNT(DISTINCT bk.model_name) AS models,
+                       COUNT(DISTINCT bk.model_name || ' ~ ' || bk.variant_name) AS variants,
+                       MIN(ABS(bk.ex_showroom - r.amount)) AS gap
+                FROM (VALUES (0.00), (1.00), (2.00), (10.00), (100.00)) AS b(band)
+                JOIN book bk ON bk.price_list_version_id = p.plv
+                            AND bk.ex_showroom IS NOT NULL
+                            AND ABS(bk.ex_showroom - r.amount) <= b.band
+                GROUP BY band
+            ) m ON true
+            GROUP BY p.journey_id, p.product_sku_id, p.plv
+        )
+        SELECT COUNT(*) AS journeys,
+               COUNT(*) FILTER (WHERE resolved) AS resolved_by_words,
+               COUNT(*) FILTER (WHERE NOT resolved) AS not_resolved,
+               COUNT(*) FILTER (WHERE figures = 0) AS no_ex_showroom_read,
+               COUNT(*) FILTER (WHERE NOT had_book) AS no_price_book_in_force,
+               -- what a price key would do with the ones the words left open
+               COUNT(*) FILTER (WHERE NOT resolved AND pinning_band = 0) AS open_pinned_to_the_paisa,
+               COUNT(*) FILTER (WHERE NOT resolved AND pinning_band = 1) AS open_pinned_within_a_rupee,
+               COUNT(*) FILTER (WHERE NOT resolved AND pinning_band = 2) AS open_pinned_within_two,
+               COUNT(*) FILTER (WHERE NOT resolved AND pinning_band > 2) AS open_pinned_only_loosely,
+               COUNT(*) FILTER (WHERE NOT resolved AND pinning_band IS NULL
+                                  AND model_band IS NOT NULL) AS open_narrowed_to_one_model,
+               COUNT(*) FILTER (WHERE NOT resolved AND pinning_band IS NULL
+                                  AND model_band IS NULL AND had_book) AS open_price_settles_nothing,
+               -- and whether it agrees where the words already succeeded
+               COUNT(*) FILTER (WHERE resolved AND pinning_band <= 1) AS resolved_price_pins_one_too,
+               COUNT(*) FILTER (WHERE resolved AND pinning_band IS NULL AND had_book)
+                 AS resolved_price_pins_nothing,
+               ROUND(percentile_disc(0.5) WITHIN GROUP (ORDER BY closest_gap), 2) AS median_gap,
+               ROUND(percentile_disc(0.9) WITHIN GROUP (ORDER BY closest_gap), 2) AS p90_gap
+        FROM per_journey
+    """,
     # How the ex-showroom figures are actually stored, per document type, so a
     # figure the simulation could not parse is visible rather than silently
     # making the price key look worse than it is.
@@ -245,8 +339,11 @@ REPORTS: dict[str, str] = {
             WHERE bk.price_list_version_id = p.plv AND bk.ex_showroom = r.amount
         ) m ON true
         LEFT JOIN LATERAL (
-            -- Nearest price in the book, for the figures that do not match to
-            -- the paisa: a form that rounded, or a figure read a digit out.
+            -- Within one rupee. Measured 2026-10-24: the book carries paisa
+            -- (2478999.58) and forms print the rounded rupee (2479000), so
+            -- equality to the paisa almost never fires. A percentage band is
+            -- useless in the other direction -- 0.5% of a 24-lakh car is
+            -- 12,000 rupees and swept in three unrelated models.
             SELECT COUNT(*) AS near_skus,
                    COUNT(DISTINCT bk.model_name) AS near_models,
                    COUNT(DISTINCT bk.model_name || ' ~ ' || bk.variant_name) AS near_variants,
@@ -255,7 +352,7 @@ REPORTS: dict[str, str] = {
             FROM book bk
             WHERE bk.price_list_version_id = p.plv
               AND bk.ex_showroom IS NOT NULL
-              AND ABS(bk.ex_showroom - r.amount) <= GREATEST(r.amount * 0.005, 100)
+              AND ABS(bk.ex_showroom - r.amount) <= 1
         ) n ON true
         ORDER BY (p.product_sku_id IS NOT NULL), p.journey_reference, r.document
     """,
