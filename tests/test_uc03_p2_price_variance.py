@@ -59,13 +59,29 @@ def _runtime_row(journey):
         note_facts_changed(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, reason="TEST")
 
 
-def _set(journey, value):
+def _set(journey, value, *, fresh: bool = True):
+    """Put a value in the cache. ``fresh`` stamps the Journey's current fact
+    version alongside it, as a real refresh does; without it the value is a
+    copy left behind by a change that never recomputed it."""
+    version = "fact_version" if fresh else "price_variance_fact_version"
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
-            text("UPDATE auditcore.p2_journey_runtime SET price_variance=:v WHERE tenant_id=:t AND journey_id=:j"),
+            text(f"UPDATE auditcore.p2_journey_runtime "
+                 f"SET price_variance=:v, price_variance_fact_version={version} "
+                 f"WHERE tenant_id=:t AND journey_id=:j"),
             {"v": value, "t": journey.tenant_id, "j": journey.journey_id},
         )
+
+
+def _stored_version(journey):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return connection.execute(
+            text("SELECT fact_version, price_variance_fact_version FROM auditcore.p2_journey_runtime "
+                 "WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).one()
 
 
 def test_the_worker_stores_the_deals_own_variance_and_the_list_shows_it(journey):
@@ -90,6 +106,41 @@ def test_the_list_reads_the_stored_value_and_falls_back_while_it_is_not_computed
     assert Decimal(_listed(journey)) == 123
     _set(journey, None)  # not computed yet: the list's previous calculation
     assert Decimal(_listed(journey)) == 5000
+
+
+def test_the_list_never_shows_a_cached_variance_older_than_the_facts(journey):
+    """The bug this guards (2026-10-24): a Journey's deal changed -- a SKU
+    re-pinned by a resolution run -- and the list went on showing the figure
+    from before, while Journey 360 recomputed live and showed another. One
+    customer read +2,71,181 on the list against -9,407 on the Deal tab."""
+    _seed_deal(journey)
+    _runtime_row(journey)
+    _set(journey, Decimal("271181.00"), fresh=False)
+    assert Decimal(_listed(journey)) == 5000, "a stale copy must not reach the list"
+
+    # and the sweep restores the Deal's own figure, stamped at these facts
+    assert price_variance.backfill_price_variance(journey.engine, tenant_id=journey.tenant_id) == 1
+    assert _stored(journey) == 5000
+    current, cached = _stored_version(journey)
+    assert cached == current
+    assert Decimal(_listed(journey)) == 5000
+
+
+def test_a_fact_change_makes_the_cached_variance_stale_and_the_sweep_picks_it_up(journey):
+    _seed_deal(journey)
+    _runtime_row(journey)
+    assert price_variance.backfill_price_variance(journey.engine, tenant_id=journey.tenant_id) == 1
+    current, cached = _stored_version(journey)
+    assert cached == current
+    # nothing has moved, so there is nothing to recompute
+    assert price_variance.backfill_price_variance(journey.engine, tenant_id=journey.tenant_id) == 0
+
+    _runtime_row(journey)  # a fact changed: the cached copy is now behind
+    current, cached = _stored_version(journey)
+    assert cached < current
+    assert price_variance.backfill_price_variance(journey.engine, tenant_id=journey.tenant_id) == 1
+    current, cached = _stored_version(journey)
+    assert cached == current
 
 
 def test_a_deal_that_cannot_be_built_never_breaks_the_recompute_or_overwrites(journey, monkeypatch):
@@ -125,7 +176,25 @@ def test_backfill_fills_journeys_without_a_value_once_per_process(journey):
     assert _stored(journey) is None
     assert price_variance.backfill_price_variance(journey.engine, tenant_id=journey.tenant_id) == 1
     assert _stored(journey) == 5000
-    # nothing left to fill; a journey already tried in this process is not tried again
+    # nothing left to fill: the value it wrote is stamped at the Journey's facts
     assert price_variance.backfill_price_variance(journey.engine, tenant_id=journey.tenant_id) == 0
-    _set(journey, None)
+
+
+def test_a_deal_that_cannot_be_built_is_not_retried_until_its_facts_move(journey, monkeypatch):
+    _seed_deal(journey)
+    _runtime_row(journey)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("deal exploded")
+
+    monkeypatch.setattr(price_variance, "deal", boom)
     assert price_variance.backfill_price_variance(journey.engine, tenant_id=journey.tenant_id) == 0
+    assert _stored(journey) is None
+    # the same broken Deal is not rebuilt every sweep
+    assert len(price_variance._backfill_tried) == 1
+    assert price_variance.backfill_price_variance(journey.engine, tenant_id=journey.tenant_id) == 0
+
+    _runtime_row(journey)  # its facts moved: worth another attempt
+    monkeypatch.undo()
+    assert price_variance.backfill_price_variance(journey.engine, tenant_id=journey.tenant_id) == 1
+    assert _stored(journey) == 5000
