@@ -24,6 +24,24 @@ _MAX_ROWS = int(os.environ.get("AUDIT_CORE_DIAG_MAX_ROWS", "600"))
 _ANSWER_ROWS = int(os.environ.get("AUDIT_CORE_DIAG_ANSWER_ROWS", "5"))
 
 REPORTS: dict[str, str] = {
+    # The invoice rows behind those shared GSTINs, one per document: which
+    # document type each came from, the invoice's own seller and buyer as read,
+    # and the GSTIN status the document gave.
+    "shared_gstin_rows": """
+        SELECT j.journey_reference, COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
+               v.document_type_key, v.source_di_document_id, v.invoice_number, v.invoice_date,
+               v.seller_name, v.seller_gstin, v.buyer_name, v.buyer_gstin, v.buyer_gstin_status,
+               v.created_at_utc
+        FROM auditcore.invoice_review_values v
+        JOIN auditcore.journeys j ON j.tenant_id = v.tenant_id AND j.journey_id = v.journey_id
+        LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+        WHERE v.tenant_id = :t AND v.buyer_gstin IS NOT NULL
+          AND upper(btrim(v.buyer_gstin)) IN (
+              SELECT upper(btrim(buyer_gstin)) FROM auditcore.invoice_review_values
+              WHERE tenant_id = :t AND buyer_gstin IS NOT NULL
+              GROUP BY upper(btrim(buyer_gstin)) HAVING count(DISTINCT journey_id) > 1)
+        ORDER BY upper(btrim(v.buyer_gstin)), j.journey_reference, v.created_at_utc
+    """,
     # A buyer GSTIN carried by more than one Journey (2026-10-24: two different
     # customers paired as duplicates on 21AAACU2665C1ZV while one of them has no
     # GSTIN). Is it the dealer's own GSTIN (a seller GSTIN anywhere in the
