@@ -20,6 +20,8 @@ from audit_core.db import set_platform_super_admin_context, set_tenant_context
 
 logger = structlog.get_logger(__name__)
 _MAX_ROWS = int(os.environ.get("AUDIT_CORE_DIAG_MAX_ROWS", "600"))
+# A report returning at most this many rows is also logged whole, on one line.
+_ANSWER_ROWS = int(os.environ.get("AUDIT_CORE_DIAG_ANSWER_ROWS", "5"))
 
 REPORTS: dict[str, str] = {
     # Every Journey's vehicle: what was read, the SKU pinned, how and when.
@@ -1182,6 +1184,13 @@ def _date_floor() -> date:
         return date(1900, 1, 1)
 
 
+def _scalar(value: Any) -> Any:
+    """For the one-line answer: JSON-safe and compact, never re-encoded."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def _plain(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -1210,6 +1219,17 @@ def run_diagnostics(engine: Engine, names: list[str]) -> None:
                 for row in rows[:_MAX_ROWS]:
                     logger.info("diag_row", report=name, tenant_id=tenant_id,
                                 project=project["project_name"], **{k: _plain(v) for k, v in row.items()})
+                if 0 < len(rows) <= _ANSWER_ROWS:
+                    # The whole answer on one line (2026-10-24). A report that
+                    # returns a handful of rows is the answer to a question, and
+                    # fishing those rows out of a log API that pages and cannot
+                    # filter on structured attributes wasted most of a morning.
+                    logger.info(
+                        "diag_answer", report=name, tenant_id=tenant_id,
+                        project=project["project_name"], rows=len(rows),
+                        answer=json.dumps([{k: _scalar(v) for k, v in r.items()} for r in rows],
+                                          default=str)[:3800],
+                    )
                 logger.info("diag_report_done", report=name, tenant_id=tenant_id, rows=len(rows))
             except Exception:
                 logger.warning("diag_report_failed", report=name, tenant_id=tenant_id, exc_info=True)
