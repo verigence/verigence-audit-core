@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
+import structlog
 from sqlalchemy import Connection, text
 
 from audit_core.errors import AuditCoreError
@@ -15,6 +16,8 @@ from audit_core.price_lists import (
     resolve_effective_price_list_version,
     resolve_effective_price_plan,
 )
+
+logger = structlog.get_logger(__name__)
 
 _NON_ALNUM = re.compile(r"[^A-Z0-9]+")
 
@@ -37,6 +40,44 @@ def _label_similarity(observed: str, master: str) -> Decimal:
     return Decimal(1) if left == right else Decimal(0)
 
 
+def _priceable(day: date | None, *, source: str, tenant_id: str, journey_id: UUID) -> date | None:
+    """A read date the programme has already called a misread is not a pricing
+    date (2026-10-24).
+
+    ``before_floor`` states the rule outright -- "a date earlier than the
+    programme's floor is a misread, never a fact" -- and it is enforced for
+    delivery dates, for booking confirmation, and as the high-severity
+    DATE_BEFORE_FLOOR verification reason. It was never enforced here, on the
+    one date every price-master lookup goes through, so a handwritten 26 read
+    as 24 priced the deal in 2024, found no price book in force, and the run
+    skipped it as "no effective price list" -- pointing the fix at loading
+    historical price books that would never have been used. PRATEEK PANIGRAHI
+    (2024-08-21) and PUSPANJALI SAHOO (2024-09-04) were both booked in October
+    2026. The Journey list applies the floor and hides those dates, so the
+    screen looked right while the engine used them.
+
+    A booking date after today is the same misread from the other side (a 26
+    read as 27), which ``future_date_verdict`` already names DATE_IN_FUTURE.
+
+    Rejecting the value is the whole fix: resolution then skips as
+    "no_pricing_date", which is the truthful reason, raises the task that asks
+    the PC for the booking date, and is one of the two reasons that let the
+    invoice-date fallback try the invoice instead.
+    """
+    if day is None:
+        return None
+    from audit_core.uc03_p2_dates import before_floor, programme_today
+
+    why = ("before the programme's date floor" if before_floor(day)
+           else "after today" if day > programme_today() else None)
+    if why is None:
+        return day
+    # Logged, not swallowed: a date quietly dropped is how this one survived.
+    logger.info("pricing_date_rejected", tenant_id=tenant_id, journey_id=str(journey_id),
+                source=source, value=day.isoformat(), reason=why)
+    return None
+
+
 def journey_pricing_date(connection: Connection, *, tenant_id: str, journey_id: UUID) -> date | None:
     """The ONE date a Journey's deal is priced on (2026-10-20 product owner
     rules, R5): the date applied to it (``bookings.pricing_effective_on``:
@@ -44,6 +85,12 @@ def journey_pricing_date(connection: Connection, *, tenant_id: str, journey_id: 
     else the booking date on the booking form (as read, or as the PC
     corrected it), else the booking date entered by hand. Never today: with
     none of them the deal is not priced yet.
+
+    The two read sources are checked against the programme's date floor and
+    against today (see ``_priceable``); a date that fails is passed over as
+    the misread it is, rather than priced on. The applied date is not checked:
+    it is only ever set to a published price-list version's own effective_from
+    by a PC's or Team Lead's explicit decision, so it cannot be a misreading.
 
     Every price-master lookup for a Journey (SKU candidates and resolution,
     the SKU pricing panel, deal reconciliation) takes its date from here."""
@@ -62,9 +109,14 @@ def journey_pricing_date(connection: Connection, *, tenant_id: str, journey_id: 
     if row is not None and row["pricing_effective_on"] is not None:
         return row["pricing_effective_on"]
     form = booking_form_date(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if form and form.get("date"):
-        return form["date"]
-    return row["booking_date"] if row is not None else None
+    read = _priceable((form or {}).get("date"), source="booking_form",
+                      tenant_id=tenant_id, journey_id=journey_id)
+    if read is not None:
+        return read
+    if row is None:
+        return None
+    return _priceable(row["booking_date"], source="booking_date",
+                      tenant_id=tenant_id, journey_id=journey_id)
 
 
 def journey_price_plan(
