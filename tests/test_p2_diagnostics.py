@@ -252,5 +252,29 @@ def test_the_verdict_separates_a_journey_with_no_price_book_from_a_price_that_fa
 
     row = _verdict(journey)
     assert row["no_price_book_in_force"] == 1
+    assert row["priced_before_the_first_book"] == 1, "that month's book has to be loaded"
+    assert row["no_pricing_date"] == 0
     assert row["open_price_settles_nothing"] == 0, "no book is not the price failing"
     assert row["open_pinned_within_a_rupee"] == 0
+
+
+def test_the_verdict_separates_a_booking_with_no_date_from_one_outside_the_books(journey):
+    """The two need different work: a Journey with no date needs its date read
+    off the documents, one priced before the earliest book needs that month's
+    book loaded. 74 of Mahindra Orissa's 171 were in this bucket on the first
+    run, so the split decides what to fix first."""
+    from datetime import date
+    from uuid import uuid4
+
+    from p2_support import add_extracted_field
+
+    _price_book(journey, {("THAR ROXX", "MX1 D MT RWD"): "1423000.58"},
+                effective_from=date(2026, 10, 1))
+    add_extracted_field(journey, di_document_id=uuid4(), field_key="ex_showroom_price",
+                        value="1423001", document_type="booking_form")
+    # no bookings row at all: nothing says when this deal was priced
+
+    row = _verdict(journey)
+    assert row["no_price_book_in_force"] == 1
+    assert row["no_pricing_date"] == 1
+    assert row["priced_before_the_first_book"] == 0

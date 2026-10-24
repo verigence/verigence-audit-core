@@ -181,7 +181,7 @@ REPORTS: dict[str, str] = {
             WHERE pli.tenant_id = :t AND s.is_active AND pm.is_active AND pv.is_active
             GROUP BY 1, 2, 3, 4
         ), per_journey AS (
-            SELECT p.journey_id,
+            SELECT p.journey_id, p.priced_on,
                    (p.product_sku_id IS NOT NULL) AS resolved,
                    (p.plv IS NOT NULL) AS had_book,
                    (SELECT COUNT(*) FROM reads r WHERE r.journey_id = p.journey_id) AS figures,
@@ -202,13 +202,31 @@ REPORTS: dict[str, str] = {
                             AND ABS(bk.ex_showroom - r.amount) <= b.band
                 GROUP BY band
             ) m ON true
-            GROUP BY p.journey_id, p.product_sku_id, p.plv
+            GROUP BY p.journey_id, p.priced_on, p.product_sku_id, p.plv
         )
         SELECT COUNT(*) AS journeys,
                COUNT(*) FILTER (WHERE resolved) AS resolved_by_words,
                COUNT(*) FILTER (WHERE NOT resolved) AS not_resolved,
                COUNT(*) FILTER (WHERE figures = 0) AS no_ex_showroom_read,
                COUNT(*) FILTER (WHERE NOT had_book) AS no_price_book_in_force,
+               -- Why there is no book, because the answers are different work:
+               -- a Journey with no date needs its date read, one priced before
+               -- the earliest book needs that month's book loaded. The first
+               -- run put 74 of 171 in this bucket, so the split decides what to
+               -- fix first (2026-10-24).
+               COUNT(*) FILTER (WHERE NOT had_book AND priced_on IS NULL) AS no_pricing_date,
+               COUNT(*) FILTER (WHERE NOT had_book AND priced_on IS NOT NULL
+                                  AND priced_on < (SELECT MIN(plv.effective_from)
+                                                     FROM auditcore.price_list_versions plv
+                                                    WHERE plv.tenant_id = :t
+                                                      AND plv.lifecycle_status IN ('PUBLISHED','RETIRED')))
+                 AS priced_before_the_first_book,
+               COUNT(*) FILTER (WHERE NOT had_book AND priced_on IS NOT NULL
+                                  AND priced_on >= (SELECT MIN(plv.effective_from)
+                                                      FROM auditcore.price_list_versions plv
+                                                     WHERE plv.tenant_id = :t
+                                                       AND plv.lifecycle_status IN ('PUBLISHED','RETIRED')))
+                 AS priced_in_a_gap_between_books,
                -- what a price key would do with the ones the words left open
                COUNT(*) FILTER (WHERE NOT resolved AND pinning_band = 0) AS open_pinned_to_the_paisa,
                COUNT(*) FILTER (WHERE NOT resolved AND pinning_band = 1) AS open_pinned_within_a_rupee,
