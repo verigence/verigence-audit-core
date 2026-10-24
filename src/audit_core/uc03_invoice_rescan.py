@@ -64,6 +64,20 @@ def _ex_showroom_now(connection: Connection, tenant_id: str, journey_id: UUID) -
     return None if value is None else Decimal(str(value))
 
 
+def _ex_showroom_standard(connection: Connection, tenant_id: str, journey_id: UUID) -> Decimal | None:
+    """The price list's ex-showroom for the Journey's resolved SKU and date."""
+    value = connection.execute(
+        text(
+            """
+            SELECT standard_amount FROM auditcore.commercial_lines
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id AND component_key = :key
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "key": _EX_SHOWROOM},
+    ).scalar()
+    return None if value is None else Decimal(str(value))
+
+
 def _ex_showroom_source(connection: Connection, tenant_id: str, journey_id: UUID) -> str | None:
     value = connection.execute(
         text(
@@ -115,6 +129,7 @@ def rescan_journey(
     after = selection["lines"].get(_EX_SHOWROOM)
     item = {"invoices": len(readings), "before": before, "after": after,
             "changed": after is not None and (before is None or abs(before - after) > Decimal("0.5")),
+            "standard": _ex_showroom_standard(connection, tenant_id, journey_id),
             "detail": _detail(selection, _ex_showroom_source(connection, tenant_id, journey_id))}
     if not commit:
         return item
@@ -172,5 +187,5 @@ def run_invoice_rescan(engine: Engine, tag: str, tenant_ids: list[str]) -> None:
             logger.info("invoice_rescan_item", tag=tag, tenant_id=tenant_id, commit=commit,
                         journey_id=str(journey_id), invoices=item["invoices"],
                         ex_showroom_before=str(item["before"]), ex_showroom_after=str(item["after"]),
-                        changed=item["changed"], detail=str(item["detail"]))
+                        changed=item["changed"], ex_showroom_standard=str(item["standard"]), detail=str(item["detail"]))
         logger.info("invoice_rescan_finished", tag=tag, tenant_id=tenant_id, commit=commit, **totals)

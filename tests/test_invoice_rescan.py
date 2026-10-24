@@ -24,6 +24,7 @@ def _wire(monkeypatch, *, before, phase_two=True):
     monkeypatch.setattr(rescan, "load_invoice_readings", lambda *a, **k: [_reading()])
     monkeypatch.setattr(rescan, "plausible_from", lambda *a, **k: None)
     monkeypatch.setattr(rescan, "_ex_showroom_now", lambda *a, **k: before)
+    monkeypatch.setattr(rescan, "_ex_showroom_standard", lambda *a, **k: Decimal("1344000.00"))
     monkeypatch.setattr(rescan, "_ex_showroom_source", lambda *a, **k: "tax_invoice_tally")
     monkeypatch.setattr(rescan, "_on_phase_two", lambda *a, **k: phase_two)
     monkeypatch.setattr(rescan, "record_source_value", lambda *a, **k: calls["source"].append(k["component_key"]))
@@ -65,3 +66,9 @@ def test_the_log_says_what_the_figure_was_worked_from(monkeypatch):
     detail = item["detail"]
     assert detail["basis"] == "GRAND_TOTAL" and detail["beforeSource"] == "tax_invoice_tally"
     assert detail["grandTotal"] == "1290000" and detail["tcs"] == "10000"
+
+
+def test_the_item_carries_the_price_lists_figure_to_compare_with(monkeypatch):
+    _wire(monkeypatch, before=None)
+    item = rescan.rescan_journey(object(), tenant_id=_TENANT, journey_id=uuid4(), tag="t", commit=False)
+    assert item["standard"] == item["after"] == Decimal("1344000.00")
