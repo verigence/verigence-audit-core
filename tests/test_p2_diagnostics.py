@@ -23,10 +23,19 @@ def journey():
 
 @pytest.mark.parametrize("name", sorted(REPORTS))
 def test_every_report_runs_read_only(journey, name):
+    """Bound with exactly what run_diagnostics binds, so a report that needs a
+    parameter the runner does not supply fails here rather than on the worker
+    (caught 2026-10-24: pricing_date_verdict needs the programme's date
+    floor)."""
+    from audit_core.uc03_p2_diagnostics import _date_floor
+
     with journey.engine.begin() as connection:
         connection.execute(text("SET TRANSACTION READ ONLY"))
         set_tenant_context(connection, journey.tenant_id)
-        connection.execute(text(REPORTS[name]), {"t": journey.tenant_id, "c": "%"}).mappings().all()
+        connection.execute(
+            text(REPORTS[name]),
+            {"t": journey.tenant_id, "c": "%", "floor": _date_floor()},
+        ).mappings().all()
 
 
 def test_run_logs_without_failing(journey, monkeypatch):

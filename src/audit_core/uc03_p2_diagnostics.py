@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import date
 from typing import Any
 
 import structlog
@@ -131,6 +132,111 @@ REPORTS: dict[str, str] = {
         FROM per_price
         GROUP BY 1, 2
         ORDER BY effective_from DESC, version_no DESC
+    """,
+    # One row: does any document print an identifier we could match outright,
+    # and does its shape match the codes our own price master holds? Asked
+    # 2026-10-24 ("I want 100% identification").
+    #
+    # The resolver already prefers a printed sku_code over every word rule
+    # (uc03_model_resolution._match_one), matching it exactly against
+    # product_skus.sku_code. But that column is a code WE compose --
+    # "MAXX_HD::MAXX HD 1.7L LX BS6.2", built as model_code + "::" + variant
+    # name in oem_price_masters -- not the OEM's own material code. An invoice
+    # prints the OEM's. An exact string compare between the two can never
+    # match, so the one path that needs no tolerance is dead on real
+    # documents. This report proves or disproves that from the data rather
+    # than from reading the code.
+    "printed_identifier_coverage": """
+        SELECT
+          (SELECT COUNT(*) FROM auditcore.journeys WHERE tenant_id = :t) AS journeys,
+          (SELECT COUNT(DISTINCT f.journey_id)
+             FROM auditcore.journey_document_extracted_fields f
+            WHERE f.tenant_id = :t AND f.field_key = 'sku_code'
+              AND f.effective_value IS NOT NULL
+              AND f.effective_value #>> '{}' <> '') AS journeys_printing_a_sku_code,
+          (SELECT left(string_agg(DISTINCT left(f.effective_value #>> '{}', 48), ' | '), 400)
+             FROM auditcore.journey_document_extracted_fields f
+            WHERE f.tenant_id = :t AND f.field_key = 'sku_code'
+              AND f.effective_value IS NOT NULL
+              AND f.effective_value #>> '{}' <> '') AS printed_codes,
+          (SELECT left(string_agg(DISTINCT left(s.sku_code, 48), ' | '), 400)
+             FROM auditcore.product_skus s
+             JOIN auditcore.price_list_items pli ON pli.product_sku_id = s.product_sku_id
+            WHERE pli.tenant_id = :t) AS our_own_codes,
+          -- the number that matters: printed codes that actually hit a row
+          (SELECT COUNT(DISTINCT f.journey_id)
+             FROM auditcore.journey_document_extracted_fields f
+            WHERE f.tenant_id = :t AND f.field_key = 'sku_code'
+              AND f.effective_value IS NOT NULL
+              AND EXISTS (SELECT 1 FROM auditcore.product_skus s
+                           WHERE lower(btrim(s.sku_code)) = lower(btrim(f.effective_value #>> '{}')))
+          ) AS printed_codes_that_match_a_sku,
+          (SELECT COUNT(DISTINCT f.journey_id)
+             FROM auditcore.journey_document_extracted_fields f
+            WHERE f.tenant_id = :t AND f.field_key ~ '(chassis|vin|engine)'
+              AND f.effective_value IS NOT NULL
+              AND f.effective_value #>> '{}' <> '') AS journeys_with_a_chassis_or_engine_number,
+          (SELECT left(string_agg(DISTINCT f.field_key, ', '), 300)
+             FROM auditcore.journey_document_extracted_fields f
+            WHERE f.tenant_id = :t AND f.field_key ~ '(chassis|vin|engine|material|model_code|variant_code)'
+              AND f.effective_value IS NOT NULL) AS identifier_fields_present
+    """,
+    # Every Journey whose pricing date is one the programme calls a misread,
+    # with where the date came from. Sizes the defect fixed on 2026-10-24:
+    # journey_pricing_date applied no date floor, so a handwritten 26 read as
+    # 24 priced the deal in 2024, found no book, and was recorded as a masters
+    # gap. Run this after the fix to see the same Journeys skip as
+    # "no_pricing_date" and reach the invoice-date fallback instead.
+    "pricing_date_integrity": """
+        SELECT j.journey_reference, j.created_by_display_name AS pc_name,
+               COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
+               j.created_at_utc::date AS journey_created,
+               b.pricing_effective_on AS applied_date,
+               b.booking_date,
+               (SELECT f.effective_value #>> '{}'
+                  FROM auditcore.journey_document_extracted_fields f
+                 WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+                   AND f.field_key = 'booking_date' AND f.effective_value IS NOT NULL
+                 ORDER BY f.updated_at_utc DESC LIMIT 1) AS booking_date_as_read,
+               CASE
+                 WHEN b.pricing_effective_on IS NOT NULL THEN 'applied by a person'
+                 WHEN COALESCE(b.booking_date, '9999-12-31'::date) < :floor
+                   THEN 'read before the programme started'
+                 WHEN b.booking_date > CURRENT_DATE THEN 'read as a day after today'
+                 WHEN b.booking_date IS NULL THEN 'no booking date at all'
+                 ELSE 'usable'
+               END AS verdict,
+               (jp.product_sku_id IS NOT NULL) AS has_sku
+        FROM auditcore.journeys j
+        LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+        LEFT JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+        LEFT JOIN auditcore.journey_products jp
+          ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+        WHERE j.tenant_id = :t
+          AND b.pricing_effective_on IS NULL
+          AND (b.booking_date IS NULL
+               OR b.booking_date < :floor
+               OR b.booking_date > CURRENT_DATE)
+        ORDER BY verdict, j.journey_reference
+    """,
+    # And the same thing counted, one row, so the size is unarguable.
+    "pricing_date_verdict": """
+        SELECT COUNT(*) AS journeys,
+               COUNT(*) FILTER (WHERE b.pricing_effective_on IS NOT NULL) AS applied_by_a_person,
+               COUNT(*) FILTER (WHERE b.pricing_effective_on IS NULL
+                                  AND b.booking_date IS NOT NULL
+                                  AND b.booking_date >= :floor
+                                  AND b.booking_date <= CURRENT_DATE) AS read_and_usable,
+               COUNT(*) FILTER (WHERE b.pricing_effective_on IS NULL
+                                  AND b.booking_date < :floor) AS read_before_the_programme,
+               COUNT(*) FILTER (WHERE b.pricing_effective_on IS NULL
+                                  AND b.booking_date > CURRENT_DATE) AS read_after_today,
+               COUNT(*) FILTER (WHERE b.pricing_effective_on IS NULL
+                                  AND b.booking_date IS NULL) AS no_booking_date,
+               COUNT(*) FILTER (WHERE b.journey_id IS NULL) AS no_booking_row_at_all
+        FROM auditcore.journeys j
+        LEFT JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+        WHERE j.tenant_id = :t
     """,
     # Every field the documents of this Project actually carry, with how many
     # Journeys carry it and what it looks like. Asked 2026-10-24 ("think
@@ -1064,6 +1170,18 @@ def _projects(engine: Engine) -> list[dict[str, Any]]:
         ).mappings()]
 
 
+def _date_floor() -> date:
+    """The programme's date floor, for the reports that ask which dates are
+    misreads. Falls back to a date before any real booking rather than failing
+    the whole run if the registry cannot be read."""
+    try:
+        from audit_core.uc03_p2_dates import programme_date_floor
+
+        return programme_date_floor() or date(1900, 1, 1)
+    except Exception:  # noqa: BLE001 - a diagnostic must never fail on config
+        return date(1900, 1, 1)
+
+
 def _plain(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -1086,7 +1204,8 @@ def run_diagnostics(engine: Engine, names: list[str]) -> None:
                     set_tenant_context(connection, tenant_id)
                     rows = connection.execute(
                         text(REPORTS[name]),
-                        {"t": tenant_id, "c": os.environ.get("AUDIT_CORE_DIAG_CUSTOMER", "") or "%"},
+                        {"t": tenant_id, "c": os.environ.get("AUDIT_CORE_DIAG_CUSTOMER", "") or "%",
+                         "floor": _date_floor()},
                     ).mappings().all()
                 for row in rows[:_MAX_ROWS]:
                     logger.info("diag_row", report=name, tenant_id=tenant_id,
