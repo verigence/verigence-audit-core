@@ -119,6 +119,28 @@ def future_date_verdict(field_key: str, value: Any, today: date | None = None) -
     return "DATE_IN_FUTURE" if parsed > (today or programme_today()) else None
 
 
+def unusable_pricing_date_reason(value: Any) -> str | None:
+    """Why this value cannot price a deal, in words for a PC, or None when it
+    can (2026-10-24).
+
+    One definition, two users: the resolver passes over such a date
+    (``uc03_sku_candidates.journey_pricing_date``) and the booking-date task
+    asks the PC to correct it. Keeping them apart is how a date could be
+    refused by the engine and raise no task -- a silent dead end.
+    """
+    if value is None or str(value).strip() == "":
+        return "no booking date was found on it"
+    parsed = value if isinstance(value, date) and not isinstance(value, datetime) else parse_extracted_date(value)
+    if parsed is None:
+        return f"the booking date on it ({value}) could not be read as a date"
+    if before_floor(parsed):
+        return (f"the booking date on it reads {parsed.isoformat()}, before this programme began -- "
+                "the year is misread")
+    if parsed > programme_today():
+        return f"the booking date on it reads {parsed.isoformat()}, which is after today -- the date is misread"
+    return None
+
+
 def programme_date_floor() -> date | None:
     """The registry's date floor (document_templates.yaml), or None."""
     from audit_core.uc03_p2_registry import RegistryError, get_registry

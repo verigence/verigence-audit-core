@@ -231,7 +231,7 @@ def test_a_misread_date_and_a_low_confidence_value_share_one_task(journey):
     assert "Receipt number (60%)" in task["description"]
 
 
-def test_a_booking_form_without_a_booking_date_raises_a_medium_task_that_opens_the_field(journey):
+def test_a_booking_form_without_a_booking_date_raises_a_critical_task_that_opens_the_field(journey):
     """#38 (2026-09-30): the deal is priced on the booking date, so a form
     read without one gets a Medium task pointing the PC at that field; the
     task closes itself once a date is in."""
@@ -254,7 +254,8 @@ def test_a_booking_form_without_a_booking_date_raises_a_medium_task_that_opens_t
     add_extracted_field(journey, di_document_id=document_id, field_key="booking_date", value=None)
     assert run() == {"RAISED": 1}
     raised = task()
-    assert (raised["task_type"], raised["severity"], raised["task_status"]) == ("PC_BOOKING_DATE_MISSING", "MEDIUM", "READY")
+    assert (raised["task_type"], raised["severity"], raised["task_status"]) == (
+        "PC_BOOKING_DATE_MISSING", "CRITICAL", "READY")  # nothing on the deal is priced until it is in
     assert raised["reference"]["documentId"] == str(document_id) and raised["reference"]["fieldKey"] == "booking_date"
     run()
     assert task()["task_status"] == "READY"

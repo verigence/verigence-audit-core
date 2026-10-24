@@ -649,7 +649,11 @@ def raise_not_set_task(connection: Connection, *, tenant_id: str, journey_id: UU
             "model picker. This task closes itself once a SKU is on the Journey."
         ),
         reference={"sourceCode": "SKU_NOT_SET", "leftValue": reason, "rightValue": why},
-        severity="MEDIUM",
+        # CRITICAL: a Journey with no SKU has no standard price, so not one
+        # commercial control can run on it. It is not a lesser problem than the
+        # findings it blocks (product owner, 2026-10-24: anything not available
+        # raises a task to fix).
+        severity="CRITICAL",
         registry=get_registry(),
     )
 
