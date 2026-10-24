@@ -3910,22 +3910,45 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
     actor = f"worker:{tag}"[:120]
     for tenant_id in _active_tenants(engine):
         try:
+            # A run row exists from the moment the run starts, so "a row
+            # exists" used to mean "already done" -- and a run the platform
+            # killed half way through (a deploy replaces the container: it
+            # happened twice on 2026-10-24) was abandoned for good, while the
+            # log said "already done". It is done only when it says COMPLETE;
+            # anything else resumes from the Journey it reached, which is
+            # exact because the run pages in a stable order
+            # (created_at_utc, journey_id).
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
-                done = connection.execute(
-                    text("SELECT 1 FROM auditcore.sku_resolution_runs WHERE tenant_id=:t AND started_by_actor_id=:a"),
+                previous = connection.execute(
+                    text(
+                        """
+                        SELECT r.run_id, r.status,
+                               (SELECT count(*) FROM auditcore.sku_resolution_run_items i
+                                 WHERE i.tenant_id = r.tenant_id AND i.run_id = r.run_id) AS done_items
+                        FROM auditcore.sku_resolution_runs r
+                        WHERE r.tenant_id = :t AND r.started_by_actor_id = :a
+                        ORDER BY r.started_at_utc DESC
+                        LIMIT 1
+                        """
+                    ),
                     {"t": tenant_id, "a": actor},
-                ).first()
-            if done:
+                ).mappings().one_or_none()
+            if previous is not None and previous["status"] == "COMPLETE":
                 logger.info("sku_run_already_done", tenant_id=tenant_id, tag=tag)
                 continue
+            resume_from = int(previous["done_items"]) if previous is not None else 0
+            if previous is not None:
+                logger.info("sku_run_resuming", tenant_id=tenant_id, tag=tag,
+                            run_id=str(previous["run_id"]), status=previous["status"],
+                            journeys_already_done=resume_from)
             result: dict[str, Any] = {}
             if tag.lower().startswith("reresolve"):
                 result = reresolve_all_skus(engine, tenant_id, actor_id=actor, commit="-commit" in tag.lower())
                 run_id = result.get("runId")
             else:
-                offset: int | None = 0
-                run_id = None
+                offset: int | None = resume_from
+                run_id = previous["run_id"] if previous is not None else None
                 while offset is not None:
                     result = backfill_sku_resolution_for_tenant(
                         engine, tenant_id=tenant_id, offset=offset, limit=10, run_id=run_id, actor_id=actor,

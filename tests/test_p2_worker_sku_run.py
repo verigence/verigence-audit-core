@@ -34,8 +34,16 @@ def test_the_run_pages_until_done_and_does_not_repeat_for_the_same_tag(monkeypat
 
         def execute(self, *_args, **_kwargs):
             class _R:
-                def first(self_inner):
-                    return (1,) if "t1" in done else None
+                def mappings(self_inner):
+                    return self_inner
+
+                def one_or_none(self_inner):
+                    # A COMPLETE run for this tag, or none at all. The resume
+                    # case has its own real-database test
+                    # (test_sku_run_resumes.py).
+                    if "t1" not in done:
+                        return None
+                    return {"run_id": run_ids[0], "status": "COMPLETE", "done_items": 25}
             return _R()
 
     class _Engine:
@@ -83,8 +91,11 @@ def test_a_refused_commit_tag_says_so_in_plain_words_and_can_be_set_again(monkey
 
         def execute(self, *_args, **_kwargs):
             class _R:
-                def first(self_inner):
-                    return None
+                def mappings(self_inner):
+                    return self_inner
+
+                def one_or_none(self_inner):
+                    return None  # this tag has never run
             return _R()
 
     class _Engine:
