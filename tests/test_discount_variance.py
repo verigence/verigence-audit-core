@@ -83,8 +83,9 @@ def test_the_report_carries_category_pc_outlet_customer_and_model(journey):
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
-            text("UPDATE auditcore.p2_journey_runtime SET discount_variance = CAST(:d AS jsonb) "
-                 "WHERE tenant_id = :t AND journey_id = :j"),
+            text("INSERT INTO auditcore.p2_journey_runtime (tenant_id, journey_id, current_stage, discount_variance) "
+                 "VALUES (:t, :j, 'BOOKING_VERIFY_DOCUMENTS', CAST(:d AS jsonb)) "
+                 "ON CONFLICT (tenant_id, journey_id) DO UPDATE SET discount_variance = EXCLUDED.discount_variance"),
             {"d": json.dumps(rows), "t": journey.tenant_id, "j": journey.journey_id},
         )
         report = discount_variance_report(connection, tenant_id=journey.tenant_id)
