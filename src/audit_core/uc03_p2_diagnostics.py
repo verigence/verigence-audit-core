@@ -172,7 +172,9 @@ REPORTS: dict[str, str] = {
               AND COALESCE(f.source_document_type_key, '') NOT IN ('wholesale_invoice')
             GROUP BY 1, 2
         ), book AS (
-            SELECT pli.price_list_version_id, s.product_sku_id, pm.model_name, pv.variant_name,
+            SELECT pli.price_list_version_id, s.product_sku_id,
+                   pm.model_name || ' ~ ' || pv.variant_name AS name,
+                   pm.model_name,
                    SUM(pli.standard_amount) FILTER (WHERE pli.component_key = 'EX_SHOWROOM') AS ex_showroom
             FROM auditcore.price_list_items pli
             JOIN auditcore.product_skus s      ON s.product_sku_id = pli.product_sku_id
@@ -181,20 +183,31 @@ REPORTS: dict[str, str] = {
             WHERE pli.tenant_id = :t AND s.is_active AND pm.is_active AND pv.is_active
             GROUP BY 1, 2, 3, 4
         ), per_journey AS (
-            SELECT p.journey_id,
+            SELECT p.journey_id, p.priced_on,
                    (p.product_sku_id IS NOT NULL) AS resolved,
                    (p.plv IS NOT NULL) AS had_book,
                    (SELECT COUNT(*) FROM reads r WHERE r.journey_id = p.journey_id) AS figures,
                    -- the tightest band at which some figure names exactly one variant
                    MIN(CASE WHEN m.variants = 1 THEN m.band END) AS pinning_band,
                    MIN(CASE WHEN m.models = 1 THEN m.band END) AS model_band,
-                   MIN(m.gap) FILTER (WHERE m.gap IS NOT NULL) AS closest_gap
+                   MIN(m.gap) FILTER (WHERE m.gap IS NOT NULL) AS closest_gap,
+                   -- The one the price names within a rupee, against the one the
+                   -- Journey actually carries. The question that decides whether
+                   -- a price key is safe to ship is not how many it would add
+                   -- but whether it ever contradicts a SKU the words already
+                   -- chose, and that cannot be assumed (2026-10-24).
+                   MIN(CASE WHEN m.variants = 1 AND m.band <= 1 THEN m.one_name END) AS price_names,
+                   MAX(pm.model_name || ' ~ ' || pv.variant_name) AS pinned_name
             FROM planned p
+            LEFT JOIN auditcore.product_skus ps ON ps.product_sku_id = p.product_sku_id
+            LEFT JOIN auditcore.product_models pm ON pm.model_id = ps.model_id
+            LEFT JOIN auditcore.product_variants pv ON pv.variant_id = ps.variant_id
             LEFT JOIN reads r ON r.journey_id = p.journey_id
             LEFT JOIN LATERAL (
                 SELECT band,
                        COUNT(DISTINCT bk.model_name) AS models,
-                       COUNT(DISTINCT bk.model_name || ' ~ ' || bk.variant_name) AS variants,
+                       COUNT(DISTINCT bk.name) AS variants,
+                       MIN(bk.name) AS one_name,
                        MIN(ABS(bk.ex_showroom - r.amount)) AS gap
                 FROM (VALUES (0.00), (1.00), (2.00), (10.00), (100.00)) AS b(band)
                 JOIN book bk ON bk.price_list_version_id = p.plv
@@ -202,13 +215,31 @@ REPORTS: dict[str, str] = {
                             AND ABS(bk.ex_showroom - r.amount) <= b.band
                 GROUP BY band
             ) m ON true
-            GROUP BY p.journey_id, p.product_sku_id, p.plv
+            GROUP BY p.journey_id, p.priced_on, p.product_sku_id, p.plv
         )
         SELECT COUNT(*) AS journeys,
                COUNT(*) FILTER (WHERE resolved) AS resolved_by_words,
                COUNT(*) FILTER (WHERE NOT resolved) AS not_resolved,
                COUNT(*) FILTER (WHERE figures = 0) AS no_ex_showroom_read,
                COUNT(*) FILTER (WHERE NOT had_book) AS no_price_book_in_force,
+               -- Why there is no book, because the answers are different work:
+               -- a Journey with no date needs its date read, one priced before
+               -- the earliest book needs that month's book loaded. The first
+               -- run put 74 of 171 in this bucket, so the split decides what to
+               -- fix first (2026-10-24).
+               COUNT(*) FILTER (WHERE NOT had_book AND priced_on IS NULL) AS no_pricing_date,
+               COUNT(*) FILTER (WHERE NOT had_book AND priced_on IS NOT NULL
+                                  AND priced_on < (SELECT MIN(plv.effective_from)
+                                                     FROM auditcore.price_list_versions plv
+                                                    WHERE plv.tenant_id = :t
+                                                      AND plv.lifecycle_status IN ('PUBLISHED','RETIRED')))
+                 AS priced_before_the_first_book,
+               COUNT(*) FILTER (WHERE NOT had_book AND priced_on IS NOT NULL
+                                  AND priced_on >= (SELECT MIN(plv.effective_from)
+                                                      FROM auditcore.price_list_versions plv
+                                                     WHERE plv.tenant_id = :t
+                                                       AND plv.lifecycle_status IN ('PUBLISHED','RETIRED')))
+                 AS priced_in_a_gap_between_books,
                -- what a price key would do with the ones the words left open
                COUNT(*) FILTER (WHERE NOT resolved AND pinning_band = 0) AS open_pinned_to_the_paisa,
                COUNT(*) FILTER (WHERE NOT resolved AND pinning_band = 1) AS open_pinned_within_a_rupee,
@@ -220,6 +251,14 @@ REPORTS: dict[str, str] = {
                                   AND model_band IS NULL AND had_book) AS open_price_settles_nothing,
                -- and whether it agrees where the words already succeeded
                COUNT(*) FILTER (WHERE resolved AND pinning_band <= 1) AS resolved_price_pins_one_too,
+               COUNT(*) FILTER (WHERE resolved AND pinning_band <= 1
+                                  AND price_names = pinned_name) AS resolved_price_agrees,
+               -- The number that decides whether a price key may pin: every one
+               -- of these is a Journey where the price would have chosen a
+               -- different variant from the one the words chose, and each has to
+               -- be read before the matcher is allowed to act on a price.
+               COUNT(*) FILTER (WHERE resolved AND pinning_band <= 1
+                                  AND price_names <> pinned_name) AS resolved_price_disagrees,
                COUNT(*) FILTER (WHERE resolved AND pinning_band IS NULL AND had_book)
                  AS resolved_price_pins_nothing,
                ROUND(percentile_disc(0.5) WITHIN GROUP (ORDER BY closest_gap), 2) AS median_gap,
