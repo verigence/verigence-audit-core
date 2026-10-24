@@ -89,6 +89,176 @@ REPORTS: dict[str, str] = {
         WHERE j.tenant_id = :t AND jp.product_sku_id IS NULL
         ORDER BY j.created_at_utc
     """,
+    # Is an ex-showroom figure a key at all? Per published price book: how many
+    # of its prices name exactly one variant, one model, or span models. Asked
+    # 2026-10-24 ("cant we even able to pick a price") before changing the
+    # matcher, because a price that names two models cannot pin a SKU.
+    "price_key_coverage": """
+        WITH ex AS (
+            SELECT plv.price_list_version_id, plv.version_no, plv.effective_from,
+                   s.product_sku_id, pm.model_name, pv.variant_name,
+                   SUM(pli.standard_amount) FILTER (WHERE pli.component_key = 'EX_SHOWROOM') AS ex_showroom
+            FROM auditcore.price_list_versions plv
+            JOIN auditcore.price_lists pl
+              ON pl.tenant_id = plv.tenant_id AND pl.price_list_id = plv.price_list_id
+            JOIN auditcore.price_list_items pli
+              ON pli.tenant_id = plv.tenant_id AND pli.price_list_version_id = plv.price_list_version_id
+            JOIN auditcore.product_skus s      ON s.product_sku_id = pli.product_sku_id
+            JOIN auditcore.product_models pm   ON pm.model_id = s.model_id
+            JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
+            WHERE plv.tenant_id = :t
+              AND plv.lifecycle_status IN ('PUBLISHED', 'RETIRED')
+              AND s.is_active AND pm.is_active AND pv.is_active
+            GROUP BY plv.price_list_version_id, plv.version_no, plv.effective_from,
+                     s.product_sku_id, pm.model_name, pv.variant_name
+        ), per_price AS (
+            SELECT version_no, effective_from, ex_showroom,
+                   COUNT(*) AS skus,
+                   COUNT(DISTINCT model_name) AS models,
+                   COUNT(DISTINCT model_name || ' ~ ' || variant_name) AS variants
+            FROM ex WHERE ex_showroom IS NOT NULL
+            GROUP BY 1, 2, 3
+        )
+        SELECT version_no, effective_from,
+               COUNT(*) AS distinct_prices,
+               SUM(skus) AS priced_skus,
+               COUNT(*) FILTER (WHERE variants = 1) AS prices_naming_one_variant,
+               COUNT(*) FILTER (WHERE models = 1 AND variants > 1) AS prices_naming_one_model,
+               COUNT(*) FILTER (WHERE models > 1) AS prices_spanning_models,
+               SUM(skus) FILTER (WHERE variants = 1) AS skus_a_price_pins_outright,
+               SUM(skus) FILTER (WHERE models = 1 AND variants > 1) AS skus_a_price_narrows_to_model,
+               SUM(skus) FILTER (WHERE models > 1) AS skus_a_price_leaves_open
+        FROM per_price
+        GROUP BY 1, 2
+        ORDER BY effective_from DESC, version_no DESC
+    """,
+    # How the ex-showroom figures are actually stored, per document type, so a
+    # figure the simulation could not parse is visible rather than silently
+    # making the price key look worse than it is.
+    "price_reads_shape": """
+        SELECT COALESCE(dt.classified_document_type_key, f.source_document_type_key) AS document,
+               COUNT(*) AS reads,
+               COUNT(DISTINCT f.journey_id) AS journeys,
+               COUNT(*) FILTER (
+                   WHERE (f.effective_value #>> '{}') ~ '[0-9][0-9,]*(\\.[0-9]+)?') AS usable_as_a_figure,
+               ROUND(AVG(f.confidence_score), 3) AS mean_confidence,
+               string_agg(DISTINCT left(f.effective_value #>> '{}', 24), ' | ') FILTER (
+                   WHERE (f.effective_value #>> '{}') !~ '[0-9][0-9,]*(\\.[0-9]+)?') AS shapes_not_usable
+        FROM auditcore.journey_document_extracted_fields f
+        LEFT JOIN auditcore.document_capture_v2_documents dt
+          ON dt.tenant_id = f.tenant_id AND dt.journey_id = f.journey_id
+         AND dt.di_document_id = f.di_document_id
+        WHERE f.tenant_id = :t AND f.field_key = 'ex_showroom_price' AND f.effective_value IS NOT NULL
+        GROUP BY 1
+        ORDER BY reads DESC
+    """,
+    # Retrospective: for every Journey, every ex-showroom figure its documents
+    # carry, and what an exact match on that figure against the price book in
+    # force would have found -- beside what the words actually resolved. One
+    # row per figure read. This measures the change before it is made.
+    "price_key_simulation": """
+        WITH j AS (
+            SELECT j.journey_id, j.journey_reference, j.created_by_display_name AS pc_name,
+                   o.outlet_name,
+                   COALESCE(NULLIF(cu.display_name, ''), j.journey_reference) AS customer,
+                   COALESCE(b.pricing_effective_on, b.booking_date) AS priced_on,
+                   jp.product_sku_id, jp.model_name_snapshot AS pinned_model,
+                   jp.variant_name_snapshot AS pinned_variant, jp.selection_method
+            FROM auditcore.journeys j
+            LEFT JOIN auditcore.customers cu
+              ON cu.tenant_id = j.tenant_id AND cu.customer_id = j.customer_id
+            LEFT JOIN auditcore.dealer_outlets o
+              ON o.tenant_id = j.tenant_id AND o.dealer_id = j.dealer_id AND o.outlet_id = j.outlet_id
+            LEFT JOIN auditcore.journey_products jp
+              ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+            LEFT JOIN auditcore.bookings b
+              ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+            WHERE j.tenant_id = :t
+        ), planned AS (
+            SELECT j.*, (
+                SELECT plv.price_list_version_id
+                FROM auditcore.price_list_versions plv
+                JOIN auditcore.price_lists pl
+                  ON pl.tenant_id = plv.tenant_id AND pl.price_list_id = plv.price_list_id
+                WHERE plv.tenant_id = :t
+                  AND plv.lifecycle_status IN ('PUBLISHED', 'RETIRED')
+                  AND plv.effective_from <= j.priced_on
+                  AND (plv.effective_to IS NULL OR plv.effective_to >= j.priced_on)
+                  AND (pl.price_list_code = 'OEM_NATIVE_PRICE_LIST'
+                       OR NOT EXISTS (SELECT 1 FROM auditcore.price_lists own
+                                       WHERE own.tenant_id = plv.tenant_id
+                                         AND own.price_list_code = 'OEM_NATIVE_PRICE_LIST'))
+                ORDER BY plv.effective_from DESC, plv.version_no DESC, plv.price_list_version_id DESC
+                LIMIT 1) AS plv
+            FROM j
+        ), raw AS (
+            -- A figure a form prints as "Rs. 8,48,999.65" is the same key as
+            -- the book's 848999.65. Taking the first number-like token, not
+            -- stripping non-digits: stripping leaves the dot of "Rs." in front
+            -- of the number and the figure is lost (caught in test, 2026-10-24).
+            SELECT f.journey_id,
+                   COALESCE(dt.classified_document_type_key, f.source_document_type_key) AS document,
+                   replace(COALESCE((regexp_match(f.effective_value #>> '{}',
+                                     '[0-9][0-9,]*(?:\\.[0-9]+)?'))[1], ''), ',', '') AS cleaned,
+                   f.confidence_score
+            FROM auditcore.journey_document_extracted_fields f
+            LEFT JOIN auditcore.document_capture_v2_documents dt
+              ON dt.tenant_id = f.tenant_id AND dt.journey_id = f.journey_id
+             AND dt.di_document_id = f.di_document_id
+            WHERE f.tenant_id = :t
+              AND f.field_key = 'ex_showroom_price'
+              AND f.effective_value IS NOT NULL
+        ), reads AS (
+            SELECT journey_id, document, ROUND(cleaned::numeric, 2) AS amount,
+                   MAX(confidence_score) AS confidence
+            FROM raw
+            WHERE cleaned ~ '^[0-9]+(\\.[0-9]+)?$' AND cleaned::numeric > 10000
+            GROUP BY 1, 2, 3
+        ), book AS (
+            SELECT pli.price_list_version_id, s.product_sku_id, pm.model_name, pv.variant_name,
+                   SUM(pli.standard_amount) FILTER (WHERE pli.component_key = 'EX_SHOWROOM') AS ex_showroom
+            FROM auditcore.price_list_items pli
+            JOIN auditcore.product_skus s      ON s.product_sku_id = pli.product_sku_id
+            JOIN auditcore.product_models pm   ON pm.model_id = s.model_id
+            JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
+            WHERE pli.tenant_id = :t AND s.is_active AND pm.is_active AND pv.is_active
+            GROUP BY 1, 2, 3, 4
+        )
+        SELECT p.journey_reference, p.pc_name, p.outlet_name, p.customer, p.priced_on,
+               (p.product_sku_id IS NOT NULL) AS resolved_today,
+               p.pinned_model, p.pinned_variant, p.selection_method,
+               (SELECT bk.ex_showroom FROM book bk
+                 WHERE bk.price_list_version_id = p.plv AND bk.product_sku_id = p.product_sku_id)
+                 AS pinned_ex_showroom,
+               r.document, r.amount AS read_amount, r.confidence,
+               (p.plv IS NOT NULL) AS had_a_price_book,
+               m.exact_skus, m.exact_models, m.exact_variants, m.exact_names,
+               n.near_skus, n.near_models, n.near_variants, n.near_names, n.near_gap
+        FROM planned p
+        JOIN reads r ON r.journey_id = p.journey_id
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS exact_skus,
+                   COUNT(DISTINCT bk.model_name) AS exact_models,
+                   COUNT(DISTINCT bk.model_name || ' ~ ' || bk.variant_name) AS exact_variants,
+                   string_agg(DISTINCT bk.model_name || ' ~ ' || bk.variant_name, ' | ') AS exact_names
+            FROM book bk
+            WHERE bk.price_list_version_id = p.plv AND bk.ex_showroom = r.amount
+        ) m ON true
+        LEFT JOIN LATERAL (
+            -- Nearest price in the book, for the figures that do not match to
+            -- the paisa: a form that rounded, or a figure read a digit out.
+            SELECT COUNT(*) AS near_skus,
+                   COUNT(DISTINCT bk.model_name) AS near_models,
+                   COUNT(DISTINCT bk.model_name || ' ~ ' || bk.variant_name) AS near_variants,
+                   string_agg(DISTINCT bk.model_name || ' ~ ' || bk.variant_name, ' | ') AS near_names,
+                   MIN(ABS(bk.ex_showroom - r.amount)) AS near_gap
+            FROM book bk
+            WHERE bk.price_list_version_id = p.plv
+              AND bk.ex_showroom IS NOT NULL
+              AND ABS(bk.ex_showroom - r.amount) <= GREATEST(r.amount * 0.005, 100)
+        ) n ON true
+        ORDER BY (p.product_sku_id IS NOT NULL), p.journey_reference, r.document
+    """,
     # What the documents say the vehicle is, per Journey and document.
     "vehicle_reads": """
         SELECT f.journey_id, f.stage_code, f.source_document_type_key AS document_type, f.field_key,

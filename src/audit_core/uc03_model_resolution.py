@@ -949,6 +949,38 @@ _PIN_SQL = """
 """
 
 
+def _note_sku_fact_change(connection: Connection, *, tenant_id: str, journey_id: UUID, reason: str) -> None:
+    """A pinned SKU is a fact change, and until 2026-10-24 it was the one fact
+    change that told nothing downstream.
+
+    The SKU chooses the price-list row, so pinning it rewrites every standard
+    amount on the deal and every discount the standard entitles. Writing
+    ``journey_products`` alone left the Journey's ``fact_version`` where it was,
+    so the Journey list's cached variance and the controls' own
+    ``evaluated_fact_version`` both still believed themselves current:
+    NIRUPAMA KHUNTIA read +2,71,181 on the list against -9,407 on the Deal tab,
+    from the same field, because a resolution run had re-pinned her SKU
+    overnight. Requesting the recompute here puts a pin on the same footing as
+    every other fact change, and it fires only when a pin was actually written.
+
+    Guarded on the Phase 2 runtime row already existing, because
+    ``p2_request_stage_recompute`` would otherwise create one and a Phase 1
+    journey would start reading as Phase 2 in the list.
+    """
+    phase2 = connection.execute(
+        text(
+            "SELECT 1 FROM auditcore.p2_journey_runtime "
+            "WHERE tenant_id = :t AND journey_id = :j"
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).first()
+    if phase2 is None:
+        return
+    from audit_core.uc03_p2_runtime import note_facts_changed
+
+    note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id, reason=reason)
+
+
 def _pin_sku(
     connection: Connection, *, tenant_id: str, journey_id: UUID, product_sku_id: UUID,
     method: str = _SELECTION_METHOD, basis: str = BASIS_AUTO_MATCHED, evidence: dict[str, Any] | None = None,
@@ -967,6 +999,8 @@ def _pin_sku(
     ).first() is not None
     if written:
         _close_sku_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
+        _note_sku_fact_change(connection, tenant_id=tenant_id, journey_id=journey_id,
+                              reason="sku_pinned_automatically")
     return written
 
 
@@ -985,6 +1019,8 @@ def _pin_human(
         },
     )
     _close_sku_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
+    _note_sku_fact_change(connection, tenant_id=tenant_id, journey_id=journey_id,
+                          reason="sku_set_by_reviewer")
     from audit_core.uc03_sku_tasks import resolve_automatic_match_tasks
 
     resolve_automatic_match_tasks(connection, tenant_id=tenant_id, journey_id=journey_id,

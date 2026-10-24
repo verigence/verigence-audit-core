@@ -508,7 +508,17 @@ def list_p2_journeys(
             )
             SELECT p.journey_id, p.journey_reference, p.customer_name, p.mobile_last4,
                    p.dealer_name, p.outlet_name, p.outlet_code, p.vehicle, p.created_at_utc, p.updated_at_utc,
-                   p.pc_name, COALESCE(pr.price_variance, pv.price_variance) AS price_variance,
+                   p.pc_name,
+                   -- The Deal tab's own number, but only while the cached copy
+                   -- was computed at the Journey's current fact version
+                   -- (migration 0159). Stale -- a SKU re-pinned, a pricing date
+                   -- moved -- and the row falls back to the pv recomputation
+                   -- below, which is already computed for every row on this
+                   -- page and so costs nothing extra; the worker's sweep
+                   -- restores the Deal's own figure within a cycle.
+                   CASE WHEN pr.price_variance IS NOT NULL
+                              AND pr.price_variance_fact_version = pr.fact_version
+                        THEN pr.price_variance ELSE pv.price_variance END AS price_variance,
                    gt.kyc_status, gt.docs_required, gt.docs_received,
                    gp.gate_pass_date, op.opened_at, op.last_upload_at,
                    up.processing_now, up.upload_started_at, up.upload_finished_at,
@@ -643,7 +653,7 @@ def list_p2_journeys(
             ) fd ON true
             LEFT JOIN LATERAL (
               -- Fallback while the Journey's stored Deal variance (price_variance,
-              -- the Deal tab's own number) is not computed yet: for every
+              -- the Deal tab's own number) is missing or stale: for every
               -- priced line the figure a document still on file carries (a
               -- billing document, else the booking form, else the line's own
               -- actual before any invoice) against the price list, less the
