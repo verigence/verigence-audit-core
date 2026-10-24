@@ -24,6 +24,45 @@ _MAX_ROWS = int(os.environ.get("AUDIT_CORE_DIAG_MAX_ROWS", "600"))
 _ANSWER_ROWS = int(os.environ.get("AUDIT_CORE_DIAG_ANSWER_ROWS", "5"))
 
 REPORTS: dict[str, str] = {
+    # Discounts whose INVOICE figure is not the entitlement, tallied per
+    # category and status (2026-10-24: the Discount variance tab). Stored by
+    # the Deal build on p2_journey_runtime.discount_variance.
+    "discount_variance_summary": """
+        SELECT e.item->>'status' AS status, e.item->>'label' AS discount,
+               count(*) AS discounts, count(DISTINCT r.journey_id) AS journeys,
+               sum((e.item->>'variance')::numeric) AS total_variance
+        FROM auditcore.p2_journey_runtime r
+        CROSS JOIN LATERAL jsonb_array_elements(COALESCE(r.discount_variance, '[]'::jsonb)) AS e(item)
+        WHERE r.tenant_id = :t
+        GROUP BY 1, 2 ORDER BY 1, 3 DESC
+    """,
+    # The same, one row per discount, with the PC, outlet, customer and car model.
+    "discount_variance_rows": """
+        SELECT j.journey_reference, COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
+               j.created_by_display_name AS pc_name, o.outlet_name,
+               jp.model_name_snapshot AS model, jp.variant_name_snapshot AS variant,
+               e.item->>'label' AS discount, e.item->>'status' AS status,
+               e.item->>'entitled' AS entitled, e.item->>'invoice' AS invoice,
+               e.item->>'variance' AS variance
+        FROM auditcore.p2_journey_runtime r
+        JOIN auditcore.journeys j ON j.tenant_id = r.tenant_id AND j.journey_id = r.journey_id
+        CROSS JOIN LATERAL jsonb_array_elements(COALESCE(r.discount_variance, '[]'::jsonb)) AS e(item)
+        LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+        LEFT JOIN auditcore.dealer_outlets o
+          ON o.tenant_id = j.tenant_id AND o.dealer_id = j.dealer_id AND o.outlet_id = j.outlet_id
+        LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+        WHERE r.tenant_id = :t
+        ORDER BY (e.item->>'status' = 'ENTITLEMENT_UNKNOWN'), abs(COALESCE((e.item->>'variance')::numeric, 0)) DESC
+    """,
+    # How far the recompute has got.
+    "discount_variance_progress": """
+        SELECT count(*) AS journeys,
+               count(*) FILTER (WHERE discount_variance IS NOT NULL) AS calculated,
+               count(*) FILTER (WHERE discount_variance IS NULL OR price_variance_fact_version IS NULL
+                                  OR price_variance_fact_version <> fact_version) AS pending,
+               count(*) FILTER (WHERE jsonb_array_length(COALESCE(discount_variance, '[]'::jsonb)) > 0) AS with_variance
+        FROM auditcore.p2_journey_runtime WHERE tenant_id = :t
+    """,
     # Every Journey's vehicle: what was read, the SKU pinned, how and when.
     "sku_pins": """
         SELECT j.journey_id, j.journey_reference, j.created_by_display_name AS pc_name,
