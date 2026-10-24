@@ -110,7 +110,8 @@ def _set(c, **values) -> None:
 
 
 def _task(c, kind=PRICE_MASTER_NOT_IN_FORCE_TASK):
-    return c.execute(text("SELECT task_status, title, assigned_role_code FROM auditcore.p2_tasks WHERE tenant_id=:t "
+    return c.execute(text("SELECT task_status, title, assigned_role_code, severity, priority "
+                          "FROM auditcore.p2_tasks WHERE tenant_id=:t "
                           "AND journey_id=:j AND task_type=:k"),
                      {"t": c.tenant_id, "j": c.journey_id, "k": kind}).mappings().one_or_none()
 
@@ -152,11 +153,16 @@ def test_nothing_in_force_is_said_not_priced_on_the_newest_book(journey) -> None
 
 
 def test_a_task_says_no_price_master_is_in_force_and_closes_once_one_is(journey) -> None:
+    """Critical, and it says which vehicle has no price (product owner,
+    2026-10-24). The old wording named the book rather than the car, so a PC
+    reading the task could not tell what was unpriced."""
     c = journey
     _set(c, booking_date=date(2026, 8, 15))
     sync_price_master_in_force_task(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
     task = _task(c)
-    assert task["title"] == "No price master in force on 2026-08-15" and task["task_status"] != "VERIFIED_COMPLETE"
+    assert task["title"] == "No price available for this vehicle on 2026-08-15"
+    assert (task["severity"], task["priority"]) == ("CRITICAL", "URGENT")
+    assert task["task_status"] != "VERIFIED_COMPLETE"
     _set(c, booking_date=date(2026, 9, 15))  # the PC corrects the date (or the August book is loaded)
     sync_price_master_in_force_task(c, tenant_id=c.tenant_id, journey_id=c.journey_id)
     assert _task(c)["task_status"] == "VERIFIED_COMPLETE"

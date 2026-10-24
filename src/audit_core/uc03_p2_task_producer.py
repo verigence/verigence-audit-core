@@ -1135,25 +1135,35 @@ def sync_booking_date_task(
     date field and closes itself once a date is in. A date that was read
     but cannot be right (before the floor, unreadable) is the field review
     task's business, not this one's."""
-    from audit_core.uc03_p2_dates import booking_form_date
+    from audit_core.uc03_p2_dates import booking_form_date, unusable_pricing_date_reason
 
     registry = registry or get_registry()
     key = f"booking-date:{journey_id}"
     form = booking_form_date(connection, tenant_id=tenant_id, journey_id=journey_id)
     counts: dict[str, int] = {}
-    if form is not None and form["raw"] in (None, ""):
+    # A date that is present but cannot price a deal gets the same task as a
+    # date that is missing (2026-10-24). Before this it only fired on an empty
+    # value, so a booking date misread as 2024 left the resolver with nothing
+    # to price on and nobody asked to fix it: 30 Journeys on Mahindra Orissa
+    # stuck with no price and no task. Anything not available raises a task.
+    unusable = (unusable_pricing_date_reason(form["raw"]) if form is not None else None)
+    if form is not None and unusable is not None:
         name = "Booking Form" if form["documentType"] == "booking_form" else "Booking Docket"
+        missing = form["raw"] in (None, "")
         _, outcome = raise_or_refresh(
             connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
             task_type="PC_BOOKING_DATE_MISSING", source_type="DOCUMENT_FIELD", source_code="BOOKING_DATE_MISSING",
-            title=f"Enter the booking date on the {name}",
-            description=(f"The {name} was read, but no booking date was found on it. The deal is priced on the "
-                         "booking date, so nothing is priced until it is in. Open the document, enter the booking "
-                         "date printed on it and save. This task closes itself once the date is in."),
+            title=(f"Enter the booking date on the {name}" if missing
+                   else f"Correct the booking date on the {name}"),
+            description=(f"The {name} was read, but {unusable}. The deal is priced on the booking date, so "
+                         "nothing is priced until it is right -- no standard price, no SKU check, no "
+                         f"commercial finding. Open the document, {'enter' if missing else 'correct'} the "
+                         "booking date printed on it and save. This task closes itself once the date is in."),
             reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT_FIELD", "sourceCode": "BOOKING_DATE_MISSING",
                        "documentId": form["documentId"], "documentIds": [form["documentId"]],
-                       "templateKey": form["documentType"], "fieldKey": "booking_date", "fieldKeys": ["booking_date"]},
-            severity="MEDIUM", registry=registry, evaluation_started_at=evaluation_started_at,
+                       "templateKey": form["documentType"], "fieldKey": "booking_date",
+                       "fieldKeys": ["booking_date"], "readAs": form["raw"], "reason": unusable},
+            severity="CRITICAL", registry=registry, evaluation_started_at=evaluation_started_at,
         )
         counts[outcome] = counts.get(outcome, 0) + 1
     elif resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,

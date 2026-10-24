@@ -66,13 +66,15 @@ def _priceable(day: date | None, *, source: str, tenant_id: str, journey_id: UUI
     """
     if day is None:
         return None
-    from audit_core.uc03_p2_dates import before_floor, programme_today
+    from audit_core.uc03_p2_dates import unusable_pricing_date_reason
 
-    why = ("before the programme's date floor" if before_floor(day)
-           else "after today" if day > programme_today() else None)
+    why = unusable_pricing_date_reason(day)
     if why is None:
         return day
     # Logged, not swallowed: a date quietly dropped is how this one survived.
+    # The same predicate raises the task that asks the PC to correct it
+    # (uc03_p2_task_producer.sync_booking_date_task), so a date the engine
+    # refuses can never be a silent dead end.
     logger.info("pricing_date_rejected", tenant_id=tenant_id, journey_id=str(journey_id),
                 source=source, value=day.isoformat(), reason=why)
     return None
@@ -149,6 +151,27 @@ def _not_in_force_key(journey_id: UUID) -> str:
     return f"price-master-not-in-force:{journey_id}"
 
 
+def _booked_vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str | None:
+    """The vehicle as this Journey names it, for a task that has to say which
+    model has no price (product owner, 2026-10-24: "raise critical task that
+    the given model doesnt has price available"). None when nothing names it --
+    then the task says so rather than inventing a name."""
+    row = connection.execute(
+        text(
+            """
+            SELECT NULLIF(btrim(COALESCE(model_name_snapshot, '')), '')   AS model,
+                   NULLIF(btrim(COALESCE(variant_name_snapshot, '')), '') AS variant
+            FROM auditcore.journey_products
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().one_or_none()
+    if row is None:
+        return None
+    return " ".join(part for part in (row["model"], row["variant"]) if part) or None
+
+
 def sync_price_master_in_force_task(
     connection: Connection, *, tenant_id: str, journey_id: UUID
 ) -> dict[str, Any]:
@@ -172,6 +195,11 @@ def sync_price_master_in_force_task(
             },
         )
         return found
+    # CRITICAL, and it names the vehicle: a deal with no price cannot be
+    # audited at all, and a Journey list full of MEDIUMs buried this
+    # (product owner, 2026-10-24).
+    vehicle = _booked_vehicle(connection, tenant_id=tenant_id, journey_id=journey_id)
+    named = f"No price available for {vehicle}" if vehicle else "No price available for this vehicle"
     raise_or_refresh(
         connection,
         tenant_id=tenant_id,
@@ -180,14 +208,15 @@ def sync_price_master_in_force_task(
         task_type=PRICE_MASTER_NOT_IN_FORCE_TASK,
         source_type="RESOLVER",
         source_code=PRICE_MASTER_NOT_IN_FORCE_TASK,
-        title=no_price_master_detail(on),
+        title=f"{named} on {on.isoformat()}",
         description=(
-            f"{no_price_master_detail(on)}: this deal is priced on {on.isoformat()} and no price master "
-            "version covers that date, so it has no standard price and no SKU can be checked against one. "
-            "Load the OEM price list for that date, or correct the pricing date."
+            f"{named} on {on.isoformat()}. {no_price_master_detail(on)}, so this deal has no standard "
+            "price and no SKU can be checked against one. Load the OEM price list that covers that date, "
+            "or correct the pricing date."
         ),
-        reference={"sourceCode": PRICE_MASTER_NOT_IN_FORCE_TASK, "onDate": on.isoformat(), "reason": found["reason"]},
-        severity="MEDIUM",
+        reference={"sourceCode": PRICE_MASTER_NOT_IN_FORCE_TASK, "onDate": on.isoformat(),
+                   "reason": found["reason"], "vehicle": vehicle},
+        severity="CRITICAL",
         registry=get_registry(),
     )
     return found
@@ -249,6 +278,7 @@ def sync_sku_in_price_master_task(
         {"t": tenant_id, "j": journey_id},
     )
     label = f"{plan.get('price_list_name') or plan.get('price_list_code')} v{plan.get('version_no')}"
+    vehicle = _booked_vehicle(connection, tenant_id=tenant_id, journey_id=journey_id)
     raise_or_refresh(
         connection,
         tenant_id=tenant_id,
@@ -257,19 +287,22 @@ def sync_sku_in_price_master_task(
         task_type=SKU_NOT_IN_PRICE_MASTER_TASK,
         source_type="RESOLVER",
         source_code=SKU_NOT_IN_PRICE_MASTER_TASK,
-        title=f"SKU {sku['sku_code']} is not in the price master for {on.isoformat()} — set the SKU",
+        title=(f"No price available for {vehicle} on {on.isoformat()} — set the SKU" if vehicle
+               else f"SKU {sku['sku_code']} is not in the price master for {on.isoformat()} — set the SKU"),
         description=(
-            f"The vehicle on this Journey ({sku['sku_code']}) is not listed in the price master in force on "
-            f"{on.isoformat()} ({label}, from {plan.get('effective_from')}). The OEM withdrew or renamed it; "
-            "the deal has no standard price until the SKU is set to the vehicle sold."
+            f"The vehicle on this Journey ({vehicle + ', ' if vehicle else ''}{sku['sku_code']}) is not listed "
+            f"in the price master in force on {on.isoformat()} ({label}, from {plan.get('effective_from')}). "
+            "The OEM withdrew or renamed it; the deal has no standard price until the SKU is set to the "
+            "vehicle sold."
         ),
         reference={
             "sourceCode": SKU_NOT_IN_PRICE_MASTER_TASK,
             "skuCode": sku["sku_code"],
             "onDate": on.isoformat(),
             "priceListVersionId": str(plan["price_list_version_id"]),
+            "vehicle": vehicle,
         },
-        severity="MEDIUM",
+        severity="CRITICAL",
         registry=get_registry(),
     )
     return True
