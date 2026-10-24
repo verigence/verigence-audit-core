@@ -108,6 +108,27 @@ def _detail(selection: dict[str, Any], before_source: str | None) -> dict[str, A
     }
 
 
+_RAW_KEYS = ("invoice_purpose", "invoice_nature", "invoice_number", "gross_amount_before_discount",
+             "invoice_discount_amount", "taxable_amount", "cgst_rate", "cgst_amount", "sgst_rate", "sgst_amount",
+             "igst_rate", "igst_amount", "cess_amount", "tcs_amount", "round_off_amount", "grand_total_amount")
+
+
+def _reading_summary(reading: dict[str, Any]) -> dict[str, Any]:
+    """An invoice that gave no ex-showroom, as it was read: why, in the invoice's
+    own figures."""
+    raw = reading.get("_raw") or {}
+    items = raw.get("line_items") or []
+    return {
+        "type": reading.get("documentType"), "family": reading.get("family"),
+        "issues": [i["code"] for i in reading.get("issues", [])],
+        "lines": sorted((reading.get("lines") or {}).keys()),
+        "raw": {k: raw[k] for k in _RAW_KEYS if raw.get(k) not in (None, "")},
+        "lineItems": [{k: i.get(k) for k in ("line_category", "gross_amount", "taxable_amount", "net_amount",
+                                              "tax_rate", "tax_amount") if i.get(k) not in (None, "")}
+                      for i in items if isinstance(i, dict)][:12],
+    }
+
+
 def _on_phase_two(connection: Connection, tenant_id: str, journey_id: UUID) -> bool:
     """Only a Journey that already has its Phase 2 runtime row is told its
     facts changed; asking would otherwise create one."""
@@ -131,6 +152,8 @@ def rescan_journey(
             "changed": after is not None and (before is None or abs(before - after) > Decimal("0.5")),
             "standard": _ex_showroom_standard(connection, tenant_id, journey_id),
             "detail": _detail(selection, _ex_showroom_source(connection, tenant_id, journey_id))}
+    if after is None:
+        item["detail"]["readings"] = [_reading_summary(r) for r in readings]
     if not commit:
         return item
     for reading in readings:

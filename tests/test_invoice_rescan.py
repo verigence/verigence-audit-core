@@ -72,3 +72,18 @@ def test_the_item_carries_the_price_lists_figure_to_compare_with(monkeypatch):
     _wire(monkeypatch, before=None)
     item = rescan.rescan_journey(object(), tenant_id=_TENANT, journey_id=uuid4(), tag="t", commit=False)
     assert item["standard"] == item["after"] == Decimal("1344000.00")
+
+
+def test_an_invoice_that_gave_no_price_is_logged_as_it_was_read(monkeypatch):
+    # an invoice with no price anywhere: the log shows its own figures
+    reading = read_invoice("tax_invoice_tally", {"invoice_purpose": "VEHICLE_SALE", "invoice_number": "X1",
+                                                  "line_items": [{"line_category": "VEHICLE", "description_raw": "x"}]},
+                           document_id=uuid4(), evidence_id=uuid4())
+    monkeypatch.setattr(rescan, "load_invoice_readings", lambda *a, **k: [reading])
+    monkeypatch.setattr(rescan, "plausible_from", lambda *a, **k: None)
+    monkeypatch.setattr(rescan, "_ex_showroom_now", lambda *a, **k: None)
+    monkeypatch.setattr(rescan, "_ex_showroom_standard", lambda *a, **k: None)
+    monkeypatch.setattr(rescan, "_ex_showroom_source", lambda *a, **k: None)
+    item = rescan.rescan_journey(object(), tenant_id=_TENANT, journey_id=uuid4(), tag="t", commit=False)
+    summary = item["detail"]["readings"][0]
+    assert summary["raw"]["invoice_number"] == "X1" and "PRICE_NOT_READ" in summary["issues"]
