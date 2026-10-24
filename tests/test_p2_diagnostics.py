@@ -278,3 +278,78 @@ def test_the_verdict_separates_a_booking_with_no_date_from_one_outside_the_books
     assert row["no_price_book_in_force"] == 1
     assert row["no_pricing_date"] == 1
     assert row["priced_before_the_first_book"] == 0
+
+
+def test_the_verdict_names_a_journey_where_the_price_contradicts_the_words(journey):
+    """The number that decides whether a price key may pin at all. A Journey
+    whose words chose one variant while the price names another is not a win,
+    it is a case to read -- and the verdict must count it apart from agreement
+    rather than letting it hide inside "the price pins one too"."""
+    from datetime import date
+    from uuid import uuid4
+
+    from p2_support import add_extracted_field
+
+    version = _price_book(journey, {
+        ("THAR ROXX", "MX1 D MT RWD"): "1423000.58",
+        ("THAR ROXX", "MX3 D MT RWD"): "1623000.58",
+    }, effective_from=date(2026, 10, 1))
+    _booked_on(journey, date(2026, 10, 15))
+    # the words landed on MX3; the form's figure is MX1's price
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        mx3 = connection.execute(
+            text("SELECT pli.product_sku_id FROM auditcore.price_list_items pli "
+                 "JOIN auditcore.product_skus s ON s.product_sku_id = pli.product_sku_id "
+                 "JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id "
+                 "WHERE pli.price_list_version_id = :v AND pv.variant_name = 'MX3 D MT RWD'"),
+            {"v": version},
+        ).scalar_one()
+        connection.execute(
+            text("INSERT INTO auditcore.journey_products (tenant_id, journey_id, product_sku_id, "
+                 "model_name_snapshot, variant_name_snapshot, selection_source) "
+                 "VALUES (:t, :j, :s, 'THAR ROXX', 'MX3 D MT RWD', 'EVIDENCE')"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "s": mx3},
+        )
+    add_extracted_field(journey, di_document_id=uuid4(), field_key="ex_showroom_price",
+                        value="1423001", document_type="booking_form")
+
+    row = _verdict(journey)
+    assert row["resolved_by_words"] == 1
+    assert row["resolved_price_pins_one_too"] == 1
+    assert row["resolved_price_agrees"] == 0
+    assert row["resolved_price_disagrees"] == 1, "a contradiction must never read as a win"
+
+
+def test_the_verdict_counts_agreement_when_the_price_names_the_pinned_variant(journey):
+    from datetime import date
+    from uuid import uuid4
+
+    from p2_support import add_extracted_field
+
+    version = _price_book(journey, {
+        ("THAR ROXX", "MX1 D MT RWD"): "1423000.58",
+        ("THAR ROXX", "MX3 D MT RWD"): "1623000.58",
+    }, effective_from=date(2026, 10, 1))
+    _booked_on(journey, date(2026, 10, 15))
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        mx1 = connection.execute(
+            text("SELECT pli.product_sku_id FROM auditcore.price_list_items pli "
+                 "JOIN auditcore.product_skus s ON s.product_sku_id = pli.product_sku_id "
+                 "JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id "
+                 "WHERE pli.price_list_version_id = :v AND pv.variant_name = 'MX1 D MT RWD'"),
+            {"v": version},
+        ).scalar_one()
+        connection.execute(
+            text("INSERT INTO auditcore.journey_products (tenant_id, journey_id, product_sku_id, "
+                 "model_name_snapshot, variant_name_snapshot, selection_source) "
+                 "VALUES (:t, :j, :s, 'THAR ROXX', 'MX1 D MT RWD', 'EVIDENCE')"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "s": mx1},
+        )
+    add_extracted_field(journey, di_document_id=uuid4(), field_key="ex_showroom_price",
+                        value="1423001", document_type="booking_form")
+
+    row = _verdict(journey)
+    assert row["resolved_price_agrees"] == 1
+    assert row["resolved_price_disagrees"] == 0

@@ -172,7 +172,9 @@ REPORTS: dict[str, str] = {
               AND COALESCE(f.source_document_type_key, '') NOT IN ('wholesale_invoice')
             GROUP BY 1, 2
         ), book AS (
-            SELECT pli.price_list_version_id, s.product_sku_id, pm.model_name, pv.variant_name,
+            SELECT pli.price_list_version_id, s.product_sku_id,
+                   pm.model_name || ' ~ ' || pv.variant_name AS name,
+                   pm.model_name,
                    SUM(pli.standard_amount) FILTER (WHERE pli.component_key = 'EX_SHOWROOM') AS ex_showroom
             FROM auditcore.price_list_items pli
             JOIN auditcore.product_skus s      ON s.product_sku_id = pli.product_sku_id
@@ -188,13 +190,24 @@ REPORTS: dict[str, str] = {
                    -- the tightest band at which some figure names exactly one variant
                    MIN(CASE WHEN m.variants = 1 THEN m.band END) AS pinning_band,
                    MIN(CASE WHEN m.models = 1 THEN m.band END) AS model_band,
-                   MIN(m.gap) FILTER (WHERE m.gap IS NOT NULL) AS closest_gap
+                   MIN(m.gap) FILTER (WHERE m.gap IS NOT NULL) AS closest_gap,
+                   -- The one the price names within a rupee, against the one the
+                   -- Journey actually carries. The question that decides whether
+                   -- a price key is safe to ship is not how many it would add
+                   -- but whether it ever contradicts a SKU the words already
+                   -- chose, and that cannot be assumed (2026-10-24).
+                   MIN(CASE WHEN m.variants = 1 AND m.band <= 1 THEN m.one_name END) AS price_names,
+                   MAX(pm.model_name || ' ~ ' || pv.variant_name) AS pinned_name
             FROM planned p
+            LEFT JOIN auditcore.product_skus ps ON ps.product_sku_id = p.product_sku_id
+            LEFT JOIN auditcore.product_models pm ON pm.model_id = ps.model_id
+            LEFT JOIN auditcore.product_variants pv ON pv.variant_id = ps.variant_id
             LEFT JOIN reads r ON r.journey_id = p.journey_id
             LEFT JOIN LATERAL (
                 SELECT band,
                        COUNT(DISTINCT bk.model_name) AS models,
-                       COUNT(DISTINCT bk.model_name || ' ~ ' || bk.variant_name) AS variants,
+                       COUNT(DISTINCT bk.name) AS variants,
+                       MIN(bk.name) AS one_name,
                        MIN(ABS(bk.ex_showroom - r.amount)) AS gap
                 FROM (VALUES (0.00), (1.00), (2.00), (10.00), (100.00)) AS b(band)
                 JOIN book bk ON bk.price_list_version_id = p.plv
@@ -238,6 +251,14 @@ REPORTS: dict[str, str] = {
                                   AND model_band IS NULL AND had_book) AS open_price_settles_nothing,
                -- and whether it agrees where the words already succeeded
                COUNT(*) FILTER (WHERE resolved AND pinning_band <= 1) AS resolved_price_pins_one_too,
+               COUNT(*) FILTER (WHERE resolved AND pinning_band <= 1
+                                  AND price_names = pinned_name) AS resolved_price_agrees,
+               -- The number that decides whether a price key may pin: every one
+               -- of these is a Journey where the price would have chosen a
+               -- different variant from the one the words chose, and each has to
+               -- be read before the matcher is allowed to act on a price.
+               COUNT(*) FILTER (WHERE resolved AND pinning_band <= 1
+                                  AND price_names <> pinned_name) AS resolved_price_disagrees,
                COUNT(*) FILTER (WHERE resolved AND pinning_band IS NULL AND had_book)
                  AS resolved_price_pins_nothing,
                ROUND(percentile_disc(0.5) WITHIN GROUP (ORDER BY closest_gap), 2) AS median_gap,
