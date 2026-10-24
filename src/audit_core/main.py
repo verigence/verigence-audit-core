@@ -71,6 +71,7 @@ from audit_core.uc03_delivery_documents import router as uc03_delivery_documents
 from audit_core.uc03_delivery_vehicle_photos import (
     router as uc03_delivery_vehicle_photos_router,
 )
+from audit_core.uc03_discount_variance import router as uc03_discount_variance_router
 from audit_core.uc03_document_assessments import (
     router as uc03_document_assessments_router,
 )
@@ -274,6 +275,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_model_resolution_router)
     application.include_router(uc03_model_selection_corrections_router)
     application.include_router(uc03_sku_attention_router)
+    application.include_router(uc03_discount_variance_router)
     application.include_router(uc03_p2_router)
     application.include_router(uc03_p2_documents_router)
     application.include_router(uc03_p2_resplit_router)
