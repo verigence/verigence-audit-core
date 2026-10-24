@@ -15,6 +15,7 @@ the previous value untouched and is logged, so it can never break a recompute.
 """
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 from uuid import UUID
 
@@ -22,6 +23,7 @@ import structlog
 from sqlalchemy import Connection, Engine, text
 
 from audit_core.db import set_tenant_context
+from audit_core.uc03_discount_variance import discount_variance_rows
 from audit_core.uc03_p2_journey360 import deal
 
 logger = structlog.get_logger(__name__)
@@ -43,19 +45,22 @@ def refresh_price_variance(connection: Connection, *, tenant_id: str, journey_id
             view = deal(connection, tenant_id=tenant_id, journey_id=journey_id)
             raw = view["summary"]["variance"]["currentVsStandard"]
             value = Decimal(raw) if raw is not None else Decimal(0)
+            discounts = json.dumps(discount_variance_rows(view))
             # The version is stamped even when the figure itself has not moved:
             # that is what marks the cache current for the facts as they stand.
             connection.execute(
                 text(
                     """
                     UPDATE auditcore.p2_journey_runtime
-                    SET price_variance=:value, price_variance_fact_version=fact_version
+                    SET price_variance=:value, price_variance_fact_version=fact_version,
+                        discount_variance=CAST(:discounts AS jsonb)
                     WHERE tenant_id=:tenant_id AND journey_id=:journey_id
                       AND (price_variance IS DISTINCT FROM :value
-                           OR price_variance_fact_version IS DISTINCT FROM fact_version)
+                           OR price_variance_fact_version IS DISTINCT FROM fact_version
+                           OR discount_variance IS DISTINCT FROM CAST(:discounts AS jsonb))
                     """
                 ),
-                {"tenant_id": tenant_id, "journey_id": journey_id, "value": value},
+                {"tenant_id": tenant_id, "journey_id": journey_id, "value": value, "discounts": discounts},
             )
             return value
     except Exception:
