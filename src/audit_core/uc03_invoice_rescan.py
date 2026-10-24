@@ -64,6 +64,36 @@ def _ex_showroom_now(connection: Connection, tenant_id: str, journey_id: UUID) -
     return None if value is None else Decimal(str(value))
 
 
+def _ex_showroom_source(connection: Connection, tenant_id: str, journey_id: UUID) -> str | None:
+    value = connection.execute(
+        text(
+            """
+            SELECT source_reference FROM auditcore.commercial_lines
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id AND component_key = :key
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "key": _EX_SHOWROOM},
+    ).scalar()
+    return None if value is None else str(value).split(":", 1)[0]
+
+
+def _detail(selection: dict[str, Any], before_source: str | None) -> dict[str, Any]:
+    """What the new ex-showroom was worked from, for reading the log."""
+    holders = (selection.get("lineDocuments") or {}).get(_EX_SHOWROOM) or []
+    rep = holders[0] if holders else None
+    vehicle = (rep or {}).get("vehicle") or {}
+    raw = (rep or {}).get("_raw") or {}
+    return {
+        "beforeSource": before_source,
+        "basis": vehicle.get("gstBasis"), "rate": vehicle.get("gstRate"),
+        "selling": vehicle.get("sellingPrice"), "sellingFrom": vehicle.get("sellingPriceSource"),
+        "taxable": vehicle.get("taxable"), "discountPrinted": vehicle.get("discountPrinted"),
+        "grandTotal": raw.get("grand_total_amount"), "tcs": raw.get("tcs_amount"),
+        "addOnLines": sorted(k for k in (rep or {}).get("lines", {}) if k != _EX_SHOWROOM),
+        "issues": [i["code"] for i in (rep or {}).get("issues", [])],
+    }
+
+
 def _on_phase_two(connection: Connection, tenant_id: str, journey_id: UUID) -> bool:
     """Only a Journey that already has its Phase 2 runtime row is told its
     facts changed; asking would otherwise create one."""
@@ -84,7 +114,8 @@ def rescan_journey(
     before = _ex_showroom_now(connection, tenant_id, journey_id)
     after = selection["lines"].get(_EX_SHOWROOM)
     item = {"invoices": len(readings), "before": before, "after": after,
-            "changed": after is not None and (before is None or abs(before - after) > Decimal("0.5"))}
+            "changed": after is not None and (before is None or abs(before - after) > Decimal("0.5")),
+            "detail": _detail(selection, _ex_showroom_source(connection, tenant_id, journey_id))}
     if not commit:
         return item
     for reading in readings:
@@ -141,5 +172,5 @@ def run_invoice_rescan(engine: Engine, tag: str, tenant_ids: list[str]) -> None:
             logger.info("invoice_rescan_item", tag=tag, tenant_id=tenant_id, commit=commit,
                         journey_id=str(journey_id), invoices=item["invoices"],
                         ex_showroom_before=str(item["before"]), ex_showroom_after=str(item["after"]),
-                        changed=item["changed"])
+                        changed=item["changed"], detail=str(item["detail"]))
         logger.info("invoice_rescan_finished", tag=tag, tenant_id=tenant_id, commit=commit, **totals)
