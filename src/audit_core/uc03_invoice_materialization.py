@@ -574,6 +574,58 @@ def _vin_relation(a: dict[str, Any], b: dict[str, Any]) -> str | None:
     return "same" if a["vinTail"] == b["vinTail"] else "different"
 
 
+_MAX_GST_FRACTION = Decimal("0.5")
+
+
+def _gst_factor(
+    rate: Decimal | None,
+    selling: Decimal | None,
+    discount_total: Decimal,
+    lines: list[dict[str, Any]],
+    grand_total: Decimal | None,
+    tcs: Decimal | None,
+    round_off: Decimal,
+    has_addons: bool,
+) -> tuple[Decimal | None, str | None, Decimal | None]:
+    """(factor, basis, price): what multiplies this invoice's printed vehicle
+    price (and discounts) to give the GST-inclusive figure, or, when no price
+    was printed, the GST-inclusive vehicle price itself.
+
+    A printed rate is used as it stands. Otherwise, from this invoice only:
+    separate GST line items give the rate on the price after discount; failing
+    those, the grand total (less TCS and round-off) over that same amount
+    does -- exactly 1 when the printed price already includes GST. Never
+    guessed when add-on lines share the total, and never outside 0 - 50%."""
+    if rate is not None:
+        return 1 + rate, "PRINTED_RATE", None
+    if has_addons:
+        return None, None, None
+    after_discount = selling - discount_total if selling is not None else None
+    if after_discount is not None and after_discount > 0:
+        tax_lines = [a for a in (_to_decimal(i.get("tax_amount")) if _to_decimal(i.get("tax_amount")) is not None
+                                 else _line_amount(i)
+                                 for i in lines if _upper(i.get("line_category")) == _TAX_LINE_CATEGORY)
+                     if a is not None]
+        if tax_lines:
+            fraction = sum(tax_lines, Decimal(0)) / after_discount
+            if Decimal(0) <= fraction <= _MAX_GST_FRACTION:
+                return 1 + fraction, "TAX_LINES", None
+    if grand_total is None:
+        return None, None, None
+    target = grand_total - (tcs or Decimal(0)) - round_off
+    if selling is None:
+        # No price printed: with no discount either, the total is the price.
+        return (None, "GRAND_TOTAL", target) if discount_total == 0 and target > 0 else (None, None, None)
+    if after_discount is None or after_discount <= 0:
+        return None, None, None
+    if abs(after_discount - target) <= _ONE_RUPEE:
+        return Decimal(1), "INCLUDED_IN_PRICE", None
+    implied = target / after_discount
+    if 1 < implied <= 1 + _MAX_GST_FRACTION:
+        return implied, "GRAND_TOTAL", None
+    return None, None, None
+
+
 def _read_vehicle(raw: dict[str, Any], lines: list[dict[str, Any]], out: dict[str, Any]) -> None:
     """The vehicle invoice's own lines: ex-showroom (R1), each discount by
     type, TCS, any add-on lines it carries, and its own checks."""
@@ -652,20 +704,6 @@ def _read_vehicle(raw: dict[str, Any], lines: list[dict[str, Any]], out: dict[st
 
     rate, rate_issues = _rate_reading(raw, header_taxable if header_taxable else taxable, rate_line)
     issues.extend(rate_issues)
-    taxes_read = rate is not None
-    if not taxes_read and not rate_issues:
-        issues.append(_issue("TAXES_NOT_READ", "The GST on this invoice (CGST/SGST or IGST) was not read."))
-
-    ex_showroom = _q(selling * (1 + rate)) if selling is not None and rate is not None else None
-    if ex_showroom is not None:
-        out["lines"]["ex_showroom_price"] = ex_showroom
-    for key, entry in printed.items():
-        out["discounts"][key] = {
-            "amount": _q(entry["printed"] * (1 + rate)) if rate is not None else None,
-            "printed": entry["printed"],
-            "descriptions": entry["descriptions"],
-        }
-
     # TCS: the header figure, else its TCS lines (one or the other).
     tcs = _to_decimal(raw.get("tcs_amount"))
     if tcs is None:
@@ -678,6 +716,32 @@ def _read_vehicle(raw: dict[str, Any], lines: list[dict[str, Any]], out: dict[st
         if amount is not None:
             component = _LINE_CATEGORY_TO_COMPONENT[_upper(item.get("line_category"))]
             out["lines"][component] = out["lines"].get(component, Decimal(0)) + amount
+
+    # GST-inclusive figures. A printed GST rate is used as it stands. With no
+    # rate printed the invoice's own figures decide, never another invoice's:
+    # separate GST line items give the rate; one combined total gives it, or
+    # shows the printed price already includes GST.
+    grand_total = _to_decimal(raw.get("grand_total_amount"))
+    round_off = _to_decimal(raw.get("round_off_amount")) or Decimal(0)
+    factor, gst_basis, price_given = _gst_factor(
+        rate, selling, discount_total, lines, grand_total, tcs, round_off, bool(addon_lines))
+    taxes_read = rate is not None or factor is not None or price_given is not None
+    if rate is not None:
+        gst_basis = "PRINTED_RATE"
+    if not taxes_read and not rate_issues:
+        issues.append(_issue("TAXES_NOT_READ", "The GST on this invoice (CGST/SGST or IGST) was not read."))
+    if factor is not None and selling is not None:
+        ex_showroom: Decimal | None = _q(selling * factor)
+    else:
+        ex_showroom = price_given
+    if ex_showroom is not None:
+        out["lines"]["ex_showroom_price"] = ex_showroom
+    for key, entry in printed.items():
+        out["discounts"][key] = {
+            "amount": _q(entry["printed"] * factor) if factor is not None else None,
+            "printed": entry["printed"],
+            "descriptions": entry["descriptions"],
+        }
 
     # The invoice's own arithmetic, to the rupee (R1 / Q5).
     taxes = [_to_decimal(raw.get(k)) for k in ("cgst_amount", "sgst_amount", "igst_amount", "cess_amount")]
@@ -699,8 +763,6 @@ def _read_vehicle(raw: dict[str, Any], lines: list[dict[str, Any]], out: dict[st
                 f"GST {sum(gst_amounts, Decimal(0))} is not the printed rate on the taxable value {header_taxable}.",
                 taxable=header_taxable, gst=sum(gst_amounts, Decimal(0)),
             ))
-    grand_total = _to_decimal(raw.get("grand_total_amount"))
-    round_off = _to_decimal(raw.get("round_off_amount")) or Decimal(0)
     if grand_total is not None and header_taxable is not None and any(t is not None for t in taxes):
         expected = header_taxable + tax_total + (tcs or Decimal(0)) + round_off
         if abs(expected - grand_total) > _ONE_RUPEE:
@@ -717,8 +779,10 @@ def _read_vehicle(raw: dict[str, Any], lines: list[dict[str, Any]], out: dict[st
         "sellingPrice": selling,
         "sellingPriceSource": selling_source,
         "taxable": taxable,
-        "gstRate": rate,
+        "gstRate": rate if rate is not None else (
+            (factor - 1).quantize(_RATE_PLACES, rounding=ROUND_HALF_UP) if factor is not None and factor != 1 else None),
         "taxesRead": taxes_read,
+        "gstBasis": gst_basis,
         "rateUnclear": bool(rate_issues),
         "exShowroom": ex_showroom,
         "discountPrinted": discount_total,

@@ -508,9 +508,12 @@ def test_a_vehicle_line_rate_counts_only_when_it_agrees_with_the_header():
         *[li for li in EXAMPLE["line_items"] if li["line_category"] == "DISCOUNT_LINE"]]})
     assert per_component["lines"]["ex_showroom_price"] == Decimal("852000.00")
     assert per_component["lines"]["accessories_cost"] == Decimal(5900)
-    # 28% on the line against 18% on the header: unclear, no figure.
+    # 28% on the line against 18% on the header: the rate stays unclear (and
+    # flagged), but the invoice's own grand total gives the figure -- nothing
+    # read is dropped, nothing is doubled.
     disagree = im.read_invoice("customer_invoice_dms", {**EXAMPLE, "line_items": [{**vehicle_line, "tax_rate": 28}]})
-    assert "ex_showroom_price" not in disagree["lines"]
+    assert disagree["lines"]["ex_showroom_price"] == Decimal("852000.00")
+    assert disagree["vehicle"]["gstBasis"] == "GRAND_TOTAL"
     assert [i["code"] for i in disagree["issues"]] == ["RATE_UNCLEAR"]
 
 
@@ -531,7 +534,9 @@ def test_a_rate_printed_on_one_component_is_never_doubled_blindly():
     assert per_component["vehicle"]["gstRate"] == Decimal("0.18")
     unconfirmed = im.read_invoice("customer_invoice_dms", {
         k: v for k, v in base.items() if k not in ("cgst_amount", "sgst_amount")})
-    assert "ex_showroom_price" not in unconfirmed["lines"]
+    # not doubled blindly: the figure is worked out from the invoice's total
+    assert unconfirmed["lines"]["ex_showroom_price"] == Decimal("852000.00")
+    assert unconfirmed["vehicle"]["gstBasis"] == "GRAND_TOTAL"
     assert "RATE_UNCLEAR" in [i["code"] for i in unconfirmed["issues"]]
 
 
