@@ -68,6 +68,58 @@ REPORTS: dict[str, str] = {
                count(*) FILTER (WHERE jsonb_array_length(COALESCE(discount_variance, '[]'::jsonb)) > 0) AS with_variance
         FROM auditcore.p2_journey_runtime WHERE tenant_id = :t
     """,
+    # The invoice rows behind those shared GSTINs, one per document: which
+    # document type each came from, the invoice's own seller and buyer as read,
+    # and the GSTIN status the document gave.
+    "shared_gstin_rows": """
+        SELECT j.journey_reference, COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
+               v.document_type_key, v.source_di_document_id, v.invoice_number, v.invoice_date,
+               v.seller_name, v.seller_gstin, v.buyer_name, v.buyer_gstin, v.buyer_gstin_status,
+               v.created_at_utc
+        FROM auditcore.invoice_review_values v
+        JOIN auditcore.journeys j ON j.tenant_id = v.tenant_id AND j.journey_id = v.journey_id
+        LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+        WHERE v.tenant_id = :t AND v.buyer_gstin IS NOT NULL
+          AND upper(btrim(v.buyer_gstin)) IN (
+              SELECT upper(btrim(buyer_gstin)) FROM auditcore.invoice_review_values
+              WHERE tenant_id = :t AND buyer_gstin IS NOT NULL
+              GROUP BY upper(btrim(buyer_gstin)) HAVING count(DISTINCT journey_id) > 1)
+        ORDER BY upper(btrim(v.buyer_gstin)), j.journey_reference, v.created_at_utc
+    """,
+    # A buyer GSTIN carried by more than one Journey (2026-10-24: two different
+    # customers paired as duplicates on 21AAACU2665C1ZV while one of them has no
+    # GSTIN). Is it the dealer's own GSTIN (a seller GSTIN anywhere in the
+    # project), read into the buyer field? The pairing rule only checks the
+    # shape of a GSTIN, so a seller's number would pass it.
+    "shared_gstins": """
+        WITH buyer AS (
+            SELECT v.journey_id, upper(btrim(v.buyer_gstin)) AS gstin, v.seller_gstin, v.document_type_key
+            FROM auditcore.invoice_review_values v
+            WHERE v.tenant_id = :t AND v.buyer_gstin IS NOT NULL
+        ),
+        seller AS (
+            SELECT DISTINCT upper(btrim(seller_gstin)) AS gstin
+            FROM auditcore.invoice_review_values
+            WHERE tenant_id = :t AND seller_gstin IS NOT NULL
+        )
+        SELECT b.gstin,
+               count(DISTINCT b.journey_id) AS journeys,
+               count(DISTINCT COALESCE(NULLIF(c.display_name, ''), j.journey_reference)) AS customers,
+               bool_or(b.gstin IN (SELECT gstin FROM seller)) AS is_a_seller_gstin_in_the_project,
+               count(*) FILTER (WHERE upper(btrim(COALESCE(b.seller_gstin, ''))) = b.gstin) AS same_invoice_buyer_is_seller,
+               string_agg(DISTINCT b.document_type_key, ',') AS document_types,
+               string_agg(DISTINCT o.outlet_name, ' | ') AS outlets,
+               string_agg(DISTINCT COALESCE(NULLIF(c.display_name, ''), j.journey_reference), ' | ') AS customer_names
+        FROM buyer b
+        JOIN auditcore.journeys j ON j.tenant_id = :t AND j.journey_id = b.journey_id
+        LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+        LEFT JOIN auditcore.dealer_outlets o
+          ON o.tenant_id = j.tenant_id AND o.dealer_id = j.dealer_id AND o.outlet_id = j.outlet_id
+        GROUP BY b.gstin
+        HAVING count(DISTINCT b.journey_id) > 1
+            OR bool_or(b.gstin IN (SELECT gstin FROM seller))
+        ORDER BY count(DISTINCT b.journey_id) DESC, b.gstin
+    """,
     # Every Journey's vehicle: what was read, the SKU pinned, how and when.
     "sku_pins": """
         SELECT j.journey_id, j.journey_reference, j.created_by_display_name AS pc_name,
