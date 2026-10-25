@@ -1345,7 +1345,7 @@ REPORTS.update({
     """,
     "rv_discounts": f"""
         SELECT j.journey_reference AS ref,
-               (SELECT string_agg(da.discount_key || ':e=' || COALESCE(da.standard_eligible_amount::text, '-')
+               (SELECT string_agg(da.discount_key || ' elig=' || COALESCE(da.standard_eligible_amount::text, '-')
                                   || ',a=' || COALESCE(da.actual_discount_amount::text, '-')
                                   || ',' || COALESCE(da.eligibility_result, '-'), ' | ' ORDER BY da.discount_key)
                   FROM auditcore.discount_applications da
