@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import date
 from typing import Any
 
@@ -23,6 +24,9 @@ logger = structlog.get_logger(__name__)
 _MAX_ROWS = int(os.environ.get("AUDIT_CORE_DIAG_MAX_ROWS", "600"))
 # A report returning at most this many rows is also logged whole, on one line.
 _ANSWER_ROWS = int(os.environ.get("AUDIT_CORE_DIAG_ANSWER_ROWS", "5"))
+# Railway drops log lines past 500/second for a replica (2026-10-25: a 509-row
+# report lost 51 rows). A pause per row keeps a big report whole; 0 = off.
+_ROW_PAUSE_S = int(os.environ.get("AUDIT_CORE_DIAG_ROW_PAUSE_MS", "0") or "0") / 1000
 
 REPORTS: dict[str, str] = {
     # Discounts whose INVOICE figure is not the entitlement, tallied per
@@ -1208,6 +1212,47 @@ REPORTS: dict[str, str] = {
 REPORTS.update({f"rv_{name}": sql for name, sql in REVIEW_SQL.items()})
 
 
+# Beyond the Reports page's facts: the Deal's own lines (standard and actual per
+# component) and the customer ledger documents in full (their entry lines).
+REPORTS.update({
+    "rv_lines": """
+        SELECT j.journey_reference AS ref,
+               (SELECT string_agg(cl.component_key || '=' || COALESCE(cl.standard_amount::text, '-') || '/'
+                                  || COALESCE(cl.actual_amount::text, '-') || '@'
+                                  || COALESCE(cl.actual_source_kind, '-'), ' | ' ORDER BY cl.component_key)
+                  FROM auditcore.commercial_lines cl
+                 WHERE cl.tenant_id = j.tenant_id AND cl.journey_id = j.journey_id) AS deal_lines,
+               (SELECT string_agg(sv.component_key || '=' || sv.amount::text || '@' || sv.source_document_type,
+                                  ' | ' ORDER BY sv.component_key, sv.source_document_type)
+                  FROM auditcore.commercial_line_source_values sv
+                 WHERE sv.tenant_id = j.tenant_id AND sv.journey_id = j.journey_id
+                   AND sv.line_kind = 'COMMERCIAL') AS source_values
+        FROM auditcore.journeys j
+        WHERE j.tenant_id = :t
+        ORDER BY j.journey_reference
+    """,
+    "rv_ledger": """
+        SELECT j.journey_reference AS ref, left(e.di_document_id::text, 8) AS doc,
+               (SELECT string_agg(f.field_key || '=' || left(f.effective_value #>> '{}', 40), ' | ' ORDER BY f.field_key)
+                  FROM auditcore.journey_document_extracted_fields f
+                 WHERE f.tenant_id = e.tenant_id AND f.journey_id = e.journey_id
+                   AND f.di_document_id = e.di_document_id AND f.effective_value IS NOT NULL
+                   AND f.field_key <> 'line_items') AS fields,
+               length(max(CASE WHEN f2.field_key = 'line_items' THEN f2.effective_value #>> '{}' END)) AS lines_len,
+               substr(max(CASE WHEN f2.field_key = 'line_items' THEN f2.effective_value #>> '{}' END), 1, 1400) AS lines_1,
+               substr(max(CASE WHEN f2.field_key = 'line_items' THEN f2.effective_value #>> '{}' END), 1401, 1400) AS lines_2
+        FROM auditcore.evidence e
+        JOIN auditcore.journeys j ON j.tenant_id = e.tenant_id AND j.journey_id = e.journey_id
+        LEFT JOIN auditcore.journey_document_extracted_fields f2
+          ON f2.tenant_id = e.tenant_id AND f2.journey_id = e.journey_id
+         AND f2.di_document_id = e.di_document_id AND f2.field_key = 'line_items'
+        WHERE e.tenant_id = :t AND e.association_status = 'ACTIVE' AND e.document_type_key = 'customer_ledger'
+        GROUP BY j.journey_reference, e.tenant_id, e.journey_id, e.di_document_id
+        ORDER BY j.journey_reference
+    """,
+})
+
+
 def _projects(engine: Engine) -> list[dict[str, Any]]:
     with engine.begin() as connection:
         set_platform_super_admin_context(connection)
@@ -1263,6 +1308,8 @@ def run_diagnostics(engine: Engine, names: list[str]) -> None:
                 for row in rows[:_MAX_ROWS]:
                     logger.info("diag_row", report=name, tenant_id=tenant_id,
                                 project=project["project_name"], **{k: _plain(v) for k, v in row.items()})
+                    if _ROW_PAUSE_S:
+                        time.sleep(_ROW_PAUSE_S)
                 if 0 < len(rows) <= _ANSWER_ROWS:
                     # The whole answer on one line (2026-10-24). A report that
                     # returns a handful of rows is the answer to a question, and
