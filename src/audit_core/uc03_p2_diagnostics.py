@@ -17,6 +17,7 @@ import structlog
 from sqlalchemy import Engine, text
 
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
+from audit_core.uc03_journey_review import REVIEW_SQL
 
 logger = structlog.get_logger(__name__)
 _MAX_ROWS = int(os.environ.get("AUDIT_CORE_DIAG_MAX_ROWS", "600"))
@@ -1201,6 +1202,10 @@ REPORTS: dict[str, str] = {
         ORDER BY 2, 1, 3
     """,
 }
+
+
+# The all-Journey review queries live with the Reports page that shows them.
+REPORTS.update({f"rv_{name}": sql for name, sql in REVIEW_SQL.items()})
 
 
 def _projects(engine: Engine) -> list[dict[str, Any]]:
