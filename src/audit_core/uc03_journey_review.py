@@ -160,7 +160,7 @@ REVIEW_SQL: dict[str, str] = {
                  WHERE pli.tenant_id = j.tenant_id AND pli.price_list_version_id = j.price_list_version_id
                    AND jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
                    AND pli.component_key = 'INSURANCE' LIMIT 1) AS std_insurance,
-               {_active_doc_fields('booking_form', '^insurance')} AS booking_insurance
+               {_active_doc_fields('booking_docket', '^insurance')} AS booking_insurance
         FROM auditcore.journeys j
         LEFT JOIN auditcore.dealer_outlets o
           ON o.tenant_id = j.tenant_id AND o.dealer_id = j.dealer_id AND o.outlet_id = j.outlet_id
@@ -190,7 +190,7 @@ REVIEW_SQL: dict[str, str] = {
                (SELECT count(*) FROM auditcore.evidence e
                  WHERE e.tenant_id = j.tenant_id AND e.journey_id = j.journey_id
                    AND e.association_status = 'ACTIVE' AND e.document_type_key = 'credit_note') AS credit_notes,
-               {_active_doc_fields('booking_form', '(discount|bonus|scrap|exchange)')} AS booking_discounts,
+               {_active_doc_fields('booking_docket', '(discount|bonus|scrap|exchange)')} AS booking_discounts,
                {_active_doc_fields('cost_sheet', '(discount|bonus|scrap|exchange)')} AS cost_sheet_discounts
         FROM auditcore.journeys j
         WHERE j.tenant_id = :t
@@ -199,7 +199,7 @@ REVIEW_SQL: dict[str, str] = {
     "pricedocs": f"""
         SELECT j.journey_reference AS ref,
                {_active_doc_fields('cost_sheet', width=40)} AS cost_sheet,
-               {_active_doc_fields('booking_form', '(price|amount|total|ex_showroom|road|rto|accessor)', width=30)} AS booking_form,
+               {_active_doc_fields('booking_docket', '(price|amount|total|ex_showroom|road|rto|accessor)', width=30)} AS booking_docket,
                {_active_doc_fields('bank_approval_letter', '(considered|invoice_or_proforma|sanctioned|margin)', width=30)} AS bank_letter,
                {_active_doc_fields('customer_ledger', width=30)} AS ledger,
                {_active_doc_fields('no_dues_certificate', width=30)} AS no_dues
