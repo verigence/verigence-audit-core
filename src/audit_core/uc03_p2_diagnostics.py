@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import date
 from typing import Any
 
@@ -23,6 +24,9 @@ logger = structlog.get_logger(__name__)
 _MAX_ROWS = int(os.environ.get("AUDIT_CORE_DIAG_MAX_ROWS", "600"))
 # A report returning at most this many rows is also logged whole, on one line.
 _ANSWER_ROWS = int(os.environ.get("AUDIT_CORE_DIAG_ANSWER_ROWS", "5"))
+# Railway drops log lines past 500/second for a replica (2026-10-25: a 509-row
+# report lost 51 rows). A pause per row keeps a big report whole; 0 = off.
+_ROW_PAUSE_S = int(os.environ.get("AUDIT_CORE_DIAG_ROW_PAUSE_MS", "0") or "0") / 1000
 
 REPORTS: dict[str, str] = {
     # Discounts whose INVOICE figure is not the entitlement, tallied per
@@ -1263,6 +1267,8 @@ def run_diagnostics(engine: Engine, names: list[str]) -> None:
                 for row in rows[:_MAX_ROWS]:
                     logger.info("diag_row", report=name, tenant_id=tenant_id,
                                 project=project["project_name"], **{k: _plain(v) for k, v in row.items()})
+                    if _ROW_PAUSE_S:
+                        time.sleep(_ROW_PAUSE_S)
                 if 0 < len(rows) <= _ANSWER_ROWS:
                     # The whole answer on one line (2026-10-24). A report that
                     # returns a handful of rows is the answer to a question, and
