@@ -416,6 +416,33 @@ task_types:
     - COMPLETE_ACTION
     - ACCEPT_EXCEPTION
     - ADD_COMMENT
+  # MAHINDRA ORISSA: the dealer's account statement is the Deal's source of
+  # truth (uc03_account_statement). These two are raised CRITICAL.
+  # A statement is on file but no vehicle / ex-showroom line was read from it.
+  ACCOUNT_STATEMENT_NO_EX_SHOWROOM:
+    category: CROSS_DOCUMENT_REVIEW
+    owner: TL
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - PROVIDE_FEEDBACK
+    - COMPLETE_ACTION
+    - ADD_COMMENT
+  # The Tally ledger disagrees with the account statement by more than Rs 100.
+  ACCOUNT_STATEMENT_TALLY_DEVIATION:
+    category: CROSS_DOCUMENT_REVIEW
+    owner: TL
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - PROVIDE_FEEDBACK
+    - COMPLETE_ACTION
+    - ACCEPT_EXCEPTION
+    - ADD_COMMENT
   FINANCE_DISBURSEMENT_REVIEW:
     category: BUSINESS_RESOLUTION
     owner: PC

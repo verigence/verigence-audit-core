@@ -38,7 +38,7 @@ _refuse_non_local_database()
 _TENANT_DATA_DELETE_ORDER = (
     "sku_resolution_run_items", "sku_resolution_runs", "delivery_vehicle_photos", "activity_records", "administrative_operations", "audit_chain_heads", "audit_events",
     "audit_finding_events", "audit_state_events", "booking_form_review_values", "business_assignments",
-    "commercial_line_source_values", "commercial_lines", "crm_interactions", "customer_identity_index",
+    "commercial_line_source_values", "commercial_lines", "deal_source_snapshots", "crm_interactions", "customer_identity_index",
     "customer_identity_review_values", "daily_ops_items", "dealer_receipt_review_values",
     "delivery_status_history", "di_subject_mappings", "discount_applications", "discount_policy_parameters",
     "discount_scheme_benefits", "discount_scheme_eligibility", "document_capture_v2_declarations",
