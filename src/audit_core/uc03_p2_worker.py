@@ -4148,6 +4148,17 @@ def main() -> None:
 
         threading.Thread(target=run_invoice_rescan, args=(engine, rescan_tag, _active_tenants(engine)),
                          name="invoice-rescan", daemon=True).start()
+    # Mahindra Orissa: every Journey's Deal set from its account statement
+    # (2026-10-25): dry run unless the tag ends with "-commit".
+    statement_tag = os.environ.get("AUDIT_CORE_ACCOUNT_STATEMENT_TAG", "").strip()
+    if statement_tag:
+        from audit_core.uc03_account_statement_rebuild import (
+            run_account_statement_rebuild,
+        )
+
+        threading.Thread(target=run_account_statement_rebuild,
+                         args=(engine, statement_tag, _active_tenants(engine)),
+                         name="account-statement-rebuild", daemon=True).start()
     # Every Journey's variance as the list stores it and as the Deal computes it
     # (2026-10-24); read-only.
     variance_tag = os.environ.get("AUDIT_CORE_VARIANCE_AUDIT_TAG", "").strip()

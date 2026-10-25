@@ -38,6 +38,8 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_deal_source_policy import invoice_withheld
+
 LineKind = str  # "COMMERCIAL" | "DISCOUNT"
 
 # The nil UUID stands in for "no document" in the unique key, so a source
@@ -76,6 +78,10 @@ def record_source_value(
     are two rows, never one overwriting the other.
     """
     if amount is None:
+        return
+    # Mahindra Orissa: the account statement is the source of truth, so an
+    # invoice records nothing in the Deal (the document stays on file).
+    if invoice_withheld(connection, tenant_id=tenant_id, document_type=source_document_type):
         return
     connection.execute(
         text(
@@ -241,6 +247,10 @@ def upsert_commercial_actual(
     from audit_core.uc03_attribute_mapping import spec_for_field
 
     document_type = normalise_document_type(document_type)
+    # Mahindra Orissa: the account statement is the source of truth (see
+    # uc03_account_statement); an invoice sets no canonical actual either.
+    if invoice_withheld(connection, tenant_id=tenant_id, document_type=document_type):
+        return False
     if record:
         record_source_value(
             connection,

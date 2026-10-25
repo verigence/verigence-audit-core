@@ -28,6 +28,10 @@ from sqlalchemy import Connection, text
 
 from audit_core.logging_config import release_version
 from audit_core.uc03_deal_source_history import active_source_rows
+from audit_core.uc03_deal_source_policy import (
+    account_statement_is_source_of_truth,
+    is_invoice_type,
+)
 from audit_core.uc03_duplicate_booking_detection import _BASIS_LABEL
 from audit_core.uc03_duplicate_receipt_detection import (
     ReceiptRecord,
@@ -270,6 +274,10 @@ def _norm_type(value: Any) -> str:
 
 _BOOKING_NORM = frozenset(_norm_type(t) for t in _BOOKING_SOURCES)
 _LEDGER_NORM = frozenset(_norm_type(t) for t in _LEDGER_SOURCES)
+# For a Project that takes its Deal from the account statement the statement is
+# a billed source (no column of its own); this name keeps it out of the
+# "ledger" column and labels it for the person reading the Deal.
+_STATEMENT_COLUMN_TYPE = "account_statement"
 _QUOTE_NORM = frozenset(_norm_type(t) for t in _QUOTE_SOURCES)
 
 
@@ -1015,6 +1023,20 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         connection, tenant_id=tenant_id, journey_id=journey_id,
         di_types=tuple(dict.fromkeys(_INVOICE_TYPES + _ITEM_SOURCES + ("insurance_cover",) + tuple(_BOOKING_SOURCES))),
     )
+    # MAHINDRA ORISSA: THE ACCOUNT STATEMENT IS THE SOURCE OF TRUTH (product
+    # owner, 2026-10-25). For a Project whose deal_source_policy is
+    # ACCOUNT_STATEMENT no invoice is read into the Deal: the dealer's account
+    # statement (stored as customer_ledger) stands in the billed column, under
+    # its own name, and a Journey without one has no billed figures. Every other
+    # Project reads its invoices below, unchanged.
+    statement_policy = account_statement_is_source_of_truth(connection, tenant_id=tenant_id)
+    if statement_policy:
+        documents = [d for d in documents if d["documentType"] not in _INVOICE_TYPES]
+        sources = [
+            {**s, "source_document_type": _STATEMENT_COLUMN_TYPE}
+            if _norm_type(s["source_document_type"]) in _LEDGER_NORM else s
+            for s in sources if not is_invoice_type(s["source_document_type"])
+        ]
     # Each invoice read on its own and counted once (2026-10-20, R1/R2).
     selection = deal_invoices(documents, booking_date=plausible_from(
         connection, tenant_id=tenant_id, journey_id=journey_id))
@@ -1034,6 +1056,14 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # truth (decision 2026-10-20). The wholesale invoice does not switch it.
     invoice_on_file = bool(selection["counted"]) or bool(legacy_invoice_types)
     families = set(selection["families"])
+    if statement_policy:
+        # The statement is what "an invoice on file" means for this Project:
+        # its vehicle line is the vehicle bill, so lines it does not carry are
+        # not invoiced rather than awaited, as they are once an invoice is read.
+        statement_rows = [s for s in sources if s["source_document_type"] == _STATEMENT_COLUMN_TYPE]
+        invoice_on_file = bool(statement_rows)
+        if any(str(s["component_key"]) == "ex_showroom_price" for s in statement_rows):
+            families.add(FAMILY_VEHICLE)
     for kind in legacy_invoice_types:
         if kind in _VEHICLE_NORM:
             families.add(FAMILY_VEHICLE)
@@ -1122,6 +1152,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         effective_source = None
         if line and line["source_reference"]:
             effective_type = str(line["source_reference"]).split(":")[0]
+            if statement_policy and _norm_type(effective_type) in _LEDGER_NORM:
+                effective_type = _STATEMENT_COLUMN_TYPE
             effective_source = _document_label(effective_type)
             # The canonical line already knows which document set its value;
             # a source table written before that document was recorded

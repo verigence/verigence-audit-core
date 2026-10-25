@@ -1756,6 +1756,20 @@ def sync_invoice_actuals(
     and nothing else: each invoice counted once, voided documents left out,
     and a line or discount an invoice no longer carries recomputed from the
     remaining sources (2026-10-20, R2)."""
+    # MAHINDRA ORISSA: THE ACCOUNT STATEMENT IS THE SOURCE OF TRUTH (product
+    # owner, 2026-10-25). For a Project whose deal_source_policy is
+    # ACCOUNT_STATEMENT the Deal's billed figures come from the dealer's account
+    # statement (uc03_account_statement) and this invoice logic does not run:
+    # the invoices stay on file as evidence and set nothing in the Deal. Every
+    # other Project falls through to the unchanged invoice logic below.
+    from audit_core.uc03_account_statement import sync_if_source_of_truth
+
+    statement = sync_if_source_of_truth(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage_code,
+        correlation_id=correlation_id,
+    )
+    if statement is not None:
+        return statement
     readings = load_invoice_readings(connection, tenant_id=tenant_id, journey_id=journey_id)
     selection = select_invoices(readings, plausible_from=plausible_from(
         connection, tenant_id=tenant_id, journey_id=journey_id))
