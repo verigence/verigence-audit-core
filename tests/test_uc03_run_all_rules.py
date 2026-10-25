@@ -87,7 +87,7 @@ def test_run_all_rules_for_a_fresh_booking_journey_returns_all_expected_rule_cod
         "THIRD_PARTY_PAYMENT_UNCONFIRMED", "THIRD_PARTY_PAYMENT_UNDECLARED",
         "CASH_INTIMATION_UNCONFIRMED", "CASH_NOT_INTIMATED", "CASH_ABOVE_LIMIT", "PAYMENT_BEFORE_BOOKING",
         "INSURANCE_INVOICE_MISSING", "SELF_INSURANCE_DECLARED",
-        "TCS_SHORT",
+        "TCS_SHORT", "BOOKING_DATE_UNUSABLE",
     }
     # Nothing has been extracted yet -- every one of these is a clean SKIPPED,
     # except AUTOMATED_SYNC_FAILURE, which has no SKIPPED state of its own
@@ -116,7 +116,7 @@ def test_run_all_rules_writes_execution_log_rows(run_all_rules_setup) -> None:
         ),
         {"t": tenant_id, "j": journey_id},
     ).mappings().all()
-    assert len(rows) == 19  # 8 sync rules + 11 deal-audit checks
+    assert len(rows) == 20  # 8 sync rules + 12 deal-audit checks
     assert all(row["triggering_event"] == "MANUAL_RUN_ALL_RULES" for row in rows)
 
 
