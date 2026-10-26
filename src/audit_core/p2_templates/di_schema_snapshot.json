@@ -2056,13 +2056,103 @@
      "type": "number"
     },
     {
+     "description": "Title printed at the top of the dealer's own account statement form, verbatim (for example Account Statement, Vehicle Account Statement, Accounts Statement); empty for a DMS or Tally ledger export",
+     "key": "statement_title",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model printed on the account statement form, exactly as printed",
+     "key": "vehicle_model",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle VIN / chassis number printed on the account statement form, exactly as printed",
+     "key": "vin_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Invoice number printed on the account statement form, exactly as printed",
+     "key": "invoice_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Invoice date printed on the account statement form",
+     "key": "invoice_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Booking date printed on the account statement form",
+     "key": "booking_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Delivery date printed on the account statement form",
+     "key": "delivery_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "The amount printed against Gross Value on the account statement form, before the discount",
+     "key": "gross_value",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "The amount printed against Less: Discount on the account statement form",
+     "key": "discount_value",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "The final amount the customer is to pay, as printed against Net Value, Net Receivable (A+B) or Final Price on the account statement form; never Gross Value, Total Cost or Total (A)",
+     "key": "net_value",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "The amount printed against Total Cost on a Vehicle Account Statement (the figure before the other discount)",
+     "key": "total_cost",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "The amount printed against Total Receipts, Total Receipt or Net Amount Received (E) on the account statement form",
+     "key": "total_receipts",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "The amount printed against Short / Excess, Due or Balance Excess/Shortage (C-E) on the account statement form, as printed",
+     "key": "balance_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "JSON array of the rows of the Discount Details box of the account statement form that carry an amount, each as label (verbatim: Scheme, Loyalty, Accessory, Insurance, Other, MR, Exchange Bonus, Extended Warranty) and amount; empty when the form has no such box",
+     "key": "discount_details",
+     "required": false,
+     "type": "array"
+    },
+    {
+     "description": "The amount printed against Total in the Discount Details box of the account statement form",
+     "key": "discount_details_total",
+     "required": false,
+     "type": "number"
+    },
+    {
      "description": "JSON array of visible ledger rows. For each row preserve entry_date (date), particulars_raw, voucher_type, voucher_number, debit_amount, credit_amount and running_balance exactly as printed; do not merge rows or compute missing values",
      "key": "line_items",
      "required": false,
      "type": "array"
     }
    ],
-   "schema_version": "1.0"
+   "schema_version": "1.1"
   },
   "dealer_receipt": {
    "display_name": "Dealer Receipt",
@@ -4924,6 +5014,6 @@
  "source": {
   "branch": "dev",
   "repo": "verigence/verigence-di",
-  "sha": "1b10eda7cd351f41e190702fe47b70a189dc4310"
+  "sha": "64c10e26f223d847638d248a758c19e14e358581"
  }
 }
