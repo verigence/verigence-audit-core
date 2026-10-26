@@ -55,6 +55,7 @@ from audit_core.uc03_p2_journey_views import (
     counts_from_row,
     view_sql,
 )
+from audit_core.uc03_p2_object_keys import original_key
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_reviewer import page_stage_code, stage_is_reviewed
 from audit_core.uc03_p2_runtime import (
@@ -130,6 +131,24 @@ def _safe_filename(value: str) -> str:
     name = value.strip() or "document"
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
     return name[:180] or "document"
+
+
+def _upload_labels(connection: Connection, *, tenant_id: str, journey_id: UUID) -> tuple[str | None, str | None]:
+    """The outlet name and the PC's name the Journey belongs to, for the name
+    of the stored file (uc03_p2_object_keys)."""
+    row = connection.execute(
+        text(
+            """
+            SELECT o.outlet_name, j.created_by_display_name
+            FROM auditcore.journeys j
+            LEFT JOIN auditcore.dealer_outlets o
+              ON o.tenant_id = j.tenant_id AND o.dealer_id = j.dealer_id AND o.outlet_id = j.outlet_id
+            WHERE j.tenant_id = :t AND j.journey_id = :j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).one_or_none()
+    return (row[0], row[1]) if row else (None, None)
 
 
 def _activity(
@@ -1033,6 +1052,7 @@ def init_uploads(
             detail="Phase 2 document storage is not configured."
         ) from exc
 
+    labels = _upload_labels(connection, tenant_id=tenant_id, journey_id=journey_id)
     prepared: list[dict[str, Any]] = []
     for item in command.files:
         content_type = item.contentType.lower().strip()
@@ -1047,9 +1067,9 @@ def init_uploads(
                 detail=f"{item.filename}: file exceeds the {max_bytes // (1024 * 1024)} MB limit.",
             )
         candidate_batch_id = uuid4()
-        safe_name = _safe_filename(item.filename)
-        candidate_object_key = (
-            f"p2-documents/{tenant_id}/{journey_id}/{candidate_batch_id}/original/{safe_name}"
+        candidate_object_key = original_key(
+            tenant_id, journey_id, candidate_batch_id, filename=item.filename,
+            outlet_name=labels[0], pc_name=labels[1],
         )
         inserted = connection.execute(
             text(
@@ -1239,9 +1259,10 @@ def replace_document(
         ) from exc
 
     candidate_batch_id = uuid4()
-    candidate_key = (
-        f"p2-documents/{tenant_id}/{journey_id}/{candidate_batch_id}/original/"
-        f"{_safe_filename(command.filename)}"
+    outlet_name, pc_name = _upload_labels(connection, tenant_id=tenant_id, journey_id=journey_id)
+    candidate_key = original_key(
+        tenant_id, journey_id, candidate_batch_id, filename=command.filename,
+        outlet_name=outlet_name, pc_name=pc_name,
     )
     connection.execute(
         text(

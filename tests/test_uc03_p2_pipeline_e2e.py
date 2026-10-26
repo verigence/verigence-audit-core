@@ -410,3 +410,39 @@ def test_a_technical_intent_failure_still_retries():
     refused = DiCaptureV2Error(status_code=409, detail='{"detail": "x", "retryable": false}')
     assert worker._is_retryable(technical) is True
     assert worker._is_retryable(refused) is False
+
+
+def test_a_pc_upload_is_stored_under_its_ist_date_with_outlet_and_pc_in_the_name(pipeline):
+    """The original, its pages and its merged documents all sit in one dated
+    batch folder; the original's name carries the outlet and the PC."""
+    import re
+
+    journey, storage, di = pipeline
+    di.fail_next_finalize = False
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.journeys SET created_by_display_name='Ravi Kumar' "
+                 "WHERE tenant_id=:t AND journey_id=:j"), {"t": journey.tenant_id, "j": journey.journey_id})
+        outlet = connection.execute(
+            text("SELECT outlet_name FROM auditcore.dealer_outlets WHERE tenant_id=:t AND outlet_id=:o"),
+            {"t": journey.tenant_id, "o": journey.outlet_id}).scalar_one()
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}"
+    pdf = _three_page_pdf()
+    [upload] = client.post(f"{base}/uploads:init", json={"files": [{
+        "filename": "booking packet.pdf", "contentType": "application/pdf", "sizeBytes": len(pdf),
+        "clientUploadId": "e2e-packet-0099"}]}).json()["uploads"]
+    original = upload["uploadUrl"].split("https://storage.test/", 1)[1].split("?", 1)[0]
+    storage.objects[original] = pdf
+    assert client.post(f"{base}/uploads/{upload['batchId']}:finalize").status_code == 202
+    _drain(journey)
+
+    folder = (rf"p2-documents/{re.escape(journey.tenant_id)}/\d{{4}}-W\d{{2}}/\d{{4}}-\d{{2}}-\d{{2}}/"
+              rf"{journey.journey_id}/{upload['batchId']}")
+    assert re.fullmatch(rf"{folder}/original/[A-Za-z0-9.-]+__Ravi-Kumar__booking_packet\.pdf", original), original
+    assert outlet.split()[0] in original
+    stored = [k for k in storage.objects if k != original]
+    assert stored, "the worker stored no pages"
+    assert all(re.fullmatch(rf"{folder}/(pages|groups)/.+", k) for k in stored), stored
+    assert any("/pages/" in k for k in stored)

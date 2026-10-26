@@ -58,6 +58,7 @@ from audit_core.uc03_document_capture_v2 import (
     get_security_oauth_client,
 )
 from audit_core.uc03_p2_access import P2AccessContext, authorize_p2_any
+from audit_core.uc03_p2_object_keys import journey_folder_of
 from audit_core.uc03_p2_storage import (
     P2DocumentStorage,
     P2DocumentStorageError,
@@ -404,6 +405,11 @@ def delete_journey(
         keys = set(started["object_keys"])
         for prefix in storage_prefixes(tenant_id, journey_id):
             keys.update(storage.list_keys(prefix))
+        # Uploads made since 2026-10-26 sit under a date folder, not directly
+        # under the journey: sweep the journey's folder on each upload day too,
+        # for anything the database does not list.
+        for folder in sorted({f for k in started["object_keys"] if (f := journey_folder_of(k, journey_id))}):
+            keys.update(storage.list_keys(folder))
         object_count = storage.delete_objects(sorted(keys))
     except (P2DocumentStorageError, ValueError) as exc:
         logger.error("p2_journey_delete_r2_failed", tenant_id=tenant_id, journey_id=str(journey_id), error=str(exc))
