@@ -490,6 +490,19 @@ def test_deal_of_a_project_on_the_invoice_policy_is_unchanged(journey) -> None:
 
 
 # ── the rebuild job ──────────────────────────────────────────────────────────
+def test_rebuild_reports_a_statement_without_a_vehicle_line_as_no_ex_showroom(journey) -> None:
+    """The job's summary counts these (no_ex_showroom); the figure used to read
+    "None" as text and so never counted."""
+    from audit_core.uc03_account_statement_rebuild import rebuild_journey
+
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _ledger(journey, ADITYA_NO_VEHICLE)
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        item = rebuild_journey(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id, tag="t", commit=False)
+    assert item["statements"] == 1 and item["exShowroom"] is None
+
+
 def test_rebuild_dry_run_writes_nothing_and_commit_sets_the_deal(journey) -> None:
     from audit_core.uc03_account_statement_rebuild import rebuild_journey
 
