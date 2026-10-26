@@ -116,15 +116,19 @@ class DiCaptureV2Client:
         tenant_id: str,
         external_context_ref: str,
         document_id: str,
+        force: bool = False,
     ) -> dict[str, Any]:
         """Ask DI to read a document it already holds once more (no
         re-upload). Returns DI's outcome: queued, in_progress,
-        already_processed or not_classified."""
+        already_processed or not_classified. ``force`` reads a document that
+        was already read (the one-off statement re-read); DI refuses it with
+        ``has_corrections`` when a person verified or corrected it there."""
         return self._request(
             "POST",
             f"/v2/tenants/{tenant_id}/audit-storage-contexts/"
             f"{external_context_ref}/capture-documents/{document_id}:reprocess",
             token=token,
+            params={"force": "true"} if force else None,
         )
 
     def delete_document(
