@@ -109,3 +109,22 @@ def test_the_dry_run_asks_nothing(monkeypatch):
     assert asked == []
     reread.run_statement_reread(Engine(), "tag-commit", ["t1"])
     assert asked == [1]
+
+
+def test_a_copy_tag_does_not_ask_di_again(monkeypatch):
+    connection = _wire(monkeypatch)
+    seen: list = []
+
+    @contextmanager
+    def open_connection():
+        yield connection
+
+    class Engine:
+        begin = staticmethod(open_connection)
+
+    monkeypatch.setattr(reread, "set_tenant_context", lambda *a, **k: None)
+    monkeypatch.setattr(reread, "account_statement_is_source_of_truth", lambda *a, **k: True)
+    monkeypatch.setattr(reread, "_reread", lambda *a, **k: seen.append(k["ask"]) or {})
+    reread.run_statement_reread(Engine(), "x-copy-commit", ["t1"])
+    reread.run_statement_reread(Engine(), "x-commit", ["t1"])
+    assert seen == [False, True]
