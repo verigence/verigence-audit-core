@@ -1287,6 +1287,33 @@ REPORTS.update({
               AND e.association_status = 'ACTIVE' AND e.document_type_key = 'customer_ledger')
         ORDER BY x.outcome, j.journey_reference
     """,
+    # Every payment row of the Journeys whose receipts-against-statement check
+    # failed, with whether it counts (EVIDENCE on an ACTIVE document) and the
+    # kinds of document on file (2026-10-26: why do the receipts fall so short).
+    "receipts_failing_detail": """
+        SELECT j.journey_reference AS ref, p.amount, p.receipt_number AS receipt_no,
+               to_char(p.receipt_date, 'YYYY-MM-DD') AS receipt_date,
+               COALESCE(p.payment_mode_code, p.payment_method_code) AS mode,
+               p.status_source AS source, e.association_status AS doc_status,
+               e.document_type_key AS doc_type, left(p.source_di_document_id::text, 8) AS doc,
+               (SELECT string_agg(DISTINCT e2.document_type_key, ',')
+                  FROM auditcore.evidence e2
+                 WHERE e2.tenant_id = j.tenant_id AND e2.journey_id = j.journey_id
+                   AND e2.association_status = 'ACTIVE') AS documents_on_file
+        FROM auditcore.journeys j
+        JOIN LATERAL (
+            SELECT re.outcome, re.reason
+            FROM auditcore.rule_executions re
+            WHERE re.tenant_id = j.tenant_id AND re.journey_id = j.journey_id
+              AND re.rule_code = 'RECEIPTS_EQUAL_INVOICES'
+            ORDER BY re.evaluated_at_utc DESC LIMIT 1
+        ) x ON x.outcome = 'FAIL' AND x.reason LIKE '%account statement%'
+        LEFT JOIN auditcore.payments p ON p.tenant_id = j.tenant_id AND p.journey_id = j.journey_id
+        LEFT JOIN auditcore.evidence e
+          ON e.tenant_id = p.tenant_id AND e.journey_id = p.journey_id AND e.di_document_id = p.source_di_document_id
+        WHERE j.tenant_id = :t
+        ORDER BY j.journey_reference, p.receipt_date NULLS LAST, p.created_at_utc
+    """,
     "rv_lines": """
         SELECT j.journey_reference AS ref,
                (SELECT string_agg(cl.component_key || '=' || COALESCE(cl.standard_amount::text, '-') || '/'
