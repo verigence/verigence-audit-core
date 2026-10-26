@@ -140,6 +140,13 @@ _DISCOUNTS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 # 2026-10-26: every dealer's statement has one): "Net Value" (Aditya, Shivnath),
 # "NET RECEIVABLE (A+B)" (Utkal) -- and "Final price", which he also named.
 _PRINTED_TOTAL = re.compile(r"(NET VALUE|FINAL PRICE|NET RECEIVABLE( \(A ?\+ ?B\))?)( .*)?")
+# The form's own summary rows: figures the dealer wrote from the rows above
+# them, never a charge or a receipt, so they are not "unmapped" and are not
+# read as one. (The net value is read separately, above.)
+_SUMMARY = re.compile(
+    r"GROSS VALUE|DISCOUNT|TOTAL( COST| RECEIPTS?| \(A\))?|NET AMOUNT RECEIVED( \(E\))?|"
+    r"SHORT ?/ ?EXCESS|BALANCE ?(EXCESS ?/ ?SHORTAGE)?( \(C-E\))?|DUE"
+)
 # A discount line that names a scrappage bonus does not say whether it is the
 # dealer's or the certificate of deposit's, and the two are different
 # benefits: it is reported, not filed under either.
@@ -218,6 +225,8 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
         if key is not None:
             found.setdefault(key, []).append(amount)
             continue
+        if _SUMMARY.fullmatch(label):
+            continue
         if _FINANCER.fullmatch(label):
             out.financer = (out.financer or Decimal(0)) + amount
             out.receipts += amount
@@ -238,10 +247,15 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
     return out
 
 
-def statement_total(read: StatementRead) -> Decimal | None:
+def statement_total(fields: dict[str, Any], read: StatementRead) -> Decimal | None:
     """What the customer owes on the statement, for the receipts check (product
-    owner, 2026-10-26): the "Net value" / "Final price" the statement prints,
-    used as printed with no calculation. None when the statement prints none."""
+    owner, 2026-10-26): the net value as printed, with no calculation -- the
+    ``net_value`` field Document Intelligence reads (customer_ledger schema 1.1),
+    else the "Net value" / "Net receivable" / "Final price" row of the line
+    items. None when the statement prints none."""
+    field_value = _amount(fields.get("net_value"))
+    if field_value is not None and field_value > 0:
+        return field_value
     return read.printed_total if read.printed_total is not None and read.printed_total > 0 else None
 
 

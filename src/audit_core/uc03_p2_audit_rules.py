@@ -759,7 +759,7 @@ def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
             "The account statement has lines that could not be read with certainty (" + ", ".join(lines) + "); "
             "the receipts are compared once they are cleared."
         ))
-    billed = statement_total(read)
+    billed = statement_total(document["fields"], read)
     if billed is None:
         return RuleOutcome(code, "SKIPPED", "The account statement shows no net value or final price.")
     delivered = facts.delivery_date

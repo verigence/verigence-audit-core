@@ -39,7 +39,7 @@ def test_net_value_and_final_price_are_the_printed_total_not_an_unmapped_line() 
         read = read_statement([*CHARGES, {"particulars_raw": label, "debit_amount": 1145000}])
         assert read.printed_total == D(1145000)
         assert read.unmapped == [] and read.conflicts == []
-        assert statement_total(read) == D(1145000)
+        assert statement_total({}, read) == D(1145000)
 
 
 def test_the_three_dealers_total_labels_as_written_on_the_forms() -> None:
@@ -61,7 +61,7 @@ def test_two_different_printed_totals_are_a_conflict() -> None:
 
 
 def test_no_printed_total_means_no_total_nothing_is_calculated() -> None:
-    assert statement_total(read_statement(CHARGES)) is None
+    assert statement_total({}, read_statement(CHARGES)) is None
 
 
 @pytest.fixture
@@ -142,3 +142,43 @@ def test_a_line_that_could_not_be_read_skips_instead_of_guessing(journey) -> Non
     _delivered(journey, 30)
     result = _check(journey)
     assert result.outcome == "SKIPPED" and "MYSTERY FEE" in result.reason
+
+
+GENERIC_FORM = [  # the generic Account Statement form as DI may read it: charges, receipts and the summary rows
+    {"particulars_raw": "Ex Showroom", "debit_amount": 3070050}, {"particulars_raw": "Fast Tag", "debit_amount": 600},
+    {"particulars_raw": "Cash", "credit_amount": 25000}, {"particulars_raw": "Online transfer", "credit_amount": 3235715},
+    {"particulars_raw": "Gross Value", "debit_amount": 3240650}, {"particulars_raw": "Less: Discount*", "credit_amount": 4710},
+    {"particulars_raw": "Total Receipts", "credit_amount": 3260715}, {"particulars_raw": "Short / Excess", "debit_amount": 1},
+    {"particulars_raw": "Total Cost", "debit_amount": 3240650}, {"particulars_raw": "TOTAL (A)", "debit_amount": 1},
+    {"particulars_raw": "NET AMOUNT RECEIVED (E)", "credit_amount": 3260715},
+    {"particulars_raw": "BALANCE EXCESS/SHORTAGE (C-E)", "debit_amount": 503}, {"particulars_raw": "Due", "debit_amount": 45},
+]
+
+
+def test_the_forms_own_summary_rows_are_not_unmapped_lines() -> None:
+    read = read_statement([*GENERIC_FORM, {"particulars_raw": "Net Value", "debit_amount": 3235940}])
+    assert read.unmapped == [] and read.conflicts == []
+    assert read.components == {"ex_showroom_price": D(3070050), "fastag_amount": D(600)}
+    assert read.receipts == D(25000 + 3235715)  # cash + online only, never the total
+    assert read.printed_total == D(3235940)
+
+
+def test_the_dedicated_net_value_field_wins_over_the_row() -> None:
+    read = read_statement([*CHARGES, {"particulars_raw": "Net value", "debit_amount": 1145000}])
+    assert statement_total({"net_value": "11,68,095"}, read) == D(1168095)
+    assert statement_total({"net_value": None}, read) == D(1145000)
+    assert statement_total({"net_value": "0"}, read) == D(1145000)
+
+
+def test_a_statement_with_the_net_value_only_in_its_field_is_compared(journey) -> None:
+    document_id = uuid4()
+    add_evidence(journey, di_document_id=document_id, document_type_key="customer_ledger", process_area="DELIVERY")
+    add_extracted_field(journey, di_document_id=document_id, field_key="line_items", value=GENERIC_FORM,
+                        document_type="customer_ledger")
+    add_extracted_field(journey, di_document_id=document_id, field_key="net_value", value="3235940",
+                        document_type="customer_ledger")
+    _delivered(journey, 30)
+    add_receipt_payment(journey, amount="3235940", receipt_number="R-1", receipt_date="2026-09-01")
+    result = _check(journey)
+    assert result.outcome == "PASS", result.reason
+    assert D(result.details["statementTotal"]) == D(3235940)
