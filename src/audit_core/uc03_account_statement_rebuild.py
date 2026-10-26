@@ -66,25 +66,31 @@ def _invoice_held(connection: Connection, tenant_id: str, journey_id: UUID) -> i
     ).scalar() or 0)
 
 
-def _ex_showroom_references(connection: Connection, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
-    """What the statement's ex-showroom can be compared with, information only:
-    the price book's ex-showroom for the Journey's SKU (the price list version
-    the Journey is priced on) and the ex-showroom the Journey's other documents
-    read."""
-    book = connection.execute(
+def book_ex_showroom(connection: Connection, tenant_id: str, journey_id: UUID) -> list[Decimal]:
+    """The price book's ex-showroom for the Journey's SKU, on the price list
+    version the Journey is priced on (empty when it has no SKU or no price)."""
+    rows = connection.execute(
         text(
             """
-            SELECT string_agg(DISTINCT pli.standard_amount::text, ',')
+            SELECT DISTINCT pli.standard_amount
             FROM auditcore.journeys j
             JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
             JOIN auditcore.price_list_items pli
               ON pli.tenant_id = j.tenant_id AND pli.price_list_version_id = j.price_list_version_id
              AND pli.product_sku_id = jp.product_sku_id AND pli.component_key = 'EX_SHOWROOM'
-            WHERE j.tenant_id = :t AND j.journey_id = :j
+            WHERE j.tenant_id = :t AND j.journey_id = :j AND pli.standard_amount IS NOT NULL
             """
         ),
         {"t": tenant_id, "j": journey_id},
-    ).scalar()
+    ).scalars().all()
+    return [Decimal(str(r)) for r in rows]
+
+
+def _ex_showroom_references(connection: Connection, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """What the statement's ex-showroom can be compared with, information only:
+    the price book's ex-showroom for the Journey's SKU and the ex-showroom the
+    Journey's other documents read."""
+    book = book_ex_showroom(connection, tenant_id, journey_id)
     others = connection.execute(
         text(
             """
@@ -96,7 +102,7 @@ def _ex_showroom_references(connection: Connection, tenant_id: str, journey_id: 
         ),
         {"t": tenant_id, "j": journey_id},
     ).scalar()
-    return {"bookExShowroom": book, "otherDocumentsExShowroom": others}
+    return {"bookExShowroom": ",".join(str(b) for b in sorted(book)) or None, "otherDocumentsExShowroom": others}
 
 
 def _on_phase_two(connection: Connection, tenant_id: str, journey_id: UUID) -> bool:

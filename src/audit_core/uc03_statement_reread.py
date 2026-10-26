@@ -16,6 +16,10 @@ left alone, and listed by Journey, when
 Document Intelligence refuses, too, a document a person verified or
 corrected there (``has_corrections``).
 
+A tag containing "-misread-" picks, instead, the statements whose ex-showroom is
+implausible against the price book (see ex_showroom_implausible), printed net
+value or not, and reports after a commit how many still are.
+
 A tag containing "-copy-" does not ask DI again: it only copies the pages DI
 has already read (after a worker restart cut a run short).
 
@@ -32,6 +36,7 @@ from __future__ import annotations
 
 import os
 import time
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -62,6 +67,20 @@ _POLL_SECONDS = int(os.environ.get("AUDIT_CORE_STATEMENT_REREAD_POLL_SECONDS", "
 # on DEV (2026-10-26).
 _SETTLE_SECONDS = int(os.environ.get("AUDIT_CORE_STATEMENT_REREAD_SETTLE_SECONDS", "300"))
 _SETTLED_PAGE_STATES = ("READY", "NEEDS_REVIEW")
+# A statement's ex-showroom this many times above or below the price book's is
+# a misreading, not a price: no dealer sells at a third or at three times the
+# list price, and a slipped decimal or digit is ten times off (2026-10-26:
+# 98,65,000 read for 9,86,500).
+_IMPLAUSIBLE_RATIO = Decimal(3)
+
+
+def ex_showroom_implausible(ex_showroom: Decimal | None, book: list[Decimal]) -> bool:
+    """True when the statement's ex-showroom is far from every price the book
+    holds for the Journey's SKU. False when either is missing: nothing to
+    compare, so nothing is claimed."""
+    if ex_showroom is None or not book:
+        return False
+    return all(not (b / _IMPLAUSIBLE_RATIO <= ex_showroom <= b * _IMPLAUSIBLE_RATIO) for b in book if b > 0)
 
 
 def _page(connection: Connection, tenant_id: str, journey_id: UUID, di_document_id: Any) -> dict[str, Any] | None:
@@ -91,9 +110,12 @@ def _corrected_fields(connection: Connection, tenant_id: str, journey_id: UUID, 
     ).scalar() or 0)
 
 
-def statement_items(connection: Connection, tenant_id: str) -> list[dict[str, Any]]:
+def statement_items(connection: Connection, tenant_id: str, *, misread: bool = False) -> list[dict[str, Any]]:
     """Every customer_ledger statement of the tenant, with whether it needs
-    reading again and why not when it is left alone."""
+    reading again and why not when it is left alone. ``misread`` picks the
+    statements whose ex-showroom is implausible against the price book instead
+    of those with no printed net value."""
+    from audit_core.uc03_account_statement_rebuild import book_ex_showroom
     from audit_core.uc03_p2_reviewer import page_stage_code, stage_is_reviewed
 
     journeys = connection.execute(
@@ -116,6 +138,8 @@ def statement_items(connection: Connection, tenant_id: str) -> list[dict[str, An
             kind = statement_kind(rows)
             read = read_statement(rows) if kind == KIND_FORM else None
             has_total = bool(read) and statement_total(document["fields"], read) is not None
+            implausible = bool(read) and ex_showroom_implausible(
+                read.components.get("ex_showroom_price"), book_ex_showroom(connection, tenant_id, journey_id))
             di_document_id = document["documentId"]
             page = _page(connection, tenant_id, journey_id, di_document_id)
             stage = page_stage_code(connection, tenant_id=tenant_id, journey_id=journey_id,
@@ -125,7 +149,9 @@ def statement_items(connection: Connection, tenant_id: str) -> list[dict[str, An
                 connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage)
             if kind != KIND_FORM:
                 decision = "SKIP_NOT_A_STATEMENT_FORM"
-            elif has_total:
+            elif misread and not implausible:
+                decision = "SKIP_EX_SHOWROOM_PLAUSIBLE"
+            elif has_total and not misread:
                 decision = "SKIP_HAS_PRINTED_TOTAL"
             elif page is None or stage is None:
                 decision = "SKIP_PAGE_UNKNOWN"
@@ -141,7 +167,7 @@ def statement_items(connection: Connection, tenant_id: str) -> list[dict[str, An
                 "journeyId": journey_id, "journeyReference": journey["journey_reference"],
                 "diDocumentId": di_document_id, "queueId": page["queue_id"] if page else None,
                 "queueStatus": page["queue_status"] if page else None, "stage": stage, "kind": kind,
-                "hasPrintedTotal": has_total, "correctedFields": corrected, "stageReviewed": reviewed,
+                "hasPrintedTotal": has_total, "exShowroomImplausible": implausible, "correctedFields": corrected, "stageReviewed": reviewed,
                 "decision": decision,
             })
     return items
@@ -279,13 +305,14 @@ def _reread(engine: Engine, tenant_id: str, items: list[dict[str, Any]], tag: st
 
 def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> None:
     commit = tag.endswith("-commit")
+    misread = "-misread-" in tag
     for tenant_id in tenant_ids:
         try:
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
                 if not account_statement_is_source_of_truth(connection, tenant_id=tenant_id):
                     continue
-                items = statement_items(connection, tenant_id)
+                items = statement_items(connection, tenant_id, misread=misread)
         except Exception:
             logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
             continue
@@ -299,6 +326,18 @@ def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> Non
             try:
                 results = _reread(engine, tenant_id, [i for i in items if i["decision"] == "REREAD"], tag,
                                   ask="-copy-" not in tag)
+            except Exception:
+                logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
+        if misread and commit:
+            # the same test again, on what the statements now hold
+            try:
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    after = [i for i in statement_items(connection, tenant_id, misread=True) if i["exShowroomImplausible"]]
+                results["still_implausible"] = len(after)
+                for item in after:
+                    logger.warning("statement_ex_showroom_still_implausible", tag=tag, tenant_id=tenant_id,
+                                   journey=item["journeyReference"], di_document_id=str(item["diDocumentId"]))
             except Exception:
                 logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
         logger.info("statement_reread_finished", tag=tag, tenant_id=tenant_id, commit=commit,
