@@ -21,7 +21,7 @@ actions:
 - CONFIRM_BREACH
 - MARK_FALSE_POSITIVE
 # The PC closes an image-quality task by hand, with a comment
-# (PC_PAGE_QUALITY_REJECTED only).
+# (PC_PAGE_QUALITY_REJECTED and PC_LARGE_UPLOAD_REVIEW only).
 - CLOSE_TASK
 exception_roles:
 - TL
@@ -141,6 +141,20 @@ task_types:
     completion: MACHINE_VERIFIED
     actions:
     - REUPLOAD_DOCUMENT
+    - ADD_COMMENT
+  # An uploaded file of more than 25 pages (P2_LARGE_UPLOAD_PAGES): "please
+  # review it and check that all these pages are really needed" (product
+  # owner 2026-10-26). Advice only: nothing is blocked. It is deliberately
+  # outside the Documents and Manual Verification tabs, so the delivery gate
+  # never waits for it. The PC closes it with a comment.
+  PC_LARGE_UPLOAD_REVIEW:
+    category: UPLOAD_REVIEW
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT
+    completion: MACHINE_VERIFIED
+    actions:
+    - CLOSE_TASK
     - ADD_COMMENT
   # One task per uploaded file with pages refused by the scan-quality check
   # (blurred, faded / low contrast, too small: any DI_QUALITY_* refusal),

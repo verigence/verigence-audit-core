@@ -37,7 +37,10 @@ _EXCEPTION_ROLES = frozenset({"TL", "PM"})
 # with a comment (product owner 2026-10-22): the system cannot know which
 # upload answers it.
 QUALITY_TASK = "PC_PAGE_QUALITY_REJECTED"
+LARGE_UPLOAD_TASK = "PC_LARGE_UPLOAD_REVIEW"
 CLOSE_TASK = "CLOSE_TASK"
+# The tasks a PC closes by hand, with a comment.
+CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK})
 
 
 class TaskStateError(ValueError):
@@ -417,8 +420,8 @@ def submit_action(
         )
 
     if action == CLOSE_TASK:
-        if task["task_type"] != QUALITY_TASK:
-            raise ValueError(f"Action {action} is only for the image-quality task")
+        if task["task_type"] not in CLOSE_TASK_TYPES:
+            raise ValueError(f"Action {action} is only for the image-quality and large-upload tasks")
         # Checked here, on the server, before anything is written: the web
         # page asks for the comment too, but is not what enforces it.
         comment = (comment or "").strip()

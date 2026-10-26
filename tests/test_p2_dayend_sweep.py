@@ -909,11 +909,13 @@ def test_only_whoever_the_task_is_assigned_to_can_close_it(journey):
     assert len([e for e in _events(journey, task_id) if e["event_type"] == CLOSE]) == 1
 
 
-def test_the_action_belongs_to_the_image_quality_task_only(journey):
+def test_the_action_belongs_to_the_image_quality_and_large_upload_tasks_only(journey):
     from audit_core.uc03_p2_registry import get_registry
 
     tasks = get_registry().tasks
-    assert [name for name, template in tasks.items() if CLOSE in template.actions] == ["PC_PAGE_QUALITY_REJECTED"]
+    # (2026-10-26: the large-upload notice is closed the same way, with a comment.)
+    assert sorted(name for name, template in tasks.items() if CLOSE in template.actions) == [
+        "PC_LARGE_UPLOAD_REVIEW", "PC_PAGE_QUALITY_REJECTED"]
     # The file's other failed page keeps its own, unchanged task and cannot use it.
     batch_id, rows = _file(journey, [("booking_form", "READY"), (None, "FAILED"), (None, "FAILED")])
     _fail(journey, rows[1]["queue_id"], BLUR)

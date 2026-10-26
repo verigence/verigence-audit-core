@@ -31,6 +31,7 @@ from audit_core.uc03_p2_document_health import TL_AFTER_SECONDS
 from audit_core.uc03_p2_names import display_name, same_organisation, same_person
 from audit_core.uc03_p2_registry import ControlTemplate, Registry, get_registry
 from audit_core.uc03_p2_runtime import (
+    LARGE_UPLOAD_PAGES,
     QUALITY_CLOSE_INSTRUCTION,
     dayend_removal_notice,
     swept_pending_sql,
@@ -646,6 +647,13 @@ def page_open_path(tenant_id: str, journey_id: UUID, queue_id: UUID | str) -> st
 
 
 
+def upload_open_path(tenant_id: str, journey_id: UUID, batch_id: UUID | str) -> str:
+    """The app endpoint that issues a short-lived link to the file as the PC
+    uploaded it (uc03_p2_api.get_upload_file): the Daily Processing report
+    carries it as filePath, since a storage link itself would expire."""
+    return f"/p2/v1/tenants/{tenant_id}/journeys/{journey_id}/uploads/{batch_id}/file"
+
+
 # Why the quality task closed by itself. There is no time rule: an upload of
 # some other file never answers a refused page (review of #479, 2026-10-21).
 # The PC closes the task by hand, with a comment, every time (2026-10-22;
@@ -980,6 +988,66 @@ def sync_processing_failure_tasks(
         closed += _resolve_prefix_except(connection, tenant_id=tenant_id, journey_id=journey_id, prefix=prefix,
                                          keep=keep, evidence=evidence)
     closed += sync_dead_work_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, registry=registry)
+    if closed:
+        counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed
+    return counts
+
+
+LARGE_UPLOAD_TASK_TYPE = "PC_LARGE_UPLOAD_REVIEW"
+_LARGE_UPLOAD_PREFIX = "large-upload:"
+
+
+def sync_large_upload_tasks(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, registry: Registry | None = None,
+    evaluation_started_at: datetime | None = None, threshold: int | None = None,
+) -> dict[str, int]:
+    """One Info notice (PC) per uploaded file of more than ``threshold`` pages
+    (25 by default; product owner 2026-10-26): please review the file and
+    confirm that this many pages are really needed. It never blocks anything:
+    the upload is already read, the task sits outside the Documents and
+    Manual Verification tabs the delivery gate looks at, and the PC closes it
+    with a comment (Close task). A task closed that way is not reopened for
+    the same file. It closes itself if the file is cancelled, fails before it
+    was split or is deleted. The Daily Processing report highlights the file."""
+    registry = registry or get_registry()
+    limit = LARGE_UPLOAD_PAGES if threshold is None else threshold
+    batches = connection.execute(
+        text(
+            """
+            SELECT batch_id, original_filename, page_count
+            FROM auditcore.p2_upload_batches
+            WHERE tenant_id=:t AND journey_id=:j AND page_count > :limit
+              AND batch_status NOT IN ('CANCELLED','FAILED','AWAITING_UPLOAD')
+            ORDER BY created_at_utc
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "limit": limit},
+    ).mappings().all()
+    counts: dict[str, int] = {}
+    wanted: set[str] = set()
+    for row in batches:
+        pages, filename = int(row["page_count"]), row["original_filename"]
+        key = f"{_LARGE_UPLOAD_PREFIX}{journey_id}:{row['batch_id']}"
+        wanted.add(key)
+        _, outcome = raise_or_refresh(
+            connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+            task_type=LARGE_UPLOAD_TASK_TYPE, source_type="DOCUMENT", source_code="LARGE_UPLOAD",
+            title=f"{filename}: {pages} pages uploaded, please review",
+            description=(f"{filename} has {pages} pages, more than {limit}. Please review the file and check "
+                         f"that all {pages} pages are really needed on this booking; remove or leave out the "
+                         "pages that are not. Nothing is blocked and you can keep uploading. Close this task "
+                         "with a comment when you have reviewed it."),
+            reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "LARGE_UPLOAD",
+                       "batchId": str(row["batch_id"]), "filename": filename, "pageCount": pages,
+                       "threshold": limit},
+            severity="INFO", registry=registry, evaluation_started_at=evaluation_started_at,
+        )
+        counts[outcome] = counts.get(outcome, 0) + 1
+    closed = _resolve_prefix_except(
+        connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"{_LARGE_UPLOAD_PREFIX}{journey_id}:",
+        keep=wanted, evidence={"reason": "The file is no longer on the journey, or has no more than "
+                                         f"{limit} pages."},
+    )
     if closed:
         counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed
     return counts
