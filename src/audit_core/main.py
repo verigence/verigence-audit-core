@@ -41,6 +41,8 @@ from audit_core.projects import router as project_router
 from audit_core.readiness import router as readiness_router
 from audit_core.role_mapping_policy import install_role_mapping_policy
 from audit_core.runtime_warmup import warm_runtime_dependencies
+from audit_core.task_manager_api import admin_router as task_manager_admin_router
+from audit_core.task_manager_api import router as task_manager_router
 from audit_core.tasks_api import router as task_router
 from audit_core.uc02_project_admin_stabilization import (
     router as uc02_project_admin_stabilization_router,
@@ -292,6 +294,8 @@ def create_app() -> FastAPI:
     application.include_router(uc03_sku_standard_router)
     application.include_router(uc03_masters_overview_router)
     application.include_router(uc03_p2_gate_pass_router)
+    application.include_router(task_manager_router)
+    application.include_router(task_manager_admin_router)
     application.include_router(uc03_p2_vehicle_photos_router)
     application.include_router(uc03_document_capture_v2_router)
     application.include_router(uc03_unified_document_capture_router)
