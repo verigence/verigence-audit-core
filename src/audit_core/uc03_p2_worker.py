@@ -4166,6 +4166,16 @@ def main() -> None:
         threading.Thread(target=run_account_statement_rebuild,
                          args=(engine, statement_tag, _active_tenants(engine)),
                          name="account-statement-rebuild", daemon=True).start()
+    # Mahindra Orissa: the account statements read before customer_ledger 1.1
+    # read again for the printed net value (2026-10-26): dry run unless the
+    # tag ends with "-commit".
+    statement_reread_tag = os.environ.get("AUDIT_CORE_STATEMENT_REREAD_TAG", "").strip()
+    if statement_reread_tag:
+        from audit_core.uc03_statement_reread import run_statement_reread
+
+        threading.Thread(target=run_statement_reread,
+                         args=(engine, statement_reread_tag, _active_tenants(engine)),
+                         name="statement-reread", daemon=True).start()
     # Mahindra Orissa: the open invoice-check tasks closed (2026-10-26): dry run
     # unless the tag ends with "-commit".
     invoice_cleanup_tag = os.environ.get("AUDIT_CORE_INVOICE_TASK_CLEANUP_TAG", "").strip()
