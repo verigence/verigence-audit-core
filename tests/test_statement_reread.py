@@ -38,9 +38,13 @@ class _Connection:
         return _Result(self._journeys)
 
 
-def _wire(monkeypatch, *, lines=FORM, fields_extra=None, queue_status="READY", corrected=0, reviewed=False, stage="DELIVERY"):
+def _wire(monkeypatch, *, lines=FORM, fields_extra=None, queue_status="READY", corrected=0, reviewed=False, stage="DELIVERY",
+          book=()):
     journey_id = uuid4()
     document = {"documentId": uuid4(), "fields": {"line_items": lines, **(fields_extra or {})}}
+    import audit_core.uc03_account_statement_rebuild as rebuild
+
+    monkeypatch.setattr(rebuild, "book_ex_showroom", lambda *a, **k: list(book))
     monkeypatch.setattr(reread, "load_ledger_documents", lambda *a, **k: [document])
     monkeypatch.setattr(reread, "_page", lambda *a, **k: {"queue_id": uuid4(), "queue_status": queue_status})
     monkeypatch.setattr(reread, "_corrected_fields", lambda *a, **k: corrected)
@@ -192,3 +196,40 @@ def test_a_statement_whose_copy_fails_is_counted_not_dropped(monkeypatch):
     monkeypatch.setattr(reread, "_copy_into_audit_core", boom)
     counts = reread._reread(Engine(), "t1", [item], "x-copy-commit", ask=False)
     assert counts["failed"] == 1 and counts["finished"] == 0
+
+
+def test_an_ex_showroom_ten_times_the_price_book_is_a_misreading():
+    from decimal import Decimal
+
+    book = [Decimal("986499.35")]
+    assert reread.ex_showroom_implausible(Decimal(9865000), book) is True
+    assert reread.ex_showroom_implausible(Decimal(98650), book) is True
+
+
+def test_a_real_price_difference_is_not_called_a_misreading():
+    from decimal import Decimal
+
+    # a dealer's price a tenth above or below the book is a variance, not a misread
+    assert reread.ex_showroom_implausible(Decimal(1030100), [Decimal("909000.54")]) is False
+    assert reread.ex_showroom_implausible(Decimal(891000), [Decimal("808499.97")]) is False
+
+
+def test_nothing_is_claimed_without_a_price_to_compare_with():
+    from decimal import Decimal
+
+    assert reread.ex_showroom_implausible(Decimal(9865000), []) is False
+    assert reread.ex_showroom_implausible(None, [Decimal("986499.35")]) is False
+
+
+def test_the_misread_run_picks_only_the_implausible_statement_even_with_a_printed_total(monkeypatch):
+    from decimal import Decimal
+
+    book = [Decimal("1802000.64")]
+    printed = FORM + [{"particulars_raw": "Net Value", "debit_amount": 1964237}]
+    bad = [dict(r) for r in printed]
+    bad[0]["debit_amount"] = 17970010  # ex-showroom ten times too large
+    assert reread.statement_items(_wire(monkeypatch, lines=bad, book=book), "t1", misread=True)[0]["decision"] == "REREAD"
+    assert reread.statement_items(_wire(monkeypatch, lines=printed, book=book), "t1", misread=True)[0][
+        "decision"] == "SKIP_EX_SHOWROOM_PLAUSIBLE"
+    assert reread.statement_items(_wire(monkeypatch, lines=bad, book=book), "t1")[0][
+        "decision"] == "SKIP_HAS_PRINTED_TOTAL"
