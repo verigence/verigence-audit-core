@@ -162,7 +162,7 @@ Computed on read from indexed range queries; no batch job.
 - Limits stated on the dashboard: it measures interaction, not work; minutes
   since the last send are lost if the browser is killed (undercount, never
   overcount); a person using two browsers the same day shows the larger one.
-- A one-line notice at sign-in tells staff that time on the system is measured.
+- No notice is shown at sign-in (product owner, 2026-10-26).
 
 ## 10. Schema (migration 0164_task_manager)
 
