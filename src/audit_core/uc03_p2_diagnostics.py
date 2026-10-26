@@ -1267,6 +1267,26 @@ REPORTS.update({f"rv_{name}": sql for name, sql in REVIEW_SQL.items()})
 # Beyond the Reports page's facts: the Deal's own lines (standard and actual per
 # component) and the customer ledger documents in full (their entry lines).
 REPORTS.update({
+    # The receipts-against-statement check as last run, for the Journeys that
+    # have an account statement (2026-10-26: did the printed net value make it
+    # run?).
+    "receipts_statement_outcomes": """
+        SELECT j.journey_reference AS ref, x.outcome, left(x.reason, 230) AS reason,
+               to_char(x.evaluated_at_utc, 'MM-DD HH24:MI') AS evaluated
+        FROM auditcore.journeys j
+        JOIN LATERAL (
+            SELECT re.outcome, re.reason, re.evaluated_at_utc
+            FROM auditcore.rule_executions re
+            WHERE re.tenant_id = j.tenant_id AND re.journey_id = j.journey_id
+              AND re.rule_code = 'RECEIPTS_EQUAL_INVOICES'
+            ORDER BY re.evaluated_at_utc DESC LIMIT 1
+        ) x ON TRUE
+        WHERE j.tenant_id = :t AND EXISTS (
+            SELECT 1 FROM auditcore.evidence e
+            WHERE e.tenant_id = j.tenant_id AND e.journey_id = j.journey_id
+              AND e.association_status = 'ACTIVE' AND e.document_type_key = 'customer_ledger')
+        ORDER BY x.outcome, j.journey_reference
+    """,
     "rv_lines": """
         SELECT j.journey_reference AS ref,
                (SELECT string_agg(cl.component_key || '=' || COALESCE(cl.standard_amount::text, '-') || '/'
