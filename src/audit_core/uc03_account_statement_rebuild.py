@@ -66,6 +66,39 @@ def _invoice_held(connection: Connection, tenant_id: str, journey_id: UUID) -> i
     ).scalar() or 0)
 
 
+def _ex_showroom_references(connection: Connection, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """What the statement's ex-showroom can be compared with, information only:
+    the price book's ex-showroom for the Journey's SKU (the price list version
+    the Journey is priced on) and the ex-showroom the Journey's other documents
+    read."""
+    book = connection.execute(
+        text(
+            """
+            SELECT string_agg(DISTINCT pli.standard_amount::text, ',')
+            FROM auditcore.journeys j
+            JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+            JOIN auditcore.price_list_items pli
+              ON pli.tenant_id = j.tenant_id AND pli.price_list_version_id = j.price_list_version_id
+             AND pli.product_sku_id = jp.product_sku_id AND pli.component_key = 'EX_SHOWROOM'
+            WHERE j.tenant_id = :t AND j.journey_id = :j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar()
+    others = connection.execute(
+        text(
+            """
+            SELECT string_agg(DISTINCT f.source_document_type_key || '=' || (f.effective_value #>> '{}'), ' | ')
+            FROM auditcore.journey_document_extracted_fields f
+            WHERE f.tenant_id = :t AND f.journey_id = :j AND f.field_key = 'ex_showroom_price'
+              AND f.effective_value IS NOT NULL
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar()
+    return {"bookExShowroom": book, "otherDocumentsExShowroom": others}
+
+
 def _on_phase_two(connection: Connection, tenant_id: str, journey_id: UUID) -> bool:
     return connection.execute(
         text("SELECT 1 FROM auditcore.p2_journey_runtime WHERE tenant_id = :t AND journey_id = :j"),
@@ -103,6 +136,8 @@ def rebuild_journey(
                                      - sum(statement.discounts.values(), Decimal(0))) if statement else None),
         "invoiceHeldBefore": _invoice_held(connection, tenant_id, journey_id),
     }
+    if statement:
+        item.update(_ex_showroom_references(connection, tenant_id, journey_id))
     if not commit:
         return item
     sync_account_statement(connection, tenant_id=tenant_id, journey_id=journey_id,
