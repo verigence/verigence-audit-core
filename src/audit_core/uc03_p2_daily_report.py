@@ -481,8 +481,12 @@ def build_daily_processing_report(
     status = _document_status(file_list["files"], pcs, names)
     team = _team_work(connection, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end, names=names)
     large = [f for f in file_list["files"] if f["large"]]
+    from audit_core.task_manager_reports import build_task_status
+
     return {
         "day": day.isoformat(),
+        # Daily status of Journey Tasks and Task Manager tasks (product owner 2026-10-26).
+        "taskStatus": build_task_status(connection, tenant_id=tenant_id, day=day),
         "timezone": timezone_name,
         "documentStatus": status,
         "teamWork": team,

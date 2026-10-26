@@ -3518,7 +3518,8 @@ def get_task(
         text("SELECT * FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_id=:id"),
         {"t": tenant_id, "id": task_id},
     ).mappings().one_or_none()
-    if task is None:
+    if task is None or task["journey_id"] is None:
+        # A Task Manager task (no Journey) is read through /task-manager/tasks.
         raise HTTPException(status_code=404, detail="Task was not found.")
     resolve_p2_scope(
         connection, tenant_id=tenant_id, journey_id=UUID(str(task["journey_id"])),

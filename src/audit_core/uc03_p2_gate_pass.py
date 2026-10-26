@@ -39,6 +39,8 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.task_manager import _insert_task as insert_task_manager_task
+from audit_core.task_manager import close_gate_pass_tasks
 from audit_core.uc03_p2_access import authorize_p2
 from audit_core.uc03_p2_object_keys import ist_day, safe_filename, safe_part
 from audit_core.uc03_p2_storage import P2DocumentStorageError, get_p2_document_storage
@@ -269,6 +271,9 @@ def submit_counts(
         {"nd": declared, "st": command.stockTransfers, "td": command.testDrives, "oc": command.otherCount,
          "on": note or None, "files": files, "div": divergence, "t": tenant_id, "i": str(gate_pass_id)},
     )
+    if divergence == "NONE":
+        close_gate_pass_tasks(connection, tenant_id=tenant_id, outlet_id=row["outlet_id"],
+                              business_date=row["business_date"])
     return {
         "gatePass": _public_gate_pass(_gate_pass_row(connection, tenant_id, gate_pass_id)),
         "divergence": divergence, "declared": declared, "deliveryFiles": files,
@@ -284,29 +289,31 @@ class AnswerCommand(BaseModel):
 def _raise_delivery_not_notified(connection: Connection, tenant_id: str, row: dict[str, Any], actor_id: str) -> None:
     missing = int(row["new_deliveries"] or 0) - int(row["delivery_files"] or 0)
     day = row["business_date"]
-    connection.execute(
-        text(
-            """
-            INSERT INTO auditcore.p2_daily_tasks (
-                tenant_id, gate_pass_id, dealer_id, outlet_id, outlet_name, business_date, category, task_type,
-                title, description, priority, assigned_role_code, details, raised_by_actor_id)
-            VALUES (:t, :gp, :dealer, :outlet, :outlet_name, :day, :cat, :type, :title, :descr, 'HIGH', 'TL',
-                    CAST(:details AS jsonb), :actor)
-            ON CONFLICT (tenant_id, gate_pass_id, task_type) WHERE gate_pass_id IS NOT NULL DO NOTHING
-            """
-        ),
-        {"t": tenant_id, "gp": str(row["gate_pass_id"]), "dealer": str(row["dealer_id"]),
-         "outlet": str(row["outlet_id"]), "outlet_name": row["outlet_name"], "day": day,
-         "cat": DAILY_TASK_CATEGORY, "type": TASK_DELIVERY_NOT_NOTIFIED,
-         "title": f"Delivery not notified to the PC: {row['outlet_name']}, {day:%d-%m-%y}",
-         "descr": (f"The gate pass of {row['outlet_name']} for {day:%d-%m-%y} lists {row['new_deliveries']} new "
+    title = f"Delivery not notified to the PC: {row['outlet_name']}, {day:%d-%m-%y}"
+    description = (f"The gate pass of {row['outlet_name']} for {day:%d-%m-%y} lists {row['new_deliveries']} new "
                    f"deliveries, but only {row['delivery_files']} Delivery files were uploaded. "
                    f"{row['pc_name']} says the {missing} other {'delivery was' if missing == 1 else 'deliveries were'} "
-                   f"not notified to them and they hold no files for it."),
-         "details": json.dumps({"declared": row["new_deliveries"], "deliveryFiles": row["delivery_files"],
-                                "missing": missing, "pcName": row["pc_name"]}),
-         "actor": actor_id},
-    )
+                   f"not notified to them and they hold no files for it.")
+    # A Task Manager task of the outlet for the Team Lead, closed by the TL with
+    # a note (product owner 2026-10-26: daily tasks live in the Task Manager).
+    task_id = insert_task_manager_task(connection, tenant_id=tenant_id, values={
+        "scope": "OUTLET", "dealer_id": str(row["dealer_id"]), "outlet_id": str(row["outlet_id"]),
+        "task_type": TASK_DELIVERY_NOT_NOTIFIED, "category": DAILY_TASK_CATEGORY, "origin": "SYSTEM",
+        "source_type": "GATE_PASS", "source_code": str(row["gate_pass_id"]),
+        "dedupe_key": f"gatepass:{row['gate_pass_id']}:{TASK_DELIVERY_NOT_NOTIFIED}",
+        "title": title, "description": description, "priority": "HIGH",
+        "reference": {"declared": row["new_deliveries"], "deliveryFiles": row["delivery_files"], "missing": missing,
+                      "pcName": row["pc_name"], "gatePassId": str(row["gate_pass_id"]),
+                      "businessDate": day.isoformat(), "outletName": row["outlet_name"]},
+        "assigned_role": "TL", "raised_by": actor_id, "raised_role": "PC", "raised_name": row["pc_name"],
+        "protocol": "SELF_CLOSING",
+    })
+    if task_id is not None:
+        connection.execute(
+            text("INSERT INTO auditcore.p2_task_events (tenant_id, task_id, journey_id, event_type, actor_id, "
+                 "actor_role_code, details) VALUES (:t, :id, NULL, 'RAISED', :a, 'PC', CAST(:d AS jsonb))"),
+            {"t": tenant_id, "id": str(task_id), "a": actor_id, "d": json.dumps({"gatePassId": str(row["gate_pass_id"])})},
+        )
 
 
 @router.post("/gate-passes/{gate_pass_id}/answer")
@@ -333,6 +340,8 @@ def answer_divergence(
                  "WHERE tenant_id = :t AND gate_pass_id = :i"),
             {"n": note, "t": tenant_id, "i": str(gate_pass_id)},
         )
+        close_gate_pass_tasks(connection, tenant_id=tenant_id, outlet_id=row["outlet_id"],
+                              business_date=row["business_date"])
     elif row["divergence"] == "MISSING_FILES":
         if command.filesHeld is None:
             raise HTTPException(status_code=422, detail="Answer YES or NO: do you hold the files for the other deliveries?")
@@ -341,6 +350,8 @@ def answer_divergence(
                  "WHERE tenant_id = :t AND gate_pass_id = :i"),
             {"h": command.filesHeld, "t": tenant_id, "i": str(gate_pass_id)},
         )
+        close_gate_pass_tasks(connection, tenant_id=tenant_id, outlet_id=row["outlet_id"],
+                              business_date=row["business_date"])
         if command.filesHeld is False:
             _raise_delivery_not_notified(connection, tenant_id, row, principal.subject)
     else:
@@ -458,15 +469,28 @@ def gate_pass_image_url(
     return {"url": url, "contentType": row["content_type"], "filename": row["object_key"].rsplit("/", 1)[-1]}
 
 
+# Daily tasks now live in the Task Manager (p2_tasks, OUTLET scope); these two
+# endpoints keep their response shape for the Daily Gate Pass screen.
+_DAILY_TASK_SQL = """
+    SELECT t.task_id, t.category, t.task_type, t.title, t.description, t.priority, t.task_status,
+           t.outlet_id, COALESCE(o.outlet_name, t.reference->>'outletName') AS outlet_name,
+           t.reference, t.created_at_utc, t.verified_at_utc, t.completion_result
+    FROM auditcore.p2_tasks t
+    LEFT JOIN auditcore.dealer_outlets o ON o.tenant_id = t.tenant_id AND o.outlet_id = t.outlet_id
+"""
+
+
 def _public_task(row: dict[str, Any]) -> dict[str, Any]:
+    reference = row["reference"] or {}
+    done = row["task_status"] == "VERIFIED_COMPLETE"
     return {
-        "dailyTaskId": str(row["daily_task_id"]), "category": row["category"], "taskType": row["task_type"],
+        "dailyTaskId": str(row["task_id"]), "category": row["category"], "taskType": row["task_type"],
         "title": row["title"], "description": row["description"], "priority": row["priority"],
-        "status": row["task_status"], "outletId": str(row["outlet_id"]), "outletName": row["outlet_name"],
-        "businessDate": row["business_date"].isoformat(), "gatePassId": str(row["gate_pass_id"]) if row["gate_pass_id"] else None,
-        "details": row["details"], "createdAtUtc": row["created_at_utc"].isoformat(),
-        "resolvedAtUtc": row["resolved_at_utc"].isoformat() if row["resolved_at_utc"] else None,
-        "resolutionNote": row["resolution_note"],
+        "status": "DONE" if done else "OPEN", "outletId": str(row["outlet_id"]), "outletName": row["outlet_name"],
+        "businessDate": reference.get("businessDate"), "gatePassId": reference.get("gatePassId"),
+        "details": reference, "createdAtUtc": row["created_at_utc"].isoformat(),
+        "resolvedAtUtc": row["verified_at_utc"].isoformat() if row["verified_at_utc"] else None,
+        "resolutionNote": (row["completion_result"] or {}).get("note"),
     }
 
 
@@ -484,15 +508,17 @@ def list_daily_tasks(
                   if set(o["roles"]) & set(_SUPERVISOR_ROLES)]
     rows = connection.execute(
         text(
-            """
-            SELECT * FROM auditcore.p2_daily_tasks
-            WHERE tenant_id = :t AND outlet_id = ANY(CAST(:ids AS uuid[]))
-              AND (:status = 'ALL' OR task_status = :status)
-            ORDER BY (task_status = 'OPEN') DESC, created_at_utc DESC
+            _DAILY_TASK_SQL + """
+            WHERE t.tenant_id = :t AND t.category = :cat AND t.scope_kind = 'OUTLET'
+              AND t.outlet_id = ANY(CAST(:ids AS uuid[]))
+              AND (:status = 'ALL'
+                   OR (:status = 'DONE' AND t.task_status = 'VERIFIED_COMPLETE')
+                   OR (:status = 'OPEN' AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED')))
+            ORDER BY (t.task_status <> 'VERIFIED_COMPLETE') DESC, t.created_at_utc DESC
             LIMIT 200
             """
         ),
-        {"t": tenant_id, "ids": supervised, "status": status},
+        {"t": tenant_id, "cat": DAILY_TASK_CATEGORY, "ids": supervised, "status": status},
     ).mappings().all()
     return {"items": [_public_task(dict(r)) for r in rows]}
 
@@ -512,22 +538,35 @@ def resolve_daily_task(
 ) -> dict[str, Any]:
     _authorize(connection, tenant_id, principal, client, _READ)
     row = connection.execute(
-        text("SELECT * FROM auditcore.p2_daily_tasks WHERE tenant_id = :t AND daily_task_id = :i"),
-        {"t": tenant_id, "i": str(daily_task_id)},
+        text(_DAILY_TASK_SQL + " WHERE t.tenant_id = :t AND t.task_id = :i AND t.category = :cat FOR UPDATE OF t"),
+        {"t": tenant_id, "i": str(daily_task_id), "cat": DAILY_TASK_CATEGORY},
     ).mappings().one_or_none()
     outlets = scope_outlets(connection, tenant_id, principal.subject)
     if row is None or not any(str(o["outlet_id"]) == str(row["outlet_id"]) and set(o["roles"]) & set(_SUPERVISOR_ROLES)
                               for o in outlets):
         raise HTTPException(status_code=404, detail="Daily task not found.")
-    if row["task_status"] == "DONE":
+    if row["task_status"] == "VERIFIED_COMPLETE":
         raise HTTPException(status_code=409, detail="This task is already done.")
+    role = next((str(r).upper() for o in outlets if str(o["outlet_id"]) == str(row["outlet_id"])
+                 for r in o["roles"] if str(r).upper() in _SUPERVISOR_ROLES), "TL")
+    note = command.note.strip()
     connection.execute(
-        text("UPDATE auditcore.p2_daily_tasks SET task_status = 'DONE', resolved_at_utc = now(), "
-             "resolved_by_actor_id = :a, resolution_note = :n WHERE tenant_id = :t AND daily_task_id = :i"),
-        {"a": principal.subject, "n": command.note.strip(), "t": tenant_id, "i": str(daily_task_id)},
+        text("""
+            UPDATE auditcore.p2_tasks
+            SET task_status = 'VERIFIED_COMPLETE', verified_at_utc = now(), action_completed_at_utc = now(),
+                completed_by_actor_id = :a, updated_at_utc = now(),
+                completion_result = completion_result || jsonb_build_object('note', CAST(:n AS text))
+            WHERE tenant_id = :t AND task_id = :i
+        """),
+        {"a": principal.subject, "n": note, "t": tenant_id, "i": str(daily_task_id)},
+    )
+    connection.execute(
+        text("INSERT INTO auditcore.p2_task_events (tenant_id, task_id, journey_id, event_type, actor_id, "
+             "actor_role_code, comment) VALUES (:t, :i, NULL, 'COMPLETE_ACTION', :a, :r, :n)"),
+        {"t": tenant_id, "i": str(daily_task_id), "a": principal.subject, "r": role, "n": note},
     )
     done = connection.execute(
-        text("SELECT * FROM auditcore.p2_daily_tasks WHERE tenant_id = :t AND daily_task_id = :i"),
+        text(_DAILY_TASK_SQL + " WHERE t.tenant_id = :t AND t.task_id = :i"),
         {"t": tenant_id, "i": str(daily_task_id)},
     ).mappings().one()
     return _public_task(dict(done))

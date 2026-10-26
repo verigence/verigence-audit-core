@@ -75,6 +75,10 @@ def setup(monkeypatch):
         app.dependency_overrides.clear()
         with engine.begin() as connection:
             set_tenant_context(connection, journey.tenant_id)
+            connection.execute(text("DELETE FROM auditcore.p2_task_events WHERE tenant_id=:t AND journey_id IS NULL"),
+                               {"t": journey.tenant_id})
+            connection.execute(text("DELETE FROM auditcore.p2_tasks WHERE tenant_id=:t AND scope_kind <> 'JOURNEY'"),
+                               {"t": journey.tenant_id})
             for table in ("p2_daily_tasks", "p2_gate_passes"):
                 connection.execute(text(f"DELETE FROM auditcore.{table} WHERE tenant_id=:t"), {"t": journey.tenant_id})
         engine.dispose()
@@ -196,9 +200,13 @@ def test_fewer_files_than_declared_raises_a_high_priority_daily_task_only_on_no(
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
         [task] = connection.execute(
-            text("SELECT category, task_type, priority, assigned_role_code, task_status "
-                 "FROM auditcore.p2_daily_tasks WHERE tenant_id=:t"), {"t": s.journey.tenant_id}).all()
-    assert tuple(task) == ("DAILY_TASK", "GATE_PASS_DELIVERY_NOT_NOTIFIED", "HIGH", "TL", "OPEN")
+            text("SELECT category, task_type, priority, assigned_role_code, task_status, scope_kind, "
+                 "completion_protocol FROM auditcore.p2_tasks WHERE tenant_id=:t AND category='DAILY_TASK'"),
+            {"t": s.journey.tenant_id}).all()
+    # Daily tasks live in the Task Manager (2026-10-26): an outlet task for the
+    # Team Lead, closed by the TL with a note, no reviewer.
+    assert tuple(task) == ("DAILY_TASK", "GATE_PASS_DELIVERY_NOT_NOTIFIED", "HIGH", "TL", "READY", "OUTLET",
+                           "SELF_CLOSING")
 
 
 def test_other_entries_need_a_description(setup):

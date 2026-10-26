@@ -3407,6 +3407,9 @@ _last_dayend_sweep: dict[str, str] = {}
 _rollout_done: set[str] = set()
 _last_watchdog_at: dict[str, float] = {}
 _WATCHDOG_SECONDS = 60
+# Task Manager pass (recurring occurrences, gate pass tasks): every 5 minutes.
+_last_task_manager_at: dict[str, float] = {}
+_TASK_MANAGER_SECONDS = 300
 _RETRY_POLICY_RUN = "RETRY_POLICY_2026_10_21"
 _ROLLOUT_REASON = ("Retrying now (the automatic retries were shortened to three attempts within 20 minutes). "
                    "Nothing to do yet.")
@@ -3678,6 +3681,25 @@ def run_dayend_sweep(engine: Engine, tenant_id: str, now: datetime | None = None
         return None
 
 
+def run_task_manager(engine: Engine, tenant_id: str, now: datetime | None = None) -> dict[str, int] | None:
+    """The Task Manager's pass for one Project (docs/TASK_MANAGER_DESIGN_v1.0.md):
+    raise today's recurring occurrences (each claimed once in
+    p2_scheduled_runs), close finished gate pass tasks, mark unfinished ones
+    incomplete. A failure is logged and retried on the next pass."""
+    from audit_core.task_manager import run_tick
+
+    try:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            result = run_tick(connection, tenant_id=tenant_id, now=now, claimed_by=_WORKER_ID)
+        if any(result.values()):
+            logger.info("task_manager_tick", tenant_id=tenant_id, **result)
+        return result
+    except Exception:
+        logger.warning("task_manager_tick_failed", tenant_id=tenant_id, exc_info=True)
+        return None
+
+
 def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
     now = time.monotonic()
     if now - _last_sweep_at.get(tenant_id, 0.0) < _FACT_SWEEP_SECONDS:
@@ -3716,6 +3738,9 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
         except Exception:
             logger.warning("p2_watchdog_failed", tenant_id=tenant_id, exc_info=True)
     run_dayend_sweep(engine, tenant_id)
+    if now - _last_task_manager_at.get(tenant_id, 0.0) >= _TASK_MANAGER_SECONDS:
+        _last_task_manager_at[tenant_id] = now
+        run_task_manager(engine, tenant_id)
     due = _nightly_review_due(tenant_id)
     if due is None:
         return
