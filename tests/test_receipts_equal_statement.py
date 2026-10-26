@@ -1,7 +1,6 @@
 """RECEIPTS_EQUAL_INVOICES for a Project whose account statement is the source of
 truth (product owner, 2026-10-26): the payment receipts are compared with the
-"Net value" / "Final price" the statement prints, or, when it prints none, the
-charges less the discounts. The statement's own received lines are not used."""
+"Net value" / "Final price" the statement prints, used as printed. The statement's own received lines are not used."""
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
@@ -40,7 +39,7 @@ def test_net_value_and_final_price_are_the_printed_total_not_an_unmapped_line() 
         read = read_statement([*CHARGES, {"particulars_raw": label, "debit_amount": 1145000}])
         assert read.printed_total == D(1145000)
         assert read.unmapped == [] and read.conflicts == []
-        assert statement_total(read)["source"] == "PRINTED"
+        assert statement_total(read) == D(1145000)
 
 
 def test_two_different_printed_totals_are_a_conflict() -> None:
@@ -50,10 +49,8 @@ def test_two_different_printed_totals_are_a_conflict() -> None:
     assert read.conflicts == [{"kind": "TOTAL", "key": "printed_total", "amounts": [D(1140000), D(1145000)]}]
 
 
-def test_without_a_printed_total_it_is_the_charges_less_the_discounts() -> None:
-    total = statement_total(read_statement(CHARGES))
-    assert total["source"] == "CHARGES_LESS_DISCOUNTS"
-    assert total["total"] == D(1145000) and total["charges"] == D(1150000) and total["discounts"] == D(5000)
+def test_no_printed_total_means_no_total_nothing_is_calculated() -> None:
+    assert statement_total(read_statement(CHARGES)) is None
 
 
 @pytest.fixture
@@ -111,13 +108,12 @@ def test_receipts_short_of_the_final_price_fail_with_the_gap(journey) -> None:
     assert result.details["findingTitle"] == "Receipts do not equal the account statement"
 
 
-def test_with_no_printed_total_the_discounts_are_subtracted(journey) -> None:
+def test_a_statement_with_no_net_value_is_skipped_not_calculated(journey) -> None:
     _statement(journey, CHARGES)
     _delivered(journey, 30)
     add_receipt_payment(journey, amount="1145000", receipt_number="R-1", receipt_date="2026-09-01")
     result = _check(journey)
-    assert result.outcome == "PASS", result.reason
-    assert result.details["statementTotalSource"] == "CHARGES_LESS_DISCOUNTS"
+    assert result.outcome == "SKIPPED" and "no net value or final price" in result.reason
 
 
 def test_skipped_without_a_statement_or_inside_the_settlement_window(journey) -> None:

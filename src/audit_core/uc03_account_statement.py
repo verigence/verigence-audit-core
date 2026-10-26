@@ -236,19 +236,11 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
     return out
 
 
-def statement_total(read: StatementRead) -> dict[str, Any]:
+def statement_total(read: StatementRead) -> Decimal | None:
     """What the customer owes on the statement, for the receipts check (product
-    owner, 2026-10-26): the "Net value" / "Final price" the statement prints;
-    when it prints none, the charges less the discounts given. The charges are
-    the statement's own lines, none left out and none added."""
-    charges = sum(read.components.values(), Decimal(0))
-    discounts = sum(read.discounts.values(), Decimal(0))
-    computed = charges - discounts
-    if read.printed_total is not None and read.printed_total > 0:
-        return {"total": read.printed_total, "source": "PRINTED", "printed": read.printed_total,
-                "charges": charges, "discounts": discounts, "computed": computed}
-    return {"total": computed, "source": "CHARGES_LESS_DISCOUNTS", "printed": None,
-            "charges": charges, "discounts": discounts, "computed": computed}
+    owner, 2026-10-26): the "Net value" / "Final price" the statement prints,
+    used as printed with no calculation. None when the statement prints none."""
+    return read.printed_total if read.printed_total is not None and read.printed_total > 0 else None
 
 
 # ── Tally validation (pure) ──────────────────────────────────────────────────
