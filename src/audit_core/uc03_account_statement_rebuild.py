@@ -84,7 +84,10 @@ def rebuild_journey(
     deviations = (tally_deviations(statement, tally_postings(tallies[0])) if statement and tallies else [])
     item: dict[str, Any] = {
         "statements": len(forms), "tallies": len(tallies),
-        "exShowroom": str(statement.components.get("ex_showroom_price")) if statement else None,
+        # None when the statement has no vehicle line (str(None) is "None", which
+        # made the job's no_ex_showroom total read 0 for every such statement).
+        "exShowroom": (str(ex_showroom) if (ex_showroom := statement.components.get("ex_showroom_price")) is not None
+                       else None) if statement else None,
         "components": sorted(statement.components) if statement else [],
         "discounts": sorted(statement.discounts) if statement else [],
         "unmapped": statement.unmapped if statement else [],
