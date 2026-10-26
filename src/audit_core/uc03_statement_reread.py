@@ -22,8 +22,8 @@ has already read (after a worker restart cut a run short).
 Started from outside with AUDIT_CORE_STATEMENT_REREAD_TAG on the worker. A DRY
 RUN (one ``statement_reread_item`` log line per statement, nothing asked)
 unless the tag ends with "-commit". On commit each picked statement is asked
-for, then polled until Document Intelligence has finished, and the page is
-copied through the same journey reconcile a PC's Re-sync uses. The Deal is
+for, then polled until Document Intelligence has finished, and the document is
+synced into the Journey's fields. The Deal is
 then set from the statements by the account-statement rebuild
 (AUDIT_CORE_ACCOUNT_STATEMENT_TAG), which is run separately. Safe to run
 again: a statement that has its printed net value is no longer picked.
@@ -159,26 +159,33 @@ def _di_status(v2: Any, *, token: str, tenant_id: str, context_ref: str, di_docu
 
 
 def _copy_into_audit_core(engine: Engine, tenant_id: str, item: dict[str, Any], tag: str) -> None:
-    """The journey reconcile copies the page's new values (what a PC's Re-sync asks for)."""
-    from audit_core.uc03_p2_runtime import enqueue_work, record_activity
+    """Copy what Document Intelligence now holds for the statement into the
+    Journey's fields: the document sync itself (the one a link callback runs),
+    not the page reconcile, whose copy step leaves a page alone once it holds
+    any value and so never writes the new reading."""
+    from audit_core.uc03_confidence_review_policy import (
+        _prefetch_document_for_sync,
+        _sync_booking_document_once,
+    )
+    from audit_core.uc03_document_capture_v2 import (
+        get_di_client,
+        get_security_oauth_client,
+    )
+    from audit_core.uc03_p2_runtime import record_activity
 
+    security, di = get_security_oauth_client(), get_di_client()
+    document_id = UUID(str(item["diDocumentId"]))
+    prefetched = _prefetch_document_for_sync(
+        engine, tenant_id=tenant_id, journey_id=item["journeyId"], document_id=document_id,
+        security_client=security, di_client=di)
+    if prefetched is None:
+        raise RuntimeError("the statement's evidence link is no longer active")
+    _sync_booking_document_once(
+        engine, tenant_id=tenant_id, journey_id=item["journeyId"], document_id=document_id,
+        service_id="p2-worker", stage_code=str(item["stage"]).upper(),
+        security_client=security, di_client=di, prefetched=prefetched)
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.p2_document_queue
-                SET queue_status='SYNCING_TO_AUDIT_CORE', status_reason=NULL, updated_at_utc=now()
-                WHERE tenant_id=:t AND queue_id=:q AND queue_status IN ('READY','NEEDS_REVIEW')
-                """
-            ),
-            {"t": tenant_id, "q": item["queueId"]},
-        )
-        enqueue_work(
-            connection, tenant_id=tenant_id, journey_id=item["journeyId"], work_type="JOURNEY_RECONCILE",
-            work_key=str(item["journeyId"]), payload={"reason": "STATEMENT_REREAD", "uploadedBy": f"system:{tag}"},
-            correlation_id=f"statement-reread:{tag}",
-        )
         record_activity(
             connection, tenant_id=tenant_id, journey_id=item["journeyId"], event_type="PAGE_RESYNC_REQUESTED",
             subject_type="DOCUMENT_PAGE", subject_id=str(item["queueId"]),
@@ -248,7 +255,13 @@ def _reread(engine: Engine, tenant_id: str, items: list[dict[str, Any]], tag: st
                 continue
             processing = str(status.get("processingStatus") or "")
             if processing == "PROCESSED":
-                _copy_into_audit_core(engine, tenant_id, item, tag)
+                try:
+                    _copy_into_audit_core(engine, tenant_id, item, tag)
+                except Exception:
+                    counts["failed"] += 1
+                    logger.warning("statement_reread_copy_failed", tag=tag, tenant_id=tenant_id,
+                                   journey=item["journeyReference"], exc_info=True)
+                    continue
                 counts["finished"] += 1
                 logger.info("statement_reread_copied", tag=tag, tenant_id=tenant_id, journey=item["journeyReference"])
             elif processing == "FAILED":

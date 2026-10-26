@@ -128,3 +128,67 @@ def test_a_copy_tag_does_not_ask_di_again(monkeypatch):
     reread.run_statement_reread(Engine(), "x-copy-commit", ["t1"])
     reread.run_statement_reread(Engine(), "x-commit", ["t1"])
     assert seen == [False, True]
+
+
+def test_the_copy_runs_the_document_sync_not_the_page_reconcile(monkeypatch):
+    """The page reconcile leaves a page that already holds values alone, so the
+    new reading would never be written; the document sync is what writes it."""
+    import audit_core.uc03_confidence_review_policy as policy
+    import audit_core.uc03_document_capture_v2 as capture
+    import audit_core.uc03_p2_runtime as runtime
+
+    synced: list[dict] = []
+    activity: list[dict] = []
+
+    @contextmanager
+    def open_connection():
+        yield object()
+
+    class Engine:
+        begin = staticmethod(open_connection)
+
+    monkeypatch.setattr(reread, "set_tenant_context", lambda *a, **k: None)
+    monkeypatch.setattr(capture, "get_security_oauth_client", lambda: "security")
+    monkeypatch.setattr(capture, "get_di_client", lambda: "di")
+    monkeypatch.setattr(policy, "_prefetch_document_for_sync", lambda *a, **k: "fetched")
+    monkeypatch.setattr(policy, "_sync_booking_document_once", lambda *a, **k: synced.append(k))
+    monkeypatch.setattr(runtime, "record_activity", lambda *a, **k: activity.append(k))
+    item = {"journeyId": uuid4(), "diDocumentId": uuid4(), "queueId": uuid4(), "stage": "delivery"}
+    reread._copy_into_audit_core(Engine(), "t1", item, "tag")
+    assert len(synced) == 1
+    assert synced[0]["stage_code"] == "DELIVERY" and synced[0]["prefetched"] == "fetched"
+    assert activity[0]["event_type"] == "PAGE_RESYNC_REQUESTED"
+
+
+def test_a_statement_whose_copy_fails_is_counted_not_dropped(monkeypatch):
+    item = {"journeyId": uuid4(), "journeyReference": "J-1", "diDocumentId": uuid4(), "queueId": uuid4(),
+            "stage": "DELIVERY", "decision": "REREAD"}
+    import audit_core.uc03_document_capture_v2 as capture
+
+    class Security:
+        def get_service_token(self, **_):
+            return "tok"
+
+    class V2:
+        def list_documents(self, **_):
+            return {"documents": [{"documentId": str(item["diDocumentId"]), "processingStatus": "PROCESSED"}]}
+
+    @contextmanager
+    def open_connection():
+        yield object()
+
+    class Engine:
+        begin = staticmethod(open_connection)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("no link")
+
+    monkeypatch.setattr(reread, "set_tenant_context", lambda *a, **k: None)
+    monkeypatch.setattr(reread.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(capture, "get_security_oauth_client", lambda: Security())
+    monkeypatch.setattr(capture, "get_di_client", lambda: object())
+    monkeypatch.setattr(capture, "get_di_capture_v2_client", lambda: V2())
+    monkeypatch.setattr(capture, "_ensure_di_context", lambda **_: ("ctx", "tok"))
+    monkeypatch.setattr(reread, "_copy_into_audit_core", boom)
+    counts = reread._reread(Engine(), "t1", [item], "x-copy-commit", ask=False)
+    assert counts["failed"] == 1 and counts["finished"] == 0

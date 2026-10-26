@@ -316,7 +316,7 @@ def load_ledger_documents(connection: Connection, *, tenant_id: str, journey_id:
               ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
             WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='ACTIVE'
               AND e.document_type_key = :type
-            ORDER BY e.linked_at_utc DESC, e.di_document_id, f.field_key
+            ORDER BY e.linked_at_utc DESC, e.di_document_id, f.field_key, f.source_fact_version
             """
         ),
         {"t": tenant_id, "j": journey_id, "type": ACCOUNT_STATEMENT_TYPE},
