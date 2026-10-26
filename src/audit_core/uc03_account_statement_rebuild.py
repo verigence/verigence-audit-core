@@ -29,6 +29,7 @@ from audit_core.uc03_account_statement import (
     load_ledger_documents,
     read_statement,
     statement_kind,
+    statement_total,
     sync_account_statement,
     tally_deviations,
     tally_postings,
@@ -80,6 +81,7 @@ def rebuild_journey(
     documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
     parsed = [(d, rows, statement_kind(rows)) for d in documents for rows in [line_rows(d["fields"].get("line_items"))]]
     forms = [rows for _, rows, kind in parsed if kind == KIND_FORM]
+    forms_fields = [d["fields"] for d, _, kind in parsed if kind == KIND_FORM]
     tallies = [rows for _, rows, kind in parsed if kind == KIND_TALLY]
     statement = read_statement(forms[0]) if forms else None
     deviations = (tally_deviations(statement, tally_postings(tallies[0])) if statement and tallies else [])
@@ -94,7 +96,8 @@ def rebuild_journey(
         "unmapped": statement.unmapped if statement else [],
         "conflicts": statement.conflicts if statement else [],
         "tallyDeviations": [d["line"] for d in deviations],
-        "printedTotal": str(statement.printed_total) if statement and statement.printed_total is not None else None,
+        "printedTotal": (str(total) if statement and (total := statement_total(forms_fields[0], statement)) is not None
+                         else None),
         # information only, to spot a misread statement: never used for a check
         "chargesLessDiscounts": (str(sum(statement.components.values(), Decimal(0))
                                      - sum(statement.discounts.values(), Decimal(0))) if statement else None),
