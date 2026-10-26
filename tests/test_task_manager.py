@@ -16,12 +16,20 @@ from sqlalchemy import text
 
 from audit_core import task_manager as tm
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import HumanAdminRequest, get_human_principal, require_super_admin_request
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_human_principal,
+    require_super_admin_request,
+)
 from audit_core.main import app
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import get_security_authorization_client
 from audit_core.security_integration import SecurityAdminContext
-from audit_core.task_manager_reports import build_task_status, build_utilisation, record_activity
+from audit_core.task_manager_reports import (
+    build_task_status,
+    build_utilisation,
+    record_activity,
+)
 
 IST = tm.IST
 MONDAY = date(2026, 11, 2)  # a Monday
