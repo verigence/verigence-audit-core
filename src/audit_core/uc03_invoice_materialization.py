@@ -58,6 +58,7 @@ from audit_core.uc03_deal_source_history import (
     source_rank,
     upsert_commercial_actual,
 )
+from audit_core.uc03_deal_source_policy import account_statement_is_source_of_truth
 from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_manual_verification import _resolve_finding
 from audit_core.uc03_v2_review_materialization import (
@@ -92,6 +93,8 @@ _INVOICE_FINDING_STAGE: Literal["DELIVERY"] = "DELIVERY"
 # Findings raised by the earlier per-type comparison; superseded by the
 # per-invoice comparison and closed on the next run.
 _LEGACY_DISAGREEMENT_PREFIX = "INVOICE_FIELD_DISAGREEMENT:"
+INVOICES_NOT_USED_NOTE = ("This Project takes its figures from the account statement, so the invoices are "
+                          "not checked. They stay on file as evidence.")
 
 # invoice header scalar fields persisted verbatim in invoice_review_values.
 _HEADER_TEXT_FIELDS = (
@@ -1976,6 +1979,13 @@ def sync_invoice_checks(
       or more than one vehicle invoice on file -> a Team Lead validates.
     """
     wanted: dict[str, dict[str, Any]] = {}
+    # MAHINDRA ORISSA (product owner, 2026-10-26): the account statement is the
+    # source of truth and the invoices are withheld from the Deal, so nothing is
+    # asked about them -- no "check the reading" and no "copies disagree" task --
+    # and any that is still open closes below. The invoices stay on file.
+    invoices_not_used = account_statement_is_source_of_truth(connection, tenant_id=tenant_id)
+    if invoices_not_used:
+        selection = {"groups": [], "sameBillQuestions": [], "cancellationQuestions": [], "multipleVehicle": False}
     for group in selection["groups"]:
         if group["cancelled"] or (not group["counted"] and group["family"] != FAMILY_VEHICLE):
             continue
@@ -2082,7 +2092,8 @@ def sync_invoice_checks(
         _resolve_finding(
             connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=row["stage_code"] or stage_code,
             finding_id=row["audit_finding_id"], actor_id=None, correlation_id=correlation_id,
-            note=("The invoices on file no longer show this problem." if row["rule_key"] not in wanted
+            note=(INVOICES_NOT_USED_NOTE if invoices_not_used
+                  else "The invoices on file no longer show this problem." if row["rule_key"] not in wanted
                   else "Merged into the journey's one finding for this invoice problem."),
         )
         resolved += 1

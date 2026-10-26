@@ -10,6 +10,7 @@ and answer the questions a manual deal audit asks:
   Short payment            DELIVERED_ON_SHORT_PAYMENT, PAYMENT_AFTER_DELIVERY_WITHIN_GRACE,
                            PAYMENT_AFTER_DELIVERY_BEYOND_GRACE
   Receipts vs invoices     RECEIPTS_EQUAL_INVOICES     all receipts = all invoices, within Rs 1
+                           (ACCOUNT_STATEMENT Projects: = the account statement's total)
   Financier (DO)           DO_PAYMENT_NOT_RECEIVED, DO_SHORT_PAYMENT
   Trade-in                 TRADE_IN_NOT_RESOLD, TRADE_IN_SOLD_AT_LOSS
   Refund                   POST_DELIVERY_REFUND
@@ -729,7 +730,77 @@ def _not_counted(facts: _Facts) -> list[dict[str, Any]]:
     return out
 
 
+def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
+    """MAHINDRA ORISSA (product owner, 2026-10-26): the receipts are compared
+    with the total on the dealer's account statement -- the printed total, or
+    the charges less the discounts when none is printed -- not with the
+    invoices. The statement's own received lines are not used."""
+    from audit_core.uc03_account_statement import (
+        KIND_FORM,
+        line_rows,
+        load_ledger_documents,
+        read_statement,
+        statement_kind,
+        statement_total,
+    )
+
+    code = "RECEIPTS_EQUAL_INVOICES"
+    forms = []
+    for document in load_ledger_documents(facts.connection, tenant_id=facts.tenant_id, journey_id=facts.journey_id):
+        rows = line_rows(document["fields"].get("line_items"))
+        if statement_kind(rows) == KIND_FORM:
+            forms.append((document, rows))
+    if not forms:
+        return RuleOutcome(code, "SKIPPED", "No account statement has been read yet.")
+    document, rows = forms[0]
+    read = read_statement(rows)
+    if read.conflicts or read.unmapped:
+        lines = [str(u["label"]) for u in read.unmapped] + [str(c["key"]) for c in read.conflicts]
+        return RuleOutcome(code, "SKIPPED", (
+            "The account statement has lines that could not be read with certainty (" + ", ".join(lines) + "); "
+            "the receipts are compared once they are cleared."
+        ))
+    total = statement_total(read)
+    if total["total"] <= 0:
+        return RuleOutcome(code, "SKIPPED", "No amount could be read on the account statement.")
+    delivered = facts.delivery_date
+    if delivered is None:
+        return RuleOutcome(code, "SKIPPED", _NO_DELIVERY_DATE)
+    settles = delivered + timedelta(days=_SETTLEMENT_DAYS)
+    if facts.today <= settles:
+        return RuleOutcome(code, "SKIPPED", (
+            f"Receipts are compared with the account statement once the settlement window closes on "
+            f"{_when(settles)} ({_SETTLEMENT_DAYS} days after delivery on {_when(delivered)})."
+        ))
+    billed = total["total"]
+    received = sum((r["amount"] for r in facts.receipts), Decimal(0))
+    refunded = sum((abs(r["amount"]) for r in facts.refunds), Decimal(0))
+    net = received - refunded
+    gap = net - billed
+    refund_text = f" less {_rupees(refunded)} refunded" if refunded else ""
+    how = ("the net value printed on the account statement" if total["source"] == "PRINTED"
+           else "the account statement's charges less its discounts")
+    details = {"statementTotal": str(billed), "statementTotalSource": total["source"],
+               "statementCharges": str(total["charges"]), "statementDiscounts": str(total["discounts"]),
+               "statementPrintedTotal": None if total["printed"] is None else str(total["printed"]),
+               "statementChargesLessDiscounts": str(total["computed"]),
+               "statementReceivedLines": str(read.receipts), "received": str(received), "refunded": str(refunded),
+               "difference": str(gap), "documentId": str(document["documentId"])}
+    if abs(gap) <= _INVOICE_TOLERANCE:
+        return RuleOutcome(code, "PASS", (
+            f"Receipts {_rupees(received)}{refund_text} match {how}, {_rupees(billed)}."
+        ), details)
+    direction = "short of" if gap < 0 else "more than"
+    return RuleOutcome(code, "FAIL", (
+        f"Receipts {_rupees(received)}{refund_text} are {_rupees(abs(gap))} {direction} {how}, {_rupees(billed)}."
+    ), {**details, "findingTitle": "Receipts do not equal the account statement"})
+
+
 def receipts_equal_invoices(facts: _Facts) -> RuleOutcome:
+    from audit_core.uc03_deal_source_policy import account_statement_is_source_of_truth
+
+    if account_statement_is_source_of_truth(facts.connection, tenant_id=facts.tenant_id):
+        return _receipts_equal_statement(facts)
     code = "RECEIPTS_EQUAL_INVOICES"
     bills, unreadable = _invoice_bills(facts)
     if not any(b["vehicle"] for b in bills):

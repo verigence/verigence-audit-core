@@ -135,6 +135,9 @@ _DISCOUNTS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("ADDITIONAL_DISCOUNT", r"(OTHER DISCOUNT( \(IF ANY\))?|CASH DISCOUNT)( .*)?"),
     )
 )
+# The total the statement prints for what the customer owes: "Net value" or
+# "Final price" (product owner, 2026-10-26: every dealer's statement has one).
+_PRINTED_TOTAL = re.compile(r"(NET VALUE|FINAL PRICE)( .*)?")
 # A discount line that names a scrappage bonus does not say whether it is the
 # dealer's or the certificate of deposit's, and the two are different
 # benefits: it is reported, not filed under either.
@@ -175,6 +178,8 @@ class StatementRead:
     discounts: dict[str, Decimal] = field(default_factory=dict)
     financer: Decimal | None = None
     receipts: Decimal = Decimal(0)
+    # the "Net value" / "Final price" the statement prints, when it has one
+    printed_total: Decimal | None = None
     # lines left blank on purpose, with why
     unmapped: list[dict[str, Any]] = field(default_factory=list)
     conflicts: list[dict[str, Any]] = field(default_factory=list)
@@ -206,6 +211,8 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
         key = next((("COMMERCIAL", k) for k, pattern in _CHARGES if pattern.fullmatch(label)), None)
         if key is None:
             key = next((("DISCOUNT", k) for k, pattern in _DISCOUNTS if pattern.fullmatch(label)), None)
+        if key is None and _PRINTED_TOTAL.fullmatch(label):
+            key = ("TOTAL", "printed_total")
         if key is not None:
             found.setdefault(key, []).append(amount)
             continue
@@ -222,8 +229,26 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
         if len(distinct) > 1:
             out.conflicts.append({"kind": kind, "key": key, "amounts": distinct})
             continue
+        if kind == "TOTAL":
+            out.printed_total = distinct[0]
+            continue
         (out.components if kind == "COMMERCIAL" else out.discounts)[key] = distinct[0]
     return out
+
+
+def statement_total(read: StatementRead) -> dict[str, Any]:
+    """What the customer owes on the statement, for the receipts check (product
+    owner, 2026-10-26): the "Net value" / "Final price" the statement prints;
+    when it prints none, the charges less the discounts given. The charges are
+    the statement's own lines, none left out and none added."""
+    charges = sum(read.components.values(), Decimal(0))
+    discounts = sum(read.discounts.values(), Decimal(0))
+    computed = charges - discounts
+    if read.printed_total is not None and read.printed_total > 0:
+        return {"total": read.printed_total, "source": "PRINTED", "printed": read.printed_total,
+                "charges": charges, "discounts": discounts, "computed": computed}
+    return {"total": computed, "source": "CHARGES_LESS_DISCOUNTS", "printed": None,
+            "charges": charges, "discounts": discounts, "computed": computed}
 
 
 # ── Tally validation (pure) ──────────────────────────────────────────────────

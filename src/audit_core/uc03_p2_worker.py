@@ -4166,6 +4166,15 @@ def main() -> None:
         threading.Thread(target=run_account_statement_rebuild,
                          args=(engine, statement_tag, _active_tenants(engine)),
                          name="account-statement-rebuild", daemon=True).start()
+    # Mahindra Orissa: the open invoice-check tasks closed (2026-10-26): dry run
+    # unless the tag ends with "-commit".
+    invoice_cleanup_tag = os.environ.get("AUDIT_CORE_INVOICE_TASK_CLEANUP_TAG", "").strip()
+    if invoice_cleanup_tag:
+        from audit_core.uc03_invoice_task_cleanup import run_invoice_task_cleanup
+
+        threading.Thread(target=run_invoice_task_cleanup,
+                         args=(engine, invoice_cleanup_tag, _active_tenants(engine)),
+                         name="invoice-task-cleanup", daemon=True).start()
     # Every Journey's variance as the list stores it and as the Deal computes it
     # (2026-10-24); read-only.
     variance_tag = os.environ.get("AUDIT_CORE_VARIANCE_AUDIT_TAG", "").strip()

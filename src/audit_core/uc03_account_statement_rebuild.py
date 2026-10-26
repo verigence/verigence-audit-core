@@ -28,6 +28,7 @@ from audit_core.uc03_account_statement import (
     load_ledger_documents,
     read_statement,
     statement_kind,
+    statement_total,
     sync_account_statement,
     tally_deviations,
     tally_postings,
@@ -90,6 +91,8 @@ def rebuild_journey(
         "unmapped": statement.unmapped if statement else [],
         "conflicts": statement.conflicts if statement else [],
         "tallyDeviations": [d["line"] for d in deviations],
+        "printedTotal": str(statement.printed_total) if statement and statement.printed_total is not None else None,
+        "chargesLessDiscounts": str(statement_total(statement)["computed"]) if statement else None,
         "invoiceHeldBefore": _invoice_held(connection, tenant_id, journey_id),
     }
     if not commit:
