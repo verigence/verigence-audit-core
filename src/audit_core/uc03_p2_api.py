@@ -2150,6 +2150,47 @@ def get_page_file(
     }
 
 
+@router.get("/journeys/{journey_id}/uploads/{batch_id}/file")
+def get_upload_file(
+    tenant_id: str,
+    journey_id: UUID,
+    batch_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """A short-lived link that opens the file exactly as the PC uploaded it
+    (the original, before it was split into pages), issued to a reader of the
+    journey. The Daily Processing report points here (product owner
+    2026-10-26): a presigned storage link, never a raw bucket address."""
+    _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_READ_PERMISSION,
+    )
+    row = connection.execute(
+        text(
+            """
+            SELECT original_object_key, original_filename, page_count, batch_status
+            FROM auditcore.p2_upload_batches
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND batch_id=:batch_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "batch_id": batch_id},
+    ).mappings().one_or_none()
+    if row is None or not row["original_object_key"] or row["batch_status"] == "AWAITING_UPLOAD":
+        raise HTTPException(status_code=404, detail="The uploaded file was not found.")
+    try:
+        url = get_p2_document_storage().presign_get(str(row["original_object_key"]), expires_seconds=_PAGE_LINK_SECONDS)
+    except (RuntimeError, P2DocumentStorageError) as exc:
+        raise HTTPException(status_code=503, detail="The file cannot be opened right now. Try again.") from exc
+    return {
+        "batchId": str(batch_id), "filename": row["original_filename"], "pages": int(row["page_count"] or 0),
+        "status": row["batch_status"], "url": url, "expiresInSeconds": _PAGE_LINK_SECONDS,
+    }
+
+
 _REMOVABLE_PAGE_STATES = ("FAILED", "DEAD_LETTER")
 
 

@@ -24,6 +24,16 @@ Every figure is read from what Audit Core stores -- nothing is estimated:
 - night corrections: night-sweep requests on the day, and how many of those
   pages were read (DOCUMENT_READY) afterwards;
 - tasks: ``p2_tasks`` created on the day, plus REOPENED rounds;
+- files (2026-10-26): every file uploaded on the day with its state (read,
+  still being read, partly failed, never uploaded, could not be split,
+  duplicate), a link that opens the original, and a flag when it has more
+  pages than LARGE_UPLOAD_PAGES (25) -- with the PC's notice on it and what
+  they answered;
+- document status (2026-10-26): per PC and for the day, uploaded / not
+  uploaded / rejected / retried / read / still waiting, from the above;
+- work done (2026-10-26): the human task actions of the day from
+  ``p2_task_events`` (a system event is never work): per person, the tasks
+  they worked, what they did and which of those tasks closed that day;
 - failed pages (2026-10-21, also its own endpoint /reports/failed-pages):
   every page now FAILED, and every file that failed before it was split,
   with the reason, the attempts, when it was uploaded and failed (the
@@ -50,7 +60,7 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_p2_access import authorize_p2
-from audit_core.uc03_p2_runtime import swept_pending_sql
+from audit_core.uc03_p2_runtime import LARGE_UPLOAD_PAGES, swept_pending_sql
 
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-daily-report"])
 
@@ -65,6 +75,18 @@ _WAITING = frozenset({
 })
 _SETTLED = ("READY", "SUPPORTING", "NEEDS_REVIEW", "FAILED", "DEAD_LETTER")
 _REJECTED_ERRORS = frozenset({"FILE_EMPTY", "INVALID_FILE_CONTENT", "CORRUPT", "UPLOAD_FAILED"})
+
+# What a person does on a task (the action catalog plus the two events that
+# close one). Everything else in p2_task_events -- raised, updated, machine
+# verification, returned -- is the system's, not work.
+_WORK_EVENTS = (
+    "UPLOAD_DOCUMENT", "REUPLOAD_DOCUMENT", "REVIEW_DOCUMENT", "CORRECT_EXTRACTED_FIELD", "ADD_EVIDENCE",
+    "ADD_COMMENT", "PROVIDE_FEEDBACK", "REQUEST_CLARIFICATION", "COMPLETE_ACTION", "APPROVE_CORRECTION",
+    "REJECT_CORRECTION", "ACCEPT", "REJECT", "ACCEPT_EXCEPTION", "PROVIDE_VEHICLE_ID", "CONFIRM_BREACH",
+    "MARK_FALSE_POSITIVE", "CLOSE_TASK", "COMPLETED", "VERDICT",
+)
+_WORK_TASKS_PER_PERSON = 100
+_FILE_ROWS_LIMIT = 2000
 
 _SCOPE = """
     EXISTS (
@@ -452,9 +474,22 @@ def build_daily_processing_report(
     # that opens it (product owner 2026-10-21).
     failed = build_failed_pages_report(connection, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end)
     documents = docs["extracted"] + docs["readNoValues"] + docs["notRead"] + docs["waiting"] + docs["failed"]
+    file_list = _uploaded_files(
+        connection, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end, names=names,
+        units_by_batch=by_batch,
+    )
+    status = _document_status(file_list["files"], pcs, names)
+    team = _team_work(connection, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end, names=names)
+    large = [f for f in file_list["files"] if f["large"]]
     return {
         "day": day.isoformat(),
         "timezone": timezone_name,
+        "documentStatus": status,
+        "teamWork": team,
+        "files": file_list["files"],
+        "filesTruncated": file_list["truncated"],
+        "linkExpiresInSeconds": _LINK_SECONDS,
+        "largeUploads": {"threshold": LARGE_UPLOAD_PAGES, "count": len(large), "files": large},
         "quality": {
             "files": day_total["files"],
             "pages": day_total["pages"],
@@ -484,7 +519,274 @@ def build_daily_processing_report(
             ("Failed pages lists every page and file that failed on the day and is still failed, with the reason "
              "and a link that opens it (valid 30 minutes from when the report was loaded)."),
             "Document Intelligence's own nightly re-processing keeps its per-document results in DI and is not counted here.",
+            ("Document status: rejected = pages the scan-quality check refused; retried = automatic re-attempts and "
+             "the PC's own retry / read-again requests; not uploaded = files that never arrived within 30 minutes "
+             "(the PC is told to upload again); duplicate files are dropped on arrival."),
+            (f"Large uploads: a file of more than {LARGE_UPLOAD_PAGES} pages gets the PC a notice to review it and "
+             "confirm the pages are needed. Nothing is blocked; the PC closes the notice with a comment, shown here."),
+            ("Work done counts what people did on tasks that day (comments, reviews, uploads, closing). The "
+             "system's own task updates are not work. Tasks closed = worked by that person and closed on the day. "
+             "A Team Lead's name is not stored with the task, so the account id shows unless a name is known."),
+            "File links open the original as uploaded and are valid 30 minutes from when the report was loaded.",
         ],
+    }
+
+
+def _file_state(row: Any, units: list[dict[str, Any]]) -> str:
+    """Where one uploaded file stands, in one word."""
+    from audit_core.uc03_p2_task_producer import FILE_NOT_UPLOADED_IN_TIME_REASON
+
+    status = str(row["batch_status"])
+    pages = int(row["page_count"] or 0)
+    if status == "AWAITING_UPLOAD":
+        return "UPLOAD_PENDING"
+    if status == "FAILED" and pages == 0:
+        return "NOT_UPLOADED" if (row["failure_reason"] or "") == FILE_NOT_UPLOADED_IN_TIME_REASON else "NOT_SPLIT"
+    if status == "CANCELLED" and pages == 0:
+        return "DUPLICATE" if row["sha256"] else "CANCELLED"
+    states = [str(u["queue_status"]) for u in units if str(u["queue_status"]) != "CANCELLED"]
+    if any(st in _WAITING for st in states):
+        return "READING"
+    if any(st in ("FAILED", "DEAD_LETTER") for st in states):
+        return "PARTLY_FAILED"
+    return "READ"
+
+
+def _uploaded_files(
+    connection: Connection, *, tenant_id: str, actor_id: str, start: datetime, end: datetime,
+    names: dict[str, str], units_by_batch: dict[Any, list[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Every file uploaded on the day (any state, a file that never arrived
+    included), newest first, with a link that opens the original and the
+    large-upload flag. The PC is the uploader, else the journey's PC."""
+    from audit_core.uc03_p2_task_producer import upload_open_path
+
+    rows = connection.execute(
+        text(
+            f"""
+            SELECT b.batch_id, b.journey_id, j.journey_reference, b.original_filename, b.page_count,
+                   b.batch_status, b.failure_reason, b.sha256, b.original_object_key, b.created_at_utc,
+                   COALESCE(b.uploaded_by_actor_id, j.created_by_actor_id) AS pc_actor_id,
+                   COALESCE(c.legal_name, c.display_name) AS customer_name,
+                   d.dealer_name, o.outlet_name, o.outlet_code,
+                   tk.task_status AS review_status,
+                   (SELECT te.comment FROM auditcore.p2_task_events te
+                     WHERE te.tenant_id=tk.tenant_id AND te.task_id=tk.task_id
+                       AND te.event_type IN ('CLOSE_TASK','ADD_COMMENT','PROVIDE_FEEDBACK')
+                       AND te.comment IS NOT NULL
+                     ORDER BY te.created_at_utc DESC LIMIT 1) AS review_comment
+            FROM auditcore.p2_upload_batches b
+            JOIN auditcore.journeys j ON j.tenant_id=b.tenant_id AND j.journey_id=b.journey_id
+            LEFT JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            LEFT JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+            LEFT JOIN auditcore.dealer_outlets o
+              ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
+            LEFT JOIN auditcore.p2_tasks tk
+              ON tk.tenant_id=b.tenant_id AND tk.journey_id=b.journey_id
+             AND tk.dedupe_key = 'large-upload:' || b.journey_id::text || ':' || b.batch_id::text
+            WHERE b.tenant_id=:t AND b.created_at_utc >= :s AND b.created_at_utc < :e AND {_SCOPE}
+            ORDER BY b.created_at_utc DESC
+            LIMIT :limit
+            """
+        ),
+        {"t": tenant_id, "actor_id": actor_id, "s": start, "e": end, "limit": _FILE_ROWS_LIMIT + 1},
+    ).mappings().all()
+    truncated = len(rows) > _FILE_ROWS_LIMIT
+    rows = rows[:_FILE_ROWS_LIMIT]
+    batch_ids = [r["batch_id"] for r in rows if r["batch_id"] not in (units_by_batch or {})]
+    units_by_batch = dict(units_by_batch or {})
+    if batch_ids:
+        extra: dict[Any, list[dict[str, Any]]] = defaultdict(list)
+        for unit in connection.execute(
+            text(
+                f"""
+                SELECT q.batch_id,
+                       CASE WHEN {swept_pending_sql("q")} THEN 'FAILED' ELSE q.queue_status END AS queue_status,
+                       q.last_error, q.unit_kind, COALESCE(cardinality(q.page_numbers), 1) AS unit_pages
+                FROM auditcore.p2_document_queue q
+                WHERE q.tenant_id=:t AND q.batch_id = ANY(:batches) AND q.queue_status <> 'MERGED'
+                """
+            ),
+            {"t": tenant_id, "batches": batch_ids},
+        ).mappings():
+            extra[unit["batch_id"]].append(dict(unit))
+        units_by_batch.update(extra)
+
+    files: list[dict[str, Any]] = []
+    for row in rows:
+        units = units_by_batch.get(row["batch_id"], [])
+        state = _file_state(row, units)
+        pages = int(row["page_count"] or 0)
+        docs = {"read": 0, "waiting": 0, "failed": 0, "rejected": 0}
+        for unit in units:
+            status = str(unit["queue_status"])
+            if status in ("READY", "NEEDS_REVIEW", "SUPPORTING"):
+                docs["read"] += 1
+            elif status in _WAITING:
+                docs["waiting"] += 1
+            elif status in ("FAILED", "DEAD_LETTER"):
+                docs["failed"] += 1
+                if rejection_reason(unit["last_error"]) is not None:
+                    docs["rejected"] += 1
+        has_file = state not in ("UPLOAD_PENDING", "NOT_UPLOADED") and bool(row["original_object_key"])
+        large = pages > LARGE_UPLOAD_PAGES and state not in ("CANCELLED", "NOT_SPLIT", "NOT_UPLOADED", "UPLOAD_PENDING")
+        pc = row["pc_actor_id"] or ""
+        files.append({
+            "batchId": str(row["batch_id"]), "journeyId": str(row["journey_id"]),
+            "journeyReference": row["journey_reference"], "customerName": row["customer_name"],
+            "dealerName": row["dealer_name"], "outletName": row["outlet_name"], "outletCode": row["outlet_code"],
+            "pcActorId": pc or None, "pcName": names.get(pc),
+            "filename": row["original_filename"], "pages": pages, "state": state,
+            "failureReason": row["failure_reason"] if state in ("NOT_UPLOADED", "NOT_SPLIT") else None,
+            "uploadedAtUtc": row["created_at_utc"].isoformat() if row["created_at_utc"] else None,
+            "documents": docs,
+            "large": large,
+            "review": ({"status": "OPEN" if str(row["review_status"]) not in ("VERIFIED_COMPLETE", "CANCELLED")
+                        else "CLOSED", "comment": row["review_comment"]}
+                       if large and row["review_status"] else None),
+            # A file that never arrived has nothing to open.
+            "openUrl": _signed_link(row["original_object_key"]) if has_file else None,
+            "filePath": upload_open_path(tenant_id, row["journey_id"], row["batch_id"]) if has_file else None,
+        })
+    return {"files": files, "truncated": truncated}
+
+
+def _document_status(
+    files: list[dict[str, Any]], pcs: dict[str, dict[str, Any]], names: dict[str, str],
+) -> dict[str, Any]:
+    """The day's document status in the words the product owner uses
+    (2026-10-26): uploaded, not uploaded, rejected, retried, read, waiting --
+    per PC and in total. Files are counted from the file list; documents and
+    retries from each PC's row of the report."""
+    def empty() -> dict[str, Any]:
+        return {
+            "filesUploaded": 0, "filesNotUploaded": 0, "filesUploadPending": 0, "filesNotSplit": 0,
+            "duplicateFiles": 0, "largeUploads": 0,
+            "documents": 0, "read": 0, "rejected": 0, "failedOther": 0, "waiting": 0,
+            "retriedAutomatically": 0, "retriedByPc": 0, "retriesExhausted": 0,
+        }
+
+    by_pc: dict[str, dict[str, Any]] = {}
+
+    def slot(pc: str) -> dict[str, Any]:
+        if pc not in by_pc:
+            by_pc[pc] = {"pcActorId": pc or None, "pcName": names.get(pc) or (pcs.get(pc) or {}).get("pcName"),
+                         **empty()}
+        return by_pc[pc]
+
+    for file in files:
+        entry = slot(file["pcActorId"] or "")
+        state = file["state"]
+        if state == "NOT_UPLOADED":
+            entry["filesNotUploaded"] += 1
+        elif state == "UPLOAD_PENDING":
+            entry["filesUploadPending"] += 1
+        elif state == "NOT_SPLIT":
+            entry["filesNotSplit"] += 1
+        elif state == "DUPLICATE":
+            entry["duplicateFiles"] += 1
+        elif state != "CANCELLED":
+            entry["filesUploaded"] += 1
+        if file["large"]:
+            entry["largeUploads"] += 1
+    for pc, summary in pcs.items():
+        entry = slot(pc)
+        docs = summary["documents"]
+        entry["read"] = docs["extracted"] + docs["readNoValues"] + docs["notRead"]
+        entry["rejected"] = docs["rejectedScans"]
+        entry["failedOther"] = max(0, docs["failed"] - docs["rejectedScans"])
+        entry["waiting"] = docs["waiting"]
+        entry["documents"] = entry["read"] + docs["failed"] + docs["waiting"]
+        entry["retriedAutomatically"] = summary["autoRetries"]
+        entry["retriedByPc"] = summary["pcRetries"] + summary["readAgain"]
+        entry["retriesExhausted"] = summary["retriesExhausted"]
+    total = empty()
+    for entry in by_pc.values():
+        for key in total:
+            total[key] += entry[key]
+    people = sorted(by_pc.values(), key=lambda e: (-e["filesUploaded"], e["pcName"] or e["pcActorId"] or "~"))
+    return {"total": total, "byPc": people}
+
+
+def _team_work(
+    connection: Connection, *, tenant_id: str, actor_id: str, start: datetime, end: datetime,
+    names: dict[str, str],
+) -> dict[str, Any]:
+    """What each PC / Team Lead did on tasks during the day: the tasks they
+    worked (a task counts once however many actions), the actions, the
+    journeys, and which of those tasks closed on the day. Machine events
+    (SYSTEM) are not work. A Team Lead's name is not stored with the task, so
+    it shows as the account id unless that person also started journeys."""
+    rows = connection.execute(
+        text(
+            f"""
+            SELECT te.actor_id, upper(COALESCE(te.actor_role_code, '')) AS role, te.event_type, te.task_id,
+                   te.journey_id, te.created_at_utc, te.comment,
+                   tk.task_type, tk.title, tk.task_status, tk.verified_at_utc,
+                   j.journey_reference, COALESCE(c.legal_name, c.display_name) AS customer_name
+            FROM auditcore.p2_task_events te
+            JOIN auditcore.p2_tasks tk ON tk.tenant_id=te.tenant_id AND tk.task_id=te.task_id
+            JOIN auditcore.journeys j ON j.tenant_id=tk.tenant_id AND j.journey_id=tk.journey_id
+            LEFT JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            WHERE te.tenant_id=:t AND te.created_at_utc >= :s AND te.created_at_utc < :e
+              AND te.actor_id IS NOT NULL AND upper(te.actor_id) <> 'SYSTEM'
+              AND te.event_type = ANY(:work) AND {_SCOPE}
+            ORDER BY te.created_at_utc
+            """
+        ),
+        {"t": tenant_id, "actor_id": actor_id, "s": start, "e": end, "work": list(_WORK_EVENTS)},
+    ).mappings().all()
+    people: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row["actor_id"]), row["role"])
+        person = people.setdefault(key, {
+            "actorId": key[0], "name": names.get(key[0]), "role": key[1] or None,
+            "actions": 0, "byAction": {}, "firstAt": None, "lastAt": None,
+            "_tasks": {}, "_journeys": set(),
+        })
+        person["actions"] += 1
+        person["byAction"][row["event_type"]] = person["byAction"].get(row["event_type"], 0) + 1
+        at = row["created_at_utc"]
+        person["firstAt"] = person["firstAt"] or at
+        person["lastAt"] = at
+        person["_journeys"].add(row["journey_id"])
+        task = person["_tasks"].setdefault(row["task_id"], {
+            "taskId": str(row["task_id"]), "journeyId": str(row["journey_id"]),
+            "journeyReference": row["journey_reference"], "customerName": row["customer_name"],
+            "taskType": row["task_type"], "title": row["title"], "status": row["task_status"],
+            "closedOnDay": bool(row["verified_at_utc"] and start <= row["verified_at_utc"] < end
+                                and row["task_status"] == "VERIFIED_COMPLETE"),
+            "actions": [], "lastAt": None, "lastComment": None,
+        })
+        if row["event_type"] not in task["actions"]:
+            task["actions"].append(row["event_type"])
+        task["lastAt"] = at.isoformat()
+        if row["comment"]:
+            task["lastComment"] = row["comment"]
+    out: list[dict[str, Any]] = []
+    for person in people.values():
+        tasks = list(person.pop("_tasks").values())
+        by_type: dict[str, int] = {}
+        for task in tasks:
+            by_type[task["taskType"]] = by_type.get(task["taskType"], 0) + 1
+        person["tasksWorked"] = len(tasks)
+        person["tasksClosed"] = sum(1 for t in tasks if t["closedOnDay"])
+        person["journeys"] = len(person.pop("_journeys"))
+        person["byTaskType"] = by_type
+        tasks.sort(key=lambda t: t["lastAt"] or "", reverse=True)
+        person["tasks"] = tasks[:_WORK_TASKS_PER_PERSON]
+        person["tasksTruncated"] = len(tasks) > _WORK_TASKS_PER_PERSON
+        person["firstAt"] = person["firstAt"].isoformat() if person["firstAt"] else None
+        person["lastAt"] = person["lastAt"].isoformat() if person["lastAt"] else None
+        out.append(person)
+    order = {"PC": 0, "TL": 1, "PM": 2}
+    out.sort(key=lambda p: (order.get(p["role"] or "", 9), -p["tasksWorked"], p["name"] or p["actorId"]))
+    return {
+        "people": out,
+        "totals": {
+            "people": len(out), "tasksWorked": sum(p["tasksWorked"] for p in out),
+            "actions": sum(p["actions"] for p in out), "tasksClosed": sum(p["tasksClosed"] for p in out),
+        },
     }
 
 

@@ -103,6 +103,7 @@ from audit_core.uc03_p2_task_producer import (
     sync_delivery_review_task,
     sync_document_missing_tasks,
     sync_field_review_tasks,
+    sync_large_upload_tasks,
     sync_name_consistency_tasks,
     sync_processing_failure_tasks,
     sync_unclassified_page_tasks,
@@ -3064,6 +3065,8 @@ def _sync_rule_tasks(connection, *, tenant_id: str, journey_id: UUID, started_at
         "name_consistency": sync_name_consistency_tasks(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
         "processing_failure": sync_processing_failure_tasks(
+            connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
+        "large_upload": sync_large_upload_tasks(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
         "unclassified_page": sync_unclassified_page_tasks(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),

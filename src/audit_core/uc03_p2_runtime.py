@@ -264,6 +264,14 @@ def dayend_removal_notice(pages: int = 1) -> str:
             "Please upload clearer copies.")
 
 
+# A file with more pages than this gets the PC a "review this upload" notice
+# (product owner 2026-10-26): are all these pages really needed? It is advice,
+# never a blocker: the upload goes through, the notice is outside the delivery
+# gate, and the Daily Processing report highlights the file. Set
+# P2_LARGE_UPLOAD_PAGES to change it.
+LARGE_UPLOAD_PAGES = int(os.environ.get("P2_LARGE_UPLOAD_PAGES", "25"))
+
+
 # What the PC does to close an image-quality task (product owner 2026-10-22):
 # the system cannot know which upload answers it, so he closes it by hand with
 # a comment. These two phrases are the guidance, quoted exactly; they are not a
