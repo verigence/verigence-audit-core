@@ -601,3 +601,64 @@ def test_idempotent(journey) -> None:
         text("SELECT count(*) FROM auditcore.discount_applications WHERE tenant_id=:t AND journey_id=:j"),
         {"t": c.tenant_id, "j": c.journey_id},
     ).scalar_one() == 1
+
+
+# ── 2026-10-26: a Project that takes its figures from the account statement ──
+def _use_the_account_statement(c) -> None:
+    c.execute(text("UPDATE auditcore.projects SET deal_source_policy='ACCOUNT_STATEMENT' WHERE tenant_id=:t"),
+              {"t": c.tenant_id})
+
+
+def _open_invoice_tasks(c) -> list[str]:
+    return [r[0] for r in c.execute(
+        text("SELECT task_type FROM auditcore.workflow_tasks WHERE tenant_id=:t AND journey_id=:j "
+             "AND task_type IN ('INVOICE_FIELD_REVIEW', 'INVOICE_DISCREPANCY_REVIEW') "
+             "AND task_status NOT IN ('COMPLETED', 'CANCELLED', 'FAILED', 'DEAD_LETTER') ORDER BY task_type"),
+        {"t": c.tenant_id, "j": c.journey_id}).all()]
+
+
+def test_a_statement_project_raises_no_invoice_task(journey) -> None:
+    c = journey
+    _use_the_account_statement(c)
+    im.materialize_reviewed_invoices(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[_vehicle("tax_invoice_tally", "1600000"), _vehicle("invoice_generic", "999999"),
+                   _doc("customer_invoice_dms", {"invoice_purpose": "VEHICLE_SALE", "invoice_number": "D-1",
+                                                 "taxable_amount": "1600000"})],
+    )
+    assert _open_invoice_tasks(c) == []
+    assert _finding(c, "INVOICE_COPIES_DISAGREE:VEHICLE|N|1NV9") is None
+
+
+def test_invoice_tasks_open_before_the_change_are_closed_by_the_cleanup_job(journey) -> None:
+    from audit_core import uc03_invoice_task_cleanup as cleanup
+
+    c = journey
+    documents = [_vehicle("tax_invoice_tally", "1600000"), _vehicle("invoice_generic", "999999"),
+                 _doc("customer_invoice_dms", {"invoice_purpose": "VEHICLE_SALE", "invoice_number": "D-1",
+                                               "taxable_amount": "1600000"})]
+    im.materialize_reviewed_invoices(c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+                                     documents=documents)
+    raised = _open_invoice_tasks(c)
+    assert raised.count("INVOICE_FIELD_REVIEW") == 1 and raised.count("INVOICE_DISCREPANCY_REVIEW") >= 1
+    _use_the_account_statement(c)
+
+    dry = cleanup.close_journey(c, tenant_id=c.tenant_id, journey_id=c.journey_id, tag="t", commit=False)
+    assert (dry["open"], dry["fieldReview"]) == (len(raised), 1)
+    assert dry["discrepancyReview"] == len(raised) - 1
+    assert _open_invoice_tasks(c) == raised  # nothing written
+
+    done = cleanup.close_journey(c, tenant_id=c.tenant_id, journey_id=c.journey_id, tag="t", commit=True)
+    assert done["openAfter"] == 0 and _open_invoice_tasks(c) == []
+    assert _finding(c, "INVOICE_COPIES_DISAGREE:VEHICLE|N|1NV9")["finding_status"] != "OPEN"
+    again = cleanup.close_journey(c, tenant_id=c.tenant_id, journey_id=c.journey_id, tag="t", commit=True)
+    assert again["open"] == 0
+
+
+def test_a_project_on_the_invoice_policy_keeps_its_invoice_tasks(journey) -> None:
+    c = journey
+    im.materialize_reviewed_invoices(
+        c, tenant_id=c.tenant_id, journey_id=c.journey_id, actor_id="tester",
+        documents=[_vehicle("tax_invoice_tally", "1600000"), _vehicle("invoice_generic", "999999")],
+    )
+    assert _open_invoice_tasks(c) == ["INVOICE_DISCREPANCY_REVIEW"]

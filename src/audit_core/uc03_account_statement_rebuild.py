@@ -13,6 +13,7 @@ is already right.
 """
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
@@ -93,6 +94,10 @@ def rebuild_journey(
         "unmapped": statement.unmapped if statement else [],
         "conflicts": statement.conflicts if statement else [],
         "tallyDeviations": [d["line"] for d in deviations],
+        "printedTotal": str(statement.printed_total) if statement and statement.printed_total is not None else None,
+        # information only, to spot a misread statement: never used for a check
+        "chargesLessDiscounts": (str(sum(statement.components.values(), Decimal(0))
+                                     - sum(statement.discounts.values(), Decimal(0))) if statement else None),
         "invoiceHeldBefore": _invoice_held(connection, tenant_id, journey_id),
     }
     if not commit:
