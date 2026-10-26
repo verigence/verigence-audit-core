@@ -272,3 +272,21 @@ def test_storage_prefixes_end_with_a_slash_so_one_journey_never_matches_another(
     tenant, one = "t1", uuid4()
     for prefix in storage_prefixes(tenant, one):
         assert prefix.endswith("/") and str(one) in prefix
+
+
+def test_deleting_also_sweeps_the_dated_folder_an_upload_sits_in(journey):
+    batch_id, _queue, _doc = add_page(journey)
+    dated = f"p2-documents/{journey.tenant_id}/2026-W44/2026-10-26/{journey.journey_id}/{batch_id}/original/o__p__f.pdf"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_upload_batches SET original_object_key=:k WHERE tenant_id=:t AND batch_id=:b"),
+            {"k": dated, "t": journey.tenant_id, "b": batch_id},
+        )
+    folder = f"p2-documents/{journey.tenant_id}/2026-W44/2026-10-26/{journey.journey_id}/"
+    straggler = f"{folder}{batch_id}/pages/0009-left-behind.pdf"
+    storage = FakeStorage({folder: [straggler]})
+
+    _run(journey, storage=storage)
+
+    assert dated in storage.deleted and straggler in storage.deleted

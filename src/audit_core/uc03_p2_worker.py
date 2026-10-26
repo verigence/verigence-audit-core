@@ -72,6 +72,7 @@ from audit_core.uc03_p2_grouping import (
     plan_documents,
     read_once_di_types,
 )
+from audit_core.uc03_p2_object_keys import root_of
 from audit_core.uc03_p2_price_variance import (
     backfill_price_variance,
     refresh_price_variance,
@@ -949,15 +950,18 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
     else:
         pages = [(payload, content_type)]
 
+    batch_folder = root_of(str(batch["original_object_key"])) or (
+        f"p2-documents/{work.tenant_id}/{work.journey_id}/{batch['batch_id']}"
+    )
     page_records: list[dict[str, Any]] = []
     for page_number, (page_payload, page_content_type) in enumerate(pages, start=1):
         page_sha = _page_content_sha(page_payload, page_content_type)
+        # Beside the original, in whichever layout the original was stored
+        # (dated for new uploads; uc03_p2_object_keys).
         object_key = (
-            f"p2-documents/{work.tenant_id}/{work.journey_id}/"
-            f"{batch['batch_id']}/pages/{page_number:04d}-{page_sha[:12]}.pdf"
+            f"{batch_folder}/pages/{page_number:04d}-{page_sha[:12]}.pdf"
             if page_content_type == "application/pdf"
-            else f"p2-documents/{work.tenant_id}/{work.journey_id}/"
-                 f"{batch['batch_id']}/pages/{page_number:04d}-{page_sha[:12]}"
+            else f"{batch_folder}/pages/{page_number:04d}-{page_sha[:12]}"
         )
         storage.put_object(object_key, page_payload, content_type=page_content_type)
         page_records.append(
@@ -2410,7 +2414,7 @@ def _group_batch(engine: Engine, work: WorkItem) -> None:
         batch = connection.execute(
             text(
                 """
-                SELECT batch_id, grouping_status, original_filename
+                SELECT batch_id, grouping_status, original_filename, original_object_key
                 FROM auditcore.p2_upload_batches
                 WHERE tenant_id=:tenant_id AND batch_id=:batch_id
                 """
@@ -2463,10 +2467,10 @@ def _group_batch(engine: Engine, work: WorkItem) -> None:
         )
         digest = hashlib.sha256(payload).hexdigest()
         label = "-".join(f"{n:04d}" for n in document.page_numbers)
-        key = (
-            f"p2-documents/{work.tenant_id}/{work.journey_id}/{batch_id}/groups/"
-            f"{label}-{digest[:12]}.pdf"
+        folder = root_of(str(batch["original_object_key"])) or (
+            f"p2-documents/{work.tenant_id}/{work.journey_id}/{batch_id}"
         )
+        key = f"{folder}/groups/{label}-{digest[:12]}.pdf"
         storage.put_object(key, payload, content_type="application/pdf")
         merged_keys[document.page_numbers] = (key, digest)
 
