@@ -42,6 +42,17 @@ def test_net_value_and_final_price_are_the_printed_total_not_an_unmapped_line() 
         assert statement_total(read) == D(1145000)
 
 
+def test_the_three_dealers_total_labels_as_written_on_the_forms() -> None:
+    """The three labels on the forms: 'NET RECEIVABLE (A+B)' with the amount
+    closed by '/-', and 'Net Value' twice."""
+    for label, amount, expected in (("NET RECEIVABLE (A+B)", "2045867/-", D(2045867)),
+                                    ("Net Value", 1168095, D(1168095)),
+                                    ("Net Value", "32,35,940", D(3235940))):
+        read = read_statement([*CHARGES, {"particulars_raw": label, "debit_amount": amount}])
+        assert read.printed_total == expected, label
+        assert read.unmapped == [] and read.conflicts == []
+
+
 def test_two_different_printed_totals_are_a_conflict() -> None:
     read = read_statement([*CHARGES, {"particulars_raw": "Net value", "debit_amount": 1145000},
                            {"particulars_raw": "Final price", "debit_amount": 1140000}])

@@ -83,7 +83,8 @@ def _amount(value: Any) -> Decimal | None:
     if value is None or value == "":
         return None
     try:
-        return Decimal(str(value).replace(",", "").strip())
+        # handwritten amounts are closed with "/-" or "/=" ("20,45,867/-")
+        return Decimal(re.sub(r"\s*/\s*[-=]*\s*$", "", str(value).replace(",", "").strip()))
     except (InvalidOperation, ValueError):
         return None
 
@@ -135,9 +136,10 @@ _DISCOUNTS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("ADDITIONAL_DISCOUNT", r"(OTHER DISCOUNT( \(IF ANY\))?|CASH DISCOUNT)( .*)?"),
     )
 )
-# The total the statement prints for what the customer owes: "Net value" or
-# "Final price" (product owner, 2026-10-26: every dealer's statement has one).
-_PRINTED_TOTAL = re.compile(r"(NET VALUE|FINAL PRICE)( .*)?")
+# The total the statement prints for what the customer owes (product owner,
+# 2026-10-26: every dealer's statement has one): "Net Value" (Aditya, Shivnath),
+# "NET RECEIVABLE (A+B)" (Utkal) -- and "Final price", which he also named.
+_PRINTED_TOTAL = re.compile(r"(NET VALUE|FINAL PRICE|NET RECEIVABLE( \(A ?\+ ?B\))?)( .*)?")
 # A discount line that names a scrappage bonus does not say whether it is the
 # dealer's or the certificate of deposit's, and the two are different
 # benefits: it is reported, not filed under either.
