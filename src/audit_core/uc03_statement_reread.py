@@ -16,6 +16,9 @@ left alone, and listed by Journey, when
 Document Intelligence refuses, too, a document a person verified or
 corrected there (``has_corrections``).
 
+A tag containing "-copy-" does not ask DI again: it only copies the pages DI
+has already read (after a worker restart cut a run short).
+
 Started from outside with AUDIT_CORE_STATEMENT_REREAD_TAG on the worker. A DRY
 RUN (one ``statement_reread_item`` log line per statement, nothing asked)
 unless the tag ends with "-commit". On commit each picked statement is asked
@@ -53,6 +56,11 @@ logger = structlog.get_logger(__name__)
 
 _WAIT_SECONDS = int(os.environ.get("AUDIT_CORE_STATEMENT_REREAD_WAIT_SECONDS", "2400"))
 _POLL_SECONDS = int(os.environ.get("AUDIT_CORE_STATEMENT_REREAD_POLL_SECONDS", "15"))
+# DI's listing does not say that a PROCESSED document has a new reading queued
+# (nextAttemptAtUtc is set only for a failing one), so a statement is copied
+# only after this long since the request: DI read each one in about ten seconds
+# on DEV (2026-10-26).
+_SETTLE_SECONDS = int(os.environ.get("AUDIT_CORE_STATEMENT_REREAD_SETTLE_SECONDS", "300"))
 _SETTLED_PAGE_STATES = ("READY", "NEEDS_REVIEW")
 
 
@@ -139,11 +147,14 @@ def statement_items(connection: Connection, tenant_id: str) -> list[dict[str, An
     return items
 
 
-def _di_status(v2: Any, *, token: str, tenant_id: str, context_ref: str, phase: str, di_document_id: str) -> dict[str, Any] | None:
-    listing = v2.list_documents(token=token, tenant_id=tenant_id, external_context_ref=context_ref, phase=phase)
-    for item in listing.get("documents") or []:
-        if str(item.get("documentId")) == di_document_id:
-            return item
+def _di_status(v2: Any, *, token: str, tenant_id: str, context_ref: str, di_document_id: str) -> dict[str, Any] | None:
+    """The document's listing entry. The stage a statement belongs to is not
+    always the phase it was uploaded in, so both phases are looked at."""
+    for phase in ("BOOKING", "DELIVERY"):
+        listing = v2.list_documents(token=token, tenant_id=tenant_id, external_context_ref=context_ref, phase=phase)
+        for item in listing.get("documents") or []:
+            if str(item.get("documentId")) == di_document_id:
+                return item
     return None
 
 
@@ -176,7 +187,7 @@ def _copy_into_audit_core(engine: Engine, tenant_id: str, item: dict[str, Any], 
         )
 
 
-def _reread(engine: Engine, tenant_id: str, items: list[dict[str, Any]], tag: str) -> dict[str, int]:
+def _reread(engine: Engine, tenant_id: str, items: list[dict[str, Any]], tag: str, *, ask: bool = True) -> dict[str, int]:
     from audit_core.uc03_document_capture_v2 import (
         _DI_AUDIENCE,
         _ensure_di_context,
@@ -196,6 +207,10 @@ def _reread(engine: Engine, tenant_id: str, items: list[dict[str, Any]], tag: st
                 context_ref, token = _ensure_di_context(
                     connection=connection, engine=engine, tenant_id=tenant_id,
                     journey_id=item["journeyId"], security_client=security, di_client=di)
+            if not ask:
+                # "-copy-" tag: DI already read these; only copy what it holds.
+                pending.append({**item, "contextRef": context_ref})
+                continue
             outcome = v2.reprocess_document(
                 token=token, tenant_id=tenant_id, external_context_ref=context_ref,
                 document_id=str(item["diDocumentId"]), force=True)
@@ -213,15 +228,18 @@ def _reread(engine: Engine, tenant_id: str, items: list[dict[str, Any]], tag: st
             pending.append({**item, "contextRef": context_ref})
         else:
             counts["refused"] += 1
-    deadline = time.monotonic() + _WAIT_SECONDS
+    started = time.monotonic()
+    deadline = started + _WAIT_SECONDS
     while pending and time.monotonic() < deadline:
         time.sleep(_POLL_SECONDS)
+        if ask and time.monotonic() - started < _SETTLE_SECONDS:
+            continue
         token = security.get_service_token(audience=_DI_AUDIENCE)
         still: list[dict[str, Any]] = []
         for item in pending:
             try:
                 status = _di_status(v2, token=token, tenant_id=tenant_id, context_ref=item["contextRef"],
-                                    phase=str(item["stage"]), di_document_id=str(item["diDocumentId"]))
+                                    di_document_id=str(item["diDocumentId"]))
             except DiCaptureV2Error:
                 still.append(item)
                 continue
@@ -266,7 +284,8 @@ def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> Non
         results: dict[str, int] = {}
         if commit:
             try:
-                results = _reread(engine, tenant_id, [i for i in items if i["decision"] == "REREAD"], tag)
+                results = _reread(engine, tenant_id, [i for i in items if i["decision"] == "REREAD"], tag,
+                                  ask="-copy-" not in tag)
             except Exception:
                 logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
         logger.info("statement_reread_finished", tag=tag, tenant_id=tenant_id, commit=commit,
