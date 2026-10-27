@@ -183,6 +183,9 @@ def test_railway_webhook_needs_the_secret_and_keeps_only_known_fields(engine):
                            headers={"X-Verigence-Webhook-Secret": "wrong"}).status_code == 401
         assert client.post("/v1/platform/railway-webhook", json=event,
                            headers={"X-Verigence-Webhook-Secret": secret}).status_code == 204
+        assert client.post("/v1/platform/railway-webhook?key=wrong", json=event).status_code == 401
+        assert client.post(f"/v1/platform/railway-webhook?key={secret}",
+                           json={**event, "resource": {**event["resource"], "deployment": {"id": "other"}}}).status_code == 204
         with engine.begin() as connection:
             row = connection.execute(
                 text("SELECT event_type, status, service_name, environment_name, payload FROM platform_ops.railway_events "
@@ -193,4 +196,28 @@ def test_railway_webhook_needs_the_secret_and_keeps_only_known_fields(engine):
     finally:
         with engine.begin() as connection:
             connection.execute(text("DELETE FROM platform_ops.webhook_secrets WHERE name='railway'"))
+
+
+def test_a_beat_writes_the_boot_row_when_the_start_could_not(engine, monkeypatch):
+    """Live 2026-10-27: services that started before the tables existed never showed."""
+    monkeypatch.setattr(platform_health, "_BOOT_ID", uuid4())
+    platform_health.beat(get_engine(), f"late-{uuid4().hex[:6]}")
+    with engine.begin() as connection:
+        assert connection.execute(
+            text("SELECT count(*) FROM platform_ops.service_heartbeats WHERE boot_id=:b"),
+            {"b": platform_health.boot_id()}).scalar_one() == 1
+
+
+def test_a_process_replaced_by_a_new_deployment_is_not_a_crash(engine):
+    """Live 2026-10-27: uvicorn waits for open streams on shutdown and Railway stops
+    the old container first, so the old process cannot stamp its stop."""
+    now = datetime.now(UTC)
+    svc = f"api-{uuid4().hex[:6]}"
+    with engine.begin() as connection:
+        _boot(connection, svc, deployment="A", replica="ra", started=now - timedelta(hours=2),
+              last_seen=now - timedelta(minutes=30))                       # replaced, no stop stamp
+        _boot(connection, svc, deployment="B", replica="rb", started=now - timedelta(minutes=31),
+              last_seen=now - timedelta(seconds=20))
+        rows = {s["service"]: s for s in services_health(connection, now - timedelta(hours=24), now)}
+    assert (rows[svc]["deploys"], rows[svc]["restarts"], rows[svc]["uncleanStops"]) == (1, 0, 0)
 
