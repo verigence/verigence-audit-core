@@ -87,6 +87,13 @@ from audit_core.uc03_p2_price_variance import (
     refresh_price_variance,
 )
 from audit_core.uc03_p2_registry import get_registry
+from audit_core.uc03_p2_retry_stop import (
+    STOPPED_CODE,
+    STOPPED_EVENT,
+    automatic_retry_stop_reason,
+    stop_reason_text,
+    stopped_details,
+)
 from audit_core.uc03_p2_runtime import (
     DAYEND_SWEEP_DEFAULT_UTC,
     claim_scheduled_run,
@@ -598,6 +605,15 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         _owned(connection, work)
+        if not terminal and work.work_type in _PAGE_RETRY_WORK_TYPES:
+            # Product owner 2026-10-27: once the PC has closed the page's
+            # task, no automatic retry (uc03_p2_retry_stop); while it is
+            # open, the T0 / +10 / +20 minute retries run as before.
+            why = automatic_retry_stop_reason(connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                                              queue_id=work.work_key)
+            if why:
+                _stop_automatic_retry(connection, work, why=why, error=error, attempts=attempts, cancel_work=True)
+                return
         connection.execute(
             text(
                 """
@@ -641,6 +657,59 @@ def _fail(engine: Engine, work: WorkItem, exc: Exception) -> None:
                 sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
             return
         _mark_dead(connection, work, attempts=attempts, retryable=retryable, cause=cause, error=error)
+
+
+# The page steps whose automatic retries stop once the PC closed the task.
+_PAGE_RETRY_WORK_TYPES = frozenset({"DOCUMENT_INGEST", "PAGE_REREAD"})
+
+
+def _stop_automatic_retry(
+    connection, work: WorkItem, *, why: str, error: str | None, attempts: int | None, cancel_work: bool,
+) -> None:
+    """Do not try this page again by itself (uc03_p2_retry_stop). The work
+    item is cancelled (``cancel_work``; otherwise the caller completes it),
+    a page still in hand is failed with the reason -- a page already settled
+    (kept as Others, removed, failed) is left as it is -- and the decision is
+    recorded. The file's tasks are refreshed as for any failed page."""
+    logger.info("p2_work_retry_stopped", why=why, **_work_fields(work))
+    if cancel_work:
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_work_queue
+                SET work_status='CANCELLED', attempt_count=COALESCE(:attempts, attempt_count),
+                    next_attempt_at_utc=NULL, lease_token=NULL, lease_expires_at_utc=NULL,
+                    last_error=:error, updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND work_id=:work_id
+                """
+            ),
+            {"tenant_id": work.tenant_id, "work_id": work.work_id, "attempts": attempts,
+             "error": (error or f"{STOPPED_CODE}: {why}")[:1800]},
+        )
+    batch_id = connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status='FAILED', status_reason=:reason, last_error=:code,
+                next_attempt_at_utc=NULL, updated_at_utc=now()
+            WHERE tenant_id=:tenant_id AND queue_id=CAST(:queue_id AS uuid) AND queue_status = ANY(:active)
+            RETURNING batch_id
+            """
+        ),
+        {"tenant_id": work.tenant_id, "queue_id": work.work_key, "reason": stop_reason_text(why),
+         "code": STOPPED_CODE, "active": list(_PAGE_ACTIVE_STATES)},
+    ).scalar_one_or_none()
+    if batch_id is not None:
+        _refresh_batch_status(connection, work.tenant_id, UUID(str(batch_id)))
+    record_activity(
+        connection, tenant_id=work.tenant_id, journey_id=work.journey_id, event_type=STOPPED_EVENT,
+        subject_type="DOCUMENT_PAGE", subject_id=work.work_key,
+        details=stopped_details(work.work_type, work.work_key, why,
+                                {"pageFailed": batch_id is not None, "attempts": attempts, "error": error}),
+        correlation_id=work.correlation_id,
+    )
+    if batch_id is not None:
+        sync_processing_failure_tasks(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
 
 
 def _failure_category(exc: Exception) -> str:
@@ -3355,6 +3424,18 @@ def process_work(engine: Engine, work: WorkItem) -> None:
     handler = handlers.get(work.work_type)
     if handler is None:
         raise ValueError(f"Unsupported P2 work type {work.work_type}")
+    if work.work_type in _PAGE_RETRY_WORK_TYPES and work.attempt_count > 0:
+        # An automatic retry already scheduled when the PC closed the page's
+        # task does not run (product owner 2026-10-27; uc03_p2_retry_stop).
+        with engine.begin() as connection:
+            set_tenant_context(connection, work.tenant_id)
+            _owned(connection, work)
+            why = automatic_retry_stop_reason(connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                                              queue_id=work.work_key)
+            if why:
+                _stop_automatic_retry(connection, work, why=why, error=None, attempts=None, cancel_work=False)
+        if why:
+            return
     handler(engine, work)
 
 

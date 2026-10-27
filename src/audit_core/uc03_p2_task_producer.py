@@ -801,7 +801,8 @@ def sync_processing_failure_tasks(
                        'queueId', q.queue_id,
                        'pages', COALESCE(q.page_numbers, ARRAY[q.page_number]),
                        'reason', q.status_reason,
-                       'code', q.last_error) ORDER BY q.page_number)
+                       'code', q.last_error,
+                       'templateKey', NULLIF(q.template_key, 'supporting_document')) ORDER BY q.page_number)
                      FILTER (WHERE q.queue_status IN ('FAILED','DEAD_LETTER')
                                      AND COALESCE(q.last_error, '') NOT LIKE 'DI_QUALITY_%'), '[]'::jsonb)
                      AS failed_units,
@@ -814,7 +815,7 @@ def sync_processing_failure_tasks(
             FROM auditcore.p2_upload_batches b
             LEFT JOIN (
               SELECT p.tenant_id, p.batch_id, p.queue_id, p.page_number, p.page_numbers, p.status_reason,
-                     p.last_error,
+                     p.last_error, p.template_key,
                      CASE WHEN {swept_pending_sql("p")} THEN 'FAILED' ELSE p.queue_status END AS queue_status
               FROM auditcore.p2_document_queue p
               WHERE p.tenant_id=:t AND p.journey_id=:j
@@ -873,6 +874,10 @@ def sync_processing_failure_tasks(
                 {"queueId": str(u["queueId"]), "pageNumbers": [int(p) for p in (u.get("pages") or [])],
                  "reason": resubmit_page_reason(u.get("code"), u.get("reason")),
                  "code": u.get("code"),
+                 # The type the page was identified as, when it is known:
+                 # the task offers "Send again" for such a page and "Set type
+                 # and send" for one that was never identified (2026-10-27).
+                 "templateKey": u.get("templateKey"),
                  "filePath": page_open_path(tenant_id, journey_id, u["queueId"])}
                 for u in failed_units
             ]
@@ -905,6 +910,20 @@ def sync_processing_failure_tasks(
                            "pages": pages, "setupOnly": only_setup},
                 severity="HIGH", registry=registry,
                 evaluation_started_at=evaluation_started_at,
+            )
+            # The pages' type (2026-10-27) is not part of the issue, so a
+            # task already open is not refreshed for it: give it the list.
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.p2_tasks
+                    SET reference=jsonb_set(reference, '{pages}', CAST(:pages AS jsonb)), updated_at_utc=now()
+                    WHERE tenant_id=:t AND dedupe_key=:k
+                      AND task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')
+                      AND reference->'pages' IS DISTINCT FROM CAST(:pages AS jsonb)
+                    """
+                ),
+                {"t": tenant_id, "k": key, "pages": _json(pages)},
             )
             counts[outcome] = counts.get(outcome, 0) + 1
             continue
