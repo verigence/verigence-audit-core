@@ -16,6 +16,9 @@ GET /v1/admin/system-health?hours=24 answers, for the whole platform:
 - database: connections, idle-in-transaction sessions, deadlocks and rollbacks
   (with the change over the window, from 15-minute counter snapshots),
   slowest queries;
+- Document Intelligence: DI keeps its own database, so its boots, CPU/memory,
+  queues and database come from DI's GET /v1/platform/health and are merged
+  into services, resources, pipeline.documentIntelligence and diDatabase;
 - alerts: what needs attention now, most severe first, shown as a banner.
 
 Counts and error codes only; no Journey or customer data leaves this route.
@@ -39,6 +42,14 @@ from audit_core.dependencies import (
     get_engine,
     require_super_admin_request,
 )
+from audit_core.system_health_di import (
+    DiHealthUnavailable,
+    di_alerts,
+    di_boot_rows,
+    di_pipeline,
+    di_unavailable,
+    fetch_di_health,
+)
 
 router = APIRouter(tags=["system-health"])
 
@@ -61,8 +72,9 @@ def _iso(value: Any) -> str | None:
     return value.isoformat() if isinstance(value, datetime) else value
 
 
-def services_health(connection: Connection, since: datetime, now: datetime) -> list[dict[str, Any]]:
-    boots = connection.execute(
+def services_health(connection: Connection, since: datetime, now: datetime,
+                    extra_boots: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    boots = [dict(b) for b in connection.execute(
         text(
             """
             SELECT boot_id, service_name, replica_id, deployment_id, version, started_at_utc,
@@ -73,7 +85,10 @@ def services_health(connection: Connection, since: datetime, now: datetime) -> l
             """
         ),
         {"since": since},
-    ).mappings().all()
+    ).mappings().all()]
+    # Services on their own database (Document Intelligence) report their boots
+    # through their API; the same rules count them.
+    boots = sorted(boots + list(extra_boots or []), key=lambda b: (b["service_name"], b["started_at_utc"]))
     http = {r["service_name"]: dict(r) for r in connection.execute(
         text(
             """
@@ -455,22 +470,51 @@ def system_health(
 ) -> dict[str, Any]:
     now = datetime.now(UTC)
     since = now - timedelta(hours=hours)
-    services = services_health(connection, since, now)
+    # Document Intelligence keeps its own database: asked over HTTP; a failure is
+    # shown on the page and raised as an alert, never fatal.
+    di: dict[str, Any] | None
+    try:
+        di = fetch_di_health(hours)
+        di_error = None
+    except DiHealthUnavailable as exc:
+        di, di_error = None, str(exc)
+    services = services_health(connection, since, now, extra_boots=di_boot_rows(di) if di else None)
     railway = railway_health(connection, since)
     resources = resources_health(connection, since)
     pipeline = pipeline_health(connection, since)
     database = connection.execute(text("SELECT platform_ops.db_health()")).scalar_one()
     database["window"] = _db_counters_delta(connection, since, database)
+    di_database: dict[str, Any] | None = None
+    if di is None:
+        pipeline["documentIntelligence"] = di_unavailable(di_error or "unknown")
+    else:
+        resources = sorted(resources + [r for r in di.get("resources") or [] if isinstance(r, dict)],
+                           key=lambda r: str(r.get("service")))
+        pipeline["documentIntelligence"] = di_pipeline(di, project_names(connection))
+        if isinstance(di.get("database"), dict):
+            di_database = {**di["database"], "window": None}
+    alerts = build_alerts(services, railway, pipeline, database, resources)
+    alerts += di_alerts(pipeline["documentIntelligence"], di_database)
+    order = {"CRITICAL": 0, "WARNING": 1}
+    alerts.sort(key=lambda a: order.get(a["severity"], 2))
     return {
         "generatedAtUtc": now.isoformat(),
         "windowHours": hours,
-        "alerts": build_alerts(services, railway, pipeline, database, resources),
+        "alerts": alerts,
         "services": services,
         "railway": railway,
         "resources": resources,
         "pipeline": pipeline,
         "database": database,
+        "diDatabase": di_database,
     }
+
+
+def project_names(connection: Connection) -> dict[str, dict[str, Any]]:
+    set_platform_super_admin_context(connection)
+    return {str(r["tenant_id"]): {"name": r["project_name"], "status": r["project_status"]}
+            for r in connection.execute(
+                text("SELECT tenant_id, project_name, project_status FROM auditcore.projects")).mappings().all()}
 
 
 WEBHOOK_SECRET_HEADER = "X-Verigence-Webhook-Secret"
