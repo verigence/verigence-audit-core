@@ -1674,7 +1674,11 @@ def addons(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[
     for item in insurance:
         item["premium_variance"] = _minus(item["actual_premium_amount"], item["standard_premium_amount"])
     finance = _rows(connection, """
-        SELECT f.finance_type_code, f.provider_name, f.financed_amount, f.loan_disbursement_amount,
+        SELECT f.finance_type_code, f.provider_name,
+               -- From documents this is the RTO challan's hypothecation charges, not the loan (2026-10-27).
+               CASE WHEN f.source_kind = 'EVIDENCE' THEN f.financed_amount END AS hypothecation_charges,
+               CASE WHEN f.source_kind IS DISTINCT FROM 'EVIDENCE' THEN f.financed_amount END AS sanctioned_amount,
+               f.loan_disbursement_amount,
                f.loan_disbursement_confidence, f.loan_disbursement_match_basis, f.do_reference,
                f.po_reference, f.actual_status_code,
                p.receipt_date AS disbursement_date, p.payment_reference AS disbursement_reference
@@ -1684,7 +1688,7 @@ def addons(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[
         WHERE f.tenant_id=:t AND f.journey_id=:j
         ORDER BY f.updated_at_utc DESC""", params)
     for item in finance:
-        item["disbursement_gap"] = _minus(item["financed_amount"], item["loan_disbursement_amount"])
+        item["disbursement_gap"] = _minus(item["sanctioned_amount"], item["loan_disbursement_amount"])
     plans = _rows(connection, """
         SELECT addon_type_code, provider_name, standard_amount, actual_amount, reference_number, source_kind
         FROM auditcore.journey_addons WHERE tenant_id=:t AND journey_id=:j

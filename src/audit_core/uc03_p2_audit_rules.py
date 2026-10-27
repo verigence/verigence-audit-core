@@ -228,7 +228,8 @@ class _Facts:
     def finance(self) -> dict[str, Any] | None:
         rows = self._rows(
             """
-            SELECT provider_name, do_reference, financed_amount, loan_disbursement_amount
+            SELECT provider_name, do_reference, financed_amount, loan_disbursement_amount, source_kind,
+                   finance_type_code
             FROM auditcore.finance_records WHERE tenant_id=:t AND journey_id=:j
             ORDER BY updated_at_utc DESC LIMIT 1
             """
@@ -236,10 +237,19 @@ class _Facts:
         if not rows:
             return None
         row = rows[0]
+        # A record read from documents (EVIDENCE) holds the RTO challan's
+        # hypothecation charges in financed_amount -- Rs 1,500 on every live
+        # record, never the loan (product owner 2026-10-27). No document states
+        # the sanctioned amount, so only a figure a person entered is one.
+        from_documents = row["source_kind"] == "EVIDENCE"
+        amount = Decimal(row["financed_amount"] or 0)
+        sanction = Decimal(0) if from_documents else amount
         return {
             "provider": row["provider_name"] or "the financier",
             "reference": row["do_reference"],
-            "financed": Decimal(row["financed_amount"] or 0),
+            "financed": bool(row["finance_type_code"]) or from_documents or sanction > 0,
+            "sanction": sanction,
+            "hypothecationCharges": amount if from_documents else None,
             "disbursed": Decimal(row["loan_disbursement_amount"] or 0),
         }
 
@@ -607,8 +617,8 @@ def _at_delivery(facts: _Facts) -> dict[str, Any] | RuleOutcome:
     if payable is None:
         return RuleOutcome("", "SKIPPED", "The amount payable is not known yet (no booking form or invoice read).")
     received = sum((r["amount"] for r in facts.receipts if r["date"] is None or r["date"] <= delivered), Decimal(0))
-    financed = facts.finance["financed"] if facts.finance else Decimal(0)
-    committed = max(financed, facts.loan_received)
+    sanction = facts.finance["sanction"] if facts.finance else Decimal(0)
+    committed = max(sanction, facts.loan_received)
     covered = received + committed
     return {"delivered": delivered, "payable": payable, "received": received, "committed": committed,
             "covered": covered, "short": payable - covered}
@@ -616,7 +626,7 @@ def _at_delivery(facts: _Facts) -> dict[str, Any] | RuleOutcome:
 
 def _received_in_all(facts: _Facts) -> Decimal:
     return sum((r["amount"] for r in facts.receipts), Decimal(0)) + (
-        max(facts.finance["financed"], facts.loan_received) if facts.finance else facts.loan_received
+        max(facts.finance["sanction"], facts.loan_received) if facts.finance else facts.loan_received
     )
 
 
@@ -892,7 +902,7 @@ def payment_after_delivery_beyond_grace(facts: _Facts) -> RuleOutcome:
 def do_payment_not_received(facts: _Facts) -> RuleOutcome:
     code = "DO_PAYMENT_NOT_RECEIVED"
     finance = facts.finance
-    if finance is None or finance["financed"] <= 0:
+    if finance is None or not finance["financed"]:
         return RuleOutcome(code, "PASS", "The deal is not financed.")
     if finance["disbursed"] > 0:
         return RuleOutcome(code, "PASS", f"Loan of {_rupees(finance['disbursed'])} received from {finance['provider']}.")
@@ -905,27 +915,33 @@ def do_payment_not_received(facts: _Facts) -> RuleOutcome:
                                             f"due by {_when(deadline)}.")
     return RuleOutcome(code, "FAIL", (
         f"No loan disbursement from {finance['provider']} recorded {(facts.today - delivered).days} days after "
-        f"delivery on {_when(delivered)}; the sanction was {_rupees(finance['financed'])}."
+        f"delivery on {_when(delivered)}"
+        + (f"; the sanction was {_rupees(finance['sanction'])}." if finance["sanction"] > 0 else ".")
     ), {"findingTitle": f"Financier payment not received within {_FINANCE_DAYS} days of delivery",
-        "financed": str(finance["financed"]), "deliveredOn": delivered.isoformat()})
+        "financed": str(finance["sanction"]) if finance["sanction"] > 0 else None,
+        "deliveredOn": delivered.isoformat()})
 
 
 def do_short_payment(facts: _Facts) -> RuleOutcome:
     code = "DO_SHORT_PAYMENT"
     finance = facts.finance
-    if finance is None or finance["financed"] <= 0:
+    if finance is None or not finance["financed"]:
         return RuleOutcome(code, "PASS", "The deal is not financed.")
     if finance["disbursed"] <= 0:
         return RuleOutcome(code, "SKIPPED", f"The loan from {finance['provider']} has not been received yet.")
-    short = finance["financed"] - finance["disbursed"]
+    if finance["sanction"] <= 0:
+        return RuleOutcome(code, "SKIPPED", (
+            f"No document states the amount {finance['provider']} sanctioned (the RTO challan shows only the "
+            "hypothecation charges), so the disbursement cannot be checked against it."))
+    short = finance["sanction"] - finance["disbursed"]
     if short > _TOLERANCE:
         return RuleOutcome(code, "FAIL", (
             f"{finance['provider']} disbursed {_rupees(finance['disbursed'])} against a sanction of "
-            f"{_rupees(finance['financed'])} ({_rupees(short)} short)."
+            f"{_rupees(finance['sanction'])} ({_rupees(short)} short)."
         ), {"findingTitle": "Financier paid less than the delivery order",
-            "financed": str(finance["financed"]), "disbursed": str(finance["disbursed"]), "short": str(short)})
+            "financed": str(finance["sanction"]), "disbursed": str(finance["disbursed"]), "short": str(short)})
     return RuleOutcome(code, "PASS", f"{finance['provider']} disbursed {_rupees(finance['disbursed'])} against "
-                                     f"a sanction of {_rupees(finance['financed'])}.")
+                                     f"a sanction of {_rupees(finance['sanction'])}.")
 
 
 def trade_in_not_resold(facts: _Facts) -> RuleOutcome:
