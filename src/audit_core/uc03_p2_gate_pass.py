@@ -17,10 +17,10 @@ dated that day, has been uploaded (product owner 2026-10-27):
     5. GET   /gate-passes/{id}/image-url  the photo, one outlet at a time
     6. GET   /daily-tasks, POST /daily-tasks/{id}/resolve   the TL's Daily Tasks
 
-For the Daily Gate Pass task a delivery counts only when its Journey carries the
-vehicle's gate pass document and the delivery date on it matches the day (see
-delivery_file_count). The calendar and the consolidated view keep their own count:
-Journeys with a Delivery-stage page uploaded on the day (IST), each counted once.
+A delivery counts only when its Journey carries the vehicle's gate pass document
+and the delivery date on it matches the day (see vehicle_gate_pass_deliveries):
+the Daily Gate Pass task, the calendar and the consolidated view all count the
+same way (product owner 2026-10-27).
 """
 from __future__ import annotations
 
@@ -134,32 +134,55 @@ def _day_info(day: date | None) -> dict[str, Any] | None:
             "dueAtUtc": gate_pass_due(day).isoformat()}
 
 
-def delivery_file_count(connection: Connection, tenant_id: str, outlet_id: UUID | str, day: date) -> int:
-    """Delivery Journeys of the outlet that carry the vehicle's own gate pass for the
-    day the Daily Gate Pass is for (product owner 2026-10-27).
+def vehicle_gate_pass_deliveries(connection: Connection, tenant_id: str, outlet_ids: list[str],
+                                 first: date, last: date) -> dict[tuple[date, str], int]:
+    """Delivery Journeys per (Daily Gate Pass day, outlet) that carry the vehicle's own
+    gate pass dated on a day that Daily Gate Pass covers (product owner 2026-10-27).
 
-    A Journey counts only when a vehicle gate pass document has been uploaded to it and
-    the delivery date on that gate pass (a reviewer's correction wins) is a day this
-    Daily Gate Pass covers, year included: Monday's covers Sunday too. Uploading other
-    delivery documents on the day does not count a Journey, and a gate pass whose date
-    was misread (often the year, on a handwritten gate pass) counts once the date is
-    corrected."""
-    covers = gate_pass_covers(day)
-    return int(connection.execute(
+    A Journey counts only when a vehicle gate pass document is on file (live) and the
+    delivery date on its newest reading (a reviewer's correction wins) is the day, year
+    included; Monday's Daily Gate Pass covers Sunday too. Uploading other delivery
+    documents does not count a Journey, and a gate pass whose date was misread (often
+    the year, on a handwritten gate pass) counts once the date is corrected."""
+    if not outlet_ids:
+        return {}
+    out: dict[tuple[date, str], int] = {}
+    for r in connection.execute(
         text(
             """
-            SELECT COUNT(DISTINCT f.journey_id)
-            FROM auditcore.journey_document_extracted_fields f
-            JOIN auditcore.journeys j ON j.tenant_id = f.tenant_id AND j.journey_id = f.journey_id
-            WHERE f.tenant_id = :tenant_id AND j.outlet_id = :outlet_id
-              AND f.source_document_type_key = 'gate_pass' AND f.field_key = 'delivery_date'
-              AND (f.effective_value #>> '{}') ~ '^\\d{4}-\\d{2}-\\d{2}$'
-              AND CAST(f.effective_value #>> '{}' AS date) = ANY(CAST(:days AS date[]))
+            WITH dated AS (
+                SELECT DISTINCT ON (f.journey_id, f.di_document_id) f.journey_id, f.effective_value #>> '{}' AS v
+                FROM auditcore.journey_document_extracted_fields f
+                JOIN auditcore.evidence e
+                  ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+                 AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
+                WHERE f.tenant_id = :t AND f.field_key = 'delivery_date'
+                  AND COALESCE(e.document_type_key, f.source_document_type_key) = 'gate_pass'
+                ORDER BY f.journey_id, f.di_document_id, f.source_fact_version DESC NULLS LAST,
+                         f.updated_at_utc DESC
+            )
+            SELECT CAST(d.v AS date) AS day, j.outlet_id, COUNT(DISTINCT d.journey_id) AS n
+            FROM dated d
+            JOIN auditcore.journeys j ON j.tenant_id = :t AND j.journey_id = d.journey_id
+            WHERE d.v ~ '^\\d{4}-\\d{2}-\\d{2}$' AND j.outlet_id = ANY(CAST(:ids AS uuid[]))
+              AND CAST(d.v AS date) BETWEEN :a AND :b
+            GROUP BY 1, 2
             """
         ),
-        {"tenant_id": tenant_id, "outlet_id": str(outlet_id),
-         "days": covers},
-    ).scalar_one() or 0)
+        {"t": tenant_id, "ids": [str(i) for i in outlet_ids], "a": gate_pass_covers(first)[0], "b": last},
+    ).mappings().all():
+        # Sunday's deliveries belong to Monday's Daily Gate Pass, which covers both days.
+        day = r["day"] + timedelta(days=1) if r["day"].isoweekday() == 7 else r["day"]
+        if first <= day <= last:
+            key = (day, str(r["outlet_id"]))
+            out[key] = out.get(key, 0) + int(r["n"])
+    return out
+
+
+def delivery_file_count(connection: Connection, tenant_id: str, outlet_id: UUID | str, day: date) -> int:
+    """Delivery Journeys of the outlet with the vehicle's gate pass for the day (see
+    vehicle_gate_pass_deliveries)."""
+    return vehicle_gate_pass_deliveries(connection, tenant_id, [str(outlet_id)], day, day).get((day, str(outlet_id)), 0)
 
 
 def _gate_pass_row(connection: Connection, tenant_id: str, gate_pass_id: UUID) -> dict[str, Any]:
@@ -585,22 +608,7 @@ def gate_pass_calendar(
         ),
         {"t": tenant_id, "ids": ids, "a": first, "b": last},
     ).mappings().all()
-    uploaded_rows = connection.execute(
-        text(
-            """
-            SELECT (q.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date AS day, j.outlet_id,
-                   COUNT(DISTINCT q.journey_id) AS files
-            FROM auditcore.p2_document_queue q
-            JOIN auditcore.journeys j ON j.tenant_id = q.tenant_id AND j.journey_id = q.journey_id
-            WHERE q.tenant_id = :t AND q.business_stage = 'DELIVERY' AND q.queue_status <> 'CANCELLED'
-              AND j.outlet_id = ANY(CAST(:ids AS uuid[]))
-              AND (q.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date BETWEEN :a AND :b
-            GROUP BY 1, 2
-            """
-        ),
-        # The Sunday before the 1st belongs to a Monday the 1st.
-        {"t": tenant_id, "ids": ids, "a": gate_pass_covers(first)[0], "b": last},
-    ).mappings().all()
+    uploaded = vehicle_gate_pass_deliveries(connection, tenant_id, ids, first, last)
     per_day: dict[date, dict[str, Any]] = {}
 
     def day_entry(day: date) -> dict[str, Any]:
@@ -608,12 +616,8 @@ def gate_pass_calendar(
                                         "gatePasses": 0, "open": 0})
 
     per_outlet: dict[tuple[date, str], dict[str, int]] = {}
-    for r in uploaded_rows:
-        # Sunday's delivery files are compared with Monday's gate pass, which covers both days.
-        day = r["day"] + timedelta(days=1) if r["day"].isoweekday() == 7 else r["day"]
-        if not first <= day <= last:
-            continue
-        per_outlet.setdefault((day, str(r["outlet_id"])), {"declared": 0, "uploaded": 0})["uploaded"] += int(r["files"])
+    for key, files in uploaded.items():
+        per_outlet.setdefault(key, {"declared": 0, "uploaded": 0})["uploaded"] += files
     gate_pass_ids: dict[date, str] = {}
     for r in declared_rows:
         per_outlet.setdefault((r["business_date"], str(r["outlet_id"])), {"declared": 0, "uploaded": 0})["declared"] += int(r["new_deliveries"] or 0)
@@ -660,7 +664,8 @@ def gate_pass_summary(
     (product owner 2026-10-27):
 
     - asPerRegister: new deliveries on the gate-out register (the gate pass counts);
-    - updatedInTool: Delivery files uploaded on the days the gate pass covers (live);
+    - updatedInTool: deliveries whose vehicle gate pass, dated that day, is uploaded to the Journey
+      (vehicle_gate_pass_deliveries, the same count as the PC's Daily Gate Pass task);
     - notNotifiedToPc: how many of the rest the PC said the dealership did not notify to them
       ("Not notified to PC", 2026-10-27; also returned as pendingDueToClient for older clients);
     - pendingDueToPc: as per register - (updated in tool + not notified to PC): what the PC has
@@ -692,22 +697,7 @@ def gate_pass_summary(
             WHERE tenant_id = :t AND status = 'ACTIVE' AND outlet_id = ANY(CAST(:ids AS uuid[]))
               AND business_date BETWEEN :a AND :b
         """), {"t": tenant_id, "ids": ids, "a": start, "b": end}).mappings().all()}
-    uploaded: dict[tuple[date, str], int] = {}
-    for r in connection.execute(
-        text("""
-            SELECT (q.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date AS day, j.outlet_id,
-                   COUNT(DISTINCT q.journey_id) AS files
-            FROM auditcore.p2_document_queue q
-            JOIN auditcore.journeys j ON j.tenant_id = q.tenant_id AND j.journey_id = q.journey_id
-            WHERE q.tenant_id = :t AND q.business_stage = 'DELIVERY' AND q.queue_status <> 'CANCELLED'
-              AND j.outlet_id = ANY(CAST(:ids AS uuid[]))
-              AND (q.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date BETWEEN :a AND :b
-            GROUP BY 1, 2
-        """), {"t": tenant_id, "ids": ids, "a": gate_pass_covers(start)[0], "b": end}).mappings().all():
-        # Sunday's files belong to Monday's gate pass, which covers both days.
-        day = r["day"] + timedelta(days=1) if r["day"].isoweekday() == 7 else r["day"]
-        key = (day, str(r["outlet_id"]))
-        uploaded[key] = uploaded.get(key, 0) + int(r["files"])
+    uploaded = vehicle_gate_pass_deliveries(connection, tenant_id, ids, start, end)
 
     leads = _team_leads(connection, tenant_id, outlets)
     totals = dict(empty)
@@ -764,8 +754,9 @@ def gate_pass_summary(
         "from": start.isoformat(), "to": end.isoformat(), "outlets": rows, "totals": totals,
         "notes": [
             "Onsite outlets only: the daily gate pass is not taken at a satellite outlet.",
-            ("As per gate-out register: new deliveries on the gate pass. Updated in tool: Delivery files uploaded "
-             "on the days the gate pass covers (Monday's covers Sunday); files uploaded later count on their day."),
+            ("As per gate-out register: new deliveries on the gate pass. Updated in tool: deliveries whose vehicle "
+             "gate pass, dated that day, is uploaded to the Journey (Monday's covers Sunday); a gate pass uploaded "
+             "later still counts on the day it is dated."),
             ("Not notified to PC: deliveries the PC said the dealership did not notify to them. Pending due to PC: "
              "as per register - (updated in tool + not notified to PC): deliveries the PC has not uploaded, "
              "or the whole gap while the PC has not answered yet."),
