@@ -377,7 +377,10 @@ _AMOUNT_EVIDENCE = {
     "corporateDiscount": ("corporate_discount_amount", "corporate_offer_amount", "CORPORATE_PRIVILEGE", "CORPORATE"),
     "exchangeBenefit": ("exchange_discount_amount", "exchange_claim_amount", "exchange_value", "exchange_credit",
                         "EXCHANGE_BONUS", "EXCHANGE"),
-    "financeCase": ("loan_credit", "financed_amount", "loan_amount", "loan_disbursement_amount"),
+    # financeCase is not inferred from any field (product owner 2026-10-27): it
+    # is the finance record, which uc03_finance_rule keeps to "RTO, insurance
+    # hypothecation or a receipt from the financier" -- an invoice's
+    # "Financed by: CASH" made this true for cash deals.
     "insuranceByDealer": ("inhouse_insurance_discount_amount",),
     # registrationByDealer is deliberately NOT inferred from an amount.
     # Road tax, RTO and registration charges are collected on virtually every
@@ -397,7 +400,6 @@ _AMOUNT_EVIDENCE = {
 }
 _TEXT_EVIDENCE = {
     # evidence key -> field keys whose non-empty value is the evidence
-    "financeCase": ("financed_by", "financier_name", "hypothecation", "hypothecated_to"),
     "corporateCustomer": ("buyer_gstin", "customer_gstin", "gstin_of_buyer"),
 }
 _DEALER_WORDS = ("DEALER", "SHOWROOM", "IN-HOUSE", "INHOUSE", "IN HOUSE", "COMPANY")
@@ -474,9 +476,9 @@ def condition_reasons(connection: Connection, *, tenant_id: str, journey_id: UUI
                 WHERE j.tenant_id=:t AND j.journey_id=:j) AS customer_type,
               EXISTS (SELECT 1 FROM auditcore.trade_in_cases WHERE tenant_id=:t AND journey_id=:j
                         AND {EXCHANGE_ON_FILE}) AS trade_in,
-              (SELECT provider_name FROM auditcore.finance_records WHERE tenant_id=:t AND journey_id=:j
-                 AND (provider_name IS NOT NULL OR financed_amount > 0) ORDER BY updated_at_utc DESC LIMIT 1)
-                AS financier,
+              (SELECT COALESCE(provider_name, 'a financier') FROM auditcore.finance_records
+                WHERE tenant_id=:t AND journey_id=:j AND finance_type_code IS NOT NULL
+                ORDER BY updated_at_utc DESC LIMIT 1) AS financier,
               (SELECT upper(COALESCE(insurance_by, '')) FROM auditcore.insurance_records
                 WHERE tenant_id=:t AND journey_id=:j ORDER BY updated_at_utc DESC LIMIT 1) AS insurance_record_by,
               (SELECT upper(COALESCE(registration_by, '')) FROM auditcore.registration_records

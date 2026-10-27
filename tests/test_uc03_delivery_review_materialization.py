@@ -185,28 +185,28 @@ def test_rto_challan_fields_only_selected_from_an_actual_rto_challan() -> None:
     assert district[1].value == "Cuttack"
 
 
-def test_financed_by_is_picked_up_from_any_invoice_document() -> None:
-    # financed_by is a common invoice-schema field, not scoped to one
-    # document type -- unlike the RTO Challan fields above.
-    invoice = _document(
-        "customer_invoice_dms",
-        [_field("financed_by", "HDFC Bank")],
-    )
-    selected = materialization._best_field([invoice], materialization._FINANCED_BY_FIELD_KEYS)
-    assert selected is not None
-    assert selected[1].value == "HDFC Bank"
+def test_an_invoice_financed_by_alone_is_not_finance_and_cash_never_is() -> None:
+    # Product owner 2026-10-27: finance only from the RTO, the insurance
+    # hypothecation or a receipt from the financier; CASH is never finance.
+    from audit_core.uc03_finance_rule import names_a_financier, receipt_financier
+
+    assert not names_a_financier("CASH") and not names_a_financier(" cash ") and not names_a_financier("Nil")
+    assert names_a_financier("HDFC Bank")
+    assert receipt_financier("STATE BANK OF INDIA (FINANCER)") == "STATE BANK OF INDIA"
+    assert receipt_financier("ICICI Finance (D.O)") == "ICICI Finance"
+    assert receipt_financier("NIRANJAN ROUT ( HP TO CANARA BANK )") == "CANARA BANK"
+    assert receipt_financier("BANSIDHAR BHUYAN") is None
+    assert receipt_financier("BANK CHARGES") is None
 
 
-def test_hp_charges_only_selected_from_an_actual_rto_challan() -> None:
-    challan = _document("rto_challan", [_field("hp_charges_amount", "5000")])
-    other = _document("customer_invoice_dms", [_field("hp_charges_amount", "SHOULD-NOT-MATCH")])
+def test_hypothecation_is_read_from_the_rto_line_items_too() -> None:
+    from audit_core.uc03_finance_rule import hypothecation_line_amount
 
-    selected = materialization._best_field(
-        [other, challan], materialization._HP_CHARGES_FIELD_KEYS, document_types={"rto_challan"},
-    )
-    assert selected is not None
-    assert selected[0].documentTypeKey == "rto_challan"
-    assert selected[1].value == "5000"
+    lines = '[{"description_raw": "New Registration (RTO Side)", "amount": 600, "total": 600}, ' \
+            '{"description_raw": "Hypothecation Addition", "amount": 1500, "total": 1500}]'
+    assert hypothecation_line_amount(lines) == 1500
+    assert hypothecation_line_amount([{"description_raw": "NUMBER RESERVATION FEE", "total": 10000}]) is None
+    assert hypothecation_line_amount([{"description_raw": "Hypothecation Addition", "amount": 0}]) is None
 
 
 def test_delivery_insurance_mapping_matches_di_insurance_cover_contract() -> None:
@@ -419,117 +419,94 @@ def test_delivery_review_materializes_before_marking_stage_verified() -> None:
     assert materialize_at < verified_at
 
 
-def test_materialize_delivery_finance_fills_provider_then_hp_charges(journey) -> None:
+def _finance_rows(journey):
+    return journey.execute(
+        text("SELECT finance_type_code, provider_name, financed_amount, source_kind "
+             "FROM auditcore.finance_records WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": journey.tenant_id, "j": journey.journey_id},
+    ).mappings().all()
+
+
+def test_an_invoice_financier_alone_makes_no_finance_then_the_rto_proves_it(journey) -> None:
+    """Product owner 2026-10-27: finance only from the RTO, the insurance
+    hypothecation or a receipt from the financier."""
     tenant_id, journey_id = journey.tenant_id, journey.journey_id
     invoice = _document("customer_invoice_dms", [_field("financed_by", "HDFC Bank")])
 
-    written = materialization.materialize_delivery_finance(
-        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[invoice],
-    )
-    assert written == 2  # finance_type_code (derived) + provider_name
+    assert materialization.materialize_delivery_finance(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[invoice]) == 0
+    assert _finance_rows(journey) == []
 
-    row = journey.execute(
-        text("SELECT finance_type_code, provider_name, financed_amount "
-             "FROM auditcore.finance_records WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": tenant_id, "j": journey_id},
-    ).mappings().one()
-    assert row["finance_type_code"] == "LOAN"
-    assert row["provider_name"] == "HDFC Bank"
-    assert row["financed_amount"] is None
-
-    # A later RTO Challan fills the HP charges without disturbing the
-    # provider already on record, and without creating a second row
-    # (finance_records has no (tenant_id, journey_id) uniqueness -- confirmed
-    # live gap this function guards against by matching the latest-row
-    # pattern payments_finance.put_finance already uses).
+    # The RTO charges hypothecation but names nobody: financed, named from the invoice.
     challan = _document("rto_challan", [_field("hp_charges_amount", "7500")])
+    assert materialization.materialize_delivery_finance(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[invoice, challan]) == 1
+    [row] = _finance_rows(journey)
+    assert (row["finance_type_code"], row["provider_name"], row["financed_amount"]) == ("LOAN", "HDFC Bank", 7500)
+
+    # The RTO names the financier: its name wins, still one row.
+    named = _document("rto_challan", [_field("hp_charges_amount", "7500"), _field("financer_name", "HDFC BANK LTD")])
     materialization.materialize_delivery_finance(
-        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[invoice, challan],
-    )
-    row2 = journey.execute(
-        text("SELECT provider_name, financed_amount FROM auditcore.finance_records "
-             "WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": tenant_id, "j": journey_id},
-    ).mappings().one()
-    assert row2["provider_name"] == "HDFC Bank"
-    assert row2["financed_amount"] == 7500
-
-    count = journey.execute(
-        text("SELECT count(*) FROM auditcore.finance_records WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": tenant_id, "j": journey_id},
-    ).scalar_one()
-    assert count == 1
-    # 2026-10-20: a date before the programme's floor is never the Journey's
-    # delivery date ("Delivery 06 Oct 2020" on the Journey list).
-    delivered = journey.execute(
-        text("SELECT actual_delivered_at FROM auditcore.deliveries WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": tenant_id, "j": journey_id},
-    ).scalar_one_or_none()
-    assert delivered is None
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[invoice, named])
+    [row] = _finance_rows(journey)
+    assert row["provider_name"] == "HDFC BANK LTD"
 
 
-def test_materialize_delivery_finance_no_financed_by_creates_no_row(journey) -> None:
+def test_cash_on_the_invoice_is_never_a_loan_and_a_stale_loan_is_removed(journey) -> None:
+    """Live 2026-10-27 (BANSIDHAR BHUYAN): an invoice reading "Financed by: CASH"
+    left a LOAN from "CASH" behind, even after that invoice was voided."""
     tenant_id, journey_id = journey.tenant_id, journey.journey_id
-    challan = _document("rto_challan", [_field("hp_charges_amount", "5000")])
-
-    written = materialization.materialize_delivery_finance(
-        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[challan],
-    )
-    assert written == 0
-    count = journey.execute(
-        text("SELECT count(*) FROM auditcore.finance_records WHERE tenant_id=:t AND journey_id=:j"),
+    journey.execute(
+        text("INSERT INTO auditcore.finance_records (tenant_id, journey_id, finance_type_code, provider_name, "
+             "source_kind, details) VALUES (:t, :j, 'LOAN', 'CASH', 'EVIDENCE', '{}'::jsonb)"),
         {"t": tenant_id, "j": journey_id},
-    ).scalar_one()
-    assert count == 0
+    )
+    materialization.sync_finance_hypothecation_findings(journey, tenant_id=tenant_id, journey_id=journey_id)
+    cash = _document("customer_invoice_dms", [_field("financed_by", "CASH")])
+    assert materialization.materialize_delivery_finance(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[cash]) == 1
+    assert _finance_rows(journey) == []
+    # The "financed deal has no hypothecation" finding the false loan raised is resolved.
+    statuses = journey.execute(
+        text("SELECT finding_status FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j "
+             "AND finding_type_code='FINANCE_HYPOTHECATION_MISSING'"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalars().all()
+    assert statuses == ["RESOLVED"]
 
 
-def test_finance_hypothecation_finding_raises_then_resolves(journey) -> None:
+def test_a_finance_record_a_person_entered_is_never_removed(journey) -> None:
     tenant_id, journey_id = journey.tenant_id, journey.journey_id
-    invoice = _document("customer_invoice_dms", [_field("financed_by", "SBI")])
+    journey.execute(
+        text("INSERT INTO auditcore.finance_records (tenant_id, journey_id, finance_type_code, provider_name, "
+             "source_kind, details) VALUES (:t, :j, 'LOAN', 'SBI', 'OPERATIONAL_INPUT', '{}'::jsonb)"),
+        {"t": tenant_id, "j": journey_id},
+    )
+    assert materialization.materialize_delivery_finance(
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[]) == 0
+    assert [r["provider_name"] for r in _finance_rows(journey)] == ["SBI"]
+
+
+def test_a_receipt_from_the_financier_or_rto_line_items_prove_finance(journey) -> None:
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    receipt = _document("dealer_receipt", [_field("customer_name", "STATE BANK OF INDIA (FINANCER)")])
     materialization.materialize_delivery_finance(
-        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[invoice],
-    )
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[receipt])
+    [row] = _finance_rows(journey)
+    assert (row["provider_name"], row["financed_amount"]) == ("STATE BANK OF INDIA", None)
 
-    raised = materialization.sync_finance_hypothecation_findings(
-        journey, tenant_id=tenant_id, journey_id=journey_id,
-    )
-    assert raised == {"raised": 1, "resolved": 0}
-
-    row = journey.execute(
-        text("SELECT finding_type_code, finding_class, owner_role_code, finding_status "
-             "FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": tenant_id, "j": journey_id},
-    ).mappings().one()
-    assert row["finding_type_code"] == "FINANCE_HYPOTHECATION_MISSING"
-    assert row["finding_class"] == "DATA_GAP"
-    assert row["owner_role_code"] == "PC"
-    assert row["finding_status"] == "OPEN"
-
-    # idempotent -- no duplicate finding on a repeat call
-    again = materialization.sync_finance_hypothecation_findings(
-        journey, tenant_id=tenant_id, journey_id=journey_id,
-    )
-    assert again == {"raised": 1, "resolved": 0}
-    count = journey.execute(
-        text("SELECT count(*) FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": tenant_id, "j": journey_id},
-    ).scalar_one()
-    assert count == 1
-
-    # HP charges arrive -- the finding resolves.
-    challan = _document("rto_challan", [_field("hp_charges_amount", "3200")])
+    # No HP charges yet: the "financed deal has no hypothecation" finding is raised ...
+    assert materialization.sync_finance_hypothecation_findings(
+        journey, tenant_id=tenant_id, journey_id=journey_id) == {"raised": 1, "resolved": 0}
+    # ... and resolves once the RTO charges it, here only as a line item.
+    challan = _document("rto_challan", [_field(
+        "line_items", '[{"description_raw": "Hypothecation Addition", "amount": 1500, "total": 1500}]')])
     materialization.materialize_delivery_finance(
-        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[invoice, challan],
-    )
-    resolved = materialization.sync_finance_hypothecation_findings(
-        journey, tenant_id=tenant_id, journey_id=journey_id,
-    )
-    assert resolved == {"raised": 0, "resolved": 1}
-    status = journey.execute(
-        text("SELECT finding_status FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j"),
-        {"t": tenant_id, "j": journey_id},
-    ).scalar_one()
-    assert status == "RESOLVED"
+        journey, tenant_id=tenant_id, journey_id=journey_id, documents=[receipt, challan])
+    [row] = _finance_rows(journey)
+    assert row["financed_amount"] == 1500
+    assert materialization.sync_finance_hypothecation_findings(
+        journey, tenant_id=tenant_id, journey_id=journey_id) == {"raised": 0, "resolved": 1}
 
 
 def test_finance_hypothecation_no_finding_when_not_financed(journey) -> None:
