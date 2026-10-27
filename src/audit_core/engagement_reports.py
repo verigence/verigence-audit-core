@@ -74,6 +74,9 @@ def _iso(value: Any) -> str | None:
 def _empty() -> dict[str, Any]:
     return {
         "activeMinutes": 0, "idleMinutes": 0, "backgroundMinutes": 0,
+        # Active minutes by where they were spent: WEB (computer browser),
+        # MOBILE_WEB (phone / tablet browser), ANDROID, IOS (the app).
+        "activeMinutesBySource": {},
         "sessions": 0, "_sessionMinutes": [], "daysActive": 0,
         "firstActiveAtUtc": None, "lastActiveAtUtc": None, "_firstClock": [], "_lastClock": [],
         "hourlyActiveMinutes": [0] * 24,
@@ -88,6 +91,9 @@ def _merge(into: dict[str, Any], part: dict[str, Any]) -> None:
     for key, value in part.items():
         if key == "hourlyActiveMinutes":
             into[key] = [a + b for a, b in zip(into[key], value, strict=True)]
+        elif key == "activeMinutesBySource":
+            for source, minutes in value.items():
+                into[key][source] = into[key].get(source, 0) + minutes
         elif key in ("_sessionMinutes", "_firstClock", "_lastClock"):
             into[key] += value
         elif key == "firstActiveAtUtc":
@@ -218,13 +224,16 @@ def build_engagement(connection: Connection, *, tenant_id: str, start_day: date,
         c["taskActions"] += int(row["actions"])
 
     for row in connection.execute(text("""
-        SELECT actor_id, activity_date, active_seconds, idle_seconds, background_seconds, hourly_active_minutes,
-               first_active_at_utc, last_active_at_utc, sessions
+        SELECT actor_id, activity_date, client_kind, active_seconds, idle_seconds, background_seconds,
+               hourly_active_minutes, first_active_at_utc, last_active_at_utc, sessions
         FROM auditcore.p2_user_activity_daily
         WHERE tenant_id = :t AND activity_date BETWEEN :sd AND :ed
     """), {"t": tenant_id, "sd": start_day, "ed": end_day}).mappings().all():
         c = cell(row["actor_id"], row["activity_date"])
         c["activeMinutes"] += round(int(row["active_seconds"]) / 60)
+        source = str(row["client_kind"] or "WEB")
+        c["activeMinutesBySource"][source] = (c["activeMinutesBySource"].get(source, 0)
+                                              + round(int(row["active_seconds"]) / 60))
         c["idleMinutes"] += round(int(row["idle_seconds"]) / 60)
         c["backgroundMinutes"] += round(int(row["background_seconds"]) / 60)
         hourly = [int(v or 0) for v in list(row["hourly_active_minutes"] or [])] + [0] * 24

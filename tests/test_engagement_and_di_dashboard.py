@@ -23,7 +23,7 @@ from audit_core.engagement_reports import build_engagement, period_key, working_
 from audit_core.main import app
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import get_security_authorization_client
-from audit_core.task_manager import Caller, ist_today
+from audit_core.task_manager import Caller, TaskManagerError, ist_today
 from audit_core.task_manager_reports import merge_sessions, record_activity
 
 
@@ -100,6 +100,27 @@ def test_engagement_by_day_week_and_month(journey):
     assert len(week["periods"]) in (2, 3)
     pc_week = next(p for p in week["people"] if p["actorId"] == journey.actor_id)
     assert sum(p["sessions"] for p in pc_week["periods"]) == 2
+
+
+def test_engagement_shows_where_the_time_was_spent(journey):
+    """Product owner 2026-10-27: capture mobile too and show the source used.
+    A phone's browser is its own source (MOBILE_WEB), added to the computer's
+    time rather than merged with it."""
+    today = ist_today()
+    now = datetime.now(UTC)
+    caller = Caller(actor_id=journey.actor_id, role="PC")
+    with _db(journey) as c:
+        for kind, seconds in (("WEB", 1800), ("MOBILE_WEB", 600), ("ANDROID", 1200)):
+            assert record_activity(c, tenant_id=journey.tenant_id, caller=caller, now=now, payload={
+                "date": today.isoformat(), "clientKind": kind, "activeSeconds": seconds, "idleSeconds": 0,
+                "backgroundSeconds": 0, "hourlyActiveMinutes": [0] * 24})
+        with pytest.raises(TaskManagerError):
+            record_activity(c, tenant_id=journey.tenant_id, caller=caller, now=now, payload={
+                "date": today.isoformat(), "clientKind": "TV", "activeSeconds": 1})
+        report = build_engagement(c, tenant_id=journey.tenant_id, start_day=today, end_day=today, period="day")
+    t = next(p for p in report["people"] if p["actorId"] == journey.actor_id)["totals"]
+    assert t["activeMinutes"] == 60
+    assert t["activeMinutesBySource"] == {"WEB": 30, "MOBILE_WEB": 10, "ANDROID": 20}
 
 
 def test_di_dashboard_outcomes_reasons_and_failed_links(journey):
