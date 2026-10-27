@@ -414,7 +414,7 @@ def _finance_items(connection: Connection, tenant_id: str, journey_id: UUID) -> 
     row = connection.execute(
         text(
             """
-            SELECT finance_type_code, provider_name, financed_amount
+            SELECT finance_type_code, provider_name, financed_amount, source_kind
             FROM auditcore.finance_records
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
             """
@@ -427,7 +427,8 @@ def _finance_items(connection: Connection, tenant_id: str, journey_id: UUID) -> 
         return []
     return [
         ComplianceReportLineItem(
-            label="Financed Amount",
+            # From documents: the RTO challan's hypothecation charges, not the loan (2026-10-27).
+            label="Hypothecation charges" if row["source_kind"] == "EVIDENCE" else "Financed Amount",
             detail=row["provider_name"] or _friendly(row["finance_type_code"]),
             standardAmount=None,
             actualAmount=_to_float(row["financed_amount"]),
