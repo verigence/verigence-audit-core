@@ -45,7 +45,7 @@ ASSIGN_MATRIX: dict[str, frozenset[str]] = {
     SUPER_ADMIN: frozenset(ALL_ROLES),
     EXECUTIVE: frozenset(ALL_ROLES),
     "PM": frozenset({"TL", "PC", "CRM"}),
-    "TL": frozenset({"PC", "CRM"}),
+    "TL": frozenset({"PC", "CRM", "REVIEWER"}),  # Reviewer added 2026-10-27
     "CRM": frozenset({"TL", "PM"}),
     "REVIEWER": frozenset({"PC"}),
     "PC": frozenset(),

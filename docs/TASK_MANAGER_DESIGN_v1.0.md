@@ -29,7 +29,7 @@ Three kinds of task scope live in `p2_tasks.scope_kind`:
 | Superadmin | anyone in the Project (PC, TL, PM, CRM, Reviewer, Executive) |
 | Executive | anyone in the Project |
 | PM | TL, PC, CRM |
-| TL | PC, CRM |
+| TL | PC, CRM, Reviewer (Reviewer added 2026-10-27) |
 | CRM | TL, PM |
 | Reviewer | PC |
 | PC | no one |
