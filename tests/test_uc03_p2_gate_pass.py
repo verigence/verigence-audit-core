@@ -320,7 +320,7 @@ def test_consolidated_view_register_tool_and_pending(setup):
     view = s.client.get(f"{s.base}/summary").json()
     [row] = view["outlets"]
     assert (row["asPerRegister"], row["updatedInTool"], row["pendingDueToPc"], row["pendingDueToClient"]) == (5, 2, 3, 0)
-    assert row["days"][-1]["status"] == "ANSWER_PENDING"
+    assert row["days"][-1]["status"] == "ANSWER_PENDING" and row["days"][-1]["photoQuality"] == "GOOD"
     assert s.client.post(f"{s.base}/{gp}/answer", json={"filesHeld": False}).status_code == 200
     after = s.client.get(f"{s.base}/summary").json()
     assert (after["totals"]["pendingDueToClient"], after["totals"]["pendingDueToPc"]) == (3, 0)
