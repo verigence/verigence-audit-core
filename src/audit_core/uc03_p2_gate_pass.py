@@ -139,14 +139,11 @@ def delivery_file_count(connection: Connection, tenant_id: str, outlet_id: UUID 
     day the Daily Gate Pass is for (product owner 2026-10-27).
 
     A Journey counts only when a vehicle gate pass document has been uploaded to it and
-    the delivery date read off that gate pass (a reviewer's correction wins) falls on a
-    day this Daily Gate Pass covers: Monday's covers Sunday too. Uploading other
-    delivery documents on the day does not count a Journey.
-
-    Day and month are compared, not the year: the year on a handwritten gate pass is
-    often misread (October 2026 deliveries read as 2020-2024), while day and month
-    read reliably, and a daily gate pass cannot be confused with the same day of
-    another year."""
+    the delivery date on that gate pass (a reviewer's correction wins) is a day this
+    Daily Gate Pass covers, year included: Monday's covers Sunday too. Uploading other
+    delivery documents on the day does not count a Journey, and a gate pass whose date
+    was misread (often the year, on a handwritten gate pass) counts once the date is
+    corrected."""
     covers = gate_pass_covers(day)
     return int(connection.execute(
         text(
@@ -157,11 +154,11 @@ def delivery_file_count(connection: Connection, tenant_id: str, outlet_id: UUID 
             WHERE f.tenant_id = :tenant_id AND j.outlet_id = :outlet_id
               AND f.source_document_type_key = 'gate_pass' AND f.field_key = 'delivery_date'
               AND (f.effective_value #>> '{}') ~ '^\\d{4}-\\d{2}-\\d{2}$'
-              AND to_char(CAST(f.effective_value #>> '{}' AS date), 'MM-DD') = ANY(CAST(:month_days AS text[]))
+              AND CAST(f.effective_value #>> '{}' AS date) = ANY(CAST(:days AS date[]))
             """
         ),
         {"tenant_id": tenant_id, "outlet_id": str(outlet_id),
-         "month_days": [d.strftime("%m-%d") for d in covers]},
+         "days": covers},
     ).scalar_one() or 0)
 
 

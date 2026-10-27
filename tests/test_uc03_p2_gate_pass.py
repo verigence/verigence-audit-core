@@ -418,11 +418,11 @@ def test_a_delivery_counts_only_with_its_vehicle_gate_pass_of_that_day(setup):
     _delivery_file(s, journeys=1, fresh=True, gate_pass_dated=None)           # documents but no vehicle gate pass
     _delivery_file(s, journeys=1, fresh=True, gate_pass_dated=date(2026, 1, 1) if today != date(2026, 1, 1)
                    else date(2026, 1, 2))                                     # gate pass of another day
-    _delivery_file(s, journeys=1, fresh=True, gate_pass_dated=today.replace(year=2022))  # year misread: counts
+    _delivery_file(s, journeys=1, fresh=True, gate_pass_dated=today.replace(year=2022))  # year misread: not counted
     [[misread]] = _delivery_file(s, journeys=1, fresh=True, gate_pass_dated=date(2026, 3, 3) if today != date(2026, 3, 3)
                                  else date(2026, 3, 4))
     gp = _upload(s).json()["gatePassId"]
-    assert _counts(s, gp, 2).json()["deliveryFiles"] == 2
+    assert _counts(s, gp, 1).json()["deliveryFiles"] == 1
     # A reviewer corrects a misread date to today: that vehicle now counts.
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
@@ -430,7 +430,7 @@ def test_a_delivery_counts_only_with_its_vehicle_gate_pass_of_that_day(setup):
                                       "AND queue_id=:q"), {"t": s.journey.tenant_id, "q": str(misread["queue_id"])}).scalar_one()
     _vehicle_gate_pass(s, jid, date(2026, 3, 3), corrected_to=today)
     gp2 = _upload(s).json()["gatePassId"]
-    assert _counts(s, gp2, 3).json()["deliveryFiles"] == 3
+    assert _counts(s, gp2, 2).json()["deliveryFiles"] == 2
 
 
 def test_monday_counts_vehicle_gate_passes_of_sunday_too(setup):
