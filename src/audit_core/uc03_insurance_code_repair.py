@@ -13,9 +13,12 @@ looks like a phone number:
 1. rebuild the Journey's values from the readings Audit Core holds -- the
    newest live reading now wins, which fixes a Journey whose newest reading was
    already right. The rebuild only fills empty columns, so a phone-shaped code
-   is cleared first, and the change is kept only when a proper code (not
-   empty, not phone-shaped) takes its place; otherwise it is rolled back and
-   the Journey listed (live 2026-10-27: the rebuild alone changed nothing);
+   is cleared first. The change is kept when a proper code takes its place, or
+   when the column stays empty because no current reading holds the phone
+   number any more (the policy prints only a contact number there, and the
+   new reading rightly has no code). If a current reading still holds it (not
+   read again yet, or its stage reviewed), the Journey is rolled back and
+   listed (live 2026-10-27: the rebuild alone changed nothing);
 2. if the code still looks like a phone number, ask Document Intelligence to
    read the Journey's live insurance pages again under the new instructions
    (reprocess force) and copy the new reading in -- the same request, wait and
@@ -144,6 +147,31 @@ def _codes(connection: Connection, tenant_id: str, journey_id: UUID) -> dict[str
     return dict(row) if row is not None else None
 
 
+def _current_readings_say_no_code(connection: Connection, tenant_id: str, journey_id: UUID, field_key: str) -> bool:
+    """The readings that still speak for the Journey -- active evidence, a page
+    not merged, cancelled or retired -- exist for this field and none of them
+    holds a phone number: the policy was read and has no code there."""
+    values = connection.execute(
+        text(
+            """
+            SELECT f.effective_value
+            FROM auditcore.journey_document_extracted_fields f
+            JOIN auditcore.evidence e ON e.tenant_id = f.tenant_id AND e.di_document_id = f.di_document_id
+            WHERE f.tenant_id = :t AND f.journey_id = :j AND f.field_key = :k
+              AND e.association_status = 'ACTIVE'
+              AND f.source_document_type_key = ANY(CAST(:types AS text[]))
+              AND NOT EXISTS (
+                  SELECT 1 FROM auditcore.p2_document_queue q
+                  WHERE q.tenant_id = f.tenant_id AND q.di_document_id = f.di_document_id
+                  HAVING bool_and(q.retired_at_utc IS NOT NULL OR q.queue_status IN ('MERGED', 'CANCELLED'))
+              )
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "k": field_key, "types": list(_INSURANCE_TYPES)},
+    ).scalars().all()
+    return bool(values) and not any(looks_like_phone_number(v) for v in values)
+
+
 def _rebuild(engine: Engine, tenant_id: str, journey_id: UUID) -> list[str]:
     """Clear the phone-shaped codes and rebuild from the newest live readings.
     Returns the columns that now hold a proper code; anything else is rolled back."""
@@ -174,7 +202,11 @@ def _rebuild(engine: Engine, tenant_id: str, journey_id: UUID) -> list[str]:
             materialize_booking_documents_from_durable_store(connection, tenant_id=tenant_id, journey_id=journey_id)
             materialize_delivery_documents_from_durable_store(connection, tenant_id=tenant_id, journey_id=journey_id)
             after = _codes(connection, tenant_id, journey_id) or {}
-            fixed = [c for c in wrong if after.get(c) and not looks_like_phone_number(after.get(c))]
+            fixed = [
+                c for c in wrong
+                if (after.get(c) and not looks_like_phone_number(after.get(c)))
+                or (after.get(c) is None and _current_readings_say_no_code(connection, tenant_id, journey_id, c))
+            ]
             if fixed != wrong:
                 raise _KeepAsIs
             return fixed
