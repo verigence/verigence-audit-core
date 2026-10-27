@@ -301,3 +301,35 @@ def test_sunday_goes_with_monday(setup, monkeypatch):
     saturday = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id)},
                              files={"file": ("gatepass.jpg", SHARP, "image/jpeg")})
     assert saturday.status_code == 201 and saturday.json()["businessDate"] == "2026-10-31"
+
+
+def test_consolidated_view_register_tool_and_pending(setup):
+    """Product owner 2026-10-27: TL / PM / Executive see, per onsite outlet, as per
+    gate-out register, updated in tool, pending due to client and due to PC."""
+    s = setup
+    _delivery_file(s, journeys=2)
+    gp = _upload(s).json()["gatePassId"]
+    assert _counts(s, gp, 5).json()["divergence"] == "MISSING_FILES"
+    view = s.client.get(f"{s.base}/summary").json()
+    [row] = view["outlets"]
+    assert (row["asPerRegister"], row["updatedInTool"], row["pendingDueToPc"], row["pendingDueToClient"]) == (5, 2, 3, 0)
+    assert row["days"][-1]["status"] == "ANSWER_PENDING"
+    assert s.client.post(f"{s.base}/{gp}/answer", json={"filesHeld": False}).status_code == 200
+    after = s.client.get(f"{s.base}/summary").json()
+    assert (after["totals"]["pendingDueToClient"], after["totals"]["pendingDueToPc"]) == (3, 0)
+    assert after["totals"]["gatePassesFinished"] == 1
+    _delivery_file(s, journeys=1, fresh=True)  # one of them uploaded later the same day
+    assert s.client.get(f"{s.base}/summary").json()["totals"]["pendingDueToClient"] == 2
+
+
+def test_satellite_outlets_have_no_gate_pass(setup):
+    s = setup
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.dealer_outlets SET outlet_classification='SATELLITE' "
+                                "WHERE outlet_id=:o"), {"o": s.journey.outlet_id})
+    outlets = s.client.get(f"{s.base}/outlets").json()
+    assert outlets["outlets"] == [] and outlets["satelliteOnly"] is True
+    refused = _upload(s)
+    assert refused.status_code == 422 and "onsite" in refused.json()["detail"]
+    assert s.client.get(f"{s.base}/summary").json()["outlets"] == []

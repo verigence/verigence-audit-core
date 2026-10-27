@@ -96,6 +96,13 @@ must be someone the reassigning person may assign to. Recorded as a
   pass. Monday's covers Sunday and Monday, one photo for both days with the
   counts of both together, and is compared with the Delivery files uploaded on
   both days (the calendar folds Sunday into Monday).
+- Onsite outlets only (product owner 2026-10-27): no gate pass task, upload or
+  calendar entry for a satellite outlet; open tasks of a satellite are cancelled.
+- Consolidated view (`GET /gate-passes/summary?from&to`) for TL (outlets under
+  them), PM and Executive (all): per onsite outlet and day, as per gate-out
+  register, updated in tool (Delivery files of the covered days, live), pending
+  due to client (PC said not notified) and pending due to PC (files held or not
+  answered yet), and gate passes missing / finished.
 - The task names its day first: "Gate pass for Tue 27 Oct: <outlet>", or
   "Gate pass for Sun 1 + Mon 2 Nov: <outlet>".
 - The upload is filed under the day it is for: today, or the previous gate

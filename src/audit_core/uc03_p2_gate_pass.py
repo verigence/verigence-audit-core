@@ -195,9 +195,10 @@ def gate_pass_outlets(
     and the days a gate pass can be uploaded for. ``previousOpenOutletIds``: outlets whose gate pass of
     the previous day is not finished yet, so the screen asks which day the photo is for."""
     _authorize(connection, tenant_id, principal, client, _UPDATE)
-    outlets = scope_outlets(connection, tenant_id, principal.subject)
-    onsite = [o for o in outlets if o["outlet_classification"] == "ONSITE"]
-    default = (onsite or outlets or [None])[0]
+    scoped = scope_outlets(connection, tenant_id, principal.subject)
+    # The daily gate pass is for onsite outlets only, never a satellite (product owner 2026-10-27).
+    outlets = onsite = [o for o in scoped if o["outlet_classification"] == "ONSITE"]
+    default = (onsite or [None])[0]
     default_id = str(default["outlet_id"]) if default else None
     days = gate_pass_days()
     previous_open: list[str] = []
@@ -215,6 +216,7 @@ def gate_pass_outlets(
         "previousOpenOutletIds": previous_open,
         "outlets": [_public_outlet(o, default_id=default_id) for o in outlets],
         "defaultOutletId": default_id,
+        "satelliteOnly": bool(scoped) and not outlets,
     }
 
 
@@ -231,6 +233,8 @@ def upload_gate_pass(
 ) -> dict[str, Any]:
     _authorize(connection, tenant_id, principal, client, _UPDATE)
     outlet = _outlet_in_scope(scope_outlets(connection, tenant_id, principal.subject), outletId)
+    if outlet["outlet_classification"] != "ONSITE":
+        raise HTTPException(status_code=422, detail="The daily gate pass is for onsite outlets only, not a satellite outlet.")
     days = gate_pass_days()
     allowed = [d for d in (days["current"], days["previous"]) if d is not None]
     business_date = businessDate or (days["current"] or days["previous"])
@@ -428,7 +432,9 @@ def gate_pass_calendar(
     The photo (gatePassId) is only given when one outlet is chosen: a dealership
     or all-outlets view has figures only, nothing to open or download."""
     _authorize(connection, tenant_id, principal, client, _READ)
-    outlets = scope_outlets(connection, tenant_id, principal.subject)
+    # Onsite outlets only: the daily gate pass is not taken at a satellite (2026-10-27).
+    outlets = [o for o in scope_outlets(connection, tenant_id, principal.subject)
+               if o["outlet_classification"] == "ONSITE"]
     chosen = outlets
     scope = "ALL"
     if outletId is not None:
@@ -507,6 +513,139 @@ def gate_pass_calendar(
         "totals": {"declared": sum(d["declared"] for d in days), "uploaded": sum(d["uploaded"] for d in days),
                    "missing": sum(d["missing"] for d in days)},
     }
+
+
+MAX_SUMMARY_DAYS = 31
+
+
+@router.get("/gate-passes/summary")
+def gate_pass_summary(
+    tenant_id: str,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    start: Annotated[date | None, Query(alias="from")] = None,
+    end: Annotated[date | None, Query(alias="to")] = None,
+) -> dict[str, Any]:
+    """Consolidated view of the daily gate pass across the caller's onsite outlets
+    (TL: the outlets under them; PM and Executive: all), per outlet and day
+    (product owner 2026-10-27):
+
+    - asPerRegister: new deliveries on the gate-out register (the gate pass counts);
+    - updatedInTool: Delivery files uploaded on the days the gate pass covers (live);
+    - pendingDueToClient: the rest, where the PC said the deliveries were not notified to them;
+    - pendingDueToPc: the rest otherwise (the PC holds the files, or has not answered yet).
+    """
+    _authorize(connection, tenant_id, principal, client, _READ)
+    today = ist_day().date()
+    end = min(end or today, today)
+    start = start or end
+    if start > end or (end - start).days >= MAX_SUMMARY_DAYS:
+        raise HTTPException(status_code=422, detail=f"Choose a range of 1 to {MAX_SUMMARY_DAYS} days.")
+    outlets = [o for o in scope_outlets(connection, tenant_id, principal.subject)
+               if o["outlet_classification"] == "ONSITE"]
+    days = [start + timedelta(days=i) for i in range((end - start).days + 1)
+            if (start + timedelta(days=i)).isoweekday() != 7]
+    ids = [str(o["outlet_id"]) for o in outlets]
+    empty = {"asPerRegister": 0, "updatedInTool": 0, "pendingDueToClient": 0, "pendingDueToPc": 0,
+             "gatePassDays": 0, "gatePassesFinished": 0, "gatePassesMissing": 0}
+    if not ids or not days:
+        return {"from": start.isoformat(), "to": end.isoformat(), "outlets": [], "totals": dict(empty), "notes": []}
+    passes = {(r["business_date"], str(r["outlet_id"])): dict(r) for r in connection.execute(
+        text("""
+            SELECT business_date, outlet_id, gate_pass_id, pc_name, new_deliveries, files_held, divergence,
+                   counts_submitted_at_utc, completed_at_utc
+            FROM auditcore.p2_gate_passes
+            WHERE tenant_id = :t AND status = 'ACTIVE' AND outlet_id = ANY(CAST(:ids AS uuid[]))
+              AND business_date BETWEEN :a AND :b
+        """), {"t": tenant_id, "ids": ids, "a": start, "b": end}).mappings().all()}
+    uploaded: dict[tuple[date, str], int] = {}
+    for r in connection.execute(
+        text("""
+            SELECT (q.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date AS day, j.outlet_id,
+                   COUNT(DISTINCT q.journey_id) AS files
+            FROM auditcore.p2_document_queue q
+            JOIN auditcore.journeys j ON j.tenant_id = q.tenant_id AND j.journey_id = q.journey_id
+            WHERE q.tenant_id = :t AND q.business_stage = 'DELIVERY' AND q.queue_status <> 'CANCELLED'
+              AND j.outlet_id = ANY(CAST(:ids AS uuid[]))
+              AND (q.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date BETWEEN :a AND :b
+            GROUP BY 1, 2
+        """), {"t": tenant_id, "ids": ids, "a": gate_pass_covers(start)[0], "b": end}).mappings().all():
+        # Sunday's files belong to Monday's gate pass, which covers both days.
+        day = r["day"] + timedelta(days=1) if r["day"].isoweekday() == 7 else r["day"]
+        key = (day, str(r["outlet_id"]))
+        uploaded[key] = uploaded.get(key, 0) + int(r["files"])
+
+    leads = _team_leads(connection, tenant_id, outlets)
+    totals = dict(empty)
+    rows = []
+    for o in outlets:
+        oid = str(o["outlet_id"])
+        line = dict(empty)
+        per_day = []
+        for d in days:
+            gp = passes.get((d, oid))
+            files = uploaded.get((d, oid), 0)
+            entry = {"date": d.isoformat(), "label": gate_pass_day_label(d), "updatedInTool": files,
+                     "asPerRegister": None, "pendingDueToClient": 0, "pendingDueToPc": 0,
+                     "status": "NOT_UPLOADED", "gatePassId": None, "pcName": None}
+            line["gatePassDays"] += 1
+            line["updatedInTool"] += files
+            if gp is None:
+                line["gatePassesMissing"] += 1
+            else:
+                entry.update(gatePassId=str(gp["gate_pass_id"]), pcName=gp["pc_name"])
+                if gp["counts_submitted_at_utc"] is None:
+                    entry["status"] = "COUNTS_PENDING"
+                else:
+                    register = int(gp["new_deliveries"] or 0)
+                    pending = max(register - files, 0)
+                    entry["asPerRegister"] = register
+                    if gp["files_held"] is False:
+                        entry["pendingDueToClient"] = pending
+                    else:
+                        entry["pendingDueToPc"] = pending
+                    entry["status"] = "DONE" if gp["completed_at_utc"] is not None else "ANSWER_PENDING"
+                    line["asPerRegister"] += register
+                    line["pendingDueToClient"] += entry["pendingDueToClient"]
+                    line["pendingDueToPc"] += entry["pendingDueToPc"]
+                if gp["completed_at_utc"] is not None:
+                    line["gatePassesFinished"] += 1
+            per_day.append(entry)
+        for k in totals:
+            totals[k] += line[k]
+        rows.append({"outletId": oid, "outletName": o["outlet_name"], "dealerId": str(o["dealer_id"]),
+                     "dealerName": o["dealer_name"], "teamLeads": leads.get(oid, []), **line, "days": per_day})
+    return {
+        "from": start.isoformat(), "to": end.isoformat(), "outlets": rows, "totals": totals,
+        "notes": [
+            "Onsite outlets only: the daily gate pass is not taken at a satellite outlet.",
+            ("As per gate-out register: new deliveries on the gate pass. Updated in tool: Delivery files uploaded "
+             "on the days the gate pass covers (Monday's covers Sunday); files uploaded later count on their day."),
+            ("Pending due to client: the PC said those deliveries were not notified to them. Pending due to PC: "
+             "the PC holds the files but they are not uploaded, or has not answered yet."),
+        ],
+    }
+
+
+def _team_leads(connection: Connection, tenant_id: str, outlets: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """Names of the Team Leads over each outlet (assigned to it, its dealer, or the whole Project)."""
+    from audit_core.task_manager import known_names
+
+    rows = connection.execute(text("""
+        SELECT security_actor_id, dealer_id, outlet_id FROM auditcore.business_assignments ba
+        WHERE ba.tenant_id = :t AND upper(ba.business_role_code) = 'TL' AND ba.assignment_status = 'ACTIVE'
+          AND ba.effective_from <= now() AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+    """), {"t": tenant_id}).mappings().all()
+    names = known_names(connection, tenant_id=tenant_id)
+    out: dict[str, list[str]] = {}
+    for o in outlets:
+        oid, did = str(o["outlet_id"]), str(o["dealer_id"])
+        found = sorted({names.get(r["security_actor_id"]) or r["security_actor_id"] for r in rows
+                        if (r["dealer_id"] is None or str(r["dealer_id"]) == did)
+                        and (r["outlet_id"] is None or str(r["outlet_id"]) == oid)})
+        out[oid] = found
+    return out
 
 
 @router.get("/gate-passes/{gate_pass_id}/image-url")

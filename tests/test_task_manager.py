@@ -439,3 +439,17 @@ def test_monday_gate_pass_task_names_both_days(project):
     assert task["title"].startswith("Gate pass for Sun 1 + Mon 2 Nov: ")
     assert "one photo of the gate pass for both days" in task["description"]
     assert task["reference"]["coversDates"] == ["2026-11-01", "2026-11-02"]
+
+
+def test_gate_pass_task_is_for_onsite_outlets_only(project):
+    p = project
+    with _db(p) as c:
+        tm.ensure_system_schedules(c, tenant_id=p.tenant, now=_at(MONDAY, 7, 0))
+        c.execute(text("UPDATE auditcore.p2_task_schedules SET starts_on = :d WHERE tenant_id = :t"),
+                  {"d": MONDAY, "t": p.tenant})
+        assert tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY, 7, 5))["raised"] == 1
+        c.execute(text("UPDATE auditcore.dealer_outlets SET outlet_classification='SATELLITE' "
+                       "WHERE tenant_id=:t AND outlet_id=:o"), {"t": p.tenant, "o": p.journey.outlet_id})
+        tick = tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY, 8))
+        assert tick["gatePassNotRequired"] == 1  # the open one is cancelled
+        assert tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY + timedelta(days=1), 7, 5))["raised"] == 0
