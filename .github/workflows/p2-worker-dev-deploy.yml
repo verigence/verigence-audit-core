@@ -159,6 +159,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # 2026-10-27: deploys come only from this workflow (railway up). With the
+          # GitHub repo also connected, Railway deployed every bot "record live
+          # baseline" commit as well: 8 extra P2 worker restarts on 26 Oct, each
+          # one leaving the items it held locked. Disconnecting is idempotent.
+          railway service source disconnect --service "$WORKER_SERVICE" >/dev/null 2>&1 \
+            || echo "::warning title=source disconnect::could not disconnect the GitHub source of $WORKER_SERVICE (already disconnected, or the CLI lacks the command)"
           railway deployment list --service "$WORKER_SERVICE" --limit 1 --json >/tmp/before.json
           previous_id="$(python - <<'PY'
           import json

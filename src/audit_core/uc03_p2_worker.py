@@ -4306,81 +4306,107 @@ def refresh_journey_dates(engine: Engine) -> None:
             logger.warning("journey_dates_refresh_failed", tenant_id=tenant_id, exc_info=True)
 
 
+def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
+    """The function and arguments of a one-off job, by kind (the variable it was
+    started by until 2026-10-27, without the AUDIT_CORE_ prefix and _TAG)."""
+    if kind == "DIAG_REPORTS":
+        from audit_core.uc03_p2_diagnostics import run_diagnostics
+        return run_diagnostics, (engine, reports)
+    if kind == "MASTER_RELOAD":
+        from audit_core.oem_master_reload import run_master_reload
+        return run_master_reload, (engine, tag)
+    if kind == "SKU_RUN":
+        return _sku_run_once, (engine, tag)
+    per_tenant = {
+        "PAGE_RESEND": ("audit_core.uc03_p2_page_resend", "run_page_resend"),
+        "INVOICE_RESCAN": ("audit_core.uc03_invoice_rescan", "run_invoice_rescan"),
+        "ACCOUNT_STATEMENT": ("audit_core.uc03_account_statement_rebuild", "run_account_statement_rebuild"),
+        "STATEMENT_REREAD": ("audit_core.uc03_statement_reread", "run_statement_reread"),
+        "INVOICE_TASK_CLEANUP": ("audit_core.uc03_invoice_task_cleanup", "run_invoice_task_cleanup"),
+        "VARIANCE_AUDIT": ("audit_core.uc03_variance_audit", "run_variance_audit"),
+    }
+    if kind not in per_tenant:
+        raise ValueError(f"unknown worker job kind {kind!r}")
+    import importlib
+
+    module, name = per_tenant[kind]
+    return getattr(importlib.import_module(module), name), (engine, tag, _active_tenants(engine))
+
+
+# The variables that start a one-off job when the worker starts (kept: a job
+# can still be started this way, but that restarts the worker).
+_ONE_SHOT_VARIABLES = {
+    "MASTER_RELOAD": "AUDIT_CORE_MASTER_RELOAD_TAG",
+    "PAGE_RESEND": "AUDIT_CORE_PAGE_RESEND_TAG",
+    "INVOICE_RESCAN": "AUDIT_CORE_INVOICE_RESCAN_TAG",
+    "ACCOUNT_STATEMENT": "AUDIT_CORE_ACCOUNT_STATEMENT_TAG",
+    "STATEMENT_REREAD": "AUDIT_CORE_STATEMENT_REREAD_TAG",
+    "INVOICE_TASK_CLEANUP": "AUDIT_CORE_INVOICE_TASK_CLEANUP_TAG",
+    "VARIANCE_AUDIT": "AUDIT_CORE_VARIANCE_AUDIT_TAG",
+    "SKU_RUN": "AUDIT_CORE_SKU_RUN_TAG",
+}
+_JOB_POLL_SECONDS = 60
+
+
+def _run_job(engine: Engine, job: dict[str, Any]) -> None:
+    job_id = str(job["job_id"])
+    status, detail = "DONE", None
+    try:
+        target, args = _one_shot_target(job["job_kind"], engine, job["tag"], list(job["reports"] or []))
+        logger.info("p2_worker_job_started", job_id=job_id, kind=job["job_kind"], tag=job["tag"])
+        target(*args)
+    except Exception as exc:  # recorded on the job row
+        status, detail = "FAILED", f"{type(exc).__name__}: {exc}"[:1000]
+        logger.warning("p2_worker_job_failed", job_id=job_id, kind=job["job_kind"], exc_info=True)
+    with engine.begin() as connection:
+        set_platform_super_admin_context(connection)
+        connection.execute(
+            text("UPDATE auditcore.p2_worker_jobs SET status = :s, finished_at_utc = now(), detail = :d "
+                 "WHERE job_id = CAST(:id AS uuid)"),
+            {"s": status, "d": detail, "id": job_id},
+        )
+    logger.info("p2_worker_job_finished", job_id=job_id, kind=job["job_kind"], status=status)
+
+
+def claim_worker_jobs(engine: Engine) -> list[dict[str, Any]]:
+    """Take every pending one-off job (one worker gets each)."""
+    with engine.begin() as connection:
+        set_platform_super_admin_context(connection)
+        return [dict(r) for r in connection.execute(text("""
+            UPDATE auditcore.p2_worker_jobs SET status = 'RUNNING', started_at_utc = now(), worker_id = :w
+            WHERE job_id IN (SELECT job_id FROM auditcore.p2_worker_jobs WHERE status = 'PENDING'
+                             ORDER BY requested_at_utc FOR UPDATE SKIP LOCKED LIMIT 5)
+            RETURNING job_id, job_kind, tag, reports
+        """), {"w": _WORKER_ID}).mappings().all()]
+
+
+def _watch_worker_jobs(engine: Engine) -> None:
+    """One-off jobs requested as rows of p2_worker_jobs (2026-10-27), so a job
+    never needs a restart of the worker."""
+    while not _stopping.is_set():
+        try:
+            for job in claim_worker_jobs(engine):
+                threading.Thread(target=_run_job, args=(engine, job), name=f"job-{job['job_kind'].lower()}",
+                                 daemon=True).start()
+        except Exception:  # e.g. the table not migrated yet; try again later
+            logger.warning("p2_worker_jobs_poll_failed", exc_info=True)
+        _stopping.wait(_JOB_POLL_SECONDS)
+
+
 def main() -> None:
     _configure_worker_observability()
     engine = get_engine()
     threading.Thread(target=refresh_journey_dates, args=(engine,), name="journey-dates", daemon=True).start()
     diag_reports = [r.strip() for r in os.environ.get("AUDIT_CORE_DIAG_REPORTS", "").split(",") if r.strip()]
     if diag_reports:
-        from audit_core.uc03_p2_diagnostics import run_diagnostics
-
-        threading.Thread(target=run_diagnostics, args=(engine, diag_reports), name="diagnostics",
-                         daemon=True).start()
-    # The one-off price-master re-load (2026-10-21): dry run unless the tag
-    # ends with "-commit"; once per tag and tenant.
-    reload_tag = os.environ.get("AUDIT_CORE_MASTER_RELOAD_TAG", "").strip()
-    if reload_tag:
-        from audit_core.oem_master_reload import run_master_reload
-
-        threading.Thread(target=run_master_reload, args=(engine, reload_tag), name="master-reload",
-                         daemon=True).start()
-    # One-off re-send of pages that failed on our side (2026-10-21): dry run
-    # unless the tag ends with "-commit"; only FAILED pages are picked.
-    resend_tag = os.environ.get("AUDIT_CORE_PAGE_RESEND_TAG", "").strip()
-    if resend_tag:
-        from audit_core.uc03_p2_page_resend import run_page_resend
-
-        threading.Thread(target=run_page_resend, args=(engine, resend_tag, _active_tenants(engine)),
-                         name="page-resend", daemon=True).start()
-    # Every Journey's invoices read again with the current reader (2026-10-24):
-    # dry run unless the tag ends with "-commit".
-    rescan_tag = os.environ.get("AUDIT_CORE_INVOICE_RESCAN_TAG", "").strip()
-    if rescan_tag:
-        from audit_core.uc03_invoice_rescan import run_invoice_rescan
-
-        threading.Thread(target=run_invoice_rescan, args=(engine, rescan_tag, _active_tenants(engine)),
-                         name="invoice-rescan", daemon=True).start()
-    # Mahindra Orissa: every Journey's Deal set from its account statement
-    # (2026-10-25): dry run unless the tag ends with "-commit".
-    statement_tag = os.environ.get("AUDIT_CORE_ACCOUNT_STATEMENT_TAG", "").strip()
-    if statement_tag:
-        from audit_core.uc03_account_statement_rebuild import (
-            run_account_statement_rebuild,
-        )
-
-        threading.Thread(target=run_account_statement_rebuild,
-                         args=(engine, statement_tag, _active_tenants(engine)),
-                         name="account-statement-rebuild", daemon=True).start()
-    # Mahindra Orissa: the account statements read before customer_ledger 1.1
-    # read again for the printed net value (2026-10-26): dry run unless the
-    # tag ends with "-commit".
-    statement_reread_tag = os.environ.get("AUDIT_CORE_STATEMENT_REREAD_TAG", "").strip()
-    if statement_reread_tag:
-        from audit_core.uc03_statement_reread import run_statement_reread
-
-        threading.Thread(target=run_statement_reread,
-                         args=(engine, statement_reread_tag, _active_tenants(engine)),
-                         name="statement-reread", daemon=True).start()
-    # Mahindra Orissa: the open invoice-check tasks closed (2026-10-26): dry run
-    # unless the tag ends with "-commit".
-    invoice_cleanup_tag = os.environ.get("AUDIT_CORE_INVOICE_TASK_CLEANUP_TAG", "").strip()
-    if invoice_cleanup_tag:
-        from audit_core.uc03_invoice_task_cleanup import run_invoice_task_cleanup
-
-        threading.Thread(target=run_invoice_task_cleanup,
-                         args=(engine, invoice_cleanup_tag, _active_tenants(engine)),
-                         name="invoice-task-cleanup", daemon=True).start()
-    # Every Journey's variance as the list stores it and as the Deal computes it
-    # (2026-10-24); read-only.
-    variance_tag = os.environ.get("AUDIT_CORE_VARIANCE_AUDIT_TAG", "").strip()
-    if variance_tag:
-        from audit_core.uc03_variance_audit import run_variance_audit
-
-        threading.Thread(target=run_variance_audit, args=(engine, variance_tag, _active_tenants(engine)),
-                         name="variance-audit", daemon=True).start()
-    sku_run_tag = os.environ.get("AUDIT_CORE_SKU_RUN_TAG", "").strip()
-    if sku_run_tag:
-        threading.Thread(target=_sku_run_once, args=(engine, sku_run_tag), name="sku-run", daemon=True).start()
+        target, args = _one_shot_target("DIAG_REPORTS", engine, "", diag_reports)
+        threading.Thread(target=target, args=args, name="diagnostics", daemon=True).start()
+    for kind, variable in _ONE_SHOT_VARIABLES.items():
+        tag = os.environ.get(variable, "").strip()
+        if tag:
+            target, args = _one_shot_target(kind, engine, tag, [])
+            threading.Thread(target=target, args=args, name=kind.lower().replace("_", "-"), daemon=True).start()
+    threading.Thread(target=_watch_worker_jobs, args=(engine,), name="worker-jobs", daemon=True).start()
     logger.info(
         "p2_worker_started",
         worker_id=_WORKER_ID,
