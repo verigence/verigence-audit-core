@@ -86,3 +86,15 @@ def test_future_date_verdict(field_key, value, expected):
     from audit_core.uc03_p2_dates import future_date_verdict
 
     assert future_date_verdict(field_key, value, today=date(2026, 10, 21)) == expected
+
+
+def test_a_time_before_or_after_the_day_as_payment_apps_write_it():
+    """2026-10-27: a UPI screenshot read as "01:44 pm on 12 Oct 2026" was flagged as not a date."""
+    from datetime import date
+
+    from audit_core.uc03_p2_dates import parse_extracted_date
+
+    for value in ("01:44 pm on 12 Oct 2026", "1:44 PM, 12 Oct 2026", "12 Oct 2026, 1:44 PM",
+                  "12 Oct 2026 01:44 pm", "12/10/2026 13:44:00"):
+        assert parse_extracted_date(value) == date(2026, 10, 12), value
+    assert parse_extracted_date("12:30") is None

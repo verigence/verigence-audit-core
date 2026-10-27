@@ -156,6 +156,26 @@ def _document_context(
     }
 
 
+_EXTRA_COPY_DETAIL = (
+    "This page is an extra copy of a document already read for this booking. Its values are not used, "
+    "so there is nothing to confirm or change on it."
+)
+
+
+def _field_missing_detail(connection: Connection, *, tenant_id: str, journey_id: UUID, document_id: UUID) -> str:
+    """Why a field could not be confirmed or corrected: the page is an extra
+    copy whose values were never taken into the Journey, or the value really
+    changed since the page was opened."""
+    stored = connection.execute(
+        text("SELECT 1 FROM auditcore.journey_document_extracted_fields WHERE tenant_id=:t AND journey_id=:j "
+             "AND di_document_id=:d LIMIT 1"),
+        {"t": tenant_id, "j": journey_id, "d": document_id},
+    ).first()
+    if stored is None:
+        return _EXTRA_COPY_DETAIL
+    return "The extracted field changed. Refresh the document and retry."
+
+
 def _durable_fields(
     connection: Connection,
     *,
@@ -441,8 +461,14 @@ def get_p2_document_review(
     registry = get_registry()
     di_type = context["document_type_key"]
     template = registry.template_for_di_type(di_type, stage=str(context["stage_code"] or "").upper() or None)
+    # An extra copy of a document already read (SUPPORTING) has no values of its
+    # own in the Journey: nothing on it is used, so nothing on it asks for a
+    # review, and "Looks right" or a correction has nothing to change (product
+    # owner 2026-10-27: a UPI screenshot asked for a date check that then failed
+    # with "The extracted field changed").
+    values_used = bool(durable) or str(context.get("queue_status") or "").upper() != "SUPPORTING"
     for item in fields:
-        reviewed = bool(item.get("reviewedAtUtc")) or bool(item.get("isModified"))
+        reviewed = bool(item.get("reviewedAtUtc")) or bool(item.get("isModified")) or not values_used
         value = item.get("effectiveValue")
         blank = value is None or value == "" or value == "null"
         confidence = item.get("confidenceScore")
@@ -516,6 +542,7 @@ def get_p2_document_review(
         ),
         "contentAvailable": di_document is not None,
         "diReadError": di_error,
+        "valuesUsed": values_used,
         "fields": fields,
         "correctionHistory": correction_history,
         "relatedTasks": related_tasks,
@@ -826,10 +853,8 @@ def confirm_p2_document_field(
         },
     ).scalars().all()
     if not confirmed:
-        raise HTTPException(
-            status_code=409,
-            detail="The extracted field changed. Refresh the document and retry.",
-        )
+        raise HTTPException(status_code=409, detail=_field_missing_detail(
+            connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id))
     note_facts_changed(
         connection, tenant_id=tenant_id, journey_id=journey_id, reason="FIELD_CONFIRMED",
     )
@@ -919,10 +944,8 @@ def correct_p2_document_field(
         },
     ).mappings().one_or_none()
     if field is None:
-        raise HTTPException(
-            status_code=409,
-            detail="The extracted field changed. Refresh the document and retry.",
-        )
+        raise HTTPException(status_code=409, detail=_field_missing_detail(
+            connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id))
     if _pending_for(
         _pending_corrections(connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id),
         field_key=command.fieldKey, canonical_field_id=command.canonicalFieldId,

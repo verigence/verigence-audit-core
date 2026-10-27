@@ -50,7 +50,10 @@ def parse_extracted_date(value: Any) -> date | None:
     text = str(value).strip().lower()
     # A leading time or weekday adds nothing: "mon, 01 sep 2026 10:30" -> "01 sep 2026 10:30".
     text = re.sub(r"^(mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s+", "", text)
-    text = re.sub(r"\s+(at\s+)?\d{1,2}:\d{2}(:\d{2})?\s*(am|pm|ist|utc)?$", "", text)
+    # A time before or after the day, as payment apps write it (2026-10-27):
+    # "01:44 pm on 12 oct 2026", "1:44 pm, 12 oct 2026", "12 oct 2026, 1:44 pm".
+    text = re.sub(r"^\d{1,2}:\d{2}(:\d{2})?\s*(am|pm)?\s*(ist|utc)?\s*(on\b|,|-|\|)?\s*", "", text)
+    text = re.sub(r"[\s,|\-]*(at\s+)?\d{1,2}:\d{2}(:\d{2})?\s*(am|pm)?\s*(ist|utc)?$", "", text)
     if not text:
         return None
     if match := _ISO.match(text):
