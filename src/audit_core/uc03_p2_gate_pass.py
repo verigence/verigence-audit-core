@@ -2,7 +2,8 @@
 
 Each day a PC photographs the outlet's hand-written gate pass and says how
 many new deliveries, stock transfers and test drives it lists. The new-delivery
-count is checked against the Delivery files uploaded that day for the outlet:
+count is checked against the deliveries of the outlet whose own vehicle gate pass,
+dated that day, has been uploaded (product owner 2026-10-27):
 
     equal                       no divergence, the task is finished
     files > declared            the PC names the files that belong to other days
@@ -16,9 +17,10 @@ count is checked against the Delivery files uploaded that day for the outlet:
     5. GET   /gate-passes/{id}/image-url  the photo, one outlet at a time
     6. GET   /daily-tasks, POST /daily-tasks/{id}/resolve   the TL's Daily Tasks
 
-A Delivery file is a Journey of the outlet with at least one Delivery-stage
-page uploaded that day (IST); Booking pages are not counted, and a Journey with
-several Delivery pages counts once.
+For the Daily Gate Pass task a delivery counts only when its Journey carries the
+vehicle's gate pass document and the delivery date on it matches the day (see
+delivery_file_count). The calendar and the consolidated view keep their own count:
+Journeys with a Delivery-stage page uploaded on the day (IST), each counted once.
 """
 from __future__ import annotations
 
@@ -133,20 +135,33 @@ def _day_info(day: date | None) -> dict[str, Any] | None:
 
 
 def delivery_file_count(connection: Connection, tenant_id: str, outlet_id: UUID | str, day: date) -> int:
-    """Journeys of the outlet with a Delivery-stage page uploaded on the days
-    the gate pass of ``day`` covers (IST): Monday's counts Sunday's too."""
+    """Delivery Journeys of the outlet that carry the vehicle's own gate pass for the
+    day the Daily Gate Pass is for (product owner 2026-10-27).
+
+    A Journey counts only when a vehicle gate pass document has been uploaded to it and
+    the delivery date read off that gate pass (a reviewer's correction wins) falls on a
+    day this Daily Gate Pass covers: Monday's covers Sunday too. Uploading other
+    delivery documents on the day does not count a Journey.
+
+    Day and month are compared, not the year: the year on a handwritten gate pass is
+    often misread (October 2026 deliveries read as 2020-2024), while day and month
+    read reliably, and a daily gate pass cannot be confused with the same day of
+    another year."""
+    covers = gate_pass_covers(day)
     return int(connection.execute(
         text(
             """
-            SELECT COUNT(DISTINCT q.journey_id)
-            FROM auditcore.p2_document_queue q
-            JOIN auditcore.journeys j ON j.tenant_id = q.tenant_id AND j.journey_id = q.journey_id
-            WHERE q.tenant_id = :tenant_id AND j.outlet_id = :outlet_id
-              AND q.business_stage = 'DELIVERY' AND q.queue_status <> 'CANCELLED'
-              AND (q.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date BETWEEN :first AND :day
+            SELECT COUNT(DISTINCT f.journey_id)
+            FROM auditcore.journey_document_extracted_fields f
+            JOIN auditcore.journeys j ON j.tenant_id = f.tenant_id AND j.journey_id = f.journey_id
+            WHERE f.tenant_id = :tenant_id AND j.outlet_id = :outlet_id
+              AND f.source_document_type_key = 'gate_pass' AND f.field_key = 'delivery_date'
+              AND (f.effective_value #>> '{}') ~ '^\\d{4}-\\d{2}-\\d{2}$'
+              AND to_char(CAST(f.effective_value #>> '{}' AS date), 'MM-DD') = ANY(CAST(:month_days AS text[]))
             """
         ),
-        {"tenant_id": tenant_id, "outlet_id": str(outlet_id), "day": day, "first": gate_pass_covers(day)[0]},
+        {"tenant_id": tenant_id, "outlet_id": str(outlet_id),
+         "month_days": [d.strftime("%m-%d") for d in covers]},
     ).scalar_one() or 0)
 
 
@@ -442,7 +457,7 @@ def _raise_delivery_not_notified(connection: Connection, tenant_id: str, row: di
     day = row["business_date"]
     title = f"Delivery not notified to the PC: {row['outlet_name']}, {gate_pass_day_label(day)}"
     description = (f"The gate pass of {row['outlet_name']} for {gate_pass_day_label(day)} lists {row['new_deliveries']} new "
-                   f"deliveries, but only {row['delivery_files']} Delivery files were uploaded. "
+                   f"deliveries, but only {row['delivery_files']} vehicle gate passes of that day were uploaded. "
                    f"{row['pc_name']} says the {missing} other {'delivery was' if missing == 1 else 'deliveries were'} "
                    f"not notified to them and they hold no files for it.")
     # A Task Manager task of the outlet for the Team Lead, closed by the TL with
@@ -628,7 +643,8 @@ def gate_pass_summary(
 
     - asPerRegister: new deliveries on the gate-out register (the gate pass counts);
     - updatedInTool: Delivery files uploaded on the days the gate pass covers (live);
-    - pendingDueToClient: the rest, where the PC said the deliveries were not notified to them;
+    - notNotifiedToPc: the rest, where the PC said the deliveries were not notified to them
+      ("Not notified to PC", 2026-10-27; also returned as pendingDueToClient for older clients);
     - pendingDueToPc: the rest otherwise (the PC holds the files, or has not answered yet).
     """
     _authorize(connection, tenant_id, principal, client, _READ)
@@ -642,7 +658,7 @@ def gate_pass_summary(
     days = [start + timedelta(days=i) for i in range((end - start).days + 1)
             if (start + timedelta(days=i)).isoweekday() != 7]
     ids = [str(o["outlet_id"]) for o in outlets]
-    empty = {"asPerRegister": 0, "updatedInTool": 0, "pendingDueToClient": 0, "pendingDueToPc": 0,
+    empty = {"asPerRegister": 0, "updatedInTool": 0, "notNotifiedToPc": 0, "pendingDueToPc": 0,
              "gatePassDays": 0, "gatePassesFinished": 0, "gatePassesMissing": 0}
     if not ids or not days:
         return {"from": start.isoformat(), "to": end.isoformat(), "outlets": [], "totals": dict(empty), "notes": []}
@@ -685,7 +701,7 @@ def gate_pass_summary(
             gp = passes.get((d, oid))
             files = uploaded.get((d, oid), 0)
             entry = {"date": d.isoformat(), "label": gate_pass_day_label(d), "updatedInTool": files,
-                     "asPerRegister": None, "pendingDueToClient": 0, "pendingDueToPc": 0,
+                     "asPerRegister": None, "notNotifiedToPc": 0, "pendingDueToPc": 0,
                      "status": "NOT_UPLOADED", "gatePassId": None, "pcName": None, "photoQuality": None}
             line["gatePassDays"] += 1
             line["updatedInTool"] += files
@@ -704,12 +720,12 @@ def gate_pass_summary(
                     pending = max(register - files, 0)
                     entry["asPerRegister"] = register
                     if gp["files_held"] is False:
-                        entry["pendingDueToClient"] = pending
+                        entry["notNotifiedToPc"] = pending
                     else:
                         entry["pendingDueToPc"] = pending
                     entry["status"] = "DONE" if gp["completed_at_utc"] is not None else "ANSWER_PENDING"
                     line["asPerRegister"] += register
-                    line["pendingDueToClient"] += entry["pendingDueToClient"]
+                    line["notNotifiedToPc"] += entry["notNotifiedToPc"]
                     line["pendingDueToPc"] += entry["pendingDueToPc"]
                 if gp["completed_at_utc"] is not None:
                     line["gatePassesFinished"] += 1
@@ -719,13 +735,15 @@ def gate_pass_summary(
         rows.append({"outletId": oid, "outletName": o["outlet_name"], "dealerId": str(o["dealer_id"]),
                      "dealerName": o["dealer_name"], "teamLeads": leads.get(oid, []),
                      "uploadedBy": sorted(uploaders), **line, "days": per_day})
+    for figures in [totals, *rows, *(d for r in rows for d in r["days"])]:
+        figures["pendingDueToClient"] = figures["notNotifiedToPc"]
     return {
         "from": start.isoformat(), "to": end.isoformat(), "outlets": rows, "totals": totals,
         "notes": [
             "Onsite outlets only: the daily gate pass is not taken at a satellite outlet.",
             ("As per gate-out register: new deliveries on the gate pass. Updated in tool: Delivery files uploaded "
              "on the days the gate pass covers (Monday's covers Sunday); files uploaded later count on their day."),
-            ("Pending due to client: the PC said those deliveries were not notified to them. Pending due to PC: "
+            ("Not notified to PC: the PC said those deliveries were not notified to them. Pending due to PC: "
              "the PC holds the files but they are not uploaded, or has not answered yet."),
         ],
     }
