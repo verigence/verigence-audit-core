@@ -526,3 +526,37 @@ def test_insurance_takes_the_newest_live_read_not_a_retired_or_older_one(journey
     ).mappings().one()
     assert (row["agent_intermediary_code"], row["insurer_name"]) == (
         "MIBL/M&M/AAECA5786A/000", "Generali Central Insurance Company Limited")
+
+
+def test_an_insurance_record_with_add_ons_can_still_change(journey) -> None:
+    """Live 2026-10-27: add_ons (jsonb) came back as a list and was written back
+    as a Postgres array -- "invalid input syntax for type json" -- so no value of
+    a Journey whose insurance had add-ons could change. Clearing a wrong agent
+    code and rebuilding failed on every such Journey."""
+    from audit_core.uc03_delivery_review_materialization import (
+        materialize_delivery_insurance,
+    )
+
+    c = journey
+    tenant_id, journey_id = c.tenant_id, c.journey_id
+    c.execute(
+        text("INSERT INTO auditcore.insurance_records (tenant_id, journey_id, insurer_name, add_ons, source_kind) "
+             "VALUES (:t, :j, 'Generali Central Insurance Company Limited', "
+             "CAST('[\"Consumable Cover\", \"Engine Protect\"]' AS jsonb), 'EVIDENCE')"),
+        {"t": tenant_id, "j": journey_id},
+    )
+    document = ReviewV2Document(
+        documentId=uuid4(), label="Insurance Cover", documentTypeKey="insurance_cover",
+        originalFilename="insurance.pdf", processingStatus="PROCESSED", extractionState="READY",
+        fields=[_field("agent_intermediary_code", "MIBL/M&M/AAECA5786A/000", confidence=92.0),
+                _field("add_ons", ["Zero Depreciation Cover"], confidence=92.0)],
+    )
+    assert materialize_delivery_insurance(c, tenant_id=tenant_id, journey_id=journey_id, documents=[document]) >= 1
+    row = c.execute(
+        text("SELECT agent_intermediary_code, add_ons FROM auditcore.insurance_records WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one()
+    assert row["agent_intermediary_code"] == "MIBL/M&M/AAECA5786A/000"
+    assert row["add_ons"] == ["Consumable Cover", "Engine Protect"]  # kept as it was, still a JSON array
+    # Nothing left to change: a second pass writes nothing.
+    assert materialize_delivery_insurance(c, tenant_id=tenant_id, journey_id=journey_id, documents=[document]) == 0

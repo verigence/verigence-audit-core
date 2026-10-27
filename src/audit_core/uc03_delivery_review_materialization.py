@@ -954,6 +954,12 @@ def sync_finance_hypothecation_findings(
     return {"raised": 0, "resolved": updated.rowcount}
 
 
+def _json_text(value: Any) -> str | None:
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
 def materialize_delivery_insurance(
     connection: Connection,
     *,
@@ -1017,7 +1023,11 @@ def materialize_delivery_insurance(
     if existing is not None:
         for key in _INSURANCE_MERGE_COLUMNS:
             merged[key] = existing[key] if existing[key] is not None else values.get(key)
-        merged["add_ons"] = existing["add_ons"] if existing["add_ons"] is not None else add_ons_json
+        # add_ons is jsonb and comes back as a Python list: it must go back as
+        # JSON text. Passed as the list, psycopg sends a Postgres array and the
+        # write fails ("invalid input syntax for type json"), so no insurance
+        # value of a Journey with add-ons could change (live 2026-10-27).
+        merged["add_ons"] = _json_text(existing["add_ons"]) if existing["add_ons"] is not None else add_ons_json
         source_evidence_id = existing["source_evidence_id"]
     if source_evidence_id is None:
         candidates = list(selected.values()) + [add_ons_pair]
@@ -1028,8 +1038,8 @@ def materialize_delivery_insurance(
                     break
 
     if existing is not None and all(
-        existing[key] == merged[key] for key in (*_INSURANCE_MERGE_COLUMNS, "add_ons")
-    ):
+        existing[key] == merged[key] for key in _INSURANCE_MERGE_COLUMNS
+    ) and _json_text(existing["add_ons"]) == merged["add_ons"]:
         return 0
 
     connection.execute(

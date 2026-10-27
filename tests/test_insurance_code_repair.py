@@ -4,7 +4,12 @@ still wrong are read again by Document Intelligence; a dry run changes nothing."
 from __future__ import annotations
 
 import pytest
-from p2_support import create_p2_journey, database_engine
+from p2_support import (
+    add_evidence,
+    add_extracted_field,
+    create_p2_journey,
+    database_engine,
+)
 from sqlalchemy import text
 
 from audit_core import uc03_insurance_code_repair as repair
@@ -125,5 +130,34 @@ def test_without_a_proper_reading_the_journey_is_left_as_it_was(journey, monkeyp
 def test_a_value_a_person_entered_is_never_cleared(journey, monkeypatch) -> None:
     _set_source(journey, "OPERATIONAL_INPUT")  # entered by a person
     _patch_materializers(monkeypatch, _fills_empty_code_with("MIBL/M&M/AAECA5786A/000"))
+    assert repair._rebuild(journey.engine, journey.tenant_id, journey.journey_id) == []
+    assert _code(journey) == "7873999100"
+
+
+def _reading(journey, agent_code):
+    """A current insurance reading; agent_code None = the field was read and is empty."""
+    from uuid import uuid4
+    document = uuid4()
+    add_evidence(journey, di_document_id=document, document_type_key="insurance_cover", process_area="DELIVERY")
+    add_extracted_field(journey, di_document_id=document, field_key="agent_intermediary_code", value=agent_code,
+                        document_type="insurance_cover", confidence=92.0)
+    return document
+
+
+def test_an_empty_code_is_kept_when_the_policy_was_read_and_has_none(journey, monkeypatch) -> None:
+    # Live 2026-10-27 (UTK-SA-261019-001): the new reading has no agent code --
+    # the policy prints only a contact number there.
+    _set_source(journey, "EVIDENCE")
+    _reading(journey, None)
+    _patch_materializers(monkeypatch, _fills_empty_code_with(None))
+    assert repair._rebuild(journey.engine, journey.tenant_id, journey.journey_id) == ["agent_intermediary_code"]
+    assert _code(journey) is None
+
+
+def test_the_phone_number_stays_while_a_current_reading_still_holds_it(journey, monkeypatch) -> None:
+    # Not read again (separately uploaded file) or its stage reviewed.
+    _set_source(journey, "EVIDENCE")
+    _reading(journey, "7873999100")
+    _patch_materializers(monkeypatch, _fills_empty_code_with(None))
     assert repair._rebuild(journey.engine, journey.tenant_id, journey.journey_id) == []
     assert _code(journey) == "7873999100"
