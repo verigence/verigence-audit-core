@@ -12,6 +12,10 @@ commit each page goes through the same recovery a PC's Retry uses
 (request_page_recovery: look at what Document Intelligence holds first, send
 again only if DI gave it up). Only FAILED pages are picked, so a second run
 finds nothing to do.
+
+A page whose task the PC has closed is never re-sent (product owner
+2026-10-27, uc03_p2_retry_stop): "if the task is closed, then automatic
+retries shouldn't happen".
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ import structlog
 from sqlalchemy import Engine, text
 
 from audit_core.db import set_tenant_context
+from audit_core.uc03_p2_retry_stop import automatic_retry_stop_reason
 from audit_core.uc03_p2_runtime import request_page_recovery
 
 logger = structlog.get_logger(__name__)
@@ -56,7 +61,17 @@ def _candidates(connection, tenant_id: str) -> list[dict[str, Any]]:
         ),
         {"t": tenant_id, "days": _DAYS},
     ).mappings().all()
-    return [dict(r) for r in rows if not str(r["last_error"]).startswith(_NOT_RESENT)]
+    picked = []
+    for row in rows:
+        if str(row["last_error"]).startswith(_NOT_RESENT):
+            continue
+        why = automatic_retry_stop_reason(connection, tenant_id=tenant_id, journey_id=row["journey_id"],
+                                          queue_id=row["queue_id"])
+        if why:
+            logger.info("page_resend_skipped", tenant_id=tenant_id, queue_id=str(row["queue_id"]), why=why)
+            continue
+        picked.append(dict(row))
+    return picked
 
 
 def run_page_resend(engine: Engine, tag: str, tenant_ids: list[str]) -> None:
