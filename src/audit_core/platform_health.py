@@ -190,10 +190,22 @@ def beat(engine: Engine, default_service: str, *, include_current_minute: bool =
     resources = _take_closed(_resources, include_current=include_current_minute)
     service = _identity(default_service)["service"]
     with engine.begin() as connection:
-        connection.execute(
+        seen = connection.execute(
             text("UPDATE platform_ops.service_heartbeats SET last_seen_at_utc = now() WHERE boot_id = :b"),
             {"b": boot_id()},
         )
+        if seen.rowcount == 0:
+            # The boot row was never written (the database was unreachable, or the
+            # tables did not exist yet, when the process started): write it now.
+            ident = _identity(default_service)
+            connection.execute(
+                text(
+                    "INSERT INTO platform_ops.service_heartbeats (boot_id, service_name, replica_id, deployment_id, "
+                    "version) VALUES (:b, :s, :r, :d, :v) ON CONFLICT (boot_id) DO UPDATE SET last_seen_at_utc = now()"
+                ),
+                {"b": boot_id(), "s": ident["service"], "r": ident["replica"], "d": ident["deployment"],
+                 "v": ident["version"]},
+            )
         for minute, bucket in minutes.items():
             routes = {route: {"4xx": counts[0], "5xx": counts[1]} for route, counts in bucket["routes"].items()}
             connection.execute(

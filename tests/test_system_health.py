@@ -197,3 +197,13 @@ def test_railway_webhook_needs_the_secret_and_keeps_only_known_fields(engine):
         with engine.begin() as connection:
             connection.execute(text("DELETE FROM platform_ops.webhook_secrets WHERE name='railway'"))
 
+
+def test_a_beat_writes_the_boot_row_when_the_start_could_not(engine, monkeypatch):
+    """Live 2026-10-27: services that started before the tables existed never showed."""
+    monkeypatch.setattr(platform_health, "_BOOT_ID", uuid4())
+    platform_health.beat(get_engine(), f"late-{uuid4().hex[:6]}")
+    with engine.begin() as connection:
+        assert connection.execute(
+            text("SELECT count(*) FROM platform_ops.service_heartbeats WHERE boot_id=:b"),
+            {"b": platform_health.boot_id()}).scalar_one() == 1
+
