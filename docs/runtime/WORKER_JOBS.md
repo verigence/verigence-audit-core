@@ -14,7 +14,7 @@ FROM auditcore.p2_worker_jobs ORDER BY requested_at_utc DESC LIMIT 10;
 
 Kinds: `DIAG_REPORTS`, `MASTER_RELOAD`, `PAGE_RESEND`, `INVOICE_RESCAN`,
 `ACCOUNT_STATEMENT`, `STATEMENT_REREAD`, `INVOICE_TASK_CLEANUP`, `VARIANCE_AUDIT`,
-`SKU_RUN`. Each job keeps its own rules (dry run unless the tag ends with `-commit`,
+`SKU_RUN`, `PEOPLE_NAMES` (names from Security now, instead of waiting for the six-hourly copy). Each job keeps its own rules (dry run unless the tag ends with `-commit`,
 once per tag).
 
 Why: on 26 Oct 2026 the worker was restarted 34 times, none of them a crash. 16
