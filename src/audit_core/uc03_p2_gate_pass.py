@@ -157,7 +157,13 @@ def _gate_pass_row(connection: Connection, tenant_id: str, gate_pass_id: UUID) -
     ).mappings().one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="Gate pass not found.")
-    return dict(row)
+    out = dict(row)
+    out["pages"] = [dict(p) for p in connection.execute(
+        text("SELECT page_no, page_date, object_key, content_type, quality_flag FROM auditcore.p2_gate_pass_pages "
+             "WHERE tenant_id = :t AND gate_pass_id = :i ORDER BY page_no"),
+        {"t": tenant_id, "i": str(gate_pass_id)},
+    ).mappings().all()]
+    return out
 
 
 _QUALITY_NOTES = {
@@ -181,6 +187,10 @@ def _public_gate_pass(row: dict[str, Any]) -> dict[str, Any]:
         "completed": row["completed_at_utc"] is not None,
         # The photo is always kept; its quality is a flag (2026-10-27).
         "photoQuality": row.get("quality_flag") or "GOOD",
+        "photoMode": row.get("photo_mode") or "COMBINED",
+        "dayCounts": row.get("day_counts"),
+        "pages": [{"pageNo": p["page_no"], "date": p["page_date"].isoformat(),
+                   "photoQuality": p["quality_flag"] or "GOOD"} for p in row.get("pages", [])],
         "photoQualityNote": _QUALITY_NOTES.get(row.get("quality_flag") or "GOOD"),
     }
 
@@ -237,10 +247,15 @@ def upload_gate_pass(
     client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
     outletId: Annotated[UUID, Form()],
-    file: Annotated[UploadFile, File()],
+    file: Annotated[list[UploadFile] | None, File()] = None,
+    files: Annotated[list[UploadFile] | None, File()] = None,
     pcName: Annotated[str | None, Form()] = None,
     businessDate: Annotated[date | None, Form()] = None,
+    fileDates: Annotated[list[date] | None, Form()] = None,
 ) -> dict[str, Any]:
+    """Up to four photos of the day's gate-out register (it can run over pages).
+    For Monday, which covers Sunday too, ``fileDates`` (one per photo, Sunday or
+    Monday) says the PC photographed the two days apart (product owner 2026-10-27)."""
     _authorize(connection, tenant_id, principal, client, _UPDATE)
     outlet = _outlet_in_scope(scope_outlets(connection, tenant_id, principal.subject), outletId)
     if outlet["outlet_classification"] != "ONSITE":
@@ -254,21 +269,47 @@ def upload_gate_pass(
                                                         "Monday's, one photo for both days.")
         raise HTTPException(status_code=422, detail="A gate pass can be uploaded only for "
                                                     + " or ".join(gate_pass_day_label(d) for d in allowed) + ".")
-    data = file.file.read(MAX_BYTES + 1)
-    assessment = assess_gate_pass_image(data)
-    if not assessment.ok:
-        raise HTTPException(status_code=422, detail=assessment.message)
+    uploads = [f for f in (files or []) + (file or []) if f is not None]
+    if not uploads:
+        raise HTTPException(status_code=422, detail="Add a photo of the gate pass.")
+    if len(uploads) > MAX_PAGES:
+        raise HTTPException(status_code=422, detail=f"Upload at most {MAX_PAGES} photos for one gate pass.")
+    covers = gate_pass_covers(business_date)
+    separate = bool(fileDates) and len(covers) > 1
+    if fileDates and len(fileDates) != len(uploads):
+        raise HTTPException(status_code=422, detail="Say which day each photo is for.")
+    page_dates = list(fileDates) if separate else [business_date] * len(uploads)
+    if any(d not in covers for d in page_dates):
+        raise HTTPException(status_code=422, detail="A photo is for a day this gate pass does not cover.")
+    if separate and set(page_dates) != set(covers):
+        raise HTTPException(status_code=422, detail="Add at least one photo for Sunday and one for Monday.")
+    pages = []
+    for n, upload in enumerate(uploads, start=1):
+        data = upload.file.read(MAX_BYTES + 1)
+        assessment = assess_gate_pass_image(data)
+        if not assessment.ok:
+            raise HTTPException(status_code=422, detail=f"Photo {n}: {assessment.message}"
+                                if len(uploads) > 1 else assessment.message)
+        pages.append((data, assessment))
 
     day = datetime.combine(business_date, datetime.min.time())
     pc_name = (pcName or "").strip() or principal.subject
     gate_pass_id = uuid4()
     label = f"{safe_part(outlet['outlet_name'], fallback='outlet')}__{safe_part(pc_name, fallback='pc')}__{day:%d-%m-%y}"
-    key = (f"daily-gate-passes/{tenant_id}/{day:%Y-%m-%d}/{gate_pass_id}/"
-           f"{safe_filename(label)}.{assessment.extension}")
+    keys = []
     try:
-        get_p2_document_storage().put_object(key, data, content_type=str(assessment.content_type))
+        for n, (data, assessment) in enumerate(pages, start=1):
+            suffix = "" if len(pages) == 1 else f"__p{n}"
+            key = (f"daily-gate-passes/{tenant_id}/{day:%Y-%m-%d}/{gate_pass_id}/"
+                   f"{safe_filename(label + suffix)}.{assessment.extension}")
+            get_p2_document_storage().put_object(key, data, content_type=str(assessment.content_type))
+            keys.append(key)
     except (P2DocumentStorageError, RuntimeError) as exc:
         raise HTTPException(status_code=503, detail="The photo could not be stored just now. Please try again.") from exc
+    first_data, assessment = pages[0]
+    key = keys[0]
+    # The gate pass is as good as its worst page.
+    worst = next((a.quality for _, a in pages if a.quality != "GOOD"), "GOOD")
 
     connection.execute(
         text("UPDATE auditcore.p2_gate_passes SET status = 'SUPERSEDED' "
@@ -280,26 +321,49 @@ def upload_gate_pass(
             """
             INSERT INTO auditcore.p2_gate_passes (
                 tenant_id, gate_pass_id, dealer_id, outlet_id, outlet_name, pc_actor_id, pc_name, business_date,
-                object_key, content_type, size_bytes, width_px, height_px, sharpness, brightness, quality_flag)
+                object_key, content_type, size_bytes, width_px, height_px, sharpness, brightness, quality_flag,
+                photo_mode)
             VALUES (:t, :id, :dealer, :outlet, :outlet_name, :actor, :pc_name, :day,
-                    :key, :ct, :size, :w, :h, :sharp, :bright, :quality)
+                    :key, :ct, :size, :w, :h, :sharp, :bright, :quality, :mode)
             """
         ),
         {"t": tenant_id, "id": str(gate_pass_id), "dealer": str(outlet["dealer_id"]),
          "outlet": str(outlet["outlet_id"]), "outlet_name": outlet["outlet_name"], "actor": principal.subject,
-         "pc_name": pc_name, "day": day.date(), "key": key, "ct": assessment.content_type, "size": len(data),
-         "w": assessment.width, "h": assessment.height, "sharp": assessment.sharpness,
-         "bright": assessment.brightness, "quality": assessment.quality},
+         "pc_name": pc_name, "day": day.date(), "key": key, "ct": assessment.content_type,
+         "size": len(first_data), "w": assessment.width, "h": assessment.height, "sharp": assessment.sharpness,
+         "bright": assessment.brightness, "quality": worst, "mode": "SEPARATE" if separate else "COMBINED"},
     )
+    for n, ((data, a), page_key, page_date) in enumerate(zip(pages, keys, page_dates, strict=True), start=1):
+        connection.execute(
+            text("""
+                INSERT INTO auditcore.p2_gate_pass_pages (tenant_id, gate_pass_id, page_no, page_date, object_key,
+                  content_type, size_bytes, width_px, height_px, sharpness, brightness, quality_flag)
+                VALUES (:t, :id, :n, :d, :key, :ct, :size, :w, :h, :sharp, :bright, :quality)
+            """),
+            {"t": tenant_id, "id": str(gate_pass_id), "n": n, "d": page_date, "key": page_key,
+             "ct": a.content_type, "size": len(data), "w": a.width, "h": a.height, "sharp": a.sharpness,
+             "bright": a.brightness, "quality": a.quality},
+        )
     return _public_gate_pass(_gate_pass_row(connection, tenant_id, gate_pass_id))
 
 
-class CountsCommand(BaseModel):
+class DayCounts(BaseModel):
+    date: date
     newDeliveries: int = Field(ge=0, le=500)
     stockTransfers: int = Field(ge=0, le=500)
     testDrives: int = Field(ge=0, le=500)
     otherCount: int = Field(default=0, ge=0, le=500)
     otherNote: str | None = Field(default=None, max_length=500)
+
+
+class CountsCommand(BaseModel):
+    newDeliveries: int = Field(default=0, ge=0, le=1000)
+    stockTransfers: int = Field(default=0, ge=0, le=1000)
+    testDrives: int = Field(default=0, ge=0, le=1000)
+    otherCount: int = Field(default=0, ge=0, le=1000)
+    otherNote: str | None = Field(default=None, max_length=1000)
+    # Sunday and Monday photographed apart: the counts of each day; the totals are their sum.
+    days: list[DayCounts] | None = None
 
 
 def _next_step(divergence: str) -> str:
@@ -319,6 +383,24 @@ def submit_counts(
     row = _own_gate_pass(connection, tenant_id, gate_pass_id, principal.subject)
     if row["completed_at_utc"] is not None:
         raise HTTPException(status_code=409, detail="This gate pass is already finished.")
+    day_counts = None
+    if command.days:
+        covers = gate_pass_covers(row["business_date"])
+        if sorted(d.date for d in command.days) != covers:
+            raise HTTPException(status_code=422, detail="Enter the counts of each day: "
+                                + " and ".join(gate_pass_day_label(d) for d in covers) + ".")
+        for d in command.days:
+            if d.otherCount > 0 and not (d.otherNote or "").strip():
+                raise HTTPException(status_code=422, detail="Say what the other entries are.")
+        day_counts = [{**d.model_dump(), "date": d.date.isoformat()} for d in command.days]
+        command = CountsCommand(
+            newDeliveries=sum(d.newDeliveries for d in command.days),
+            stockTransfers=sum(d.stockTransfers for d in command.days),
+            testDrives=sum(d.testDrives for d in command.days),
+            otherCount=sum(d.otherCount for d in command.days),
+            otherNote="; ".join(f"{d.date:%a}: {d.otherNote.strip()}" for d in command.days
+                                if (d.otherNote or "").strip()) or None,
+        )
     note = (command.otherNote or "").strip()
     if command.otherCount > 0 and not note:
         raise HTTPException(status_code=422, detail="Say what the other entries are.")
@@ -331,13 +413,14 @@ def submit_counts(
             UPDATE auditcore.p2_gate_passes
             SET new_deliveries = :nd, stock_transfers = :st, test_drives = :td, other_count = :oc,
                 other_note = :on, delivery_files = :files, divergence = CAST(:div AS varchar),
-                counts_submitted_at_utc = now(),
+                day_counts = CAST(:dc AS jsonb), counts_submitted_at_utc = now(),
                 completed_at_utc = CASE WHEN CAST(:div AS varchar) = 'NONE' THEN now() END
             WHERE tenant_id = :t AND gate_pass_id = :i
             """
         ),
         {"nd": declared, "st": command.stockTransfers, "td": command.testDrives, "oc": command.otherCount,
-         "on": note or None, "files": files, "div": divergence, "t": tenant_id, "i": str(gate_pass_id)},
+         "on": note or None, "files": files, "div": divergence, "t": tenant_id, "i": str(gate_pass_id),
+         "dc": json.dumps(day_counts) if day_counts else None},
     )
     if divergence == "NONE":
         close_gate_pass_tasks(connection, tenant_id=tenant_id, outlet_id=row["outlet_id"],
@@ -527,6 +610,7 @@ def gate_pass_calendar(
 
 
 MAX_SUMMARY_DAYS = 31
+MAX_PAGES = 4
 
 
 @router.get("/gate-passes/summary")
@@ -564,9 +648,11 @@ def gate_pass_summary(
         return {"from": start.isoformat(), "to": end.isoformat(), "outlets": [], "totals": dict(empty), "notes": []}
     passes = {(r["business_date"], str(r["outlet_id"])): dict(r) for r in connection.execute(
         text("""
-            SELECT business_date, outlet_id, gate_pass_id, pc_name, new_deliveries, files_held, divergence,
-                   counts_submitted_at_utc, completed_at_utc, quality_flag
-            FROM auditcore.p2_gate_passes
+            SELECT g.business_date, g.outlet_id, g.gate_pass_id, g.pc_name, g.new_deliveries, g.files_held,
+                   g.divergence, g.counts_submitted_at_utc, g.completed_at_utc, g.quality_flag, g.photo_mode,
+                   (SELECT count(*) FROM auditcore.p2_gate_pass_pages pp
+                    WHERE pp.tenant_id = g.tenant_id AND pp.gate_pass_id = g.gate_pass_id) AS pages
+            FROM auditcore.p2_gate_passes g
             WHERE tenant_id = :t AND status = 'ACTIVE' AND outlet_id = ANY(CAST(:ids AS uuid[]))
               AND business_date BETWEEN :a AND :b
         """), {"t": tenant_id, "ids": ids, "a": start, "b": end}).mappings().all()}
@@ -594,6 +680,7 @@ def gate_pass_summary(
         oid = str(o["outlet_id"])
         line = dict(empty)
         per_day = []
+        uploaders: set[str] = set()
         for d in days:
             gp = passes.get((d, oid))
             files = uploaded.get((d, oid), 0)
@@ -606,7 +693,10 @@ def gate_pass_summary(
                 line["gatePassesMissing"] += 1
             else:
                 entry.update(gatePassId=str(gp["gate_pass_id"]), pcName=gp["pc_name"],
-                             photoQuality=gp["quality_flag"] or "GOOD")
+                             photoQuality=gp["quality_flag"] or "GOOD", pages=max(1, int(gp["pages"] or 0)),
+                             photoMode=gp["photo_mode"])
+                if gp["pc_name"]:
+                    uploaders.add(gp["pc_name"])
                 if gp["counts_submitted_at_utc"] is None:
                     entry["status"] = "COUNTS_PENDING"
                 else:
@@ -627,7 +717,8 @@ def gate_pass_summary(
         for k in totals:
             totals[k] += line[k]
         rows.append({"outletId": oid, "outletName": o["outlet_name"], "dealerId": str(o["dealer_id"]),
-                     "dealerName": o["dealer_name"], "teamLeads": leads.get(oid, []), **line, "days": per_day})
+                     "dealerName": o["dealer_name"], "teamLeads": leads.get(oid, []),
+                     "uploadedBy": sorted(uploaders), **line, "days": per_day})
     return {
         "from": start.isoformat(), "to": end.isoformat(), "outlets": rows, "totals": totals,
         "notes": [
@@ -667,15 +758,22 @@ def gate_pass_image_url(
     principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
     client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
+    page: Annotated[int, Query(ge=1, le=8)] = 1,
 ) -> dict[str, Any]:
     _authorize(connection, tenant_id, principal, client, _READ)
     row = _gate_pass_row(connection, tenant_id, gate_pass_id)
     _outlet_in_scope(scope_outlets(connection, tenant_id, principal.subject), row["outlet_id"])
+    chosen = next((p for p in row["pages"] if p["page_no"] == page), None)
+    if chosen is None and page != 1:
+        raise HTTPException(status_code=404, detail="This gate pass has no such page.")
+    key = chosen["object_key"] if chosen else row["object_key"]
+    content_type = chosen["content_type"] if chosen else row["content_type"]
     try:
-        url = get_p2_document_storage().presign_get(row["object_key"], expires_seconds=600)
+        url = get_p2_document_storage().presign_get(key, expires_seconds=600)
     except (P2DocumentStorageError, RuntimeError) as exc:
         raise HTTPException(status_code=503, detail="The photo could not be opened just now. Please try again.") from exc
-    return {"url": url, "contentType": row["content_type"], "filename": row["object_key"].rsplit("/", 1)[-1]}
+    return {"url": url, "contentType": content_type, "filename": key.rsplit("/", 1)[-1],
+            "page": page, "pages": max(1, len(row["pages"]))}
 
 
 # Daily tasks now live in the Task Manager (p2_tasks, OUTLET scope); these two

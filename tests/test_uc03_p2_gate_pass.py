@@ -83,7 +83,7 @@ def setup(monkeypatch):
                                {"t": journey.tenant_id})
             connection.execute(text("DELETE FROM auditcore.p2_tasks WHERE tenant_id=:t AND scope_kind <> 'JOURNEY'"),
                                {"t": journey.tenant_id})
-            for table in ("p2_daily_tasks", "p2_gate_passes"):
+            for table in ("p2_daily_tasks", "p2_gate_pass_pages", "p2_gate_passes"):
                 connection.execute(text(f"DELETE FROM auditcore.{table} WHERE tenant_id=:t"), {"t": journey.tenant_id})
         engine.dispose()
 
@@ -340,3 +340,44 @@ def test_satellite_outlets_have_no_gate_pass(setup):
     refused = _upload(s)
     assert refused.status_code == 422 and "onsite" in refused.json()["detail"]
     assert s.client.get(f"{s.base}/summary").json()["outlets"] == []
+
+
+def test_up_to_four_pages_and_each_page_opens(setup):
+    """The gate-out register can run over pages: 1 to 4 photos (product owner 2026-10-27)."""
+    s = setup
+    many = [("files", (f"p{n}.jpg", SHARP, "image/jpeg")) for n in range(5)]
+    refused = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id)}, files=many)
+    assert refused.status_code == 422 and "at most 4" in refused.json()["detail"]
+    made = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id)}, files=many[:3])
+    assert made.status_code == 201, made.text
+    gp = made.json()
+    assert [p["pageNo"] for p in gp["pages"]] == [1, 2, 3] and len(s.storage.objects) == 3
+    third = s.client.get(f"{s.base}/{gp['gatePassId']}/image-url", params={"page": 3}).json()
+    assert third["filename"].endswith("__p3.jpg") and third["pages"] == 3
+    assert s.client.get(f"{s.base}/{gp['gatePassId']}/image-url", params={"page": 4}).status_code == 404
+    assert s.client.get(f"{s.base}/summary").json()["outlets"][0]["days"][-1]["pages"] == 3
+
+
+def test_sunday_and_monday_photographed_apart(setup, monkeypatch):
+    from datetime import date
+
+    s = setup
+    monday, sunday = date(2026, 11, 2), date(2026, 11, 1)
+    monkeypatch.setattr(gate_pass, "gate_pass_days",
+                        lambda now=None: {"today": monday, "current": monday, "previous": date(2026, 10, 31)})
+    files = [("files", ("sun.jpg", SHARP, "image/jpeg")), ("files", ("mon1.jpg", SHARP, "image/jpeg")),
+             ("files", ("mon2.jpg", SHARP, "image/jpeg"))]
+    one_day = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id),
+                                          "fileDates": ["2026-11-02", "2026-11-02", "2026-11-02"]}, files=files)
+    assert one_day.status_code == 422 and "Sunday" in one_day.json()["detail"]
+    made = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id),
+                                       "fileDates": ["2026-11-01", "2026-11-02", "2026-11-02"]}, files=files)
+    assert made.status_code == 201, made.text
+    gp = made.json()
+    assert gp["photoMode"] == "SEPARATE" and [p["date"] for p in gp["pages"]] == [
+        "2026-11-01", "2026-11-02", "2026-11-02"]
+    day = {"stockTransfers": 0, "testDrives": 0, "otherCount": 0}
+    counts = s.client.post(f"{s.base}/{gp['gatePassId']}/counts", json={"days": [
+        {"date": sunday.isoformat(), "newDeliveries": 0, **day},
+        {"date": monday.isoformat(), "newDeliveries": 0, **day}]}).json()
+    assert counts["declared"] == 0 and counts["gatePass"]["dayCounts"][0]["date"] == "2026-11-01"
