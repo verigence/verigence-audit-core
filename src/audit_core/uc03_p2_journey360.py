@@ -852,22 +852,13 @@ def _opted(billed: Any, booking: Any, *, invoiced: bool) -> dict[str, Any]:
 
 def resolve_insurance_source(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     """Inhouse (through the dealership; the premium is part of the deal) or
-    Self (the customer arranged it; the premium is not). The PC's
-    confirmation decides; until then Inhouse is assumed. The cover-note
-    rule that reads it from the document slots in here."""
-    row = connection.execute(
-        text(
-            """
-            SELECT insurance_source, insurance_source_set_at_utc, insurance_source_set_by_actor_id
-            FROM auditcore.insurance_records WHERE tenant_id=:t AND journey_id=:j
-            """
-        ),
-        {"t": tenant_id, "j": journey_id},
-    ).mappings().first()
-    if row and row["insurance_source"]:
-        return {"source": str(row["insurance_source"]), "decidedBy": "PC",
-                "decidedAt": row["insurance_source_set_at_utc"], "actorId": row["insurance_source_set_by_actor_id"]}
-    return {"source": "INHOUSE", "decidedBy": "DEFAULT", "decidedAt": None, "actorId": None}
+    Self (the customer arranged it; the premium is not): the PC's
+    confirmation, else the documents (the dealer's Agent / MISP code on the
+    policy, or the premium on the dealer invoice), else the PC is asked and
+    Inhouse is kept meanwhile (product owner 2026-10-27, uc03_insurance_source)."""
+    from audit_core.uc03_insurance_source import resolve
+
+    return resolve(connection, tenant_id=tenant_id, journey_id=journey_id)
 
 
 def _invoice_fields(fields: dict[str, Any]) -> dict[str, Any]:

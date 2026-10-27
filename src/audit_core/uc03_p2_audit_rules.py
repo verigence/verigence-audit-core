@@ -1223,6 +1223,8 @@ def accessory_fitted_unbilled(facts: _Facts) -> RuleOutcome:
 def _insurance_decided(insurance: dict[str, Any]) -> str:
     if insurance.get("decidedBy") == "PC":
         return f"confirmed by the PC on {_when(insurance.get('decidedAt'))}"
+    if insurance.get("decidedBy") == "DOCUMENT":
+        return str(insurance.get("basis") or "shown by the documents")
     return "assumed until confirmed"
 
 
