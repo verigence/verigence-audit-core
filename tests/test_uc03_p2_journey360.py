@@ -557,7 +557,7 @@ def test_opted_lines_read_the_invoice_once_one_exists_else_the_booking_form(jour
     assert rows["additional_warranty_amount"]["opted"] == {"taken": False, "source": "booking"}
     assert view["discounts"][0]["opted"] == {"taken": True, "source": "booking"}
     assert view["insurance"] == {"source": "INHOUSE", "decidedBy": "DEFAULT", "decidedAt": None, "actorId": None,
-                                 "invoiceOnFile": False, "vehicleInvoiced": False}
+                                 "basis": None, "invoiceOnFile": False, "vehicleInvoiced": False}
 
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)

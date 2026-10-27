@@ -387,14 +387,16 @@ def test_confirm_time_materialization_covers_insurance_and_finance(journey) -> N
             _field("agent_intermediary_name", "Aditya Motors"),
         ],
     )
+    # Product owner 2026-10-27: finance only from the RTO challan, the
+    # insurance hypothecation or a receipt from the financier.
     finance_doc = ReviewV2Document(
         documentId=uuid4(),
-        label="Bank Approval Letter",
-        documentTypeKey="bank_approval_letter",
-        originalFilename="approval.pdf",
+        label="RTO Challan",
+        documentTypeKey="rto_challan",
+        originalFilename="rto.pdf",
         processingStatus="PROCESSED",
         extractionState="READY",
-        fields=[_field("financed_by", "UCO Bank")],
+        fields=[_field("financer_name", "UCO Bank"), _field("hp_charges_amount", "1500")],
     )
 
     result = materialize_reviewed_di_business_values(
