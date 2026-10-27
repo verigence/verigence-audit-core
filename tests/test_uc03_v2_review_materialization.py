@@ -533,7 +533,9 @@ def test_an_insurance_record_with_add_ons_can_still_change(journey) -> None:
     as a Postgres array -- "invalid input syntax for type json" -- so no value of
     a Journey whose insurance had add-ons could change. Clearing a wrong agent
     code and rebuilding failed on every such Journey."""
-    from audit_core.uc03_delivery_review_materialization import materialize_delivery_insurance
+    from audit_core.uc03_delivery_review_materialization import (
+        materialize_delivery_insurance,
+    )
 
     c = journey
     tenant_id, journey_id = c.tenant_id, c.journey_id
