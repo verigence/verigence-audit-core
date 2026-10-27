@@ -207,3 +207,17 @@ def test_a_beat_writes_the_boot_row_when_the_start_could_not(engine, monkeypatch
             text("SELECT count(*) FROM platform_ops.service_heartbeats WHERE boot_id=:b"),
             {"b": platform_health.boot_id()}).scalar_one() == 1
 
+
+def test_a_process_replaced_by_a_new_deployment_is_not_a_crash(engine):
+    """Live 2026-10-27: uvicorn waits for open streams on shutdown and Railway stops
+    the old container first, so the old process cannot stamp its stop."""
+    now = datetime.now(UTC)
+    svc = f"api-{uuid4().hex[:6]}"
+    with engine.begin() as connection:
+        _boot(connection, svc, deployment="A", replica="ra", started=now - timedelta(hours=2),
+              last_seen=now - timedelta(minutes=30))                       # replaced, no stop stamp
+        _boot(connection, svc, deployment="B", replica="rb", started=now - timedelta(minutes=31),
+              last_seen=now - timedelta(seconds=20))
+        rows = {s["service"]: s for s in services_health(connection, now - timedelta(hours=24), now)}
+    assert (rows[svc]["deploys"], rows[svc]["restarts"], rows[svc]["uncleanStops"]) == (1, 0, 0)
+
