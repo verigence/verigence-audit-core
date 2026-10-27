@@ -457,3 +457,34 @@ def test_consolidated_view_names_the_column_not_notified_to_pc(setup):
     assert view["outlets"][0]["days"][-1]["notNotifiedToPc"] == 2
     assert any(n.startswith("Not notified to PC") for n in view["notes"])
 
+
+
+def test_the_pc_says_how_many_were_not_notified_and_the_rest_is_not_uploaded_by_the_pc(setup):
+    """Product owner 2026-10-27: not uploaded by PC = deliveries on the gate pass
+    - (found in the tool + not notified to the PC by the dealership)."""
+    s = setup
+    _delivery_file(s, journeys=1)
+    gp = _upload(s).json()["gatePassId"]
+    assert _counts(s, gp, 5).json()["difference"] == 4
+    assert s.client.post(f"{s.base}/{gp}/answer", json={"notNotified": 5}).status_code == 422  # more than the gap
+    answer = s.client.post(f"{s.base}/{gp}/answer", json={"notNotified": 3}).json()
+    assert (answer["notNotified"], answer["notUploadedByPc"], answer["taskRaised"]) == (3, 1, True)
+    assert (answer["gatePass"]["notNotifiedToPc"], answer["gatePass"]["notUploadedByPc"]) == (3, 1)
+    totals = s.client.get(f"{s.base}/summary").json()["totals"]
+    assert (totals["asPerRegister"], totals["updatedInTool"], totals["notNotifiedToPc"], totals["pendingDueToPc"]) == \
+        (5, 1, 3, 1)
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        reference = connection.execute(
+            text("SELECT reference FROM auditcore.p2_tasks WHERE tenant_id=:t AND category='DAILY_TASK'"),
+            {"t": s.journey.tenant_id}).scalar_one()
+    assert (reference["missing"], reference["notUploadedByPc"]) == (3, 1)
+
+
+def test_all_notified_means_the_whole_gap_is_the_pcs_and_no_tl_task(setup):
+    s = setup
+    gp = _upload(s).json()["gatePassId"]
+    _counts(s, gp, 2)
+    answer = s.client.post(f"{s.base}/{gp}/answer", json={"notNotified": 0}).json()
+    assert (answer["notUploadedByPc"], answer["taskRaised"]) == (2, False)
+    assert s.client.get(f"{s.base}/summary").json()["totals"]["pendingDueToPc"] == 2

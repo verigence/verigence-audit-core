@@ -195,6 +195,10 @@ def _public_gate_pass(row: dict[str, Any]) -> dict[str, Any]:
         "testDrives": row["test_drives"], "otherCount": row["other_count"], "otherNote": row["other_note"],
         "deliveryFiles": row["delivery_files"], "divergence": row["divergence"],
         "pastDeliveryNote": row["past_delivery_note"], "filesHeld": row["files_held"],
+        "notNotifiedToPc": row.get("not_notified_count"),
+        "notUploadedByPc": (max(int(row["new_deliveries"] or 0) - int(row["delivery_files"] or 0)
+                                - int(row.get("not_notified_count") or 0), 0)
+                            if row.get("not_notified_count") is not None else None),
         "countsSubmitted": row["counts_submitted_at_utc"] is not None,
         "completed": row["completed_at_utc"] is not None,
         # The photo is always kept; its quality is a flag (2026-10-27).
@@ -446,17 +450,23 @@ def submit_counts(
 
 class AnswerCommand(BaseModel):
     pastDeliveries: str | None = Field(default=None, max_length=1000)
+    # How many of the missing deliveries the dealership did not notify to the PC
+    # (product owner 2026-10-27). filesHeld is the older yes/no answer, still read.
+    notNotified: int | None = Field(default=None, ge=0)
     filesHeld: bool | None = None
 
 
-def _raise_delivery_not_notified(connection: Connection, tenant_id: str, row: dict[str, Any], actor_id: str) -> None:
-    missing = int(row["new_deliveries"] or 0) - int(row["delivery_files"] or 0)
+def _raise_delivery_not_notified(connection: Connection, tenant_id: str, row: dict[str, Any], actor_id: str, *,
+                                 not_notified: int, not_uploaded: int = 0) -> None:
+    missing = not_notified
     day = row["business_date"]
     title = f"Delivery not notified to the PC: {row['outlet_name']}, {gate_pass_day_label(day)}"
     description = (f"The gate pass of {row['outlet_name']} for {gate_pass_day_label(day)} lists {row['new_deliveries']} new "
                    f"deliveries, but only {row['delivery_files']} vehicle gate passes of that day were uploaded. "
-                   f"{row['pc_name']} says the {missing} other {'delivery was' if missing == 1 else 'deliveries were'} "
-                   f"not notified to them and they hold no files for it.")
+                   f"{row['pc_name']} says {not_notified} {'delivery was' if not_notified == 1 else 'deliveries were'} "
+                   f"not notified to them by the dealership"
+                   + (f", and {not_uploaded} {'is' if not_uploaded == 1 else 'are'} still to be uploaded by them."
+                      if not_uploaded else "."))
     # A Task Manager task of the outlet for the Team Lead, closed by the TL with
     # a note (product owner 2026-10-26: daily tasks live in the Task Manager).
     task_id = insert_task_manager_task(connection, tenant_id=tenant_id, values={
@@ -466,6 +476,7 @@ def _raise_delivery_not_notified(connection: Connection, tenant_id: str, row: di
         "dedupe_key": f"gatepass:{row['gate_pass_id']}:{TASK_DELIVERY_NOT_NOTIFIED}",
         "title": title, "description": description, "priority": "HIGH",
         "reference": {"declared": row["new_deliveries"], "deliveryFiles": row["delivery_files"], "missing": missing,
+                      "notUploadedByPc": not_uploaded,
                       "pcName": row["pc_name"], "gatePassId": str(row["gate_pass_id"]),
                       "businessDate": day.isoformat(), "outletName": row["outlet_name"]},
         "assigned_role": "TL", "raised_by": actor_id, "raised_role": "PC", "raised_name": row["pc_name"],
@@ -506,21 +517,31 @@ def answer_divergence(
         close_gate_pass_tasks(connection, tenant_id=tenant_id, outlet_id=row["outlet_id"],
                               business_date=row["business_date"])
     elif row["divergence"] == "MISSING_FILES":
-        if command.filesHeld is None:
-            raise HTTPException(status_code=422, detail="Answer YES or NO: do you hold the files for the other deliveries?")
+        missing = max(int(row["new_deliveries"] or 0) - int(row["delivery_files"] or 0), 0)
+        not_notified = command.notNotified
+        if not_notified is None and command.filesHeld is not None:
+            not_notified = 0 if command.filesHeld else missing
+        if not_notified is None:
+            raise HTTPException(status_code=422, detail="Say how many of these deliveries the dealership did not notify to you.")
+        if not_notified > missing:
+            raise HTTPException(status_code=422, detail=f"That is more than the {missing} deliveries not found in the tool.")
+        not_uploaded = missing - not_notified
         connection.execute(
-            text("UPDATE auditcore.p2_gate_passes SET files_held = :h, completed_at_utc = now() "
+            text("UPDATE auditcore.p2_gate_passes SET not_notified_count = :n, files_held = :h, completed_at_utc = now() "
                  "WHERE tenant_id = :t AND gate_pass_id = :i"),
-            {"h": command.filesHeld, "t": tenant_id, "i": str(gate_pass_id)},
+            {"n": not_notified, "h": not_uploaded > 0, "t": tenant_id, "i": str(gate_pass_id)},
         )
         close_gate_pass_tasks(connection, tenant_id=tenant_id, outlet_id=row["outlet_id"],
                               business_date=row["business_date"])
-        if command.filesHeld is False:
-            _raise_delivery_not_notified(connection, tenant_id, row, principal.subject)
+        if not_notified:
+            _raise_delivery_not_notified(connection, tenant_id, row, principal.subject, not_notified=not_notified,
+                                         not_uploaded=not_uploaded)
+        return {"gatePass": _public_gate_pass(_gate_pass_row(connection, tenant_id, gate_pass_id)),
+                "taskRaised": not_notified > 0, "notNotified": not_notified, "notUploadedByPc": not_uploaded}
     else:
         raise HTTPException(status_code=409, detail="There is no difference to answer.")
     return {"gatePass": _public_gate_pass(_gate_pass_row(connection, tenant_id, gate_pass_id)),
-            "taskRaised": row["divergence"] == "MISSING_FILES" and command.filesHeld is False}
+            "taskRaised": False}
 
 
 @router.get("/gate-passes/calendar")
@@ -640,9 +661,10 @@ def gate_pass_summary(
 
     - asPerRegister: new deliveries on the gate-out register (the gate pass counts);
     - updatedInTool: Delivery files uploaded on the days the gate pass covers (live);
-    - notNotifiedToPc: the rest, where the PC said the deliveries were not notified to them
+    - notNotifiedToPc: how many of the rest the PC said the dealership did not notify to them
       ("Not notified to PC", 2026-10-27; also returned as pendingDueToClient for older clients);
-    - pendingDueToPc: the rest otherwise (the PC holds the files, or has not answered yet).
+    - pendingDueToPc: as per register - (updated in tool + not notified to PC): what the PC has
+      not uploaded (the whole gap while the PC has not answered).
     """
     _authorize(connection, tenant_id, principal, client, _READ)
     today = ist_day().date()
@@ -662,6 +684,7 @@ def gate_pass_summary(
     passes = {(r["business_date"], str(r["outlet_id"])): dict(r) for r in connection.execute(
         text("""
             SELECT g.business_date, g.outlet_id, g.gate_pass_id, g.pc_name, g.new_deliveries, g.files_held,
+                   g.not_notified_count,
                    g.divergence, g.counts_submitted_at_utc, g.completed_at_utc, g.quality_flag, g.photo_mode,
                    (SELECT count(*) FROM auditcore.p2_gate_pass_pages pp
                     WHERE pp.tenant_id = g.tenant_id AND pp.gate_pass_id = g.gate_pass_id) AS pages
@@ -716,10 +739,13 @@ def gate_pass_summary(
                     register = int(gp["new_deliveries"] or 0)
                     pending = max(register - files, 0)
                     entry["asPerRegister"] = register
-                    if gp["files_held"] is False:
-                        entry["notNotifiedToPc"] = pending
-                    else:
-                        entry["pendingDueToPc"] = pending
+                    # The PC's count of deliveries the dealership did not notify (2026-10-27);
+                    # the rest of the gap is the PC's to upload.
+                    not_notified = gp["not_notified_count"]
+                    if not_notified is None:
+                        not_notified = pending if gp["files_held"] is False else 0
+                    entry["notNotifiedToPc"] = min(int(not_notified), pending)
+                    entry["pendingDueToPc"] = pending - entry["notNotifiedToPc"]
                     entry["status"] = "DONE" if gp["completed_at_utc"] is not None else "ANSWER_PENDING"
                     line["asPerRegister"] += register
                     line["notNotifiedToPc"] += entry["notNotifiedToPc"]
@@ -740,8 +766,9 @@ def gate_pass_summary(
             "Onsite outlets only: the daily gate pass is not taken at a satellite outlet.",
             ("As per gate-out register: new deliveries on the gate pass. Updated in tool: Delivery files uploaded "
              "on the days the gate pass covers (Monday's covers Sunday); files uploaded later count on their day."),
-            ("Not notified to PC: the PC said those deliveries were not notified to them. Pending due to PC: "
-             "the PC holds the files but they are not uploaded, or has not answered yet."),
+            ("Not notified to PC: deliveries the PC said the dealership did not notify to them. Pending due to PC: "
+             "as per register - (updated in tool + not notified to PC): deliveries the PC has not uploaded, "
+             "or the whole gap while the PC has not answered yet."),
         ],
     }
 
