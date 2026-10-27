@@ -103,7 +103,7 @@ def _act(p, role: str, task_id: str, action: str, comment: str | None = "done", 
 
 
 @pytest.mark.parametrize(("raiser", "to", "allowed"), [
-    ("TL", "PC", True), ("TL", "CRM", True), ("TL", "PM", False),
+    ("TL", "PC", True), ("TL", "CRM", True), ("TL", "REVIEWER", True), ("TL", "PM", False),
     ("PM", "TL", True), ("PM", "EXECUTIVE", False),
     ("CRM", "TL", True), ("CRM", "PM", True), ("CRM", "PC", False),
     ("REVIEWER", "PC", True), ("REVIEWER", "TL", False),
@@ -373,7 +373,7 @@ def test_http_routes_and_role_gates(project):
     base = f"/p2/v1/tenants/{p.tenant}"
 
     context = client.get(f"{base}/task-manager/context").json()
-    assert context["canAssignTo"] == ["CRM", "PC"] and not context["canCreateSchedules"]
+    assert context["canAssignTo"] == ["CRM", "PC", "REVIEWER"] and not context["canCreateSchedules"]
     created = client.post(f"{base}/task-manager/tasks", json={
         "title": "Visit", "description": "Visit the outlet", "assigneeActorIds": [p.people["PC"]],
         "expectedCloseMinutes": 240})
