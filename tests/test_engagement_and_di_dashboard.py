@@ -123,6 +123,30 @@ def test_engagement_shows_where_the_time_was_spent(journey):
     assert t["activeMinutesBySource"] == {"WEB": 30, "MOBILE_WEB": 10, "ANDROID": 20}
 
 
+def test_engagement_gives_each_days_first_and_last_activity(journey):
+    """Product owner 2026-10-27: crisp figures first, such as who started first
+    and finished last each day; the page ranks people from these."""
+    today = ist_today()
+    now = datetime.now(UTC)
+    start = now.replace(microsecond=0) - timedelta(hours=3)
+    people = (("pc-early", 900, 0, 60), ("pc-mid", 3600, 30, 90), ("pc-late", 7200, 45, 150))
+    with _db(journey) as c:
+        for actor, seconds, begin, end in people:
+            assert record_activity(c, tenant_id=journey.tenant_id, caller=Caller(actor_id=actor, role="PC"),
+                                   now=now, payload={
+                                       "date": today.isoformat(), "activeSeconds": seconds, "idleSeconds": 0,
+                                       "backgroundSeconds": 0, "hourlyActiveMinutes": [0] * 24,
+                                       "firstActiveAt": (start + timedelta(minutes=begin)).isoformat(),
+                                       "lastActiveAt": (start + timedelta(minutes=end)).isoformat()})
+        report = build_engagement(c, tenant_id=journey.tenant_id, start_day=today, end_day=today, period="day")
+    by_actor = {p["actorId"]: p for p in report["people"]}
+    days = {a: by_actor[a]["days"] for a in ("pc-early", "pc-mid", "pc-late")}
+    assert all(len(d) == 1 and d[0]["day"] == today.isoformat() for d in days.values())
+    assert days["pc-early"][0]["activeMinutes"] == 15
+    assert days["pc-early"][0]["firstActiveAtUtc"] == start.isoformat()
+    assert days["pc-late"][0]["lastActiveAtUtc"] == (start + timedelta(minutes=150)).isoformat()
+    assert by_actor[journey.actor_id]["days"] == []  # mapped, no time today
+
 def test_di_dashboard_outcomes_reasons_and_failed_links(journey):
     _, rows = add_batch_pages(journey, [("booking_form", "READY"), ("pan_card", "READY"), (None, "CANCELLED"),
                                         (None, "CANCELLED"), ("invoice", "SUPPORTING")])

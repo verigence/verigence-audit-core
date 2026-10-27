@@ -296,6 +296,12 @@ def build_engagement(connection: Connection, *, tenant_id: str, start_day: date,
             "outlets": [o["outletName"] for o in (person or {}).get("outlets", []) if o.get("outletName")],
             "totals": _finish(total, work_days=working_days(start_day, end_day)),
             "periods": series,
+            # Each day with time on Verigence: when the person started and
+            # stopped, for "who was in first / out last" (product owner 2026-10-27).
+            "days": [{"day": d.isoformat(), "activeMinutes": per_day[d]["activeMinutes"],
+                      "firstActiveAtUtc": _iso(per_day[d]["firstActiveAtUtc"]),
+                      "lastActiveAtUtc": _iso(per_day[d]["lastActiveAtUtc"])}
+                     for d in span if d in per_day and per_day[d]["activeMinutes"]],
         })
     out_people.sort(key=lambda p: (_ROLE_ORDER.get(p["role"] or "", 9), (p["name"] or p["actorId"]).lower()))
     return {
