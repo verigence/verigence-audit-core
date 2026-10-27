@@ -30,6 +30,7 @@ from audit_core.onboarding_imports import router as onboarding_router
 from audit_core.otel import configure_otlp, install_correlation_propagation
 from audit_core.outlet_geocoding import router as outlet_geocoding_router
 from audit_core.payments_finance import router as payments_finance_router
+from audit_core.platform_health import run_heartbeat_loop
 from audit_core.project_activation import router as project_activation_router
 from audit_core.project_master_admin import router as project_master_admin_router
 from audit_core.project_master_forms import router as project_master_form_router
@@ -41,6 +42,7 @@ from audit_core.projects import router as project_router
 from audit_core.readiness import router as readiness_router
 from audit_core.role_mapping_policy import install_role_mapping_policy
 from audit_core.runtime_warmup import warm_runtime_dependencies
+from audit_core.system_health_api import router as system_health_router
 from audit_core.task_manager_api import admin_router as task_manager_admin_router
 from audit_core.task_manager_api import router as task_manager_router
 from audit_core.tasks_api import router as task_router
@@ -219,9 +221,17 @@ async def _lifespan(_: FastAPI):
             get_engine(), interval_seconds=document_sync_sweep_interval,
         )
     )
+    # Boot row, a beat a minute, request counts, and a stop stamp on shutdown:
+    # the SuperAdmin System Health page (2026-10-27).
+    heartbeat_task = asyncio.create_task(run_heartbeat_loop(get_engine(), "verigence-audit-core"))
     try:
         yield
     finally:
+        heartbeat_task.cancel()
+        try:
+            await asyncio.wait_for(heartbeat_task, timeout=10)
+        except (asyncio.CancelledError, TimeoutError):
+            pass
         sweep_task.cancel()
         document_sync_sweep_task.cancel()
         try:
@@ -343,6 +353,7 @@ def create_app() -> FastAPI:
     application.include_router(hr_work_context_router)
     application.include_router(user_project_history_router)
     application.include_router(oem_price_masters_router)
+    application.include_router(system_health_router)
 
     @application.get("/health")
     def health() -> dict[str, str]:

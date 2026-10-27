@@ -56,6 +56,7 @@ from audit_core.dependencies import get_engine
 from audit_core.di_capture_v2_client import DiCaptureV2Error
 from audit_core.logging_config import configure_logging, exception_summary, redact_text
 from audit_core.otel import install_correlation_propagation
+from audit_core.platform_health import start_heartbeat_thread
 from audit_core.uc03_document_capture_v2 import (
     _DI_AUDIENCE,
     _candidate_type_keys,
@@ -4431,7 +4432,15 @@ def main() -> None:
     )
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    run_forever(engine)
+    # Boot row and a beat a minute for the SuperAdmin System Health page (2026-10-27);
+    # the stop stamp is written once run_forever has drained.
+    heartbeat_stop = threading.Event()
+    heartbeat = start_heartbeat_thread(engine, "verigence-p2-worker", heartbeat_stop)
+    try:
+        run_forever(engine)
+    finally:
+        heartbeat_stop.set()
+        heartbeat.join(timeout=10)
 
 
 if __name__ == "__main__":
