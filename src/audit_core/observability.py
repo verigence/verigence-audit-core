@@ -139,6 +139,11 @@ def install_observability(app: FastAPI) -> None:
                     labels=labels,
                 )
                 route = getattr(request.scope.get("route"), "path", None) or request.url.path
+                if not _is_probe(request.url.path):
+                    # Per-minute counts for the SuperAdmin System Health page (2026-10-27).
+                    from audit_core.platform_health import record_request
+
+                    record_request(status_code, route, duration_ms, slow_ms=_slow_request_threshold_ms())
                 # Exactly one timing line per request (decision 2026-09-30): the
                 # response time, where it went (database, outbound calls) and the
                 # business context, as http_request for a normal request,
