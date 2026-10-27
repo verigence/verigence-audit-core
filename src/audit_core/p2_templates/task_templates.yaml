@@ -210,6 +210,19 @@ task_types:
     - APPROVE_CORRECTION
     - REJECT_CORRECTION
     - ADD_COMMENT
+  # In-house or external insurance (product owner 2026-10-27): asked only
+  # when the policy carries none of the dealer's Agent / MISP codes and no
+  # dealer invoice bills the premium. The PC answers with the code in the
+  # comment; an in-house code is remembered for the dealer.
+  INSURANCE_SOURCE_CONFIRM:
+    category: CORRECTION_APPROVAL
+    owner: PC
+    origin: SYSTEM
+    source: DOCUMENT_FIELD
+    completion: MACHINE_VERIFIED
+    actions:
+    - COMPLETE_ACTION
+    - ADD_COMMENT
   # SKU resolution (decision 2026-10-20). The closest price-master SKU is
   # only suggested: the PC accepts it or rejects it and picks one by hand.
   SKU_CLOSEST_MATCH_CONFIRM:

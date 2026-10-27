@@ -15,6 +15,8 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from audit_core.uc03_document_field_corrections import _apply_field_value
+from audit_core.uc03_insurance_source import TASK_TYPE as INSURANCE_SOURCE_TASK
+from audit_core.uc03_insurance_source import answer_task as answer_insurance_source_task
 from audit_core.uc03_p2_runtime import note_facts_changed
 from audit_core.uc03_sku_tasks import SKU_TASK_TYPES, handle_sku_task_action
 
@@ -501,6 +503,10 @@ def submit_action(
         )
         if handled is not None:
             return handled
+
+    if task["task_type"] == INSURANCE_SOURCE_TASK and action == "COMPLETE_ACTION":
+        return answer_insurance_source_task(connection, tenant_id=tenant_id, task=task, actor_id=actor_id,
+                                            comment=comment, details=details)
 
     if task["task_type"] == "TL_MANAGEMENT_REFERRAL" and action == "COMPLETE_ACTION":
         return _enable_management_referral(

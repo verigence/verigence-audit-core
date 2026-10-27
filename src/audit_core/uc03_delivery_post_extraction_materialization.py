@@ -141,7 +141,10 @@ def materialize_delivery_documents_from_durable_store(
             connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="DELIVERY"
         )
         if not documents:
-            return {"skipped": True, "reason": "no_documents"}
+            # The last Delivery document went (an RTO challan voided): the
+            # finance it proved must go too (2026-10-27).
+            return {"skipped": True, "reason": "no_documents",
+                    "finance": _apply_finance_rule(connection, tenant_id=tenant_id, journey_id=journey_id)}
         result = materialize_reviewed_delivery_business_values(
             connection,
             tenant_id=tenant_id,
@@ -208,8 +211,12 @@ def materialize_booking_documents_from_durable_store(
         invoices = sync_invoice_actuals(
             connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING"
         )
+        # Finance follows every current document of the Journey, whichever
+        # stage changed (2026-10-27): a financier's receipt at Booking proves
+        # it, and a voided one stops proving it, even with no document left here.
+        finance = _apply_finance_rule(connection, tenant_id=tenant_id, journey_id=journey_id)
         if not documents:
-            return {"skipped": True, "reason": "no_documents", "invoiceActuals": invoices}
+            return {"skipped": True, "reason": "no_documents", "invoiceActuals": invoices, "finance": finance}
         insurance_written = materialize_delivery_insurance(
             connection,
             tenant_id=tenant_id,
@@ -226,6 +233,7 @@ def materialize_booking_documents_from_durable_store(
             "insuranceFieldsWritten": insurance_written,
             "registrationFieldsWritten": registration_written,
             "invoiceActuals": invoices,
+            "finance": finance,
         }
         logger.info(
             "uc03_booking_documents_materialized",
@@ -242,6 +250,12 @@ def materialize_booking_documents_from_durable_store(
             "materialize_booking_documents_from_durable_store failed", exc_info=True
         )
         return {"error": True}
+
+
+def _apply_finance_rule(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str:
+    from audit_core.uc03_finance_rule import apply_finance_rule
+
+    return str(apply_finance_rule(connection, tenant_id=tenant_id, journey_id=journey_id)["action"])
 
 
 __all__ = [

@@ -1003,6 +1003,13 @@ def _grid_tier(connection: Connection, *, tenant_id: str, journey_id: UUID) -> s
         {"t": tenant_id, "j": journey_id},
     ).mappings().one()
     source = str(row["insurance_source"] or "").upper()
+    if not source:
+        # Not confirmed by the PC: in-house only when the documents show it
+        # (the dealer's Agent / MISP code, or the premium on the dealer invoice).
+        from audit_core.uc03_insurance_source import document_decision
+
+        decided = document_decision(connection, tenant_id=tenant_id, journey_id=journey_id)
+        source = "INHOUSE" if decided is not None else ""
     inhouse = source == "INHOUSE" or (source != "SELF" and (_to_decimal(row["insurance"]) or 0) > 0)
     ew = (_to_decimal(row["ew"]) or 0) > 0
     if inhouse and ew:

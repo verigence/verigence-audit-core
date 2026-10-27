@@ -67,6 +67,7 @@ from audit_core.uc03_document_capture_v2 import (
     get_di_client,
     get_security_oauth_client,
 )
+from audit_core.uc03_insurance_source import sync_insurance_source_task
 from audit_core.uc03_p2_controls import (
     evaluate_unit,
     mark_unit_controls,
@@ -3087,6 +3088,8 @@ def _sync_rule_tasks(connection, *, tenant_id: str, journey_id: UUID, started_at
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
         "delivery_review": sync_delivery_review_task(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
+        "insurance_source": sync_insurance_source_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
     }
     for rule, counts in outcomes.items():
         # The single-task rules answer with what happened to their one task.
@@ -4329,6 +4332,8 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         "INVOICE_TASK_CLEANUP": ("audit_core.uc03_invoice_task_cleanup", "run_invoice_task_cleanup"),
         "VARIANCE_AUDIT": ("audit_core.uc03_variance_audit", "run_variance_audit"),
         "INSURANCE_CODE_REPAIR": ("audit_core.uc03_insurance_code_repair", "run_insurance_code_repair"),
+        "FINANCE_RULE_REPAIR": ("audit_core.uc03_finance_rule_repair", "run_finance_rule_repair"),
+        "INSURANCE_SOURCE_REVIEW": ("audit_core.uc03_insurance_source_review", "run_insurance_source_review"),
     }
     if kind not in per_tenant:
         raise ValueError(f"unknown worker job kind {kind!r}")

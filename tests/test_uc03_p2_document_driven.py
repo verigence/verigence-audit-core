@@ -93,11 +93,32 @@ def _verify(journey, task_id):
     worker._task_verify(journey.engine, work)
 
 
-def test_invoice_evidence_makes_conditional_documents_mandatory(journey):
+def test_an_invoice_financier_alone_is_not_a_finance_case(journey):
+    # Product owner 2026-10-27: finance only from the RTO, the insurance
+    # hypothecation or a receipt from the financier -- never from the invoice.
+    from audit_core.uc03_finance_rule import apply_finance_rule
+
     _complete_booking(journey)
-    _mandatory_delivery_documents(journey, financed_by="HDFC Bank", accessories_cost="12500")
+    _mandatory_delivery_documents(journey, financed_by="CASH", accessories_cost="12500")
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
+        assert apply_finance_rule(connection, tenant_id=journey.tenant_id,
+                                  journey_id=journey.journey_id)["action"] == "NONE"
+        reasons = condition_reasons(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert "financeCase" not in reasons and "accessoriesSold" in reasons
+
+
+def test_invoice_evidence_makes_conditional_documents_mandatory(journey):
+    from audit_core.uc03_finance_rule import apply_finance_rule
+
+    _complete_booking(journey)
+    _mandatory_delivery_documents(journey, financed_by="HDFC Bank", accessories_cost="12500")
+    # The RTO challan proves the finance (hypothecation to the financier).
+    add_ready_document(journey, "rto_challan", financer_name="HDFC BANK LTD", hp_charges_amount="1500")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert apply_finance_rule(connection, tenant_id=journey.tenant_id,
+                                  journey_id=journey.journey_id)["action"] == "CREATED"
         reasons = condition_reasons(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     assert {"financeCase", "accessoriesSold"} <= set(reasons)
     assert "corporateDiscount" not in reasons
@@ -112,7 +133,7 @@ def test_invoice_evidence_makes_conditional_documents_mandatory(journey):
     assert set(tasks) == missing
     letter = tasks["bank_approval_letter"]
     assert letter["assigned_role_code"] == "PC" and letter["title"] == "Upload the Bank Approval Letter"
-    assert "HDFC Bank" in letter["description"]
+    assert "HDFC BANK LTD" in letter["description"]  # the RTO names the financier
     _settle(journey)
     assert len(_tasks(journey, "DOCUMENT_MISSING")) == 4  # deduplicated, not raised again
 

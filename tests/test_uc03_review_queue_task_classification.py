@@ -164,6 +164,9 @@ def test_every_task_type_used_in_the_codebase_is_a_conscious_mapping_decision() 
         "CRM_CALL",
         "ESCALATION_FOLLOW_UP",
         "PC_CORRECTION",
+        # A Phase 2 task (auditcore.p2_tasks, raised by uc03_insurance_source,
+        # 2026-10-27), like the uc03_p2_* modules skipped above.
+        "INSURANCE_SOURCE_CONFIRM",
     }
     accounted_for = set(rq._TASK_TYPE_FINDING_CLASS) | deliberately_unmapped
     unaccounted = found - accounted_for

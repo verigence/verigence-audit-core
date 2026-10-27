@@ -521,7 +521,9 @@ def put_finance(
         "po_reference": payload.poReference,
         "financed_amount": payload.financedAmount,
         "actual_status_code": payload.actualStatusCode,
-        "source_kind": payload.sourceKind,
+        # A record entered here is a person's unless they say otherwise; the
+        # finance rule (uc03_finance_rule) changes only EVIDENCE records.
+        "source_kind": payload.sourceKind or "OPERATIONAL_INPUT",
         "source_evidence_id": payload.sourceEvidenceId,
         "details": __import__("json").dumps(payload.details),
     }

@@ -70,12 +70,7 @@ _RTO_CHALLAN_FIELDS = {
     "registration_type": "registration_type_code",
 }
 
-# financed_by (bank/institution name) is a common invoice-schema field, not
-# scoped to one document type -- any invoice can carry it. hp_charges_amount
-# (hypothecation charges) is RTO-Challan-specific, same reasoning as the
-# registration_state/district/territory/type fields above.
-_FINANCED_BY_FIELD_KEYS = ("financed_by",)
-_HP_CHARGES_FIELD_KEYS = ("hp_charges_amount",)
+# Finance (financier, hypothecation charges) is decided by uc03_finance_rule.
 
 # Direct user correction (2026-09-24): "MV Tax is Road Tax and Registration
 # Charges can be Hypothecation Charges" -- a real RTO Challan's own money
@@ -751,116 +746,17 @@ def materialize_delivery_finance(
     journey_id: UUID,
     documents: list[Any],
 ) -> int:
-    """Fill Finance tab facts from the explicit invoice financier field and
-    the RTO Challan's hypothecation charges.
+    """Keep the finance record to the product owner's rule (2026-10-27): a deal
+    is financed only when the RTO challan, the insurance hypothecation or a
+    receipt from the financier shows it -- never from an invoice's "Financed
+    by" (DMS invoices print CASH there). See uc03_finance_rule. The record is
+    created, corrected or removed to match the Journey's current documents,
+    whatever stage's documents triggered this pass; a person's entry is kept.
+    Returns 1 when the record changed, else 0."""
+    from audit_core.uc03_finance_rule import apply_finance_rule
 
-    A finance_records row is only created when a financier is actually
-    stated -- no invoice ever declares "this is a cash purchase", so absence
-    of financed_by is the correct signal for "presumed cash/outright
-    purchase" (see the Finance tab's own empty-state copy), not something to
-    default a row for.
-    """
-    documents = live_documents_newest_first(connection, tenant_id=tenant_id, documents=documents)
-
-    provider_pair = _best_field(documents, _FINANCED_BY_FIELD_KEYS)
-    provider_name = _text(getattr(provider_pair[1], "value", None)) if provider_pair is not None else None
-    if provider_name is None:
-        return 0
-
-    hp_pair = _best_field(documents, _HP_CHARGES_FIELD_KEYS, document_types={_RTO_CHALLAN_DOCUMENT_TYPE})
-    financed_amount = None
-    if hp_pair is not None:
-        raw_amount = getattr(hp_pair[1], "value", None)
-        if _has_value(raw_amount):
-            financed_amount = uc03_booking_capture._as_decimal(raw_amount, "HP_CHARGES_AMOUNT")
-
-    values = {
-        "finance_type_code": "LOAN",
-        "provider_name": provider_name,
-        "financed_amount": financed_amount,
-    }
-    columns = ("finance_type_code", "provider_name", "financed_amount")
-
-    # finance_records has no (tenant_id, journey_id) uniqueness -- its own PC
-    # write path (payments_finance.put_finance) treats the latest row as "the"
-    # finance record for a journey rather than upserting on a key. Match that
-    # exact select-then-branch pattern instead of ON CONFLICT.
-    existing = connection.execute(
-        text(
-            """
-            SELECT finance_record_id, finance_type_code, provider_name, financed_amount,
-                   source_kind, source_evidence_id
-            FROM auditcore.finance_records
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-            ORDER BY created_at_utc DESC, finance_record_id DESC
-            LIMIT 1
-            FOR UPDATE
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().one_or_none()
-
-    merged = dict(values)
-    source_evidence_id: UUID | None = None
-    if existing is not None:
-        for column in columns:
-            merged[column] = existing[column] if existing[column] is not None else values[column]
-        source_evidence_id = existing["source_evidence_id"]
-    if source_evidence_id is None:
-        for pair in (provider_pair, hp_pair):
-            if pair is not None:
-                source_evidence_id = _source_evidence(pair[0])
-                if source_evidence_id is not None:
-                    break
-
-    if existing is not None and all(existing[column] == merged[column] for column in columns):
-        return 0
-
-    if existing is None:
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.finance_records (
-                    tenant_id, journey_id, finance_type_code, provider_name,
-                    financed_amount, source_kind, source_evidence_id
-                ) VALUES (
-                    :tenant_id, :journey_id, :finance_type_code, :provider_name,
-                    :financed_amount, 'EVIDENCE', :source_evidence_id
-                )
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                **merged,
-                "source_evidence_id": source_evidence_id,
-            },
-        )
-    else:
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.finance_records
-                SET finance_type_code=:finance_type_code,
-                    provider_name=:provider_name,
-                    financed_amount=:financed_amount,
-                    source_kind=COALESCE(source_kind, 'EVIDENCE'),
-                    source_evidence_id=COALESCE(source_evidence_id, :source_evidence_id),
-                    updated_at_utc=now()
-                WHERE tenant_id=:tenant_id AND finance_record_id=:finance_record_id
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "finance_record_id": existing["finance_record_id"],
-                **merged,
-                "source_evidence_id": source_evidence_id,
-            },
-        )
-    return sum(
-        1 for column in columns
-        if values.get(column) is not None and (existing is None or existing[column] is None)
-    )
+    result = apply_finance_rule(connection, tenant_id=tenant_id, journey_id=journey_id, documents=documents)
+    return 1 if result["action"] in ("CREATED", "UPDATED", "REMOVED") else 0
 
 
 _FINANCE_HYPOTHECATION_FINDING_TYPE = "FINANCE_HYPOTHECATION_MISSING"
