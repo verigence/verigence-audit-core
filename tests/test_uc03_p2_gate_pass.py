@@ -64,6 +64,10 @@ def setup(monkeypatch):
     journey = create_p2_journey(engine, prefix="gatepass")
     storage = Storage()
     monkeypatch.setattr(gate_pass, "get_p2_document_storage", lambda: storage)
+    real_days = gate_pass.gate_pass_days
+    # Sunday is the off day (no gate pass of its own); keep these same-day tests independent of when they run.
+    monkeypatch.setattr(gate_pass, "gate_pass_days",
+                        lambda now=None: {**real_days(now), "current": gate_pass.ist_day(now).date()})
     acting = {"subject": journey.actor_id}
     app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=acting["subject"])
     app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization()
@@ -256,3 +260,44 @@ def test_calendar_shows_outlet_photo_but_no_photo_for_a_dealership_view_and_tl_r
     done = s.client.post(f"{tasks_url}/{task['dailyTaskId']}/resolve", json={"note": "Called the dealer"}).json()
     assert done["status"] == "DONE"
     assert s.client.get(tasks_url).json()["items"] == []
+
+
+def test_a_late_gate_pass_is_filed_under_its_own_day_and_the_screen_asks(setup, monkeypatch):
+    """Product owner 2026-10-27: the previous day's gate pass can still be
+    uploaded the next day; the screen asks which day the photo is for."""
+    from datetime import date, timedelta
+
+    s = setup
+    tuesday, monday = date(2026, 10, 27), date(2026, 10, 26)
+    monkeypatch.setattr(gate_pass, "gate_pass_days",
+                        lambda now=None: {"today": tuesday, "current": tuesday, "previous": monday})
+    outlets = s.client.get(f"{s.base}/outlets").json()
+    assert outlets["today"]["label"] == "Tue 27 Oct"
+    assert outlets["previous"] == {"date": "2026-10-26", "label": "Sun 25 + Mon 26 Oct",
+                                   "coversDates": ["2026-10-25", "2026-10-26"],
+                                   "dueAtUtc": "2026-10-27T18:29:59+00:00"}
+    assert outlets["previousOpenOutletIds"] == [str(s.journey.outlet_id)]
+
+    late = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id), "businessDate": "2026-10-26"},
+                         files={"file": ("gatepass.jpg", SHARP, "image/jpeg")})
+    assert late.status_code == 201, late.text
+    assert late.json()["businessDate"] == "2026-10-26" and late.json()["dayLabel"] == "Sun 25 + Mon 26 Oct"
+    too_old = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id),
+                                          "businessDate": (monday - timedelta(days=2)).isoformat()},
+                            files={"file": ("gatepass.jpg", SHARP, "image/jpeg")})
+    assert too_old.status_code == 422 and "Tue 27 Oct or Sun 25 + Mon 26 Oct" in too_old.json()["detail"]
+
+
+def test_sunday_goes_with_monday(setup, monkeypatch):
+    from datetime import date
+
+    s = setup
+    sunday = date(2026, 11, 1)
+    monkeypatch.setattr(gate_pass, "gate_pass_days",
+                        lambda now=None: {"today": sunday, "current": None, "previous": date(2026, 10, 31)})
+    refused = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id), "businessDate": "2026-11-01"},
+                            files={"file": ("gatepass.jpg", SHARP, "image/jpeg")})
+    assert refused.status_code == 422 and "Monday" in refused.json()["detail"]
+    saturday = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id)},
+                             files={"file": ("gatepass.jpg", SHARP, "image/jpeg")})
+    assert saturday.status_code == 201 and saturday.json()["businessDate"] == "2026-10-31"

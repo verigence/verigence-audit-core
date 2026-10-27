@@ -89,8 +89,19 @@ must be someone the reassigning person may assign to. Recorded as a
 - No human reviewer (`completion_protocol='SYSTEM_VERIFIED'`). The system
   closes it as soon as the ACTIVE gate pass of that outlet and day has its
   photo and is finished (`completed_at_utc`).
-- Due 23:59:59 IST on N+1. Not finished by then → status `FAILED`,
+- Due 23:59:59 IST on the next gate pass day (N+1; a Saturday's runs to
+  Monday night, as Sunday is off). Not finished by then → status `FAILED`,
   outcome `INCOMPLETE`, flagged.
+- Sunday is the off day (product owner 2026-10-27): there is no Sunday gate
+  pass. Monday's covers Sunday and Monday, one photo for both days with the
+  counts of both together, and is compared with the Delivery files uploaded on
+  both days (the calendar folds Sunday into Monday).
+- The task names its day first: "Gate pass for Tue 27 Oct: <outlet>", or
+  "Gate pass for Sun 1 + Mon 2 Nov: <outlet>".
+- The upload is filed under the day it is for: today, or the previous gate
+  pass day while it is still open. When the previous day's gate pass of the
+  outlet is not finished, the screen asks which day the photo is for; no date
+  is picked otherwise. A Sunday upload goes to Saturday.
 
 The gate-pass mismatch task ("Delivery not notified to the PC", raised to the
 TL) moves from `p2_daily_tasks` into `p2_tasks` as an `OUTLET` task with no
@@ -120,7 +131,7 @@ Every action writes a `p2_task_events` row (journey_id null for these tasks).
 | Overdue | open for the assignee (`READY`, `IN_PROGRESS`, `RETURNED`) and `due_at_utc` passed |
 | Review overdue | `AWAITING_REQUESTER_REVIEW` and `review_due_at_utc` passed (flagged against the reviewer) |
 | Missed | recurring occurrence still open when the next one was generated |
-| Incomplete | gate pass task not finished by 23:59 IST on N+1 |
+| Incomplete | gate pass task not finished by 23:59 IST on the next gate pass day |
 | Closed late | completed after `due_at_utc` |
 
 Daily status is two new sections of the Daily Processing report (TL, PM,
