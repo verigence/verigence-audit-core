@@ -7,7 +7,12 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pytest
-from p2_support import add_evidence, add_extracted_field, create_p2_journey, database_engine
+from p2_support import (
+    add_evidence,
+    add_extracted_field,
+    create_p2_journey,
+    database_engine,
+)
 from sqlalchemy import text
 
 from audit_core.db import set_tenant_context
@@ -118,7 +123,10 @@ def test_removing_the_last_delivery_document_removes_the_loan(journey) -> None:
 
 
 def test_the_disbursement_review_comes_back_when_finance_does(journey) -> None:
-    from audit_core.uc03_finance_disbursement_resolution import TASK_TYPE, resolve_finance_disbursement
+    from audit_core.uc03_finance_disbursement_resolution import (
+        TASK_TYPE,
+        resolve_finance_disbursement,
+    )
 
     def open_tasks():
         with journey.engine.begin() as connection:
