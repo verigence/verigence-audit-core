@@ -4,7 +4,9 @@ the Team Lead (real Postgres, storage doubled)."""
 from __future__ import annotations
 
 import io
+import json
 import random
+from datetime import date
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -93,8 +95,30 @@ def _upload(s, data=SHARP, name="Pc One"):
                          files={"file": ("gatepass.jpg", data, "image/jpeg")})
 
 
-def _delivery_file(s, journeys=1, *, stage="DELIVERY", pages=1, fresh=False):
-    """``journeys`` journeys of the outlet, each with ``pages`` pages of ``stage`` uploaded today."""
+_TODAY = object()
+
+
+def _vehicle_gate_pass(s, journey_id, read_date, *, corrected_to=None):
+    """The vehicle's own gate pass on a Journey, with the delivery date read off it
+    (and a reviewer's correction, when given)."""
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.journey_document_extracted_fields (tenant_id, journey_id, di_document_id, "
+                 "field_key, stage_code, source_document_type_key, extracted_value, modified_value, "
+                 "modified_by_actor_id, modified_at_utc, effective_value, is_modified) "
+                 "VALUES (:t, :j, :d, 'delivery_date', 'DELIVERY', 'gate_pass', CAST(:x AS jsonb), CAST(:m AS jsonb), "
+                 "CAST(:a AS varchar), CASE WHEN CAST(:a AS varchar) IS NULL THEN NULL ELSE now() END, CAST(:e AS jsonb), :im)"),
+            {"t": s.journey.tenant_id, "j": str(journey_id), "d": str(uuid4()),
+             "x": json.dumps(str(read_date)), "m": json.dumps(str(corrected_to)) if corrected_to else None,
+             "a": s.journey.actor_id if corrected_to else None,
+             "e": json.dumps(str(corrected_to or read_date)), "im": corrected_to is not None})
+
+
+def _delivery_file(s, journeys=1, *, stage="DELIVERY", pages=1, fresh=False, gate_pass_dated=_TODAY):
+    """``journeys`` journeys of the outlet, each with ``pages`` pages of ``stage`` uploaded today and,
+    for a delivery, the vehicle's gate pass dated ``gate_pass_dated`` (today by default; None: no
+    vehicle gate pass uploaded)."""
     made = []
     for n in range(journeys):
         if n == 0 and not fresh:
@@ -117,6 +141,8 @@ def _delivery_file(s, journeys=1, *, stage="DELIVERY", pages=1, fresh=False):
             connection.execute(
                 text("UPDATE auditcore.p2_document_queue SET business_stage=:s WHERE tenant_id=:t AND journey_id=:j"),
                 {"s": stage, "t": s.journey.tenant_id, "j": j.journey_id})
+        if stage == "DELIVERY" and gate_pass_dated is not None:
+            _vehicle_gate_pass(s, j.journey_id, gate_pass.ist_day().date() if gate_pass_dated is _TODAY else gate_pass_dated)
         made.append(rows)
     return made
 
@@ -381,3 +407,84 @@ def test_sunday_and_monday_photographed_apart(setup, monkeypatch):
         {"date": sunday.isoformat(), "newDeliveries": 0, **day},
         {"date": monday.isoformat(), "newDeliveries": 0, **day}]}).json()
     assert counts["declared"] == 0 and counts["gatePass"]["dayCounts"][0]["date"] == "2026-11-01"
+
+
+def test_a_delivery_counts_only_with_its_vehicle_gate_pass_of_that_day(setup):
+    """Product owner 2026-10-27: for the Daily Gate Pass a delivery counts only when the PC
+    has uploaded that vehicle's gate pass and its date matches the Daily Gate Pass date."""
+    s = setup
+    today = gate_pass.ist_day().date()
+    _delivery_file(s, journeys=1)                                             # counts
+    _delivery_file(s, journeys=1, fresh=True, gate_pass_dated=None)           # documents but no vehicle gate pass
+    _delivery_file(s, journeys=1, fresh=True, gate_pass_dated=date(2026, 1, 1) if today != date(2026, 1, 1)
+                   else date(2026, 1, 2))                                     # gate pass of another day
+    _delivery_file(s, journeys=1, fresh=True, gate_pass_dated=today.replace(year=2022))  # year misread: not counted
+    [[misread]] = _delivery_file(s, journeys=1, fresh=True, gate_pass_dated=date(2026, 3, 3) if today != date(2026, 3, 3)
+                                 else date(2026, 3, 4))
+    gp = _upload(s).json()["gatePassId"]
+    assert _counts(s, gp, 1).json()["deliveryFiles"] == 1
+    # A reviewer corrects a misread date to today: that vehicle now counts.
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        jid = connection.execute(text("SELECT journey_id FROM auditcore.p2_document_queue WHERE tenant_id=:t "
+                                      "AND queue_id=:q"), {"t": s.journey.tenant_id, "q": str(misread["queue_id"])}).scalar_one()
+    _vehicle_gate_pass(s, jid, date(2026, 3, 3), corrected_to=today)
+    gp2 = _upload(s).json()["gatePassId"]
+    assert _counts(s, gp2, 2).json()["deliveryFiles"] == 2
+
+
+def test_monday_counts_vehicle_gate_passes_of_sunday_too(setup):
+    s = setup
+    monday = date(2026, 11, 2)
+    with s.journey.engine.begin() as connection:
+        assert gate_pass.delivery_file_count(connection, s.journey.tenant_id, s.journey.outlet_id, monday) == 0
+    _delivery_file(s, journeys=1, gate_pass_dated=date(2026, 11, 1))
+    _delivery_file(s, journeys=1, fresh=True, gate_pass_dated=monday)
+    _delivery_file(s, journeys=1, fresh=True, gate_pass_dated=date(2026, 10, 31))  # Saturday: its own gate pass
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        assert gate_pass.delivery_file_count(connection, s.journey.tenant_id, s.journey.outlet_id, monday) == 2
+
+
+def test_consolidated_view_names_the_column_not_notified_to_pc(setup):
+    s = setup
+    _delivery_file(s, journeys=1)
+    gp = _upload(s).json()["gatePassId"]
+    _counts(s, gp, 3)
+    s.client.post(f"{s.base}/{gp}/answer", json={"filesHeld": False})
+    view = s.client.get(f"{s.base}/summary").json()
+    assert view["totals"]["notNotifiedToPc"] == 2 == view["totals"]["pendingDueToClient"]
+    assert view["outlets"][0]["days"][-1]["notNotifiedToPc"] == 2
+    assert any(n.startswith("Not notified to PC") for n in view["notes"])
+
+
+
+def test_the_pc_says_how_many_were_not_notified_and_the_rest_is_not_uploaded_by_the_pc(setup):
+    """Product owner 2026-10-27: not uploaded by PC = deliveries on the gate pass
+    - (found in the tool + not notified to the PC by the dealership)."""
+    s = setup
+    _delivery_file(s, journeys=1)
+    gp = _upload(s).json()["gatePassId"]
+    assert _counts(s, gp, 5).json()["difference"] == 4
+    assert s.client.post(f"{s.base}/{gp}/answer", json={"notNotified": 5}).status_code == 422  # more than the gap
+    answer = s.client.post(f"{s.base}/{gp}/answer", json={"notNotified": 3}).json()
+    assert (answer["notNotified"], answer["notUploadedByPc"], answer["taskRaised"]) == (3, 1, True)
+    assert (answer["gatePass"]["notNotifiedToPc"], answer["gatePass"]["notUploadedByPc"]) == (3, 1)
+    totals = s.client.get(f"{s.base}/summary").json()["totals"]
+    assert (totals["asPerRegister"], totals["updatedInTool"], totals["notNotifiedToPc"], totals["pendingDueToPc"]) == \
+        (5, 1, 3, 1)
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        reference = connection.execute(
+            text("SELECT reference FROM auditcore.p2_tasks WHERE tenant_id=:t AND category='DAILY_TASK'"),
+            {"t": s.journey.tenant_id}).scalar_one()
+    assert (reference["missing"], reference["notUploadedByPc"]) == (3, 1)
+
+
+def test_all_notified_means_the_whole_gap_is_the_pcs_and_no_tl_task(setup):
+    s = setup
+    gp = _upload(s).json()["gatePassId"]
+    _counts(s, gp, 2)
+    answer = s.client.post(f"{s.base}/{gp}/answer", json={"notNotified": 0}).json()
+    assert (answer["notUploadedByPc"], answer["taskRaised"]) == (2, False)
+    assert s.client.get(f"{s.base}/summary").json()["totals"]["pendingDueToPc"] == 2
