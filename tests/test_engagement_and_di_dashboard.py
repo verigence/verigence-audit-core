@@ -23,7 +23,7 @@ from audit_core.engagement_reports import build_engagement, period_key, working_
 from audit_core.main import app
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import get_security_authorization_client
-from audit_core.task_manager import Caller, ist_today
+from audit_core.task_manager import Caller, TaskManagerError, ist_today
 from audit_core.task_manager_reports import merge_sessions, record_activity
 
 
@@ -101,6 +101,51 @@ def test_engagement_by_day_week_and_month(journey):
     pc_week = next(p for p in week["people"] if p["actorId"] == journey.actor_id)
     assert sum(p["sessions"] for p in pc_week["periods"]) == 2
 
+
+def test_engagement_shows_where_the_time_was_spent(journey):
+    """Product owner 2026-10-27: capture mobile too and show the source used.
+    A phone's browser is its own source (MOBILE_WEB), added to the computer's
+    time rather than merged with it."""
+    today = ist_today()
+    now = datetime.now(UTC)
+    caller = Caller(actor_id=journey.actor_id, role="PC")
+    with _db(journey) as c:
+        for kind, seconds in (("WEB", 1800), ("MOBILE_WEB", 600), ("ANDROID", 1200)):
+            assert record_activity(c, tenant_id=journey.tenant_id, caller=caller, now=now, payload={
+                "date": today.isoformat(), "clientKind": kind, "activeSeconds": seconds, "idleSeconds": 0,
+                "backgroundSeconds": 0, "hourlyActiveMinutes": [0] * 24})
+        with pytest.raises(TaskManagerError):
+            record_activity(c, tenant_id=journey.tenant_id, caller=caller, now=now, payload={
+                "date": today.isoformat(), "clientKind": "TV", "activeSeconds": 1})
+        report = build_engagement(c, tenant_id=journey.tenant_id, start_day=today, end_day=today, period="day")
+    t = next(p for p in report["people"] if p["actorId"] == journey.actor_id)["totals"]
+    assert t["activeMinutes"] == 60
+    assert t["activeMinutesBySource"] == {"WEB": 30, "MOBILE_WEB": 10, "ANDROID": 20}
+
+
+def test_engagement_gives_each_days_first_and_last_activity(journey):
+    """Product owner 2026-10-27: crisp figures first, such as who started first
+    and finished last each day; the page ranks people from these."""
+    today = ist_today()
+    now = datetime.now(UTC)
+    start = now.replace(microsecond=0) - timedelta(hours=3)
+    people = (("pc-early", 900, 0, 60), ("pc-mid", 3600, 30, 90), ("pc-late", 7200, 45, 150))
+    with _db(journey) as c:
+        for actor, seconds, begin, end in people:
+            assert record_activity(c, tenant_id=journey.tenant_id, caller=Caller(actor_id=actor, role="PC"),
+                                   now=now, payload={
+                                       "date": today.isoformat(), "activeSeconds": seconds, "idleSeconds": 0,
+                                       "backgroundSeconds": 0, "hourlyActiveMinutes": [0] * 24,
+                                       "firstActiveAt": (start + timedelta(minutes=begin)).isoformat(),
+                                       "lastActiveAt": (start + timedelta(minutes=end)).isoformat()})
+        report = build_engagement(c, tenant_id=journey.tenant_id, start_day=today, end_day=today, period="day")
+    by_actor = {p["actorId"]: p for p in report["people"]}
+    days = {a: by_actor[a]["days"] for a in ("pc-early", "pc-mid", "pc-late")}
+    assert all(len(d) == 1 and d[0]["day"] == today.isoformat() for d in days.values())
+    assert days["pc-early"][0]["activeMinutes"] == 15
+    assert days["pc-early"][0]["firstActiveAtUtc"] == start.isoformat()
+    assert days["pc-late"][0]["lastActiveAtUtc"] == (start + timedelta(minutes=150)).isoformat()
+    assert by_actor[journey.actor_id]["days"] == []  # mapped, no time today
 
 def test_di_dashboard_outcomes_reasons_and_failed_links(journey):
     _, rows = add_batch_pages(journey, [("booking_form", "READY"), ("pan_card", "READY"), (None, "CANCELLED"),

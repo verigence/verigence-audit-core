@@ -179,6 +179,11 @@ def build_task_status(connection: Connection, *, tenant_id: str, day: date,
 # --------------------------------------------------------------------------- time on Verigence
 
 
+# Where the time was spent (2026-10-27): the browser on a computer, the browser
+# on a phone or tablet, or the Android / iOS app.
+CLIENT_KINDS = ("WEB", "MOBILE_WEB", "ANDROID", "IOS")
+
+
 def record_activity(connection: Connection, *, tenant_id: str, caller: Caller, payload: dict[str, Any],
                     now: datetime | None = None) -> bool:
     """Raise the day's counters of the caller to what the browser reports.
@@ -193,7 +198,7 @@ def record_activity(connection: Connection, *, tenant_id: str, caller: Caller, p
     if day not in (today, today - timedelta(days=1)):
         return False
     client = str(payload.get("clientKind") or "WEB").upper()
-    if client not in {"WEB", "ANDROID", "IOS"}:
+    if client not in CLIENT_KINDS:
         raise TaskManagerError("Unknown client.")
 
     def seconds(key: str) -> int:
