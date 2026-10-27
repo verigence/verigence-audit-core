@@ -99,17 +99,24 @@ _TODAY = object()
 
 
 def _vehicle_gate_pass(s, journey_id, read_date, *, corrected_to=None):
-    """The vehicle's own gate pass on a Journey, with the delivery date read off it
-    (and a reviewer's correction, when given)."""
+    """The vehicle's own gate pass on a Journey (a live document), with the delivery date
+    read off it (and a reviewer's correction, when given)."""
+    document = uuid4()
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id, di_document_id, "
+                 "document_type_key, evidence_purpose, process_area, association_status) "
+                 "SELECT tenant_id, journey_id, customer_id, :s, :d, 'gate_pass', 'JOURNEY_DOCUMENT', 'DELIVERY', "
+                 "'ACTIVE' FROM auditcore.journeys WHERE tenant_id = :t AND journey_id = :j"),
+            {"t": s.journey.tenant_id, "j": str(journey_id), "s": str(uuid4()), "d": str(document)})
         connection.execute(
             text("INSERT INTO auditcore.journey_document_extracted_fields (tenant_id, journey_id, di_document_id, "
                  "field_key, stage_code, source_document_type_key, extracted_value, modified_value, "
                  "modified_by_actor_id, modified_at_utc, effective_value, is_modified) "
                  "VALUES (:t, :j, :d, 'delivery_date', 'DELIVERY', 'gate_pass', CAST(:x AS jsonb), CAST(:m AS jsonb), "
                  "CAST(:a AS varchar), CASE WHEN CAST(:a AS varchar) IS NULL THEN NULL ELSE now() END, CAST(:e AS jsonb), :im)"),
-            {"t": s.journey.tenant_id, "j": str(journey_id), "d": str(uuid4()),
+            {"t": s.journey.tenant_id, "j": str(journey_id), "d": str(document),
              "x": json.dumps(str(read_date)), "m": json.dumps(str(corrected_to)) if corrected_to else None,
              "a": s.journey.actor_id if corrected_to else None,
              "e": json.dumps(str(corrected_to or read_date)), "im": corrected_to is not None})
@@ -431,6 +438,24 @@ def test_a_delivery_counts_only_with_its_vehicle_gate_pass_of_that_day(setup):
     _vehicle_gate_pass(s, jid, date(2026, 3, 3), corrected_to=today)
     gp2 = _upload(s).json()["gatePassId"]
     assert _counts(s, gp2, 2).json()["deliveryFiles"] == 2
+
+
+def test_a_removed_vehicle_gate_pass_no_longer_counts(setup):
+    """Only a live vehicle gate pass counts (product owner 2026-10-27): the task, the
+    calendar and the consolidated view count the same deliveries."""
+    s = setup
+    _delivery_file(s, journeys=2, fresh=True)
+    day = gate_pass.ist_day().date()
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        assert gate_pass.delivery_file_count(connection, s.journey.tenant_id, s.journey.outlet_id, day) == 2
+        connection.execute(text(
+            "UPDATE auditcore.evidence SET association_status = 'VOIDED' WHERE tenant_id = :t AND evidence_id = "
+            "(SELECT evidence_id FROM auditcore.evidence WHERE tenant_id = :t AND document_type_key = 'gate_pass' LIMIT 1)"),
+            {"t": s.journey.tenant_id})
+        assert gate_pass.delivery_file_count(connection, s.journey.tenant_id, s.journey.outlet_id, day) == 1
+        assert gate_pass.vehicle_gate_pass_deliveries(
+            connection, s.journey.tenant_id, [str(s.journey.outlet_id)], day, day) == {(day, str(s.journey.outlet_id)): 1}
 
 
 def test_monday_counts_vehicle_gate_passes_of_sunday_too(setup):
