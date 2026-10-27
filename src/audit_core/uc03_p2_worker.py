@@ -26,10 +26,17 @@ import io
 import json
 import os
 import random
+import signal
 import socket
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -172,7 +179,8 @@ def _retry_delay(work_type: str, attempts: int, payload: dict[str, Any] | None =
     return delays[min(attempts, len(delays)) - 1]
 _POLL_SECONDS = float(os.environ.get("P2_WORKER_POLL_SECONDS", "1.0"))
 _MAX_PDF_PAGES = int(os.environ.get("P2_MAX_PDF_PAGES", "100"))
-_WORKER_CONCURRENCY = max(1, int(os.environ.get("P2_WORKER_CONCURRENCY", "6")))
+# 10 parallel items (2026-10-27, was 6): the container has 8 vCPU and the DB pool 30.
+_WORKER_CONCURRENCY = max(1, int(os.environ.get("P2_WORKER_CONCURRENCY", "10")))
 _PER_JOURNEY_CONCURRENCY = max(1, int(os.environ.get("P2_PER_JOURNEY_CONCURRENCY", "3")))
 _LEASE_SECONDS = int(os.environ.get("P2_WORKER_LEASE_SECONDS", "600"))
 _LEASE_RENEW_SECONDS = max(5, _LEASE_SECONDS // 3)
@@ -3829,27 +3837,179 @@ def _keep_leases(engine: Engine, items: list[WorkItem], done: threading.Event) -
                 logger.warning("p2_work_lease_renewal_failed", tenant_id=tenant_id, **exception_summary(exc))
 
 
+def _settle_finished(engine: Engine, work: WorkItem, future: Future) -> None:
+    started = _started_at.pop(work.work_id, None)
+    duration_ms = round((time.perf_counter() - started) * 1000.0, 1) if started else None
+    try:
+        future.result()
+    except RescheduleWork as exc:
+        logger.info("p2_work_rescheduled", retry_in_seconds=exc.delay_seconds,
+                    reason=redact_text(str(exc), 200), duration_ms=duration_ms, **_work_fields(work))
+        _settle(engine, work, _reschedule, exc)
+    except LeaseLost:
+        logger.warning("p2_work_lease_lost", duration_ms=duration_ms, **_work_fields(work))
+    except Exception as exc:  # noqa: BLE001 - every failure is settled (retry/dead-letter)
+        # _fail logs p2_work_retry_scheduled / p2_work_dead_lettered with the summary.
+        _settle(engine, work, _fail, exc)
+    else:
+        logger.info("p2_work_completed", duration_ms=duration_ms, **_work_fields(work))
+        _settle(engine, work, _complete)
+
+
 def _run_claimed(engine: Engine, claimed: list[WorkItem]) -> None:
     with ThreadPoolExecutor(max_workers=_WORKER_CONCURRENCY) as pool:
         futures = {pool.submit(_process_in_context, engine, item): item for item in claimed}
         for future in as_completed(futures):
-            work = futures[future]
-            started = _started_at.pop(work.work_id, None)
-            duration_ms = round((time.perf_counter() - started) * 1000.0, 1) if started else None
-            try:
-                future.result()
-            except RescheduleWork as exc:
-                logger.info("p2_work_rescheduled", retry_in_seconds=exc.delay_seconds,
-                            reason=redact_text(str(exc), 200), duration_ms=duration_ms, **_work_fields(work))
-                _settle(engine, work, _reschedule, exc)
-            except LeaseLost:
-                logger.warning("p2_work_lease_lost", duration_ms=duration_ms, **_work_fields(work))
-            except Exception as exc:  # noqa: BLE001 - every failure is settled (retry/dead-letter)
-                # _fail logs p2_work_retry_scheduled / p2_work_dead_lettered with the summary.
-                _settle(engine, work, _fail, exc)
+            _settle_finished(engine, futures[future], future)
+
+
+# ---------------------------------------------------------------- continuous loop
+# 2026-10-27 review of 26 Oct's "not read within 30 minutes" pages: the worker
+# was restarted about every 5-10 minutes in the afternoon (each push to dev),
+# and every restart left its claimed items locked for the 10-minute lease
+# before anyone could pick them up; and run_once waited for the slowest item
+# of a batch before claiming more. The worker now claims as soon as a slot is
+# free, and on SIGTERM stops claiming, lets running items finish for a few
+# seconds and releases the rest at once so the next worker takes them.
+_stopping = threading.Event()
+_inflight: dict[UUID, WorkItem] = {}
+_inflight_lock = threading.Lock()
+_DRAIN_SECONDS = float(os.environ.get("P2_WORKER_DRAIN_SECONDS", "15"))
+
+
+def request_stop(*_: Any) -> None:
+    """SIGTERM / SIGINT: finish what is running, take nothing new."""
+    if not _stopping.is_set():
+        logger.info("p2_worker_stopping", worker_id=_WORKER_ID, inflight=len(_inflight))
+    _stopping.set()
+
+
+def _renew_inflight_leases(engine: Engine) -> None:
+    with _inflight_lock:
+        running = list(_inflight.values())
+    for tenant_id in {item.tenant_id for item in running}:
+        try:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                for item in (i for i in running if i.tenant_id == tenant_id):
+                    connection.execute(
+                        text(
+                            """
+                            UPDATE auditcore.p2_work_queue
+                            SET lease_expires_at_utc=now() + (:lease_seconds * interval '1 second')
+                            WHERE tenant_id=:tenant_id AND work_id=:work_id AND lease_token=:token
+                            """
+                        ),
+                        {"tenant_id": tenant_id, "work_id": item.work_id, "token": item.lease_token,
+                         "lease_seconds": _LEASE_SECONDS},
+                    )
+        except Exception as exc:  # noqa: BLE001 - renewal is best effort; expiry is the fallback
+            logger.warning("p2_work_lease_renewal_failed", tenant_id=tenant_id, **exception_summary(exc))
+
+
+def release_inflight_leases(engine: Engine, items: list[WorkItem] | None = None) -> int:
+    """Let another worker take these items now instead of after the lease runs
+    out. Safe while they still run here: whatever finishes first writes, the
+    other one's write is refused by the lease token (LeaseLost)."""
+    if items is None:
+        with _inflight_lock:
+            items = list(_inflight.values())
+    released = 0
+    for tenant_id in {item.tenant_id for item in items}:
+        try:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                for item in (i for i in items if i.tenant_id == tenant_id):
+                    released += connection.execute(
+                        text(
+                            """
+                            UPDATE auditcore.p2_work_queue
+                            SET lease_expires_at_utc=now()
+                            WHERE tenant_id=:tenant_id AND work_id=:work_id AND lease_token=:token
+                              AND work_status IN ('CLAIMED','PROCESSING')
+                            """
+                        ),
+                        {"tenant_id": tenant_id, "work_id": item.work_id, "token": item.lease_token},
+                    ).rowcount or 0
+        except Exception as exc:  # noqa: BLE001 - the lease expiry stays the fallback
+            logger.warning("p2_work_lease_release_failed", tenant_id=tenant_id, **exception_summary(exc))
+    return released
+
+
+def _claim_free_slots(engine: Engine, free: int) -> list[WorkItem]:
+    claimed: list[WorkItem] = []
+    for tenant_id in _active_tenants(engine):
+        _maybe_sweep(engine, tenant_id)
+        remaining = free - len(claimed)
+        if remaining > 0 and not _stopping.is_set():
+            claimed.extend(_claim_for_tenant(engine, tenant_id, remaining))
+    return claimed
+
+
+def run_forever(engine: Engine, *, stop: threading.Event | None = None, max_idle_cycles: int | None = None) -> None:
+    """Keep up to _WORKER_CONCURRENCY items running; claim the moment a slot
+    frees. ``max_idle_cycles`` ends the loop after that many empty polls (tests)."""
+    stop = stop or _stopping
+    pool = ThreadPoolExecutor(max_workers=_WORKER_CONCURRENCY, thread_name_prefix="p2-work")
+    futures: dict[Future, WorkItem] = {}
+    renewer_stop = threading.Event()
+
+    def renew() -> None:
+        while not renewer_stop.wait(_LEASE_RENEW_SECONDS):
+            _renew_inflight_leases(engine)
+
+    threading.Thread(target=renew, name="lease-renewer", daemon=True).start()
+    last_heartbeat = time.monotonic()
+    cycles = failed_cycles = idle = 0
+    try:
+        while not stop.is_set():
+            cycles += 1
+            free = _WORKER_CONCURRENCY - len(futures)
+            claimed: list[WorkItem] = []
+            if free > 0:
+                try:
+                    claimed = _claim_free_slots(engine, free)
+                except Exception as exc:  # noqa: BLE001 - a database blip must not kill the worker
+                    failed_cycles += 1
+                    logger.error("p2_worker_cycle_failed", error_category="TECHNICAL", **exception_summary(exc))
+            for item in claimed:
+                with _inflight_lock:
+                    _inflight[item.work_id] = item
+                futures[pool.submit(_process_in_context, engine, item)] = item
+            if futures:
+                idle = 0
+                done, _ = wait(list(futures), timeout=_POLL_SECONDS, return_when=FIRST_COMPLETED)
+                for future in done:
+                    item = futures.pop(future)
+                    with _inflight_lock:
+                        _inflight.pop(item.work_id, None)
+                    _settle_finished(engine, item, future)
+                    _stats["processed"] += 1
             else:
-                logger.info("p2_work_completed", duration_ms=duration_ms, **_work_fields(work))
-                _settle(engine, work, _complete)
+                idle += 1
+                if max_idle_cycles is not None and idle >= max_idle_cycles:
+                    break
+                stop.wait(_POLL_SECONDS)
+            if time.monotonic() - last_heartbeat >= _HEARTBEAT_SECONDS:
+                logger.info("p2_worker_heartbeat", worker_id=_WORKER_ID, cycles=cycles,
+                            failed_cycles=failed_cycles, processed=_stats["processed"], inflight=len(futures),
+                            **_queue_depth(engine))
+                last_heartbeat = time.monotonic()
+                cycles = failed_cycles = 0
+                _stats["processed"] = 0
+    finally:
+        if futures:
+            # Stopping: give running items a moment, then hand the rest over.
+            done, _ = wait(list(futures), timeout=_DRAIN_SECONDS)
+            for future in done:
+                item = futures.pop(future)
+                with _inflight_lock:
+                    _inflight.pop(item.work_id, None)
+                _settle_finished(engine, item, future)
+            released = release_inflight_leases(engine, list(futures.values()))
+            logger.info("p2_worker_stopped", worker_id=_WORKER_ID, finished=len(done), released=released)
+        renewer_stop.set()
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 _started_at: dict[UUID, float] = {}
@@ -4227,26 +4387,9 @@ def main() -> None:
         concurrency=_WORKER_CONCURRENCY,
         per_journey_concurrency=_PER_JOURNEY_CONCURRENCY,
     )
-    last_heartbeat = time.monotonic()
-    cycles = failed_cycles = 0
-    while True:
-        cycles += 1
-        try:
-            processed = run_once(engine)
-        except Exception as exc:  # noqa: BLE001 - logged; the loop must survive
-            # A database blip must not kill the worker process.
-            failed_cycles += 1
-            logger.error("p2_worker_cycle_failed", error_category="TECHNICAL", **exception_summary(exc))
-            processed = 0
-        if time.monotonic() - last_heartbeat >= _HEARTBEAT_SECONDS:
-            # Proof of life for a quiet worker; a missing heartbeat means it is stuck or down.
-            logger.info("p2_worker_heartbeat", worker_id=_WORKER_ID, cycles=cycles,
-                        failed_cycles=failed_cycles, processed=_stats["processed"], **_queue_depth(engine))
-            last_heartbeat = time.monotonic()
-            cycles = failed_cycles = 0
-            _stats["processed"] = 0
-        if processed == 0:
-            time.sleep(_POLL_SECONDS)
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    run_forever(engine)
 
 
 if __name__ == "__main__":
