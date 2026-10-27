@@ -145,11 +145,15 @@ def caller_role(connection: Connection, *, tenant_id: str, actor_id: str) -> str
 
 
 def known_names(connection: Connection, *, tenant_id: str) -> dict[str, str]:
-    """The best known display name of each person of the Project: the name the
-    app last reported for them, else the name on what they did (journeys, gate
-    passes, tasks). Audit Core has no people directory of its own."""
+    """The best known display name of each person of the Project: the name in
+    Security (copied by the worker, 2026-10-27), else the name the app last
+    reported for them, else the name on what they did (journeys, gate passes,
+    tasks)."""
     rows = connection.execute(
         text("""
+            SELECT actor_id, display_name, 0 AS rank FROM auditcore.people_names
+            WHERE actor_id IN (SELECT security_actor_id FROM auditcore.business_assignments WHERE tenant_id = :t)
+            UNION ALL
             SELECT actor_id, display_name, rank FROM (
               SELECT DISTINCT ON (actor_id) actor_id, display_name, 1 AS rank
               FROM auditcore.p2_user_activity_daily

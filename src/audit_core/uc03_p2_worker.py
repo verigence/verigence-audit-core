@@ -4317,6 +4317,9 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         return run_master_reload, (engine, tag)
     if kind == "SKU_RUN":
         return _sku_run_once, (engine, tag)
+    if kind == "PEOPLE_NAMES":
+        from audit_core.people_names import refresh_people_names
+        return refresh_people_names, (engine,)
     per_tenant = {
         "PAGE_RESEND": ("audit_core.uc03_p2_page_resend", "run_page_resend"),
         "INVOICE_RESCAN": ("audit_core.uc03_invoice_rescan", "run_invoice_rescan"),
@@ -4393,6 +4396,18 @@ def _watch_worker_jobs(engine: Engine) -> None:
         _stopping.wait(_JOB_POLL_SECONDS)
 
 
+_NAMES_REFRESH_SECONDS = 6 * 3600
+
+
+def _refresh_names_every(engine: Engine) -> None:
+    """People's names from Security, at start and every six hours (2026-10-27)."""
+    from audit_core.people_names import refresh_people_names
+
+    while not _stopping.is_set():
+        refresh_people_names(engine)
+        _stopping.wait(_NAMES_REFRESH_SECONDS)
+
+
 def main() -> None:
     _configure_worker_observability()
     engine = get_engine()
@@ -4407,6 +4422,7 @@ def main() -> None:
             target, args = _one_shot_target(kind, engine, tag, [])
             threading.Thread(target=target, args=args, name=kind.lower().replace("_", "-"), daemon=True).start()
     threading.Thread(target=_watch_worker_jobs, args=(engine,), name="worker-jobs", daemon=True).start()
+    threading.Thread(target=_refresh_names_every, args=(engine,), name="people-names", daemon=True).start()
     logger.info(
         "p2_worker_started",
         worker_id=_WORKER_ID,
