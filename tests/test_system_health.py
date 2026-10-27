@@ -183,6 +183,9 @@ def test_railway_webhook_needs_the_secret_and_keeps_only_known_fields(engine):
                            headers={"X-Verigence-Webhook-Secret": "wrong"}).status_code == 401
         assert client.post("/v1/platform/railway-webhook", json=event,
                            headers={"X-Verigence-Webhook-Secret": secret}).status_code == 204
+        assert client.post("/v1/platform/railway-webhook?key=wrong", json=event).status_code == 401
+        assert client.post(f"/v1/platform/railway-webhook?key={secret}",
+                           json={**event, "resource": {**event["resource"], "deployment": {"id": "other"}}}).status_code == 204
         with engine.begin() as connection:
             row = connection.execute(
                 text("SELECT event_type, status, service_name, environment_name, payload FROM platform_ops.railway_events "

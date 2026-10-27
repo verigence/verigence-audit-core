@@ -482,7 +482,10 @@ async def railway_webhook(request: Request) -> Response:
     body = await request.body()
     if len(body) > _MAX_WEBHOOK_BYTES:
         raise HTTPException(status_code=413, detail="Payload too large.")
-    presented = request.headers.get(WEBHOOK_SECRET_HEADER)
+    # The header is preferred; Railway's API cannot set custom headers on a webhook,
+    # so the same secret is also accepted as a ?key= query parameter (Railway's own
+    # documented fallback). Request logs here record the route template, not the query.
+    presented = request.headers.get(WEBHOOK_SECRET_HEADER) or request.query_params.get("key")
 
     def _store() -> int:
         with get_engine().begin() as connection:
