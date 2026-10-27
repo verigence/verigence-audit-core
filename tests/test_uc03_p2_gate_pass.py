@@ -137,13 +137,20 @@ def test_the_onsite_outlet_is_the_default_and_the_photo_is_checked_and_named(set
     assert outlets["defaultOutletId"] == str(s.journey.outlet_id)
     assert [o["outletName"] for o in outlets["outlets"]] == ["Cuttack Road"]
 
-    refused = _upload(s, BLURRED)
-    assert refused.status_code == 422 and "blurred" in refused.json()["detail"]
+    # No hard rules at the camera (2026-10-27): a blurred or small photo is kept and flagged.
+    blurred = _upload(s, BLURRED)
+    assert blurred.status_code == 201 and blurred.json()["photoQuality"] == "BLURRED"
     small = _upload(s, _page(1000, 750))
-    assert small.status_code == 422 and "too small" in small.json()["detail"]
-    assert s.storage.objects == {}
+    assert small.status_code == 201
+    assert s.client.post(s.base, data={"outletId": str(s.journey.outlet_id)},
+                         files={"file": ("x.jpg", b"not a photo", "image/jpeg")}).status_code == 422
+    s.storage.objects.clear()
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("DELETE FROM auditcore.p2_gate_passes WHERE tenant_id=:t"), {"t": s.journey.tenant_id})
 
     created = _upload(s)
+    assert created.json()["photoQuality"] == "GOOD"
     assert created.status_code == 201, created.text
     [key] = s.storage.objects
     name = key.rsplit("/", 1)[-1]

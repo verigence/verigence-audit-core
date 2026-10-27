@@ -160,6 +160,13 @@ def _gate_pass_row(connection: Connection, tenant_id: str, gate_pass_id: UUID) -
     return dict(row)
 
 
+_QUALITY_NOTES = {
+    "BLURRED": "The photo looks blurred.",
+    "TOO_DARK": "The photo looks dark.",
+    "WASHED_OUT": "The photo looks washed out.",
+}
+
+
 def _public_gate_pass(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "gatePassId": str(row["gate_pass_id"]), "outletId": str(row["outlet_id"]), "outletName": row["outlet_name"],
@@ -172,6 +179,9 @@ def _public_gate_pass(row: dict[str, Any]) -> dict[str, Any]:
         "pastDeliveryNote": row["past_delivery_note"], "filesHeld": row["files_held"],
         "countsSubmitted": row["counts_submitted_at_utc"] is not None,
         "completed": row["completed_at_utc"] is not None,
+        # The photo is always kept; its quality is a flag (2026-10-27).
+        "photoQuality": row.get("quality_flag") or "GOOD",
+        "photoQualityNote": _QUALITY_NOTES.get(row.get("quality_flag") or "GOOD"),
     }
 
 
@@ -270,15 +280,16 @@ def upload_gate_pass(
             """
             INSERT INTO auditcore.p2_gate_passes (
                 tenant_id, gate_pass_id, dealer_id, outlet_id, outlet_name, pc_actor_id, pc_name, business_date,
-                object_key, content_type, size_bytes, width_px, height_px, sharpness)
+                object_key, content_type, size_bytes, width_px, height_px, sharpness, brightness, quality_flag)
             VALUES (:t, :id, :dealer, :outlet, :outlet_name, :actor, :pc_name, :day,
-                    :key, :ct, :size, :w, :h, :sharp)
+                    :key, :ct, :size, :w, :h, :sharp, :bright, :quality)
             """
         ),
         {"t": tenant_id, "id": str(gate_pass_id), "dealer": str(outlet["dealer_id"]),
          "outlet": str(outlet["outlet_id"]), "outlet_name": outlet["outlet_name"], "actor": principal.subject,
          "pc_name": pc_name, "day": day.date(), "key": key, "ct": assessment.content_type, "size": len(data),
-         "w": assessment.width, "h": assessment.height, "sharp": assessment.sharpness},
+         "w": assessment.width, "h": assessment.height, "sharp": assessment.sharpness,
+         "bright": assessment.brightness, "quality": assessment.quality},
     )
     return _public_gate_pass(_gate_pass_row(connection, tenant_id, gate_pass_id))
 
