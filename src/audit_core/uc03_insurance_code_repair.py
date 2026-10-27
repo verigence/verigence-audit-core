@@ -12,7 +12,10 @@ looks like a phone number:
 
 1. rebuild the Journey's values from the readings Audit Core holds -- the
    newest live reading now wins, which fixes a Journey whose newest reading was
-   already right;
+   already right. The rebuild only fills empty columns, so a phone-shaped code
+   is cleared first, and the change is kept only when a proper code (not
+   empty, not phone-shaped) takes its place; otherwise it is rolled back and
+   the Journey listed (live 2026-10-27: the rebuild alone changed nothing);
 2. if the code still looks like a phone number, ask Document Intelligence to
    read the Journey's live insurance pages again under the new instructions
    (reprocess force) and copy the new reading in -- the same request, wait and
@@ -121,16 +124,62 @@ def insurance_pages(connection: Connection, tenant_id: str, journey: dict[str, A
     return items
 
 
-def _rebuild(engine: Engine, tenant_id: str, journey_id: UUID) -> None:
+_CODE_COLUMNS = ("agent_intermediary_code", "misp_code")
+
+
+class _KeepAsIs(Exception):
+    """No proper code replaced the phone number: roll the Journey back."""
+
+
+def _codes(connection: Connection, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    row = connection.execute(
+        text(
+            """
+            SELECT agent_intermediary_code, misp_code, source_kind
+            FROM auditcore.insurance_records WHERE tenant_id = :t AND journey_id = :j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one_or_none()
+    return dict(row) if row is not None else None
+
+
+def _rebuild(engine: Engine, tenant_id: str, journey_id: UUID) -> list[str]:
+    """Clear the phone-shaped codes and rebuild from the newest live readings.
+    Returns the columns that now hold a proper code; anything else is rolled back."""
     from audit_core.uc03_delivery_post_extraction_materialization import (
         materialize_booking_documents_from_durable_store,
         materialize_delivery_documents_from_durable_store,
     )
 
-    with engine.begin() as connection:
-        set_tenant_context(connection, tenant_id)
-        materialize_booking_documents_from_durable_store(connection, tenant_id=tenant_id, journey_id=journey_id)
-        materialize_delivery_documents_from_durable_store(connection, tenant_id=tenant_id, journey_id=journey_id)
+    try:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            before = _codes(connection, tenant_id, journey_id)
+            # Only values Audit Core copied from documents; never one a person entered.
+            if before is None or before["source_kind"] != "EVIDENCE":
+                return []
+            wrong = [c for c in _CODE_COLUMNS if looks_like_phone_number(before[c])]
+            if not wrong:
+                return []
+            connection.execute(
+                text(
+                    f"""
+                    UPDATE auditcore.insurance_records SET {', '.join(f'{c} = NULL' for c in wrong)}
+                    WHERE tenant_id = :t AND journey_id = :j
+                    """
+                ),
+                {"t": tenant_id, "j": journey_id},
+            )
+            materialize_booking_documents_from_durable_store(connection, tenant_id=tenant_id, journey_id=journey_id)
+            materialize_delivery_documents_from_durable_store(connection, tenant_id=tenant_id, journey_id=journey_id)
+            after = _codes(connection, tenant_id, journey_id) or {}
+            fixed = [c for c in wrong if after.get(c) and not looks_like_phone_number(after.get(c))]
+            if fixed != wrong:
+                raise _KeepAsIs
+            return fixed
+    except _KeepAsIs:
+        return []
 
 
 def run_insurance_code_repair(engine: Engine, tag: str, tenant_ids: list[str]) -> None:
@@ -181,9 +230,26 @@ def run_insurance_code_repair(engine: Engine, tag: str, tenant_ids: list[str]) -
             except Exception:
                 logger.warning("insurance_code_repair_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
         if commit:
+            # The re-read copies the new reading in, but the rebuild only fills
+            # empty columns: clear and rebuild once more with the new readings.
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
-                still = len(affected_journeys(connection, tenant_id))
+                left = affected_journeys(connection, tenant_id)
+            for journey in left:
+                try:
+                    _rebuild(engine, tenant_id, UUID(str(journey["journey_id"])))
+                except Exception:
+                    logger.warning("insurance_code_repair_rebuild_failed", tag=tag, tenant_id=tenant_id,
+                                   journey=journey["journey_reference"], exc_info=True)
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                remaining = affected_journeys(connection, tenant_id)
+                still = len(remaining)
+            for journey in remaining:
+                logger.info("insurance_code_repair_left", tag=tag, tenant_id=tenant_id,
+                            journey=journey["journey_reference"],
+                            agent_code_phone=looks_like_phone_number(journey["agent_intermediary_code"]),
+                            misp_code_phone=looks_like_phone_number(journey["misp_code"]))
         logger.info("insurance_code_repair_finished", tag=tag, tenant_id=tenant_id, commit=commit,
                     journeys=len(before), fixed_by_rebuild=rebuilt, pages_to_reread=len(to_reread),
                     still_phone_shaped=still if commit else None,
