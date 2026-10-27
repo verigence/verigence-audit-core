@@ -37,3 +37,16 @@ def test_names_are_fetched_in_batches_and_preferred():
             c.execute(text("DELETE FROM auditcore.people_names WHERE actor_id = :a"), {"a": journey.actor_id})
         delete_tenant_data(engine, journey.tenant_id)
         engine.dispose()
+
+
+def test_assigned_people_are_found_in_every_project():
+    """Assignments are tenant-isolated: the platform context alone sees none (2026-10-27)."""
+    from audit_core.people_names import _assigned_actor_ids
+
+    engine = database_engine()
+    journey = create_p2_journey(engine, prefix="names2")
+    try:
+        assert journey.actor_id in _assigned_actor_ids(engine)
+    finally:
+        delete_tenant_data(engine, journey.tenant_id)
+        engine.dispose()
