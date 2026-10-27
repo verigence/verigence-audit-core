@@ -108,6 +108,9 @@ jobs:
           railway environment edit --environment dev             --service-config "$WORKER_SERVICE" deploy.startCommand             "PYTHONPATH=src python -m audit_core.uc03_p2_worker" >/dev/null
           railway environment edit --environment dev             --service-config "$WORKER_SERVICE" deploy.restartPolicyType             "ON_FAILURE" >/dev/null
           railway environment edit --environment dev             --service-config "$WORKER_SERVICE" deploy.restartPolicyMaxRetries             "10" >/dev/null
+          # 2026-10-27: SIGTERM -> SIGKILL gap, so a stopping worker can hand its
+          # running items over at once instead of leaving them on a 10-minute lease.
+          railway environment edit --environment dev             --service-config "$WORKER_SERVICE" deploy.drainingSeconds             "20" >/dev/null
 
       - name: Validate worker runtime configuration
         shell: bash
