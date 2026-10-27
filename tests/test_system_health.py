@@ -221,3 +221,129 @@ def test_a_process_replaced_by_a_new_deployment_is_not_a_crash(engine):
         rows = {s["service"]: s for s in services_health(connection, now - timedelta(hours=24), now)}
     assert (rows[svc]["deploys"], rows[svc]["restarts"], rows[svc]["uncleanStops"]) == (1, 0, 0)
 
+
+
+# --- Document Intelligence (its own database, read over its API) ----------
+
+def _di_payload(tenant_id: str) -> dict:
+    now = datetime.now(UTC)
+    iso = lambda d: d.isoformat()
+    return {
+        "generatedAtUtc": iso(now), "windowHours": 24,
+        "boots": [
+            # Same deployment and replica started twice: one restart; the first went quiet uncleanly.
+            {"bootId": str(uuid4()), "service": "di-worker-v2", "replicaId": "r1", "deploymentId": "d1",
+             "version": "abc", "startedAtUtc": iso(now - timedelta(hours=2)),
+             "lastSeenAtUtc": iso(now - timedelta(hours=1)), "stoppedAtUtc": None},
+            {"bootId": str(uuid4()), "service": "di-worker-v2", "replicaId": "r1", "deploymentId": "d1",
+             "version": "abc", "startedAtUtc": iso(now - timedelta(minutes=50)),
+             "lastSeenAtUtc": iso(now - timedelta(seconds=30)), "stoppedAtUtc": None},
+        ],
+        "resources": [{"service": "di-api", "cpuMax": 0.5, "cpuAvg": 0.1, "cpuLimit": 8.0, "cpuPeakAtUtc": iso(now),
+                       "cpuHotMinutes": 0, "memoryMaxGb": 7.5, "memoryAvgGb": 1.0, "memoryLimitGb": 8.0,
+                       "memoryPeakAtUtc": iso(now), "hourly": []}],
+        "queues": {
+            "byStatus": [
+                {"queue": "extraction", "tenantId": tenant_id, "status": "PENDING", "count": 3, "over30m": 2,
+                 "oldestInFlightAtUtc": iso(now - timedelta(hours=1))},
+                {"queue": "classification", "tenantId": tenant_id, "status": "FAILED", "count": 4, "over30m": 0,
+                 "oldestInFlightAtUtc": None},
+            ],
+            "failures": [{"queue": "classification", "tenantId": tenant_id, "errorCode": "GEMINI_TIMEOUT", "count": 4}],
+            "leaseReclaims": 1,
+        },
+        "schedulerProblems": [{"runName": "nightly_reprocess", "runDate": "2026-10-26", "startedAtUtc": iso(now),
+                               "completedAtUtc": None, "errorCode": None}],
+        "database": {"database": "railway", "sizeBytes": 1, "maxConnections": 100, "commits": 1, "rollbacks": 0,
+                     "deadlocks": 0, "conflicts": 0, "tempFiles": 0, "statsResetAtUtc": None,
+                     "connections": {"idle": 85}, "idleInTransactionOver5m": 1, "activeOver1m": 0,
+                     "waitingOnLocks": 0, "slowQueries": None, "slowQueriesNote": "pg_stat_statements is not installed"},
+    }
+
+
+def _get_health(monkeypatch, fake):
+    from audit_core import system_health_api
+
+    monkeypatch.setattr(system_health_api, "fetch_di_health", fake)
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        app.dependency_overrides[require_super_admin_request] = lambda: HumanAdminRequest(
+            user_id="sa", bearer_token="t",
+            admin_context=SecurityAdminContext(user_id="sa", is_super_admin=True, admin_scopes=()))
+        response = client.get("/v1/admin/system-health", params={"hours": 24})
+    finally:
+        app.dependency_overrides.clear()
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_document_intelligence_health_is_merged_into_the_page(engine, monkeypatch):
+    journey = create_p2_journey(engine, prefix="dihealth")
+    body = _get_health(monkeypatch, lambda hours: _di_payload(str(journey.tenant_id)))
+    [worker] = [s for s in body["services"] if s["service"] == "di-worker-v2"]
+    assert (worker["status"], worker["restarts"], worker["uncleanStops"]) == ("UP", 1, 1)
+    assert any(r["service"] == "di-api" for r in body["resources"])
+    di = body["pipeline"]["documentIntelligence"]
+    assert di["available"] is True and di["leaseReclaims"] == 1
+    [mine] = [p for p in di["projects"] if p["tenantId"] == str(journey.tenant_id)]
+    assert mine["projectName"] != str(journey.tenant_id)  # named, not a bare id
+    assert (mine["extraction"]["inFlight"], mine["extraction"]["over30m"], mine["classification"]["failed"]) == (3, 2, 4)
+    assert mine["failureReasons"] == [{"queue": "classification", "errorCode": "GEMINI_TIMEOUT", "count": 4}]
+    codes = {a["code"] for a in body["alerts"]}
+    assert {"DI_JOBS_OVER_30_MIN", "DI_JOBS_FAILED", "DI_LEASE_RECLAIMED", "DI_SCHEDULER_PROBLEM",
+            "DI_DB_IDLE_IN_TRANSACTION", "DI_DB_CONNECTIONS_HIGH", "MEMORY_HIGH", "SERVICE_RESTARTED"} <= codes
+    assert body["diDatabase"]["database"] == "railway" and body["diDatabase"]["window"] is None
+    assert body["alerts"][0]["severity"] == "CRITICAL"
+
+
+def test_an_unreachable_document_intelligence_is_an_alert_not_an_error(engine, monkeypatch):
+    from audit_core.system_health_di import DiHealthUnavailable
+
+    def down(hours):
+        raise DiHealthUnavailable("Document Intelligence answered HTTP 503.")
+
+    body = _get_health(monkeypatch, down)
+    di = body["pipeline"]["documentIntelligence"]
+    assert di["available"] is False and "503" in di["error"]
+    assert body["diDatabase"] is None
+    assert "DI_HEALTH_UNAVAILABLE" in {a["code"] for a in body["alerts"]}
+
+
+def test_di_health_is_asked_with_a_di_service_token(monkeypatch):
+    import httpx
+
+    from audit_core import system_health_di
+
+    seen = {}
+
+    class FakeOAuth:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def get_service_token(self, *, audience):
+            seen["audience"] = audience
+            return "svc-token"
+
+    def fake_get(url, *, params, headers, timeout):
+        seen.update(url=url, params=params, auth=headers["Authorization"])
+        return httpx.Response(200, json={"boots": []}, request=httpx.Request("GET", url))
+
+    for key, value in {"DI_BASE_URL": "https://di.example/", "SECURITY_BASE_URL": "https://sec.example",
+                       "SECURITY_CLIENT_ID": "audit-core", "SECURITY_CLIENT_SECRET": "x"}.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(system_health_di, "SecurityOAuthClient", FakeOAuth)
+    monkeypatch.setattr(system_health_di.httpx, "get", fake_get)
+    assert system_health_di.fetch_di_health(6) == {"boots": []}
+    assert seen == {"audience": "di", "url": "https://di.example/v1/platform/health", "params": {"hours": 6},
+                    "auth": "Bearer svc-token"}
+
+    monkeypatch.setattr(system_health_di.httpx, "get",
+                        lambda url, **kw: httpx.Response(403, request=httpx.Request("GET", url)))
+    with pytest.raises(system_health_di.DiHealthUnavailable, match="403"):
+        system_health_di.fetch_di_health(6)
