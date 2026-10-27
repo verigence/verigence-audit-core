@@ -478,3 +478,51 @@ def test_extended_warranty_amount_aliases_onto_additional_warranty_amount(journe
     ).mappings().all()
     by_key = {row["component_key"]: row["actual_amount"] for row in rows}
     assert by_key == {"additional_warranty_amount": Decimal(17999)}
+
+
+def test_insurance_takes_the_newest_live_read_not_a_retired_or_older_one(journey) -> None:
+    """Confirmed live 2026-10-27: one policy read three times. The first page was
+    merged into a combined document (retired) and read the MISP contact number as
+    the agent code; the combined document repeated it; a later re-upload read the
+    code correctly. The Insurance card showed the retired page's value because ties
+    were broken by document id. Retired pages no longer count; the newest live read wins."""
+    c = journey
+    tenant_id, journey_id = c.tenant_id, c.journey_id
+    retired, older, newest = uuid4(), uuid4(), uuid4()
+    batch = c.execute(
+        text("INSERT INTO auditcore.p2_upload_batches (tenant_id, journey_id, original_filename, size_bytes, "
+             "original_object_key, uploaded_by_actor_id) VALUES (:t, :j, 'p.pdf', 1, 'k', 'pc') RETURNING batch_id"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
+    for page, (doc, status, retired_at, minutes_ago) in enumerate(
+        ((retired, "MERGED", "now()", 120), (older, "READY", "NULL", 90), (newest, "READY", "NULL", 10)), start=1,
+    ):
+        c.execute(
+            text("INSERT INTO auditcore.p2_document_queue (tenant_id, batch_id, journey_id, page_number, page_sha256, "
+                 "page_object_key, client_upload_id, di_document_id, queue_status, retired_at_utc, created_at_utc, "
+                 f"di_processed_seen_at_utc) VALUES (:t, :b, :j, :p, :sha, 'k', :cu, :d, :s, {retired_at}, "
+                 "now() - make_interval(mins => :m), now() - make_interval(mins => :m))"),
+            {"t": tenant_id, "b": batch, "j": journey_id, "p": page, "sha": uuid4().hex, "cu": f"cu-{uuid4().hex}",
+             "d": doc, "s": status, "m": minutes_ago},
+        )
+
+    def cover(doc_id, code: str, insurer: str) -> ReviewV2Document:
+        return ReviewV2Document(
+            documentId=doc_id, label="Insurance Cover", documentTypeKey="insurance_cover",
+            originalFilename="insurance.pdf", processingStatus="PROCESSED", extractionState="READY",
+            fields=[_field("agent_intermediary_code", code, confidence=92.0), _field("insurer_name", insurer, confidence=92.0)],
+        )
+
+    # Listed in the order that used to pick the retired page first.
+    documents = [cover(retired, "7873999100", "Future Generali India Insurance Co. Ltd."),
+                 cover(older, "7873999100", "Future Generali India Insurance Co. Ltd."),
+                 cover(newest, "MIBL/M&M/AAECA5786A/000", "Generali Central Insurance Company Limited")]
+    materialize_reviewed_di_business_values(c, tenant_id=tenant_id, journey_id=journey_id, documents=documents,
+                                            rejected_review_keys=set(), actor_id="tester")
+    row = c.execute(
+        text("SELECT agent_intermediary_code, insurer_name FROM auditcore.insurance_records "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one()
+    assert (row["agent_intermediary_code"], row["insurer_name"]) == (
+        "MIBL/M&M/AAECA5786A/000", "Generali Central Insurance Company Limited")

@@ -136,6 +136,7 @@ def _field_candidates(
     keys = {key.casefold() for key in field_keys}
     priorities = {key.casefold(): index for index, key in enumerate(source_priority)}
     candidates: list[tuple[Any, Any]] = []
+    position = {id(document): index for index, document in enumerate(documents)}
     for document in _ready_documents(documents):
         document_type = str(getattr(document, "documentTypeKey", "") or "").strip().casefold()
         if document_types is not None and document_type not in document_types:
@@ -147,19 +148,58 @@ def _field_candidates(
                 continue
             candidates.append((document, field))
 
-    def sort_key(item: tuple[Any, Any]) -> tuple[int, float, str, str]:
+    def sort_key(item: tuple[Any, Any]) -> tuple[int, float, int, str]:
         document, field = item
         document_type = str(getattr(document, "documentTypeKey", "") or "").strip().casefold()
         confidence = getattr(field, "confidenceScore", None)
         confidence_value = float(confidence) if confidence is not None else -1.0
+        # Same type, same confidence: the order the documents came in, which
+        # live_documents_newest_first() makes the newest read first (2026-10-27:
+        # ordering by document id let an older, wrong read of the same policy win).
         return (
             priorities.get(document_type, len(priorities)),
             -confidence_value,
-            str(getattr(document, "documentId", "")),
+            position.get(id(document), len(position)),
             str(getattr(field, "fieldKey", "")),
         )
 
     return sorted(candidates, key=sort_key)
+
+
+_RETIRED_QUEUE_STATUSES = ("MERGED", "CANCELLED")
+
+
+def live_documents_newest_first(connection: Connection, *, tenant_id: str, documents: list[Any]) -> list[Any]:
+    """Only documents still live on the Journey, the newest read first (2026-10-27).
+
+    A page that was merged into a combined document, cancelled or retired no
+    longer speaks for the Journey, even though DI still holds its reading:
+    confirmed live, a retired fragment's misread agent code (the MISP contact
+    number) won over the correct, later reading of the same policy. Documents
+    Audit Core has no page row for (older capture paths) are kept as they are,
+    after the dated ones."""
+    ids = [str(getattr(d, "documentId", "") or "") for d in documents]
+    ids = [i for i in ids if i]
+    if not ids:
+        return list(documents)
+    rows = {str(r["di_document_id"]): r for r in connection.execute(
+        text(
+            """
+            SELECT di_document_id,
+                   bool_or(retired_at_utc IS NULL AND queue_status NOT IN ('MERGED','CANCELLED')) AS live,
+                   max(COALESCE(di_processed_seen_at_utc, updated_at_utc, created_at_utc)) AS read_at
+            FROM auditcore.p2_document_queue
+            WHERE tenant_id = :t AND di_document_id = ANY(CAST(:ids AS uuid[]))
+            GROUP BY di_document_id
+            """
+        ),
+        {"t": tenant_id, "ids": ids},
+    ).mappings().all()}
+    kept = [d for d in documents if rows.get(str(getattr(d, "documentId", "")), {"live": True})["live"]]
+    dated = [d for d in kept if str(getattr(d, "documentId", "")) in rows]
+    undated = [d for d in kept if str(getattr(d, "documentId", "")) not in rows]
+    dated.sort(key=lambda d: rows[str(getattr(d, "documentId", ""))]["read_at"], reverse=True)
+    return dated + undated
 
 
 def _best_field(
@@ -315,6 +355,7 @@ def materialize_delivery_date(
     sync keeps it live if the field is later corrected in review, matching
     this pipeline's own "always-live, never-frozen" philosophy elsewhere.
     """
+    documents = live_documents_newest_first(connection, tenant_id=tenant_id, documents=documents)
 
     pair = _best_field(
         documents, ("delivery_date",), document_types={_GATE_PASS_DOCUMENT_TYPE}
@@ -409,6 +450,7 @@ def materialize_delivery_vehicle(
     documents: list[Any],
 ) -> int:
     """Fill missing canonical vehicle identifiers from reviewed Delivery evidence."""
+    documents = live_documents_newest_first(connection, tenant_id=tenant_id, documents=documents)
 
     selected = {
         "vin": _best_field(
@@ -518,6 +560,7 @@ def materialize_delivery_registration(
     PC to type State/District in by hand even when the document already
     states them.
     """
+    documents = live_documents_newest_first(connection, tenant_id=tenant_id, documents=documents)
 
     values: dict[str, Any] = {}
     document_for_field: dict[str, Any] = {}
@@ -717,6 +760,7 @@ def materialize_delivery_finance(
     purchase" (see the Finance tab's own empty-state copy), not something to
     default a row for.
     """
+    documents = live_documents_newest_first(connection, tenant_id=tenant_id, documents=documents)
 
     provider_pair = _best_field(documents, _FINANCED_BY_FIELD_KEYS)
     provider_name = _text(getattr(provider_pair[1], "value", None)) if provider_pair is not None else None
@@ -918,6 +962,7 @@ def materialize_delivery_insurance(
     documents: list[Any],
 ) -> int:
     """Fill canonical insurance facts from the explicit DI insurance_cover schema."""
+    documents = live_documents_newest_first(connection, tenant_id=tenant_id, documents=documents)
 
     insurance_documents = {
         _INSURANCE_DOCUMENT_TYPE,
@@ -1054,6 +1099,7 @@ def materialize_delivery_commercial_lines(
     UC03 source priority ranks it ahead of the existing source.  This prevents a
     random Delivery upload from overwriting a stronger reviewed Booking source.
     """
+    documents = live_documents_newest_first(connection, tenant_id=tenant_id, documents=documents)
 
     written = 0
     ready = _ready_documents(documents)
@@ -1152,6 +1198,7 @@ def materialize_delivery_receipts(
     actor_id: str,
 ) -> dict[str, int]:
     """Persist reviewed Delivery receipts and additive canonical Payment rows."""
+    documents = live_documents_newest_first(connection, tenant_id=tenant_id, documents=documents)
 
     receipt_documents = [
         document
