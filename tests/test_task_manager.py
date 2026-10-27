@@ -415,3 +415,27 @@ def test_http_routes_and_role_gates(project):
         user_id="x", bearer_token="t",
         admin_context=SecurityAdminContext(user_id="x", is_super_admin=False, admin_scopes=()))
     assert client.get(f"{admin}/tasks").status_code == 403
+
+
+def test_gate_pass_days_sunday_is_off():
+    saturday, sunday, monday = MONDAY - timedelta(days=2), MONDAY - timedelta(days=1), MONDAY
+    assert tm.next_gate_pass_day(saturday) == monday and tm.previous_gate_pass_day(monday) == saturday
+    assert tm.gate_pass_covers(monday) == [sunday, monday] and tm.gate_pass_covers(saturday) == [saturday]
+    assert tm.gate_pass_day_label(monday) == "Sun 1 + Mon 2 Nov"
+    assert tm.gate_pass_day_label(date(2026, 10, 26)) == "Sun 25 + Mon 26 Oct"
+    assert tm.gate_pass_day_label(saturday) == "Sat 31 Oct"
+    # Saturday's extra day would be Sunday: it runs to Monday night instead.
+    assert tm.gate_pass_due(saturday) == _at(monday, 23, 59) + timedelta(seconds=59)
+
+
+def test_monday_gate_pass_task_names_both_days(project):
+    p = project
+    with _db(p) as c:
+        tm.ensure_system_schedules(c, tenant_id=p.tenant, now=_at(MONDAY, 7, 0))
+        c.execute(text("UPDATE auditcore.p2_task_schedules SET starts_on = :d WHERE tenant_id = :t"),
+                  {"d": MONDAY, "t": p.tenant})
+        tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY, 7, 5))
+        [task] = tm.list_tasks(c, tenant_id=p.tenant, caller=_caller(p, "PC2"), view="mine")["items"]
+    assert task["title"].startswith("Gate pass for Sun 1 + Mon 2 Nov: ")
+    assert "one photo of the gate pass for both days" in task["description"]
+    assert task["reference"]["coversDates"] == ["2026-11-01", "2026-11-02"]

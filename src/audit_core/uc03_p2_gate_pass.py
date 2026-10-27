@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import calendar as _calendar
 import json
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
@@ -40,7 +40,13 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.task_manager import _insert_task as insert_task_manager_task
-from audit_core.task_manager import close_gate_pass_tasks
+from audit_core.task_manager import (
+    close_gate_pass_tasks,
+    gate_pass_covers,
+    gate_pass_day_label,
+    gate_pass_due,
+    previous_gate_pass_day,
+)
 from audit_core.uc03_p2_access import authorize_p2
 from audit_core.uc03_p2_object_keys import ist_day, safe_filename, safe_part
 from audit_core.uc03_p2_storage import P2DocumentStorageError, get_p2_document_storage
@@ -106,8 +112,29 @@ def _public_outlet(outlet: dict[str, Any], *, default_id: str | None = None) -> 
     }
 
 
+def gate_pass_days(now: datetime | None = None) -> dict[str, Any]:
+    """The days a gate pass can be uploaded for now: today's (none on a
+    Sunday, the off day: Sunday goes with Monday) and the previous gate pass
+    day's, which stays open until 23:59 of the next gate pass day."""
+    today = ist_day(now).date()
+    current = None if today.isoweekday() == 7 else today
+    previous = previous_gate_pass_day(today) if current else today - timedelta(days=1)
+    if (now or datetime.now(UTC)) > gate_pass_due(previous):
+        previous = None
+    return {"today": today, "current": current, "previous": previous}
+
+
+def _day_info(day: date | None) -> dict[str, Any] | None:
+    if day is None:
+        return None
+    return {"date": day.isoformat(), "label": gate_pass_day_label(day),
+            "coversDates": [d.isoformat() for d in gate_pass_covers(day)],
+            "dueAtUtc": gate_pass_due(day).isoformat()}
+
+
 def delivery_file_count(connection: Connection, tenant_id: str, outlet_id: UUID | str, day: date) -> int:
-    """Journeys of the outlet with a Delivery-stage page uploaded on ``day`` (IST)."""
+    """Journeys of the outlet with a Delivery-stage page uploaded on the days
+    the gate pass of ``day`` covers (IST): Monday's counts Sunday's too."""
     return int(connection.execute(
         text(
             """
@@ -116,10 +143,10 @@ def delivery_file_count(connection: Connection, tenant_id: str, outlet_id: UUID 
             JOIN auditcore.journeys j ON j.tenant_id = q.tenant_id AND j.journey_id = q.journey_id
             WHERE q.tenant_id = :tenant_id AND j.outlet_id = :outlet_id
               AND q.business_stage = 'DELIVERY' AND q.queue_status <> 'CANCELLED'
-              AND (q.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date = :day
+              AND (q.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date BETWEEN :first AND :day
             """
         ),
-        {"tenant_id": tenant_id, "outlet_id": str(outlet_id), "day": day},
+        {"tenant_id": tenant_id, "outlet_id": str(outlet_id), "day": day, "first": gate_pass_covers(day)[0]},
     ).scalar_one() or 0)
 
 
@@ -137,6 +164,8 @@ def _public_gate_pass(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "gatePassId": str(row["gate_pass_id"]), "outletId": str(row["outlet_id"]), "outletName": row["outlet_name"],
         "pcName": row["pc_name"], "businessDate": row["business_date"].isoformat(), "status": row["status"],
+        "dayLabel": gate_pass_day_label(row["business_date"]),
+        "coversDates": [d.isoformat() for d in gate_pass_covers(row["business_date"])],
         "newDeliveries": row["new_deliveries"], "stockTransfers": row["stock_transfers"],
         "testDrives": row["test_drives"], "otherCount": row["other_count"], "otherNote": row["other_note"],
         "deliveryFiles": row["delivery_files"], "divergence": row["divergence"],
@@ -162,14 +191,28 @@ def gate_pass_outlets(
     client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    """The outlets the caller may upload for, the mapped ONSITE outlet first and marked as the default."""
+    """The outlets the caller may upload for, the mapped ONSITE outlet first and marked as the default,
+    and the days a gate pass can be uploaded for. ``previousOpenOutletIds``: outlets whose gate pass of
+    the previous day is not finished yet, so the screen asks which day the photo is for."""
     _authorize(connection, tenant_id, principal, client, _UPDATE)
     outlets = scope_outlets(connection, tenant_id, principal.subject)
     onsite = [o for o in outlets if o["outlet_classification"] == "ONSITE"]
     default = (onsite or outlets or [None])[0]
     default_id = str(default["outlet_id"]) if default else None
+    days = gate_pass_days()
+    previous_open: list[str] = []
+    if days["previous"] is not None and outlets:
+        done = {str(r) for r in connection.execute(
+            text("SELECT outlet_id FROM auditcore.p2_gate_passes WHERE tenant_id = :t AND business_date = :d "
+                 "AND status = 'ACTIVE' AND completed_at_utc IS NOT NULL AND outlet_id = ANY(CAST(:ids AS uuid[]))"),
+            {"t": tenant_id, "d": days["previous"], "ids": [str(o["outlet_id"]) for o in outlets]},
+        ).scalars().all()}
+        previous_open = [str(o["outlet_id"]) for o in outlets if str(o["outlet_id"]) not in done]
     return {
-        "businessDate": ist_day().date().isoformat(),
+        "businessDate": (days["current"] or days["previous"] or days["today"]).isoformat(),
+        "today": _day_info(days["current"]),
+        "previous": _day_info(days["previous"]),
+        "previousOpenOutletIds": previous_open,
         "outlets": [_public_outlet(o, default_id=default_id) for o in outlets],
         "defaultOutletId": default_id,
     }
@@ -184,15 +227,25 @@ def upload_gate_pass(
     outletId: Annotated[UUID, Form()],
     file: Annotated[UploadFile, File()],
     pcName: Annotated[str | None, Form()] = None,
+    businessDate: Annotated[date | None, Form()] = None,
 ) -> dict[str, Any]:
     _authorize(connection, tenant_id, principal, client, _UPDATE)
     outlet = _outlet_in_scope(scope_outlets(connection, tenant_id, principal.subject), outletId)
+    days = gate_pass_days()
+    allowed = [d for d in (days["current"], days["previous"]) if d is not None]
+    business_date = businessDate or (days["current"] or days["previous"])
+    if business_date not in allowed:
+        if days["current"] is None and businessDate == days["today"]:
+            raise HTTPException(status_code=422, detail="Sunday is the off day: upload Sunday's gate pass with "
+                                                        "Monday's, one photo for both days.")
+        raise HTTPException(status_code=422, detail="A gate pass can be uploaded only for "
+                                                    + " or ".join(gate_pass_day_label(d) for d in allowed) + ".")
     data = file.file.read(MAX_BYTES + 1)
     assessment = assess_gate_pass_image(data)
     if not assessment.ok:
         raise HTTPException(status_code=422, detail=assessment.message)
 
-    day = ist_day()
+    day = datetime.combine(business_date, datetime.min.time())
     pc_name = (pcName or "").strip() or principal.subject
     gate_pass_id = uuid4()
     label = f"{safe_part(outlet['outlet_name'], fallback='outlet')}__{safe_part(pc_name, fallback='pc')}__{day:%d-%m-%y}"
@@ -289,8 +342,8 @@ class AnswerCommand(BaseModel):
 def _raise_delivery_not_notified(connection: Connection, tenant_id: str, row: dict[str, Any], actor_id: str) -> None:
     missing = int(row["new_deliveries"] or 0) - int(row["delivery_files"] or 0)
     day = row["business_date"]
-    title = f"Delivery not notified to the PC: {row['outlet_name']}, {day:%d-%m-%y}"
-    description = (f"The gate pass of {row['outlet_name']} for {day:%d-%m-%y} lists {row['new_deliveries']} new "
+    title = f"Delivery not notified to the PC: {row['outlet_name']}, {gate_pass_day_label(day)}"
+    description = (f"The gate pass of {row['outlet_name']} for {gate_pass_day_label(day)} lists {row['new_deliveries']} new "
                    f"deliveries, but only {row['delivery_files']} Delivery files were uploaded. "
                    f"{row['pc_name']} says the {missing} other {'delivery was' if missing == 1 else 'deliveries were'} "
                    f"not notified to them and they hold no files for it.")
@@ -412,7 +465,8 @@ def gate_pass_calendar(
             GROUP BY 1, 2
             """
         ),
-        {"t": tenant_id, "ids": ids, "a": first, "b": last},
+        # The Sunday before the 1st belongs to a Monday the 1st.
+        {"t": tenant_id, "ids": ids, "a": gate_pass_covers(first)[0], "b": last},
     ).mappings().all()
     per_day: dict[date, dict[str, Any]] = {}
 
@@ -422,7 +476,11 @@ def gate_pass_calendar(
 
     per_outlet: dict[tuple[date, str], dict[str, int]] = {}
     for r in uploaded_rows:
-        per_outlet.setdefault((r["day"], str(r["outlet_id"])), {"declared": 0, "uploaded": 0})["uploaded"] += int(r["files"])
+        # Sunday's delivery files are compared with Monday's gate pass, which covers both days.
+        day = r["day"] + timedelta(days=1) if r["day"].isoweekday() == 7 else r["day"]
+        if not first <= day <= last:
+            continue
+        per_outlet.setdefault((day, str(r["outlet_id"])), {"declared": 0, "uploaded": 0})["uploaded"] += int(r["files"])
     gate_pass_ids: dict[date, str] = {}
     for r in declared_rows:
         per_outlet.setdefault((r["business_date"], str(r["outlet_id"])), {"declared": 0, "uploaded": 0})["declared"] += int(r["new_deliveries"] or 0)

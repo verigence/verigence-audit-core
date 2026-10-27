@@ -1063,6 +1063,41 @@ def occurs_on(schedule: dict[str, Any], day: date) -> bool:
                    _monthly_date(previous.year, previous.month, month_day)}
 
 
+# --------------------------------------------------------------------------- gate pass days
+# Sunday is the off day (product owner 2026-10-27): there is no gate pass of
+# Sunday; Monday's gate pass covers Sunday and Monday, one photo for both, and
+# the day after a Saturday is Monday.
+
+
+def previous_gate_pass_day(day: date) -> date:
+    before = day - timedelta(days=1)
+    return before - timedelta(days=1) if before.isoweekday() == 7 else before
+
+
+def next_gate_pass_day(day: date) -> date:
+    after = day + timedelta(days=1)
+    return after + timedelta(days=1) if after.isoweekday() == 7 else after
+
+
+def gate_pass_covers(day: date) -> list[date]:
+    """The days a gate pass of ``day`` covers: Monday's covers Sunday too."""
+    return [day - timedelta(days=1), day] if day.isoweekday() == 1 else [day]
+
+
+def gate_pass_day_label(day: date) -> str:
+    """'Tue 27 Oct', or 'Sun 1 + Mon 2 Nov' for a Monday."""
+    if day.isoweekday() == 1:
+        sunday = day - timedelta(days=1)
+        first = f"Sun {sunday.day}" + ("" if sunday.month == day.month else f" {sunday:%b}")
+        return f"{first} + Mon {day.day} {day:%b}"
+    return f"{day:%a} {day.day} {day:%b}"
+
+
+def gate_pass_due(day: date) -> datetime:
+    """The end of the next gate pass day (a Saturday's runs to Monday night)."""
+    return _ist_at(next_gate_pass_day(day), time(23, 59, 59))
+
+
 def _ist_at(day: date, at: time) -> datetime:
     return datetime.combine(day, at, tzinfo=IST).astimezone(UTC)
 
@@ -1129,12 +1164,17 @@ def generate_occurrence(connection: Connection, *, tenant_id: str, schedule: dic
         )
         if gate_pass:
             protocol, reviewer_role = "SYSTEM_VERIFIED", None
-            due = _ist_at(day + timedelta(days=1), time(23, 59, 59))
-            title = f"Daily gate pass: {who['outlet']['outlet_name']}, {day:%d-%m-%y}"
+            due = gate_pass_due(day)
+            label = gate_pass_day_label(day)
+            outlet_name = who['outlet']['outlet_name']
+            title = f"Gate pass for {label}: {outlet_name}"
+            covers = (f"{label} (Sunday is off, so one photo of the gate pass for both days, with the counts of "
+                      "both days together)" if day.isoweekday() == 1 else label)
+            deadline = gate_pass_day_label(next_gate_pass_day(day)).split(" + ")[-1]
             description = (
-                f"Photograph the gate pass of {who['outlet']['outlet_name']} for {day:%d-%m-%Y} and enter its "
-                "counts on the Daily Gate Pass screen. The system closes this task when the gate pass is "
-                "finished; if it is not finished by 23:59 tomorrow it is marked incomplete."
+                f"Photograph the gate pass of {outlet_name} for {covers} and enter its counts on the Daily Gate "
+                "Pass screen. The system closes this task when the gate pass is finished; if it is not finished "
+                f"by 23:59 on {deadline} it is marked incomplete."
             )
         else:
             protocol, reviewer_role = _reviewer_for_recurring(connection, tenant_id=tenant_id,
@@ -1151,8 +1191,10 @@ def generate_occurrence(connection: Connection, *, tenant_id: str, schedule: dic
             "origin": "SYSTEM", "source_type": "SCHEDULE", "source_code": schedule_id,
             "dedupe_key": f"sched:{schedule_id}:{day.isoformat()}:{who['key']}",
             "title": title, "description": description, "priority": schedule["priority"],
-            "reference": {"outletName": outlet["outlet_name"], "businessDate": day.isoformat()} if outlet
-                         else {"occurrenceDate": day.isoformat()},
+            "reference": ({"outletName": outlet["outlet_name"], "businessDate": day.isoformat(),
+                           **({"gatePassFor": gate_pass_day_label(day),
+                               "coversDates": [d.isoformat() for d in gate_pass_covers(day)]} if gate_pass else {})}
+                          if outlet else {"occurrenceDate": day.isoformat()}),
             "assigned_role": who["role"], "assigned_actor": who["actor"], "assigned_name": who["name"],
             "raised_by": schedule["created_by_actor_id"], "raised_role": schedule["created_by_role_code"],
             "raised_name": schedule["created_by_display_name"],
