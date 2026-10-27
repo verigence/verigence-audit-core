@@ -7,6 +7,7 @@ here runs as a batch. Time on Verigence comes from the browser's own tally
 """
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
@@ -214,15 +215,16 @@ def record_activity(connection: Connection, *, tenant_id: str, caller: Caller, p
         start, end = _bounds(day)
         return at if start <= at < end + timedelta(minutes=5) and at <= now + timedelta(minutes=5) else None
 
+    sessions = clean_sessions(payload.get("sessions"), day=day, now=now)
     connection.execute(
         text("""
             INSERT INTO auditcore.p2_user_activity_daily (
               tenant_id, actor_id, activity_date, client_kind, role_code, display_name,
               active_seconds, idle_seconds, background_seconds, hourly_active_minutes,
-              first_active_at_utc, last_active_at_utc
+              first_active_at_utc, last_active_at_utc, sessions
             ) VALUES (
               :t, :a, :d, :client, :role, :name, :active, :idle, :background, CAST(:hourly AS smallint[]),
-              :first, :last
+              :first, :last, CAST(:sessions AS jsonb)
             )
             ON CONFLICT (tenant_id, actor_id, activity_date, client_kind) DO UPDATE SET
               role_code = COALESCE(EXCLUDED.role_code, auditcore.p2_user_activity_daily.role_code),
@@ -239,15 +241,68 @@ def record_activity(connection: Connection, *, tenant_id: str, caller: Caller, p
                                           EXCLUDED.first_active_at_utc),
               last_active_at_utc = GREATEST(auditcore.p2_user_activity_daily.last_active_at_utc,
                                             EXCLUDED.last_active_at_utc),
+              sessions = CAST(:merged AS jsonb),
               updated_at_utc = now()
         """),
         {"t": tenant_id, "a": caller.actor_id, "d": day, "client": client, "role": caller.role,
          "name": (str(payload.get("displayName") or "").strip()[:200] or caller.display_name or None),
          "active": seconds("activeSeconds"), "idle": seconds("idleSeconds"),
          "background": seconds("backgroundSeconds"), "hourly": hourly,
-         "first": stamp("firstActiveAt"), "last": stamp("lastActiveAt")},
+         "first": stamp("firstActiveAt"), "last": stamp("lastActiveAt"),
+         "sessions": json.dumps(sessions),
+         "merged": json.dumps(merge_sessions(_stored_sessions(connection, tenant_id=tenant_id, actor_id=caller.actor_id,
+                                                              day=day, client=client), sessions))},
     )
     return True
+
+
+MAX_SESSIONS_PER_DAY = 100
+
+
+def clean_sessions(raw: Any, *, day: date, now: datetime) -> list[dict[str, Any]]:
+    """The browser's sessions of the day, kept only when they make sense:
+    inside the day, start before end, not in the future."""
+    start_of_day, end_of_day = _bounds(day)
+    out: list[dict[str, Any]] = []
+    for item in list(raw or [])[:MAX_SESSIONS_PER_DAY]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = datetime.fromisoformat(str(item.get("start")))
+            end = datetime.fromisoformat(str(item.get("end")))
+        except ValueError:
+            continue
+        if start.tzinfo is None or end.tzinfo is None or end < start:
+            continue
+        if not (start_of_day - timedelta(minutes=5) <= start < end_of_day) or end > now + timedelta(minutes=5):
+            continue
+        active = max(0, min(int(item.get("activeSeconds") or 0), int((end - start).total_seconds()) + 60))
+        out.append({"start": start.astimezone(UTC).isoformat(), "end": end.astimezone(UTC).isoformat(),
+                    "activeSeconds": active})
+    return out
+
+
+def merge_sessions(old: list[dict[str, Any]], new: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sessions are keyed by their start; a later send only ever lengthens one."""
+    merged: dict[str, dict[str, Any]] = {str(s["start"]): dict(s) for s in old if s.get("start")}
+    for item in new:
+        current = merged.get(item["start"])
+        if current is None:
+            merged[item["start"]] = dict(item)
+        else:
+            current["end"] = max(str(current.get("end") or ""), item["end"])
+            current["activeSeconds"] = max(int(current.get("activeSeconds") or 0), item["activeSeconds"])
+    return sorted(merged.values(), key=lambda s: s["start"])[:MAX_SESSIONS_PER_DAY]
+
+
+def _stored_sessions(connection: Connection, *, tenant_id: str, actor_id: str, day: date,
+                     client: str) -> list[dict[str, Any]]:
+    value = connection.execute(
+        text("SELECT sessions FROM auditcore.p2_user_activity_daily WHERE tenant_id = :t AND actor_id = :a "
+             "AND activity_date = :d AND client_kind = :c FOR UPDATE"),
+        {"t": tenant_id, "a": actor_id, "d": day, "c": client},
+    ).scalar_one_or_none()
+    return list(value or [])
 
 
 # --------------------------------------------------------------------------- employee utilisation

@@ -27,6 +27,8 @@ from audit_core.dependencies import (
     get_human_principal,
     require_super_admin_request,
 )
+from audit_core.di_dashboard import build_di_dashboard
+from audit_core.engagement_reports import build_engagement
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
@@ -166,6 +168,7 @@ class ActivityCommand(BaseModel):
     hourlyActiveMinutes: list[int] = Field(default_factory=list, max_length=24)
     firstActiveAt: str | None = None
     lastActiveAt: str | None = None
+    sessions: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
 
 
 # --------------------------------------------------------------------------- shared handlers
@@ -297,6 +300,43 @@ def employee_utilisation(tenant_id: str, principal: Principal, client: Client, c
     return _utilisation(connection, tenant_id=tenant_id, caller=caller, start=start, end=end)
 
 
+def _engagement(connection: Connection, *, tenant_id: str, caller: Caller, start: date | None, end: date | None,
+                period: str) -> dict[str, Any]:
+    if not utilisation_allowed(caller):
+        raise HTTPException(status_code=403, detail="Only an Executive or Superadmin can see engagement.")
+    end = end or ist_today()
+    start = start or end
+    return _run(lambda: build_engagement(connection, tenant_id=tenant_id, start_day=start, end_day=end, period=period))
+
+
+def _di_dashboard(connection: Connection, *, tenant_id: str, caller: Caller, start: date | None,
+                  end: date | None) -> dict[str, Any]:
+    if not utilisation_allowed(caller):
+        raise HTTPException(status_code=403, detail="Only an Executive or Superadmin can see the DI dashboard.")
+    end = end or ist_today()
+    start = start or end
+    return _run(lambda: build_di_dashboard(connection, tenant_id=tenant_id, start_day=start, end_day=end))
+
+
+Period = Annotated[str, Query(pattern="^(day|week|month)$")]
+From = Annotated[date | None, Query(alias="from")]
+To = Annotated[date | None, Query(alias="to")]
+
+
+@router.get("/reports/engagement")
+def engagement(tenant_id: str, principal: Principal, client: Client, connection: Db,
+               start: From = None, end: To = None, period: Period = "day") -> dict[str, Any]:
+    caller = _project_caller(connection, tenant_id=tenant_id, principal=principal, client=client)
+    return _engagement(connection, tenant_id=tenant_id, caller=caller, start=start, end=end, period=period)
+
+
+@router.get("/reports/di-dashboard")
+def di_dashboard(tenant_id: str, principal: Principal, client: Client, connection: Db,
+                 start: From = None, end: To = None) -> dict[str, Any]:
+    caller = _project_caller(connection, tenant_id=tenant_id, principal=principal, client=client)
+    return _di_dashboard(connection, tenant_id=tenant_id, caller=caller, start=start, end=end)
+
+
 @router.post("/activity", status_code=202)
 def activity(tenant_id: str, command: ActivityCommand, principal: Principal, client: Client,
              connection: Db) -> dict[str, Any]:
@@ -392,6 +432,20 @@ def admin_utilisation(tenant_id: str, admin: Admin, connection: Db,
                       end: Annotated[date | None, Query(alias="to")] = None) -> dict[str, Any]:
     caller = _admin_caller(connection, tenant_id=tenant_id, admin=admin)
     return _utilisation(connection, tenant_id=tenant_id, caller=caller, start=start, end=end)
+
+
+@admin_router.get("/engagement")
+def admin_engagement(tenant_id: str, admin: Admin, connection: Db, start: From = None, end: To = None,
+                     period: Period = "day") -> dict[str, Any]:
+    caller = _admin_caller(connection, tenant_id=tenant_id, admin=admin)
+    return _engagement(connection, tenant_id=tenant_id, caller=caller, start=start, end=end, period=period)
+
+
+@admin_router.get("/di-dashboard")
+def admin_di_dashboard(tenant_id: str, admin: Admin, connection: Db, start: From = None,
+                       end: To = None) -> dict[str, Any]:
+    caller = _admin_caller(connection, tenant_id=tenant_id, admin=admin)
+    return _di_dashboard(connection, tenant_id=tenant_id, caller=caller, start=start, end=end)
 
 
 __all__ = ["admin_router", "router"]
