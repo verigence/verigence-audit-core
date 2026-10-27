@@ -1358,6 +1358,23 @@ def _named_documents(connection: Connection, *, tenant_id: str, journey_id: UUID
     ]
 
 
+def _gst_trade_names(connection: Connection, *, tenant_id: str, journey_id: UUID, document_id: str | None) -> list[str]:
+    """The trade name the GST certificate prints, if any."""
+    if not document_id:
+        return []
+    return [str(v) for v in connection.execute(
+        text(
+            """
+            SELECT DISTINCT f.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields f
+            WHERE f.tenant_id=:t AND f.journey_id=:j AND f.di_document_id=CAST(:d AS uuid)
+              AND f.field_key IN ('organisation_trade_name', 'trade_name')
+              AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "d": document_id},
+    ).scalars().all() if v and str(v).strip()]
+
+
 def sync_name_consistency_tasks(
     connection: Connection,
     *,
@@ -1433,8 +1450,30 @@ def sync_name_consistency_tasks(
         checked = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
                                    pairs=rules.customer_name_checked)
         checked += [doc for doc in references if doc["documentId"] != kyc["documentId"]]
+        # The customer named by a GST certificate (product owner 2026-10-27):
+        # a document may carry the GSTIN's legal or trade name, or the name of
+        # the person whose KYC is on file (the proprietor / signatory). The
+        # KYC documents are that person's own, so they only have to agree
+        # with each other, not with a firm's name.
+        gst_names: list[str] = []
+        person: dict[str, Any] | None = None
+        if kyc["diType"] == "gst_certificate":
+            gst_names = [str(kyc["name"]), *_gst_trade_names(connection, tenant_id=tenant_id,
+                                                             journey_id=journey_id, document_id=kyc["documentId"])]
+            by_pair = {doc["pair"]: doc for doc in reversed(references)}
+            person = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
+
+        def matches(document: dict[str, Any]) -> bool:
+            if not gst_names:
+                return same_person(document["name"], kyc["name"])
+            if document["pair"] in rules.customer_name_reference:
+                return person is None or document["documentId"] == person["documentId"] or same_person(
+                    document["name"], person["name"])
+            return (any(same_person(document["name"], n) or same_organisation(document["name"], n) for n in gst_names)
+                    or (person is not None and same_person(document["name"], person["name"])))
+
         for document in checked:
-            if same_person(document["name"], kyc["name"]):
+            if matches(document):
                 continue
             template = registry.template_for_di_type(document["diType"], stage=document["stage"])
             raise_task(
@@ -1444,7 +1483,8 @@ def sync_name_consistency_tasks(
                     f"The {template.display_name} is in the name of {display_name(document['name'])}, but the "
                     f"customer per the {kyc_template.display_name} is {display_name(kyc['name'])}. Wrong document "
                     f"uploaded: please delete it and upload the {template.display_name} in the customer's name as "
-                    f"per PAN/Aadhaar. If the name was only misread, correct it on the document instead."
+                    f"per {'the GST certificate' if gst_names else 'PAN/Aadhaar'}. If the name was only misread, "
+                    f"correct it on the document instead."
                 ),
                 reference={"documentName": display_name(document["name"]), "customerName": display_name(kyc["name"]),
                            "referenceDocumentId": kyc["documentId"], "referenceTemplateKey": kyc_template.key},

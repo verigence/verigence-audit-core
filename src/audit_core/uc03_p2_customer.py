@@ -5,9 +5,16 @@ Journey id as its entered name, the placeholder the database recognises
 (migration 0058). Once a PAN card or Aadhaar is read, its name becomes the
 customer's legal name (VERIFIED), and the database replaces the
 placeholder entered name with it.
+
+Product owner 2026-10-27: when a GST certificate with a GSTIN is on file, the
+customer's name is the GSTIN's legal name -- for those customers the PAN is
+often not fully readable (masked) and Aadhaar is optional and personal. Only
+when a GST certificate carrying a GSTIN is uploaded; otherwise the KYC rule
+stands.
 """
 from __future__ import annotations
 
+import re
 from uuid import UUID
 
 from sqlalchemy import Connection, text
@@ -15,8 +22,15 @@ from sqlalchemy import Connection, text
 from audit_core.uc03_p2_names import same_person
 
 _MACHINE_ACTOR = "p2-worker"
-_KYC_NAME_FIELDS = {"pan_card": "pan_name", "aadhaar": "aadhaar_name", "customer_kyc": "customer_name"}
-_KYC_PRECEDENCE = ("pan_card", "aadhaar", "customer_kyc")
+_KYC_NAME_FIELDS = {"pan_card": ("pan_name",), "aadhaar": ("aadhaar_name",), "customer_kyc": ("customer_name",),
+                    "gst_certificate": ("organisation_legal_name", "legal_name")}
+_KYC_PRECEDENCE = ("gst_certificate", "pan_card", "aadhaar", "customer_kyc")
+_GSTIN = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
+
+
+def is_gstin(value: object) -> bool:
+    """A GSTIN as printed: 15 characters, state code, PAN, entity, Z, check."""
+    return bool(_GSTIN.match(re.sub(r"\s", "", str(value or "")).upper()))
 
 
 def sync_customer_name(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str:
@@ -36,7 +50,7 @@ def sync_customer_name(connection: Connection, *, tenant_id: str, journey_id: UU
     customer = connection.execute(
         text(
             """
-            SELECT c.customer_id, c.legal_name, c.legal_name_status,
+            SELECT c.customer_id, c.legal_name, c.legal_name_status, c.legal_name_source_evidence_id,
                    COALESCE(e.association_status = 'ACTIVE', false) AS source_on_file
             FROM auditcore.journeys j
             JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
@@ -51,7 +65,7 @@ def sync_customer_name(connection: Connection, *, tenant_id: str, journey_id: UU
     if customer is None:
         return "NO_NAME"
     best: dict[str, dict[str, object]] = {}
-    for row in connection.execute(
+    rows = connection.execute(
         text(
             """
             SELECT e.evidence_id, e.document_type_key, f.field_key, f.effective_value
@@ -60,22 +74,29 @@ def sync_customer_name(connection: Connection, *, tenant_id: str, journey_id: UU
               ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
             WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='ACTIVE'
               AND e.document_type_key = ANY(:types)
-            ORDER BY e.linked_at_utc DESC
+            ORDER BY e.linked_at_utc DESC, f.source_fact_version DESC NULLS LAST, f.updated_at_utc DESC
             """
         ),
         {"t": tenant_id, "j": journey_id, "types": sorted(_KYC_NAME_FIELDS)},
-    ).mappings().all():
+    ).mappings().all()
+    # A GST certificate names the customer only when it carries a GSTIN.
+    with_gstin = {r["evidence_id"] for r in rows if r["field_key"] == "gstin" and is_gstin(r["effective_value"])}
+    for row in rows:
         value = row["effective_value"]
         name = " ".join(str(value).split()) if isinstance(value, str) else ""
         doc_type = str(row["document_type_key"])
-        if _KYC_NAME_FIELDS.get(doc_type) == str(row["field_key"]) and name and doc_type not in best:
+        if doc_type == "gst_certificate" and row["evidence_id"] not in with_gstin:
+            continue
+        if str(row["field_key"]) in _KYC_NAME_FIELDS.get(doc_type, ()) and name and doc_type not in best:
             best[doc_type] = {"name": name, "evidence": row["evidence_id"]}
     kyc = next((best[t] for t in _KYC_PRECEDENCE if t in best), None)
     if kyc is None:
         return "NO_NAME"
     current, status = customer["legal_name"], customer["legal_name_status"]
     if status == "VERIFIED" and current and (
-        current == kyc["name"] or (same_person(current, str(kyc["name"])) and customer["source_on_file"])
+        current == kyc["name"] or (same_person(current, str(kyc["name"])) and customer["source_on_file"]
+                                   and (kyc is not best.get("gst_certificate")
+                                        or customer["legal_name_source_evidence_id"] == kyc["evidence"]))
     ):
         return "UNCHANGED"
     connection.execute(

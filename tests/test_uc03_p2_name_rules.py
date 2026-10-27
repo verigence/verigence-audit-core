@@ -191,3 +191,54 @@ def test_the_verified_kyc_name_stays_the_reference_when_another_persons_kyc_arri
     assert task["reference"]["referenceDocumentId"] == str(pan_a)
     assert task["title"] == "Replace the PAN Card: it is not in the customer's name"
     assert "customer per the PAN Card is BISWABHANU BISWAL" in task["description"]
+
+
+def _named(journey):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        outcome = sync_customer_name(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        name = connection.execute(
+            text("SELECT c.legal_name FROM auditcore.journeys j JOIN auditcore.customers c "
+                 "ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id WHERE j.tenant_id=:t AND j.journey_id=:j"),
+            {"t": journey.tenant_id, "j": journey.journey_id}).scalar_one()
+    return outcome, name
+
+
+def test_a_gst_certificate_with_a_gstin_names_the_customer(journey):
+    """Product owner 2026-10-27: with a GSTIN uploaded the customer is named as
+    per the GSTIN (the PAN is often masked, Aadhaar is optional)."""
+    add_ready_document(journey, "pan_card", pan_number="AXXXX1234F", pan_name="AXXXA KXXXR SXXXO")
+    assert _named(journey) == ("VERIFIED", "AXXXA KXXXR SXXXO")
+    add_ready_document(journey, "gst_certificate", gstin="21ARPPS0866A1ZX", organisation_legal_name="ANAYA KUMAR SAHOO",
+                       organisation_trade_name="M/S SHREE KRISHNA TRADERS")
+    assert _named(journey) == ("VERIFIED", "ANAYA KUMAR SAHOO")
+    assert _named(journey) == ("UNCHANGED", "ANAYA KUMAR SAHOO")
+
+
+def test_a_gst_certificate_without_a_gstin_does_not_name_the_customer(journey):
+    add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="BISWABHANU BISWAL")
+    add_ready_document(journey, "gst_certificate", gstin="No", organisation_legal_name="SOME TRADERS")
+    assert _named(journey) == ("VERIFIED", "BISWABHANU BISWAL")
+
+
+def test_a_company_customer_keeps_its_directors_kyc_and_its_trade_name_documents(journey):
+    """The company is the customer; the director's PAN and Aadhaar are not the
+    wrong documents, and a receipt in the director's or the trade name is fine.
+    A document in a third name is still the wrong document."""
+    add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="PRASANA KUMAR SENAPATI")
+    add_ready_document(journey, "aadhaar", aadhaar_name="Prasana Kumar Senapati")
+    add_ready_document(journey, "gst_certificate", gstin="21AAFCJ2048H1ZY",
+                       organisation_legal_name="JAGANNATH POWER AND INFRA PRIVATE LIMITED",
+                       organisation_trade_name="JAGANNATH POWER")
+    assert _named(journey) == ("VERIFIED", "JAGANNATH POWER AND INFRA PRIVATE LIMITED")
+    add_ready_document(journey, "customer_invoice_dms", buyer_name="Jagannath Power and Infra Pvt Ltd",
+                       seller_name="Sarthak Motors", invoice_number="I1")
+    add_ready_document(journey, "dealer_receipt", customer_name="JAGANNATH POWER-R270909255",
+                       dealer_name="Sarthak Motors", amount_paid="21000")
+    add_ready_document(journey, "booking_form", customer_name="Prasana Kumar Senapati", dealer_name="Sarthak Motors")
+    assert _sync(journey) == {}
+    other = add_ready_document(journey, "insurance_cover", insured_name="RAMAKANTA SAHOO")
+    assert _sync(journey) == {"RAISED": 1}
+    (task,) = _tasks(journey)
+    assert task["reference"]["documentId"] == str(other)
+    assert "as per the GST certificate" in task["description"]
