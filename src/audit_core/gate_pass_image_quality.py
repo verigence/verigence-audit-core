@@ -1,7 +1,12 @@
 """Is a photographed gate pass good enough to keep? (2026-10-26)
 
 The gate pass is hand written and photographed, so the check is about the
-photo: large enough to read, in focus, and neither too dark nor washed out.
+photo: in focus (not blurred, crisp handwriting) and clear (neither too dark
+nor washed out). Product owner 2026-10-27: no hard rules at the camera. Any
+photo that can be read as an image is kept; blur and clarity are judged here
+and recorded as a quality flag the PC is told about and the TL sees. Only an
+empty, oversized or unreadable file is refused. There is no minimum size (it
+refused good phone photos such as 1087 x 2400).
 It runs on the server, so the website and the mobile app get the same answer.
 
 Sharpness is the spread (variance) of a Laplacian-filtered grey copy, scaled to
@@ -45,6 +50,9 @@ class ImageAssessment:
     height: int
     sharpness: float
     brightness: float
+    # GOOD, BLURRED, TOO_DARK or WASHED_OUT; a flag, never a refusal.
+    quality: str = "GOOD"
+    quality_message: str | None = None
 
 
 def _refuse(code: str, message: str, *, width: int = 0, height: int = 0, sharpness: float = 0.0,
@@ -74,8 +82,6 @@ def tile_sharpness(gray: Image.Image) -> float:
 
 
 def assess_gate_pass_image(data: bytes) -> ImageAssessment:
-    min_long = int(_setting("GATE_PASS_MIN_LONG_SIDE", 1600))
-    min_short = int(_setting("GATE_PASS_MIN_SHORT_SIDE", 1200))
     min_sharp = _setting("GATE_PASS_MIN_SHARPNESS", 150.0)
     dark, bright = _setting("GATE_PASS_MIN_BRIGHTNESS", 50.0), _setting("GATE_PASS_MAX_BRIGHTNESS", 240.0)
     if not data:
@@ -92,26 +98,18 @@ def assess_gate_pass_image(data: bytes) -> ImageAssessment:
         return _refuse("GATE_PASS_IMAGE_FORMAT", "Upload the gate pass as a JPEG or PNG photo.")
     image = ImageOps.exif_transpose(image)
     width, height = image.size
-    long_side, short_side = max(width, height), min(width, height)
-    if long_side < min_long or short_side < min_short:
-        return _refuse(
-            "GATE_PASS_IMAGE_LOW_RESOLUTION",
-            f"The photo is too small ({width} x {height}). Take it closer, at the camera's full resolution; "
-            f"at least {min_long} x {min_short} is needed so the handwriting can be read.",
-            width=width, height=height,
-        )
     gray = image.convert("L")
     brightness = float(ImageStat.Stat(gray).mean[0])
     sharpness = round(tile_sharpness(gray), 2)
-    if brightness < dark:
-        return _refuse("GATE_PASS_IMAGE_TOO_DARK", "The photo is too dark. Take it in better light.",
-                       width=width, height=height, sharpness=sharpness, brightness=brightness)
-    if brightness > bright:
-        return _refuse("GATE_PASS_IMAGE_TOO_BRIGHT", "The photo is washed out. Avoid glare and direct light on the paper.",
-                       width=width, height=height, sharpness=sharpness, brightness=brightness)
+    quality, note = "GOOD", None
     if sharpness < min_sharp:
-        return _refuse("GATE_PASS_IMAGE_BLURRED",
-                       "The photo is blurred. Hold the phone steady, let it focus on the paper, and take it again.",
-                       width=width, height=height, sharpness=sharpness, brightness=brightness)
+        quality, note = "BLURRED", ("The photo looks blurred. If the handwriting is hard to read, hold the phone "
+                                    "steady, let it focus on the paper, and take it again.")
+    elif brightness < dark:
+        quality, note = "TOO_DARK", "The photo looks dark. If it is hard to read, take it again in better light."
+    elif brightness > bright:
+        quality, note = "WASHED_OUT", ("The photo looks washed out. If it is hard to read, take it again without "
+                                       "glare or direct light on the paper.")
     content_type, extension = ALLOWED_FORMATS[fmt]
-    return ImageAssessment(True, None, None, content_type, extension, width, height, sharpness, brightness)
+    return ImageAssessment(True, None, None, content_type, extension, width, height, sharpness,
+                           round(brightness, 2), quality, note)
