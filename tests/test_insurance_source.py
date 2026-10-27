@@ -140,3 +140,64 @@ def test_review_job_is_a_dry_run_unless_committed(engine) -> None:
     assert _task(journey) is not None
     target, _args = _one_shot_target("INSURANCE_SOURCE_REVIEW", engine=engine, tag="x", reports=[])
     assert target is run_insurance_source_review
+
+
+def _invoice(journey, document_type, **fields):
+    invoice = uuid4()
+    add_evidence(journey, di_document_id=invoice, document_type_key=document_type, process_area="DELIVERY")
+    for key, value in fields.items():
+        add_extracted_field(journey, di_document_id=invoice, field_key=key, document_type=document_type, value=value)
+
+
+def test_the_agent_code_and_a_debit_note_premium_also_decide(engine) -> None:
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _policy(journey, agent_code="BA0000123456", agent="ADITYA MOTORS")
+    _sync(journey)
+    _answer(journey, _task(journey)["task_id"], "INHOUSE", "Agent code BA0000123456 on 27-10-2026 call 7873999101")
+    with engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        codes = connection.execute(text("SELECT normalized_code FROM auditcore.dealer_insurance_codes WHERE tenant_id=:t"),
+                                   {"t": journey.tenant_id}).scalars().all()
+        connection.execute(text("UPDATE auditcore.insurance_records SET insurance_source=NULL WHERE tenant_id=:t"),
+                           {"t": journey.tenant_id})
+    assert codes == ["BA0000123456"]  # only the policy's code, never the date or the phone number
+    assert _sync(journey)["decidedBy"] == "DOCUMENT"
+
+    other = create_p2_journey(engine, prefix="inssrc")
+    _policy(other)
+    _invoice(other, "debit_note", insurance_amount="28228")
+    assert _sync(other)["decidedBy"] == "DOCUMENT"
+
+
+def test_a_proforma_or_generic_invoice_does_not_make_it_inhouse(engine) -> None:
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _policy(journey)
+    line = '[{"description_raw": "Insurance", "net_amount": 30000, "line_category": "INSURANCE"}]'
+    _invoice(journey, "customer_invoice_dms", line_items=line, invoice_nature="PROFORMA INVOICE")
+    _invoice(journey, "invoice_generic", line_items=line)
+    assert _sync(journey)["decidedBy"] == "UNCONFIRMED"
+
+
+def test_an_answer_needs_a_code_and_a_valid_choice(engine) -> None:
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _policy(journey)
+    _sync(journey)
+    task_id = _task(journey)["task_id"]
+    with pytest.raises(ValueError, match="Agent code / MISP code"):
+        _answer(journey, task_id, "EXTERNAL", "customer did it")
+    with pytest.raises(ValueError, match="in-house or external"):
+        _answer(journey, task_id, "MAYBE", "code 91063100000001")
+
+
+def test_a_deal_tab_choice_closes_the_task(engine) -> None:
+    from audit_core.uc03_p2_deal_actions import set_insurance_source
+
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _policy(journey)
+    _sync(journey)
+    with engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        set_insurance_source(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, source="SELF",
+                             actor_id=journey.actor_id, reason="customer's own", correlation_id=None, via="DEAL_TAB")
+    _sync(journey)
+    assert _task(journey)["task_status"] == "VERIFIED_COMPLETE"

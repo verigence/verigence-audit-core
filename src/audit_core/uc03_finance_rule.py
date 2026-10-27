@@ -51,36 +51,69 @@ _RELEVANT_KEYS = frozenset(
     + _INVOICE_FINANCIER_KEYS + ("line_items",)
 )
 
-# A value that names no financier. CASH first of all.
-_NO_FINANCIER = re.compile(
-    r"^\s*(cash(\s*(sale|purchase|payment))?|nil|null|none|na|n\s*/\s*a|not\s+applicable|self|own|-+|0|\.)\s*$",
-    re.IGNORECASE,
-)
+# Words that, on their own, name no financier: a value made only of these (and
+# numbers / punctuation) is "no finance" -- "N.A.", "Hypothecation: NIL",
+# "NOT HYPOTHECATED", "0.00". CASH and SELF anywhere at the start mean no
+# financier too ("By Cash", "CASH SALES", "Self Finance", "Cash/Self").
+_EMPTY_WORDS = frozenset({
+    "na", "n", "a", "nil", "nill", "null", "none", "no", "not", "applicable", "hypothecation", "hypothecated",
+    "hypothecate", "to", "with", "without", "financer", "financier", "finance", "name", "hpa", "by", "of",
+    "the", "is", "nan",
+})
+_CASH_OR_SELF = re.compile(r"^(by\s+)?(cash|self|own)\b", re.IGNORECASE)
 # Receipt payer names that are a financier paying the dealer.
 _FINANCIER_MARKER = re.compile(r"\(\s*(financ(er|ier|e)|d\s*\.?\s*o\s*\.?)\s*\)|\bhp\s+to\b", re.IGNORECASE)
 _INSTITUTION = re.compile(
-    r"\bbank\b|financ|\bfincorp\b|\bmmfsl\b|\bm\.?f\.?s\.?l\b|\bnbfc\b|\bleasing\b|\bhdb\b", re.IGNORECASE)
-_NOT_A_PAYER = re.compile(r"\bbank\s+charges?\b", re.IGNORECASE)
+    r"\bbank\b|financ|\bfinserv\b|\bfincorp\b|\bmmfsl\b|\bm\.?f\.?s\.?l\b|\bnbfc\b|\bleasing\b|\bhdb\b"
+    r"|\bchola\b|\bcholamandalam\b|\bsundaram\b|\bshriram\b|\btata\s+capital\b|\bidfc\b|\bhdfc\b|\bicici\b"
+    r"|\baxis\b|\bkotak\b|\bindusind\b|\bhinduja\b|\bmuthoot\b|\bau\s+small\b",
+    re.IGNORECASE)
+_NOT_A_PAYER = re.compile(r"\bbank\s+charges?\b|\bneft\b|\brtgs\b|\bimps\b|\bthrough\b|\(\s*self\s*\)", re.IGNORECASE)
 _HP_TO = re.compile(r"\bhp\s+to\s+(?P<name>[^)]+)", re.IGNORECASE)
-_HYPOTHECATION_LINE = re.compile(r"hypoth", re.IGNORECASE)
+_HYPOTHECATION_LINE = re.compile(r"hypoth|\bh\.?\s*p\.?\s*a\b", re.IGNORECASE)
 
 
 def names_a_financier(value: Any) -> bool:
+    """True only for a value that actually names someone: never CASH / SELF,
+    never "N.A.", "NIL", "Hypothecation: NIL", "NOT HYPOTHECATED", "0.00"."""
     text_value = _text(value)
-    return bool(text_value) and not _NO_FINANCIER.match(text_value)
+    if not text_value or _CASH_OR_SELF.match(text_value.strip(" .:-/")):
+        return False
+    words = [w for w in re.split(r"[^a-z0-9]+", text_value.lower()) if w]
+    return any(w not in _EMPTY_WORDS and not w.isdigit() for w in words)
 
 
-def receipt_financier(payer: Any) -> str | None:
-    """The financier a receipt was received from, or None for a customer's own payment."""
+def _same_name(a: str | None, b: str | None) -> bool:
+    def key(value: str | None) -> str:
+        return re.sub(r"[^a-z0-9]", "", re.sub(r"\b(m\s*/\s*s|mr|mrs|ms|shri|smt)\b", "", (value or "").lower()))
+    return bool(key(a)) and key(a) == key(b)
+
+
+def receipt_financier(payer: Any, *, customer_names: tuple[str, ...] = ()) -> str | None:
+    """The financier a receipt was received from, or None for a customer's own
+    payment. A payer who is the Journey's customer is never a financier (a
+    customer that is itself a bank buys its own vehicle)."""
     name = _text(payer)
     if not name or _NOT_A_PAYER.search(name):
         return None
     hp_to = _HP_TO.search(name)
     if hp_to:
         return _clean_name(hp_to.group("name"))
-    if _FINANCIER_MARKER.search(name) or _INSTITUTION.search(name):
-        return _clean_name(_FINANCIER_MARKER.sub("", name))
+    cleaned = _clean_name(_FINANCIER_MARKER.sub("", name))
+    if any(_same_name(cleaned, c) for c in customer_names):
+        return None
+    if _INSTITUTION.search(name):
+        return cleaned
     return None
+
+
+def receipt_from_financier_for_customer(payer: Any, *, customer_names: tuple[str, ...] = ()) -> bool:
+    """A receipt in the customer's own name marked as the financier's payment,
+    e.g. "R K SAHOO (DO)": finance, with no financier named on it."""
+    name = _text(payer)
+    if not name or not _FINANCIER_MARKER.search(name) or _HP_TO.search(name):
+        return False
+    return any(_same_name(_clean_name(_FINANCIER_MARKER.sub("", name)), c) for c in customer_names)
 
 
 def _clean_name(value: str) -> str | None:
@@ -100,7 +133,9 @@ def _text(value: Any) -> str:
 def _amount(value: Any) -> Decimal | None:
     if value is None or isinstance(value, (dict, list, bool)):
         return None
-    cleaned = re.sub(r"[^0-9.\-]", "", str(value))
+    # "Rs. 1,500/-" -> 1500 (the "." of "Rs." is not a decimal point).
+    raw = re.sub(r"(?i)\b(rs|inr)\.?|₹|/-", " ", str(value))
+    cleaned = re.sub(r"[^0-9.\-]", "", raw).strip(".")
     if cleaned in ("", ".", "-"):
         return None
     try:
@@ -156,11 +191,15 @@ def _current_documents(connection: Connection, *, tenant_id: str, journey_id: UU
     rows = connection.execute(
         text(
             """
-            SELECT f.di_document_id, f.source_document_type_key, f.field_key, f.effective_value
+            -- The newest reading of each field of each current document (a
+            -- document can hold several fact versions and both stages' rows).
+            SELECT DISTINCT ON (f.di_document_id, f.field_key)
+                   f.di_document_id, COALESCE(e.document_type_key, f.source_document_type_key) AS document_type,
+                   f.field_key, f.effective_value
             FROM auditcore.journey_document_extracted_fields f
             JOIN auditcore.evidence e
-              ON e.tenant_id = f.tenant_id AND e.di_document_id = f.di_document_id
-             AND e.association_status = 'ACTIVE'
+              ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+             AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
             WHERE f.tenant_id = :t AND f.journey_id = :j
               AND f.field_key = ANY(CAST(:keys AS text[]))
               AND NOT EXISTS (
@@ -168,6 +207,8 @@ def _current_documents(connection: Connection, *, tenant_id: str, journey_id: UU
                   WHERE q.tenant_id = f.tenant_id AND q.di_document_id = f.di_document_id
                   HAVING bool_and(q.retired_at_utc IS NOT NULL OR q.queue_status IN ('MERGED', 'CANCELLED'))
               )
+            ORDER BY f.di_document_id, f.field_key, f.source_fact_version DESC NULLS LAST,
+                     f.updated_at_utc DESC
             """
         ),
         {"t": tenant_id, "j": journey_id, "keys": sorted(_RELEVANT_KEYS)},
@@ -175,7 +216,7 @@ def _current_documents(connection: Connection, *, tenant_id: str, journey_id: UU
     docs: dict[str, _Doc] = {}
     for row in rows:
         doc_id = str(row["di_document_id"])
-        doc = docs.setdefault(doc_id, _Doc(doc_id, str(row["source_document_type_key"] or "").lower(), {}))
+        doc = docs.setdefault(doc_id, _Doc(doc_id, str(row["document_type"] or "").lower(), {}))
         doc.fields[str(row["field_key"])] = row["effective_value"]
     return docs
 
@@ -204,6 +245,7 @@ def finance_evidence(
     docs = _current_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
     if documents:
         _overlay(connection, tenant_id=tenant_id, docs=docs, documents=documents)
+    customers = _customer_names(connection, tenant_id=tenant_id, journey_id=journey_id)
     found = FinanceEvidence()
     names: list[tuple[int, str, str]] = []  # (priority, name, document)
     hp_amounts: list[Decimal] = []
@@ -228,10 +270,13 @@ def finance_evidence(
                     names.append((1, _text(values[key]), doc.document_id))
         elif kind in _RECEIPT_TYPES:
             for key in _RECEIPT_PAYER_KEYS:
-                financier = receipt_financier(values.get(key))
+                financier = receipt_financier(values.get(key), customer_names=customers)
                 if financier:
                     found.basis.append(f"Payment receipt received from {_text(values[key])}")
                     names.append((2, financier, doc.document_id))
+                elif receipt_from_financier_for_customer(values.get(key), customer_names=customers):
+                    found.basis.append(f"Payment receipt marked as the financier's payment ({_text(values[key])})")
+                    found.source_document_id = found.source_document_id or doc.document_id
     found.financed = bool(found.basis)
     if names:
         _priority, name, document_id = min(names, key=lambda n: (n[0], n[2]))
@@ -248,6 +293,33 @@ def finance_evidence(
     if hp_amounts:
         found.financed_amount = max(hp_amounts)
     return found
+
+
+def _customer_names(connection: Connection, *, tenant_id: str, journey_id: UUID) -> tuple[str, ...]:
+    row = connection.execute(
+        text(
+            """
+            SELECT c.display_name, c.legal_name FROM auditcore.journeys j
+            JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+            WHERE j.tenant_id = :t AND j.journey_id = :j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().first()
+    buyers = connection.execute(
+        text(
+            """
+            SELECT DISTINCT f.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields f
+            JOIN auditcore.evidence e ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+             AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
+            WHERE f.tenant_id = :t AND f.journey_id = :j AND f.field_key IN ('buyer_name', 'customer_name')
+              AND COALESCE(e.document_type_key, f.source_document_type_key) NOT IN ('dealer_receipt', 'payment_receipt')
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).scalars().all()
+    names = [v for v in ((row or {}).get("display_name"), (row or {}).get("legal_name"), *buyers) if v]
+    return tuple(dict.fromkeys(str(n) for n in names))
 
 
 def _evidence_id(connection: Connection, *, tenant_id: str, di_document_id: str | None) -> UUID | None:
@@ -267,6 +339,10 @@ def apply_finance_rule(
 
     Returns {"action": CREATED | UPDATED | REMOVED | UNCHANGED | KEPT_PERSON_ENTERED |
     KEPT_PC_CONFIRMED_DISBURSEMENT | NONE, ...}. With write=False nothing is changed."""
+    if write:
+        # One pass per Journey at a time: two passes finding no row could both insert one.
+        connection.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"),
+                           {"k": f"finance-rule:{tenant_id}:{journey_id}"})
     evidence = finance_evidence(connection, tenant_id=tenant_id, journey_id=journey_id, documents=documents)
     records = connection.execute(
         text(
@@ -288,7 +364,10 @@ def apply_finance_rule(
         "before": ({"provider": latest["provider_name"], "type": latest["finance_type_code"],
                     "sourceKind": latest["source_kind"]} if latest else None),
     }
-    if latest is not None and (latest["source_kind"] or "EVIDENCE") != "EVIDENCE":
+    # Only a record Audit Core copied from documents (EVIDENCE) is Audit Core's
+    # to change; one a person entered -- OPERATIONAL_INPUT, SOURCE_SYSTEM, or
+    # no source given -- is never touched.
+    if latest is not None and latest["source_kind"] != "EVIDENCE":
         return {**out, "action": "KEPT_PERSON_ENTERED"}
 
     if not evidence.financed:
@@ -299,7 +378,7 @@ def apply_finance_rule(
         if write:
             connection.execute(
                 text("DELETE FROM auditcore.finance_records WHERE tenant_id = :t AND journey_id = :j "
-                     "AND COALESCE(source_kind, 'EVIDENCE') = 'EVIDENCE'"),
+                     "AND source_kind = 'EVIDENCE'"),
                 {"t": tenant_id, "j": journey_id},
             )
             _after_finance_removed(connection, tenant_id=tenant_id, journey_id=journey_id)

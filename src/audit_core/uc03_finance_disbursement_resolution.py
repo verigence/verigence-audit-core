@@ -351,11 +351,23 @@ def resolve_finance_disbursement(
             match_basis="No eligible (non-Cash/UPI/Card/QR) payment found after the minimum booking amount.",
         )
     effect_key = _effect_key(tenant_id, journey_id)
-    existing = connection.execute(
-        text("SELECT 1 FROM auditcore.workflow_tasks WHERE tenant_id=:t AND effect_key=:k"),
-        {"t": tenant_id, "k": effect_key},
-    ).scalar_one_or_none()
-    if existing is None:
+    # One task per financed spell: a task cancelled because the deal stopped
+    # being financed (uc03_finance_rule) is raised again, under a fresh key,
+    # once the documents prove finance again (2026-10-27 review).
+    earlier = connection.execute(
+        text(
+            """
+            SELECT task_status FROM auditcore.workflow_tasks
+            WHERE tenant_id=:t AND (effect_key=:k OR effect_key LIKE :prefix)
+            ORDER BY created_at_utc DESC
+            """
+        ),
+        {"t": tenant_id, "k": effect_key, "prefix": f"{effect_key}:%"},
+    ).scalars().all()
+    if earlier and earlier[0] == "CANCELLED" and _open_task_id(connection, tenant_id=tenant_id, journey_id=journey_id) is None:
+        effect_key = f"{effect_key}:{len(earlier) + 1}"
+        earlier = []
+    if not earlier:
         create_workflow_task(
             connection,
             tenant_id=tenant_id,

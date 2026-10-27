@@ -36,8 +36,12 @@ from sqlalchemy import Connection, text
 
 TASK_TYPE = "INSURANCE_SOURCE_CONFIRM"
 INHOUSE, EXTERNAL = "INHOUSE", "EXTERNAL"
+# The dealer's own billing: its tax invoices and debit notes -- not a generic
+# invoice (an insurer's own bill is uploaded as one), not a credit note, and
+# not a proforma / quotation / estimate (Booking estimates list insurance).
 _INVOICE_TYPES = ("customer_invoice_dms", "tax_invoice_tally", "tax_invoice_dms", "tax_invoice",
-                  "customer_invoice_dms_v2", "invoice_generic", "debit_note")
+                  "customer_invoice_dms_v2", "debit_note")
+_NOT_A_BILL = re.compile(r"pro\s*-?\s*forma|quotation|estimate|credit\s+note", re.IGNORECASE)
 # A code as a person writes it: letters / digits with / & - and at least one digit.
 _CODE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-.]{3,}[A-Za-z0-9]")
 
@@ -96,25 +100,35 @@ def premium_on_dealer_invoice(connection: Connection, *, tenant_id: str, journey
     rows = connection.execute(
         text(
             """
-            SELECT f.field_key, f.effective_value
+            SELECT DISTINCT ON (f.di_document_id, f.field_key)
+                   f.di_document_id, f.field_key, f.effective_value
             FROM auditcore.journey_document_extracted_fields f
             JOIN auditcore.evidence e
-              ON e.tenant_id = f.tenant_id AND e.di_document_id = f.di_document_id
-             AND e.association_status = 'ACTIVE'
+              ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+             AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
             WHERE f.tenant_id = :t AND f.journey_id = :j
-              AND f.source_document_type_key = ANY(CAST(:types AS text[]))
-              AND f.field_key IN ('line_items', 'insurance_amount')
+              AND COALESCE(e.document_type_key, f.source_document_type_key) = ANY(CAST(:types AS text[]))
+              AND f.field_key IN ('line_items', 'insurance_amount', 'invoice_nature', 'invoice_purpose',
+                                  'document_title')
               AND NOT EXISTS (
                   SELECT 1 FROM auditcore.p2_document_queue q
                   WHERE q.tenant_id = f.tenant_id AND q.di_document_id = f.di_document_id
                   HAVING bool_and(q.retired_at_utc IS NOT NULL OR q.queue_status IN ('MERGED', 'CANCELLED'))
               )
+            ORDER BY f.di_document_id, f.field_key, f.source_fact_version DESC NULLS LAST, f.updated_at_utc DESC
             """
         ),
         {"t": tenant_id, "j": journey_id, "types": list(_INVOICE_TYPES)},
     ).mappings().all()
+    not_a_bill = {
+        str(r["di_document_id"]) for r in rows
+        if r["field_key"] in ("invoice_nature", "invoice_purpose", "document_title")
+        and _NOT_A_BILL.search(str(r["effective_value"] or ""))
+    }
     best: float | None = None
     for row in rows:
+        if row["field_key"] not in ("line_items", "insurance_amount") or str(row["di_document_id"]) in not_a_bill:
+            continue
         value = row["effective_value"]
         if row["field_key"] == "insurance_amount":
             amounts = [_dec(value)]
@@ -243,7 +257,13 @@ def answer_task(connection: Connection, *, tenant_id: str, task: dict[str, Any],
             text("SELECT dealer_id FROM auditcore.journeys WHERE tenant_id = :t AND journey_id = :j"),
             {"t": tenant_id, "j": journey_id},
         ).scalar_one_or_none()
-        for code in codes:
+        # Remember as the dealer's only a code this policy carries (never a date,
+        # a phone or policy number from the comment). When the policy's codes
+        # were not read, the PC's code is all there is.
+        policy = _policy(connection, tenant_id=tenant_id, journey_id=journey_id) or {}
+        on_policy = {normalize_code(policy.get(k)) for k in ("agent_intermediary_code", "misp_code")} - {""}
+        remembered = [c for c in codes if normalize_code(c) in on_policy] if on_policy else codes
+        for code in [c for c in remembered if len(normalize_code(c)) <= 120]:
             connection.execute(
                 text(
                     """
