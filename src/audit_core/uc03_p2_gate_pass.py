@@ -565,7 +565,7 @@ def gate_pass_summary(
     passes = {(r["business_date"], str(r["outlet_id"])): dict(r) for r in connection.execute(
         text("""
             SELECT business_date, outlet_id, gate_pass_id, pc_name, new_deliveries, files_held, divergence,
-                   counts_submitted_at_utc, completed_at_utc
+                   counts_submitted_at_utc, completed_at_utc, quality_flag
             FROM auditcore.p2_gate_passes
             WHERE tenant_id = :t AND status = 'ACTIVE' AND outlet_id = ANY(CAST(:ids AS uuid[]))
               AND business_date BETWEEN :a AND :b
@@ -599,13 +599,14 @@ def gate_pass_summary(
             files = uploaded.get((d, oid), 0)
             entry = {"date": d.isoformat(), "label": gate_pass_day_label(d), "updatedInTool": files,
                      "asPerRegister": None, "pendingDueToClient": 0, "pendingDueToPc": 0,
-                     "status": "NOT_UPLOADED", "gatePassId": None, "pcName": None}
+                     "status": "NOT_UPLOADED", "gatePassId": None, "pcName": None, "photoQuality": None}
             line["gatePassDays"] += 1
             line["updatedInTool"] += files
             if gp is None:
                 line["gatePassesMissing"] += 1
             else:
-                entry.update(gatePassId=str(gp["gate_pass_id"]), pcName=gp["pc_name"])
+                entry.update(gatePassId=str(gp["gate_pass_id"]), pcName=gp["pc_name"],
+                             photoQuality=gp["quality_flag"] or "GOOD")
                 if gp["counts_submitted_at_utc"] is None:
                     entry["status"] = "COUNTS_PENDING"
                 else:
