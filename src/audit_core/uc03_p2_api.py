@@ -2300,13 +2300,15 @@ def remove_page(
     the file's tasks close or refresh at once, naming the removal. Only a
     FAILED page can be removed this way; same permission as deleting a
     document."""
+    from audit_core.uc03_p2_access import authorize_p2_removal
     from audit_core.uc03_p2_page_removal import take_page_off_journey
     from audit_core.uc03_p2_task_producer import sync_processing_failure_tasks
     from audit_core.uc03_p2_worker import _refresh_batch_status
 
-    access = _authorize(
+    # A PC, or a TL while the Journey's review is not complete (2026-10-28).
+    access = authorize_p2_removal(
         connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
-        authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
+        authorization_client=authorization_client,
     )
     reason = command.reason.strip()
     if len(reason) < 3:

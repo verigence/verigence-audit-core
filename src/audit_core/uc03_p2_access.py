@@ -188,3 +188,46 @@ def authorize_p2_any(
     return resolve_p2_scope(
         connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal, decision=decision,
     )
+
+
+_PC_UPDATE = "audit.journey.update"
+_TL_WORK_UPDATE = "audit.work.update"
+
+
+def authorize_p2_removal(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: HumanPrincipal,
+    authorization_client: SecurityAuthorizationClient,
+) -> P2AccessContext:
+    """Who may take a page or a document off a Journey (product owner
+    2026-10-28: "let TL remove the pages from the journey which are not review
+    complete"). A PC with audit.journey.update, as before; a Team Lead (whose
+    bundle has audit.work.update, not journey.update) while the Journey's
+    review is not complete. Uploading stays the PC's."""
+    try:
+        return authorize_p2(
+            connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+            authorization_client=authorization_client, permission_key=_PC_UPDATE,
+        )
+    except AuthorizationError:
+        access = authorize_p2(
+            connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+            authorization_client=authorization_client, permission_key=_TL_WORK_UPDATE,
+        )
+    reviewed = connection.execute(
+        text("SELECT review_completed_at_utc IS NOT NULL FROM auditcore.journeys "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one_or_none()
+    if reviewed is None:
+        raise NotFoundError(detail="Journey not found.")
+    if reviewed:
+        raise AuthorizationError(
+            error_code="VAC-AUTH-002",
+            status_code=403,
+            title="This journey's review is complete: a Team Lead can no longer remove its pages.",
+        )
+    return access

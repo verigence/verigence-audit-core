@@ -696,13 +696,12 @@ def delete_p2_document(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> Response:
-    authorize_p2(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
+    from audit_core.uc03_p2_access import authorize_p2_removal
+
+    # A PC, or a TL while the Journey's review is not complete (2026-10-28).
+    authorize_p2_removal(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
         authorization_client=authorization_client,
-        permission_key=_UPDATE_PERMISSION,
     )
     void_p2_document(connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
                      actor_id=human_principal.subject)
