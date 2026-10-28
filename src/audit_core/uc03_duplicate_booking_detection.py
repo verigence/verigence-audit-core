@@ -85,7 +85,6 @@ _NAME_FIELDS: dict[str, str] = {
 _RELATIONSHIP_NAME_FIELDS: tuple[str, ...] = ("aadhaar_relationship_name", "pan_relationship_name")
 _ADDRESS_FIELDS: tuple[str, ...] = ("aadhaar_address", "customer_address")
 
-_ADDRESS_MATCH_THRESHOLD = 0.72
 # Deciding "is this the same specific person" (surname already matched) is
 # a stricter question than _names_match's own 0.55 (whether a document's
 # stated name plausibly refers to a known reference name -- a different,
@@ -101,15 +100,22 @@ _WHITESPACE_ONLY = re.compile(r"\s+")
 
 # Strongest to weakest -- _match_basis returns the first of these that
 # actually matches, so a pair is never flagged more than once.
+# Product owner 2026-10-28: the same PAN or Aadhaar is a high-probability
+# duplicate; the relationship name on one booking matching the customer name
+# on another, or the same surname with the same pincode, is a probable case --
+# a common name collides between unrelated people (SUKANTI SAHOO, W/O
+# Ghanashyam Sahoo of Khordha, paired with GHANASYAM SAHOO, S/O Umakant Sahoo
+# of Bhadrak, at "90%"). A merely similar address is not one of the rules and
+# no longer pairs two bookings.
 _SEVERITY_BY_BASIS: dict[str, str] = {
     "PAN": "CRITICAL",
     "AADHAAR": "CRITICAL",
-    "CUSTOMER_MATCHES_RELATIVE": "CRITICAL",
-    "NAME_AND_ADDRESS": "CRITICAL",
+    "CUSTOMER_MATCHES_RELATIVE": "MEDIUM",
+    "NAME_AND_ADDRESS": "MEDIUM",
     "GST": "MEDIUM",
     "MOBILE": "MEDIUM",
-    "SURNAME_AND_PINCODE": "LOW",
-    "SIMILAR_ADDRESS": "LOW",
+    "SURNAME_AND_PINCODE": "MEDIUM",
+    "SIMILAR_ADDRESS": "LOW",  # no longer raised; kept to read old findings
 }
 
 # A reviewer's real question isn't just "which basis matched" but "how
@@ -124,11 +130,11 @@ _SEVERITY_BY_BASIS: dict[str, str] = {
 _CONFIDENCE_PERCENT_BY_BASIS: dict[str, int] = {
     "PAN": 99,
     "AADHAAR": 99,
-    "CUSTOMER_MATCHES_RELATIVE": 90,
-    "NAME_AND_ADDRESS": 85,
+    "CUSTOMER_MATCHES_RELATIVE": 60,
+    "NAME_AND_ADDRESS": 60,
     "GST": 75,
     "MOBILE": 70,
-    "SURNAME_AND_PINCODE": 40,
+    "SURNAME_AND_PINCODE": 50,
     "SIMILAR_ADDRESS": 35,
 }
 # One-to-one with _SEVERITY_BY_BASIS's own tiers -- kept as an explicit,
@@ -137,7 +143,7 @@ _CONFIDENCE_PERCENT_BY_BASIS: dict[str, int] = {
 # ever change independently of this.
 _CONFIDENCE_LABEL_BY_SEVERITY: dict[str, str] = {
     "CRITICAL": "HIGH",
-    "MEDIUM": "MEDIUM",
+    "MEDIUM": "PROBABLE",
     "LOW": "LOW",
 }
 
@@ -320,18 +326,6 @@ def _same_person_by_name(a: str | None, b: str | None) -> bool:
     if given_a == given_b:
         return True
     return SequenceMatcher(None, given_a, given_b).ratio() >= _GIVEN_NAME_MATCH_THRESHOLD
-
-
-def _addresses_match(a: str | None, b: str | None) -> bool:
-    if not a or not b:
-        return False
-    normalized_a = _WHITESPACE_ONLY.sub(" ", a.strip().upper())
-    normalized_b = _WHITESPACE_ONLY.sub(" ", b.strip().upper())
-    if not normalized_a or not normalized_b:
-        return False
-    if normalized_a == normalized_b:
-        return True
-    return SequenceMatcher(None, normalized_a, normalized_b).ratio() >= _ADDRESS_MATCH_THRESHOLD
 
 
 def _extract_signals(rows: list[Any], *, gst: str | None) -> dict[str, Any] | None:
@@ -523,8 +517,6 @@ def _match_basis(signals: dict[str, Any], candidate: dict[str, Any]) -> str | No
         and signals["pincode"] and candidate["pincode"] and signals["pincode"] == candidate["pincode"]
     ):
         return "SURNAME_AND_PINCODE"
-    if _addresses_match(signals["address"], candidate["address"]):
-        return "SIMILAR_ADDRESS"
     return None
 
 
@@ -661,7 +653,8 @@ def _void_open_finding_with_stale_basis(
                              WHERE e.tenant_id = f.tenant_id
                                AND e.audit_finding_id = f.audit_finding_id
                                AND e.event_type = 'RAISED'
-                             ORDER BY e.occurred_at_utc LIMIT 1) AS stored_basis
+                             ORDER BY e.occurred_at_utc LIMIT 1) AS stored_basis,
+                           f.severity AS stored_severity
                     FROM auditcore.audit_findings f
                     WHERE f.tenant_id = :tenant_id AND f.journey_id = :journey_id
                       AND f.stage_code = :stage AND f.rule_key = :rule_key
@@ -672,10 +665,12 @@ def _void_open_finding_with_stale_basis(
                 ),
                 {"tenant_id": tenant_id, "journey_id": journey_id, "stage": _STAGE, "rule_key": rule_key},
             ).mappings().one_or_none()
-            if row is None or row["stored_basis"] == basis:
+            if row is None or (row["stored_basis"] == basis
+                                and row["stored_severity"] == _SEVERITY_BY_BASIS[basis]):
                 return False
             note = (f"Match basis changed from {row['stored_basis'] or 'unknown'} to {basis}; "
-                    "raised again on the current basis.")
+                    "raised again on the current basis." if row["stored_basis"] != basis else
+                    f"Match level for {basis} changed (2026-10-28); raised again at the current level.")
             voided = connection.execute(
                 text(
                     """
