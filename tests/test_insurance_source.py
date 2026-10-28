@@ -203,3 +203,31 @@ def test_a_deal_tab_choice_closes_the_task(engine) -> None:
                              actor_id=journey.actor_id, reason="customer's own", correlation_id=None, via="DEAL_TAB")
     _sync(journey)
     assert _task(journey)["task_status"] == "VERIFIED_COMPLETE"
+
+
+@pytest.mark.parametrize(("written", "self_"), [
+    ("by the customer", True), ("Self", True), ("OWN", True), ("Done by party", True), ("done by customer", True),
+    ("Dealer", False), ("DLR", False), ("OWN / DLR", False), ("MMFSL", False), ("HDFC BANK LTD. BBSR", False),
+    ("Nil Dep", False), (None, False),
+])
+def test_what_the_booking_docket_says(written, self_) -> None:
+    assert rule.booking_says_self(written) is self_
+
+
+def test_a_docket_saying_by_the_customer_shows_self_meanwhile_and_still_asks(engine) -> None:
+    """ADI-BM-261026-002 (2026-10-28): the add-ons said 'by the customer' while the
+    Deal said Inhouse. The docket's word stands until the PC confirms."""
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _policy(journey, agent_code="20000042", agent="PRASANTA KUMAR SWAIN")
+    with engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.insurance_records SET insurance_by='by the customer' "
+                                "WHERE tenant_id=:t AND journey_id=:j"), {"t": journey.tenant_id, "j": journey.journey_id})
+    decision = _sync(journey)
+    assert (decision["source"], decision["decidedBy"]) == ("SELF", "UNCONFIRMED")
+    assert "by the customer" in decision["basis"]
+    task = _task(journey)
+    assert task["task_status"] == "READY"
+    # The PC's answer still decides.
+    _answer(journey, task["task_id"], "INHOUSE", "Agent code 20000042")
+    assert (_sync(journey)["source"], _sync(journey)["decidedBy"]) == ("INHOUSE", "PC")

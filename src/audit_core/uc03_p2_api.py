@@ -1664,6 +1664,9 @@ def list_documents(
     # 2026-10-01): the card shows it and offers its one action, the summary
     # strip counts it, the defects name the pages the pipeline still owes.
     health = journey_document_health(connection, tenant_id=tenant_id, journey_id=journey_id)
+    from audit_core.uc03_vehicle_rc import NEW_VEHICLE_RC_NAME, new_vehicle_rcs
+
+    sold_car_rcs = new_vehicle_rcs(connection, tenant_id=tenant_id, journey_id=journey_id)
     by_batch: dict[str, list[dict[str, Any]]] = {}
     for page in pages:
         item = dict(page)
@@ -1687,6 +1690,8 @@ def list_documents(
         item["queueId"] = str(item.pop("queue_id"))
         if item.get("di_document_id") is not None:
             item["diDocumentId"] = str(item.pop("di_document_id"))
+            if item["diDocumentId"] in sold_car_rcs and not item["typeSetByPc"]:
+                item["displayName"] = NEW_VEHICLE_RC_NAME
         by_batch.setdefault(batch_key, []).append(item)
 
     result = []
@@ -1731,6 +1736,9 @@ def list_documents(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
+    from audit_core.uc03_vehicle_rc import NEW_VEHICLE_RC_NAME, new_vehicle_rcs
+
+    sold_car_rcs = new_vehicle_rcs(connection, tenant_id=tenant_id, journey_id=journey_id)
     documents = []
     for raw in evidence_rows:
         doc = dict(raw)
@@ -1738,7 +1746,8 @@ def list_documents(
             doc.get("document_type_key"), stage=str(doc.get("process_area") or "").upper() or None,
         )
         doc["templateKey"] = template.key
-        doc["displayName"] = template.display_name
+        doc["displayName"] = (NEW_VEHICLE_RC_NAME if str(doc.get("di_document_id")) in sold_car_rcs
+                              else template.display_name)
         doc["requirement"] = template.requirement
         doc["evidenceId"] = str(doc.pop("evidence_id"))
         doc["documentId"] = str(doc.pop("di_document_id"))

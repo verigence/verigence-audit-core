@@ -18,7 +18,12 @@ So, in order:
    that code are recognised without asking.
 
 Until the PC answers, the deal keeps the premium (as before: "Inhouse" with
-decidedBy UNCONFIRMED) and the page says it is not confirmed.
+decidedBy UNCONFIRMED) and the page says it is not confirmed -- unless the
+booking docket says the customer arranged it ("Self", "Own", "by the customer",
+"done by party"): then the deal shows Self meanwhile, still unconfirmed and
+still asked (product owner 2026-10-28: the add-ons said "by the customer" while
+the Deal said Inhouse). A docket naming both or neither ("OWN / DLR", a bank)
+does not decide.
 
 Live 2026-10-27 (Sibaram Nahak and 75 more on Mahindra Orissa): every policy
 showed as Inhouse by default, including those issued through Policybazaar,
@@ -42,6 +47,19 @@ INHOUSE, EXTERNAL = "INHOUSE", "EXTERNAL"
 _INVOICE_TYPES = ("customer_invoice_dms", "tax_invoice_tally", "tax_invoice_dms", "tax_invoice",
                   "customer_invoice_dms_v2", "debit_note")
 _NOT_A_BILL = re.compile(r"pro\s*-?\s*forma|quotation|estimate|credit\s+note", re.IGNORECASE)
+# What the booking docket's "Insurance by" says, written by hand: the customer
+# ("Self", "Own", "by the customer", "done by party") or the dealer ("DLR").
+_SELF_WORDS = re.compile(r"\b(SELF|OWN|CUSTOMER|PARTY)\b")
+_DEALER_WORDS = re.compile(r"\b(DEALER|DEALERSHIP|DLR|IN-?HOUSE|SHOWROOM)\b")
+
+
+def booking_says_self(value: Any) -> bool:
+    """True when the booking docket says the customer arranged the insurance,
+    and nothing in it names the dealer."""
+    upper = str(value or "").upper()
+    return bool(_SELF_WORDS.search(upper)) and not _DEALER_WORDS.search(upper)
+
+
 # A code as a person writes it: letters / digits with / & - and at least one digit.
 _CODE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9/&\-.]{3,}[A-Za-z0-9]")
 
@@ -74,7 +92,7 @@ def _policy(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
         text(
             """
             SELECT r.insurer_name, r.policy_reference, r.agent_intermediary_name, r.agent_intermediary_code,
-                   r.misp_code, r.insurance_source, r.insurance_source_set_at_utc,
+                   r.misp_code, r.insurance_source, r.insurance_source_set_at_utc, r.insurance_by,
                    r.insurance_source_set_by_actor_id, j.dealer_id
             FROM auditcore.insurance_records r
             JOIN auditcore.journeys j ON j.tenant_id = r.tenant_id AND j.journey_id = r.journey_id
@@ -178,11 +196,18 @@ def resolve(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
     if decided is not None:
         return {"source": INHOUSE, "decidedBy": "DOCUMENT", "decidedAt": None, "actorId": None,
                 "basis": decided["basis"]}
+    # Meanwhile the booking docket's own word stands, when it plainly says the
+    # customer arranged it (2026-10-28).
+    said_self = bool(policy) and booking_says_self(policy.get("insurance_by"))
+    meanwhile = "SELF" if said_self else INHOUSE
+    docket = (f" The booking docket says the insurance is by {policy['insurance_by']!s}, so the premium is kept "
+              "out of the deal meanwhile.") if said_self else ""
     if policy and (policy["insurer_name"] or policy["policy_reference"]):
-        return {"source": INHOUSE, "decidedBy": "UNCONFIRMED", "decidedAt": None, "actorId": None,
+        return {"source": meanwhile, "decidedBy": "UNCONFIRMED", "decidedAt": None, "actorId": None,
                 "basis": "Neither the dealer's Agent / MISP code nor a premium on the dealer invoice was found; "
-                         "the PC is asked to confirm."}
-    return {"source": INHOUSE, "decidedBy": "DEFAULT", "decidedAt": None, "actorId": None, "basis": None}
+                         "the PC is asked to confirm." + docket}
+    return {"source": meanwhile, "decidedBy": "DEFAULT", "decidedAt": None, "actorId": None,
+            "basis": docket.strip() or None}
 
 
 def _dedupe_key(journey_id: UUID) -> str:
@@ -216,7 +241,8 @@ def sync_insurance_source_task(
                 f"The policy shows {shows}. Neither the dealer's Agent / MISP code nor an insurance premium on "
                 "the dealer invoice was found, so it is not known whether the dealership arranged this "
                 "insurance. Choose in-house or external and write the Agent code / MISP code in the comment. "
-                "Until then the premium stays in the deal."),
+                + ("The booking docket says it is by the customer, so until then the premium is kept out of "
+                   "the deal." if decision["source"] == "SELF" else "Until then the premium stays in the deal.")),
             reference={
                 "generatedBy": "SYSTEM", "sourceType": "DOCUMENT_FIELD", "sourceCode": "INSURANCE_SOURCE_UNCONFIRMED",
                 "insurerName": policy.get("insurer_name"), "agentName": policy.get("agent_intermediary_name"),

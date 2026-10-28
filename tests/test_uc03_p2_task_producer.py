@@ -306,3 +306,30 @@ def test_a_booking_date_after_today_is_a_high_verification(journey):
     assert "which is after today" in task["description"]
     (field,) = task["reference"]["fields"]
     assert field["fieldKey"] == "booking_date" and field["reasons"] == ["DATE_IN_FUTURE"]
+
+
+def test_a_gst_split_that_no_longer_exists_is_a_high_verification(journey):
+    """2026-10-28: an invoice printing CGST 20% / SGST 20% (40%, no cess) was read
+    as CGST 14% / SGST 14% plus a cess -- the pre-GST-2.0 split from the model's
+    memory. Every tax figure on it goes to the PC, whatever the confidence."""
+    invoice = add_ready_document(journey, "customer_invoice_dms", confidence=99.0, taxable_amount="1207071.71",
+                                 cgst_rate="14.0", cgst_amount="168990.0", sgst_rate="14.0", sgst_amount="168990.0",
+                                 cess_amount="144848.68", grand_total_amount="1706799.0")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {"RAISED": 1}
+    task = _task(journey, f"field-review:{invoice}")
+    assert task["severity"] == "HIGH" and task["title"].startswith("Check the GST on")
+    assert {f["fieldKey"] for f in task["reference"]["fields"]} == {
+        "cgst_rate", "cgst_amount", "sgst_rate", "sgst_amount", "cess_amount"}
+    assert "no longer exists" in task["description"]
+
+
+def test_a_gst_split_as_printed_after_gst_2_0_stands(journey):
+    add_ready_document(journey, "customer_invoice_dms", confidence=99.0, taxable_amount="1207071.71",
+                       cgst_rate="20", cgst_amount="241414.34", sgst_rate="20", sgst_amount="241414.34")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {}

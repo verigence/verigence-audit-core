@@ -46,6 +46,18 @@ def journey():
         ("Anita Sahoo", "Biswabhanu Biswal", False),
         ("A. B.", "Anita Sahoo", False),
         ("", "Anita Sahoo", False),
+        # 2026-10-28, from open name tasks on Mahindra Orissa:
+        ("RASMI RANJAN BISWAL", "RASHMI RANJAN BISWAL- R270908806", True),  # receipt number after the name
+        ("Ganganarayan Nanda", "GANGA NARAYAN NANDA-AGKPN5802B", True),  # PAN after it; split differently
+        ("RASMI RANJAN BISWAL", "RASMIRANJAN BISWAL", True),
+        ("PRITI RANJAN PANDA", "PRITI RNAJAN PANDA", True),  # two letters swapped in one word
+        ("MD EJAMUDDIN", "MD NEJAMUDDIN", True),  # one letter missed
+        ("PROGRESSIVE ODISHA PRIVATE LIMITED", "PROGRESSIVE ODISHA PVT LTD-R270936802", True),
+        ("MIHIR KUMAR DEHURY", "Mr. Anil Kumar Dehury", False),
+        ("MANOJ KUMAR MOHAPATRA", "Minakhi Mohapatra", False),
+        ("ASHADHAR SAHOO", "DEEPAK SAHOO", False),
+        ("RAM DAS", "RAJ DAS", False),  # a short word one letter apart is another word
+        ("BIJAY SAHOO", "AJAY SAHOO", False),
     ],
 )
 def test_same_person(left, right, same):
@@ -279,3 +291,16 @@ def test_a_full_name_fits_a_masked_reference():
     assert masked_matches("PXXXXJ KXXXR NXXXX", "PANKAJ KUMAR NAYAK")
     assert not masked_matches("PXXXXJ KXXXR NXXXX", "PANKAJ KUMAR SAHOO")
     assert not masked_matches("SXXXXT KXXXR SXXXO", "Subrat Sahoo")
+
+
+def test_a_proprietors_kyc_in_the_gst_legal_name_is_the_customers(journey):
+    """2026-10-28: a proprietorship's GST certificate prints the proprietor as
+    the legal name ("BISWAJIT DAS", trade name "M/S DAS CONSTRUCTION"). His
+    Aadhaar was flagged as another customer's because it was compared with the
+    masked PAN only."""
+    add_ready_document(journey, "pan_card", pan_number="AXXXX1234F", pan_name="BXXXXXXT DXS")
+    add_ready_document(journey, "aadhaar", aadhaar_name="BISWAJIT DAS")
+    add_ready_document(journey, "gst_certificate", gstin="21ARPPS0866A1ZX", organisation_legal_name="BISWAJIT DAS",
+                       organisation_trade_name="M/S DAS CONSTRUCTION", organisation_constitution="Proprietorship")
+    _named(journey)
+    assert _sync(journey) == {}

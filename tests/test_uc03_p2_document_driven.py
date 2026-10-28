@@ -201,7 +201,7 @@ def test_a_conditional_document_without_the_flag_still_raises_its_task(journey):
     """Guard for the raises_missing_task default: suppression is opt-in, so
     an ordinary CONDITIONAL document still produces its Document Missing
     task."""
-    add_ready_document(journey, "customer_invoice_dms", rsa_amount="1500")
+    add_ready_document(journey, "customer_invoice_dms", rsa_amount="1500", process_area="DELIVERY")
     _settle(journey)
 
     _, items = _delivery_requirements(journey)
@@ -210,8 +210,24 @@ def test_a_conditional_document_without_the_flag_still_raises_its_task(journey):
     assert "rsa_invoice" in raised
 
 
+def test_a_delivery_document_is_not_asked_for_while_the_journey_is_at_booking(journey):
+    """2026-10-28: the booking docket says RSA was sold, but no RSA invoice can
+    exist before delivery; PCs could only comment "it is in booking stage" on
+    the task. It is raised once a delivery document is on file."""
+    add_ready_document(journey, "booking_docket", customer_name="A", booking_date="2026-09-01", rsa_amount="1500")
+    _settle(journey)
+    reasons, items = _delivery_requirements(journey)
+    assert "rsaSold" in reasons and items["rsa_invoice"]["required"] is True
+    assert not [t for t in _tasks(journey, "DOCUMENT_MISSING") if t["task_status"] != "VERIFIED_COMPLETE"]
+    add_ready_document(journey, "customer_invoice_dms", rsa_amount="1500", process_area="DELIVERY")
+    _settle(journey)
+    raised = {t["reference"]["requirementKey"] for t in _tasks(journey, "DOCUMENT_MISSING")
+              if t["task_status"] != "VERIFIED_COMPLETE"}
+    assert "rsa_invoice" in raised
+
+
 def test_a_task_closes_when_the_evidence_no_longer_applies(journey):
-    invoice = add_ready_document(journey, "customer_invoice_dms", rsa_amount="1500")
+    invoice = add_ready_document(journey, "customer_invoice_dms", rsa_amount="1500", process_area="DELIVERY")
     _settle(journey)
     [task] = _tasks(journey, "DOCUMENT_MISSING")
     assert task["reference"]["requirementKey"] == "rsa_invoice"

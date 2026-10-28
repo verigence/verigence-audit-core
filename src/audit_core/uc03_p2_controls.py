@@ -388,8 +388,17 @@ def _evaluate_native(engine: Engine, *, tenant_id: str, journey_id: UUID, stage:
 def _presence_checks_without_their_document(
     connection: Connection, *, tenant_id: str, journey_id: UUID, controls: list[Any], registry: Registry,
 ) -> dict[str, str]:
-    """The presence checks (one operand: right is "-") whose document is not on
-    the Journey, with why they wait."""
+    """The presence checks (one operand: right is "-") that cannot be made, with
+    why: their document is not on the Journey, or it is but its reader never
+    reads the field the check looks at.
+
+    The second case (2026-10-28): GATE_PASS_CHASSIS_EMPTY looks at
+    gate_pass.chassis_number, but the Gate Pass reader reads the delivery date
+    and the car number, never a chassis number -- no Gate Pass on Mahindra Orissa
+    has the field at all, read or blank. The check failed on every Journey with a
+    gate pass, and the PC's "correct the field" could change nothing (there is no
+    field to correct), so the task came straight back. A field that was read and
+    is blank is still a FAIL; only a field the document never carries waits."""
     checks = [c for c in controls if (c.operands or {}).get("right") == "-" and c.depends_on_documents]
     if not checks:
         return {}
@@ -408,6 +417,24 @@ def _presence_checks_without_their_document(
                 missing.append(template.display_name if template else key.replace("_", " "))
         if missing:
             out[control.code] = f"Checked once the {', '.join(missing)} is on file."
+            continue
+        doc_key, _, field_key = str((control.operands or {}).get("left") or "").partition(".")
+        if not field_key or doc_key not in control.depends_on_documents:
+            continue
+        template = registry.documents.get(doc_key)
+        types = sorted(set(template.di_types if template and template.di_types else ()) | {doc_key})
+        carried = connection.execute(
+            text("SELECT EXISTS (SELECT 1 FROM auditcore.evidence e "
+                 "JOIN auditcore.journey_document_extracted_fields f "
+                 "  ON f.tenant_id=e.tenant_id AND f.di_document_id=e.di_document_id AND f.field_key=:f "
+                 "WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='ACTIVE' "
+                 "  AND e.document_type_key = ANY(:types))"),
+            {"t": tenant_id, "j": journey_id, "f": field_key, "types": types},
+        ).scalar_one()
+        if not carried:
+            name = template.display_name if template else doc_key.replace("_", " ")
+            out[control.code] = (f"The {name} on file does not carry a {field_key.replace('_', ' ')} "
+                                 "field, so there is nothing to check.")
     return out
 
 

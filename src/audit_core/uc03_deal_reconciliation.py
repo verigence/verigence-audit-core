@@ -68,6 +68,7 @@ from audit_core.uc03_sku_candidates import (
     sync_price_master_in_force_task,
     sync_sku_in_price_master_task,
 )
+from audit_core.uc03_vehicle_rc import exchange_rc_on_file
 from audit_core.workflow import cancel_workflow_task, create_workflow_task
 
 logger = logging.getLogger(__name__)
@@ -369,7 +370,11 @@ def _json(value: Any) -> dict[str, Any]:
 
 def _old_vehicle_facts(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, str]]:
     """The old vehicle's make and model as the RC, the valuation report or the
-    scrappage COD on file print them (one entry per document)."""
+    scrappage COD on file print them (one entry per document). The car
+    sold's own RC (a temporary registration, say) is not an old vehicle
+    (uc03_vehicle_rc, 2026-10-28)."""
+    from audit_core.uc03_vehicle_rc import new_vehicle_rc_sql
+
     rows = connection.execute(
         text(
             """
@@ -380,6 +385,7 @@ def _old_vehicle_facts(connection: Connection, *, tenant_id: str, journey_id: UU
             WHERE e.tenant_id = :t AND e.journey_id = :j AND e.association_status = 'ACTIVE'
               AND e.document_type_key = ANY(:types)
               AND f.field_key = ANY(:fields)
+              AND NOT """ + new_vehicle_rc_sql("e") + """
             """
         ),
         {"t": tenant_id, "j": journey_id, "types": list(_OLD_VEHICLE_DOCUMENTS),
@@ -1531,9 +1537,9 @@ def _sync_conditional_discount_evidence(
             status = "NOT_REQUIRED"
         elif claimed is None:
             status = "PENDING"
-        elif _has_active_document(
-            connection, tenant_id=tenant_id, journey_id=journey_id, document_type_key=required_document
-        ):
+        elif (exchange_rc_on_file(connection, tenant_id=tenant_id, journey_id=journey_id)
+              if required_document == "vehicle_rc" else _has_active_document(
+                  connection, tenant_id=tenant_id, journey_id=journey_id, document_type_key=required_document)):
             status = "VERIFIED"
         else:
             status = "MISSING"

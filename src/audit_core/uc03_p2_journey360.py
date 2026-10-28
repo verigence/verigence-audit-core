@@ -1012,13 +1012,17 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     )
     if standard_unavailable:
         lines = [{**dict(r), "standard_amount": None} for r in lines]
+    from audit_core.uc03_vehicle_rc import new_vehicle_rc_sql
+
     proof_on_file = {
         str(r[0]) for r in connection.execute(
             text(
                 """
-                SELECT DISTINCT document_type_key FROM auditcore.evidence
-                WHERE tenant_id=:t AND journey_id=:j AND association_status='ACTIVE'
-                  AND document_type_key IS NOT NULL
+                SELECT DISTINCT e.document_type_key FROM auditcore.evidence e
+                WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='ACTIVE'
+                  AND e.document_type_key IS NOT NULL
+                  -- the car sold's own RC proves no exchange (uc03_vehicle_rc)
+                  AND NOT """ + new_vehicle_rc_sql("e") + """
                 """
             ),
             params,
