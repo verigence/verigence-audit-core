@@ -3,7 +3,8 @@ dashboard (outcomes, reasons in plain words, processing time, failed list)
 (product owner 2026-10-27). Real Postgres."""
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 from conftest import delete_tenant_data
@@ -70,9 +71,11 @@ def test_sessions_only_lengthen():
 
 def test_engagement_by_day_week_and_month(journey):
     today = ist_today()
-    now = datetime.now(UTC)
+    # Fixed at 10:00 India time: "90 minutes ago" fell on the day before
+    # between midnight and 01:30 IST and the day lost a session.
+    s1 = datetime.combine(today, time(10, 0), tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(UTC)
+    now = s1 + timedelta(minutes=90)
     caller = Caller(actor_id=journey.actor_id, role="PC")
-    s1 = (now - timedelta(minutes=90)).replace(microsecond=0)
     sessions = [
         {"start": s1.isoformat(), "end": (s1 + timedelta(minutes=40)).isoformat(), "activeSeconds": 1800},
         {"start": (s1 + timedelta(minutes=75)).isoformat(), "end": (s1 + timedelta(minutes=85)).isoformat(),
@@ -127,8 +130,9 @@ def test_engagement_gives_each_days_first_and_last_activity(journey):
     """Product owner 2026-10-27: crisp figures first, such as who started first
     and finished last each day; the page ranks people from these."""
     today = ist_today()
-    now = datetime.now(UTC)
-    start = now.replace(microsecond=0) - timedelta(hours=3)
+    # Fixed at 10:00 India time: "3 hours ago" is the day before after midnight IST.
+    start = datetime.combine(today, time(10, 0), tzinfo=ZoneInfo("Asia/Kolkata")).astimezone(UTC)
+    now = start + timedelta(hours=3)
     people = (("pc-early", 900, 0, 60), ("pc-mid", 3600, 30, 90), ("pc-late", 7200, 45, 150))
     with _db(journey) as c:
         for actor, seconds, begin, end in people:
