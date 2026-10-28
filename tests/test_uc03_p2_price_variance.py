@@ -3,11 +3,17 @@ the worker on the Journey's runtime row (real Postgres)."""
 from __future__ import annotations
 
 from decimal import Decimal
+from uuid import uuid4
 
 import pytest
 from conftest import delete_tenant_data
 from fastapi.testclient import TestClient
-from p2_support import AllowAllAuthorization, create_p2_journey, database_engine
+from p2_support import (
+    AllowAllAuthorization,
+    add_evidence,
+    create_p2_journey,
+    database_engine,
+)
 from sqlalchemy import text
 from test_uc03_p2_journey360 import _seed_deal
 
@@ -21,11 +27,16 @@ from audit_core.security_authorization import get_security_authorization_client
 from audit_core.uc03_p2_journey360 import deal
 from audit_core.uc03_p2_runtime import note_facts_changed
 
+_DELIVERY_EVIDENCE: dict = {}
+
 
 @pytest.fixture
 def journey():
     engine = database_engine()
     created = create_p2_journey(engine, prefix="p2pv")
+    # The list shows a variance only once delivery has started (2026-10-28).
+    _DELIVERY_EVIDENCE[created.journey_id] = add_evidence(
+        created, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
     app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=created.actor_id)
     app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization()
     price_variance._backfill_tried.clear()
@@ -198,3 +209,23 @@ def test_a_deal_that_cannot_be_built_is_not_retried_until_its_facts_move(journey
     monkeypatch.undo()
     assert price_variance.backfill_price_variance(journey.engine, tenant_id=journey.tenant_id) == 1
     assert _stored(journey) == 5000
+
+
+def test_the_list_shows_no_variance_until_delivery_has_started(journey):
+    """Product owner 2026-10-28: "Variance should be shown only for the journey
+    for which Delivery has started"."""
+    _seed_deal(journey)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        price_variance.refresh_price_variance(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        connection.execute(text("UPDATE auditcore.evidence SET association_status='VOIDED' WHERE evidence_id=:e"),
+                           {"e": _DELIVERY_EVIDENCE[journey.journey_id]})
+        view = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert view["summary"]["deliveryStarted"] is False
+    assert _listed(journey) is None
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.evidence SET association_status='ACTIVE' WHERE evidence_id=:e"),
+                           {"e": _DELIVERY_EVIDENCE[journey.journey_id]})
+        assert deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["summary"]["deliveryStarted"]
+    assert _listed(journey) is not None

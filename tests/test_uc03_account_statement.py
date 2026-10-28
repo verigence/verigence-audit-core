@@ -13,7 +13,7 @@ import json
 import re
 from decimal import Decimal
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from conftest import delete_tenant_data
@@ -526,3 +526,142 @@ def test_rebuild_dry_run_writes_nothing_and_commit_sets_the_deal(journey) -> Non
     assert done["invoiceHeldAfter"] == 0
     assert _lines(journey)["ex_showroom_price"][0] == D(1797001)
     assert run(True)["invoiceHeldBefore"] == 0  # a second run has nothing left to clear
+
+
+# ── the cost sheet (product owner 2026-10-28) ────────────────────────────────
+# The Utkal NDC the product owner sent (Keonjhar, Bolero Neo): the figures as
+# printed on the "Account Statement" form.
+UTKAL_NDC = [
+    {"particulars_raw": "Ex Showroom", "debit_amount": 999899}, {"particulars_raw": "Registration", "debit_amount": 82232},
+    {"particulars_raw": "Insurance", "debit_amount": 40825}, {"particulars_raw": "Ext. Warranty", "debit_amount": 9999},
+    {"particulars_raw": "RSA", "debit_amount": 2021}, {"particulars_raw": "Accessories", "debit_amount": 37559},
+    {"particulars_raw": "Fast Tag", "debit_amount": 500}, {"particulars_raw": "Cash", "credit_amount": 200},
+    {"particulars_raw": "Online transfer", "credit_amount": 417850}, {"particulars_raw": "Bank DO", "credit_amount": 750000},
+]
+UTKAL_NDC_FIELDS = {"discount_value": "5000", "net_value": "1168095"}
+AGREEING_SHEET = {"ex_showroom_price": "999899", "rto_amount": "82232", "insurance_amount": "40825",
+                  "accessories_amount": "37500", "discount_amount": "5000", "total_on_road_price": "1168095"}
+
+
+def test_the_cost_sheet_is_read_onto_the_deal_lines_it_prices() -> None:
+    sheet = module.read_cost_sheet({"ex_showroom_price": "9,99,899", "rto_amount": "82232", "insurance_amount": "0",
+                                    "accessories_amount": None, "discount_amount": "-5000",
+                                    "total_on_road_price": "1168095"})
+    assert sheet.components == {"ex_showroom_price": D(999899), "registration_charges": D(82232)}
+    assert sheet.discount_total == D(5000) and sheet.total == D(1168095)
+
+
+def test_cost_sheet_and_ndc_differ_only_beyond_rs_100_on_lines_both_print() -> None:
+    statement = read_statement(UTKAL_NDC)
+    # accessories Rs 59 apart: within the tolerance
+    assert module.cost_sheet_differences(statement, UTKAL_NDC_FIELDS, module.read_cost_sheet(AGREEING_SHEET)) == []
+    differing = module.read_cost_sheet({**AGREEING_SHEET, "insurance_amount": "40000", "total_on_road_price": "1167270"})
+    rows = module.cost_sheet_differences(statement, UTKAL_NDC_FIELDS, differing)
+    assert [(r["line"], r["ndc"], r["costSheet"], r["difference"]) for r in rows] == [
+        ("insurance_amount", D(40825), D(40000), D(825)), ("net_total", D(1168095), D(1167270), D(825))]
+    # a line only the cost sheet prints is not a difference
+    only_sheet = module.read_cost_sheet({"ex_showroom_price": "999899", "discount_amount": "9000"})
+    assert module.cost_sheet_differences(read_statement(UTKAL_NDC), {}, only_sheet) == []
+
+
+def _cost_sheet(journey, fields: dict) -> UUID:
+    document_id = uuid4()
+    add_evidence(journey, di_document_id=document_id, document_type_key="cost_sheet", process_area="DELIVERY")
+    for key, value in fields.items():
+        add_extracted_field(journey, di_document_id=document_id, field_key=key, value=value, document_type="cost_sheet")
+    return document_id
+
+
+def _ndc(journey) -> None:
+    document_id, _ = _ledger(journey, UTKAL_NDC)
+    for key, value in UTKAL_NDC_FIELDS.items():
+        add_extracted_field(journey, di_document_id=document_id, field_key=key, value=value,
+                            document_type="customer_ledger")
+
+
+def _difference_task(journey) -> dict | None:
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        row = c.execute(
+            text("SELECT task_id, task_status, severity, assigned_role_code, allowed_actions, description "
+                 "FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j AND task_type=:type"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "type": module.COST_SHEET_DIFFERENCE_TASK},
+        ).mappings().one_or_none()
+    return dict(row) if row else None
+
+
+def test_cost_sheet_and_ndc_that_differ_raise_one_high_task_the_pc_closes_with_a_comment(journey) -> None:
+    from audit_core.uc03_p2_tasks import submit_action
+
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _ndc(journey)
+    _cost_sheet(journey, {**AGREEING_SHEET, "insurance_amount": "40000"})
+    result = _sync(journey)
+    assert result["costSheetDifferences"] == 1
+    task = _difference_task(journey)
+    assert task["task_status"] == "READY" and task["severity"] == "HIGH" and task["assigned_role_code"] == "PC"
+    assert "CLOSE_TASK" in task["allowed_actions"]
+    assert "Insurance: NDC Rs 40,825, cost sheet Rs 40,000" in task["description"]
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        with pytest.raises(ValueError):
+            submit_action(c, tenant_id=journey.tenant_id, task_id=task["task_id"], action="CLOSE_TASK",
+                          actor_id="pc-1", actor_role_code="PC", comment="  ")
+        submit_action(c, tenant_id=journey.tenant_id, task_id=task["task_id"], action="CLOSE_TASK",
+                      actor_id="pc-1", actor_role_code="PC", comment="Insurance revised after the cost sheet.")
+    _sync(journey)  # the same difference does not reopen it
+    assert _difference_task(journey)["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_cost_sheet_and_ndc_that_agree_raise_nothing_and_an_open_task_closes(journey) -> None:
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _ndc(journey)
+    sheet_id = _cost_sheet(journey, {**AGREEING_SHEET, "insurance_amount": "40000"})
+    _sync(journey)
+    assert _difference_task(journey)["task_status"] == "READY"
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("UPDATE auditcore.journey_document_extracted_fields SET effective_value=to_jsonb('40825'::text) "
+                       "WHERE tenant_id=:t AND di_document_id=:d AND field_key='insurance_amount'"),
+                  {"t": journey.tenant_id, "d": sheet_id})
+    _sync(journey)
+    assert _difference_task(journey)["task_status"] not in ("READY", "IN_PROGRESS")
+
+
+def test_with_no_ndc_the_deal_takes_the_cost_sheet_and_with_one_the_ndc(journey) -> None:
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _cost_sheet(journey, {**AGREEING_SHEET, "ex_showroom_price": "990000"})
+    _sync(journey)
+    rows = _deal_rows(journey)
+    assert D(str(rows["ex_showroom_price"]["billed"])) == D(990000)
+    assert D(str(rows["accessories_cost"]["billed"])) == D(37500)
+    assert any(s["document"] == "Cost sheet (no NDC on file)" for s in rows["ex_showroom_price"]["sources"])
+    assert _difference_task(journey) is None
+    _ndc(journey)
+    _sync(journey)
+    rows = _deal_rows(journey)
+    assert D(str(rows["ex_showroom_price"]["billed"])) == D(999899)  # the NDC's
+    assert D(str(rows["ex_showroom_price"]["quote"])) == D(990000)  # the cost sheet, beside it
+    assert any(s["document"] == "NDC (Account Statement)" for s in rows["ex_showroom_price"]["sources"])
+
+
+def test_migration_0176_cancels_the_retired_ndc_signature_question(journey) -> None:
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_task_producer import raise_or_refresh
+
+    path = Path(__file__).resolve().parent.parent / "migrations" / "versions" / "0176_retire_ndc_signature.py"
+    spec = importlib.util.spec_from_file_location("m0176", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        task_id, _ = raise_or_refresh(
+            c, tenant_id=journey.tenant_id, journey_id=journey.journey_id, dedupe_key=f"ndc:{journey.journey_id}",
+            task_type="PC_CONFIRMATION", source_type="CONTROL", source_code="NDC_SIGNATURE_UNCONFIRMED",
+            title="Confirm the No Dues Certificate was signed in your presence", description="x",
+            reference={}, severity="MEDIUM", registry=get_registry())
+        migration._retire(c)
+        status, result = c.execute(text("SELECT task_status, completion_result FROM auditcore.p2_tasks "
+                                        "WHERE tenant_id=:t AND task_id=:id"),
+                                   {"t": journey.tenant_id, "id": task_id}).one()
+    assert status == "CANCELLED" and result["outcome"] == "CHECK_RETIRED"

@@ -751,6 +751,30 @@ def _stage_gates(connection: Connection, registry: Registry, *, stage: str, tena
     return gates
 
 
+# Delivery has started once a delivery document is on the Journey or a delivery
+# is recorded. The Deal's variance is shown, and the "deal below standard"
+# finding raised, only from then on (product owner 2026-10-28: "Variance should
+# be shown only for the journey for which Delivery has started").
+DELIVERY_STARTED_SQL = """
+    EXISTS (
+      SELECT 1 FROM auditcore.evidence e
+      WHERE e.tenant_id={t} AND e.journey_id={j}
+        AND e.association_status='ACTIVE'
+        AND upper(COALESCE(e.process_area,''))='DELIVERY'
+    ) OR EXISTS (
+      SELECT 1 FROM auditcore.deliveries d
+      WHERE d.tenant_id={t} AND d.journey_id={j}
+    )
+"""
+
+
+def delivery_has_started(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    return bool(connection.execute(
+        text("SELECT " + DELIVERY_STARTED_SQL.format(t=":tenant_id", j=":journey_id")),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one())
+
+
 def recompute_journey_stage(
     connection: Connection,
     *,
@@ -800,24 +824,7 @@ def recompute_journey_stage(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id, "states": list(_IN_FLIGHT)},
     ).scalar_one())
-    delivery_started = bool(
-        connection.execute(
-            text(
-                """
-                SELECT EXISTS (
-                  SELECT 1 FROM auditcore.evidence e
-                  WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id
-                    AND e.association_status='ACTIVE'
-                    AND upper(COALESCE(e.process_area,''))='DELIVERY'
-                ) OR EXISTS (
-                  SELECT 1 FROM auditcore.deliveries d
-                  WHERE d.tenant_id=:tenant_id AND d.journey_id=:journey_id
-                )
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one()
-    )
+    delivery_started = delivery_has_started(connection, tenant_id=tenant_id, journey_id=journey_id)
     delivery_gates = _stage_gates(connection, registry, stage="DELIVERY", tenant_id=tenant_id,
                                   journey_id=journey_id, minimum=minimum, reasons=reasons)
     docs_gate = delivery_gates.get("REQUIRED_DOCUMENTS") or {"passed": False}

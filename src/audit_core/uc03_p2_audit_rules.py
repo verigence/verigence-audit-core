@@ -18,7 +18,6 @@ and answer the questions a manual deal audit asks:
   Third-party payer        THIRD_PARTY_PAYMENT_UNCONFIRMED (PC question),
                            THIRD_PARTY_PAYMENT_UNDECLARED (TL violation)
   Cash intimation          CASH_INTIMATION_UNCONFIRMED (PC question), CASH_NOT_INTIMATED
-  NDC signature            NDC_SIGNATURE_UNCONFIRMED (PC question), NDC_NOT_SIGNED
   Accessories fitted       ACCESSORIES_FITTED_UNCONFIRMED (PC question), ACCESSORY_FITTED_UNBILLED
   Delivery in time         DELIVERY_NOT_COMPLETED_IN_TIME  complete within N days of the printed date
 
@@ -1126,58 +1125,6 @@ def cash_not_intimated(facts: _Facts) -> RuleOutcome:
     return RuleOutcome(code, "PASS", "Cash collections were intimated." if rows else "No cash received on this deal.")
 
 
-_NDC_ANSWERS = [
-    {"value": "YES", "label": "Signed by the customer in my presence"},
-    {"value": "NOT_WITNESSED", "label": "Signed, but not in my presence", "requiresComment": True},
-    {"value": "NO", "label": "Not signed by the customer", "requiresComment": True},
-]
-
-
-def _ndc_unsigned_by_reading(docs: list[dict[str, Any]]) -> bool:
-    """True when the document service read the NDC and found no customer signature."""
-    for doc in docs:
-        value = doc["fields"].get("customer_signature_present")
-        if value is not None and str(value).strip().lower() in {"false", "no", "0", "absent"}:
-            return True
-    return False
-
-
-def ndc_signature_unconfirmed(facts: _Facts) -> RuleOutcome:
-    code = "NDC_SIGNATURE_UNCONFIRMED"
-    docs = facts.documents("no_dues_certificate")
-    if not docs:
-        return RuleOutcome(code, "SKIPPED", "The No Dues Certificate has not been uploaded yet.")
-    return _question(
-        facts, code, subjects=[d["linkedAtUtc"] for d in docs], none="",
-        title="Confirm the No Dues Certificate was signed in your presence",
-        question="Did the customer sign the No Dues Certificate, and was it signed in your presence?",
-        answers=_NDC_ANSWERS, details={"documentIds": [d["documentId"] for d in docs]},
-    )
-
-
-def ndc_not_signed(facts: _Facts) -> RuleOutcome:
-    code = "NDC_NOT_SIGNED"
-    docs = facts.documents("no_dues_certificate")
-    if not docs:
-        return RuleOutcome(code, "SKIPPED", "The No Dues Certificate has not been uploaded yet.")
-    details = {"documentIds": [d["documentId"] for d in docs]}
-    if _ndc_unsigned_by_reading(docs):
-        return RuleOutcome(code, "FAIL", "The No Dues Certificate carries no customer signature (read from the "
-                                         "document).", {"findingTitle": "No Dues Certificate not signed", **details})
-    answer = _answered(facts, "NDC_SIGNATURE_UNCONFIRMED", [d["linkedAtUtc"] for d in docs])
-    if answer and answer["value"] == "NO":
-        return RuleOutcome(code, "FAIL", f"The No Dues Certificate was not signed by the customer (confirmed on "
-                                         f"{_when(answer['at'])}){_remark(answer)}.",
-                           {"findingTitle": "No Dues Certificate not signed", **details})
-    if answer and answer["value"] == "NOT_WITNESSED":
-        return RuleOutcome(code, "FAIL", f"The No Dues Certificate was signed, but not in the auditor's presence "
-                                         f"(confirmed on {_when(answer['at'])}){_remark(answer)}.",
-                           {"findingTitle": "No Dues Certificate not signed in the auditor's presence", **details})
-    if answer is None:
-        return RuleOutcome(code, "SKIPPED", "Waiting for the PC to confirm how the No Dues Certificate was signed.")
-    return RuleOutcome(code, "PASS", f"Signed by the customer in the auditor's presence (confirmed on {_when(answer['at'])}){_remark(answer)}.")
-
-
 def delivery_not_completed_in_time(facts: _Facts) -> RuleOutcome:
     code = "DELIVERY_NOT_COMPLETED_IN_TIME"
     clock = facts.delivery_clock
@@ -1299,7 +1246,7 @@ _DELIVERY_RULES = (
     delivered_on_short_payment, receipts_equal_invoices, payment_after_delivery_within_grace, payment_after_delivery_beyond_grace,
     do_payment_not_received, do_short_payment,
     trade_in_not_resold, trade_in_sold_at_loss, post_delivery_refund,
-    ndc_signature_unconfirmed, ndc_not_signed, accessories_fitted_unconfirmed, accessory_fitted_unbilled,
+    accessories_fitted_unconfirmed, accessory_fitted_unbilled,
     delivery_not_completed_in_time,
 )
 RULE_CODES = {
@@ -1314,7 +1261,7 @@ _FINDING_TYPES = {
     "DEAL_UNDERCHARGED": "PRICING_ANOMALY", "TCS_SHORT": "PRICING_ANOMALY", "EXCESS_DISCOUNT": "DISCOUNT_ANOMALY",
     "TRADE_IN_NOT_RESOLD": "COMMERCIAL_EXCEPTION", "TRADE_IN_SOLD_AT_LOSS": "COMMERCIAL_EXCEPTION",
     "DELIVERY_NOT_COMPLETED_IN_TIME": "DELIVERY_EXCEPTION",
-    "NDC_NOT_SIGNED": "PROCESS_NON_COMPLIANCE", "ACCESSORY_FITTED_UNBILLED": "PROCESS_NON_COMPLIANCE",
+    "ACCESSORY_FITTED_UNBILLED": "PROCESS_NON_COMPLIANCE",
     "SELF_INSURANCE_DECLARED": "COMMERCIAL_EXCEPTION",
 }
 _DEFAULT_FINDING_TYPE = "PAYMENT_EXCEPTION"

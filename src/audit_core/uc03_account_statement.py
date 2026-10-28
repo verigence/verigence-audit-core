@@ -32,6 +32,15 @@ leaves that line blank rather than putting a figure on the wrong line.
 Tally validation: when a Tally ledger and a statement are both on file for one
 Journey, the Tally's vehicle posting, finance D/O and insurance posting must
 agree with the statement; a deviation raises a CRITICAL task.
+
+THE COST SHEET (product owner, 2026-10-28). This Project calls the account
+statement the NDC. "Depending upon which is available cost sheet or NDC you can
+pick any one": a Journey with no NDC takes its billed figures from the cost
+sheet instead (the Deal shows them as the cost sheet's). "If both are available
+do value check and if any difference raise a consolidated task of high
+priority" -- information only, the PC closes it with a comment
+(COST_SHEET_NDC_DIFFERENCE). A difference is more than Rs 100 on a line both
+documents print.
 """
 from __future__ import annotations
 
@@ -64,6 +73,8 @@ TOLERANCE = Decimal(100)  # the product owner's price tolerance
 
 NO_EX_SHOWROOM_TASK = "ACCOUNT_STATEMENT_NO_EX_SHOWROOM"
 TALLY_DEVIATION_TASK = "ACCOUNT_STATEMENT_TALLY_DEVIATION"
+COST_SHEET_DIFFERENCE_TASK = "COST_SHEET_NDC_DIFFERENCE"
+COST_SHEET_TYPE = "cost_sheet"
 
 _WS = re.compile(r"\s+")
 
@@ -303,10 +314,88 @@ def tally_deviations(statement: StatementRead, tally: dict[str, Decimal]) -> lis
     return out
 
 
+# ── the cost sheet (pure) ────────────────────────────────────────────────────
+# Cost sheet field (DI cost_sheet schema 1.0) -> the Deal line it prices.
+_COST_SHEET_COMPONENTS: tuple[tuple[str, str], ...] = (
+    ("ex_showroom_price", "ex_showroom_price"),
+    ("rto_amount", "registration_charges"),
+    ("insurance_amount", "insurance_amount"),
+    ("accessories_amount", "accessories_cost"),
+)
+_LINE_LABELS = {
+    "ex_showroom_price": "Ex-showroom price",
+    "registration_charges": "Registration / RTO",
+    "insurance_amount": "Insurance",
+    "accessories_cost": "Accessories",
+    "discount_total": "Total discount",
+    "net_total": "Net payable",
+}
+
+
+@dataclass
+class CostSheetRead:
+    components: dict[str, Decimal] = field(default_factory=dict)
+    # one figure for every discount and the on-road total, as printed
+    discount_total: Decimal | None = None
+    total: Decimal | None = None
+
+
+def read_cost_sheet(fields: dict[str, Any]) -> CostSheetRead:
+    """The cost sheet's figures as printed; a blank or zero box is not a figure."""
+    out = CostSheetRead()
+    for field_key, component in _COST_SHEET_COMPONENTS:
+        amount = _amount(fields.get(field_key))
+        if amount is not None and amount > 0:
+            out.components[component] = amount
+    discount = _amount(fields.get("discount_amount"))
+    out.discount_total = abs(discount) if discount not in (None, Decimal(0)) else None
+    total = _amount(fields.get("total_on_road_price"))
+    out.total = total if total is not None and total > 0 else None
+    return out
+
+
+def _statement_discount_total(fields: dict[str, Any], statement: StatementRead) -> Decimal | None:
+    """The statement's discount as one figure: the Less: Discount / Discount
+    Details total it prints, else its discount lines added up; None when it
+    gives none."""
+    for key in ("discount_value", "discount_details_total"):
+        printed = _amount(fields.get(key))
+        if printed is not None and printed > 0:
+            return printed
+    return sum(statement.discounts.values(), Decimal(0)) if statement.discounts else None
+
+
+def cost_sheet_differences(
+    statement: StatementRead, statement_fields: dict[str, Any], sheet: CostSheetRead,
+) -> list[dict[str, Any]]:
+    """Every line both the NDC and the cost sheet print that differs by more
+    than Rs 100. A line only one of them prints is not a difference."""
+    pairs: list[tuple[str, Decimal | None, Decimal | None]] = [
+        (key, statement.components.get(key), sheet.components.get(key)) for _, key in _COST_SHEET_COMPONENTS
+    ]
+    pairs.append(("discount_total", _statement_discount_total(statement_fields, statement), sheet.discount_total))
+    pairs.append(("net_total", statement_total(statement_fields, statement), sheet.total))
+    out: list[dict[str, Any]] = []
+    for key, ndc, cost_sheet in pairs:
+        if ndc is None or cost_sheet is None or abs(ndc - cost_sheet) <= TOLERANCE:
+            continue
+        out.append({"line": key, "label": _LINE_LABELS[key], "ndc": ndc, "costSheet": cost_sheet,
+                    "difference": ndc - cost_sheet})
+    return out
+
+
+def _difference_text(rows: list[dict[str, Any]]) -> str:
+    def rupees(value: Decimal) -> str:
+        return f"Rs {value:,.0f}"
+    return "; ".join(f"{r['label']}: NDC {rupees(r['ndc'])}, cost sheet {rupees(r['costSheet'])}" for r in rows)
+
+
 # ── the journey ──────────────────────────────────────────────────────────────
-def load_ledger_documents(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
-    """Every ACTIVE customer_ledger document of the Journey, newest first, with
-    its fields as the PC left them."""
+def load_ledger_documents(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, document_type: str = ACCOUNT_STATEMENT_TYPE,
+) -> list[dict[str, Any]]:
+    """Every ACTIVE document of this type (the customer ledger unless told
+    otherwise) of the Journey, newest first, with its fields as the PC left them."""
     rows = connection.execute(
         text(
             """
@@ -319,7 +408,7 @@ def load_ledger_documents(connection: Connection, *, tenant_id: str, journey_id:
             ORDER BY e.linked_at_utc DESC, e.di_document_id, f.field_key, f.source_fact_version
             """
         ),
-        {"t": tenant_id, "j": journey_id, "type": ACCOUNT_STATEMENT_TYPE},
+        {"t": tenant_id, "j": journey_id, "type": document_type},
     ).mappings().all()
     documents: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -473,7 +562,7 @@ def _task_key(kind: str, journey_id: UUID) -> str:
 
 def _raise_task(
     connection: Connection, *, tenant_id: str, journey_id: UUID, task_type: str, title: str, description: str,
-    reference: dict[str, Any],
+    reference: dict[str, Any], severity: str = "CRITICAL",
 ) -> None:
     from audit_core.uc03_p2_registry import get_registry
     from audit_core.uc03_p2_task_producer import raise_or_refresh
@@ -481,7 +570,7 @@ def _raise_task(
     raise_or_refresh(
         connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=_task_key(task_type, journey_id),
         task_type=task_type, source_type="RESOLVER", source_code=task_type, title=title,
-        description=description, reference={"sourceCode": task_type, **reference}, severity="CRITICAL",
+        description=description, reference={"sourceCode": task_type, **reference}, severity=severity,
         registry=get_registry(),
     )
 
@@ -554,6 +643,39 @@ def sync_account_statement(
     _stale_statement_rows(connection, tenant_id=tenant_id, journey_id=journey_id,
                           keep_components=keep_components, keep_discounts=keep_discounts)
 
+    # The cost sheet: its lines are recorded for the Deal (shown as the cost
+    # sheet's, standing in the billed column only when no NDC is on file -- see
+    # uc03_p2_journey360), and compared with the NDC when both are in.
+    sheets = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                   document_type=COST_SHEET_TYPE)
+    sheet = read_cost_sheet(sheets[0]["fields"]) if sheets else None
+    if sheet is not None:
+        for key, amount in sorted(sheet.components.items()):
+            record_source_value(
+                connection, tenant_id=tenant_id, journey_id=journey_id, line_kind="COMMERCIAL", component_key=key,
+                source_document_type=COST_SHEET_TYPE, amount=amount, evidence_id=sheets[0]["evidenceId"],
+                document_id=sheets[0]["documentId"],
+            )
+    differences = (cost_sheet_differences(statement, document["fields"], sheet)
+                   if statement is not None and document is not None and sheet is not None else [])
+    if differences:
+        _raise_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id, task_type=COST_SHEET_DIFFERENCE_TASK,
+            title="Cost sheet and NDC differ",
+            description=(
+                "The cost sheet and the NDC (account statement) on this booking differ by more than Rs 100 on: "
+                + _difference_text(differences) + ". For information: the NDC is the Deal's figure. Check which is "
+                "right and close this task with a comment."
+            ),
+            reference=_json_amounts({"differences": differences,
+                                     "ndcDocumentId": str(document["documentId"]) if document else None,
+                                     "costSheetDocumentId": str(sheets[0]["documentId"]) if sheets else None}),
+            severity="HIGH",
+        )
+    else:
+        _resolve_task(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=COST_SHEET_DIFFERENCE_TASK,
+                      evidence={"ndcOnFile": statement is not None, "costSheetOnFile": sheet is not None})
+
     # A statement is on file but its vehicle line was not read: CRITICAL, and it
     # says which lines were read (the Deal has no ex-showroom for this Journey).
     if statement is not None and "ex_showroom_price" not in statement.components:
@@ -596,13 +718,15 @@ def sync_account_statement(
         statements=len(forms), tallies=len(tallies), components=len(keep_components), discounts=len(keep_discounts),
         unmapped=len(statement.unmapped) if statement else 0, conflicts=len(statement.conflicts) if statement else 0,
         invoice_actuals_cleared=cleared, tally_deviations=len(deviations),
+        cost_sheets=len(sheets), cost_sheet_differences=len(differences),
     )
     # commercialLines / discountApplications are the keys the invoice path
     # returns, which its callers read.
     return {"commercialLines": lines_written, "discountApplications": discounts_written,
             "statements": len(forms), "tallies": len(tallies), "invoiceActualsCleared": cleared,
             "unmapped": len(statement.unmapped) if statement else 0,
-            "conflicts": len(statement.conflicts) if statement else 0, "tallyDeviations": len(deviations)}
+            "conflicts": len(statement.conflicts) if statement else 0, "tallyDeviations": len(deviations),
+            "costSheetDifferences": len(differences)}
 
 
 def sync_if_source_of_truth(
@@ -618,6 +742,8 @@ def sync_if_source_of_truth(
 
 
 __all__ = [
+    "COST_SHEET_DIFFERENCE_TASK",
+    "COST_SHEET_TYPE",
     "KIND_ERP",
     "KIND_FORM",
     "KIND_TALLY",
@@ -625,9 +751,12 @@ __all__ = [
     "NO_EX_SHOWROOM_TASK",
     "ORIGIN",
     "TALLY_DEVIATION_TASK",
+    "CostSheetRead",
     "StatementRead",
+    "cost_sheet_differences",
     "line_rows",
     "load_ledger_documents",
+    "read_cost_sheet",
     "read_statement",
     "statement_kind",
     "sync_account_statement",

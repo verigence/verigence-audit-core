@@ -117,6 +117,14 @@ def journey():
                         now(), now(), 1)"""),
             {"t": tenant_id, "j": journey_id},
         )
+        # Delivery has started: the deal is compared with the standard only
+        # from then on (product owner 2026-10-28).
+        c.execute(
+            text("""INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
+                document_type_key, evidence_purpose, process_area, association_status)
+                VALUES (:t, :j, :c, :s, :d, 'gate_pass', 'JOURNEY_DOCUMENT', 'DELIVERY', 'ACTIVE')"""),
+            {"t": tenant_id, "j": journey_id, "c": customer_id, "s": uuid4(), "d": uuid4()},
+        )
     engine.dispose()
     engine = create_engine(database_url)
     try:
@@ -774,6 +782,27 @@ def test_negative_variance_raises_high_finding_and_tl_task(journey) -> None:
     ).mappings().one()
     assert task["task_type"] == "DEAL_TOTAL_VARIANCE_REVIEW"
     assert task["assigned_role_code"] == "TL"
+
+
+def test_no_shortfall_finding_before_delivery_has_started(journey) -> None:
+    """Product owner 2026-10-28: variance only for a Journey whose delivery has started."""
+    c = journey
+    c.execute(text("UPDATE auditcore.evidence SET association_status='VOIDED' "
+                   "WHERE tenant_id=:t AND journey_id=:j AND process_area='DELIVERY'"),
+              {"t": c.tenant_id, "j": c.journey_id})
+    _seed_pinned_sku(c, model="THAR", variant="LX", components={"EX_SHOWROOM": "1500000"})
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    c.execute(
+        text("UPDATE auditcore.commercial_lines SET actual_amount=1400000, source_reference='booking_form:test' "
+             "WHERE tenant_id=:t AND journey_id=:j AND component_key='ex_showroom_price'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    )
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert c.execute(
+        text("SELECT count(*) FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j "
+             "AND rule_key='DEAL_TOTAL_VARIANCE_NEGATIVE' AND finding_status='OPEN'"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one() == 0
 
 
 def test_negative_variance_resolves_once_corrected(journey) -> None:

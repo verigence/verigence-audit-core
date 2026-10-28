@@ -1628,6 +1628,11 @@ def _sync_total_variance(
 
     summary = deal_sheet(connection, tenant_id=tenant_id, journey_id=journey_id).get("summary") or {}
     variance = _to_decimal((summary.get("variance") or {}).get("currentVsStandard"))
+    if summary.get("deliveryStarted") is False:
+        # Variance counts only once delivery has started (product owner 2026-10-28).
+        _close_total_variance(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
+                              note="The deal is compared with the standard once delivery has started.")
+        return {"skipped": True, "reason": "delivery_not_started"}
     if variance is None:
         _close_total_variance(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
                               note="The deal has no standard to compare with yet.")

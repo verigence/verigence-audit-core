@@ -1,10 +1,11 @@
-# Phase 2 control catalog: 51 Audit Core controls (26 active controls and 25 deal-audit
+# Phase 2 control catalog: 49 Audit Core controls (26 active controls and 23 deal-audit
 # checks in uc03_p2_audit_rules.py; the "Manual Observations" ones are answered by a
 # PC, TL or PM rather than read from documents) and 40 enabled Rule Engine rules
 # (blueprint v2.2 sections 9-10; six master-total rules retired on 28 Sep 2026 in favour of
 # the per-line DEAL_UNDERCHARGED / EXCESS_DISCOUNT and DELIVERED_ON_SHORT_PAYMENT checks;
 # BOOKING_RECEIPT_SUM_VS_BOOKING_FORM retired on 19 Oct 2026: receipts carry no stage, and
 # RECEIPTS_EQUAL_INVOICES compares all receipts with all invoices). Audit Core owns execution state for both.
+# NDC_SIGNATURE_UNCONFIRMED and NDC_NOT_SIGNED retired on 28 Oct 2026 (product owner: no question for the NDC signature).
 # mode: RERUN (native runner) | EXTERNAL (Rule Engine) | GATE (P2 stage gates)
 #       | PAGES (P2 page outcomes) | SYNC (existing document sync) | EVENT (process event)
 version: 1
@@ -1449,38 +1450,6 @@ controls:
     mode: RERUN
     phases:
     - BOOKING
-    - DELIVERY
-    category: Manual Observations
-    triggers:
-    - DOCUMENT_SYNCED
-    rerun: RERUNNABLE
-    finding_class: VIOLATION
-    severity: HIGH
-    owner: TL
-    resolution: ADJUDICATED
-    task:
-      type: FINDING_REVIEW
-      owner: TL
-  NDC_SIGNATURE_UNCONFIRMED:
-    executor: NATIVE
-    mode: RERUN
-    phases:
-    - DELIVERY
-    category: Manual Observations
-    triggers:
-    - DOCUMENT_SYNCED
-    rerun: RERUNNABLE
-    finding_class: DATA_GAP
-    severity: MEDIUM
-    owner: PC
-    resolution: SELF_SERVICE
-    task:
-      type: PC_CONFIRMATION
-      owner: PC
-  NDC_NOT_SIGNED:
-    executor: NATIVE
-    mode: RERUN
-    phases:
     - DELIVERY
     category: Manual Observations
     triggers:
