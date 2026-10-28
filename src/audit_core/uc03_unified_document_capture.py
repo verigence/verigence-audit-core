@@ -84,6 +84,7 @@ from audit_core.security_integration import SecurityOAuthClient
 from audit_core.uc03_booking_capture import _scope
 from audit_core.uc03_delivery_capture_v2 import _delivery_requirements
 from audit_core.uc03_delivery_commands import _delivery_state, ensure_delivery_started
+from audit_core.uc03_delivery_start import starts_delivery
 from audit_core.uc03_document_capture_v2 import (
     CaptureV2Document,
     UploadIntentCommand,
@@ -608,7 +609,11 @@ def apply_di_classification(
             delivery_requirements=delivery_requirements,
             document_id=document_id,
         )
-        if stage_code == "DELIVERY" and not delivery_started:
+        # A payment proof, cost sheet, GST certificate / declaration or purchase
+        # order comes with the booking as often as with the delivery: filed
+        # under the delivery, it does not start it (uc03_delivery_start).
+        if (stage_code == "DELIVERY" and not delivery_started
+                and starts_delivery(_canonical_document_type(str(classified_type or "")))):
             if _delivery_state(connection, tenant_id=tenant_id, journey_id=journey_id) is None:
                 ensure_delivery_started(
                     connection,

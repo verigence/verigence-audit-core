@@ -111,6 +111,19 @@ def _start_delivery(engine, *, tenant_id: str, journey_id) -> None:
             ),
             {"t": tenant_id, "j": journey_id},
         )
+        # Delivery starts with a delivery document (uc03_delivery_start,
+        # product owner 2026-10-28), not with the stage row alone.
+        connection.execute(
+            text(
+                """INSERT INTO auditcore.evidence (
+                    tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
+                    document_type_key, evidence_purpose, process_area
+                ) SELECT CAST(:t AS varchar), CAST(:j AS uuid), customer_id, :subject, :doc,
+                         'gate_pass', 'DELIVERY', 'DELIVERY'
+                  FROM auditcore.journeys WHERE tenant_id=CAST(:t AS varchar) AND journey_id=CAST(:j AS uuid)"""
+            ),
+            {"t": tenant_id, "j": journey_id, "subject": uuid4(), "doc": uuid4()},
+        )
 
 
 def _link_evidence(engine, *, tenant_id: str, journey_id, customer_id, document_type_key: str):

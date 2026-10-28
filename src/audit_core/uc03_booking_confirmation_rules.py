@@ -90,16 +90,11 @@ _RAISE_GATED_UNTIL_DELIVERY_STARTS = frozenset({"corporate_discount_amount", "ex
 
 
 def _delivery_started(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
-    return (
-        connection.execute(
-            text(
-                "SELECT 1 FROM auditcore.journey_stage_states "
-                "WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND stage_code='DELIVERY'"
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalar_one_or_none()
-        is not None
-    )
+    # The one rule for when a delivery has started (uc03_delivery_start): a
+    # receipt or cost sheet filed under the delivery does not start it.
+    from audit_core.uc03_delivery_start import delivery_has_started
+
+    return delivery_has_started(connection, tenant_id=tenant_id, journey_id=journey_id)
 
 
 def _confidence_percent(row: dict[str, Any]) -> float | None:

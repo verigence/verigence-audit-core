@@ -29,6 +29,8 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from audit_core.uc03_booking_confirmation_rules import _minimum_booking_amount
+from audit_core.uc03_customer_ledger import LEDGER_DI_TYPE, PAYMENT_LEDGER_NAME
+from audit_core.uc03_delivery_start import delivery_has_started
 from audit_core.uc03_duplicate_receipt_detection import (
     ReceiptRecord,
     compute_duplicate_groups,
@@ -74,8 +76,16 @@ def ready_document_count(
         # when they were uploaded (see receipt_split).
         split = receipt_split(connection, tenant_id=tenant_id, journey_id=journey_id)
         return len(split["DELIVERY" if str(template.stage).upper() == "DELIVERY" else "BOOKING"])
+    from audit_core.uc03_customer_ledger import (
+        PAYMENT_LEDGER_TEMPLATE,
+        payment_ledger_sql,
+    )
     from audit_core.uc03_vehicle_rc import new_vehicle_rc_sql
 
+    # The NDC and the customer ledger share a DI type (uc03_customer_ledger):
+    # each template counts only its own.
+    ledger = "" if not _shares_ledger_type(template) else (
+        "AND " + ("" if template.key == PAYMENT_LEDGER_TEMPLATE else "NOT ") + payment_ledger_sql("e"))
     return int(
         connection.execute(
             text(
@@ -88,6 +98,7 @@ def ready_document_count(
                   AND e.document_type_key = ANY(:document_types)
                   -- the car sold's own RC is not the exchange RC (uc03_vehicle_rc)
                   AND NOT """ + new_vehicle_rc_sql("e") + """
+                  """ + ledger + """
                   AND EXISTS (
                     SELECT 1
                     FROM auditcore.journey_document_extracted_fields f
@@ -111,18 +122,29 @@ def ready_document_count(
 _RECEIPT_TYPE = "dealer_receipt"
 
 
+def _shares_ledger_type(template: DocumentTemplate) -> bool:
+    from audit_core.uc03_customer_ledger import LEDGER_DI_TYPE
+
+    return LEDGER_DI_TYPE in template.di_types
+
+
 def ready_document_counts(
     connection: Connection, registry: Registry, *, tenant_id: str, journey_id: UUID,
 ) -> dict[str, int]:
     """``ready_document_count`` for every template in two statements instead
     of one per template: the documents screen asks for all of them at once,
     and a Railway database answers each round trip slowly."""
+    from audit_core.uc03_customer_ledger import (
+        PAYMENT_LEDGER_TEMPLATE,
+        payment_ledger_sql,
+    )
     from audit_core.uc03_vehicle_rc import new_vehicle_rc_sql
 
     rows = connection.execute(
         text(
             """
-            SELECT e.document_type_key, COUNT(DISTINCT e.di_document_id) AS ready
+            SELECT e.document_type_key, """ + payment_ledger_sql("e") + """ AS is_ledger,
+                   COUNT(DISTINCT e.di_document_id) AS ready
             FROM auditcore.evidence e
             WHERE e.tenant_id=:tenant_id
               AND e.journey_id=:journey_id
@@ -136,12 +158,18 @@ def ready_document_counts(
                   AND f.di_document_id=e.di_document_id
                   AND f.effective_value IS NOT NULL
               )
-            GROUP BY e.document_type_key
+            GROUP BY 1, 2
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
-    by_type = {str(row["document_type_key"]): int(row["ready"] or 0) for row in rows}
+    by_type: dict[str, int] = {}
+    ledgers: dict[str, int] = {}
+    for row in rows:
+        key, ready = str(row["document_type_key"]), int(row["ready"] or 0)
+        by_type[key] = by_type.get(key, 0) + ready
+        if row["is_ledger"]:
+            ledgers[key] = ledgers.get(key, 0) + ready
     split: dict[str, Any] | None = None
     counts: dict[str, int] = {}
     for template in registry.documents.values():
@@ -149,6 +177,12 @@ def ready_document_counts(
             if split is None:
                 split = receipt_split(connection, tenant_id=tenant_id, journey_id=journey_id)
             counts[template.key] = len(split["DELIVERY" if str(template.stage).upper() == "DELIVERY" else "BOOKING"])
+        elif _shares_ledger_type(template):
+            # The NDC and the customer ledger: each counts only its own.
+            types = _evidence_types(template)
+            ledger = sum(ledgers.get(key, 0) for key in types)
+            counts[template.key] = (ledger if template.key == PAYMENT_LEDGER_TEMPLATE
+                                    else sum(by_type.get(key, 0) for key in types) - ledger)
         else:
             counts[template.key] = sum(by_type.get(key, 0) for key in _evidence_types(template))
     return counts
@@ -360,6 +394,13 @@ def statement_values(connection: Connection, *, tenant_id: str, document_id: str
     ).all()}
 
 
+def _is_payment_ledger(line_items: Any) -> bool:
+    """A customer ledger has no statement totals to balance (uc03_customer_ledger)."""
+    from audit_core.uc03_customer_ledger import is_payment_ledger
+
+    return is_payment_ledger(line_items)
+
+
 def field_review_reasons(
     registry: Registry, template: DocumentTemplate, *, di_type: str | None, field_key: str,
     value: Any, confidence: float | None, document_values: dict[str, Any] | None = None,
@@ -372,6 +413,7 @@ def field_review_reasons(
     if field_key in GST_TAX_FIELDS and document_values and retired_gst_slab(document_values):
         reasons.append("GST_SLAB_RETIRED")
     if (field_key in STATEMENT_FIELDS and canonical_di_type(di_type) == "customer_ledger" and document_values
+            and not _is_payment_ledger(document_values.get("line_items"))
             and statement_out_of_balance(document_values)):
         reasons.append("STATEMENT_DOES_NOT_BALANCE")
     if template.needs_review(field_key, confidence):
@@ -452,7 +494,8 @@ def unreviewed_fields(
             {
                 "documentId": str(row["di_document_id"]),
                 "templateKey": template.key,
-                "documentName": template.display_name,
+                "documentName": (PAYMENT_LEDGER_NAME if di_type == LEDGER_DI_TYPE and _is_payment_ledger(
+                    by_document.get(str(row["di_document_id"]), {}).get("line_items")) else template.display_name),
                 "fieldKey": field_key,
                 "canonicalFieldId": row["source_canonical_field_id"],
                 "sourceFactVersion": int(row["source_fact_version"] or 1),
@@ -863,28 +906,9 @@ def _stage_gates(connection: Connection, registry: Registry, *, stage: str, tena
     return gates
 
 
-# Delivery has started once a delivery document is on the Journey or a delivery
-# is recorded. The Deal's variance is shown, and the "deal below standard"
-# finding raised, only from then on (product owner 2026-10-28: "Variance should
-# be shown only for the journey for which Delivery has started").
-DELIVERY_STARTED_SQL = """
-    EXISTS (
-      SELECT 1 FROM auditcore.evidence e
-      WHERE e.tenant_id={t} AND e.journey_id={j}
-        AND e.association_status='ACTIVE'
-        AND upper(COALESCE(e.process_area,''))='DELIVERY'
-    ) OR EXISTS (
-      SELECT 1 FROM auditcore.deliveries d
-      WHERE d.tenant_id={t} AND d.journey_id={j}
-    )
-"""
-
-
-def delivery_has_started(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
-    return bool(connection.execute(
-        text("SELECT " + DELIVERY_STARTED_SQL.format(t=":tenant_id", j=":journey_id")),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).scalar_one())
+# Delivery has started once a delivery document is on the Journey: the Deal's
+# variance is shown, and the "deal below standard" finding raised, only from
+# then on (product owner 2026-10-28). Which pages start it: uc03_delivery_start.
 
 
 def recompute_journey_stage(
