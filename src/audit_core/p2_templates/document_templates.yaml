@@ -804,6 +804,43 @@ document_types:
     journey_360:
     - DEAL
     - PAYMENTS
+  # The customer ledger (product owner 2026-10-28): the dealer's Tally or ERP
+  # ledger of the customer's payments -- vouchers, receipts, a running balance.
+  # DI files it under the same type as the account statement (customer_ledger);
+  # Audit Core tells them apart by what was read (uc03_customer_ledger). It
+  # does not meet the NDC; it checks the NDC's vehicle, finance and insurance
+  # postings. Listed after customer_ledger so a customer_ledger page is the
+  # NDC unless it reads as a ledger.
+  customer_payment_ledger:
+    display_name: Customer Ledger
+    di_types:
+    - customer_ledger
+    stage: DELIVERY
+    requirement: OPTIONAL
+    condition: null
+    accepted_early: true
+    pages:
+      shape: MULTI_PAGE
+      max_pages: 12
+      group: ADJACENT
+      absorb_unknown: true
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.1'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed fields
+      canonical:
+      - validation of the NDC's postings
+    processors:
+    - Account statement validation
+    controls: []
+    control_notes: Tally ledger vs NDC (vehicle, finance D/O, insurance)
+    task_effects:
+    - Low-confidence
+    journey_360:
+    - PAYMENTS
   cost_sheet:
     display_name: Cost Sheet
     di_types:

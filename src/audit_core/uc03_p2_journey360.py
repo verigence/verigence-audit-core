@@ -1794,7 +1794,13 @@ def addons(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[
 
 # ── documents with every extracted field ─────────────────────────────────────
 def documents(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    from audit_core.uc03_customer_ledger import (
+        PAYMENT_LEDGER_TEMPLATE,
+        payment_ledger_ids,
+    )
+
     registry = get_registry()
+    ledgers = payment_ledger_ids(connection, tenant_id=tenant_id, journey_id=journey_id)
     evidence = connection.execute(
         text(
             """
@@ -1834,6 +1840,9 @@ def documents(connection: Connection, *, tenant_id: str, journey_id: UUID) -> di
         template = (
             registry.documents.get(e["template_key"]) if e["template_key"] else None
         ) or registry.template_for_di_type(e["document_type_key"], stage=e["process_area"])
+        if str(e["di_document_id"]) in ledgers:
+            # A customer ledger is not the NDC (uc03_customer_ledger).
+            template = registry.documents[PAYMENT_LEDGER_TEMPLATE]
         schema_order = [f["key"] for f in registry.di_fields(template.di_types[0])] if template.di_types else []
         key_order = list(template.key_fields) + [k for k in schema_order if k not in template.key_fields]
         rows = []

@@ -803,20 +803,9 @@ def list_p2_journeys(
     # The price variance is shown only for a Journey whose delivery has started
     # (product owner 2026-10-28), the same test as the Deal's (uc03_p2_stage).
     page_ids = [row["journey_id"] for row in rows]
-    delivery_started = {
-        str(journey) for journey in connection.execute(
-            text(
-                """
-                SELECT journey_id FROM auditcore.evidence
-                WHERE tenant_id=:t AND journey_id = ANY(:ids) AND association_status='ACTIVE'
-                  AND upper(COALESCE(process_area,''))='DELIVERY'
-                UNION
-                SELECT journey_id FROM auditcore.deliveries WHERE tenant_id=:t AND journey_id = ANY(:ids)
-                """
-            ),
-            {"t": tenant_id, "ids": page_ids},
-        ).scalars().all()
-    } if page_ids else set()
+    from audit_core.uc03_delivery_start import delivery_started_ids
+
+    delivery_started = delivery_started_ids(connection, tenant_id=tenant_id, journey_ids=page_ids)
 
     items: list[dict[str, Any]] = []
     for row in rows:
@@ -1667,6 +1656,12 @@ def list_documents(
     from audit_core.uc03_vehicle_rc import NEW_VEHICLE_RC_NAME, new_vehicle_rcs
 
     sold_car_rcs = new_vehicle_rcs(connection, tenant_id=tenant_id, journey_id=journey_id)
+    from audit_core.uc03_customer_ledger import (
+        PAYMENT_LEDGER_TEMPLATE,
+        payment_ledger_ids,
+    )
+
+    ledgers = payment_ledger_ids(connection, tenant_id=tenant_id, journey_id=journey_id)
     by_batch: dict[str, list[dict[str, Any]]] = {}
     for page in pages:
         item = dict(page)
@@ -1692,6 +1687,12 @@ def list_documents(
             item["diDocumentId"] = str(item.pop("di_document_id"))
             if item["diDocumentId"] in sold_car_rcs and not item["typeSetByPc"]:
                 item["displayName"] = NEW_VEHICLE_RC_NAME
+            if item["diDocumentId"] in ledgers:
+                # A customer ledger is not the NDC (uc03_customer_ledger).
+                ledger_template = registry.documents[PAYMENT_LEDGER_TEMPLATE]
+                item["templateKey"] = ledger_template.key
+                item["displayName"] = ledger_template.display_name
+                item["requirement"] = ledger_template.requirement
         by_batch.setdefault(batch_key, []).append(item)
 
     result = []
@@ -1739,12 +1740,21 @@ def list_documents(
     from audit_core.uc03_vehicle_rc import NEW_VEHICLE_RC_NAME, new_vehicle_rcs
 
     sold_car_rcs = new_vehicle_rcs(connection, tenant_id=tenant_id, journey_id=journey_id)
+    from audit_core.uc03_customer_ledger import (
+        PAYMENT_LEDGER_TEMPLATE,
+        payment_ledger_ids,
+    )
+
+    ledgers = payment_ledger_ids(connection, tenant_id=tenant_id, journey_id=journey_id)
     documents = []
     for raw in evidence_rows:
         doc = dict(raw)
         template = registry.template_for_di_type(
             doc.get("document_type_key"), stage=str(doc.get("process_area") or "").upper() or None,
         )
+        if str(doc.get("di_document_id")) in ledgers:
+            # A customer ledger is not the NDC (uc03_customer_ledger).
+            template = registry.documents[PAYMENT_LEDGER_TEMPLATE]
         doc["templateKey"] = template.key
         doc["displayName"] = (NEW_VEHICLE_RC_NAME if str(doc.get("di_document_id")) in sold_car_rcs
                               else template.display_name)
