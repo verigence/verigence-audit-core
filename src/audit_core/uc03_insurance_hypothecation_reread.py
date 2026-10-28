@@ -58,6 +58,24 @@ def journeys_to_reread(connection: Connection, tenant_id: str) -> list[dict[str,
     ).mappings().all()]
 
 
+def _documents_to_reread(connection: Connection, tenant_id: str) -> set[str]:
+    """Live insurance policies (ACTIVE evidence) with no hypothecated_to reading."""
+    return {str(d) for d in connection.execute(
+        text(
+            """
+            SELECT e.di_document_id FROM auditcore.evidence e
+            WHERE e.tenant_id = :t AND e.association_status = 'ACTIVE'
+              AND e.document_type_key = ANY(CAST(:types AS text[]))
+              AND NOT EXISTS (
+                  SELECT 1 FROM auditcore.journey_document_extracted_fields f
+                  WHERE f.tenant_id = e.tenant_id AND f.di_document_id = e.di_document_id
+                    AND f.field_key = 'hypothecated_to')
+            """
+        ),
+        {"t": tenant_id, "types": list(_INSURANCE_TYPES)},
+    ).scalars().all()}
+
+
 def run_insurance_hypothecation_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> None:
     from audit_core.uc03_finance_rule import apply_finance_rule
     from audit_core.uc03_p2_runtime import enqueue_work
@@ -70,7 +88,13 @@ def run_insurance_hypothecation_reread(engine: Engine, tag: str, tenant_ids: lis
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
                 journeys = journeys_to_reread(connection, tenant_id)
-                pages_by_journey = {str(j["journey_id"]): insurance_pages(connection, tenant_id, j) for j in journeys}
+                wanted = _documents_to_reread(connection, tenant_id)
+                # Only the policy still on file: a page of a policy since replaced
+                # (its evidence SUPERSEDED) cannot be copied in (2026-10-28).
+                pages_by_journey = {
+                    str(j["journey_id"]): [p for p in insurance_pages(connection, tenant_id, j)
+                                           if str(p["diDocumentId"]) in wanted]
+                    for j in journeys}
         except Exception:
             logger.warning("insurance_hypothecation_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
             continue

@@ -65,3 +65,17 @@ def test_the_job_is_a_dry_run_unless_committed(journey) -> None:
     assert str(journey.journey_id) in _picked(journey)
     target, _args = _one_shot_target("INSURANCE_HYPOTHECATION_REREAD", engine=journey.engine, tag="x", reports=[])
     assert target is run_insurance_hypothecation_reread
+
+
+def test_only_a_live_policy_is_picked(journey) -> None:
+    """A policy since replaced (SUPERSEDED) is not read again (2026-10-28)."""
+    from audit_core.uc03_insurance_hypothecation_reread import _documents_to_reread
+
+    old, new = uuid4(), uuid4()
+    add_evidence(journey, di_document_id=old, document_type_key="insurance_cover", process_area="DELIVERY",
+                 status="SUPERSEDED")
+    add_evidence(journey, di_document_id=new, document_type_key="insurance_cover", process_area="DELIVERY")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        picked = _documents_to_reread(connection, journey.tenant_id)
+        assert str(new) in picked and str(old) not in picked
