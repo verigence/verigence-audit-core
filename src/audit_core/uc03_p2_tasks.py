@@ -257,6 +257,11 @@ def _enqueue_verification(
                           work_status='PENDING',
                           next_attempt_at_utc=NULL,
                           last_error=NULL,
+                          queued_at_utc=CASE
+                            WHEN auditcore.p2_work_queue.work_status IN ('PENDING','RETRY_WAIT')
+                              THEN auditcore.p2_work_queue.queued_at_utc
+                            ELSE now()
+                          END,
                           updated_at_utc=now()
             """
         ),

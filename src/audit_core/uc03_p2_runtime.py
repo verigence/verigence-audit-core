@@ -211,6 +211,15 @@ def enqueue_work(
                               THEN auditcore.p2_work_queue.last_error
                             ELSE NULL
                           END,
+                          -- an item already waiting keeps its place; one that
+                          -- had finished joins the back of the line; one
+                          -- running joins it when it finishes (_complete)
+                          queued_at_utc=CASE
+                            WHEN auditcore.p2_work_queue.work_status
+                                 IN ('PENDING','RETRY_WAIT','CLAIMED','PROCESSING')
+                              THEN auditcore.p2_work_queue.queued_at_utc
+                            ELSE now()
+                          END,
                           updated_at_utc=now()
             """
         ),

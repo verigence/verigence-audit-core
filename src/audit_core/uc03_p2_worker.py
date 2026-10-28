@@ -288,8 +288,8 @@ _CLAIM_SQL = text(
         GROUP BY journey_id
     ),
     ready AS (
-        SELECT work_id, journey_id, created_at_utc,
-               row_number() OVER (PARTITION BY journey_id ORDER BY created_at_utc) AS journey_rank
+        SELECT work_id, journey_id, queued_at_utc,
+               row_number() OVER (PARTITION BY journey_id ORDER BY queued_at_utc, work_id) AS journey_rank
         FROM auditcore.p2_work_queue
         WHERE tenant_id=:tenant_id
           AND (
@@ -303,7 +303,7 @@ _CLAIM_SQL = text(
         FROM ready r
         LEFT JOIN inflight i ON i.journey_id=r.journey_id
         WHERE r.journey_rank + COALESCE(i.running, 0) <= :per_journey
-        ORDER BY r.created_at_utc
+        ORDER BY r.queued_at_utc, r.work_id
         LIMIT :limit
     )
     SELECT w.tenant_id, w.work_id, w.journey_id, w.work_type, w.work_key,
@@ -312,7 +312,7 @@ _CLAIM_SQL = text(
     FROM auditcore.p2_work_queue w
     JOIN eligible e ON e.work_id=w.work_id
     WHERE w.tenant_id=:tenant_id
-    ORDER BY w.created_at_utc
+    ORDER BY w.queued_at_utc, w.work_id
     FOR UPDATE OF w SKIP LOCKED
     """
 )
@@ -458,6 +458,8 @@ def _complete(engine: Engine, work: WorkItem) -> None:
                 SET work_status=CAST(:status AS varchar),
                     processed_version=COALESCE(CAST(:processed_version AS bigint), processed_version),
                     attempt_count=CASE WHEN CAST(:status AS varchar)='COMPLETED' THEN 0 ELSE attempt_count END,
+                    -- asked for again while it ran: it joins the back of the line (2026-10-28)
+                    queued_at_utc=CASE WHEN CAST(:status AS varchar)='PENDING' THEN now() ELSE queued_at_utc END,
                     next_attempt_at_utc=NULL,
                     lease_token=NULL,
                     lease_expires_at_utc=NULL,
@@ -499,6 +501,8 @@ def _reschedule(engine: Engine, work: WorkItem, exc: RescheduleWork) -> None:
                     -- the step ran and only has to wait: earlier failures no
                     -- longer count toward its limit (2026-10-20 review)
                     attempt_count=0,
+                    -- it ran: when it is due again it joins the back of the line (2026-10-28)
+                    queued_at_utc=now(),
                     lease_token=NULL,
                     lease_expires_at_utc=NULL,
                     last_error=:last_error,
@@ -4133,7 +4137,7 @@ def _queue_depth(engine: Engine) -> dict[str, Any]:
                           count(*) FILTER (WHERE work_status IN ('CLAIMED','PROCESSING')) AS running,
                           count(*) FILTER (WHERE work_status='DEAD_LETTER'
                                              AND updated_at_utc > now() - interval '24 hours') AS dead,
-                          EXTRACT(EPOCH FROM now() - min(created_at_utc)
+                          EXTRACT(EPOCH FROM now() - min(queued_at_utc)
                                   FILTER (WHERE work_status IN ('PENDING','RETRY_WAIT')
                                           AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= now())))
                             AS oldest_seconds
