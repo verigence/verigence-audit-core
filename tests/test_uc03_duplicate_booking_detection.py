@@ -282,21 +282,37 @@ def test_earlier_of_two_payment_dates_wins_originality_regardless_of_creation_or
     assert _open_findings(c, c.journey_b) == []
 
 
-def _set_buyer_gstin(c, *, journey_id, gstin: str) -> None:
+def _set_buyer_gstin(c, *, journey_id, gstin: str, document_type_key: str = "tax_invoice_dms",
+                     seller_gstin: str | None = None) -> None:
+    """A customer invoice on file (live evidence) with the buyer's GSTIN."""
+    doc = uuid4()
+    c.execute(
+        text(
+            """
+            INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
+                                            document_type_key, evidence_purpose, process_area, association_status)
+            SELECT tenant_id, journey_id, customer_id, :s, :doc, :dtk, 'JOURNEY_DOCUMENT', 'DELIVERY', 'ACTIVE'
+            FROM auditcore.journeys WHERE tenant_id = :t AND journey_id = :j
+            """
+        ),
+        {"t": c.tenant_id, "j": journey_id, "s": uuid4(), "doc": doc, "dtk": document_type_key},
+    )
     c.execute(
         text(
             """
             INSERT INTO auditcore.invoice_review_values (
                 tenant_id, journey_id, source_di_document_id, document_type_key,
-                buyer_gstin, reviewed_by_actor_id
-            ) VALUES (:t, :j, :doc, 'tax_invoice_dms', :gstin, 'test-actor')
+                buyer_gstin, seller_gstin, reviewed_by_actor_id
+            ) VALUES (:t, :j, :doc, :dtk, :gstin, :seller, 'test-actor')
             """
         ),
-        {"t": c.tenant_id, "j": journey_id, "doc": uuid4(), "gstin": gstin},
+        {"t": c.tenant_id, "j": journey_id, "doc": doc, "dtk": document_type_key, "gstin": gstin,
+         "seller": seller_gstin},
     )
 
 
-def test_exact_gst_match_flags_as_moderate_severity(two_journeys) -> None:
+def test_exact_gst_match_flags_as_high_probability(two_journeys) -> None:
+    """Product owner 2026-10-28: same GSTIN is a high-probability duplicate."""
     c = two_journeys
     _set_buyer_gstin(c, journey_id=c.journey_a, gstin="27ABCDE1234F1Z5")
     _set_buyer_gstin(c, journey_id=c.journey_b, gstin="27ABCDE1234F1Z5")
@@ -312,18 +328,19 @@ def test_exact_gst_match_flags_as_moderate_severity(two_journeys) -> None:
     )
     findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
     assert len(findings) == 1
-    assert findings[0]["severity"] == "MEDIUM"
+    assert findings[0]["severity"] == "CRITICAL"
     assert (result_a["raised"], result_b["raised"]) in {(0, 1), (1, 0)}
 
 
-def test_exact_mobile_match_flags_as_moderate_severity(two_journeys) -> None:
+def test_exact_mobile_match_flags_as_high_probability(two_journeys) -> None:
+    """Product owner 2026-10-28: same mobile is a high-probability duplicate."""
     c = two_journeys
     _set_field(c, journey_id=c.journey_a, document_type_key="booking_form", field_key="customer_phone", value="+91 98765 43210")
     _set_field(c, journey_id=c.journey_b, document_type_key="booking_form", field_key="customer_phone", value="09876543210")
 
     _assert_exactly_one_flagged_as_duplicate_of_the_other(c)
     findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
-    assert findings[0]["severity"] == "MEDIUM"
+    assert findings[0]["severity"] == "CRITICAL"
 
 
 def test_customer_matches_relative_on_other_booking_flags_as_probable(two_journeys) -> None:
@@ -463,8 +480,8 @@ def test_an_open_finding_raised_on_a_weaker_basis_is_raised_again_on_the_stronge
     c = two_journeys
     _mobile_then_pan(c)
     [first] = _findings_with_basis(c)
-    assert first["finding_status"] == "OPEN" and first["severity"] == "MEDIUM"
-    assert first["raised"]["matchBasis"] == "MOBILE" and first["raised"]["matchConfidencePercent"] == 70
+    assert first["finding_status"] == "OPEN" and first["severity"] == "CRITICAL"
+    assert first["raised"]["matchBasis"] == "MOBILE" and first["raised"]["matchConfidencePercent"] == 95
 
     _add_pan(c)  # the PAN cards were read afterwards and match too
     _sync_both(c)
@@ -679,3 +696,24 @@ def test_an_open_finding_on_a_placeholder_resolves_itself(two_journeys) -> None:
     dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
     dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_b, correlation_id="")
     assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+
+
+def test_the_dealers_own_gstin_never_pairs_two_bookings(two_journeys) -> None:
+    """Utkal Automobiles' GSTIN read as the buyer's paired two customers (2026-10-28):
+    a GSTIN carrying a dealer's PAN, or one off a wholesale invoice, is not the customer's."""
+    c = two_journeys
+    dealer = "21AAACU2665C1ZV"
+    _set_buyer_gstin(c, journey_id=c.journey_a, gstin=dealer, seller_gstin=dealer)
+    _set_buyer_gstin(c, journey_id=c.journey_b, gstin=dealer)
+    for journey_id in (c.journey_a, c.journey_b):
+        assert dbd.sync_duplicate_booking_detection(
+            c, tenant_id=c.tenant_id, journey_id=journey_id, correlation_id="")["raised"] == 0
+
+
+def test_a_wholesale_invoice_buyer_gstin_never_pairs_two_bookings(two_journeys) -> None:
+    c = two_journeys
+    for journey_id in (c.journey_a, c.journey_b):
+        _set_buyer_gstin(c, journey_id=journey_id, gstin="27ABCDE1234F1Z5", document_type_key="wholesale_invoice")
+    for journey_id in (c.journey_a, c.journey_b):
+        assert dbd.sync_duplicate_booking_detection(
+            c, tenant_id=c.tenant_id, journey_id=journey_id, correlation_id="")["raised"] == 0
