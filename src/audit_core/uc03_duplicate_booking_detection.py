@@ -100,8 +100,8 @@ _WHITESPACE_ONLY = re.compile(r"\s+")
 
 # Strongest to weakest -- _match_basis returns the first of these that
 # actually matches, so a pair is never flagged more than once.
-# Product owner 2026-10-28: the same PAN or Aadhaar is a high-probability
-# duplicate; the relationship name on one booking matching the customer name
+# Product owner 2026-10-28: the same PAN, Aadhaar, mobile or buyer GSTIN is a
+# high-probability duplicate; the relationship name on one booking matching the customer name
 # on another, or the same surname with the same pincode, is a probable case --
 # a common name collides between unrelated people (SUKANTI SAHOO, W/O
 # Ghanashyam Sahoo of Khordha, paired with GHANASYAM SAHOO, S/O Umakant Sahoo
@@ -112,8 +112,8 @@ _SEVERITY_BY_BASIS: dict[str, str] = {
     "AADHAAR": "CRITICAL",
     "CUSTOMER_MATCHES_RELATIVE": "MEDIUM",
     "NAME_AND_ADDRESS": "MEDIUM",
-    "GST": "MEDIUM",
-    "MOBILE": "MEDIUM",
+    "GST": "CRITICAL",
+    "MOBILE": "CRITICAL",
     "SURNAME_AND_PINCODE": "MEDIUM",
     "SIMILAR_ADDRESS": "LOW",  # no longer raised; kept to read old findings
 }
@@ -132,8 +132,8 @@ _CONFIDENCE_PERCENT_BY_BASIS: dict[str, int] = {
     "AADHAAR": 99,
     "CUSTOMER_MATCHES_RELATIVE": 60,
     "NAME_AND_ADDRESS": 60,
-    "GST": 75,
-    "MOBILE": 70,
+    "GST": 95,
+    "MOBILE": 95,
     "SURNAME_AND_PINCODE": 50,
     "SIMILAR_ADDRESS": 35,
 }
@@ -404,6 +404,31 @@ def _identity_signals(
     return _extract_signals(rows, gst=gst)
 
 
+# The customer's GSTIN (product owner 2026-10-28): the buyer GSTIN of a live
+# customer invoice only. A wholesale invoice's buyer is the dealership, and a
+# GSTIN carrying a dealer's own PAN (printed as seller / dealer GSTIN anywhere in
+# the Project) is the dealership's -- Utkal Automobiles' 21AAACU2665C1ZV paired
+# AMIT PALEI with Subrat Kumar Mallick.
+_BUYER_GSTIN_SQL = """
+    SELECT v.journey_id, v.buyer_gstin, v.created_at_utc
+    FROM auditcore.invoice_review_values v
+    JOIN auditcore.evidence e
+      ON e.tenant_id = v.tenant_id AND e.journey_id = v.journey_id
+     AND e.di_document_id = v.source_di_document_id AND e.association_status = 'ACTIVE'
+    WHERE v.tenant_id = :tenant_id AND v.buyer_gstin IS NOT NULL
+      AND COALESCE(v.document_type_key, '') <> 'wholesale_invoice'
+      AND substr(upper(regexp_replace(v.buyer_gstin, '\\s', '', 'g')), 3, 10) NOT IN (
+          SELECT substr(upper(regexp_replace(f.effective_value #>> '{}', '\\s', '', 'g')), 3, 10)
+          FROM auditcore.journey_document_extracted_fields f
+          WHERE f.tenant_id = :tenant_id AND f.field_key IN ('seller_gstin', 'dealer_gstin')
+            AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+          UNION
+          SELECT substr(upper(regexp_replace(s.seller_gstin, '\\s', '', 'g')), 3, 10)
+          FROM auditcore.invoice_review_values s
+          WHERE s.tenant_id = :tenant_id AND s.seller_gstin IS NOT NULL
+      )
+"""
+
 def _buyer_gstin(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str | None:
     """The latest non-null buyer GSTIN off any Tax Invoice materialized for
     this journey -- lives in invoice_review_values, a separate table from
@@ -411,9 +436,9 @@ def _buyer_gstin(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
     return connection.execute(
         text(
             """
-            SELECT buyer_gstin FROM auditcore.invoice_review_values
-            WHERE tenant_id = :tenant_id AND journey_id = :journey_id AND buyer_gstin IS NOT NULL
-            ORDER BY created_at_utc DESC LIMIT 1
+            SELECT g.buyer_gstin FROM (""" + _BUYER_GSTIN_SQL + """) g
+            WHERE g.journey_id = :journey_id
+            ORDER BY g.created_at_utc DESC LIMIT 1
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
@@ -462,9 +487,9 @@ def _candidate_journeys(
         text(
             """
             SELECT DISTINCT ON (v.journey_id) v.journey_id, v.buyer_gstin, j.created_at_utc
-            FROM auditcore.invoice_review_values v
-            JOIN auditcore.journeys j ON j.tenant_id = v.tenant_id AND j.journey_id = v.journey_id
-            WHERE v.tenant_id = :tenant_id AND v.journey_id <> :journey_id AND v.buyer_gstin IS NOT NULL
+            FROM (""" + _BUYER_GSTIN_SQL + """) v
+            JOIN auditcore.journeys j ON j.tenant_id = :tenant_id AND j.journey_id = v.journey_id
+            WHERE v.journey_id <> :journey_id
             ORDER BY v.journey_id, v.created_at_utc DESC
             """
         ),
