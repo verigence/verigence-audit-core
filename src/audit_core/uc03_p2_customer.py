@@ -11,6 +11,11 @@ customer's name is the GSTIN's legal name -- for those customers the PAN is
 often not fully readable (masked) and Aadhaar is optional and personal. Only
 when a GST certificate carrying a GSTIN is uploaded; otherwise the KYC rule
 stands.
+
+Product owner 2026-10-28: a PAN read with its letters masked ("PXXXXJ KXXXR
+NXXXX") does not name the customer when an Aadhaar (or Customer KYC) gives the
+full name; with a GSTIN on file the GSTIN still names them. A masked name is
+used only when no KYC on file gives a full one.
 """
 from __future__ import annotations
 
@@ -19,7 +24,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
-from audit_core.uc03_p2_names import same_person
+from audit_core.uc03_p2_names import is_masked, same_person
 
 _MACHINE_ACTOR = "p2-worker"
 _KYC_NAME_FIELDS = {"pan_card": ("pan_name",), "aadhaar": ("aadhaar_name",), "customer_kyc": ("customer_name",),
@@ -89,7 +94,8 @@ def sync_customer_name(connection: Connection, *, tenant_id: str, journey_id: UU
             continue
         if str(row["field_key"]) in _KYC_NAME_FIELDS.get(doc_type, ()) and name and doc_type not in best:
             best[doc_type] = {"name": name, "evidence": row["evidence_id"]}
-    kyc = next((best[t] for t in _KYC_PRECEDENCE if t in best), None)
+    kyc = next((best[t] for t in _KYC_PRECEDENCE if t in best and not is_masked(best[t]["name"])), None) or next(
+        (best[t] for t in _KYC_PRECEDENCE if t in best), None)
     if kyc is None:
         return "NO_NAME"
     current, status = customer["legal_name"], customer["legal_name_status"]

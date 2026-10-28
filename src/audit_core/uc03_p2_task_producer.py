@@ -28,7 +28,13 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 from audit_core.uc03_p2_document_health import TL_AFTER_SECONDS
-from audit_core.uc03_p2_names import display_name, same_organisation, same_person
+from audit_core.uc03_p2_names import (
+    display_name,
+    is_masked,
+    masked_matches,
+    same_organisation,
+    same_person,
+)
 from audit_core.uc03_p2_registry import ControlTemplate, Registry, get_registry
 from audit_core.uc03_p2_runtime import (
     LARGE_UPLOAD_PAGES,
@@ -1464,6 +1470,13 @@ def sync_name_consistency_tasks(
             person = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
 
         def matches(document: dict[str, Any]) -> bool:
+            # A masked PAN ("PXXXXJ KXXXR NXXXX") is the customer's when its
+            # visible letters fit the customer's name (2026-10-28).
+            if is_masked(document["name"]):
+                return any(masked_matches(document["name"], n)
+                           for n in [kyc["name"], *gst_names, *([person["name"]] if person else [])])
+            if is_masked(kyc["name"]) and masked_matches(kyc["name"], document["name"]):
+                return True  # only a masked PAN names the customer: a full name that fits it is theirs
             if not gst_names:
                 return same_person(document["name"], kyc["name"])
             if document["pair"] in rules.customer_name_reference:
