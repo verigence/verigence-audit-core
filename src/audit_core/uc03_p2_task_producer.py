@@ -560,7 +560,7 @@ def sync_field_review_tasks(
         severity = "HIGH" if dated or gst or unbalanced else "MEDIUM"
         count = len(fields)
         title = (
-            f"Check the lines on {name}: they do not add up" if unbalanced and not gst and not dated and not uncertain
+            f"Check the lines on {name}: they do not add up" if unbalanced
             else f"Check the GST on {name}" if gst and not dated and not uncertain
             else f"Check {count} date{'s' if count != 1 else ''} on {name}" if dated and not uncertain and not gst
             else f"Verify {count} field{'s' if count != 1 else ''} on {name}"
