@@ -30,6 +30,7 @@ from sqlalchemy import Connection, text
 from audit_core.uc03_p2_document_health import TL_AFTER_SECONDS
 from audit_core.uc03_p2_names import (
     display_name,
+    is_firm_name,
     is_masked,
     masked_matches,
     same_organisation,
@@ -42,7 +43,11 @@ from audit_core.uc03_p2_runtime import (
     dayend_removal_notice,
     swept_pending_sql,
 )
-from audit_core.uc03_p2_stage import unreviewed_fields
+from audit_core.uc03_p2_stage import (
+    statement_out_of_balance,
+    statement_values,
+    unreviewed_fields,
+)
 from audit_core.uc03_p2_tasks import record_task_event
 
 _OPEN = ("READY", "IN_PROGRESS", "RETURNED", "ACTION_COMPLETED", "VERIFYING")
@@ -520,9 +525,19 @@ def sync_field_review_tasks(
         # least certain reading first.
         fields.sort(key=lambda f: (f["severity"] != "HIGH", f["confidence"] is not None, f["confidence"] or 0))
         gst = [f for f in fields if "GST_SLAB_RETIRED" in f.get("reasons", ())]
-        dated = [f for f in fields if f["severity"] == "HIGH" and f not in gst]
+        unbalanced = [f for f in fields if "STATEMENT_DOES_NOT_BALANCE" in f.get("reasons", ())]
+        dated = [f for f in fields if f["severity"] == "HIGH" and f not in gst and f not in unbalanced]
         uncertain = [f for f in fields if f["severity"] != "HIGH"]
         sentences = []
+        if unbalanced:
+            totals = statement_out_of_balance(statement_values(connection, tenant_id=tenant_id, document_id=document_id))
+            if totals is not None:
+                debit, credit, balance = totals
+                sentences.append(
+                    f"The {name} as read does not add up: debits Rs {debit:,.0f}, credits Rs {credit:,.0f}, balance "
+                    f"Rs {balance:,.0f}. Some line was read wrongly; the Deal takes its figures from these lines. "
+                    "Check every line against the page and correct the wrong ones."
+                )
         if gst:
             sentences.append(
                 f"The GST on the {name} was read as "
@@ -542,10 +557,11 @@ def sync_field_review_tasks(
             more = f" and {len(uncertain) - 6} more" if len(uncertain) > 6 else ""
             sentences.append(f"These values on the {name} were read with low confidence: {listed}{more}.")
         sentences.append("Open the document, compare each value with the page and confirm or correct it.")
-        severity = "HIGH" if dated or gst else "MEDIUM"
+        severity = "HIGH" if dated or gst or unbalanced else "MEDIUM"
         count = len(fields)
         title = (
-            f"Check the GST on {name}" if gst and not dated and not uncertain
+            f"Check the lines on {name}: they do not add up" if unbalanced and not gst and not dated and not uncertain
+            else f"Check the GST on {name}" if gst and not dated and not uncertain
             else f"Check {count} date{'s' if count != 1 else ''} on {name}" if dated and not uncertain and not gst
             else f"Verify {count} field{'s' if count != 1 else ''} on {name}"
         )
@@ -1517,7 +1533,26 @@ def sync_name_consistency_tasks(
             by_pair = {doc["pair"]: doc for doc in reversed(references)}
             person = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
 
+        # A document in a firm's name is the customer's when the customer is a
+        # person (product owner 2026-10-28: "firm name should be acceptable" --
+        # a proprietor's PAN is on file, the invoice or booking form is in the
+        # firm's name, "M/S SHREE SHYAM ENTERPRISES"). One firm per Journey:
+        # the firm most documents name is it, and a document naming another
+        # firm, or the dealership itself, is still the wrong document.
+        firm: str | None = None
+        if not gst_names:
+            dealership = [d["name"] for d in _named_documents(
+                connection, tenant_id=tenant_id, journey_id=journey_id, pairs=rules.dealer_name_checked)]
+            firms = [d["name"] for d in checked if is_firm_name(d["name"]) and not is_masked(d["name"])
+                     and not same_person(d["name"], kyc["name"])
+                     and not any(same_organisation(d["name"], n) for n in dealership)]
+            if firms:
+                firm = max(firms, key=lambda n: (sum(same_organisation(n, o) for o in firms), -firms.index(n)))
+
         def matches(document: dict[str, Any]) -> bool:
+            if firm is not None and document["pair"] not in rules.customer_name_reference \
+                    and same_organisation(document["name"], firm):
+                return True
             # A masked PAN ("PXXXXJ KXXXR NXXXX") is the customer's when its
             # visible letters fit the customer's name (2026-10-28).
             if is_masked(document["name"]):

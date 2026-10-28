@@ -304,3 +304,36 @@ def test_a_proprietors_kyc_in_the_gst_legal_name_is_the_customers(journey):
                        organisation_trade_name="M/S DAS CONSTRUCTION", organisation_constitution="Proprietorship")
     _named(journey)
     assert _sync(journey) == {}
+
+
+def test_a_firm_name_is_the_customers_when_the_kyc_is_the_proprietors(journey):
+    """Product owner 2026-10-28: "firm name should be acceptable". A proprietor's
+    PAN is on file; the booking form and invoice name the firm."""
+    add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="PAWAN GUPTA")
+    _named(journey)
+    add_ready_document(journey, "booking_form", customer_name="M/S SHREE SHYAM ENTERPRISES", dealer_name="Sarthak Motors")
+    add_ready_document(journey, "customer_invoice_dms", buyer_name="Shree Shyam Enterprises",
+                       seller_name="Sarthak Motors", invoice_number="I1")
+    assert _sync(journey) == {}
+
+
+def test_a_second_firm_or_the_dealership_is_still_the_wrong_document(journey):
+    add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="PAWAN GUPTA")
+    _named(journey)
+    add_ready_document(journey, "booking_form", customer_name="M/S SHREE SHYAM ENTERPRISES", dealer_name="Sarthak Motors")
+    add_ready_document(journey, "customer_invoice_dms", buyer_name="Shree Shyam Enterprises",
+                       seller_name="Sarthak Motors", invoice_number="I1")
+    other = add_ready_document(journey, "insurance_cover", insured_name="MAA MANGALA TRADERS")
+    dealer = add_ready_document(journey, "tax_invoice_tally", buyer_name="Sarthak Motors", seller_name="Sarthak Motors")
+    assert _sync(journey) == {"RAISED": 2}
+    assert {t["reference"]["documentId"] for t in _tasks(journey)} == {str(other), str(dealer)}
+
+
+@pytest.mark.parametrize(("name", "firm"), [
+    ("M/S SHREE SHYAM ENTERPRISES", True), ("MAA MANGALA TRADERS", True), ("TARA BAKERY", True),
+    ("Messrs Jagannath Agencies", True), ("PAWAN GUPTA", False), ("Mr. Anil Kumar Dehury", False),
+])
+def test_is_firm_name(name, firm):
+    from audit_core.uc03_p2_names import is_firm_name
+
+    assert is_firm_name(name) is firm

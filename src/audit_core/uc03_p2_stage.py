@@ -260,10 +260,12 @@ REVIEW_REASON_LABELS = {
     "DATE_UNREADABLE": "not a readable date",
     "DATE_IN_FUTURE": "a date after today",
     "GST_SLAB_RETIRED": "a GST split that no longer exists (28% and the cess ended on 22 Sep 2025)",
+    "STATEMENT_DOES_NOT_BALANCE": "an account statement whose debits, credits and balance do not add up",
 }
 # Reasons that make the verification High severity: the value is wrong as
 # read, not merely uncertain.
-HIGH_SEVERITY_REASONS = frozenset({"DATE_BEFORE_FLOOR", "DATE_UNREADABLE", "DATE_IN_FUTURE", "GST_SLAB_RETIRED"})
+HIGH_SEVERITY_REASONS = frozenset({"DATE_BEFORE_FLOOR", "DATE_UNREADABLE", "DATE_IN_FUTURE", "GST_SLAB_RETIRED",
+                                   "STATEMENT_DOES_NOT_BALANCE"})
 
 # GST as read must be a rate that exists (2026-10-28). An Aditya Motors invoice
 # printed CGST 20% / SGST 20% (Rs 2,41,414.34 each, 40% in all, no cess); the
@@ -300,6 +302,53 @@ def retired_gst_slab(values: dict[str, Any]) -> bool:
     return cess is not None and cess > 0
 
 
+# An account statement (NDC) always balances: what was debited equals what
+# was credited plus the balance shown (2026-10-28). Pankaj Kumar Nayak's
+# statement was read with debits of Rs 21,64,542 against credits of
+# Rs 19,72,143 and a balance of 0 -- an Extended Warranty of Rs 1,32,132 (the
+# RTO challan's total) and an insurance of Rs 1,68,991 among the lines -- and
+# the Deal showed an EW the customer never took. A statement read that way is
+# misread somewhere; its lines go to the PC before the Deal believes them.
+STATEMENT_FIELDS = frozenset({"line_items", "net_value", "total_receipts", "balance_amount"})
+_STATEMENT_TOLERANCE = 100.0
+
+
+def _items(value: Any) -> list[dict[str, Any]]:
+    import json
+
+    for _ in range(2):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return []
+    return [i for i in value if isinstance(i, dict)] if isinstance(value, list) else []
+
+
+def statement_out_of_balance(values: dict[str, Any]) -> tuple[float, float, float] | None:
+    """(debits, credits, balance) when a statement's lines, as read, do not
+    add up; None when they do or cannot be added up."""
+    items = _items(values.get("line_items"))
+    debits = [n for n in (_number(i.get("debit_amount")) for i in items) if n is not None]
+    credits = [n for n in (_number(i.get("credit_amount")) for i in items) if n is not None]
+    if not debits or not credits:
+        return None
+    balance = abs(_number(values.get("balance_amount")) or 0.0)
+    total_debit, total_credit = sum(debits), sum(credits)
+    if abs(abs(total_debit - total_credit) - balance) <= _STATEMENT_TOLERANCE:
+        return None
+    return total_debit, total_credit, balance
+
+
+def statement_values(connection: Connection, *, tenant_id: str, document_id: str) -> dict[str, Any]:
+    """A statement's values by field, as the PC sees them now."""
+    return {str(r[0]): r[1] for r in connection.execute(
+        text("SELECT field_key, effective_value FROM auditcore.journey_document_extracted_fields "
+             "WHERE tenant_id=:t AND di_document_id=CAST(:d AS uuid) AND field_key = ANY(:keys)"),
+        {"t": tenant_id, "d": document_id, "keys": sorted(STATEMENT_FIELDS)},
+    ).all()}
+
+
 def field_review_reasons(
     registry: Registry, template: DocumentTemplate, *, di_type: str | None, field_key: str,
     value: Any, confidence: float | None, document_values: dict[str, Any] | None = None,
@@ -311,6 +360,9 @@ def field_review_reasons(
     reasons: list[str] = []
     if field_key in GST_TAX_FIELDS and document_values and retired_gst_slab(document_values):
         reasons.append("GST_SLAB_RETIRED")
+    if (field_key in STATEMENT_FIELDS and canonical_di_type(di_type) == "customer_ledger" and document_values
+            and statement_out_of_balance(document_values)):
+        reasons.append("STATEMENT_DOES_NOT_BALANCE")
     if template.needs_review(field_key, confidence):
         reasons.append("LOW_CONFIDENCE")
     if registry.date_check_applies(di_type, field_key):
