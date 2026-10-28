@@ -333,3 +333,43 @@ def test_a_gst_split_as_printed_after_gst_2_0_stands(journey):
         set_tenant_context(connection, journey.tenant_id)
         assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
                                        journey_id=journey.journey_id) == {}
+
+
+_PANKAJ_LINES = (
+    '[{"particulars_raw": "EX-SHOW ROOM PRICE OF VEHICLE", "debit_amount": 1709900},'
+    ' {"particulars_raw": "TCS ON INVOICE", "debit_amount": 20000},'
+    ' {"particulars_raw": "INSURANCE COST (NORMAL)", "debit_amount": 168991},'
+    ' {"particulars_raw": "REGISTRATION COST", "debit_amount": 80998},'
+    ' {"particulars_raw": "EXTENDED WARRANTY", "debit_amount": 132132},'
+    ' {"particulars_raw": "RSA", "debit_amount": 2021}, {"particulars_raw": "FAST TAG", "debit_amount": 500},'
+    ' {"particulars_raw": "ACCESSORIES", "debit_amount": 50000},'
+    ' {"particulars_raw": "BOOKING AMOUNT", "credit_amount": 21000},'
+    ' {"particulars_raw": "DEPOSITED INTO BANK", "credit_amount": 1200000},'
+    ' {"particulars_raw": "DEPOSITED INTO BANK", "credit_amount": 50000},'
+    ' {"particulars_raw": "DEPOSITED INTO BANK", "credit_amount": 650000},'
+    ' {"particulars_raw": "CASH", "credit_amount": 51143}]'
+)
+
+
+def test_a_statement_that_does_not_add_up_goes_to_the_pc(journey):
+    """2026-10-28: Pankaj Kumar Nayak's statement read with debits Rs 21,64,542,
+    credits Rs 19,72,143 and a balance of 0; the Deal showed an EW never taken."""
+    ndc = add_ready_document(journey, "customer_ledger", confidence=99.0, line_items=_PANKAJ_LINES,
+                             balance_amount="0", net_value="1976143")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {"RAISED": 1}
+    task = _task(journey, f"field-review:{ndc}")
+    assert task["severity"] == "HIGH" and "do not add up" in task["title"]
+    assert "debits Rs 2,164,542, credits Rs 1,972,143, balance Rs 0" in task["description"]
+
+
+def test_a_statement_that_balances_stands(journey):
+    lines = ('[{"particulars_raw": "VEHICLE", "debit_amount": 1101745},'
+             ' {"particulars_raw": "DEPOSITED", "credit_amount": 1117161}]')
+    add_ready_document(journey, "customer_ledger", confidence=99.0, line_items=lines, balance_amount="15416")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {}
