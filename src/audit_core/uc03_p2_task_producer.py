@@ -404,6 +404,11 @@ def resolve_if_open(connection: Connection, *, tenant_id: str, journey_id: UUID,
     return task_id
 
 
+# Task types that ask the PC a question rather than for a fix: asked only once
+# delivery has started (2026-10-28).
+QUESTION_TASK_TYPES = frozenset({"PC_CONFIRMATION"})
+
+
 def apply_control_transitions(
     connection: Connection,
     *,
@@ -415,11 +420,29 @@ def apply_control_transitions(
 ) -> dict[str, int]:
     registry = registry or get_registry()
     counts: dict[str, int] = {}
+    delivery_started: bool | None = None
     for transition in transitions:
         control = registry.controls.get(transition.control_code)
         if control is None:
             continue
         key = f"control:{journey_id}:{control.code}"
+        if transition.current == "FAIL" and control.task_type in QUESTION_TASK_TYPES:
+            # The PC's questions (cash intimated? accessories fitted? who paid?)
+            # are asked once delivery has started (product owner 2026-10-28:
+            # fewer tasks); until then the check stays unanswered on the ledger
+            # and an open question closes, to come back at delivery.
+            if delivery_started is None:
+                from audit_core.uc03_p2_stage import delivery_has_started
+
+                delivery_started = delivery_has_started(connection, tenant_id=tenant_id, journey_id=journey_id)
+            if not delivery_started:
+                outcome = "VERIFIED" if resolve_if_open(
+                    connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                    evidence={"controlCode": control.code, "deferredUntil": "DELIVERY_STARTED",
+                              "verifiedAt": datetime.now(UTC).isoformat()},
+                ) else "DEFERRED"
+                counts[outcome] = counts.get(outcome, 0) + 1
+                continue
         if transition.current == "FAIL":
             reason = connection.execute(
                 text("SELECT status_reason FROM auditcore.p2_control_state "

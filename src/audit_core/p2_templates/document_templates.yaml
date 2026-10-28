@@ -46,8 +46,8 @@ extraction_rules:
     - booking_form.customer_name
     - customer_invoice_dms.buyer_name
     - tax_invoice_tally.buyer_name
-    - dealer_receipt.customer_name
-    - payment_receipt.customer_name
+    # Receipts are not checked (product owner 2026-10-28): the payer is often a
+    # relative or a company, which the third-party payment question covers.
     - insurance_cover.insured_name
     - accessory_invoice_dms.buyer_name
     - ew_invoice.buyer_name

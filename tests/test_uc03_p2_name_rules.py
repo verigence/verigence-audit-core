@@ -114,18 +114,26 @@ def test_documents_in_another_customers_name_raise_a_high_document_missing_task(
     assert _tasks(journey)[0]["task_status"] == "VERIFIED_COMPLETE"
 
 
+def test_a_receipt_in_another_name_raises_no_name_task(journey):
+    """Product owner 2026-10-28: the payer is often a relative or a company; the
+    third-party payment question covers it."""
+    add_ready_document(journey, "aadhaar", aadhaar_number="1234", aadhaar_name="ANITA SAHOO")
+    add_ready_document(journey, "dealer_receipt", amount_paid="21000", customer_name="RAJESH SAHOO")
+    assert _sync(journey) == {}
+
+
 def test_a_corrected_name_that_matches_closes_the_task(journey):
     add_ready_document(journey, "aadhaar", aadhaar_number="1234", aadhaar_name="ANITA SAHOO")
-    receipt = add_ready_document(journey, "dealer_receipt", amount_paid="21000")
-    add_extracted_field(journey, di_document_id=receipt, field_key="customer_name", value="AMITA SAHU",
-                        confidence=80.0, document_type="dealer_receipt")
+    receipt = add_ready_document(journey, "insurance_cover", premium_amount="21000")
+    add_extracted_field(journey, di_document_id=receipt, field_key="insured_name", value="AMITA SAHU",
+                        confidence=80.0, document_type="insurance_cover")
     assert _sync(journey) == {"RAISED": 1}
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
             text("""UPDATE auditcore.journey_document_extracted_fields
                     SET effective_value='"ANITA SAHOO"'::jsonb, is_modified=true
-                    WHERE tenant_id=:t AND di_document_id=:d AND field_key='customer_name'"""),
+                    WHERE tenant_id=:t AND di_document_id=:d AND field_key='insured_name'"""),
             {"t": journey.tenant_id, "d": receipt},
         )
     assert _sync(journey) == {"VERIFIED": 1}

@@ -194,12 +194,16 @@ def sync_insurance_source_task(
 ) -> dict[str, int]:
     """Raise the PC's task while the rule cannot decide; close it once it can."""
     from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_stage import delivery_has_started
     from audit_core.uc03_p2_task_producer import raise_or_refresh, resolve_if_open
 
     decision = resolve(connection, tenant_id=tenant_id, journey_id=journey_id)
     key = _dedupe_key(journey_id)
     counts: dict[str, int] = {}
-    if decision["decidedBy"] == "UNCONFIRMED":
+    # A question for the PC: asked once delivery has started (2026-10-28).
+    asking = decision["decidedBy"] == "UNCONFIRMED" and delivery_has_started(
+        connection, tenant_id=tenant_id, journey_id=journey_id)
+    if asking:
         policy = _policy(connection, tenant_id=tenant_id, journey_id=journey_id) or {}
         shows = "; ".join(f"{label} {policy[k]}" for label, k in (
             ("insurer", "insurer_name"), ("agent", "agent_intermediary_name"),
