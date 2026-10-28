@@ -385,6 +385,32 @@ def _evaluate_native(engine: Engine, *, tenant_id: str, journey_id: UUID, stage:
     return transitions
 
 
+def _presence_checks_without_their_document(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, controls: list[Any], registry: Registry,
+) -> dict[str, str]:
+    """The presence checks (one operand: right is "-") whose document is not on
+    the Journey, with why they wait."""
+    checks = [c for c in controls if (c.operands or {}).get("right") == "-" and c.depends_on_documents]
+    if not checks:
+        return {}
+    on_file = set(connection.execute(
+        text("SELECT DISTINCT document_type_key FROM auditcore.evidence "
+             "WHERE tenant_id=:t AND journey_id=:j AND association_status='ACTIVE'"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalars().all())
+    out: dict[str, str] = {}
+    for control in checks:
+        missing = []
+        for key in control.depends_on_documents:
+            template = registry.documents.get(key)
+            types = set(template.di_types if template and template.di_types else ()) | {key}
+            if not types & on_file:
+                missing.append(template.display_name if template else key.replace("_", " "))
+        if missing:
+            out[control.code] = f"Checked once the {', '.join(missing)} is on file."
+    return out
+
+
 def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stage: str,
                        correlation_id: str, registry: Registry) -> list[Transition]:
     from audit_core.rule_engine_client import (
@@ -438,7 +464,16 @@ def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stag
         rule.rule_code for rule in catalog
         if stage in rule.phases or "FULL" in rule.phases
     }
-    anomalies = {a.rule_code: a for a in result.anomalies}
+    # A presence check ("chassis number empty", "booking amount zero") on a
+    # document that is not on the Journey is not a finding: the value is empty
+    # because the document is missing, which the checklist already shows
+    # (2026-10-28: 207 of 309 open "Review chassis number on Gate Pass" tasks
+    # were on Journeys with no gate pass).
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        absent = _presence_checks_without_their_document(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                                         controls=controls, registry=registry)
+    anomalies = {a.rule_code: a for a in result.anomalies if a.rule_code not in absent}
     ready = set(readiness.ready)
     not_ready = {n.rule_code: n.reason for n in readiness.not_ready}
     # A rule the Rule Engine still evaluates but the catalogue no longer
@@ -451,7 +486,7 @@ def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stag
         set_tenant_context(connection, tenant_id)
         flagged = _materialize_anomalies(
             connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage,
-            anomalies=[a for a in result.anomalies if a.rule_code in catalogued],
+            anomalies=[a for a in result.anomalies if a.rule_code in catalogued and a.rule_code not in absent],
             correlation_id=correlation_id, audit_run_id=result.audit_run_id,
         )
         # Keep the existing Execution Log history complete.
@@ -467,7 +502,10 @@ def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stag
             code = control.code
             details: dict[str, Any] = {"operands": control.operands}
             finding_id = None
-            if code in anomalies:
+            if code in absent:
+                # Not applicable until its document is in: an open task for it closes.
+                status, reason = "NOT_APPLICABLE", absent[code]
+            elif code in anomalies:
                 anomaly = anomalies[code]
                 status, reason = "FAIL", anomaly.detail or "The compared values do not agree."
                 details.update({"leftValue": anomaly.left_value, "rightValue": anomaly.right_value,

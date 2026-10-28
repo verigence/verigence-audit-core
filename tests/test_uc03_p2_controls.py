@@ -367,3 +367,30 @@ def test_a_stronger_duplicate_match_replaces_the_finding_the_control_and_task_fo
     assert state["details"]["matchBasis"] == "PAN" and state["details"]["matchConfidencePercent"] == 99
     assert status == "OPEN"  # the control follows the finding on the current basis, not the voided one
     assert tasks == [str(linked)]  # one open Team Lead task, pointing at it
+
+
+class ChassisEmptyRuleEngine(FakeRuleEngine):
+    """The Rule Engine reports "chassis number empty" whether or not a gate pass is on file."""
+
+    def evaluate_phase(self, *, token, tenant_id, subject_id, phase):
+        return SimpleNamespace(audit_run_id="run-2", verdict="ANOMALIES", anomalies=(
+            SimpleNamespace(rule_code="GATE_PASS_CHASSIS_EMPTY", severity="MEDIUM", category="PROCESS",
+                            detail="Chassis number is empty", left_value=None, right_value=None),))
+
+    def list_rules(self, *, token, tenant_id):
+        return (SimpleNamespace(rule_code="GATE_PASS_CHASSIS_EMPTY", phases=("DELIVERY",)),)
+
+    def readiness(self, *, token, tenant_id, subject_id):
+        return SimpleNamespace(ready=("GATE_PASS_CHASSIS_EMPTY",), not_ready=())
+
+
+def test_a_presence_check_waits_for_its_document(journey, monkeypatch):
+    """2026-10-28: 207 of 309 open "Review chassis number on Gate Pass" tasks were
+    on Journeys with no gate pass at all."""
+    _wire_rule_engine(monkeypatch, ChassisEmptyRuleEngine())
+    _evaluate(journey, "RULE_ENGINE:DELIVERY")
+    state = _states(journey)["GATE_PASS_CHASSIS_EMPTY"]
+    assert state["control_status"] == "NOT_APPLICABLE" and "Gate Pass" in state["status_reason"]
+    add_ready_document(journey, "gate_pass", gate_pass_number="GP-1")
+    _evaluate(journey, "RULE_ENGINE:DELIVERY", force=True)
+    assert _states(journey)["GATE_PASS_CHASSIS_EMPTY"]["control_status"] == "FAIL"

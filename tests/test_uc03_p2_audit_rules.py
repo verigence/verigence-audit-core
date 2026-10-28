@@ -93,6 +93,11 @@ def _deliver(journey, on: date) -> None:
     add_ready_document(journey, "gate_pass", delivery_date=on.isoformat())
 
 
+def _start_delivery(journey) -> None:
+    """A delivery document on file: the PC's questions are asked from then on (2026-10-28)."""
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="supporting_document", process_area="DELIVERY")
+
+
 def _states(journey) -> dict:
     rows = _sql(journey, "SELECT control_code, control_status, status_reason FROM auditcore.p2_control_state "
                          "WHERE tenant_id=:t AND journey_id=:j").mappings().all()
@@ -200,6 +205,7 @@ def test_deal_checks_wait_for_the_standard_prices(journey):
 
 
 def test_cash_intimation_is_asked_answered_and_asked_again(journey):
+    _start_delivery(journey)
     _receipt(journey, "50000", TODAY - timedelta(days=3), "R-1", mode="CASH")
     _evaluate(journey, "NATIVE:BOOKING")
     assert _states(journey)["CASH_INTIMATION_UNCONFIRMED"]["control_status"] == "FAIL"
@@ -543,6 +549,7 @@ def test_a_broken_rule_is_reported_and_the_other_rules_still_run(journey, monkey
 def test_insurance_invoice_is_asked_for_once_the_vehicle_is_invoiced(journey):
     """Decision 2026-09-30: an invoiced vehicle with no insurance invoice is
     a HIGH task for the PC (upload it first; or admit self insurance)."""
+    _start_delivery(journey)
     assert _run(journey, "BOOKING")["INSURANCE_INVOICE_MISSING"].outcome == "PASS"
     add_ready_document(journey, "tax_invoice_tally", invoice_number="INV-1")
     _evaluate(journey, "NATIVE:BOOKING")
@@ -574,6 +581,7 @@ def test_insurance_cover_note_premium_closes_the_insurance_invoice_rule(journey)
     commercial instrument the dealership may never raise -- while the
     document the PC actually holds did nothing. The ask and the way to
     satisfy it are now the same document."""
+    _start_delivery(journey)
     add_ready_document(journey, "tax_invoice_tally", invoice_number="INV-1")
     _evaluate(journey, "NATIVE:BOOKING")
     assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "FAIL"
@@ -594,6 +602,7 @@ def test_cover_note_without_a_premium_does_not_account_for_it(journey):
 
 
 def test_self_insurance_admission_drops_the_premium_and_flags_the_team_lead(journey):
+    _start_delivery(journey)
     add_ready_document(journey, "tax_invoice_tally", invoice_number="INV-1")
     _evaluate(journey, "NATIVE:BOOKING")
     _answer(journey, "INSURANCE_INVOICE_MISSING", "SELF", "Customer brought their own policy")
@@ -674,3 +683,15 @@ def test_no_booking_form_yet_is_skipped_not_failed(journey):
     """A Journey whose documents have not arrived has not done anything wrong."""
     result = _run(journey, "BOOKING")["BOOKING_DATE_UNUSABLE"]
     assert result.outcome == "SKIPPED"
+
+
+def test_the_pcs_questions_wait_until_delivery_has_started(journey):
+    """Product owner 2026-10-28 (fewer tasks): the check still records the
+    unanswered question, but the PC is asked only once delivery has started."""
+    _receipt(journey, "50000", TODAY - timedelta(days=3), "R-1", mode="CASH")
+    _evaluate(journey, "NATIVE:BOOKING")
+    assert _states(journey)["CASH_INTIMATION_UNCONFIRMED"]["control_status"] == "FAIL"
+    assert _task(journey, "CASH_INTIMATION_UNCONFIRMED") is None
+    _start_delivery(journey)
+    _evaluate(journey, "NATIVE:BOOKING")
+    assert _task(journey, "CASH_INTIMATION_UNCONFIRMED")["task_status"] == "READY"

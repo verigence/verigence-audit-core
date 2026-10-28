@@ -35,6 +35,8 @@ def engine():
 
 
 def _policy(journey, *, agent_code=None, misp_code=None, agent="Policybazaar Insurance Brokers Private Limited"):
+    # The PC is asked only once delivery has started (2026-10-28).
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="supporting_document", process_area="DELIVERY")
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
