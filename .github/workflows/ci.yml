@@ -226,13 +226,18 @@ jobs:
             exit "$status"
           fi
 
+  # A commit whose message carries "[skip deploy]" is merged and tested but
+  # not deployed (product owner 2026-10-28: "merge but don't deploy, deploy we
+  # will do in the evening"); it goes out later through the Deploy Audit Core
+  # DEV and Deploy Phase 2 Worker DEV workflows (workflow_dispatch).
   deploy-dev:
     name: Deploy tested Audit Core SHA to Railway DEV
     needs: quality
     if: >-
       github.event_name == 'push' &&
       github.ref == 'refs/heads/dev' &&
-      needs.quality.result == 'success'
+      needs.quality.result == 'success' &&
+      !contains(github.event.head_commit.message, '[skip deploy]')
     uses: ./.github/workflows/audit-core-dev-deploy.yml
     secrets: inherit
 
