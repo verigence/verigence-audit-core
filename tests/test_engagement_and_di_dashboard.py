@@ -185,3 +185,80 @@ def test_routes_are_executive_only(journey):
     acting["subject"] = "exec-1"
     assert client.get(f"{base}/engagement", params={"period": "week"}).status_code == 200
     assert client.get(f"{base}/di-dashboard").status_code == 200
+
+
+# ------------------------------------------------- a person's day, minute by minute (2026-10-28)
+
+
+def _states(**runs: str) -> str:
+    """'.' everywhere, then each HH_MM=run of characters from that minute."""
+    out = ["."] * 1440
+    for key, run in runs.items():
+        start = int(key[1:3]) * 60 + int(key[4:6])
+        out[start:start + len(run)] = list(run)
+    return "".join(out)
+
+
+def test_the_day_in_blocks_and_the_longest_stretch_with_no_output():
+    from audit_core.engagement_reports import day_analysis
+
+    # 10:00 click, active to 10:03; idle 10:04-10:19; 10:20-10:59 scrolling only;
+    # 11:00 click and output.
+    states = _states(t10_00="KAAA" + "I" * 16 + "A" * 40, t11_00="KAAA")
+    a = day_analysis(states, [600, 660])
+    assert a["firstActive"] == "10:00" and a["lastActive"] == "11:03"
+    assert a["longestNoOutput"]["minutes"] == 60 and a["longestNoOutput"]["from"] == "10:00"
+    assert a["longestNoOutput"]["to"] == "11:00" and a["longestNoOutput"]["endsWithOutput"] is True
+    assert [b["state"] for b in a["blocks"]] == ["WORKING", "ACTIVE_NO_OUTPUT", "ACTIVE_NO_OUTPUT", "WORKING"]
+    assert a["blockCounts"] == {"WORKING": 2, "ACTIVE_NO_OUTPUT": 2, "IDLE": 0, "AWAY": 0}
+    assert a["scrollOnly"] == [{"from": "10:20", "to": "11:00", "minutes": 40}]
+    assert day_analysis(None, []) is None
+
+
+def test_a_persons_day_shows_screens_output_and_blocks(journey):
+    from audit_core.engagement_reports import person_day
+    from audit_core.task_manager_reports import merge_minute_states
+
+    day = ist_today() - timedelta(days=1)
+    now = datetime.now(UTC)
+    at = lambda hhmm: datetime.fromisoformat(f"{day.isoformat()}T{hhmm}:00+05:30")
+    caller = Caller(actor_id=journey.actor_id, role="PC")
+    first = _states(t10_00="KAAA" + "I" * 16)
+    later = _states(t10_20="A" * 40, t11_00="KAAA")
+    with _db(journey) as c:
+        for states, visits in ((first, [{"at": at("10:00").isoformat(), "screen": "Bookings list"}]),
+                               (later, [{"at": at("10:30").isoformat(), "screen": "Journey › Documents",
+                                         "journeyId": str(journey.journey_id)}])):
+            assert record_activity(c, tenant_id=journey.tenant_id, caller=caller, now=now, payload={
+                "date": day.isoformat(), "activeSeconds": 2700, "idleSeconds": 960, "backgroundSeconds": 0,
+                "hourlyActiveMinutes": [0] * 24, "minuteStates": states, "visits": visits,
+                "firstActiveAt": at("10:00").isoformat(), "lastActiveAt": at("11:03").isoformat()})
+        stored = c.execute(text("SELECT minute_states, screen_visits FROM auditcore.p2_user_activity_daily "
+                                "WHERE tenant_id=:t AND actor_id=:a AND activity_date=:d"),
+                           {"t": journey.tenant_id, "a": journey.actor_id, "d": day}).one()
+    assert stored[0] == merge_minute_states(first, later) and len(stored[1]) == 2
+    batch, _ = add_batch_pages(journey, [("booking_form", "READY")])
+    with _db(journey) as c:
+        c.execute(text("UPDATE auditcore.p2_upload_batches SET created_at_utc=:at, uploaded_by_actor_id=:a "
+                       "WHERE batch_id=:b"), {"at": at("11:00"), "a": journey.actor_id, "b": batch})
+        report = person_day(c, tenant_id=journey.tenant_id, actor_id=journey.actor_id, day=day)
+    assert [o["label"] for o in report["outputs"]] == ["File uploaded"] and report["outputCount"] == 1
+    assert report["analysis"]["longestNoOutput"]["minutes"] == 60
+    assert [s["screen"] for s in report["screens"]] == ["Bookings list", "Journey › Documents"]
+    assert report["screens"][1]["journeyReference"]
+    minutes = {m["screen"]: m["activeMinutes"] for m in report["minutesByScreen"]}
+    assert minutes == {"Bookings list": 4 + 10, "Journey › Documents": 30 + 4}
+
+
+def test_person_day_is_executive_only(journey):
+    acting = {"subject": journey.actor_id}
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=acting["subject"])
+    app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization()
+    client = TestClient(app, raise_server_exceptions=False)
+    url = f"/p2/v1/tenants/{journey.tenant_id}/reports/engagement/person-day"
+    assert client.get(url, params={"actorId": journey.actor_id}).status_code == 403
+    with _db(journey) as c:
+        c.execute(text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code) "
+                       "VALUES (:t, 'exec-1', 'EXECUTIVE')"), {"t": journey.tenant_id})
+    acting["subject"] = "exec-1"
+    assert client.get(url, params={"actorId": journey.actor_id}).status_code == 200

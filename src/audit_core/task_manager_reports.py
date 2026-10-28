@@ -8,6 +8,7 @@ here runs as a batch. Time on Verigence comes from the browser's own tally
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
@@ -221,15 +222,18 @@ def record_activity(connection: Connection, *, tenant_id: str, caller: Caller, p
         return at if start <= at < end + timedelta(minutes=5) and at <= now + timedelta(minutes=5) else None
 
     sessions = clean_sessions(payload.get("sessions"), day=day, now=now)
+    stored = _stored_day(connection, tenant_id=tenant_id, actor_id=caller.actor_id, day=day, client=client)
+    minutes = merge_minute_states(stored["minute_states"], clean_minute_states(payload.get("minuteStates")))
+    visits = merge_visits(stored["screen_visits"], clean_visits(payload.get("visits"), day=day, now=now))
     connection.execute(
         text("""
             INSERT INTO auditcore.p2_user_activity_daily (
               tenant_id, actor_id, activity_date, client_kind, role_code, display_name,
               active_seconds, idle_seconds, background_seconds, hourly_active_minutes,
-              first_active_at_utc, last_active_at_utc, sessions
+              first_active_at_utc, last_active_at_utc, sessions, minute_states, screen_visits
             ) VALUES (
               :t, :a, :d, :client, :role, :name, :active, :idle, :background, CAST(:hourly AS smallint[]),
-              :first, :last, CAST(:sessions AS jsonb)
+              :first, :last, CAST(:sessions AS jsonb), :minutes, CAST(:visits AS jsonb)
             )
             ON CONFLICT (tenant_id, actor_id, activity_date, client_kind) DO UPDATE SET
               role_code = COALESCE(EXCLUDED.role_code, auditcore.p2_user_activity_daily.role_code),
@@ -247,6 +251,8 @@ def record_activity(connection: Connection, *, tenant_id: str, caller: Caller, p
               last_active_at_utc = GREATEST(auditcore.p2_user_activity_daily.last_active_at_utc,
                                             EXCLUDED.last_active_at_utc),
               sessions = CAST(:merged AS jsonb),
+              minute_states = EXCLUDED.minute_states,
+              screen_visits = EXCLUDED.screen_visits,
               updated_at_utc = now()
         """),
         {"t": tenant_id, "a": caller.actor_id, "d": day, "client": client, "role": caller.role,
@@ -255,8 +261,8 @@ def record_activity(connection: Connection, *, tenant_id: str, caller: Caller, p
          "background": seconds("backgroundSeconds"), "hourly": hourly,
          "first": stamp("firstActiveAt"), "last": stamp("lastActiveAt"),
          "sessions": json.dumps(sessions),
-         "merged": json.dumps(merge_sessions(_stored_sessions(connection, tenant_id=tenant_id, actor_id=caller.actor_id,
-                                                              day=day, client=client), sessions))},
+         "merged": json.dumps(merge_sessions(stored["sessions"], sessions)),
+         "minutes": minutes, "visits": json.dumps(visits)},
     )
     return True
 
@@ -300,14 +306,72 @@ def merge_sessions(old: list[dict[str, Any]], new: list[dict[str, Any]]) -> list
     return sorted(merged.values(), key=lambda s: s["start"])[:MAX_SESSIONS_PER_DAY]
 
 
-def _stored_sessions(connection: Connection, *, tenant_id: str, actor_id: str, day: date,
-                     client: str) -> list[dict[str, Any]]:
-    value = connection.execute(
-        text("SELECT sessions FROM auditcore.p2_user_activity_daily WHERE tenant_id = :t AND actor_id = :a "
-             "AND activity_date = :d AND client_kind = :c FOR UPDATE"),
+def _stored_day(connection: Connection, *, tenant_id: str, actor_id: str, day: date,
+                client: str) -> dict[str, Any]:
+    row = connection.execute(
+        text("SELECT sessions, minute_states, screen_visits FROM auditcore.p2_user_activity_daily "
+             "WHERE tenant_id = :t AND actor_id = :a AND activity_date = :d AND client_kind = :c FOR UPDATE"),
         {"t": tenant_id, "a": actor_id, "d": day, "c": client},
-    ).scalar_one_or_none()
-    return list(value or [])
+    ).mappings().one_or_none()
+    return {"sessions": list((row or {}).get("sessions") or []),
+            "minute_states": (row or {}).get("minute_states"),
+            "screen_visits": list((row or {}).get("screen_visits") or [])}
+
+
+# One character per minute of the IST day (2026-10-28): nothing, hidden, idle,
+# active, and a click / tap / key in that very minute. Busiest wins on merge,
+# so a repeated or late send never lowers a minute.
+MINUTE_RANK = {".": 0, "B": 1, "I": 2, "A": 3, "K": 4}
+MINUTES_PER_DAY = 1440
+
+
+def clean_minute_states(raw: Any) -> str | None:
+    value = str(raw or "")
+    if len(value) != MINUTES_PER_DAY or any(c not in MINUTE_RANK for c in value):
+        return None
+    return value
+
+
+def merge_minute_states(old: str | None, new: str | None) -> str | None:
+    if not old:
+        return new
+    if not new:
+        return old
+    return "".join(a if MINUTE_RANK[a] >= MINUTE_RANK[b] else b for a, b in zip(old, new, strict=True))
+
+
+MAX_VISITS_PER_DAY = 3000
+_UUID = re.compile(r"^[0-9a-fA-F-]{36}$")
+
+
+def clean_visits(raw: Any, *, day: date, now: datetime) -> list[dict[str, Any]]:
+    """Screens opened in the browser: time, screen key, journey. Kept only
+    inside the day and not in the future."""
+    start_of_day, end_of_day = _bounds(day)
+    out: list[dict[str, Any]] = []
+    for item in list(raw or [])[:MAX_VISITS_PER_DAY]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            at = datetime.fromisoformat(str(item.get("at")))
+        except ValueError:
+            continue
+        if at.tzinfo is None or not (start_of_day <= at < end_of_day) or at > now + timedelta(minutes=5):
+            continue
+        screen = str(item.get("screen") or "").strip()[:160]
+        if not screen:
+            continue
+        journey = str(item.get("journeyId") or "")
+        out.append({"at": at.astimezone(UTC).isoformat(), "screen": screen,
+                    "journeyId": journey if _UUID.match(journey) else None})
+    return out
+
+
+def merge_visits(old: list[dict[str, Any]], new: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged = {(str(v.get("at")), str(v.get("screen"))): v for v in old if isinstance(v, dict)}
+    for v in new:
+        merged.setdefault((v["at"], v["screen"]), v)
+    return sorted(merged.values(), key=lambda v: str(v.get("at")))[-MAX_VISITS_PER_DAY:]
 
 
 # --------------------------------------------------------------------------- employee utilisation
