@@ -37,6 +37,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_db_transient import raise_if_worker_transient
 from audit_core.uc03_delivery_review_materialization import (
     materialize_delivery_insurance,
     materialize_delivery_registration,
@@ -162,7 +163,8 @@ def materialize_delivery_documents_from_durable_store(
             },
         )
         return result
-    except Exception:
+    except Exception as exc:
+        raise_if_worker_transient(exc)  # retried, not skipped (uc03_db_transient)
         logger.warning(
             "materialize_delivery_documents_from_durable_store failed", exc_info=True
         )

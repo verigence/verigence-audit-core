@@ -49,6 +49,7 @@ from sqlalchemy import Connection, text
 from audit_core.errors import AuditCoreError
 from audit_core.oem_master_parsers import is_ev_model_text, variant_excluded
 from audit_core.uc03_booking_confirmation_rules import _has_active_document
+from audit_core.uc03_db_transient import raise_if_worker_transient
 from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_manual_verification import _resolve_finding
 from audit_core.uc03_masters_alignment import (
@@ -1813,7 +1814,8 @@ def sync_deal_reconciliation(
                 connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
                 raise_findings=raise_findings,
             )
-    except Exception:
+    except Exception as exc:
+        raise_if_worker_transient(exc)  # retried, not skipped (uc03_db_transient)
         logger.warning("sync_deal_reconciliation failed", exc_info=True)
         return {"error": True}
 

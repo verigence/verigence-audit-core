@@ -376,11 +376,24 @@ def test_a_request_the_document_service_refuses_fails_at_once(journey, monkeypat
 
 
 def test_per_journey_concurrency_cap(journey, monkeypatch):
+    """The cap is for a page's own work; work on the Journey as a whole runs
+    one at a time (2026-10-28, deadlocks)."""
     monkeypatch.setattr(worker, "_PER_JOURNEY_CONCURRENCY", 2)
     for index in range(5):
-        _enqueue(journey, key=f"cap-{index}")
+        _enqueue(journey, work_type="DOCUMENT_INGEST", key=f"cap-{index}")
     first = worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
     assert len(first) == 2
+    assert worker._claim_for_tenant(journey.engine, journey.tenant_id, 10) == []
+    worker._complete(journey.engine, first[0])
+    assert len(worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)) == 1
+
+
+def test_journey_work_runs_one_at_a_time(journey, monkeypatch):
+    monkeypatch.setattr(worker, "_PER_JOURNEY_CONCURRENCY", 2)
+    for index in range(3):
+        _enqueue(journey, key=f"stage-{index}")
+    first = worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
+    assert len(first) == 1
     assert worker._claim_for_tenant(journey.engine, journey.tenant_id, 10) == []
     worker._complete(journey.engine, first[0])
     assert len(worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)) == 1
