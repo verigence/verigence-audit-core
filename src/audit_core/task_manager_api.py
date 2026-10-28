@@ -28,7 +28,7 @@ from audit_core.dependencies import (
     require_super_admin_request,
 )
 from audit_core.di_dashboard import build_di_dashboard
-from audit_core.engagement_reports import build_engagement
+from audit_core.engagement_reports import build_engagement, person_day
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
@@ -309,6 +309,13 @@ def _engagement(connection: Connection, *, tenant_id: str, caller: Caller, start
     return _run(lambda: build_engagement(connection, tenant_id=tenant_id, start_day=start, end_day=end, period=period))
 
 
+def _person_day(connection: Connection, *, tenant_id: str, caller: Caller, actor_id: str,
+                day: date | None) -> dict[str, Any]:
+    if not utilisation_allowed(caller):
+        raise HTTPException(status_code=403, detail="Only an Executive or Superadmin can see engagement.")
+    return _run(lambda: person_day(connection, tenant_id=tenant_id, actor_id=actor_id, day=day or ist_today()))
+
+
 def _di_dashboard(connection: Connection, *, tenant_id: str, caller: Caller, start: date | None,
                   end: date | None) -> dict[str, Any]:
     if not utilisation_allowed(caller):
@@ -328,6 +335,17 @@ def engagement(tenant_id: str, principal: Principal, client: Client, connection:
                start: From = None, end: To = None, period: Period = "day") -> dict[str, Any]:
     caller = _project_caller(connection, tenant_id=tenant_id, principal=principal, client=client)
     return _engagement(connection, tenant_id=tenant_id, caller=caller, start=start, end=end, period=period)
+
+
+ActorId = Annotated[str, Query(alias="actorId", min_length=1, max_length=120)]
+Day = Annotated[date | None, Query()]
+
+
+@router.get("/reports/engagement/person-day")
+def engagement_person_day(tenant_id: str, principal: Principal, client: Client, connection: Db,
+                          actor_id: ActorId, day: Day = None) -> dict[str, Any]:
+    caller = _project_caller(connection, tenant_id=tenant_id, principal=principal, client=client)
+    return _person_day(connection, tenant_id=tenant_id, caller=caller, actor_id=actor_id, day=day)
 
 
 @router.get("/reports/di-dashboard")
@@ -439,6 +457,13 @@ def admin_engagement(tenant_id: str, admin: Admin, connection: Db, start: From =
                      period: Period = "day") -> dict[str, Any]:
     caller = _admin_caller(connection, tenant_id=tenant_id, admin=admin)
     return _engagement(connection, tenant_id=tenant_id, caller=caller, start=start, end=end, period=period)
+
+
+@admin_router.get("/engagement/person-day")
+def admin_engagement_person_day(tenant_id: str, admin: Admin, connection: Db, actor_id: ActorId,
+                                day: Day = None) -> dict[str, Any]:
+    caller = _admin_caller(connection, tenant_id=tenant_id, admin=admin)
+    return _person_day(connection, tenant_id=tenant_id, caller=caller, actor_id=actor_id, day=day)
 
 
 @admin_router.get("/di-dashboard")

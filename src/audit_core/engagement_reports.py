@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import UTC, date, datetime, time, timedelta
+from itertools import pairwise
 from statistics import median
 from typing import Any
 
@@ -223,13 +224,16 @@ def build_engagement(connection: Connection, *, tenant_id: str, start_day: date,
         c["journeyTasksWorked"] += int(row["tasks"])
         c["taskActions"] += int(row["actions"])
 
+    minute_rows: dict[tuple[str, date], list[dict[str, Any]]] = defaultdict(list)
     for row in connection.execute(text("""
         SELECT actor_id, activity_date, client_kind, active_seconds, idle_seconds, background_seconds,
-               hourly_active_minutes, first_active_at_utc, last_active_at_utc, sessions
+               hourly_active_minutes, first_active_at_utc, last_active_at_utc, sessions, minute_states
         FROM auditcore.p2_user_activity_daily
         WHERE tenant_id = :t AND activity_date BETWEEN :sd AND :ed
     """), {"t": tenant_id, "sd": start_day, "ed": end_day}).mappings().all():
         c = cell(row["actor_id"], row["activity_date"])
+        if row["minute_states"]:
+            minute_rows[(str(row["actor_id"]), row["activity_date"])].append(dict(row))
         c["activeMinutes"] += round(int(row["active_seconds"]) / 60)
         source = str(row["client_kind"] or "WEB")
         c["activeMinutesBySource"][source] = (c["activeMinutesBySource"].get(source, 0)
@@ -272,6 +276,16 @@ def build_engagement(connection: Connection, *, tenant_id: str, start_day: date,
 
     people = {p["actorId"]: p for p in project_people(connection, tenant_id=tenant_id)}
     names = known_names(connection, tenant_id=tenant_id)
+    # Each day with minute detail (from 28 Oct 2026): the longest stretch with
+    # no output and the 20-minute blocks (product owner 2026-10-28).
+    by_day: dict[tuple[str, date], list[int]] = defaultdict(list)
+    if minute_rows:
+        for o in outputs(connection, tenant_id=tenant_id, start=start, end=end):
+            role = (people.get(o["actor"]) or {}).get("roleCode")
+            if counts_as_output(o["kind"], role):
+                d = o["at"].astimezone(IST).date()
+                by_day[(o["actor"], d)].append(_minute_of(o["at"], d))
+    day_detail = {key: day_analysis(merged_minutes(rows), by_day.get(key, [])) for key, rows in minute_rows.items()}
     out_people = []
     for actor in sorted(set(people) | set(cells)):
         if actor.upper() == "SYSTEM":
@@ -300,7 +314,8 @@ def build_engagement(connection: Connection, *, tenant_id: str, start_day: date,
             # stopped, for "who was in first / out last" (product owner 2026-10-27).
             "days": [{"day": d.isoformat(), "activeMinutes": per_day[d]["activeMinutes"],
                       "firstActiveAtUtc": _iso(per_day[d]["firstActiveAtUtc"]),
-                      "lastActiveAtUtc": _iso(per_day[d]["lastActiveAtUtc"])}
+                      "lastActiveAtUtc": _iso(per_day[d]["lastActiveAtUtc"]),
+                      **_day_summary(day_detail.get((actor, d)))}
                      for d in span if d in per_day and per_day[d]["activeMinutes"]],
         })
     out_people.sort(key=lambda p: (_ROLE_ORDER.get(p["role"] or "", 9), (p["name"] or p["actorId"]).lower()))
@@ -320,5 +335,257 @@ def build_engagement(connection: Connection, *, tenant_id: str, start_day: date,
              "of uploaded pages refused as bad scans, days active out of working days (Monday to Saturday)."),
             ("Time measures interaction, not work: read it next to the output. Minutes since the last send are "
              "lost if the browser is closed abruptly (an undercount, never an overcount)."),
+        ],
+    }
+
+
+def _day_summary(analysis: dict[str, Any] | None) -> dict[str, Any]:
+    if not analysis:
+        return {}
+    longest = analysis.get("longestNoOutput") or {}
+    return {"longestNoOutputMinutes": longest.get("minutes"), "longestNoOutputFrom": longest.get("from"),
+            "longestNoOutputTo": longest.get("to"), "blockCounts": analysis.get("blockCounts")}
+
+
+# --------------------------------------------------------------------------- a person's day, minute by minute
+# Product owner 2026-10-28: "a user cannot be active for 4 hours without doing
+# any updates". Which screens were used, the longest stretch with no output,
+# and the day in 20-minute blocks -- Superadmin and Executive only.
+
+BLOCK_MINUTES = 20
+SCROLL_ONLY_MINUTES = 10
+# What counts as output. A PC's output is what they save; a Reviewer's (and a
+# supervisor's) also includes opening a document, since reviewing is reading
+# (product owner 2026-10-28: "for reviewer journeys, opening documents,
+# corrections, everything should be counted").
+_OPENING_COUNTS = frozenset({"REVIEWER", "TL", "PM", "CRM", EXECUTIVE})
+_PAGE_EVENTS = ("PAGE_REMOVED", "PAGE_RETYPED", "PAGE_RETRY_REQUESTED", "PAGE_REREAD_REQUESTED",
+                "PAGE_SENT_AGAIN", "DOCUMENT_COPY_RESTORED")
+OUTPUT_LABELS = {
+    "FILE_UPLOADED": "File uploaded", "JOURNEY_STARTED": "Journey started", "VALUE_CORRECTED": "Value corrected",
+    "VALUE_CONFIRMED": "Value confirmed", "DOCUMENT_OPENED": "Document opened",
+    "DOCUMENTS_MARKED_REVIEWED": "Documents marked reviewed", "PAGE_REMOVED": "Page removed",
+    "PAGE_RETYPED": "Document type set", "PAGE_RETRY_REQUESTED": "Page retried", "PAGE_REREAD_REQUESTED": "Page re-read",
+    "PAGE_SENT_AGAIN": "Page sent again", "DOCUMENT_COPY_RESTORED": "Document copy restored",
+}
+
+
+def outputs(connection: Connection, *, tenant_id: str, start: datetime, end: datetime,
+            actor_id: str | None = None) -> list[dict[str, Any]]:
+    """Everything a person saved (or, for a Reviewer, opened) between start
+    and end: {actor, at, kind, journeyId, detail}."""
+    params = {"t": tenant_id, "s": start, "e": end, "a": actor_id, "work": list(_WORK_EVENTS),
+              "pages": list(_PAGE_EVENTS)}
+    who = "(CAST(:a AS text) IS NULL OR {col} = CAST(:a AS text))"
+    rows = connection.execute(text(f"""
+        SELECT uploaded_by_actor_id::text AS actor, created_at_utc AS at, 'FILE_UPLOADED' AS kind,
+               journey_id, original_filename AS detail
+          FROM auditcore.p2_upload_batches
+         WHERE tenant_id = :t AND created_at_utc >= :s AND created_at_utc < :e
+           AND {who.format(col='uploaded_by_actor_id::text')}
+        UNION ALL
+        SELECT created_by_actor_id::text, created_at_utc, 'JOURNEY_STARTED', journey_id, journey_reference
+          FROM auditcore.journeys
+         WHERE tenant_id = :t AND created_at_utc >= :s AND created_at_utc < :e
+           AND {who.format(col='created_by_actor_id::text')}
+        UNION ALL
+        SELECT te.actor_id, te.created_at_utc, 'TASK_' || te.event_type, te.journey_id, tk.title
+          FROM auditcore.p2_task_events te
+          LEFT JOIN auditcore.p2_tasks tk ON tk.tenant_id = te.tenant_id AND tk.task_id = te.task_id
+         WHERE te.tenant_id = :t AND te.created_at_utc >= :s AND te.created_at_utc < :e
+           AND te.event_type = ANY(:work) AND upper(COALESCE(te.actor_id, '')) <> 'SYSTEM'
+           AND {who.format(col='te.actor_id')}
+        UNION ALL
+        SELECT modified_by_actor_id::text, modified_at_utc, 'VALUE_CORRECTED', journey_id, field_key
+          FROM auditcore.journey_document_extracted_fields
+         WHERE tenant_id = :t AND modified_at_utc >= :s AND modified_at_utc < :e
+           AND {who.format(col='modified_by_actor_id::text')}
+        UNION ALL
+        SELECT reviewed_by_actor_id::text, reviewed_at_utc, 'VALUE_CONFIRMED', journey_id, field_key
+          FROM auditcore.journey_document_extracted_fields
+         WHERE tenant_id = :t AND reviewed_at_utc >= :s AND reviewed_at_utc < :e
+           AND (modified_at_utc IS NULL OR modified_at_utc <> reviewed_at_utc)
+           AND {who.format(col='reviewed_by_actor_id::text')}
+        UNION ALL
+        SELECT reviewed_by_actor_id::text, reviewed_at_utc, 'DOCUMENTS_MARKED_REVIEWED', journey_id, stage_code
+          FROM auditcore.p2_stage_document_reviews
+         WHERE tenant_id = :t AND reviewed_at_utc >= :s AND reviewed_at_utc < :e
+           AND {who.format(col='reviewed_by_actor_id::text')}
+        UNION ALL
+        SELECT actor_id, first_opened_at_utc, 'DOCUMENT_OPENED', journey_id, di_document_id::text
+          FROM auditcore.p2_document_views
+         WHERE tenant_id = :t AND first_opened_at_utc >= :s AND first_opened_at_utc < :e
+           AND {who.format(col='actor_id')}
+        UNION ALL
+        SELECT actor_id, last_opened_at_utc, 'DOCUMENT_OPENED', journey_id, di_document_id::text
+          FROM auditcore.p2_document_views
+         WHERE tenant_id = :t AND last_opened_at_utc >= :s AND last_opened_at_utc < :e
+           AND last_opened_at_utc > first_opened_at_utc + interval '1 minute'
+           AND {who.format(col='actor_id')}
+        UNION ALL
+        SELECT COALESCE(details ->> 'removedBy', details ->> 'by'), created_at_utc, event_type, journey_id,
+               details ->> 'filename'
+          FROM auditcore.p2_activity_events
+         WHERE tenant_id = :t AND created_at_utc >= :s AND created_at_utc < :e AND event_type = ANY(:pages)
+           AND {who.format(col="COALESCE(details ->> 'removedBy', details ->> 'by')")}
+    """), params).mappings().all()
+    return [{"actor": str(r["actor"]), "at": r["at"], "kind": str(r["kind"]),
+             "journeyId": str(r["journey_id"]) if r["journey_id"] else None, "detail": r["detail"]}
+            for r in rows if r["actor"] and r["at"] is not None]
+
+
+def output_label(kind: str) -> str:
+    if kind.startswith("TASK_"):
+        return "Task: " + kind[5:].replace("_", " ").lower()
+    return OUTPUT_LABELS.get(kind, kind.replace("_", " ").capitalize())
+
+
+def counts_as_output(kind: str, role: str | None) -> bool:
+    return kind != "DOCUMENT_OPENED" or (role or "").upper() in _OPENING_COUNTS
+
+
+def _minute_of(at: datetime, day: date) -> int:
+    local = at.astimezone(IST)
+    if local.date() != day:
+        return -1
+    return local.hour * 60 + local.minute
+
+
+def _hhmm(minute: int) -> str:
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def day_analysis(minute_states: str | None, output_minutes: list[int]) -> dict[str, Any] | None:
+    """The day minute by minute: the longest stretch without output, the
+    20-minute blocks, and stretches of scrolling with no click. None when the
+    browser sent no minutes for the day."""
+    if not minute_states:
+        return None
+    active = [i for i, c in enumerate(minute_states) if c in "AK"]
+    used = [i for i, c in enumerate(minute_states) if c in "AKI"]
+    if not active:
+        return {"firstActive": None, "lastActive": None, "longestNoOutput": None, "blocks": [],
+                "blockCounts": {"WORKING": 0, "ACTIVE_NO_OUTPUT": 0, "IDLE": 0, "AWAY": 0},
+                "scrollOnly": [], "activeMinutes": 0}
+    first, last = active[0], active[-1]
+    marks = sorted({m for m in output_minutes if first <= m <= last})
+    edges = [first, *marks, last + 1]
+    longest = None
+    for a, b in pairwise(edges):
+        span = b - a
+        if longest is None or span > longest["minutes"]:
+            longest = {"minutes": span, "from": _hhmm(a), "to": _hhmm(min(b, 1439)),
+                       "activeMinutes": sum(1 for i in range(a, b) if minute_states[i] in "AK"),
+                       "endsWithOutput": b in marks}
+    out_set = set(output_minutes)
+    start_block = (min(used[0], first) // BLOCK_MINUTES) * BLOCK_MINUTES
+    end_block = (max(used[-1], last) // BLOCK_MINUTES) * BLOCK_MINUTES
+    blocks = []
+    counts = {"WORKING": 0, "ACTIVE_NO_OUTPUT": 0, "IDLE": 0, "AWAY": 0}
+    for b in range(start_block, end_block + BLOCK_MINUTES, BLOCK_MINUTES):
+        window = minute_states[b:b + BLOCK_MINUTES]
+        n_out = sum(1 for m in out_set if b <= m < b + BLOCK_MINUTES)
+        n_active = sum(1 for c in window if c in "AK")
+        n_idle = window.count("I")
+        state = ("WORKING" if n_out else "ACTIVE_NO_OUTPUT" if n_active else "IDLE" if n_idle else "AWAY")
+        counts[state] += 1
+        blocks.append({"from": _hhmm(b), "to": _hhmm(b + BLOCK_MINUTES) if b + BLOCK_MINUTES < 1440 else "24:00",
+                       "state": state, "outputs": n_out, "activeMinutes": n_active,
+                       "idleMinutes": n_idle, "hiddenMinutes": window.count("B")})
+    scroll_only = []
+    run_start = None
+    for i in range(first, last + 2):
+        c = minute_states[i] if i <= 1439 else "."
+        if c == "A":
+            run_start = i if run_start is None else run_start
+            continue
+        if run_start is not None and i - run_start >= SCROLL_ONLY_MINUTES:
+            scroll_only.append({"from": _hhmm(run_start), "to": _hhmm(min(i, 1439)), "minutes": i - run_start})
+        run_start = None
+    return {"firstActive": _hhmm(first), "lastActive": _hhmm(last), "longestNoOutput": longest,
+            "blocks": blocks, "blockCounts": counts, "scrollOnly": scroll_only, "activeMinutes": len(active)}
+
+
+def merged_minutes(rows: list[dict[str, Any]]) -> str | None:
+    from audit_core.task_manager_reports import merge_minute_states
+
+    merged: str | None = None
+    for row in rows:
+        merged = merge_minute_states(merged, row.get("minute_states"))
+    return merged
+
+
+def person_day(connection: Connection, *, tenant_id: str, actor_id: str, day: date) -> dict[str, Any]:
+    """One person's day: screens used, output, the longest stretch with no
+    output and the 20-minute blocks."""
+    start, end = _bounds(day, day)
+    people = {p["actorId"]: p for p in project_people(connection, tenant_id=tenant_id)}
+    person = people.get(actor_id)
+    role = (person or {}).get("roleCode")
+    rows = [dict(r) for r in connection.execute(text("""
+        SELECT client_kind, active_seconds, idle_seconds, background_seconds, minute_states, screen_visits,
+               first_active_at_utc, last_active_at_utc
+        FROM auditcore.p2_user_activity_daily
+        WHERE tenant_id = :t AND actor_id = :a AND activity_date = :d
+    """), {"t": tenant_id, "a": actor_id, "d": day}).mappings().all()]
+    work = sorted(outputs(connection, tenant_id=tenant_id, start=start, end=end, actor_id=actor_id),
+                  key=lambda o: o["at"])
+    counted = [o for o in work if counts_as_output(o["kind"], role)]
+    minutes = merged_minutes(rows)
+    analysis = day_analysis(minutes, [_minute_of(o["at"], day) for o in counted])
+
+    visits = sorted((v for r in rows for v in (r.get("screen_visits") or []) if isinstance(v, dict)),
+                    key=lambda v: str(v.get("at")))
+    last_active = max((r["last_active_at_utc"] for r in rows if r["last_active_at_utc"]), default=None)
+    timeline = []
+    per_screen: dict[str, int] = defaultdict(int)
+    visit_minutes = []
+    for i, v in enumerate(visits):
+        at = datetime.fromisoformat(str(v["at"]))
+        nxt = datetime.fromisoformat(str(visits[i + 1]["at"])) if i + 1 < len(visits) else (last_active or at)
+        visit_minutes.append(_minute_of(at, day))
+        timeline.append({"at": at.isoformat(), "time": at.astimezone(IST).strftime("%H:%M"), "screen": v["screen"],
+                         "journeyId": v.get("journeyId"), "minutes": max(0, round((max(nxt, at) - at).total_seconds() / 60))})
+    if minutes and visit_minutes:
+        for m, c in enumerate(minutes):
+            if c not in "AK":
+                continue
+            current = next((visits[j]["screen"] for j in range(len(visits) - 1, -1, -1)
+                            if 0 <= visit_minutes[j] <= m), None)
+            per_screen[current or "Before the first screen recorded"] += 1
+
+    journey_ids = sorted({j for j in [*(o["journeyId"] for o in work), *(v.get("journeyId") for v in visits)] if j})
+    refs = {str(r[0]): r[1] for r in connection.execute(
+        text("SELECT journey_id, journey_reference FROM auditcore.journeys WHERE tenant_id = :t "
+             "AND journey_id::text = ANY(:ids)"), {"t": tenant_id, "ids": journey_ids}).all()} if journey_ids else {}
+    for item in timeline:
+        item["journeyReference"] = refs.get(str(item["journeyId"])) if item["journeyId"] else None
+    names = known_names(connection, tenant_id=tenant_id)
+    return {
+        "actorId": actor_id, "name": (person or {}).get("displayName") or names.get(actor_id), "role": role,
+        "day": day.isoformat(),
+        "activeMinutes": round(sum(int(r["active_seconds"]) for r in rows) / 60),
+        "idleMinutes": round(sum(int(r["idle_seconds"]) for r in rows) / 60),
+        "hiddenMinutes": round(sum(int(r["background_seconds"]) for r in rows) / 60),
+        "minuteDetail": minutes is not None,
+        "analysis": analysis,
+        "outputs": [{"at": o["at"].isoformat(), "time": o["at"].astimezone(IST).strftime("%H:%M"), "kind": o["kind"],
+                     "label": output_label(o["kind"]), "countsAsOutput": counts_as_output(o["kind"], role),
+                     "journeyId": o["journeyId"], "journeyReference": refs.get(str(o["journeyId"])) if o["journeyId"] else None,
+                     "detail": o["detail"]} for o in work],
+        "outputCount": len(counted),
+        "journeysReviewed": len({o["journeyId"] for o in work if o["kind"] == "DOCUMENTS_MARKED_REVIEWED"}),
+        "documentsOpened": len({o["detail"] for o in work if o["kind"] == "DOCUMENT_OPENED"}),
+        "journeysTouched": len(journey_ids),
+        "screens": timeline,
+        "minutesByScreen": [{"screen": k, "activeMinutes": v}
+                            for k, v in sorted(per_screen.items(), key=lambda kv: -kv[1])],
+        "notes": [
+            ("Output for a PC: files uploaded, journeys started, task actions, values corrected or confirmed, pages "
+             "removed, retried or retyped. For a Reviewer (and supervisors) opening a document also counts."),
+            (f"The day is cut into {BLOCK_MINUTES}-minute blocks: Working (at least one output), Active with no "
+             "output (clicks or scrolls, nothing saved), Idle (open, untouched), Away (hidden or closed)."),
+            f"Scrolling only: {SCROLL_ONLY_MINUTES} minutes or more active with no click, tap or key.",
+            "Minute-by-minute detail and screens are recorded from 28 Oct 2026; earlier days show totals only.",
         ],
     }
