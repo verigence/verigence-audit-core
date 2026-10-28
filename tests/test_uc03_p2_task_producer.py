@@ -373,3 +373,20 @@ def test_a_statement_that_balances_stands(journey):
         set_tenant_context(connection, journey.tenant_id)
         assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
                                        journey_id=journey.journey_id) == {}
+
+
+def test_a_statement_with_no_balance_read_is_not_held_against_its_lines(journey):
+    """2026-10-28: 75 of 124 statements were flagged on the first run because a
+    missing balance was taken as 0; credits above debits can be an excess the
+    customer is owed. A negative total is still a misreading."""
+    lines = ('[{"particulars_raw": "VEHICLE", "debit_amount": 1054828},'
+             ' {"particulars_raw": "DEPOSITED", "credit_amount": 1066000}]')
+    add_ready_document(journey, "customer_ledger", confidence=99.0, line_items=lines)
+    negative = ('[{"particulars_raw": "VEHICLE", "debit_amount": 5356588},'
+                ' {"particulars_raw": "DEPOSITED", "credit_amount": -4027044}]')
+    bad = add_ready_document(journey, "customer_ledger", confidence=99.0, line_items=negative)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {"RAISED": 1}
+    assert _task(journey, f"field-review:{bad}") is not None

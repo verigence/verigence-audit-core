@@ -327,14 +327,25 @@ def _items(value: Any) -> list[dict[str, Any]]:
 
 def statement_out_of_balance(values: dict[str, Any]) -> tuple[float, float, float] | None:
     """(debits, credits, balance) when a statement's lines, as read, do not
-    add up; None when they do or cannot be added up."""
+    add up; None when they do or cannot be added up.
+
+    Only against a balance that was read (2026-10-28, after the first run on
+    Mahindra Orissa): with no balance read, a statement whose credits exceed
+    its debits may simply show an excess the customer is owed, so 75 of 124
+    statements were flagged, most of them correctly read. A negative total is
+    always a misreading."""
     items = _items(values.get("line_items"))
     debits = [n for n in (_number(i.get("debit_amount")) for i in items) if n is not None]
     credits = [n for n in (_number(i.get("credit_amount")) for i in items) if n is not None]
     if not debits or not credits:
         return None
-    balance = abs(_number(values.get("balance_amount")) or 0.0)
     total_debit, total_credit = sum(debits), sum(credits)
+    read_balance = _number(values.get("balance_amount"))
+    if total_debit < 0 or total_credit < 0:
+        return total_debit, total_credit, abs(read_balance or 0.0)
+    if read_balance is None:
+        return None
+    balance = abs(read_balance)
     if abs(abs(total_debit - total_credit) - balance) <= _STATEMENT_TOLERANCE:
         return None
     return total_debit, total_credit, balance
