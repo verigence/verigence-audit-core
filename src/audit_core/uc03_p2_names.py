@@ -84,6 +84,27 @@ def same_person(left: Any, right: Any) -> bool:
     return _tokens_match(a, b) or _close_enough(a, b)
 
 
+# A PAN read with its letters masked, as some PAN copies print or DigiLocker
+# shows them: "PXXXXJ KXXXR NXXXX" (product owner 2026-10-28).
+_MASKED_TOKEN = re.compile(r"[A-Za-z]X{2,}")
+
+
+def is_masked(value: Any) -> bool:
+    """Whether a printed name has its letters masked with X."""
+    return bool(_MASKED_TOKEN.search(str(value or "")))
+
+
+def masked_matches(masked: Any, full: Any) -> bool:
+    """Whether a masked name fits a full one: the same words, each of the same
+    length, every letter that is not masked the same ("MXXXXI JXXa" is Minati Jena)."""
+    left = [t for t in re.sub(r"[^A-Za-z ]+", " ", str(masked or "")).upper().split() if t]
+    right = [t for t in re.sub(r"[^A-Za-z ]+", " ", str(full or "")).upper().split() if t]
+    if not left or len(left) != len(right):
+        return False
+    return all(len(m) == len(f) and all(a == "X" or a == b for a, b in zip(m, f, strict=True))
+               for m, f in zip(left, right, strict=True))
+
+
 def same_organisation(left: Any, right: Any) -> bool:
     """Whether two printed names are the same dealership: the same words
     once the legal suffixes go, one a prefix of the other ("Sarthak Motors"

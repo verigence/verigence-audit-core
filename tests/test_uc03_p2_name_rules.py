@@ -242,3 +242,32 @@ def test_a_company_customer_keeps_its_directors_kyc_and_its_trade_name_documents
     (task,) = _tasks(journey)
     assert task["reference"]["documentId"] == str(other)
     assert "as per the GST certificate" in task["description"]
+
+
+def test_a_masked_pan_gives_way_to_the_aadhaar_name(journey):
+    """Product owner 2026-10-28: a masked PAN does not name the customer when the Aadhaar does."""
+    add_ready_document(journey, "pan_card", pan_number="AXXXX1234F", pan_name="PXXXXJ KXXXR NXXXX")
+    assert _named(journey) == ("VERIFIED", "PXXXXJ KXXXR NXXXX")  # nothing better on file yet
+    add_ready_document(journey, "aadhaar", aadhaar_name="Pankaj Kumar Nayak")
+    assert _named(journey) == ("VERIFIED", "Pankaj Kumar Nayak")
+    assert _named(journey) == ("UNCHANGED", "Pankaj Kumar Nayak")
+    # The masked PAN is the customer's own: not the wrong document.
+    add_ready_document(journey, "booking_form", customer_name="Pankaj Kumar Nayak", dealer_name="Sarthak Motors")
+    assert _sync(journey) == {}
+
+
+def test_a_gstin_still_names_the_customer_over_a_masked_pan_and_aadhaar(journey):
+    add_ready_document(journey, "pan_card", pan_number="AXXXX1234F", pan_name="AXXXA KXXXR SXXXO")
+    add_ready_document(journey, "aadhaar", aadhaar_name="Anaya Kumar Sahoo")
+    add_ready_document(journey, "gst_certificate", gstin="21ARPPS0866A1ZX", organisation_legal_name="ANAYA KUMAR SAHOO")
+    assert _named(journey)[1] == "ANAYA KUMAR SAHOO"
+
+
+def test_a_full_name_fits_a_masked_reference():
+    from audit_core.uc03_p2_names import is_masked, masked_matches
+
+    assert is_masked("MXXXXI JXXa") and not is_masked("Minati Jena")
+    assert masked_matches("MXXXXI JXXa", "Minati Jena")
+    assert masked_matches("PXXXXJ KXXXR NXXXX", "PANKAJ KUMAR NAYAK")
+    assert not masked_matches("PXXXXJ KXXXR NXXXX", "PANKAJ KUMAR SAHOO")
+    assert not masked_matches("SXXXXT KXXXR SXXXO", "Subrat Sahoo")
