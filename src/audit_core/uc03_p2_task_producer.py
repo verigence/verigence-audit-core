@@ -519,9 +519,18 @@ def sync_field_review_tasks(
         # Misread dates first (they are wrong, not merely uncertain), then the
         # least certain reading first.
         fields.sort(key=lambda f: (f["severity"] != "HIGH", f["confidence"] is not None, f["confidence"] or 0))
-        dated = [f for f in fields if f["severity"] == "HIGH"]
+        gst = [f for f in fields if "GST_SLAB_RETIRED" in f.get("reasons", ())]
+        dated = [f for f in fields if f["severity"] == "HIGH" and f not in gst]
         uncertain = [f for f in fields if f["severity"] != "HIGH"]
         sentences = []
+        if gst:
+            sentences.append(
+                f"The GST on the {name} was read as "
+                + ", ".join(f"{_label(f['fieldKey'])} {format_value(f['fieldKey'], f.get('value'))}" for f in gst[:7])
+                + ". That split no longer exists (since 22 Sep 2025 vehicles are taxed at 40%, 18% or 5% -- half "
+                "each as CGST and SGST -- with no cess), so the reading is almost certainly not what the page "
+                "prints. Correct each tax rate and amount to the page."
+            )
         if dated:
             sentences.append(
                 f"These dates on the {name} cannot be right as read: "
@@ -533,10 +542,11 @@ def sync_field_review_tasks(
             more = f" and {len(uncertain) - 6} more" if len(uncertain) > 6 else ""
             sentences.append(f"These values on the {name} were read with low confidence: {listed}{more}.")
         sentences.append("Open the document, compare each value with the page and confirm or correct it.")
-        severity = "HIGH" if dated else "MEDIUM"
+        severity = "HIGH" if dated or gst else "MEDIUM"
         count = len(fields)
         title = (
-            f"Check {count} date{'s' if count != 1 else ''} on {name}" if dated and not uncertain
+            f"Check the GST on {name}" if gst and not dated and not uncertain
+            else f"Check {count} date{'s' if count != 1 else ''} on {name}" if dated and not uncertain and not gst
             else f"Verify {count} field{'s' if count != 1 else ''} on {name}"
         )
         reference = {
@@ -1306,14 +1316,27 @@ def sync_document_missing_tasks(
     A template may set ``raises_missing_task: false`` to stay on the stage
     checklist as expected without ever becoming a task -- for a document the
     dealership may legitimately not have raised, whose absence is not itself
-    a finding."""
-    from audit_core.uc03_p2_stage import condition_reasons, requirement_items
+    a finding.
+
+    A Delivery document is asked for only once delivery has started (2026-10-28):
+    the booking docket says RSA / EW / accessories were sold, or that the dealer
+    registers the car, long before any of those invoices or the RTO challan can
+    exist. 229 such tasks sat open on 103 Journeys still at booking, and PCs
+    could only comment "it is in booking stage" on them. Until delivery starts
+    an open one closes; it comes back with the first delivery document."""
+    from audit_core.uc03_p2_stage import (
+        condition_reasons,
+        delivery_has_started,
+        requirement_items,
+    )
 
     registry = registry or get_registry()
     reasons = condition_reasons(connection, tenant_id=tenant_id, journey_id=journey_id)
     wanted: set[str] = set()
     counts: dict[str, int] = {}
-    for stage in ("BOOKING", "DELIVERY"):
+    stages = ("BOOKING", "DELIVERY") if delivery_has_started(
+        connection, tenant_id=tenant_id, journey_id=journey_id) else ("BOOKING",)
+    for stage in stages:
         for item in requirement_items(connection, registry, tenant_id=tenant_id, journey_id=journey_id,
                                       stage=stage, reasons=reasons):
             if item["requirement"] != "CONDITIONAL" or not item["required"] or item["received"]:
@@ -1336,9 +1359,11 @@ def sync_document_missing_tasks(
                 severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
             )
             counts[outcome] = counts.get(outcome, 0) + 1
+    deferred = {"documentReceivedOrNotRequired": True, "deferredUntil": "DELIVERY_STARTED"} \
+        if "DELIVERY" not in stages else {"documentReceivedOrNotRequired": True}
     closed = _resolve_prefix_except(
         connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"document-missing:{journey_id}:",
-        keep=wanted, evidence={"documentReceivedOrNotRequired": True, "verifiedAt": datetime.now(UTC).isoformat()},
+        keep=wanted, evidence={**deferred, "verifiedAt": datetime.now(UTC).isoformat()},
     )
     if closed:
         counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed
@@ -1503,8 +1528,12 @@ def sync_name_consistency_tasks(
             if not gst_names:
                 return same_person(document["name"], kyc["name"])
             if document["pair"] in rules.customer_name_reference:
-                return person is None or document["documentId"] == person["documentId"] or same_person(
-                    document["name"], person["name"])
+                # A proprietor's Aadhaar / PAN carries the name the GST certificate
+                # prints as the legal name ("BISWAJIT DAS", trade name "M/S DAS
+                # CONSTRUCTION"): that is the customer's own KYC (2026-10-28).
+                return (person is None or document["documentId"] == person["documentId"]
+                        or same_person(document["name"], person["name"])
+                        or any(same_person(document["name"], n) for n in gst_names))
             return (any(same_person(document["name"], n) or same_organisation(document["name"], n) for n in gst_names)
                     or (person is not None and same_person(document["name"], person["name"])))
 

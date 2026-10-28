@@ -1225,7 +1225,10 @@ def insurance_invoice_missing(facts: _Facts) -> RuleOutcome:
 def self_insurance_declared(facts: _Facts) -> RuleOutcome:
     code = "SELF_INSURANCE_DECLARED"
     insurance = facts.sheet["insurance"]
-    if insurance["source"] == "SELF":
+    # Only a confirmed Self is the Team Lead's notice; the booking docket's
+    # "by the customer" is shown on the Deal meanwhile but is not confirmed
+    # until the PC answers (2026-10-28).
+    if insurance["source"] == "SELF" and insurance.get("decidedBy") in ("PC", "DOCUMENT"):
         return RuleOutcome(code, "FAIL", (
             f"The customer arranged their own insurance ({_insurance_decided(insurance)}); "
             "the premium is outside the dealer's deal."

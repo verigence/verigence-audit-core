@@ -467,6 +467,7 @@ def get_p2_document_review(
     # owner 2026-10-27: a UPI screenshot asked for a date check that then failed
     # with "The extracted field changed").
     values_used = bool(durable) or str(context.get("queue_status") or "").upper() != "SUPPORTING"
+    document_values = {str(item["fieldKey"]): item.get("effectiveValue") for item in fields}
     for item in fields:
         reviewed = bool(item.get("reviewedAtUtc")) or bool(item.get("isModified")) or not values_used
         value = item.get("effectiveValue")
@@ -474,7 +475,7 @@ def get_p2_document_review(
         confidence = item.get("confidenceScore")
         item["reviewReasons"] = [] if reviewed or blank else field_review_reasons(
             registry, template, di_type=di_type, field_key=str(item["fieldKey"]), value=value,
-            confidence=float(confidence) if confidence is not None else None,
+            confidence=float(confidence) if confidence is not None else None, document_values=document_values,
         )
         proposal = _pending_for(
             pending_corrections, field_key=str(item["fieldKey"]),

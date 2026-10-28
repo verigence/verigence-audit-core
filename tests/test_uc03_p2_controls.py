@@ -391,6 +391,19 @@ def test_a_presence_check_waits_for_its_document(journey, monkeypatch):
     _evaluate(journey, "RULE_ENGINE:DELIVERY")
     state = _states(journey)["GATE_PASS_CHASSIS_EMPTY"]
     assert state["control_status"] == "NOT_APPLICABLE" and "Gate Pass" in state["status_reason"]
-    add_ready_document(journey, "gate_pass", gate_pass_number="GP-1")
+    add_ready_document(journey, "gate_pass", gate_pass_number="GP-1", chassis_number=None)
     _evaluate(journey, "RULE_ENGINE:DELIVERY", force=True)
     assert _states(journey)["GATE_PASS_CHASSIS_EMPTY"]["control_status"] == "FAIL"
+
+
+def test_a_presence_check_waits_when_its_document_never_carries_the_field(journey, monkeypatch):
+    """2026-10-28: the Gate Pass reader reads the delivery date and car number,
+    never a chassis number; the check failed on every gate pass and the PC's
+    correction could change nothing. A chassis number read blank still fails
+    (above)."""
+    _wire_rule_engine(monkeypatch, ChassisEmptyRuleEngine())
+    add_ready_document(journey, "gate_pass", delivery_date="2026-10-20", car_number_as_printed="OD02 AB 1234")
+    _evaluate(journey, "RULE_ENGINE:DELIVERY")
+    state = _states(journey)["GATE_PASS_CHASSIS_EMPTY"]
+    assert state["control_status"] == "NOT_APPLICABLE"
+    assert "does not carry a chassis number" in state["status_reason"]

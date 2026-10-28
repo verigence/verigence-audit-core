@@ -35,7 +35,43 @@ def _tokens(value: Any, *, drop: frozenset[str]) -> list[str]:
     text = _RELATION.sub("", str(value or "").upper())
     text = text.replace("M/S", " ").replace("M/S.", " ")
     text = _NOISE.sub(" ", text)
-    return [t for t in text.split() if t and t not in drop]
+    # A word with a digit in it is not part of a name: receipts print the
+    # customer as "RASHMI RANJAN BISWAL- R270908806" or "GANGA NARAYAN
+    # NANDA-AGKPN5802B" (the receipt number, the PAN) (2026-10-28).
+    return [t for t in text.split() if t and t not in drop and not any(c.isdigit() for c in t)]
+
+
+def _one_letter_apart(a: str, b: str) -> bool:
+    """One letter misread, missed, added, or two neighbours swapped."""
+    if a == b:
+        return True
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        diff = [i for i in range(len(a)) if a[i] != b[i]]
+        return len(diff) == 1 or (len(diff) == 2 and diff[1] == diff[0] + 1
+                                  and a[diff[0]] == b[diff[1]] and a[diff[1]] == b[diff[0]])
+    short, long_ = (a, b) if len(a) < len(b) else (b, a)
+    return any(long_[:i] + long_[i + 1:] == short for i in range(len(long_)))
+
+
+# Only a word this long may differ by one letter: in a short word one letter
+# is a different word.
+_MISREAD_MIN = 5
+
+
+def _misread_once(left: list[str], right: list[str]) -> bool:
+    """The same words in the same order but one, which is one letter apart
+    ("BINAY KUMAR BEHERA" / "Binay Kumar Behar", "PRITI RANJAN PANDA" /
+    "PRITI RNAJAN PANDA"). The module's rule -- one misread letter is still
+    the customer, a different surname is not -- applied word by word, since
+    on a short name the whole-string ratio cannot tell one letter from two."""
+    if len(left) != len(right) or len(left) < 2:
+        return False
+    different = [(a, b) for a, b in zip(left, right, strict=True) if a != b]
+    return (len(different) == 1 and min(len(different[0][0]), len(different[0][1])) >= _MISREAD_MIN - 1
+            and max(len(different[0][0]), len(different[0][1])) >= _MISREAD_MIN
+            and _one_letter_apart(*different[0]))
 
 
 def person_tokens(value: Any) -> list[str]:
@@ -79,9 +115,27 @@ def _close_enough(left: list[str], right: list[str]) -> bool:
 
 
 def same_person(left: Any, right: Any) -> bool:
-    """Whether two printed names are the same customer."""
+    """Whether two printed names are the same customer.
+
+    Also (2026-10-28): the same letters split differently ("RASMIRANJAN" /
+    "RASMI RANJAN"), one word one letter apart, and -- for a company buying --
+    the same company once the legal suffixes go ("PVT LTD" / "PRIVATE LIMITED")."""
     a, b = person_tokens(left), person_tokens(right)
-    return _tokens_match(a, b) or _close_enough(a, b)
+    if _tokens_match(a, b) or _close_enough(a, b) or _misread_once(a, b):
+        return True
+    if a and b and "".join(a) == "".join(b):
+        return True
+    if _is_company(left) or _is_company(right):
+        return same_organisation(left, right)
+    return False
+
+
+_COMPANY_WORDS = frozenset({"PVT", "PRIVATE", "LTD", "LIMITED", "LLP", "PVTLTD", "TRUST", "SOCIETY",
+                            "ENTERPRISES", "CORPORATION", "COMPANY", "INDUSTRIES"})
+
+
+def _is_company(value: Any) -> bool:
+    return bool(set(_NOISE.sub(" ", str(value or "").upper()).split()) & _COMPANY_WORDS)
 
 
 # A PAN read with its letters masked, as some PAN copies print or DigiLocker

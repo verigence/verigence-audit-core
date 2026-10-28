@@ -245,11 +245,13 @@ def add_evidence(
 
 
 def add_ready_document(
-    journey: P2Journey, document_type_key: str, *, confidence: float = 99.0, **fields: Any,
+    journey: P2Journey, document_type_key: str, *, confidence: float = 99.0, process_area: str = "BOOKING",
+    **fields: Any,
 ) -> UUID:
     """ACTIVE evidence plus durable, high-confidence facts: the document is ready."""
     di_document_id = uuid4()
-    add_evidence(journey, di_document_id=di_document_id, document_type_key=document_type_key)
+    add_evidence(journey, di_document_id=di_document_id, document_type_key=document_type_key,
+                 process_area=process_area)
     for key, value in (fields or {"marker": "x"}).items():
         add_extracted_field(
             journey, di_document_id=di_document_id, field_key=key, value=value,

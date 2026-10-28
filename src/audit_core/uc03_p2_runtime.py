@@ -90,7 +90,12 @@ _FINGERPRINT_SQL = text(
                         (SELECT pricing_effective_on FROM auditcore.bookings b
                           WHERE b.tenant_id=:tenant_id AND b.journey_id=:journey_id),
                         (SELECT COUNT(*) FROM auditcore.p2_vehicle_identifications vi
-                          WHERE vi.tenant_id=:tenant_id AND vi.journey_id=:journey_id))
+                          WHERE vi.tenant_id=:tenant_id AND vi.journey_id=:journey_id),
+                        -- the PC's Self / Inhouse answer (2026-10-28: an answer
+                        -- that changed no fact left the checks skipped)
+                        (SELECT MAX(COALESCE(ir.insurance_source, '') || ir.updated_at_utc::text)
+                           FROM auditcore.insurance_records ir
+                          WHERE ir.tenant_id=:tenant_id AND ir.journey_id=:journey_id))
          FROM auditcore.journey_products jp
         WHERE jp.tenant_id=:tenant_id AND jp.journey_id=:journey_id) AS deal
     """
@@ -181,7 +186,17 @@ def enqueue_work(
                 :correlation_id
             )
             ON CONFLICT (tenant_id, work_type, work_key)
-            DO UPDATE SET payload=EXCLUDED.payload,
+            -- A forced request still waiting stays forced when an ordinary
+            -- request for the same work arrives (2026-10-28: a PC's "done"
+            -- asked for a forced re-check, a fact change a second later
+            -- overwrote it, and the check was skipped as unchanged -- the
+            -- task sat in VERIFYING).
+            DO UPDATE SET payload=CASE
+                            WHEN auditcore.p2_work_queue.work_status IN ('PENDING','RETRY_WAIT')
+                              AND auditcore.p2_work_queue.payload->>'force' = 'true'
+                              THEN EXCLUDED.payload || '{"force": true}'::jsonb
+                            ELSE EXCLUDED.payload
+                          END,
                           requested_version=GREATEST(
                             COALESCE(auditcore.p2_work_queue.requested_version, 0) + 1,
                             COALESCE(:requested_version, 0)

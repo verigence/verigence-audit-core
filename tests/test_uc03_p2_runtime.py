@@ -1226,3 +1226,53 @@ def test_work_asked_for_while_it_ran_joins_the_back_of_the_line_when_it_finishes
     worker._complete(journey.engine, check)
     assert queue_row(journey, "STAGE_RECOMPUTE", "check")["work_status"] == "PENDING"
     assert _next_key(journey) == "page"
+
+
+# ------------------------------------- a forced re-check stays forced (2026-10-28)
+# A PC's "done" on an insurance question asked for a forced re-check; a fact
+# change a second later asked again without force, overwrote the payload, and the
+# unchanged-fingerprint skip left the task in VERIFYING.
+
+
+def _payload(journey, key):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return connection.execute(
+            text("SELECT payload FROM auditcore.p2_work_queue WHERE tenant_id=:t AND work_key=:k"),
+            {"t": journey.tenant_id, "k": key},
+        ).scalar_one()
+
+
+def _ask(journey, key, payload):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        worker._enqueue(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                        work_type="CONTROL_EVALUATE", work_key=key, payload=payload, correlation_id=None)
+
+
+def test_a_waiting_forced_request_stays_forced_when_asked_again_without_force(journey):
+    _ask(journey, "unit:x:NATIVE:BOOKING", {"unit": "NATIVE:BOOKING", "force": True})
+    _ask(journey, "unit:x:NATIVE:BOOKING", {"unit": "NATIVE:BOOKING", "force": False})
+    assert _payload(journey, "unit:x:NATIVE:BOOKING") == {"unit": "NATIVE:BOOKING", "force": True}
+
+
+def test_a_finished_forced_request_does_not_force_the_next_one(journey):
+    _ask(journey, "unit:x:NATIVE:BOOKING", {"unit": "NATIVE:BOOKING", "force": True})
+    [item] = worker._claim_for_tenant(journey.engine, journey.tenant_id, 1)
+    worker._complete(journey.engine, item)
+    _ask(journey, "unit:x:NATIVE:BOOKING", {"unit": "NATIVE:BOOKING", "force": False})
+    assert _payload(journey, "unit:x:NATIVE:BOOKING")["force"] is False
+
+
+def test_the_pcs_insurance_answer_changes_the_fact_fingerprint(journey):
+    from audit_core.uc03_p2_deal_actions import set_insurance_source
+    from audit_core.uc03_p2_runtime import fact_fingerprint
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        before = fact_fingerprint(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        set_insurance_source(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                             source="SELF", actor_id="pc-1", reason="customer's own", correlation_id=None,
+                             via="TASK")
+        after = fact_fingerprint(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert before != after

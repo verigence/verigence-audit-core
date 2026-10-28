@@ -74,6 +74,8 @@ def ready_document_count(
         # when they were uploaded (see receipt_split).
         split = receipt_split(connection, tenant_id=tenant_id, journey_id=journey_id)
         return len(split["DELIVERY" if str(template.stage).upper() == "DELIVERY" else "BOOKING"])
+    from audit_core.uc03_vehicle_rc import new_vehicle_rc_sql
+
     return int(
         connection.execute(
             text(
@@ -84,6 +86,8 @@ def ready_document_count(
                   AND e.journey_id=:journey_id
                   AND e.association_status='ACTIVE'
                   AND e.document_type_key = ANY(:document_types)
+                  -- the car sold's own RC is not the exchange RC (uc03_vehicle_rc)
+                  AND NOT """ + new_vehicle_rc_sql("e") + """
                   AND EXISTS (
                     SELECT 1
                     FROM auditcore.journey_document_extracted_fields f
@@ -113,6 +117,8 @@ def ready_document_counts(
     """``ready_document_count`` for every template in two statements instead
     of one per template: the documents screen asks for all of them at once,
     and a Railway database answers each round trip slowly."""
+    from audit_core.uc03_vehicle_rc import new_vehicle_rc_sql
+
     rows = connection.execute(
         text(
             """
@@ -121,6 +127,7 @@ def ready_document_counts(
             WHERE e.tenant_id=:tenant_id
               AND e.journey_id=:journey_id
               AND e.association_status='ACTIVE'
+              AND NOT """ + new_vehicle_rc_sql("e") + """
               AND EXISTS (
                 SELECT 1
                 FROM auditcore.journey_document_extracted_fields f
@@ -252,20 +259,58 @@ REVIEW_REASON_LABELS = {
     "DATE_BEFORE_FLOOR": "a date before the programme started",
     "DATE_UNREADABLE": "not a readable date",
     "DATE_IN_FUTURE": "a date after today",
+    "GST_SLAB_RETIRED": "a GST split that no longer exists (28% and the cess ended on 22 Sep 2025)",
 }
 # Reasons that make the verification High severity: the value is wrong as
 # read, not merely uncertain.
-HIGH_SEVERITY_REASONS = frozenset({"DATE_BEFORE_FLOOR", "DATE_UNREADABLE", "DATE_IN_FUTURE"})
+HIGH_SEVERITY_REASONS = frozenset({"DATE_BEFORE_FLOOR", "DATE_UNREADABLE", "DATE_IN_FUTURE", "GST_SLAB_RETIRED"})
+
+# GST as read must be a rate that exists (2026-10-28). An Aditya Motors invoice
+# printed CGST 20% / SGST 20% (Rs 2,41,414.34 each, 40% in all, no cess); the
+# reader returned CGST 14% / SGST 14% (Rs 1,68,990 each) and a cess of
+# Rs 1,44,848.68 -- the pre-September-2025 split of the same 40%, from the
+# model's memory, not from the page. Since GST 2.0 (22 Sep 2025) the rates are
+# 0 / 5 / 18 / 40 (half each as CGST and SGST) and the compensation cess on
+# vehicles is gone, so 14% / 28% / 6% / 12% or any cess means the reading must
+# be checked against the page -- every tax figure on that document, since the
+# amounts were invented with the rates.
+GST_TAX_FIELDS = frozenset({"cgst_rate", "sgst_rate", "igst_rate", "cgst_amount", "sgst_amount",
+                            "igst_amount", "cess_amount"})
+_GST_HALF_RATES = (0.0, 0.125, 1.5, 2.5, 9.0, 20.0)
+_GST_FULL_RATES = (0.0, 0.25, 3.0, 5.0, 18.0, 40.0)
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, str):
+        value = value.replace(",", "").replace("%", "").strip().strip('"')
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def retired_gst_slab(values: dict[str, Any]) -> bool:
+    """Whether a document's tax figures, as read, use a split GST 2.0 retired."""
+    for key, allowed in (("cgst_rate", _GST_HALF_RATES), ("sgst_rate", _GST_HALF_RATES),
+                         ("igst_rate", _GST_FULL_RATES)):
+        rate = _number(values.get(key))
+        if rate is not None and not any(abs(rate - a) < 0.001 for a in allowed):
+            return True
+    cess = _number(values.get("cess_amount"))
+    return cess is not None and cess > 0
 
 
 def field_review_reasons(
     registry: Registry, template: DocumentTemplate, *, di_type: str | None, field_key: str,
-    value: Any, confidence: float | None,
+    value: Any, confidence: float | None, document_values: dict[str, Any] | None = None,
 ) -> list[str]:
     """Why a PC has to look at this value: low confidence, a date before the
-    programme's floor, or a date the extractor could not read. Empty means
-    the value stands as extracted."""
+    programme's floor, a date the extractor could not read, or a GST split
+    that no longer exists on the document (``document_values``: the document's
+    values by field). Empty means the value stands as extracted."""
     reasons: list[str] = []
+    if field_key in GST_TAX_FIELDS and document_values and retired_gst_slab(document_values):
+        reasons.append("GST_SLAB_RETIRED")
     if template.needs_review(field_key, confidence):
         reasons.append("LOW_CONFIDENCE")
     if registry.date_check_applies(di_type, field_key):
@@ -319,6 +364,9 @@ def unreviewed_fields(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": document_id},
     ).mappings().all()
+    by_document: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        by_document.setdefault(str(row["di_document_id"]), {})[str(row["field_key"])] = row["effective_value"]
     pending: list[dict[str, Any]] = []
     for row in rows:
         area = str(row["process_area"] or "").upper() or None
@@ -333,6 +381,7 @@ def unreviewed_fields(
         reasons = field_review_reasons(
             registry, template, di_type=di_type, field_key=field_key,
             value=row["effective_value"], confidence=confidence,
+            document_values=by_document.get(str(row["di_document_id"])),
         )
         if not reasons:
             continue
