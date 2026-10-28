@@ -1189,3 +1189,40 @@ def test_a_normal_document_review_returns_fields_with_the_correction_waiting_for
     assert field["pendingCorrection"]["taskId"] == proposal["taskId"]
     assert field["pendingCorrection"]["proposedValue"] == "150"
     assert review["diReadError"] is None and review["contentAvailable"] is True
+
+
+# ------------------------------------------------- queue order (2026-10-28)
+# Product owner: "pls change the queue order". Work is taken in the order it
+# last joined the line, so checks asked for again and again no longer run ahead
+# of pages uploaded after them.
+
+
+def _next_key(journey) -> str:
+    [item] = worker._claim_for_tenant(journey.engine, journey.tenant_id, 1)
+    return item.work_key
+
+
+def test_work_asked_for_again_after_it_finished_joins_the_back_of_the_line(journey):
+    _enqueue(journey, key="check")
+    [check] = worker._claim_for_tenant(journey.engine, journey.tenant_id, 1)
+    worker._complete(journey.engine, check)
+    _enqueue(journey, work_type="DOCUMENT_INGEST", key="page")
+    _enqueue(journey, key="check")
+    assert _next_key(journey) == "page"
+
+
+def test_work_already_waiting_keeps_its_place_when_asked_for_again(journey):
+    _enqueue(journey, key="check")
+    _enqueue(journey, work_type="DOCUMENT_INGEST", key="page")
+    _enqueue(journey, key="check")
+    assert _next_key(journey) == "check"
+
+
+def test_work_asked_for_while_it_ran_joins_the_back_of_the_line_when_it_finishes(journey):
+    _enqueue(journey, key="check")
+    [check] = worker._claim_for_tenant(journey.engine, journey.tenant_id, 1)
+    _enqueue(journey, work_type="DOCUMENT_INGEST", key="page")
+    _enqueue(journey, key="check")
+    worker._complete(journey.engine, check)
+    assert queue_row(journey, "STAGE_RECOMPUTE", "check")["work_status"] == "PENDING"
+    assert _next_key(journey) == "page"
