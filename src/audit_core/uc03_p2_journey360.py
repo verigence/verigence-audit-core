@@ -60,7 +60,11 @@ from audit_core.uc03_masters_alignment import (
 from audit_core.uc03_p2_controls import control_statistics
 from audit_core.uc03_p2_dates import parse_extracted_date
 from audit_core.uc03_p2_registry import get_registry
-from audit_core.uc03_p2_stage import read_booking_stage, receipt_split
+from audit_core.uc03_p2_stage import (
+    delivery_has_started,
+    read_booking_stage,
+    receipt_split,
+)
 
 # The tabs Journey 360 shows. "delivery", "activity" and "timeline" stay
 # servable for older clients but are no longer advertised: the Vehicle tab
@@ -278,12 +282,23 @@ _LEDGER_NORM = frozenset(_norm_type(t) for t in _LEDGER_SOURCES)
 # a billed source (no column of its own); this name keeps it out of the
 # "ledger" column and labels it for the person reading the Deal.
 _STATEMENT_COLUMN_TYPE = "account_statement"
+# A Journey of that Project with no NDC (account statement) on file takes the
+# billed figures from its cost sheet (product owner 2026-10-28: "depending upon
+# which is available cost sheet or NDC you can pick any one"); under this name
+# the cost sheet stands in the billed column and says whose figures they are.
+_COST_SHEET_STANDIN_TYPE = "cost_sheet_in_place_of_ndc"
+_COLUMN_LABELS = {
+    _STATEMENT_COLUMN_TYPE: "NDC (Account Statement)",
+    _COST_SHEET_STANDIN_TYPE: "Cost sheet (no NDC on file)",
+}
 _QUOTE_NORM = frozenset(_norm_type(t) for t in _QUOTE_SOURCES)
 
 
 def _document_label(document_type: str | None) -> str:
     if not document_type:
         return "Document"
+    if document_type in _COLUMN_LABELS:
+        return _COLUMN_LABELS[document_type]
     registry = get_registry()
     template = registry.template_for_di_type(document_type)
     if template.key == "supporting_document":
@@ -477,7 +492,7 @@ def summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
         {"t": tenant_id, "j": journey_id},
     ).mappings().one()
     stage = read_booking_stage(connection, tenant_id=tenant_id, journey_id=journey_id)
-    deal_view = deal(connection, tenant_id=tenant_id, journey_id=journey_id)
+    deal_view = as_shown(deal(connection, tenant_id=tenant_id, journey_id=journey_id))
     vehicle_text = " · ".join(v for v in (head["model"], head["variant"], head["colour"]) if v) or None
     return {
         "journey": {
@@ -1028,6 +1043,12 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             if _norm_type(s["source_document_type"]) in _LEDGER_NORM else s
             for s in sources if not is_invoice_type(s["source_document_type"])
         ]
+        if not any(s["source_document_type"] == _STATEMENT_COLUMN_TYPE for s in sources):
+            sources = [
+                {**s, "source_document_type": _COST_SHEET_STANDIN_TYPE}
+                if _norm_type(s["source_document_type"]) in _QUOTE_NORM and s["line_kind"] == "COMMERCIAL" else s
+                for s in sources
+            ]
     # Each invoice read on its own and counted once (2026-10-20, R1/R2).
     selection = deal_invoices(documents, booking_date=plausible_from(
         connection, tenant_id=tenant_id, journey_id=journey_id))
@@ -1634,6 +1655,14 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                 "awaiting": str(awaiting_delta) if any(r["awaiting"] for r in counted_rows + discount_rows) else None,
             },
             "invoicedComponents": invoiced,
+            # The variance is shown only once delivery has started (product
+            # owner 2026-10-28); the figures stay computed so the screen and
+            # the reports switch on the moment the first delivery document
+            # is in.
+            "deliveryStarted": delivery_has_started(connection, tenant_id=tenant_id, journey_id=journey_id),
+            # Where the billed figures come from: the invoices, or (Mahindra
+            # Orissa) the NDC / account statement, else the cost sheet.
+            "billedSource": "ACCOUNT_STATEMENT" if statement_policy else "INVOICE",
             # Lines awaiting their own document with no figure yet: not in
             # Current net, Standard net or Balance due.
             "awaiting": [{"key": r["key"], "label": r["label"], "document": r["awaiting"],
@@ -1656,6 +1685,41 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         },
         "flagged": sum(1 for r in counted_rows + discount_rows if r["flags"]),
     }
+
+
+def _without_variance(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_without_variance(v) for v in value]
+    if not isinstance(value, dict):
+        return value
+    out = {k: _without_variance(v) for k, v in value.items()}
+    if "variance" in out:
+        out["variance"] = None
+    if isinstance(out.get("flags"), list):
+        out["flags"] = [f for f in out["flags"] if f not in _STANDARD_FLAGS]
+    return out
+
+
+def as_shown(view: dict[str, Any]) -> dict[str, Any]:
+    """The Deal as the screens show it: no variance -- per line, per discount
+    or in total -- until delivery has started (product owner 2026-10-28:
+    "Variance should be shown only for the journey for which Delivery has
+    started"). The figures behind it are untouched; ``deal`` itself still
+    computes the variance for the stored list value and the reports, which
+    apply the same rule where they show it."""
+    summary = view.get("summary") or {}
+    if summary.get("deliveryStarted") is not False:
+        return view
+    shown = {**view, "categories": _without_variance(view.get("categories") or []),
+             "discounts": _without_variance(view.get("discounts") or [])}
+    shown["summary"] = {**summary, "variance": {k: None for k in (summary.get("variance") or {})}}
+    shown["flagged"] = sum(1 for g in shown["categories"] for r in g.get("components") or [] if r.get("flags")) + sum(
+        1 for r in shown["discounts"] if r.get("flags"))
+    return shown
+
+
+def deal_section(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    return as_shown(deal(connection, tenant_id=tenant_id, journey_id=journey_id))
 
 
 # ── add-ons: insurance, accessories, protection plans, finance, exchange ─────
@@ -1706,7 +1770,7 @@ def addons(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[
 
     # Accessory, insurance and protection charges live on the deal lines too;
     # surface them here so the add-on view is complete on its own.
-    deal_view = deal(connection, tenant_id=tenant_id, journey_id=journey_id)
+    deal_view = as_shown(deal(connection, tenant_id=tenant_id, journey_id=journey_id))
     lines = {g["code"]: g for g in deal_view["categories"]}
     discounts = {d["key"]: d for d in deal_view["discounts"]}
     is_accessory = lambda p: "ACCESS" in str(p["addon_type_code"]).upper()
@@ -2656,7 +2720,7 @@ def registration(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
                registration_by, actual_status_code
         FROM auditcore.registration_records WHERE tenant_id=:t AND journey_id=:j
         ORDER BY updated_at_utc DESC""", {"t": tenant_id, "j": journey_id})
-    deal_view = deal(connection, tenant_id=tenant_id, journey_id=journey_id)
+    deal_view = as_shown(deal(connection, tenant_id=tenant_id, journey_id=journey_id))
     charges = next((g for g in deal_view["categories"] if g["code"] == "REGISTRATION"), None)
     return {"records": records, "charges": charges}
 
@@ -2845,7 +2909,7 @@ def compliance_report(connection: Connection, *, tenant_id: str, journey_id: UUI
 
     legacy = build_compliance_report(connection, tenant_id=tenant_id, journey_id=journey_id).model_dump(mode="json")
     ledger = compliance(connection, tenant_id=tenant_id, journey_id=journey_id)
-    deal_view = deal(connection, tenant_id=tenant_id, journey_id=journey_id)
+    deal_view = as_shown(deal(connection, tenant_id=tenant_id, journey_id=journey_id))
     stage = read_booking_stage(connection, tenant_id=tenant_id, journey_id=journey_id)
     tasks = _rows(connection, f"""
         SELECT task_id, title, task_type, priority, assigned_role_code, task_status, due_at_utc, created_at_utc
@@ -3226,7 +3290,7 @@ def audit(connection: Connection, *, tenant_id: str, journey_id: UUID, limit: in
 
 
 BUILDERS = {
-    "deal": deal,
+    "deal": deal_section,
     "invoices": invoices,
     "addons": addons,
     "documents": documents,

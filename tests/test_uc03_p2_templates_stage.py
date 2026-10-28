@@ -35,7 +35,9 @@ from audit_core.uc03_p2_stage import (
 def test_templates_load_and_validate():
     registry = get_registry()
     assert validate_registry(registry) == []
-    assert len(registry.controls) == 92  # 26 + 26 deal-audit Audit Core + 40 Rule Engine (blueprint 8.1, seven retired)
+    # 26 + 24 deal-audit Audit Core + 40 Rule Engine (blueprint 8.1, seven retired; the two
+    # NDC signature checks retired 2026-10-28)
+    assert len(registry.controls) == 90
     assert SUPPORTING_TEMPLATE in registry.documents
 
 
@@ -223,7 +225,9 @@ def test_money_fields_share_the_ninety_percent_bar(journey):
 def test_delivery_readiness_lists_missing_required_documents(journey):
     result = _recompute(journey)
     missing = {item["key"] for item in result["delivery"]["missing"]}
-    assert {"no_dues_certificate", "customer_invoice_dms", "tax_invoice_tally", "insurance_cover",
+    assert {"customer_invoice_dms", "tax_invoice_tally", "insurance_cover",
             "customer_ledger", "cost_sheet", "payment_receipt", "vehicle_proof"} <= missing
+    # the lender's loan-closure letter is optional; the NDC is the account statement (2026-10-28)
+    assert "no_dues_certificate" not in missing
     assert "gate_pass" not in missing  # optional
     assert "gst_certificate" not in missing  # conditional, customer is not corporate

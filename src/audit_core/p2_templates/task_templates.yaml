@@ -20,8 +20,8 @@ actions:
 # A Team Lead's verdict on the finding behind a task (Phase 1 finding actions).
 - CONFIRM_BREACH
 - MARK_FALSE_POSITIVE
-# The PC closes an image-quality task by hand, with a comment
-# (PC_PAGE_QUALITY_REJECTED and PC_LARGE_UPLOAD_REVIEW only).
+# The PC closes a task by hand, with a comment (PC_PAGE_QUALITY_REJECTED,
+# PC_LARGE_UPLOAD_REVIEW and COST_SHEET_NDC_DIFFERENCE only).
 - CLOSE_TASK
 exception_roles:
 - TL
@@ -469,6 +469,19 @@ task_types:
     - PROVIDE_FEEDBACK
     - COMPLETE_ACTION
     - ACCEPT_EXCEPTION
+    - ADD_COMMENT
+  # The cost sheet and the NDC (account statement) differ by more than Rs 100
+  # on a line both print (product owner 2026-10-28): HIGH, for information
+  # only; the PC closes it with a comment. Closes itself once they agree.
+  COST_SHEET_NDC_DIFFERENCE:
+    category: CROSS_DOCUMENT_REVIEW
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - CLOSE_TASK
     - ADD_COMMENT
   FINANCE_DISBURSEMENT_REVIEW:
     category: BUSINESS_RESOLUTION

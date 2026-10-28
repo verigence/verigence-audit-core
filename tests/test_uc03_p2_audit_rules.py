@@ -351,38 +351,7 @@ def test_trade_in_resale_window_and_loss(journey):
     assert "resold for ₹2,50,000 against ₹3,00,000 allowed to the customer (₹50,000 loss)" in result["TRADE_IN_SOLD_AT_LOSS"].reason
 
 
-# ------------------------------------------------------------------ NDC
-
-
-def test_ndc_signature_is_confirmed_by_the_pc_or_read_from_the_document(journey):
-    result = _run(journey, "DELIVERY")
-    assert result["NDC_SIGNATURE_UNCONFIRMED"].outcome == "SKIPPED"
-    assert result["NDC_NOT_SIGNED"].outcome == "SKIPPED"
-
-    add_ready_document(journey, "no_dues_certificate", marker="x")
-    _evaluate(journey, "NATIVE:DELIVERY")
-    state = _states(journey)
-    assert state["NDC_SIGNATURE_UNCONFIRMED"]["control_status"] == "FAIL"
-    assert state["NDC_NOT_SIGNED"]["control_status"] == "WAITING_FOR_FACTS"
-    question = _task(journey, "NDC_SIGNATURE_UNCONFIRMED")
-    assert [a["value"] for a in question["reference"]["answers"]] == ["YES", "NOT_WITNESSED", "NO"]
-
-    # An observation may be keyed in by the Team Lead as well as the PC.
-    _answer(journey, "NDC_SIGNATURE_UNCONFIRMED", "NOT_WITNESSED", "Signed at the showroom before I arrived", role="TL")
-    _evaluate(journey, "NATIVE:DELIVERY")
-    state = _states(journey)
-    assert state["NDC_SIGNATURE_UNCONFIRMED"]["control_status"] == "PASS"
-    assert state["NDC_NOT_SIGNED"]["control_status"] == "FAIL"
-    assert "not in the auditor's presence" in state["NDC_NOT_SIGNED"]["status_reason"]
-    assert 'Signed at the showroom before I arrived' in state["NDC_NOT_SIGNED"]["status_reason"]
-    assert _task(journey, "NDC_NOT_SIGNED")["assigned_role_code"] == "TL"
-
-
-def test_ndc_without_a_customer_signature_fails_from_the_reading(journey):
-    add_ready_document(journey, "no_dues_certificate", customer_signature_present=False)
-    result = _run(journey, "DELIVERY")
-    assert result["NDC_NOT_SIGNED"].outcome == "FAIL"
-    assert "no customer signature" in result["NDC_NOT_SIGNED"].reason
+# ------------------------------------------------------------------ accessories
 
 
 def test_accessories_fitted_is_asked_once_the_car_is_delivered(journey):
@@ -498,7 +467,7 @@ def test_delivery_not_completed_in_time_lists_everything_pending_for_the_tl(jour
     waiting = _run(journey, "DELIVERY")["DELIVERY_NOT_COMPLETED_IN_TIME"]
     assert waiting.outcome == "SKIPPED"
     assert f"Delivery due by {(TODAY + timedelta(days=4)).strftime('%d %b %Y')}" in waiting.reason  # from the cover note
-    assert "insurance cover dated" in waiting.reason and "Customer Ledger" in waiting.reason
+    assert "insurance cover dated" in waiting.reason and "NDC (Account Statement)" in waiting.reason
 
     # An earlier-dated gate pass moves the clock: 8 days ago, so the window has closed.
     add_ready_document(journey, "gate_pass", delivery_date=(TODAY - timedelta(days=8)).isoformat())

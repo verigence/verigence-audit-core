@@ -913,9 +913,10 @@ def test_the_action_belongs_to_the_image_quality_and_large_upload_tasks_only(jou
     from audit_core.uc03_p2_registry import get_registry
 
     tasks = get_registry().tasks
-    # (2026-10-26: the large-upload notice is closed the same way, with a comment.)
+    # (2026-10-26: the large-upload notice is closed the same way, with a comment;
+    # 2026-10-28: so is the information-only cost sheet / NDC difference.)
     assert sorted(name for name, template in tasks.items() if CLOSE in template.actions) == [
-        "PC_LARGE_UPLOAD_REVIEW", "PC_PAGE_QUALITY_REJECTED"]
+        "COST_SHEET_NDC_DIFFERENCE", "PC_LARGE_UPLOAD_REVIEW", "PC_PAGE_QUALITY_REJECTED"]
     # The file's other failed page keeps its own, unchanged task and cannot use it.
     batch_id, rows = _file(journey, [("booking_form", "READY"), (None, "FAILED"), (None, "FAILED")])
     _fail(journey, rows[1]["queue_id"], BLUR)

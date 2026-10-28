@@ -800,6 +800,23 @@ def list_p2_journeys(
     ).mappings().all()
     more = len(rows) > page_size
     rows = rows[:page_size]
+    # The price variance is shown only for a Journey whose delivery has started
+    # (product owner 2026-10-28), the same test as the Deal's (uc03_p2_stage).
+    page_ids = [row["journey_id"] for row in rows]
+    delivery_started = {
+        str(journey) for journey in connection.execute(
+            text(
+                """
+                SELECT journey_id FROM auditcore.evidence
+                WHERE tenant_id=:t AND journey_id = ANY(:ids) AND association_status='ACTIVE'
+                  AND upper(COALESCE(process_area,''))='DELIVERY'
+                UNION
+                SELECT journey_id FROM auditcore.deliveries WHERE tenant_id=:t AND journey_id = ANY(:ids)
+                """
+            ),
+            {"t": tenant_id, "ids": page_ids},
+        ).scalars().all()
+    } if page_ids else set()
 
     items: list[dict[str, Any]] = []
     for row in rows:
@@ -816,6 +833,9 @@ def list_p2_journeys(
             if item.get(key) is not None:
                 item[key] = str(item[key])
         item["price_variance"] = item.get("price_variance") or "0"
+        item["delivery_started"] = item["journey_id"] in delivery_started
+        if not item["delivery_started"]:
+            item["price_variance"] = None
         gate_pass = parse_extracted_date(item.pop("gate_pass_date", None))
         if gate_pass is not None:
             item["delivered_at"] = gate_pass.isoformat()

@@ -769,8 +769,11 @@ document_types:
     - REGISTRATION
     - FINANCE
     - DEAL
+  # The dealer's account statement, which this Project calls the NDC (product
+  # owner 2026-10-28: "you call it Account Statement or NDC as for this project
+  # the format is same"). Required at delivery; the Deal reads it.
   customer_ledger:
-    display_name: Customer Ledger
+    display_name: NDC (Account Statement)
     di_types:
     - customer_ledger
     stage: DELIVERY
@@ -946,12 +949,15 @@ document_types:
     - Verification/correction when applicable
     journey_360:
     - DOCUMENTS
+  # A lender's loan-closure letter (usually for an exchange vehicle that was
+  # financed). Not the dealer's NDC, which is the account statement above; kept
+  # as an optional upload (product owner 2026-10-28).
   no_dues_certificate:
-    display_name: No Dues Certificate
+    display_name: Loan Closure Letter (old vehicle)
     di_types:
     - no_dues_certificate
     stage: DELIVERY
-    requirement: REQUIRED
+    requirement: OPTIONAL
     condition: null
     accepted_early: true
     pages: *id001

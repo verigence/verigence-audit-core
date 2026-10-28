@@ -40,7 +40,8 @@ def test_new_booking_starts_a_journey_idempotently(uc03_create_booking_setup):  
     listed = client.get(url, params={"state": "open"}).json()["items"]
     mine = next(item for item in listed if item["journey_id"] == first.json()["journeyId"])
     assert mine["pc_name"] == "Asha Rao" and mine["outlet_name"] and mine["dealer_name"]
-    assert mine["price_variance"] == "0"  # nothing priced yet
+    # nothing priced, and no variance before delivery starts (product owner 2026-10-28)
+    assert mine["price_variance"] is None and mine["delivery_started"] is False
 
 
 def _journey(setup, journey_id: str, customer_id: str) -> P2Journey:

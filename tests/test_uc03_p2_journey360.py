@@ -9,6 +9,7 @@ from conftest import delete_tenant_data
 from fastapi.testclient import TestClient
 from p2_support import (
     AllowAllAuthorization,
+    add_evidence,
     add_ready_document,
     add_receipt_payment,
     create_p2_journey,
@@ -419,6 +420,8 @@ def test_insurance_taken_reads_the_cover_note_not_the_bookings_zero(journey):
         )
     cover = add_ready_document(journey, "insurance_cover", insurer_name="Zurich Kotak", policy_number="MKG/P30598174",
                                premium_amount="62,029", add_ons=["CONSUMABLES COVER", "ENGINE PROTECT"])
+    # delivery has started: the Deal screen shows the variance only from then on (2026-10-28)
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
     client = TestClient(app, raise_server_exceptions=False)
     base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/360"
     vehicle = client.get(f"{base}/vehicle").json()
@@ -698,3 +701,34 @@ def test_the_etag_changes_with_the_deployed_build(journey, monkeypatch):
     assert etag() == first  # unchanged data and build: same key, so 304 still works
     monkeypatch.setattr(model, "release_version", lambda: "build-b")
     assert etag() != first
+
+
+def test_the_deal_screen_shows_no_variance_until_delivery_has_started(journey):
+    """Product owner 2026-10-28: "Variance should be shown only for the journey
+    for which Delivery has started". The Deal still computes it."""
+    from audit_core.uc03_p2_journey360 import deal
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, standard_amount, "
+                 "actual_amount, actual_source_kind, source_reference) VALUES (:t, :j, 'insurance_amount', 71809, "
+                 "62029, 'EVIDENCE', 'booking_form:x')"),
+            {"t": journey.tenant_id, "j": journey.journey_id})
+        computed = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/360"
+
+    def shown_row(body):
+        return next(r for g in body["categories"] for r in g["components"] if r["key"] == "insurance_amount")
+
+    assert next(r for g in computed["categories"] for r in g["components"]
+                if r["key"] == "insurance_amount")["variance"] is not None
+    before = client.get(f"{base}/deal").json()
+    assert before["summary"]["deliveryStarted"] is False
+    assert shown_row(before)["variance"] is None
+    assert all(v is None for v in before["summary"]["variance"].values())
+    assert client.get(f"{base}/addons").json()["insurance"]["charges"]["components"][0]["variance"] is None
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
+    after = client.get(f"{base}/deal").json()
+    assert after["summary"]["deliveryStarted"] is True and Decimal(shown_row(after)["variance"]) == -9780
