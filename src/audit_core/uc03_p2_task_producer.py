@@ -30,6 +30,7 @@ from sqlalchemy import Connection, text
 from audit_core.uc03_p2_document_health import TL_AFTER_SECONDS
 from audit_core.uc03_p2_names import (
     display_name,
+    is_firm_name,
     is_masked,
     masked_matches,
     same_organisation,
@@ -1517,7 +1518,26 @@ def sync_name_consistency_tasks(
             by_pair = {doc["pair"]: doc for doc in reversed(references)}
             person = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
 
+        # A document in a firm's name is the customer's when the customer is a
+        # person (product owner 2026-10-28: "firm name should be acceptable" --
+        # a proprietor's PAN is on file, the invoice or booking form is in the
+        # firm's name, "M/S SHREE SHYAM ENTERPRISES"). One firm per Journey:
+        # the firm most documents name is it, and a document naming another
+        # firm, or the dealership itself, is still the wrong document.
+        firm: str | None = None
+        if not gst_names:
+            dealership = [d["name"] for d in _named_documents(
+                connection, tenant_id=tenant_id, journey_id=journey_id, pairs=rules.dealer_name_checked)]
+            firms = [d["name"] for d in checked if is_firm_name(d["name"]) and not is_masked(d["name"])
+                     and not same_person(d["name"], kyc["name"])
+                     and not any(same_organisation(d["name"], n) for n in dealership)]
+            if firms:
+                firm = max(firms, key=lambda n: (sum(same_organisation(n, o) for o in firms), -firms.index(n)))
+
         def matches(document: dict[str, Any]) -> bool:
+            if firm is not None and document["pair"] not in rules.customer_name_reference \
+                    and same_organisation(document["name"], firm):
+                return True
             # A masked PAN ("PXXXXJ KXXXR NXXXX") is the customer's when its
             # visible letters fit the customer's name (2026-10-28).
             if is_masked(document["name"]):

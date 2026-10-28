@@ -171,6 +171,30 @@ def same_organisation(left: Any, right: Any) -> bool:
     return _tokens_match(a, b) or _close_enough(a, b)
 
 
+# A firm's name, as a proprietor's business prints on its documents
+# ("M/S SHREE SHYAM ENTERPRISES", "MAA MANGALA TRADERS", "TARA BAKERY").
+_FIRM_PREFIX = re.compile(r"^\s*(M\s*/\s*S\b|MESSRS\b)", re.IGNORECASE)
+_FIRM_WORDS = frozenset({
+    "ENTERPRISE", "ENTERPRISES", "ENTERPRISERS", "TRADERS", "TRADER", "TRADING", "STORE", "STORES", "SUPPLIER",
+    "SUPPLIERS", "AGENCY", "AGENCIES", "BAKERY", "BOREWELL", "CONSTRUCTION", "CONSTRUCTIONS", "TRANSPORT",
+    "TRANSPORTS", "SERVICE", "SERVICES", "MARBLE", "MARBLES", "TILES", "GLASS", "ASSOCIATES", "AGRO", "ELECTRICAL",
+    "ELECTRICALS", "WORKSHOP", "INDUSTRIES", "INDUSTRY", "UDYOG", "ADVERTISING", "CORPORATION", "CENTRE", "CENTER",
+    "MEDICAL", "MEDICALS", "HARDWARE", "BUILDERS", "DEVELOPERS", "PROJECTS", "INFRA", "INFRACON", "LOGISTICS",
+    "ROADLINES", "CARRIERS", "SOLUTIONS", "FOODS", "HOTEL", "RESTAURANT", "FURNITURE", "JEWELLERS", "TEXTILES",
+    "PHARMA", "CLINIC", "HOSPITAL", "SCHOOL", "TRUST", "SOCIETY", "ENGINEERING", "ENGINEERS", "WORKS", "MART",
+    "EMPORIUM", "BHANDAR", "SHOP", "PVT", "PRIVATE", "LTD", "LIMITED", "LLP", "COMPANY", "DEPARTMENT", "FIRM",
+})
+
+
+def is_firm_name(value: Any) -> bool:
+    """Whether a printed name is a firm's rather than a person's (2026-10-28)."""
+    text = str(value or "")
+    if _FIRM_PREFIX.search(text):
+        return True
+    words = set(_NOISE.sub(" ", text.upper()).split())
+    return bool(words & _FIRM_WORDS)
+
+
 def display_name(value: Any) -> str:
     """The name as printed, trimmed, for a task the PC reads."""
     return " ".join(str(value or "").split()) or "blank"
