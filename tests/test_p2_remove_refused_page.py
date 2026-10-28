@@ -199,3 +199,40 @@ def test_a_status_task_whose_pages_moved_to_the_quality_task_says_so(journey):
     _sync(journey)
     assert _task(journey, key)["completion_result"]["reason"] == (
         "The pages still not read were refused for image quality; they are on the file's image-quality task.")
+
+
+class TeamLeadAuthorization:
+    """Security double for a Team Lead: audit.work.update, no journey.update."""
+
+    def check_user_permission(self, *, user_id: str, tenant_id: str, permission_key: str):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(allowed=permission_key != "audit.journey.update", role_key="TL")
+
+
+def test_a_team_lead_removes_a_page_while_the_review_is_not_complete(journey):
+    """Product owner 2026-10-28: "let TL remove the pages from the journey which
+    are not review complete". Every TL removal was refused with VAC-AUTH-002."""
+    app.dependency_overrides[get_security_authorization_client] = lambda: TeamLeadAuthorization()
+    _, pages = add_batch_pages(journey, [("booking_form", "READY"), (None, "QUEUED"), (None, "QUEUED")])
+    _fail(journey, pages[1]["queue_id"], "DI_QUALITY_IMAGE_BLUR_SCORE")
+    _fail(journey, pages[2]["queue_id"], "DI_QUALITY_IMAGE_BLUR_SCORE")
+    assert _remove(journey, pages[1]["queue_id"]).status_code == 200
+
+    _sql(journey, "UPDATE auditcore.journeys SET review_completed_at_utc=now() WHERE tenant_id=:t AND journey_id=:j",
+         j=journey.journey_id)
+    response = _remove(journey, pages[2]["queue_id"])
+    assert response.status_code == 403 and "review is complete" in response.text
+
+
+def test_a_role_with_neither_permission_still_cannot_remove(journey):
+    class Nothing:
+        def check_user_permission(self, *, user_id, tenant_id, permission_key):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(allowed=permission_key == "audit.journey.read", role_key="CRM")
+
+    app.dependency_overrides[get_security_authorization_client] = lambda: Nothing()
+    _, pages = add_batch_pages(journey, [("booking_form", "READY"), (None, "QUEUED")])
+    _fail(journey, pages[1]["queue_id"], "DI_QUALITY_IMAGE_BLUR_SCORE")
+    assert _remove(journey, pages[1]["queue_id"]).status_code == 403
