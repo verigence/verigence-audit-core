@@ -71,6 +71,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_db_transient import raise_if_worker_transient
 from audit_core.uc03_manual_verification import _resolve_finding
 from audit_core.uc03_v2_review_materialization import _INVOICE_DOCUMENT_TYPES
 from audit_core.workflow import cancel_workflow_task, create_workflow_task
@@ -701,7 +702,8 @@ def sync_customer_identity_consistency(
             "examined": examined,
             "referenceName": reference_name,
         }
-    except Exception:
+    except Exception as exc:
+        raise_if_worker_transient(exc)  # retried, not skipped (uc03_db_transient)
         logger.warning("sync_customer_identity_consistency failed", exc_info=True)
         return {"error": True}
 

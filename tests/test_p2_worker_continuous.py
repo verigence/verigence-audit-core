@@ -31,13 +31,14 @@ def journey(monkeypatch):
         engine.dispose()
 
 
-def _enqueue(journey, n: int) -> list[str]:
+def _enqueue(journey, n: int, work_type: str = "DOCUMENT_INGEST") -> list[str]:
+    """Page work: several of one Journey may run at once (journey work runs alone)."""
     keys = [f"test:{uuid4().hex}" for _ in range(n)]
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         for key in keys:
             worker._enqueue(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
-                            work_type="STAGE_RECOMPUTE", work_key=key, payload={}, correlation_id=None)
+                            work_type=work_type, work_key=key, payload={}, correlation_id=None)
     return keys
 
 
@@ -91,3 +92,42 @@ def test_stopping_hands_unfinished_items_over_at_once(journey, monkeypatch):
     assert all(r["work_status"] in ("CLAIMED", "PROCESSING") and r["free"] for r in rows.values())
     reclaimed = worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)
     assert {w.work_key for w in reclaimed} == set(keys)
+
+
+# ── one Journey's work (2026-10-28: 881 deadlocks between a Journey's own items) ──
+def _claim_keys(journey) -> list[str]:
+    return [w.work_key for w in worker._claim_for_tenant(journey.engine, journey.tenant_id, 10)]
+
+
+def test_work_on_the_journey_as_a_whole_runs_alone(journey):
+    checks = _enqueue(journey, 3, work_type="CONTROL_EVALUATE")
+    reconcile = _enqueue(journey, 1, work_type="JOURNEY_RECONCILE")
+    claimed = _claim_keys(journey)
+    assert len(claimed) == 1 and set(claimed) <= set(checks + reconcile)
+    assert _claim_keys(journey) == []  # the next waits until the first is done
+
+
+def test_page_work_runs_side_by_side_up_to_the_limit(journey, monkeypatch):
+    monkeypatch.setattr(worker, "_PER_JOURNEY_CONCURRENCY", 3)
+    pages = _enqueue(journey, 5)
+    claimed = _claim_keys(journey)
+    assert len(claimed) == 3 and set(claimed) <= set(pages)
+
+
+def test_page_work_and_journey_work_never_overlap(journey, monkeypatch):
+    monkeypatch.setattr(worker, "_PER_JOURNEY_CONCURRENCY", 3)
+    first = _enqueue(journey, 1)
+    check = _enqueue(journey, 1, work_type="CONTROL_EVALUATE")
+    later = _enqueue(journey, 1)
+    assert _claim_keys(journey) == first  # the check waits for the page before it
+    assert _claim_keys(journey) == []     # the later page waits for the check
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_work_queue SET work_status='COMPLETED' "
+                                "WHERE tenant_id=:t AND work_key=:k"), {"t": journey.tenant_id, "k": first[0]})
+    assert _claim_keys(journey) == check
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_work_queue SET work_status='COMPLETED' "
+                                "WHERE tenant_id=:t AND work_key=:k"), {"t": journey.tenant_id, "k": check[0]})
+    assert _claim_keys(journey) == later

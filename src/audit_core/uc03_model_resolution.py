@@ -63,6 +63,7 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_booking_capture import _scope
+from audit_core.uc03_db_transient import raise_if_worker_transient
 from audit_core.uc03_delivery_commands import _machine_flag
 from audit_core.uc03_manual_verification import _resolve_finding
 from audit_core.uc03_masters_alignment import registration_basis
@@ -3180,6 +3181,7 @@ def _sync_model_resolution_unguarded(
         return _raise_not_identified(connection, tenant_id=tenant_id, journey_id=journey_id,
                                      correlation_id=correlation_id, ev=ev, info=info)
     except Exception as exc:
+        raise_if_worker_transient(exc)  # retried, not skipped (uc03_db_transient)
         logger.warning("sync_model_resolution failed", exc_info=True)
         return {"error": True, "errorType": type(exc).__name__, "errorMessage": str(exc)[:300]}
 

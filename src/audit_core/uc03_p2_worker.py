@@ -57,6 +57,7 @@ from audit_core.di_capture_v2_client import DiCaptureV2Error
 from audit_core.logging_config import configure_logging, exception_summary, redact_text
 from audit_core.otel import install_correlation_propagation
 from audit_core.platform_health import start_heartbeat_thread
+from audit_core.uc03_db_transient import work_item_scope
 from audit_core.uc03_document_capture_v2 import (
     _DI_AUDIENCE,
     _candidate_type_keys,
@@ -277,10 +278,22 @@ def _active_tenants(engine: Engine) -> list[str]:
     return tenants
 
 
+# Work on one Journey (2026-10-28). A page's own work (split, read, re-read,
+# group, withdraw) may run up to _PER_JOURNEY_CONCURRENCY at a time: it waits on
+# Document Intelligence and touches its own page. Work on the Journey as a whole
+# -- control checks, reconcile, stage, task verification -- runs alone: two of
+# them at once updated the same Deal, stage-flag, payment and product rows in a
+# different order and Postgres killed one (881 deadlocks; the killed step was
+# skipped and the item still reported success). A Journey item starts only
+# when nothing else of its Journey is running and it is the oldest waiting;
+# page work queued after it waits for it.
+PAGE_WORK_TYPES = ("SPLIT_BATCH", "DOCUMENT_INGEST", "PAGE_REREAD", "BATCH_GROUP", "DI_DOCUMENT_WITHDRAW")
+
 _CLAIM_SQL = text(
     """
     WITH inflight AS (
-        SELECT journey_id, COUNT(*) AS running
+        SELECT journey_id, COUNT(*) AS running,
+               COUNT(*) FILTER (WHERE work_type <> ALL(:page_types)) AS running_journey_work
         FROM auditcore.p2_work_queue
         WHERE tenant_id=:tenant_id
           AND work_status IN ('CLAIMED','PROCESSING')
@@ -288,7 +301,7 @@ _CLAIM_SQL = text(
         GROUP BY journey_id
     ),
     ready AS (
-        SELECT work_id, journey_id, queued_at_utc,
+        SELECT work_id, journey_id, queued_at_utc, (work_type = ANY(:page_types)) AS page_work,
                row_number() OVER (PARTITION BY journey_id ORDER BY queued_at_utc, work_id) AS journey_rank
         FROM auditcore.p2_work_queue
         WHERE tenant_id=:tenant_id
@@ -298,11 +311,21 @@ _CLAIM_SQL = text(
           )
           AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= now())
     ),
+    first_journey_work AS (
+        SELECT journey_id, MIN(journey_rank) AS journey_rank FROM ready WHERE NOT page_work GROUP BY journey_id
+    ),
     eligible AS (
         SELECT r.work_id
         FROM ready r
         LEFT JOIN inflight i ON i.journey_id=r.journey_id
-        WHERE r.journey_rank + COALESCE(i.running, 0) <= :per_journey
+        LEFT JOIN first_journey_work f ON f.journey_id=r.journey_id
+        WHERE CASE
+          WHEN r.page_work THEN
+            COALESCE(i.running_journey_work, 0) = 0
+            AND r.journey_rank + COALESCE(i.running, 0) <= :per_journey
+            AND r.journey_rank < COALESCE(f.journey_rank, 2147483647)
+          ELSE COALESCE(i.running, 0) = 0 AND r.journey_rank = 1
+        END
         ORDER BY r.queued_at_utc, r.work_id
         LIMIT :limit
     )
@@ -324,7 +347,8 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
         set_tenant_context(connection, tenant_id)
         rows = connection.execute(
             _CLAIM_SQL,
-            {"tenant_id": tenant_id, "limit": limit, "per_journey": _PER_JOURNEY_CONCURRENCY},
+            {"tenant_id": tenant_id, "limit": limit, "per_journey": _PER_JOURNEY_CONCURRENCY,
+             "page_types": list(PAGE_WORK_TYPES)},
         ).mappings().all()
         for row in rows:
             token = uuid4()
@@ -4112,7 +4136,9 @@ def _process_in_context(engine: Engine, work: WorkItem) -> None:
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(**_work_fields(work))
     try:
-        process_work(engine, work)
+        # A deadlock inside a step fails the item, which is retried (uc03_db_transient).
+        with work_item_scope():
+            process_work(engine, work)
     finally:
         structlog.contextvars.clear_contextvars()
 

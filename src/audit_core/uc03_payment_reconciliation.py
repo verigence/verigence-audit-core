@@ -28,6 +28,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_db_transient import raise_if_worker_transient
 from audit_core.uc03_document_registry import is_bank_statement_document_type
 from audit_core.uc03_payment_mode import classify_payment_mode
 from audit_core.uc03_v2_review_materialization import _upsert_review_value_row
@@ -494,7 +495,8 @@ def reconcile_payments(
             return _reconcile_payments(
                 connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
             )
-    except Exception:
+    except Exception as exc:
+        raise_if_worker_transient(exc)  # retried, not skipped (uc03_db_transient)
         logger.warning("reconcile_payments failed", exc_info=True)
         return {"error": True}
 
