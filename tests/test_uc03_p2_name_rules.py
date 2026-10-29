@@ -102,16 +102,16 @@ def test_documents_in_another_customers_name_raise_a_high_document_missing_task(
     wrong = add_ready_document(journey, "insurance_cover", insured_name="Anita Sahoo", policy_number="P1")
     assert _sync(journey) == {"RAISED": 1}
     (task,) = _tasks(journey)
-    # One Team Lead task per Journey (product owner 2026-10-29), not a PC task per document.
-    assert task["task_type"] == "INVOICE_DISCREPANCY_REVIEW"
+    # One PC task per Journey (product owner 2026-10-29), not a task per document.
+    assert task["task_type"] == "DOCUMENT_MISSING"
     assert task["severity"] == "HIGH" and task["priority"] == "HIGH"
-    assert task["assigned_role_code"] == "TL"
+    assert task["assigned_role_code"] == "PC"
     assert task["title"] == "Customer name differs on 1 document"
     assert "Insurance Cover Note: Anita Sahoo" in task["description"]
     assert "customer per the PAN Card is BISWABHANU BISWAL" in task["description"]
     assert task["reference"]["documentIds"] == [str(wrong)]
     assert task["reference"]["sourceCode"] == "WRONG_CUSTOMER_NAME"
-    assert "ACCEPT_EXCEPTION" in task["allowed_actions"]
+    assert "UPLOAD_DOCUMENT" in task["allowed_actions"]
     # the same evaluation again changes nothing
     assert _sync(journey) == {"UNCHANGED": 1}
 
