@@ -225,10 +225,8 @@ def test_money_fields_share_the_ninety_percent_bar(journey):
 def test_delivery_readiness_lists_missing_required_documents(journey):
     result = _recompute(journey)
     missing = {item["key"] for item in result["delivery"]["missing"]}
-    # The vehicle invoice: DMS or Tally (one requirement); vehicle pictures do
-    # not hold the delivery while the photo flow is unused (2026-10-29).
-    assert {"VEHICLE_INVOICE", "insurance_cover", "customer_ledger", "cost_sheet", "payment_receipt"} <= missing
-    assert "vehicle_proof" not in missing
+    assert {"customer_invoice_dms", "tax_invoice_tally", "insurance_cover",
+            "customer_ledger", "cost_sheet", "payment_receipt", "vehicle_proof"} <= missing
     # the lender's loan-closure letter is optional; the NDC is the account statement (2026-10-28)
     assert "no_dues_certificate" not in missing
     assert "gate_pass" not in missing  # optional

@@ -396,3 +396,77 @@ def cancel_stuck_journey(
         severity="INFO", registry=get_registry(),
     )
     return "CANCELLED"
+
+
+def complete_delivery_by_reviewer(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, actor_id: str, actor_role: str | None,
+    reason: str, correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """A Reviewer completes a Delivery the rules have not (product owner
+    2026-10-29: "give a reviewer an option to complete the delivery which
+    hasn't been so far").
+
+    The Delivery is recorded complete exactly as when every rule passes -- the
+    TL review follows -- with who, when, the reason and what was still pending
+    kept on the workflow event and the activity feed. It stays complete on every
+    later recompute. Allowed once the booking is complete and the delivery has
+    started. Returns {"outcome": COMPLETED | ALREADY_COMPLETE |
+    BOOKING_NOT_COMPLETE | DELIVERY_NOT_STARTED, "pending": [...]}."""
+    from audit_core.uc03_delivery_start import delivery_has_started
+    from audit_core.uc03_p2_runtime import record_activity
+    from audit_core.uc03_p2_stage import recompute_journey_stage
+
+    runtime = connection.execute(
+        text("SELECT booking_completion_state, delivery_completion_state FROM auditcore.p2_journey_runtime "
+             "WHERE tenant_id=:t AND journey_id=:j FOR UPDATE"),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one_or_none()
+    if runtime is not None and runtime["delivery_completion_state"] == "COMPLETE":
+        return {"outcome": "ALREADY_COMPLETE", "pending": []}
+    if runtime is None or runtime["booking_completion_state"] != "COMPLETE":
+        return {"outcome": "BOOKING_NOT_COMPLETE", "pending": []}
+    if not delivery_has_started(connection, tenant_id=tenant_id, journey_id=journey_id):
+        return {"outcome": "DELIVERY_NOT_STARTED", "pending": []}
+
+    stage = recompute_journey_stage(connection, tenant_id=tenant_id, journey_id=journey_id)
+    pending = [str(item.get("label") or item.get("key")) for item in (stage.get("delivery") or {}).get("missing", [])]
+    version = connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.journey_stage_states (
+                tenant_id, journey_id, stage_code, business_status, audit_state, audit_status,
+                first_started_at_utc, capture_completed_at_utc, business_completed_at_utc,
+                latest_activity_at_utc, version_no
+            ) VALUES (:t, :j, 'DELIVERY', 'DELIVERY_COMPLETED', 'IN_PROGRESS', 'NOT_EVALUATED',
+                      now(), now(), now(), now(), 1)
+            ON CONFLICT (tenant_id, journey_id, stage_code) DO UPDATE
+               SET business_status='DELIVERY_COMPLETED',
+                   capture_completed_at_utc=COALESCE(journey_stage_states.capture_completed_at_utc, now()),
+                   business_completed_at_utc=COALESCE(journey_stage_states.business_completed_at_utc, now()),
+                   latest_activity_at_utc=now(), updated_at_utc=now(),
+                   version_no=journey_stage_states.version_no + 1
+            RETURNING version_no
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
+    payload = {"completedBy": "REVIEWER", "reason": reason, "pendingAtCompletion": pending, "next": "TL_REVIEW"}
+    append_workflow_event(
+        connection, tenant_id=tenant_id, journey_id=journey_id, stage="DELIVERY",
+        event_type="P2_DELIVERY_COMPLETED", source_kind="HUMAN", actor_id=actor_id, actor_role=actor_role,
+        payload=payload, aggregate_version=int(version), correlation_id=correlation_id,
+    )
+    connection.execute(
+        text("UPDATE auditcore.p2_journey_runtime SET delivery_completion_state='COMPLETE', "
+             "current_stage='DELIVERY_COMPLETE', updated_at_utc=now() WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    )
+    record_activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="DELIVERY_COMPLETED_BY_REVIEWER",
+        subject_type="JOURNEY", subject_id=str(journey_id), details={"by": actor_id, **payload},
+        correlation_id=correlation_id,
+    )
+    from audit_core.uc03_p2_task_producer import sync_delivery_review_task
+
+    sync_delivery_review_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return {"outcome": "COMPLETED", "pending": pending}

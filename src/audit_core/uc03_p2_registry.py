@@ -121,8 +121,6 @@ class Gate:
     match: str = "ALL"
     role: str | None = None
     tabs: tuple[str, ...] = ()
-    # False: shown and recorded, but does not hold the stage (2026-10-29).
-    blocking: bool = True
 
 
 @dataclass(frozen=True)
@@ -367,7 +365,6 @@ def build_registry(
                     match=str(g.get("match", "ALL")),
                     role=g.get("role"),
                     tabs=_tuple(g.get("tabs")),
-                    blocking=bool(g.get("blocking", True)),
                 )
                 for g in raw.get("gates") or []
             ),

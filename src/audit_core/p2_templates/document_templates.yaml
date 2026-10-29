@@ -106,12 +106,8 @@ stages:
       kind: REQUIRED_DOCUMENTS
       label: Mandatory and applicable conditional delivery documents received
       missing: Upload the delivery documents still missing.
-    # Advisory, not blocking (product owner 2026-10-29, calibration): the
-    # vehicle photo flow is not in use yet, so its absence held every delivery.
-    # Make it blocking again once PCs take the photos.
     - key: VEHICLE_PROOF
       kind: VEHICLE_PROOF
-      blocking: false
       label: Vehicle photos (or VIN / chassis) recorded
       missing: Upload pictures of the car being delivered, or enter the VIN / chassis number from the task.
     - key: PC_TASKS_CLOSED
@@ -594,9 +590,6 @@ document_types:
     - VEHICLE
     - FINANCE
     - CUSTOMER
-    # DMS or Tally: either meets the requirement until the dealers' practice is
-    # confirmed (product owner 2026-10-29; was two separate required documents).
-    group: VEHICLE_INVOICE
   tax_invoice_tally:
     display_name: Tax Invoice (Tally)
     di_types:
@@ -637,9 +630,6 @@ document_types:
     - INVOICES
     - DEAL
     - VEHICLE
-    # DMS or Tally: either meets the requirement until the dealers' practice is
-    # confirmed (product owner 2026-10-29; was two separate required documents).
-    group: VEHICLE_INVOICE
   insurance_cover:
     display_name: Insurance Cover Note
     di_types:
@@ -714,9 +704,6 @@ document_types:
     - INVOICES
     - DEAL
     - VEHICLE
-    # DMS or Tally: either meets the requirement until the dealers' practice is
-    # confirmed (product owner 2026-10-29; was two separate required documents).
-    group: ACCESSORY_INVOICE
   accessory_invoice_tally:
     display_name: Accessory Invoice (Tally)
     di_types:
@@ -746,9 +733,6 @@ document_types:
     journey_360:
     - INVOICES
     - DEAL
-    # DMS or Tally: either meets the requirement until the dealers' practice is
-    # confirmed (product owner 2026-10-29; was two separate required documents).
-    group: ACCESSORY_INVOICE
   rto_challan:
     display_name: RTO Challan
     di_types:
