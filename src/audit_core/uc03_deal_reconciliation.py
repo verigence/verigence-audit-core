@@ -1866,6 +1866,21 @@ def _grid_task_key(grid_version_id: Any, model_id: Any) -> str:
     return f"grid-line-missing:{grid_version_id or 'none'}:{model_id}"
 
 
+def _shared_task_open(connection: Connection, *, tenant_id: str, dedupe_key: str) -> bool:
+    """A master-data task is one task across every deal it touches. When it is
+    already open there is nothing to change (its text names the deal it was
+    first seen on), so it is read without a row lock: deals re-checked
+    together queued on that one row and timed out (2026-10-29, statement
+    timeout while locking p2_tasks)."""
+    from audit_core.uc03_p2_task_producer import _OPEN
+
+    status = connection.execute(
+        text("SELECT task_status FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k"),
+        {"t": tenant_id, "k": dedupe_key},
+    ).scalar_one_or_none()
+    return status is not None and str(status) in _OPEN
+
+
 def _sync_master_tasks(
     connection: Connection, *, tenant_id: str, journey_id: UUID, ctx: dict[str, Any], effective_on: date,
     unmatched: dict[str, list[dict[str, Any]]], grid: dict[str, Any] | None, grid_gap: dict[str, Any] | None,
@@ -1885,6 +1900,9 @@ def _sync_master_tasks(
     vehicle = f"{ctx.get('model_name') or ''} {ctx.get('variant_name') or ''}".strip()
 
     for master in {m["eligibilityId"]: m for ms in unmatched.values() for m in _unmatched_detail(ms)}.values():
+        counts["mapping"] += 1
+        if _shared_task_open(connection, tenant_id=tenant_id, dedupe_key=_mapping_task_key(master["eligibilityId"])):
+            continue
         texts = ", ".join(master["variantTexts"])[:200]
         raise_or_refresh(
             connection, tenant_id=tenant_id, journey_id=journey_id,
@@ -1899,27 +1917,29 @@ def _sync_master_tasks(
             ),
             reference={"sourceCode": _MAPPING_TASK, **master}, severity="MEDIUM", registry=registry,
         )
-        counts["mapping"] += 1
 
     if grid is not None and grid.get("gridVersionId"):
-        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
-                        dedupe_key=_grid_task_key(grid["gridVersionId"], ctx["model_id"]),
-                        evidence={"gridVersionId": grid["gridVersionId"]})
+        grid_key = _grid_task_key(grid["gridVersionId"], ctx["model_id"])
+        if _shared_task_open(connection, tenant_id=tenant_id, dedupe_key=grid_key):
+            resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=grid_key,
+                            evidence={"gridVersionId": grid["gridVersionId"]})
     elif grid_gap is not None and (rows.get(_DEALER_DISCOUNT_KEY) or {}).get("eligibility_result") == "MASTER_UNMATCHED":
-        raise_or_refresh(
-            connection, tenant_id=tenant_id, journey_id=journey_id,
-            dedupe_key=_grid_task_key(grid_gap["gridVersionId"], ctx["model_id"]), task_type=_MAPPING_TASK,
-            source_type="RESOLVER", source_code=_MAPPING_TASK,
-            title=f"Dealer discount grid: {grid_gap['reason']}"[:300],
-            description=(
-                f"A dealer discount is given on {vehicle or 'this deal'} and {grid_gap['reason']}, so it has no "
-                "allowance and is not called an over-grant. Load the grid line (or a grid alias for the model)."
-            ),
-            reference={"sourceCode": _MAPPING_TASK, "gridVersionId": grid_gap["gridVersionId"],
-                       "modelId": str(ctx["model_id"]), "model": ctx.get("model_name")},
-            severity="MEDIUM", registry=registry,
-        )
         counts["grid"] += 1
+        if not _shared_task_open(connection, tenant_id=tenant_id,
+                                 dedupe_key=_grid_task_key(grid_gap["gridVersionId"], ctx["model_id"])):
+            raise_or_refresh(
+                connection, tenant_id=tenant_id, journey_id=journey_id,
+                dedupe_key=_grid_task_key(grid_gap["gridVersionId"], ctx["model_id"]), task_type=_MAPPING_TASK,
+                source_type="RESOLVER", source_code=_MAPPING_TASK,
+                title=f"Dealer discount grid: {grid_gap['reason']}"[:300],
+                description=(
+                    f"A dealer discount is given on {vehicle or 'this deal'} and {grid_gap['reason']}, so it has no "
+                    "allowance and is not called an over-grant. Load the grid line (or a grid alias for the model)."
+                ),
+                reference={"sourceCode": _MAPPING_TASK, "gridVersionId": grid_gap["gridVersionId"],
+                           "modelId": str(ctx["model_id"]), "model": ctx.get("model_name")},
+                severity="MEDIUM", registry=registry,
+            )
 
     not_in_force = sorted(k for k, r in rows.items() if r.get("eligibility_result") == "SCHEME_NOT_IN_FORCE")
     key = f"discount-scheme-not-in-force:{journey_id}"

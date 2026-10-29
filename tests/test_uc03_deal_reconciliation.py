@@ -1329,7 +1329,7 @@ def test_an_unclassified_invoice_discount_is_compared_with_the_whole_entitlement
 # ── review of PR 472 (2026-10-20 product owner rules) ────────────────────────
 def _p2_tasks(c, task_type: str) -> list[dict]:
     return [dict(r) for r in c.execute(
-        text("SELECT dedupe_key, task_status, assigned_role_code, reference, severity, title FROM auditcore.p2_tasks "
+        text("SELECT task_id, dedupe_key, task_status, assigned_role_code, reference, severity, title FROM auditcore.p2_tasks "
              "WHERE tenant_id=:t AND task_type=:k ORDER BY dedupe_key"),
         {"t": c.tenant_id, "k": task_type},
     ).mappings().all()]
@@ -1365,6 +1365,11 @@ def test_b1_an_unmatched_master_row_is_not_known_never_an_over_grant(journey) ->
     tasks = _p2_tasks(c, "SCHEME_MASTER_UNMATCHED")
     assert len(tasks) == 1 and tasks[0]["assigned_role_code"] == "TL"
     assert tasks[0]["dedupe_key"].startswith("scheme-master-unmatched:")
+    # The open task is left as it is on the second run: read without a row
+    # lock, so deals re-checked together do not queue on it (2026-10-29).
+    events = c.execute(text("SELECT event_type FROM auditcore.p2_task_events WHERE tenant_id=:t AND task_id=:id"),
+                       {"t": c.tenant_id, "id": tasks[0]["task_id"]}).scalars().all()
+    assert events == ["RAISED"]
     sheet = _sheet_discount(c, "CASH_DISCOUNT")
     assert sheet["entitled"] is None and sheet["takenAsGiven"] is True
     assert _open_finding(c, "DEAL_TOTAL_VARIANCE_NEGATIVE") is None
