@@ -1600,7 +1600,9 @@ def sync_name_consistency_tasks(
         # one). It closes itself when every document matches or is removed.
         mismatched = [document for document in checked if not matches(document)]
         if mismatched:
-            key = f"wrong-document:{journey_id}:customer"
+            # Its own key: an open TL task of 2026-10-29 (":customer") is not
+            # turned into this one; it closes below as no longer wanted.
+            key = f"wrong-document:{journey_id}:customer-name"
             wanted.add(key)
             lines = []
             for document in mismatched:

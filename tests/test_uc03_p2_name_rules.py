@@ -94,6 +94,29 @@ def _tasks(journey):
         ).mappings().all()]
 
 
+def test_an_open_tl_name_task_gives_way_to_the_pc_task(journey):
+    # The TL routing of 2026-10-29 was reverted the same day: its open task
+    # closes and the PC gets the one task for the Journey.
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_task_producer import raise_or_refresh
+
+    add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="BISWABHANU BISWAL")
+    add_ready_document(journey, "insurance_cover", insured_name="Anita Sahoo", policy_number="P1")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        raise_or_refresh(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+            dedupe_key=f"wrong-document:{journey.journey_id}:customer", task_type="INVOICE_DISCREPANCY_REVIEW",
+            source_type="DOCUMENT", source_code="WRONG_CUSTOMER_NAME", title="Customer name differs on 1 document",
+            description="old", reference={"sourceCode": "WRONG_CUSTOMER_NAME"}, severity="HIGH", registry=get_registry(),
+        )
+    _sync(journey)
+    old, new = _tasks(journey)
+    assert old["assigned_role_code"] == "TL" and old["task_status"] == "VERIFIED_COMPLETE"
+    assert new["assigned_role_code"] == "PC" and new["task_type"] == "DOCUMENT_MISSING"
+    assert new["task_status"] not in ("VERIFIED_COMPLETE", "CANCELLED")
+
+
 def test_documents_in_another_customers_name_raise_a_high_document_missing_task(journey):
     add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="BISWABHANU BISWAL")
     add_ready_document(journey, "booking_form", customer_name="Mr. Biswabhanu Biswal", dealer_name="Sarthak Motors")
