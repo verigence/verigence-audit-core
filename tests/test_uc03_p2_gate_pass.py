@@ -274,7 +274,9 @@ def test_calendar_shows_outlet_photo_but_no_photo_for_a_dealership_view_and_tl_r
     [day] = outlet_view["days"]
     assert (day["date"], day["declared"], day["uploaded"], day["missing"]) == (today, 3, 1, 2)
     assert day["gatePassId"] == gp and outlet_view["scope"] == "OUTLET"
-    assert outlet_view["totals"] == {"declared": 3, "uploaded": 1, "missing": 2}
+    # the older "files not held" answer: the whole gap was not intimated to the PC
+    assert (day["notNotified"], day["toUpload"]) == (2, 0)
+    assert outlet_view["totals"] == {"declared": 3, "uploaded": 1, "missing": 2, "notNotified": 2, "toUpload": 0}
 
     dealer_view = s.client.get(f"{s.base}/calendar", params={"month": month, "dealerId": str(s.journey.dealer_id)}).json()
     assert dealer_view["scope"] == "DEALER" and "gatePassId" not in dealer_view["days"][0]
@@ -498,6 +500,12 @@ def test_the_pc_says_how_many_were_not_notified_and_the_rest_is_not_uploaded_by_
     totals = s.client.get(f"{s.base}/summary").json()["totals"]
     assert (totals["asPerRegister"], totals["updatedInTool"], totals["notNotifiedToPc"], totals["pendingDueToPc"]) == \
         (5, 1, 3, 1)
+    # The calendar splits the gap the same way (product owner 2026-10-29): uploaded
+    # with the day's gate pass, not intimated to the PC, and left for the PC to upload.
+    from audit_core.uc03_p2_object_keys import ist_day
+    calendar = s.client.get(f"{s.base}/calendar", params={"month": f"{ist_day():%Y-%m}"}).json()
+    assert {k: calendar["totals"][k] for k in ("declared", "uploaded", "notNotified", "toUpload")} == \
+        {"declared": 5, "uploaded": 1, "notNotified": 3, "toUpload": 1}
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
         reference = connection.execute(
@@ -513,3 +521,6 @@ def test_all_notified_means_the_whole_gap_is_the_pcs_and_no_tl_task(setup):
     answer = s.client.post(f"{s.base}/{gp}/answer", json={"notNotified": 0}).json()
     assert (answer["notUploadedByPc"], answer["taskRaised"]) == (2, False)
     assert s.client.get(f"{s.base}/summary").json()["totals"]["pendingDueToPc"] == 2
+    from audit_core.uc03_p2_object_keys import ist_day
+    [day] = s.client.get(f"{s.base}/calendar", params={"month": f"{ist_day():%Y-%m}"}).json()["days"]
+    assert (day["notNotified"], day["toUpload"]) == (0, 2)

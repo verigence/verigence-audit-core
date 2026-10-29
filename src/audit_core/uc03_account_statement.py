@@ -143,7 +143,9 @@ _DISCOUNTS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (key, re.compile(pattern)) for key, pattern in (
         ("CASH_DISCOUNT", r"(SCHEME DISCOUNT|CONSUMER OFFER|CONSUMER SCHEME)( .*)?"),
         ("CORPORATE_PRIVILEGE", r"CORPORATE (DISCOUNT|OFFER)( .*)?"),
-        ("EXCHANGE_BONUS", r"(EXCHANGE (LOYALTY|BONUS|CLAIM)|EXCHANGED VEHICLE)( .*)?"),
+        # "EXCHANGE CLAIM" is the exchange bonus (product owner 2026-10-29, the
+        # Aditya form; written "EXCHANNGE CLAIM" on it).
+        ("EXCHANGE_BONUS", r"EXCHAN+GE (LOYALTY|BONUS|CLAIM)( .*)?"),
         ("ADDITIONAL_DISCOUNT", r"(OTHER DISCOUNT( \(IF ANY\))?|CASH DISCOUNT)( .*)?"),
     )
 )
@@ -158,6 +160,12 @@ _SUMMARY = re.compile(
     r"GROSS VALUE|DISCOUNT|TOTAL( COST| RECEIPTS?| \(A\))?|NET AMOUNT RECEIVED( \(E\))?|"
     r"SHORT ?/ ?EXCESS|BALANCE ?(EXCESS ?/ ?SHORTAGE)?( \(C-E\))?|DUE"
 )
+# The old vehicle's value (product owner 2026-10-29): Aditya's form deducts
+# "LESS: EXCHANGED VEHICLE" in section A, before the net receivable. It is the
+# customer paying with the old vehicle -- not a discount and not the exchange
+# bonus (that is "EXCHANGE CLAIM") -- and, being already netted off the net
+# receivable, not one of the statement's received lines either.
+_OLD_VEHICLE = re.compile(r"EXCHANGED VEHICLE( VALUE)?")
 # A discount line that names a scrappage bonus does not say whether it is the
 # dealer's or the certificate of deposit's, and the two are different
 # benefits: it is reported, not filed under either.
@@ -181,7 +189,11 @@ def statement_kind(lines: list[dict[str, Any]]) -> str:
     Tally printout; a TOTAL/NET VEHICLE COST line is the ERP printout (its
     "Ex-Showroom" is before GST, so it is not read as a statement); the form
     is recognised by its own labels."""
-    if any(row.get("running_balance") for row in lines):
+    # A form's own "TOTAL (A)" may come back with its figure as a running
+    # balance (ADI-BM-261026-003, 2026-10-29); only a posting with one makes a
+    # Tally printout.
+    if any(row.get("running_balance") and not _SUMMARY.fullmatch(_label(row.get("particulars_raw")))
+           for row in lines):
         return KIND_TALLY
     labels = [_label(row.get("particulars_raw")) for row in lines]
     if any(_ERP_TOTALS.fullmatch(label) for label in labels):
@@ -198,6 +210,8 @@ class StatementRead:
     discounts: dict[str, Decimal] = field(default_factory=dict)
     financer: Decimal | None = None
     receipts: Decimal = Decimal(0)
+    # the old vehicle's value the statement deducts ("LESS: EXCHANGED VEHICLE")
+    old_vehicle_value: Decimal | None = None
     # the "Net value" / "Final price" the statement prints, when it has one
     printed_total: Decimal | None = None
     # lines left blank on purpose, with why
@@ -224,6 +238,9 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
         if not label or side is None:
             continue  # a zero or empty line is not a figure
         _, amount = side
+        if _OLD_VEHICLE.fullmatch(label):
+            found.setdefault(("OLD_VEHICLE", "old_vehicle_value"), []).append(amount)
+            continue
         if _SCRAPPAGE.fullmatch(label):
             out.unmapped.append({"label": label, "amount": amount,
                                  "why": "scrappage: the statement does not say dealer or certificate of deposit"})
@@ -253,6 +270,9 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             continue
         if kind == "TOTAL":
             out.printed_total = distinct[0]
+            continue
+        if kind == "OLD_VEHICLE":
+            out.old_vehicle_value = distinct[0]
             continue
         (out.components if kind == "COMMERCIAL" else out.discounts)[key] = distinct[0]
     return out
@@ -717,6 +737,7 @@ def sync_account_statement(
         "account_statement_synced", tenant_id=tenant_id, journey_id=str(journey_id), correlation_id=correlation_id,
         statements=len(forms), tallies=len(tallies), components=len(keep_components), discounts=len(keep_discounts),
         unmapped=len(statement.unmapped) if statement else 0, conflicts=len(statement.conflicts) if statement else 0,
+        old_vehicle_value=str(statement.old_vehicle_value) if statement and statement.old_vehicle_value else None,
         invoice_actuals_cleared=cleared, tally_deviations=len(deviations),
         cost_sheets=len(sheets), cost_sheet_differences=len(differences),
     )
