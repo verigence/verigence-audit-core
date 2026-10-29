@@ -1445,9 +1445,9 @@ def _gst_trade_names(connection: Connection, *, tenant_id: str, journey_id: UUID
     ).scalars().all() if v and str(v).strip()]
 
 
-# A customer-name mismatch is the Team Lead's to decide, once per Journey
-# (2026-10-29): the TL's cross-document review.
-CUSTOMER_NAME_TASK_TYPE = "INVOICE_DISCREPANCY_REVIEW"
+# A customer-name mismatch is the PC's, once per Journey (product owner
+# 2026-10-29: the TL routing reverted, "raises one PC task").
+CUSTOMER_NAME_TASK_TYPE = "DOCUMENT_MISSING"
 
 
 def _verified_by_a_person(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
@@ -1594,15 +1594,15 @@ def sync_name_consistency_tasks(
             return (any(same_person(document["name"], n) or same_organisation(document["name"], n) for n in gst_names)
                     or (person is not None and same_person(document["name"], person["name"])))
 
-        # A genuine mismatch goes to the Team Lead, once per Journey (product
-        # owner 2026-10-29, calibration): one task naming every document in
-        # another name, instead of a PC task per document (141 open on 89
-        # Journeys, up to 8 on one). The TL decides: the PC replaces the
-        # document, or the TL accepts it as an exception. It closes itself when
-        # every document matches or is removed.
+        # A genuine mismatch is one PC task per Journey (product owner
+        # 2026-10-29): one task naming every document in another name,
+        # instead of a task per document (141 open on 89 Journeys, up to 8 on
+        # one). It closes itself when every document matches or is removed.
         mismatched = [document for document in checked if not matches(document)]
         if mismatched:
-            key = f"wrong-document:{journey_id}:customer"
+            # Its own key: an open TL task of 2026-10-29 (":customer") is not
+            # turned into this one; it closes below as no longer wanted.
+            key = f"wrong-document:{journey_id}:customer-name"
             wanted.add(key)
             lines = []
             for document in mismatched:
@@ -1615,11 +1615,11 @@ def sync_name_consistency_tasks(
                 title=(f"Customer name differs on {len(mismatched)} document"
                        f"{'s' if len(mismatched) != 1 else ''}"),
                 description=(
-                    f"The customer per the {kyc_template.display_name} is {display_name(kyc['name'])}. In another "
-                    f"name: {'; '.join(lines)}. Decide whether each is the wrong document (the PC deletes it and "
-                    f"uploads the one in the customer's name as per "
-                    f"{'the GST certificate' if gst_names else 'PAN/Aadhaar'}), a misread name (correct it on the "
-                    "document), or acceptable (accept as an exception)."
+                    f"Customer name differs on {'; '.join(lines)}. The customer per the "
+                    f"{kyc_template.display_name} is {display_name(kyc['name'])}. Wrong document uploaded: please "
+                    f"delete it and upload the one in the customer's name as per "
+                    f"{'the GST certificate' if gst_names else 'PAN/Aadhaar'}. If the name was only misread, "
+                    "correct it on the document instead."
                 ),
                 reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "WRONG_CUSTOMER_NAME",
                            "documentIds": ids, "documentId": ids[0], "customerName": display_name(kyc["name"]),
