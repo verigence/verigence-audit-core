@@ -905,6 +905,7 @@ def submit_delivery_capture_v2(
                 task_payload={"documentCount": len(documents)},
                 effect_key=_pc_delivery_capture_effect_key(tenant_id, journey_id),
                 correlation_id=correlation_id,
+                allow_phase2=True,  # a command a person runs; it needs the task
             )
             complete_workflow_task(
                 connection, tenant_id=tenant_id, workflow_task_id=pc_task_id,
