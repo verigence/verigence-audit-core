@@ -134,6 +134,39 @@ def test_aditya_form_with_cash_discount() -> None:
     assert read.receipts == D(1189789)
 
 
+ADITYA_EXCHANGE = [  # ADI-BM-261026-011, as the form is filled in
+    {"particulars_raw": "EX-SHOW ROOM PRICE OF VEHICLE", "debit_amount": 1074500},
+    {"particulars_raw": "LESS: CORPORATE OFFER (IF APPLICABLE)", "credit_amount": 2700},
+    {"particulars_raw": "LESS: EXCHANGED VEHICLE", "credit_amount": 265000},
+    {"particulars_raw": "LESS: EXCHANNGE CLAIM", "credit_amount": 35000},
+    {"particulars_raw": "TCS ON INVOICE", "debit_amount": 10718},
+    {"particulars_raw": "REGISTRATION COST", "debit_amount": 11340},
+    {"particulars_raw": "BOOKING AMOUNT", "credit_amount": 5000},
+    {"particulars_raw": "FINANCER AMOUNT", "credit_amount": 774300},
+    {"particulars_raw": "DEPOSITED INTO BANK", "credit_amount": 14558},
+]
+
+
+def test_aditya_exchanged_vehicle_is_the_old_vehicle_value_and_exchange_claim_the_bonus() -> None:
+    # Product owner 2026-10-29: "Exchanged vehicle" is the old vehicle's value
+    # (not a discount, not a receipt: it is netted off before the net
+    # receivable); "Exchange claim" is the exchange bonus.
+    read = read_statement(ADITYA_EXCHANGE)
+    assert read.discounts == {"CORPORATE_PRIVILEGE": D(2700), "EXCHANGE_BONUS": D(35000)}
+    assert read.old_vehicle_value == D(265000)
+    assert read.receipts == D(5000) + D(774300) + D(14558)
+    assert read.unmapped == [] and read.conflicts == []
+
+
+def test_a_forms_total_read_as_a_running_balance_does_not_make_it_a_tally() -> None:
+    # ADI-BM-261026-003: "TOTAL (A)" came back with its figure as a running balance.
+    rows = [*ADITYA_EXCHANGE[:4], {"particulars_raw": "TOTAL (A)", "running_balance": 771800}, *ADITYA_EXCHANGE[4:]]
+    assert statement_kind(rows) == KIND_FORM
+    read = read_statement(rows)
+    assert read.discounts == {"CORPORATE_PRIVILEGE": D(2700), "EXCHANGE_BONUS": D(35000)}
+    assert read.old_vehicle_value == D(265000) and read.unmapped == []
+
+
 def test_form_without_a_vehicle_line_gives_no_ex_showroom() -> None:
     read = read_statement(ADITYA_NO_VEHICLE)
     assert "ex_showroom_price" not in read.components and read.components == {}
