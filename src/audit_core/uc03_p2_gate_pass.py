@@ -579,6 +579,11 @@ def gate_pass_calendar(
 ) -> dict[str, Any]:
     """Per day: deliveries declared on the gate pass, Delivery files uploaded, and the files missing.
 
+    The gap is split as the consolidated view splits it (product owner 2026-10-29):
+    notNotified -- deliveries the PC said the dealership did not intimate to them;
+    toUpload -- the rest, whose files the PC still has to upload (the whole gap
+    while the PC has not answered). ``missing`` stays the whole gap.
+
     The photo (gatePassId) is only given when one outlet is chosen: a dealership
     or all-outlets view has figures only, nothing to open or download."""
     _authorize(connection, tenant_id, principal, client, _READ)
@@ -600,7 +605,8 @@ def gate_pass_calendar(
     declared_rows = connection.execute(
         text(
             """
-            SELECT business_date, outlet_id, gate_pass_id, new_deliveries, divergence, completed_at_utc
+            SELECT business_date, outlet_id, gate_pass_id, new_deliveries, divergence, completed_at_utc,
+                   not_notified_count, files_held
             FROM auditcore.p2_gate_passes
             WHERE tenant_id = :t AND status = 'ACTIVE' AND counts_submitted_at_utc IS NOT NULL
               AND outlet_id = ANY(CAST(:ids AS uuid[])) AND business_date BETWEEN :a AND :b
@@ -613,14 +619,19 @@ def gate_pass_calendar(
 
     def day_entry(day: date) -> dict[str, Any]:
         return per_day.setdefault(day, {"date": day.isoformat(), "declared": 0, "uploaded": 0, "missing": 0,
-                                        "gatePasses": 0, "open": 0})
+                                        "notNotified": 0, "toUpload": 0, "gatePasses": 0, "open": 0})
 
-    per_outlet: dict[tuple[date, str], dict[str, int]] = {}
+    def blank() -> dict[str, Any]:
+        return {"declared": 0, "uploaded": 0, "notNotified": None, "filesHeld": None}
+
+    per_outlet: dict[tuple[date, str], dict[str, Any]] = {}
     for key, files in uploaded.items():
-        per_outlet.setdefault(key, {"declared": 0, "uploaded": 0})["uploaded"] += files
+        per_outlet.setdefault(key, blank())["uploaded"] += files
     gate_pass_ids: dict[date, str] = {}
     for r in declared_rows:
-        per_outlet.setdefault((r["business_date"], str(r["outlet_id"])), {"declared": 0, "uploaded": 0})["declared"] += int(r["new_deliveries"] or 0)
+        figures = per_outlet.setdefault((r["business_date"], str(r["outlet_id"])), blank())
+        figures["declared"] += int(r["new_deliveries"] or 0)
+        figures["notNotified"], figures["filesHeld"] = r["not_notified_count"], r["files_held"]
         entry = day_entry(r["business_date"])
         entry["gatePasses"] += 1
         if r["completed_at_utc"] is None:
@@ -633,7 +644,15 @@ def gate_pass_calendar(
         entry["declared"] += figures["declared"]
         entry["uploaded"] += figures["uploaded"]
         # Missing is worked out per outlet, so one outlet's surplus never hides another's gap.
-        entry["missing"] += max(figures["declared"] - figures["uploaded"], 0)
+        gap = max(figures["declared"] - figures["uploaded"], 0)
+        # The PC's answer (2026-10-27); the older yes/no answer "files not held" is the whole gap.
+        not_notified = figures["notNotified"]
+        if not_notified is None:
+            not_notified = gap if figures["filesHeld"] is False else 0
+        not_notified = min(int(not_notified), gap)
+        entry["missing"] += gap
+        entry["notNotified"] += not_notified
+        entry["toUpload"] += gap - not_notified
     for day, gate_pass_id in gate_pass_ids.items():
         per_day[day]["gatePassId"] = gate_pass_id
     days = [per_day[d] for d in sorted(per_day)]
@@ -642,7 +661,9 @@ def gate_pass_calendar(
         "outlets": [_public_outlet(o) for o in outlets],
         "days": days,
         "totals": {"declared": sum(d["declared"] for d in days), "uploaded": sum(d["uploaded"] for d in days),
-                   "missing": sum(d["missing"] for d in days)},
+                   "missing": sum(d["missing"] for d in days),
+                   "notNotified": sum(d["notNotified"] for d in days),
+                   "toUpload": sum(d["toUpload"] for d in days)},
     }
 
 
