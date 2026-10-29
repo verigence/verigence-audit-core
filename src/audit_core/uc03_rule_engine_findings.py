@@ -197,6 +197,24 @@ def run_rule_engine_phase(
     if client is None:
         return  # integration dormant — RULE_ENGINE_BASE_URL not set
 
+    # The legacy paths (Phase 1 document sync, Phase 1 delivery complete, the
+    # run-all-rules button) no longer write rule-engine findings for a Phase 2
+    # Journey (product owner 2026-10-29): Phase 2's CONTROL_EVALUATE asks the
+    # rule engine and is the only findings ledger for it.
+    try:
+        from audit_core.workflow import is_phase2_journey
+
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            if is_phase2_journey(connection, tenant_id=tenant_id, journey_id=journey_id):
+                logger.debug("uc03_rule_engine_phase1_skipped", tenant_id=tenant_id,
+                             journey_id=str(journey_id), phase=phase)
+                return
+    except Exception:
+        logger.warning("uc03_rule_engine_phase_check_failed", tenant_id=tenant_id,
+                       journey_id=str(journey_id), exc_info=True)
+        return
+
     try:
         security_client = _build_security_oauth_client()
         if security_client is None:

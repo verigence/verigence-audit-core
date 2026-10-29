@@ -13,6 +13,15 @@ from audit_core.telemetry import record_metric
 logger = structlog.get_logger(__name__)
 
 
+def is_phase2_journey(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """A Journey Phase 2 runs (it has a p2_journey_runtime row)."""
+    return bool(connection.execute(
+        text("SELECT EXISTS (SELECT 1 FROM auditcore.p2_journey_runtime "
+             "WHERE tenant_id=:tenant_id AND journey_id=:journey_id)"),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalar_one())
+
+
 def create_workflow_task(
     connection: Connection,
     *,
@@ -31,7 +40,8 @@ def create_workflow_task(
     correlation_id: str | None = None,
     related_finding_id: UUID | None = None,
     severity: str | None = None,
-) -> UUID:
+    allow_phase2: bool = False,
+) -> UUID | None:
     # A task is always scoped to exactly one subject -- a journey (Booking/
     # Delivery) or a Daily Operations run -- mirroring audit_findings' own
     # subject_kind split (migration 0080) and enforced again by
@@ -43,6 +53,20 @@ def create_workflow_task(
             title="A workflow task needs exactly one subject",
             detail="Pass exactly one of journey_id or daily_ops_run_id.",
         )
+    # Phase 1 task producers are off for Phase 2 Journeys (product owner
+    # 2026-10-29): Audit Core's Phase 2 tasks are the only tasks a PC, TL or
+    # PM works. The finding a producer writes is kept; only its Phase 1 task
+    # is not created (None). Background jobs (no assigned role) and the few
+    # commands a person runs that need the task id (allow_phase2) still get one.
+    if (
+        journey_id is not None
+        and assigned_role_code is not None
+        and not allow_phase2
+        and is_phase2_journey(connection, tenant_id=tenant_id, journey_id=journey_id)
+    ):
+        logger.debug("phase1_task_skipped_for_phase2", tenant_id=tenant_id,
+                     journey_id=str(journey_id), task_type=task_type)
+        return None
     # Resolve dealer_id/outlet_id from the subject when a caller doesn't
     # already know them cheaply -- tasks_api.py's generic /tasks/{id}/*
     # endpoints only enforce business-scope when dealer_id is set, and

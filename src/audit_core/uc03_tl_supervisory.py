@@ -943,6 +943,7 @@ def request_pc_document_reupload(
             },
             effect_key=f"tl-document-reupload:{journey_id}:{payload.documentId}",
             correlation_id=correlation_id,
+            allow_phase2=True,  # a command a person runs; it needs the task
         )
         state = _stage_state(connection, tenant_id=tenant_id, journey_id=journey_id)
         next_version = int(state["version_no"]) + 1 if state is not None else 1

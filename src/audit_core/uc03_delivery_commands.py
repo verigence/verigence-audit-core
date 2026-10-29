@@ -1673,6 +1673,7 @@ def propose_delivery_vehicle_observation(
                 "computedReconciliationStatus": computed_status,
             },
             correlation_id=correlation_id,
+            allow_phase2=True,  # a command a person runs; it needs the task
         )
         connection.execute(
             text(

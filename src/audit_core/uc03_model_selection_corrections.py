@@ -224,6 +224,7 @@ def submit_model_selection_correction(
                 "proposedSkuCode": proposed_row["sku_code"],
                 "reason": payload.reason,
             },
+            allow_phase2=True,  # a command a person runs; it needs the task
         )
         _insert_proposal(
             connection,

@@ -368,6 +368,7 @@ def submit_field_correction(
                     "comment": (payload.remarks or "").strip(),
                 },
                 correlation_id=get_correlation_id(request),
+                allow_phase2=True,  # a command a person runs; it needs the task
             )
             _insert_proposal(
                 connection,
