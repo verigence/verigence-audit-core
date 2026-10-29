@@ -102,16 +102,16 @@ def test_documents_in_another_customers_name_raise_a_high_document_missing_task(
     wrong = add_ready_document(journey, "insurance_cover", insured_name="Anita Sahoo", policy_number="P1")
     assert _sync(journey) == {"RAISED": 1}
     (task,) = _tasks(journey)
-    assert task["task_type"] == "DOCUMENT_MISSING"
+    # One Team Lead task per Journey (product owner 2026-10-29), not a PC task per document.
+    assert task["task_type"] == "INVOICE_DISCREPANCY_REVIEW"
     assert task["severity"] == "HIGH" and task["priority"] == "HIGH"
-    assert task["assigned_role_code"] == "PC"
-    assert task["title"] == "Replace the Insurance Cover Note: it is not in the customer's name"
-    assert "in the name of Anita Sahoo" in task["description"]
+    assert task["assigned_role_code"] == "TL"
+    assert task["title"] == "Customer name differs on 1 document"
+    assert "Insurance Cover Note: Anita Sahoo" in task["description"]
     assert "customer per the PAN Card is BISWABHANU BISWAL" in task["description"]
-    assert "delete it and upload the Insurance Cover Note" in task["description"]
-    assert task["reference"]["documentId"] == str(wrong)
+    assert task["reference"]["documentIds"] == [str(wrong)]
     assert task["reference"]["sourceCode"] == "WRONG_CUSTOMER_NAME"
-    assert "UPLOAD_DOCUMENT" in task["allowed_actions"]
+    assert "ACCEPT_EXCEPTION" in task["allowed_actions"]
     # the same evaluation again changes nothing
     assert _sync(journey) == {"UNCHANGED": 1}
 
@@ -207,10 +207,33 @@ def test_the_verified_kyc_name_stays_the_reference_when_another_persons_kyc_arri
     pan_b = add_ready_document(journey, "pan_card", pan_number="FGHIJ5678K", pan_name="ANITA SAHOO")
     assert _sync(journey) == {"RAISED": 1}
     (task,) = _tasks(journey)
-    assert task["reference"]["documentId"] == str(pan_b)
+    assert task["reference"]["documentIds"] == [str(pan_b)]
     assert task["reference"]["referenceDocumentId"] == str(pan_a)
-    assert task["title"] == "Replace the PAN Card: it is not in the customer's name"
+    assert task["title"] == "Customer name differs on 1 document"
     assert "customer per the PAN Card is BISWABHANU BISWAL" in task["description"]
+
+
+def test_a_later_pan_does_not_switch_the_reference(journey):
+    """Product owner 2026-10-29: the first KYC document stays the reference. An
+    Aadhaar came first; a PAN in another name read later is the odd one out,
+    not the Aadhaar and every document that agrees with it."""
+    add_ready_document(journey, "aadhaar", aadhaar_name="ANITA SAHOO")
+    add_ready_document(journey, "booking_form", customer_name="Anita Sahoo", dealer_name="Sarthak Motors")
+    pan = add_ready_document(journey, "pan_card", pan_number="FGHIJ5678K", pan_name="RAJESH KUMAR")
+    assert _sync(journey) == {"RAISED": 1}
+    (task,) = _tasks(journey)
+    assert task["reference"]["documentIds"] == [str(pan)]
+    assert "customer per the Aadhaar is ANITA SAHOO" in task["description"]
+
+
+def test_several_documents_in_another_name_are_one_task(journey):
+    add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="BISWABHANU BISWAL")
+    a = add_ready_document(journey, "insurance_cover", insured_name="Anita Sahoo", policy_number="P1")
+    b = add_ready_document(journey, "booking_form", customer_name="Rajesh Kumar", dealer_name="Sarthak Motors")
+    assert _sync(journey) == {"RAISED": 1}
+    (task,) = _tasks(journey)
+    assert set(task["reference"]["documentIds"]) == {str(a), str(b)}
+    assert task["title"] == "Customer name differs on 2 documents"
 
 
 def _named(journey):
@@ -260,7 +283,7 @@ def test_a_company_customer_keeps_its_directors_kyc_and_its_trade_name_documents
     other = add_ready_document(journey, "insurance_cover", insured_name="RAMAKANTA SAHOO")
     assert _sync(journey) == {"RAISED": 1}
     (task,) = _tasks(journey)
-    assert task["reference"]["documentId"] == str(other)
+    assert task["reference"]["documentIds"] == [str(other)]
     assert "as per the GST certificate" in task["description"]
 
 
@@ -325,8 +348,9 @@ def test_a_second_firm_or_the_dealership_is_still_the_wrong_document(journey):
                        seller_name="Sarthak Motors", invoice_number="I1")
     other = add_ready_document(journey, "insurance_cover", insured_name="MAA MANGALA TRADERS")
     dealer = add_ready_document(journey, "tax_invoice_tally", buyer_name="Sarthak Motors", seller_name="Sarthak Motors")
-    assert _sync(journey) == {"RAISED": 2}
-    assert {t["reference"]["documentId"] for t in _tasks(journey)} == {str(other), str(dealer)}
+    assert _sync(journey) == {"RAISED": 1}
+    (task,) = _tasks(journey)
+    assert set(task["reference"]["documentIds"]) == {str(other), str(dealer)}
 
 
 @pytest.mark.parametrize(("name", "firm"), [
