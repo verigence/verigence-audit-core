@@ -3319,4 +3319,13 @@ BUILDERS = {
     "compliance-report": compliance_report,
     "timeline": _timeline,
     "audit": audit,
+    # Built only when its tab is opened (product owner 2026-10-29).
+    "audit-summary": lambda connection, *, tenant_id, journey_id: _audit_summary(
+        connection, tenant_id=tenant_id, journey_id=journey_id),
 }
+
+
+def _audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    from audit_core.uc03_p2_audit_summary import audit_summary
+
+    return audit_summary(connection, tenant_id=tenant_id, journey_id=journey_id)
