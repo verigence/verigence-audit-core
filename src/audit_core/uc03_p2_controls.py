@@ -5,7 +5,7 @@ regardless of who evaluates it (blueprint v2.2 section 21). Controls are
 evaluated in *units* so each executor is called once per Journey change:
 
     NATIVE:<stage>       Audit Core native runner (RERUN controls)
-    RULE_ENGINE:<stage>  external Rule Engine phase + readiness (EXTERNAL)
+    RULE_ENGINE:<stage>  external Rule Engine phase, its skipped rules included (EXTERNAL)
     P2:DERIVED           stage gates (GATE), page outcomes (PAGES), the existing
                          document sync (SYNC) and process events (EVENT)
 
@@ -443,6 +443,7 @@ def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stag
     from audit_core.rule_engine_client import (
         RULE_ENGINE_AUDIENCE,
         build_rule_engine_client,
+        cached_rule_catalog,
     )
     from audit_core.uc03_rule_engine_findings import (
         _PHASE_TRIGGERING_EVENT,
@@ -478,14 +479,15 @@ def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stag
             subject_id = _resolve_di_subject_id(connection, tenant_id=tenant_id, journey_id=journey_id)
         if subject_id is None:
             return write_all("WAITING_FOR_FACTS", "No documents have been processed for this Journey yet.")
+        # One evaluation per run (2026-10-29, rule storm): the phase result
+        # names the rules it skipped, so the second, readiness() evaluation
+        # that only told PASS from not-ready is gone. The catalogue is cached.
         result = client.evaluate_phase(token=token, tenant_id=tenant_id, subject_id=str(subject_id), phase=stage)
-        catalog = client.list_rules(token=token, tenant_id=tenant_id)
-        readiness = client.readiness(token=token, tenant_id=tenant_id, subject_id=str(subject_id))
+        catalog = cached_rule_catalog(client, token=token, tenant_id=tenant_id)
     except Exception as exc:
         raise ControlUnitError(f"Rule Engine evaluation failed: {exc.__class__.__name__}") from exc
     finally:
-        security.close()
-        client.close()
+        client.close()  # the Security client is shared by the process
 
     relevant = {
         rule.rule_code for rule in catalog
@@ -501,8 +503,9 @@ def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stag
         absent = _presence_checks_without_their_document(connection, tenant_id=tenant_id, journey_id=journey_id,
                                                          controls=controls, registry=registry)
     anomalies = {a.rule_code: a for a in result.anomalies if a.rule_code not in absent}
-    ready = set(readiness.ready)
-    not_ready = {n.rule_code: n.reason for n in readiness.not_ready}
+    not_ready = {n.rule_code: n.reason for n in getattr(result, "skipped", ())}
+    # Every rule of this phase the run neither failed nor skipped passed.
+    ready = (relevant - set(not_ready)) | {a.rule_code for a in result.anomalies}
     # A rule the Rule Engine still evaluates but the catalogue no longer
     # carries (superseded by a native check) raises nothing here.
     catalogued = {c.code for c in registry.controls_by_mode("EXTERNAL")}
@@ -751,6 +754,7 @@ def evaluate_unit(
         set_tenant_context(connection, tenant_id)
         fingerprint = _unit_fingerprint(connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit)
         current = _unit_row(connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit)
+        version_before = _fact_version(connection, tenant_id=tenant_id, journey_id=journey_id)
     if not force and current and current["unit_status"] == "OK" and current["evaluated_fingerprint"] == fingerprint:
         return []
 
@@ -775,6 +779,14 @@ def evaluate_unit(
         raise
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
+        # The fingerprint after the run (2026-10-29, rule storm): what the unit
+        # wrote itself -- its findings, the execution log, a refreshed deal --
+        # is not a reason to run it again, and the one taken before the run
+        # never matched the next request. Unless a fact change was announced
+        # while it ran (a PC's correction): then the run may not have seen it,
+        # and the earlier fingerprint makes the next request run it again.
+        if _fact_version(connection, tenant_id=tenant_id, journey_id=journey_id) == version_before:
+            fingerprint = _unit_fingerprint(connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit)
         _set_unit(connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit,
                   status="OK", fingerprint=fingerprint, error=None)
     return transitions

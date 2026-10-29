@@ -268,7 +268,11 @@ def add_receipt_payment(
     receipt_date: str | None,
     di_document_id: UUID | None = None,
 ) -> UUID:
-    di_document_id = di_document_id or add_ready_document(journey, "dealer_receipt", amount_paid=amount)
+    # The receipt's own fields carry what the payment row does: the recompute
+    # rebuilds payments from the documents (2026-10-29).
+    di_document_id = di_document_id or add_ready_document(
+        journey, "dealer_receipt", amount_paid=amount,
+        **{k: v for k, v in (("receipt_number", receipt_number), ("receipt_date", receipt_date)) if v})
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         booking_id = connection.execute(

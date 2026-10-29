@@ -191,7 +191,10 @@ _POLL_SECONDS = float(os.environ.get("P2_WORKER_POLL_SECONDS", "1.0"))
 _MAX_PDF_PAGES = int(os.environ.get("P2_MAX_PDF_PAGES", "100"))
 # 10 parallel items (2026-10-27, was 6): the container has 8 vCPU and the DB pool 30.
 _WORKER_CONCURRENCY = max(1, int(os.environ.get("P2_WORKER_CONCURRENCY", "10")))
-_PER_JOURNEY_CONCURRENCY = max(1, int(os.environ.get("P2_PER_JOURNEY_CONCURRENCY", "3")))
+# Page work (split, read, re-read, group, withdraw) of one Journey side by side
+# (2026-10-29: 6, was 3): it mostly waits on Document Intelligence, and a 20-page
+# upload read three at a time waited behind itself. Journey work runs alone.
+_PER_JOURNEY_CONCURRENCY = max(1, int(os.environ.get("P2_PER_JOURNEY_CONCURRENCY", "6")))
 _LEASE_SECONDS = int(os.environ.get("P2_WORKER_LEASE_SECONDS", "600"))
 _LEASE_RENEW_SECONDS = max(5, _LEASE_SECONDS // 3)
 # While Document Intelligence still has a page in hand it is polled
@@ -315,7 +318,7 @@ _CLAIM_SQL = text(
         SELECT journey_id, MIN(journey_rank) AS journey_rank FROM ready WHERE NOT page_work GROUP BY journey_id
     ),
     eligible AS (
-        SELECT r.work_id
+        SELECT r.work_id, r.page_work, r.queued_at_utc
         FROM ready r
         LEFT JOIN inflight i ON i.journey_id=r.journey_id
         LEFT JOIN first_journey_work f ON f.journey_id=r.journey_id
@@ -326,7 +329,11 @@ _CLAIM_SQL = text(
             AND r.journey_rank < COALESCE(f.journey_rank, 2147483647)
           ELSE COALESCE(i.running, 0) = 0 AND r.journey_rank = 1
         END
-        ORDER BY r.queued_at_utc, r.work_id
+        -- Reading first (2026-10-29): 383 of 554 pages failed by the 30-minute
+        -- rule were never sent to Document Intelligence -- they waited behind
+        -- control checks and recomputes. A page's work is claimed before any
+        -- evaluation work, oldest first within each class.
+        ORDER BY (NOT r.page_work), r.queued_at_utc, r.work_id
         LIMIT :limit
     )
     SELECT w.tenant_id, w.work_id, w.journey_id, w.work_type, w.work_key,
@@ -335,7 +342,7 @@ _CLAIM_SQL = text(
     FROM auditcore.p2_work_queue w
     JOIN eligible e ON e.work_id=w.work_id
     WHERE w.tenant_id=:tenant_id
-    ORDER BY w.queued_at_utc, w.work_id
+    ORDER BY (NOT e.page_work), w.queued_at_utc, w.work_id
     FOR UPDATE OF w SKIP LOCKED
     """
 )
@@ -2114,6 +2121,7 @@ def _copy_page_facts(
             engine, tenant_id=work.tenant_id, journey_id=work.journey_id, document_id=document_id,
             service_id="p2-worker", stage_code=str(stage_code).upper(),
             security_client=security_client, di_client=di_client, prefetched=prefetched,
+            facts_only=True,  # the Journey-wide work runs in STAGE_RECOMPUTE (2026-10-29)
         )
         return "COPIED"
     except DocumentSyncLockBusyError:
@@ -2377,7 +2385,9 @@ def _journey_reconcile(engine: Engine, work: WorkItem) -> None:
                 now=now,
                 facts_copy=facts_copies.get(str(page["queue_id"])),
             )
-            if outcome.status == "READY":
+            if outcome.status == "READY" or facts_copies.get(str(page["queue_id"])) == "COPIED":
+                # A page whose facts were copied (READY or NEEDS_REVIEW) asks for
+                # the one STAGE_RECOMPUTE that materialises them (facts_only copy).
                 facts_changed = True
             if outcome.status == "SUPPORTING" and page["queue_status"] != "SUPPORTING":
                 unclassified_settled = True
@@ -3196,12 +3206,44 @@ def _sync_rule_tasks(connection, *, tenant_id: str, journey_id: UUID, started_at
             logger.info("p2_rule_tasks", tenant_id=tenant_id, journey_id=str(journey_id), rule=rule, **changed)
 
 
+def _materialize_journey(connection, *, tenant_id: str, journey_id: UUID) -> None:
+    """Booking values, then the Booking and Delivery documents' canonical tables
+    (insurance, registration, finance, invoices, receipts), each idempotent.
+    A failure here is logged and does not stop the recompute; a deadlock fails
+    the item so it is retried (uc03_db_transient)."""
+    from audit_core.uc03_db_transient import raise_if_worker_transient
+    from audit_core.uc03_delivery_post_extraction_materialization import (
+        materialize_booking_documents_from_durable_store,
+        materialize_delivery_documents_from_durable_store,
+    )
+    from audit_core.uc03_post_extraction_materialization import (
+        materialize_machine_booking_values,
+    )
+
+    for step in (materialize_machine_booking_values, materialize_booking_documents_from_durable_store,
+                 materialize_delivery_documents_from_durable_store):
+        try:
+            with connection.begin_nested():
+                step(connection, tenant_id=tenant_id, journey_id=journey_id)
+        except Exception as exc:
+            raise_if_worker_transient(exc)
+            logger.warning("p2_materialize_failed", step=step.__name__, tenant_id=tenant_id,
+                           journey_id=str(journey_id), exc_info=True)
+
+
 def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
                    started_at: datetime | None = None) -> dict[str, Any]:
     """Recompute the stage from the documents, raise / close the rule tasks
     that follow from it, and recompute once more (closing tasks can pass
     the last Delivery gate). Returns the settled result with every
     transition seen on the way."""
+    # The Journey's canonical data from every document on file, once per
+    # recompute (2026-10-29, rule storm): the per-page copy step copies the
+    # page's facts only (facts_only), so a 20-page upload no longer rebuilds
+    # the whole Journey 20 times, and a PC's correction reaches the Deal on the
+    # recompute it requests. Identity, duplicate, SKU and payment checks run in
+    # the NATIVE control units this recompute requests.
+    _materialize_journey(connection, tenant_id=tenant_id, journey_id=journey_id)
     # The booking date follows the receipts still on file: a receipt deleted,
     # re-read or replaced since the last pass no longer sets it (2026-10-20).
     from audit_core.uc03_booking_confirmation_rules import (
@@ -3309,6 +3351,10 @@ def _stage_recompute(engine: Engine, work: WorkItem) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         _owned(connection, work, lock=False)
+        version_before = connection.execute(
+            text("SELECT fact_version FROM auditcore.p2_journey_runtime WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": work.tenant_id, "j": work.journey_id},
+        ).scalar_one_or_none()
         result = settle_journey(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
         # The Journey list reads the Deal's own price variance, stored here.
         refresh_price_variance(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)
@@ -3322,6 +3368,21 @@ def _stage_recompute(engine: Engine, work: WorkItem) -> None:
             correlation_id=work.correlation_id,
             delay_seconds=0 if force else 3,
             force=force,
+        )
+        # What this recompute derived (canonical tables, the SKU's evidence) is
+        # not a new fact: store the fingerprint as it now stands, so the
+        # 30-second fact sweep does not take the recompute's own writes for a
+        # change made elsewhere and request it again (2026-10-29, rule storm).
+        # Not when a fact change was announced meanwhile: that one still runs.
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_journey_runtime SET fact_fingerprint=:fp
+                WHERE tenant_id=:t AND journey_id=:j AND fact_version IS NOT DISTINCT FROM :v
+                """
+            ),
+            {"t": work.tenant_id, "j": work.journey_id, "v": version_before,
+             "fp": fact_fingerprint(connection, tenant_id=work.tenant_id, journey_id=work.journey_id)},
         )
 
 
@@ -3414,13 +3475,17 @@ def _control_evaluate(engine: Engine, work: WorkItem) -> None:
         if transitions:
             on_control_transitions(engine, work=work, transitions=transitions, started_at=started_at)
         return
-    # Items queued before the ledger existed name a single control: evaluate
-    # every unit instead (units are fingerprint-skipped when nothing changed).
+    # Items that name a single control -- queued before the ledger existed, and
+    # by auditcore.p2_requeue_verifying_controls on every fact change for each
+    # task in VERIFYING: evaluate every unit, NOT forced (2026-10-29, rule
+    # storm). A fact change already changes the units' fingerprints, so they
+    # run; forcing re-ran every unit once per VERIFYING task on every change.
+    # A PC's "done" still forces its re-check (TASK_VERIFY).
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         request_control_evaluation(
             connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
-            correlation_id=work.correlation_id, delay_seconds=0, force=True,
+            correlation_id=work.correlation_id, delay_seconds=0, force=False,
         )
 
 

@@ -1032,13 +1032,22 @@ def _pin_human(
 def _update_match(
     connection: Connection, *, tenant_id: str, journey_id: UUID, basis: str, evidence: dict[str, Any],
 ) -> None:
-    """Same automatic SKU, newer evidence (a price corrected on the form)."""
+    """Same automatic SKU, newer evidence (a price corrected on the form).
+
+    Written only when the basis or the evidence changed (2026-10-29, rule
+    storm): every SKU check rewrote the row and its updated_at_utc, which is
+    part of the Journey's fact fingerprint, so the fingerprint was never
+    current and the 30-second fact sweep re-ran every check on the Journey.
+    ``decidedAtUtc`` is when the check ran, not a fact: it does not count."""
     connection.execute(
         text(
             """
             UPDATE auditcore.journey_products
             SET match_basis = :basis, match_evidence = CAST(:evidence AS jsonb), updated_at_utc = now()
             WHERE tenant_id = :t AND journey_id = :j AND selection_status IS DISTINCT FROM 'CONFIRMED'
+              AND (match_basis IS DISTINCT FROM :basis
+                   OR (COALESCE(match_evidence, '{}'::jsonb) - 'decidedAtUtc')
+                      IS DISTINCT FROM (CAST(:evidence AS jsonb) - 'decidedAtUtc'))
             """
         ),
         {"t": tenant_id, "j": journey_id, "basis": basis, "evidence": json.dumps(evidence, default=str)},

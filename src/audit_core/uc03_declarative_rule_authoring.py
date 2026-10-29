@@ -125,8 +125,10 @@ def create_declarative_rule(
             detail="Could not reach the rule-engine. Please try again."
         ) from exc
     finally:
-        client.close()
-        security_client.close()
+        client.close()  # the Security client is shared by the process
+    from audit_core.rule_engine_client import forget_rule_catalog
+
+    forget_rule_catalog()  # a new rule is evaluated from the next run
 
     if result.error_code == "DUPLICATE":
         raise ConflictError(

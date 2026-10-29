@@ -470,6 +470,49 @@ def cancel_p2_journey(
     return {"journeyId": str(journey_id), "status": "BOOKING_CANCELLED"}
 
 
+class P2CompleteDeliveryCommand(BaseModel):
+    reason: str = Field(min_length=3, max_length=500)
+
+
+@router.post("/journeys/{journey_id}:complete-delivery")
+def complete_p2_delivery(
+    tenant_id: str,
+    journey_id: UUID,
+    command: P2CompleteDeliveryCommand,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """A Reviewer completes a Delivery the rules have not completed (product
+    owner 2026-10-29), with a reason. The TL review follows as for any
+    completed Delivery; what was still pending is recorded with it."""
+    from audit_core.uc03_p2_runtime import note_facts_changed
+    from audit_core.uc03_p2_workflow import complete_delivery_by_reviewer
+
+    access = _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
+    )
+    if (access.operating_role or "").upper() != "REVIEWER":
+        raise HTTPException(status_code=403, detail="Only a Reviewer can complete a delivery by hand.")
+    set_tenant_context(connection, tenant_id)
+    result = complete_delivery_by_reviewer(
+        connection, tenant_id=tenant_id, journey_id=journey_id, actor_id=human_principal.subject,
+        actor_role="REVIEWER", reason=command.reason.strip(),
+    )
+    refused = {
+        "ALREADY_COMPLETE": "This delivery is already complete.",
+        "BOOKING_NOT_COMPLETE": "The booking is not complete yet: a delivery can be completed only after it.",
+        "DELIVERY_NOT_STARTED": "The delivery has not started: no delivery document is on file yet.",
+    }
+    if result["outcome"] in refused:
+        raise HTTPException(status_code=409, detail=refused[result["outcome"]])
+    note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id, reason="DELIVERY_COMPLETED_BY_REVIEWER")
+    return {"journeyId": str(journey_id), "status": "DELIVERY_COMPLETE", "pendingAtCompletion": result["pending"]}
+
+
 def _project_timezone(connection: Connection, tenant_id: str) -> str:
     return connection.execute(
         text("SELECT COALESCE(MAX(timezone_name), 'Asia/Kolkata') FROM auditcore.projects WHERE tenant_id=:t"),
@@ -2108,11 +2151,12 @@ def restore_document_copy(
         connection, tenant_id=tenant_id, journey_id=journey_id,
         stage_code=str(target["process_area"] or "BOOKING").upper(),
     )
-    enqueue_work(
-        connection, tenant_id=tenant_id, journey_id=journey_id, work_type="STAGE_RECOMPUTE",
-        work_key=str(journey_id), payload={"reason": "DOCUMENT_COPY_RESTORED"},
-        correlation_id=get_correlation_id(request),
-    )
+    # The one STAGE_RECOMPUTE row of the Journey ('booking:<journey>'), with the
+    # fact version bumped (2026-10-29): a second key never merged with it.
+    from audit_core.uc03_p2_runtime import note_facts_changed
+
+    note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id,
+                       reason="DOCUMENT_COPY_RESTORED", correlation_id=get_correlation_id(request))
     _activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type="DOCUMENT_COPY_RESTORED",
         subject_type="DOCUMENT", subject_id=str(target["di_document_id"]),

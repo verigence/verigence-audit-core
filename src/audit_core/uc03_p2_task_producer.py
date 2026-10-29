@@ -1445,6 +1445,21 @@ def _gst_trade_names(connection: Connection, *, tenant_id: str, journey_id: UUID
     ).scalars().all() if v and str(v).strip()]
 
 
+# A customer-name mismatch is the Team Lead's to decide, once per Journey
+# (2026-10-29): the TL's cross-document review.
+CUSTOMER_NAME_TASK_TYPE = "INVOICE_DISCREPANCY_REVIEW"
+
+
+def _verified_by_a_person(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    who = connection.execute(
+        text("SELECT c.legal_name_verified_by_actor_id FROM auditcore.journeys j JOIN auditcore.customers c "
+             "ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id WHERE j.tenant_id=:t AND j.journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one_or_none()
+    text_ = str(who or "").lower()
+    return bool(text_) and "system" not in text_ and "worker" not in text_
+
+
 def sync_name_consistency_tasks(
     connection: Connection,
     *,
@@ -1485,10 +1500,9 @@ def sync_name_consistency_tasks(
         )
         counts[outcome] = counts.get(outcome, 0) + 1
 
-    # -- the customer, as the KYC names them: the verified legal name on the
-    # customer record (the first KYC read) is the reference; before one is
-    # verified, the latest KYC document is. Every other document naming the
-    # customer, a second KYC document included, must be the same person.
+    # -- the customer, as the KYC names them (see the reference rule below).
+    # Every other document naming the customer, a second KYC document
+    # included, must be the same person.
     references = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
                                   pairs=rules.customer_name_reference)
     verified = connection.execute(
@@ -1505,16 +1519,24 @@ def sync_name_consistency_tasks(
         ),
         {"t": tenant_id, "j": journey_id},
     ).mappings().first()
-    if verified is not None:
+    # A stable reference (product owner 2026-10-29, calibration): a name a
+    # person verified; else the GST certificate's, when the customer record is
+    # named from one (2026-10-27); else the FIRST KYC document read. A later
+    # PAN no longer switches the reference -- the name the system settles for
+    # the customer record changes as documents arrive, and every switch
+    # re-flagged documents already checked.
+    if verified is not None and str(verified["document_type_key"] or "") != "gst_certificate" \
+            and not _verified_by_a_person(connection, tenant_id=tenant_id, journey_id=journey_id):
+        verified = None
+    if verified is None:
+        kyc = references[0] if references else None
+    else:
         kyc = {
             "name": verified["legal_name"],
             "documentId": str(verified["di_document_id"]) if verified["di_document_id"] else None,
             "diType": str(verified["document_type_key"] or "pan_card"),
             "stage": str(verified["process_area"] or "BOOKING").upper(),
         }
-    else:
-        by_pair = {doc["pair"]: doc for doc in reversed(references)}  # latest document of each kind
-        kyc = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
     if kyc is not None:
         kyc_template = registry.template_for_di_type(kyc["diType"], stage=kyc["stage"])
         checked = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
@@ -1572,23 +1594,40 @@ def sync_name_consistency_tasks(
             return (any(same_person(document["name"], n) or same_organisation(document["name"], n) for n in gst_names)
                     or (person is not None and same_person(document["name"], person["name"])))
 
-        for document in checked:
-            if matches(document):
-                continue
-            template = registry.template_for_di_type(document["diType"], stage=document["stage"])
-            raise_task(
-                document, kind="customer",
-                title=f"Replace the {template.display_name}: it is not in the customer's name",
+        # A genuine mismatch goes to the Team Lead, once per Journey (product
+        # owner 2026-10-29, calibration): one task naming every document in
+        # another name, instead of a PC task per document (141 open on 89
+        # Journeys, up to 8 on one). The TL decides: the PC replaces the
+        # document, or the TL accepts it as an exception. It closes itself when
+        # every document matches or is removed.
+        mismatched = [document for document in checked if not matches(document)]
+        if mismatched:
+            key = f"wrong-document:{journey_id}:customer"
+            wanted.add(key)
+            lines = []
+            for document in mismatched:
+                template = registry.template_for_di_type(document["diType"], stage=document["stage"])
+                lines.append(f"{template.display_name}: {display_name(document['name'])}")
+            ids = [d["documentId"] for d in mismatched]
+            _, outcome = raise_or_refresh(
+                connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                task_type=CUSTOMER_NAME_TASK_TYPE, source_type="DOCUMENT", source_code="WRONG_CUSTOMER_NAME",
+                title=(f"Customer name differs on {len(mismatched)} document"
+                       f"{'s' if len(mismatched) != 1 else ''}"),
                 description=(
-                    f"The {template.display_name} is in the name of {display_name(document['name'])}, but the "
-                    f"customer per the {kyc_template.display_name} is {display_name(kyc['name'])}. Wrong document "
-                    f"uploaded: please delete it and upload the {template.display_name} in the customer's name as "
-                    f"per {'the GST certificate' if gst_names else 'PAN/Aadhaar'}. If the name was only misread, "
-                    f"correct it on the document instead."
+                    f"The customer per the {kyc_template.display_name} is {display_name(kyc['name'])}. In another "
+                    f"name: {'; '.join(lines)}. Decide whether each is the wrong document (the PC deletes it and "
+                    f"uploads the one in the customer's name as per "
+                    f"{'the GST certificate' if gst_names else 'PAN/Aadhaar'}), a misread name (correct it on the "
+                    "document), or acceptable (accept as an exception)."
                 ),
-                reference={"documentName": display_name(document["name"]), "customerName": display_name(kyc["name"]),
+                reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "WRONG_CUSTOMER_NAME",
+                           "documentIds": ids, "documentId": ids[0], "customerName": display_name(kyc["name"]),
+                           "documentNames": [display_name(d["name"]) for d in mismatched],
                            "referenceDocumentId": kyc["documentId"], "referenceTemplateKey": kyc_template.key},
+                severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
             )
+            counts[outcome] = counts.get(outcome, 0) + 1
 
     # -- the dealership. The booking form is the OEM's form and often names
     # the OEM (Mahindra), not the dealership (Aditya Motors), so a document

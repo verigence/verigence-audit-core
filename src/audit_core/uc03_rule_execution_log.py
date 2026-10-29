@@ -12,6 +12,16 @@ recording outcomes for RULE_ENGINE-executor rules from the rule-engine's own
 live ``readiness()`` response (that service remains the source of truth for
 pass/fail/skip on its own rules; this module never re-derives applicability
 itself). Phase 4 will add the analogous call for every AUDIT_CORE producer.
+
+CHANGES, NOT REPEATS (2026-10-29, rule storm). A rule's result is written only
+when it differs from the last one written for that rule on that Journey
+(outcome, reason, finding). Every control run used to write a row for every
+rule -- ~660 rows per Journey per day, 60-65% of them the same SKIPPED again --
+and the table had grown to a third of the database. The latest row per rule
+still says what the rule last concluded and since when ("evaluated_at" is when
+that result was first reached), so the status report and the controls read it
+unchanged; the derived-control fingerprint (MAX(evaluated_at_utc)) now moves
+only when a result changes.
 """
 from __future__ import annotations
 
@@ -35,7 +45,8 @@ def record_execution(
     audit_finding_id: UUID | None = None,
     correlation_id: str | None = None,
 ) -> None:
-    """Insert one Execution Log row. Never raises on a caller's behalf to
+    """Insert one Execution Log row, unless it repeats the rule's last result
+    on this Journey (see the module note). Never raises on a caller's behalf to
     swallow -- callers writing from a best-effort background path (like
     ``run_rule_engine_phase``) already wrap the whole flow in their own
     try/except; this stays a plain insert so a genuine DB failure surfaces
@@ -46,9 +57,22 @@ def record_execution(
             INSERT INTO auditcore.rule_executions (
                 tenant_id, journey_id, rule_code, triggering_event,
                 outcome, reason, audit_finding_id, correlation_id
-            ) VALUES (
-                :tenant_id, :journey_id, :rule_code, :triggering_event,
-                :outcome, :reason, :audit_finding_id, :correlation_id
+            )
+            SELECT CAST(:tenant_id AS varchar), CAST(:journey_id AS uuid), CAST(:rule_code AS varchar),
+                   CAST(:triggering_event AS varchar), CAST(:outcome AS varchar), CAST(:reason AS text),
+                   CAST(:audit_finding_id AS uuid), CAST(:correlation_id AS varchar)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM (
+                    SELECT outcome, reason, audit_finding_id
+                    FROM auditcore.rule_executions
+                    WHERE tenant_id = CAST(:tenant_id AS varchar) AND journey_id = CAST(:journey_id AS uuid)
+                      AND rule_code = CAST(:rule_code AS varchar)
+                    ORDER BY evaluated_at_utc DESC
+                    LIMIT 1
+                ) last
+                WHERE last.outcome = CAST(:outcome AS varchar)
+                  AND last.reason IS NOT DISTINCT FROM CAST(:reason AS text)
+                  AND last.audit_finding_id IS NOT DISTINCT FROM CAST(:audit_finding_id AS uuid)
             )
             """
         ),

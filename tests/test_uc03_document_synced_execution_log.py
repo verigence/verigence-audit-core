@@ -341,11 +341,10 @@ def test_no_payments_yet_records_skipped_for_payment_reconciliation(synced_docum
     assert payment_rows[0]["outcome"] == "SKIPPED"
 
     sync_failure_rows = _executions_for_rule(engine, tenant_id, "AUTOMATED_SYNC_FAILURE")
-    # Two rows: payment reconciliation's own half (this document type
-    # triggers it), plus SKU resolution's own half (runs unconditionally
-    # for stage=="BOOKING", regardless of document type).
-    assert len(sync_failure_rows) == 2
-    assert all(row["outcome"] == "PASS" for row in sync_failure_rows)
+    # Payment reconciliation and SKU resolution both report PASS; the log
+    # keeps changes, not repeats (2026-10-29), so the second PASS is not a row.
+    assert len(sync_failure_rows) == 1
+    assert sync_failure_rows[0]["outcome"] == "PASS"
 
 
 def test_no_bank_statement_yet_records_skipped_for_payment_reconciliation(synced_document_setup) -> None:

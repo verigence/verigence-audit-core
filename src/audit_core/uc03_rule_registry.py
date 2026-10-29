@@ -221,8 +221,7 @@ def _rule_engine_rows(tenant_id: str) -> tuple[list[RuleCatalogEntry], bool]:
     finally:
         if client is not None:
             client.close()
-        if security_client is not None:
-            security_client.close()
+        # the Security client is shared by the process (uc03_rule_engine_findings)
 
     entries: list[RuleCatalogEntry] = []
     for rule in engine_rules:

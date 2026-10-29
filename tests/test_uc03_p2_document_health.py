@@ -461,7 +461,8 @@ def test_restore_swaps_the_superseded_copy_back_in(journey):
     assert _evidence(journey, newer)["void_reason"] == "EARLIER_COPY_RESTORED"
     assert _capture_status(journey, older_doc) == "CLASSIFIED"
     assert _capture_status(journey, newer_doc) == "SUPERSEDED"
-    assert queue_row(journey, "STAGE_RECOMPUTE", str(journey.journey_id))["work_status"] == "PENDING"
+    # the Journey's one recompute row, the fact version bumped (2026-10-29)
+    assert queue_row(journey, "STAGE_RECOMPUTE", f"booking:{journey.journey_id}")["work_status"] == "PENDING"
     [event] = _activities(journey, "DOCUMENT_COPY_RESTORED")
     assert event["details"]["supersededEvidenceId"] == str(newer)
     # Only a superseded copy can be restored.
