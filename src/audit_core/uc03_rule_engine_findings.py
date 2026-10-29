@@ -71,14 +71,17 @@ _TITLE_MAX = 300
 
 
 def _build_security_oauth_client() -> SecurityOAuthClient | None:
+    """The process's one Security client (2026-10-29, rule storm): it keeps its
+    service token until shortly before expiry. A new client per rule run asked
+    Security for a new token every time. Shared: callers do not close it."""
     base_url = os.environ.get("SECURITY_BASE_URL", "").strip()
     client_id = os.environ.get("SECURITY_CLIENT_ID", "").strip()
     client_secret = os.environ.get("SECURITY_CLIENT_SECRET", "")
     if not base_url or not client_id or not client_secret:
         return None
-    return SecurityOAuthClient(
-        base_url=base_url, client_id=client_id, client_secret=client_secret
-    )
+    from audit_core.uc03_document_capture_v2 import get_security_oauth_client
+
+    return get_security_oauth_client()
 
 
 def _resolve_di_subject_id(
@@ -167,7 +170,9 @@ def _rule_codes_for_phase(
     regardless of phase, so this filter is what scopes its answer down to
     "this trigger", matching what evaluate_phase() actually just ran."""
     phase_upper = phase.strip().upper()
-    catalog = client.list_rules(token=token, tenant_id=tenant_id)
+    from audit_core.rule_engine_client import cached_rule_catalog
+
+    catalog = cached_rule_catalog(client, token=token, tenant_id=tenant_id)
     return frozenset(
         rule.rule_code
         for rule in catalog
@@ -201,10 +206,7 @@ def run_rule_engine_phase(
                 journey_id=str(journey_id),
             )
             return
-        try:
-            token = security_client.get_service_token(audience=RULE_ENGINE_AUDIENCE)
-        finally:
-            security_client.close()
+        token = security_client.get_service_token(audience=RULE_ENGINE_AUDIENCE)
 
         with engine.begin() as connection:
             set_tenant_context(connection, tenant_id)
@@ -227,21 +229,16 @@ def run_rule_engine_phase(
             phase=phase,
         )
 
-        # Best-effort, separate from the phase result itself: if either call
-        # fails, findings still materialize below -- only the Execution Log
-        # (a nice-to-have on top of the existing behaviour) is skipped.
+        # The phase result names the rules it skipped (2026-10-29): no second,
+        # readiness() evaluation. The catalogue is cached.
         relevant_codes: frozenset[str] = frozenset()
-        readiness = None
         try:
             relevant_codes = _rule_codes_for_phase(
                 client, token=token, tenant_id=tenant_id, phase=phase
             )
-            readiness = client.readiness(
-                token=token, tenant_id=tenant_id, subject_id=str(subject_id)
-            )
         except Exception:
             logger.warning(
-                "uc03_rule_engine_readiness_failed",
+                "uc03_rule_engine_catalog_failed",
                 tenant_id=tenant_id,
                 journey_id=str(journey_id),
                 phase=phase,
@@ -261,16 +258,16 @@ def run_rule_engine_phase(
                 correlation_id=correlation_id,
                 audit_run_id=result.audit_run_id,
             )
-            if readiness is not None:
-                ready_relevant = tuple(
-                    code for code in readiness.ready if code in relevant_codes
-                )
-                pass_codes = tuple(code for code in ready_relevant if code not in flagged)
+            if relevant_codes:
                 skipped_codes = {
                     nr.rule_code: nr.reason
-                    for nr in readiness.not_ready
+                    for nr in getattr(result, "skipped", ())
                     if nr.rule_code in relevant_codes
                 }
+                pass_codes = tuple(
+                    code for code in sorted(relevant_codes)
+                    if code not in flagged and code not in skipped_codes
+                )
                 record_executions_bulk(
                     connection,
                     tenant_id=tenant_id,

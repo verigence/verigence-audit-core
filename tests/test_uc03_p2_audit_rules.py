@@ -622,34 +622,32 @@ def test_self_insurance_admission_drops_the_premium_and_flags_the_team_lead(jour
 # ------------------------------------------- no usable booking date (2026-10-24)
 
 
-def test_a_booking_date_before_the_programme_is_a_critical_finding(journey):
-    """Product owner: "for date if the issue is there, make it critical
-    finding". A date before the programme began is a misread year, and until
-    2026-10-24 the resolver priced the deal on it, found no price book and
-    reported a masters gap. Nothing on such a deal can be audited, so the
-    severity is the blast radius rather than the size of the correction."""
+def test_a_misread_booking_date_skips_the_pricing_checks(journey):
+    """Product owner 2026-10-29 (calibration; replaces the CRITICAL finding of
+    2026-10-24): a booking date before the programme or after today is a
+    misreading to correct, not a finding against the deal. Both the date check
+    and the undercharge check wait for the corrected date; the PC's
+    booking-date task asks for it."""
     add_ready_document(journey, "booking_form", booking_date="2024-09-10")
-    result = _run(journey, "BOOKING")["BOOKING_DATE_UNUSABLE"]
-    assert result.outcome == "FAIL"
+    results = _run(journey, "BOOKING")
+    result = results["BOOKING_DATE_UNUSABLE"]
+    assert result.outcome == "SKIPPED"
     assert "no date it can be priced on" in result.reason
     assert "the year is misread" in result.reason
     assert result.details["readAs"] == "2024-09-10"
-
-    [finding] = _sql(
+    assert results["DEAL_UNDERCHARGED"].outcome == "SKIPPED"
+    assert "booking date is corrected" in results["DEAL_UNDERCHARGED"].reason
+    assert _sql(
         journey,
-        "SELECT severity, finding_type_code, title, owner_role_code FROM auditcore.audit_findings "
-        "WHERE tenant_id=:t AND journey_id=:j AND rule_key='BOOKING_DATE_UNUSABLE'",
-    ).mappings().all()
-    assert finding["severity"] == "CRITICAL"
-    assert finding["finding_type_code"] == "PROCESS_NON_COMPLIANCE"
-    assert finding["owner_role_code"] == "TL"
-    assert "cannot be priced or audited" in finding["title"]
+        "SELECT count(*) FROM auditcore.audit_findings "
+        "WHERE tenant_id=:t AND journey_id=:j AND rule_key IN ('BOOKING_DATE_UNUSABLE','DEAL_UNDERCHARGED')",
+    ).scalar_one() == 0
 
 
-def test_an_unreadable_booking_date_is_the_same_finding(journey):
+def test_an_unreadable_booking_date_is_skipped_too(journey):
     add_ready_document(journey, "booking_form", booking_date="as per booking")
     result = _run(journey, "BOOKING")["BOOKING_DATE_UNUSABLE"]
-    assert result.outcome == "FAIL"
+    assert result.outcome == "SKIPPED"
     assert "could not be read as a date" in result.reason
 
 

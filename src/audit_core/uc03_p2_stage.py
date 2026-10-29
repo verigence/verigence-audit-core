@@ -895,7 +895,7 @@ def _stage_gates(connection: Connection, registry: Registry, *, stage: str, tena
             connection, registry, gate, tenant_id=tenant_id, journey_id=journey_id, minimum=minimum,
             reasons=reasons, stage=stage,
         )
-        result.update({"label": gate.label, "kind": gate.kind})
+        result.update({"label": gate.label, "kind": gate.kind, "blocking": gate.blocking})
         if not result["passed"]:
             result["action"] = gate.missing
         gates[gate.key] = result
@@ -950,7 +950,7 @@ def recompute_journey_stage(
 
     gates = _stage_gates(connection, registry, stage="BOOKING", tenant_id=tenant_id, journey_id=journey_id,
                          minimum=minimum, reasons=reasons)
-    booking_complete = all(item["passed"] for item in gates.values())
+    booking_complete = all(item["passed"] or not item.get("blocking", True) for item in gates.values())
     in_flight = int(connection.execute(
         text(
             """
@@ -965,7 +965,8 @@ def recompute_journey_stage(
                                   journey_id=journey_id, minimum=minimum, reasons=reasons)
     docs_gate = delivery_gates.get("REQUIRED_DOCUMENTS") or {"passed": False}
     already_delivered = bool(previous and previous["delivery_completion_state"] == "COMPLETE")
-    delivery_ready = delivery_started and all(item["passed"] for item in delivery_gates.values())
+    delivery_ready = delivery_started and all(
+        item["passed"] or not item.get("blocking", True) for item in delivery_gates.values())
     can_complete_delivery = delivery_ready and complete_delivery
 
     if not booking_complete:
@@ -1050,7 +1051,8 @@ def recompute_journey_stage(
         "receivedCount": docs_gate.get("receivedCount", 0),
         "missing": list(docs_gate.get("missing") or [])
         + ([{"key": "vehicle_proof", "label": "Vehicle pictures (or VIN / chassis / engine number)"}]
-           if not (delivery_gates.get("VEHICLE_PROOF") or {}).get("passed") else [])
+           if not (delivery_gates.get("VEHICLE_PROOF") or {"passed": True}).get("passed")
+           and (delivery_gates.get("VEHICLE_PROOF") or {}).get("blocking", True) else [])
         + ([{"key": "pc_tasks", "label": f"{delivery_gates['PC_TASKS_CLOSED']['pendingCount']} open PC task(s)"}]
            if delivery_gates.get("PC_TASKS_CLOSED") and not delivery_gates["PC_TASKS_CLOSED"]["passed"] else []),
         "gates": delivery_gates,

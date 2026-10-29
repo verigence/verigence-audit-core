@@ -618,8 +618,16 @@ def _sync_booking_document(
     bump_version: bool,
     stage_code: str = "BOOKING",
     prefetched: _FetchedDocument | None = None,
+    facts_only: bool = False,
 ) -> int:
-    """The one per-document sync pipeline: DI status -> DOCUMENT_MISSING ->
+    """``facts_only`` (the P2 worker's per-page copy, 2026-10-29 rule storm):
+    the document's own work only -- its facts, its confirmation, its review
+    flags, the booking form's discount evidence. The Journey-wide work below
+    (identity, duplicates, materialisation, SKU, payments) runs once per
+    Journey in the STAGE_RECOMPUTE and control units the copy requests; run
+    per page it rebuilt the Journey once for every page of an upload.
+
+    The one per-document sync pipeline: DI status -> DOCUMENT_MISSING ->
     durable fact copy -> MANUAL_VERIFICATION -> stage-specific rules/triggers
     (SKU resolution is Booking-only; payment reconciliation and canonical
     materialization apply to both). ``stage_code`` is read off the calling
@@ -873,19 +881,20 @@ def _sync_booking_document(
     from audit_core.uc03_manual_verification import sync_manual_verification_findings
     from audit_core.uc03_rule_execution_log import record_from_summary
 
-    manual_verification_result = sync_manual_verification_findings(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        stage_code=stage_code,
-        correlation_id="",
-    )
-    record_from_summary(
-        connection, tenant_id=tenant_id, journey_id=journey_id,
-        rule_code="MANUAL_VERIFICATION", triggering_event="DOCUMENT_SYNCED",
-        result=manual_verification_result,
-        skipped_reason=f"no extracted fields for {stage_code} yet",
-    )
+    if not facts_only:
+        manual_verification_result = sync_manual_verification_findings(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code=stage_code,
+            correlation_id="",
+        )
+        record_from_summary(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            rule_code="MANUAL_VERIFICATION", triggering_event="DOCUMENT_SYNCED",
+            result=manual_verification_result,
+            skipped_reason=f"no extracted fields for {stage_code} yet",
+        )
     # A leftover UC03_DI_LOW_CONFIDENCE_POST_SUBMIT finding (the pre-#346
     # mechanism, no longer created -- see _ensure_post_submit_review_flag's
     # removal) closes on exactly the same event sync_manual_verification_
@@ -904,6 +913,20 @@ def _sync_booking_document(
         actor_id=service_id,
         actor_role="SYSTEM",
     )
+    if facts_only:
+        if stage_code == "BOOKING" and document_type_key:
+            from audit_core.uc03_document_capture_v2 import _canonical_document_type
+
+            if _canonical_document_type(document_type_key) == "booking_form":
+                from audit_core.uc03_booking_confirmation_rules import (
+                    record_booking_form_intimation_and_discount_evidence,
+                )
+
+                record_booking_form_intimation_and_discount_evidence(
+                    connection, tenant_id=tenant_id, journey_id=journey_id,
+                    document_id=document_id, correlation_id="",
+                )
+        return len(facts)
 
     # Every document on this Journey must belong to the same customer.
     # Reacts to any document of either stage (a KYC document confirming
@@ -1219,6 +1242,7 @@ def _sync_booking_document_once(
     security_client: SecurityOAuthClient,
     di_client: DiClient,
     prefetched: _FetchedDocument | None = None,
+    facts_only: bool = False,
 ) -> None:
     """One attempt of the actual sync transaction. Kept as a plain sync
     function so _run_sync_booking_document_task can dispatch it onto a
@@ -1263,6 +1287,7 @@ def _sync_booking_document_once(
             bump_version=True,
             stage_code=stage_code,
             prefetched=prefetched,
+            facts_only=facts_only,
         )
 
 

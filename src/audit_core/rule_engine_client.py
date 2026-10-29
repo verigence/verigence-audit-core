@@ -12,6 +12,7 @@ dependency yields ``None`` and callers skip the rule-engine step entirely.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -50,17 +51,21 @@ class RuleEngineAnomaly:
 
 
 @dataclass(frozen=True)
+class NotReadyRule:
+    rule_code: str
+    reason: str | None
+
+
+@dataclass(frozen=True)
 class RuleEnginePhaseResult:
     phase: str
     audit_run_id: str | None
     verdict: str | None
     anomalies: tuple[RuleEngineAnomaly, ...]
-
-
-@dataclass(frozen=True)
-class NotReadyRule:
-    rule_code: str
-    reason: str | None
+    # The rules the run skipped and why (``skippedRules``, 2026-10-29): with
+    # it a rule neither failed nor skipped passed, so no second, readiness
+    # evaluation is needed to tell them apart.
+    skipped: tuple[NotReadyRule, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -459,11 +464,19 @@ def _phase_result(phase: str, data: dict[str, Any]) -> RuleEnginePhaseResult:
                     right_value=_opt_str(raw.get("rightValue")),
                 )
             )
+    skipped: list[NotReadyRule] = []
+    raw_skipped = data.get("skippedRules")
+    if isinstance(raw_skipped, list):
+        for raw in raw_skipped:
+            if isinstance(raw, dict) and str(raw.get("ruleCode") or "").strip():
+                skipped.append(NotReadyRule(rule_code=str(raw["ruleCode"]).strip(),
+                                            reason=_opt_str(raw.get("reason"))))
     return RuleEnginePhaseResult(
         phase=phase,
         audit_run_id=_opt_str(data.get("auditRunId")),
         verdict=_opt_str(data.get("verdict")),
         anomalies=tuple(anomalies),
+        skipped=tuple(skipped),
     )
 
 
@@ -483,6 +496,32 @@ def get_rule_engine_client() -> Iterator[RuleEngineClient | None]:
     timeout = _positive_float(os.environ.get("RULE_ENGINE_TIMEOUT_SECONDS"), 10.0)
     with RuleEngineClient(base_url=base_url, timeout_seconds=timeout) as client:
         yield client
+
+
+# The rule catalogue changes when a rule is authored, not per evaluation: it is
+# kept for ten minutes per tenant instead of fetched on every control run
+# (2026-10-29, rule storm).
+_CATALOG_TTL_SECONDS = 600.0
+_catalog_cache: dict[str, tuple[float, tuple[RuleEngineRule, ...]]] = {}
+_catalog_lock = threading.Lock()
+
+
+def cached_rule_catalog(client: RuleEngineClient, *, token: str, tenant_id: str) -> tuple[RuleEngineRule, ...]:
+    now = time.monotonic()
+    with _catalog_lock:
+        hit = _catalog_cache.get(tenant_id)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+    rules = client.list_rules(token=token, tenant_id=tenant_id)
+    with _catalog_lock:
+        _catalog_cache[tenant_id] = (now + _CATALOG_TTL_SECONDS, rules)
+    return rules
+
+
+def forget_rule_catalog() -> None:
+    """After a rule is authored or changed: the next run reads the catalogue again."""
+    with _catalog_lock:
+        _catalog_cache.clear()
 
 
 def build_rule_engine_client() -> RuleEngineClient | None:

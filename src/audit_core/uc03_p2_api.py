@@ -2108,11 +2108,12 @@ def restore_document_copy(
         connection, tenant_id=tenant_id, journey_id=journey_id,
         stage_code=str(target["process_area"] or "BOOKING").upper(),
     )
-    enqueue_work(
-        connection, tenant_id=tenant_id, journey_id=journey_id, work_type="STAGE_RECOMPUTE",
-        work_key=str(journey_id), payload={"reason": "DOCUMENT_COPY_RESTORED"},
-        correlation_id=get_correlation_id(request),
-    )
+    # The one STAGE_RECOMPUTE row of the Journey ('booking:<journey>'), with the
+    # fact version bumped (2026-10-29): a second key never merged with it.
+    from audit_core.uc03_p2_runtime import note_facts_changed
+
+    note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id,
+                       reason="DOCUMENT_COPY_RESTORED", correlation_id=get_correlation_id(request))
     _activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type="DOCUMENT_COPY_RESTORED",
         subject_type="DOCUMENT", subject_id=str(target["di_document_id"]),

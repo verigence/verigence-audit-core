@@ -126,6 +126,8 @@ class FakeRuleEngine:
             anomalies=(SimpleNamespace(rule_code="PRICE_BOOKING_VS_INVOICE", severity="HIGH", category="PRICE",
                                        detail="Invoice total differs from booking total",
                                        left_value="2450000", right_value="2510000"),),
+            # the phase result names the rules it skipped (2026-10-29: no readiness() call)
+            skipped=(SimpleNamespace(rule_code="KYC_DOB_AADHAAR_VS_PAN", reason="pan_card.date_of_birth missing"),),
         )
 
     def list_rules(self, *, token, tenant_id):
@@ -136,10 +138,7 @@ class FakeRuleEngine:
         )
 
     def readiness(self, *, token, tenant_id, subject_id):
-        return SimpleNamespace(
-            ready=("PRICE_BOOKING_VS_INVOICE", "KYC_NAME_VS_BOOKING"),
-            not_ready=(SimpleNamespace(rule_code="KYC_DOB_AADHAAR_VS_PAN", reason="pan_card.date_of_birth missing"),),
-        )
+        raise AssertionError("readiness() is a second evaluation and is no longer called")
 
     def close(self):
         pass
@@ -257,7 +256,7 @@ class RetiredRuleEngine(FakeRuleEngine):
                                   category="DISCOUNT", detail="Booking promised discount exceeds approved amount",
                                   left_value="40000", right_value="25000")
         return SimpleNamespace(audit_run_id=result.audit_run_id, verdict=result.verdict,
-                               anomalies=(*result.anomalies, retired))
+                               anomalies=(*result.anomalies, retired), skipped=result.skipped)
 
     def list_rules(self, *, token, tenant_id):
         return (*super().list_rules(token=token, tenant_id=tenant_id),
@@ -381,7 +380,7 @@ class ChassisEmptyRuleEngine(FakeRuleEngine):
         return (SimpleNamespace(rule_code="GATE_PASS_CHASSIS_EMPTY", phases=("DELIVERY",)),)
 
     def readiness(self, *, token, tenant_id, subject_id):
-        return SimpleNamespace(ready=("GATE_PASS_CHASSIS_EMPTY",), not_ready=())
+        raise AssertionError("readiness() is no longer called")
 
 
 def test_a_presence_check_waits_for_its_document(journey, monkeypatch):

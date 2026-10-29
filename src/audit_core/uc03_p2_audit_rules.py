@@ -422,8 +422,32 @@ def _charged(row: dict[str, Any] | None) -> Decimal | None:
 _NO_STANDARD = "No standard price on record yet: the model must be resolved against a published price list first."
 
 
+def _pricing_date_rejected(facts: _Facts) -> str | None:
+    """Why the deal has no pricing date it can use -- the booking date was read
+    as a date before the programme or after today, i.e. misread -- or None.
+    A date a person applied always stands."""
+    from audit_core.uc03_p2_dates import unusable_pricing_date_reason
+
+    applied = facts.connection.execute(
+        text("SELECT pricing_effective_on FROM auditcore.bookings WHERE tenant_id=:t AND journey_id=:j"),
+        facts._params,
+    ).scalar_one_or_none()
+    if applied is not None:
+        return None
+    booking = facts.documents("booking_form", "booking_docket")
+    if not booking:
+        return None
+    return unusable_pricing_date_reason((booking[0]["fields"] or {}).get("booking_date"))
+
+
 def deal_undercharged(facts: _Facts) -> RuleOutcome:
     code = "DEAL_UNDERCHARGED"
+    # A misread booking date prices nothing (2026-10-29, calibration): the
+    # check waits for the corrected date instead of failing on prices it
+    # could not have.
+    rejected = _pricing_date_rejected(facts)
+    if rejected:
+        return RuleOutcome(code, "SKIPPED", f"Not checked until the booking date is corrected: {rejected}.")
     if not _standards_known(facts):
         return RuleOutcome(code, "SKIPPED", _NO_STANDARD)
     short: list[dict[str, Any]] = []
@@ -573,12 +597,15 @@ def booking_date_unusable(facts: _Facts) -> RuleOutcome:
     why = unusable_pricing_date_reason(raw)
     if why is None:
         return RuleOutcome(code, "PASS", f"Priced on {_when(_day(raw))}, which the programme can use.")
+    # SKIPPED, not FAIL (product owner 2026-10-29, calibration; replaces the
+    # CRITICAL finding of 2026-10-24): a misread date is a reading to correct,
+    # not a finding against the deal. The PC's booking-date task still asks
+    # for the correction (uc03_p2_task_producer.sync_booking_date_task).
     return RuleOutcome(
-        code, "FAIL",
+        code, "SKIPPED",
         f"This deal has no date it can be priced on: {why}. Nothing on it is priced -- no standard "
         "price, no SKU check and no commercial finding -- until the booking date is corrected.",
-        {"findingTitle": "No usable booking date -- this deal cannot be priced or audited",
-         "readAs": str(raw) if raw is not None else None, "reason": why},
+        {"readAs": str(raw) if raw is not None else None, "reason": why},
     )
 
 
