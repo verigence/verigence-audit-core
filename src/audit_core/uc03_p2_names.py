@@ -171,6 +171,28 @@ def same_organisation(left: Any, right: Any) -> bool:
     return _tokens_match(a, b) or _close_enough(a, b)
 
 
+def dealership_word(value: Any) -> str | None:
+    """The distinctive first word of a dealership's name ("Shivnath Motors"
+    -> "SHIVNATH"), or None when it is too short to tell dealerships apart."""
+    tokens = org_tokens(value)
+    return tokens[0] if tokens and len(tokens[0]) >= _MISREAD_MIN else None
+
+
+def same_dealership_group(left: Any, right: Any, master_words: list[str]) -> bool:
+    """Whether two printed dealer names are variants of one dealership of the
+    tenant's dealer master (product owner 2026-10-30: "Shivnath Group",
+    "Shivnath Motors (India) Pvt Ltd" and "Shivanath Motors" are one
+    dealership for now). Both names must start with the master's distinctive
+    word, one letter of misreading allowed."""
+    a, b = org_tokens(left), org_tokens(right)
+    if not a or not b:
+        return False
+    for word in master_words:
+        if _one_letter_apart(a[0], word) and _one_letter_apart(b[0], word):
+            return True
+    return False
+
+
 # A firm's name, as a proprietor's business prints on its documents
 # ("M/S SHREE SHYAM ENTERPRISES", "MAA MANGALA TRADERS", "TARA BAKERY").
 _FIRM_PREFIX = re.compile(r"^\s*(M\s*/\s*S\b|MESSRS\b)", re.IGNORECASE)

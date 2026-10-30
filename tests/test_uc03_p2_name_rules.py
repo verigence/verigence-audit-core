@@ -384,3 +384,49 @@ def test_is_firm_name(name, firm):
     from audit_core.uc03_p2_names import is_firm_name
 
     assert is_firm_name(name) is firm
+
+
+# ------------------------------- variants of one dealership (2026-10-30)
+
+def _master_dealer(journey, name):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.dealers SET dealer_name=:n WHERE tenant_id=:t"),
+                           {"n": name, "t": journey.tenant_id})
+
+
+def test_variants_of_the_master_dealerships_name_are_one_dealership(journey):
+    """Product owner 2026-10-30: "Shivnath Group", "Shivnath Motors (India)
+    Pvt Ltd" and "Shivanath Motors" are the same dealership for now."""
+    _master_dealer(journey, "Shivnath Motors")
+    add_ready_document(journey, "booking_form", customer_name="Anita Sahoo",
+                       dealer_name="SHIVNATH MOTORS (I) PVT. LTD.")
+    add_ready_document(journey, "dealer_receipt", customer_name="Anita Sahoo", dealer_name="SHIVNATH GROUP",
+                       amount_paid="21000")
+    add_ready_document(journey, "customer_invoice_dms", buyer_name="Anita Sahoo",
+                       seller_name="SHIYNATH MOTORS (INDIA) PVT LTD", invoice_number="I1")
+    assert _sync(journey) == {}
+
+
+def test_another_firm_is_still_the_wrong_dealer_document(journey):
+    _master_dealer(journey, "Utkal Mahindra")
+    add_ready_document(journey, "booking_form", customer_name="Anita Sahoo", dealer_name="UTKAL AUTOMOBILES PVT. LTD.")
+    add_ready_document(journey, "dealer_receipt", customer_name="Anita Sahoo",
+                       dealer_name="UTKAL AUTOMOBILS BARBILLMV KEONJHAR", amount_paid="21000")
+    other = add_ready_document(journey, "customer_invoice_dms", buyer_name="Anita Sahoo",
+                               seller_name="SAI ENTERPRISES", invoice_number="I1")
+    assert _sync(journey) == {"RAISED": 1}
+    (task,) = _tasks(journey)
+    assert task["reference"]["documentId"] == str(other)
+
+
+def test_a_dealership_word_outside_the_master_is_not_grouped(journey):
+    """Only the tenant's own dealerships are grouped: two names sharing a
+    first word the master does not hold are still compared as before."""
+    _master_dealer(journey, "Aditya Motors")
+    add_ready_document(journey, "booking_form", customer_name="Anita Sahoo", dealer_name="Sarthak Motors")
+    other = add_ready_document(journey, "customer_invoice_dms", buyer_name="Anita Sahoo",
+                               seller_name="Sarthak Agencies", invoice_number="I1")
+    assert _sync(journey) == {"RAISED": 1}
+    (task,) = _tasks(journey)
+    assert task["reference"]["documentId"] == str(other)

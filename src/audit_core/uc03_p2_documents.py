@@ -8,7 +8,6 @@ The UI is new, but the evidence contracts are not duplicated:
 """
 from __future__ import annotations
 
-import hashlib
 import json
 from typing import Annotated, Any
 from uuid import UUID
@@ -47,7 +46,6 @@ from audit_core.uc03_p2_reviewer import (
 )
 from audit_core.uc03_p2_runtime import note_facts_changed, record_activity
 from audit_core.uc03_p2_stage import field_review_reasons
-from audit_core.uc03_p2_tasks import create_p2_task
 from audit_core.uc03_review_confidence import requires_pc_review
 
 router = APIRouter(
@@ -978,140 +976,87 @@ def correct_p2_document_field(
     # to approve (owner decision 2026-10-18). Nobody checks the Reviewer
     # afterwards, which is why every apply below writes the change log: that
     # trail, not a second approver, is what makes the change answerable for.
+    # Every correction now applies at once (product owner 2026-10-30: "let
+    # the PC do the changes ... let the changes go through and the task get
+    # closed, with the Reviewer and TL being informed only"). A correction of
+    # a value DI read at 90% or more used to wait for a Team Lead's approval
+    # (FIELD_CORRECTION_REVIEW_P2): 236 waited, five were ever approved, and
+    # the PC's own task kept coming back because the value had not changed.
+    # The Team Lead and the Reviewer are informed instead: the journey's
+    # activity records who changed what, from which value, at what confidence.
     reviewer = (access.operating_role or "").upper() == "REVIEWER"
-    if reviewer or requires_pc_review(confidence):
-        _apply_field_value(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            stage_code=str(context["stage_code"]),
-            document_id=document_id,
-            evidence_id=field["evidence_id"],
-            document_type_key=(
-                field["source_document_type_key"]
-                or context["document_type_key"]
-            ),
-            field_key=command.fieldKey,
-            canonical_field_id=command.canonicalFieldId,
-            source_fact_version=command.sourceFactVersion,
-            confidence_score=confidence,
-            original_value=machine_value,
-            new_value=command.newValue,
-            actor_id=human_principal.subject,
-        )
-        log_field_change(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            # The authoritative stage, not `_document_context`'s, which prefers
-            # the nullable `business_stage` copy. The trail has to agree with
-            # the reviewed marks and the resync guard, and those read the NOT
-            # NULL capture column (RVW-AC-01).
-            stage_code=(
-                page_stage_code(
-                    connection,
-                    tenant_id=tenant_id,
-                    journey_id=journey_id,
-                    di_document_id=document_id,
-                )
-                or str(context["stage_code"])
-            ),
-            document_id=document_id,
-            field_key=command.fieldKey,
-            canonical_field_id=command.canonicalFieldId,
-            source_fact_version=command.sourceFactVersion,
-            previous_value=json.dumps(current_effective),
-            new_value=json.dumps(command.newValue),
-            confidence_score=confidence,
-            change_reason="CORRECTION",
-            actor_id=human_principal.subject,
-            actor_role_code=(
-                access.operating_role or access.functional_role or "USER"
-            ),
-            remarks=(command.remarks or "").strip() or None,
-        )
-        note_facts_changed(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            reason="FIELD_CORRECTED",
-        )
-        return {
-            "documentId": str(document_id),
-            "fieldKey": command.fieldKey,
-            "applied": True,
-            "taskId": None,
-        }
-
-    if not (command.remarks or "").strip():
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Remarks are required when correcting a field at or above "
-                "90% confidence."
-            ),
-        )
-
-    proposed_json = json.dumps(command.newValue, default=str, sort_keys=True)
-    proposal_hash = hashlib.sha256(proposed_json.encode("utf-8")).hexdigest()[:16]
-    reference = {
-        "kind": "FIELD_CORRECTION",
-        "documentId": str(document_id),
-        "documentTypeKey": (
-            field["source_document_type_key"] or context["document_type_key"]
-        ),
-        "stage": str(context["stage_code"]),
-        "evidenceId": (
-            str(field["evidence_id"]) if field["evidence_id"] is not None else None
-        ),
-        "canonicalFieldId": command.canonicalFieldId,
-        "fieldKey": command.fieldKey,
-        "sourceFactVersion": command.sourceFactVersion,
-        "confidenceScore": confidence,
-        "originalValue": machine_value,
-        "currentEffectiveValue": current_effective,
-        "proposedValue": command.newValue,
-        "proposalRemarks": command.remarks.strip(),
-    }
-    task_id = create_p2_task(
+    _apply_field_value(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
-        task_type="FIELD_CORRECTION_REVIEW_P2",
-        category="CORRECTION_APPROVAL",
-        origin_kind="SYSTEM",
-        source_type="DOCUMENT_FIELD",
-        source_code="FIELD_CORRECTION_REVIEW_P2",
-        dedupe_key=(
-            f"field-correction:{journey_id}:{document_id}:"
-            f"{command.canonicalFieldId}:{command.sourceFactVersion}:{proposal_hash}"
+        stage_code=str(context["stage_code"]),
+        document_id=document_id,
+        evidence_id=field["evidence_id"],
+        document_type_key=(
+            field["source_document_type_key"]
+            or context["document_type_key"]
         ),
-        title=f"Review correction · {command.fieldKey.replace('_', ' ')}",
-        description=(
-            f"{command.fieldKey.replace('_', ' ')} on "
-            f"{context['original_filename']} was extracted at "
-            f"{confidence:.1f}% confidence. Review the proposed correction "
-            "and approve or reject it."
+        field_key=command.fieldKey,
+        canonical_field_id=command.canonicalFieldId,
+        source_fact_version=command.sourceFactVersion,
+        confidence_score=confidence,
+        original_value=machine_value,
+        new_value=command.newValue,
+        actor_id=human_principal.subject,
+    )
+    log_field_change(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        # The authoritative stage, not `_document_context`'s, which prefers
+        # the nullable `business_stage` copy. The trail has to agree with
+        # the reviewed marks and the resync guard, and those read the NOT
+        # NULL capture column (RVW-AC-01).
+        stage_code=(
+            page_stage_code(
+                connection,
+                tenant_id=tenant_id,
+                journey_id=journey_id,
+                di_document_id=document_id,
+            )
+            or str(context["stage_code"])
         ),
-        reference=reference,
-        severity="MEDIUM",
-        priority="NORMAL",
-        assigned_role_code="TL",
-        assigned_actor_id=None,
-        raised_by_actor_id=human_principal.subject,
-        raised_by_role_code=(
-            access.operating_role or access.functional_role or "PC"
+        document_id=document_id,
+        field_key=command.fieldKey,
+        canonical_field_id=command.canonicalFieldId,
+        source_fact_version=command.sourceFactVersion,
+        previous_value=json.dumps(current_effective),
+        new_value=json.dumps(command.newValue),
+        confidence_score=confidence,
+        change_reason="CORRECTION",
+        actor_id=human_principal.subject,
+        actor_role_code=(
+            access.operating_role or access.functional_role or "USER"
         ),
-        allowed_actions=[
-            "APPROVE_CORRECTION",
-            "REJECT_CORRECTION",
-            "ADD_COMMENT",
-        ],
-        completion_protocol="MACHINE_VERIFIED",
+        remarks=(command.remarks or "").strip() or None,
+    )
+    if not reviewer and not requires_pc_review(confidence):
+        record_activity(
+            connection, tenant_id=tenant_id, journey_id=journey_id, event_type="FIELD_CORRECTED_FOR_INFORMATION",
+            subject_type="DOCUMENT", subject_id=str(document_id),
+            details={"fieldKey": command.fieldKey, "previousValue": current_effective,
+                     "newValue": command.newValue, "confidence": confidence,
+                     "documentTypeKey": field["source_document_type_key"] or context["document_type_key"],
+                     "actorId": human_principal.subject,
+                     "actorRole": access.operating_role or access.functional_role or "USER",
+                     "remarks": (command.remarks or "").strip() or None,
+                     "informed": ["TL", "REVIEWER"]},
+        )
+    note_facts_changed(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        reason="FIELD_CORRECTED",
     )
     return {
         "documentId": str(document_id),
         "fieldKey": command.fieldKey,
-        "applied": False,
-        "taskId": str(task_id),
+        "applied": True,
+        "taskId": None,
     }
+

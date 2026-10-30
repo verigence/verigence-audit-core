@@ -398,8 +398,8 @@ def test_a_reviewer_corrects_a_confident_value_without_raising_a_task(journey):
     assert float(entry["confidence_score"]) == pytest.approx(97.5)
 
 
-def test_a_pc_correcting_a_confident_value_still_goes_to_a_team_lead(journey):
-    """The band is unchanged for everyone else; only the Reviewer bypasses it."""
+def test_a_pc_correcting_a_confident_value_applies_it_too(journey):
+    """Product owner 2026-10-30: PC corrections go through; TL and Reviewer are informed only."""
     _, _, document = add_page(journey, page_number=1, status="READY")
     _confident_field(journey, document)
 
@@ -407,5 +407,5 @@ def test_a_pc_correcting_a_confident_value_still_goes_to_a_team_lead(journey):
         journey, document, journey.actor_id, "PC",
         value="125000", remarks="Invoice says 1,25,000",
     )
-    assert result["applied"] is False
-    assert result["taskId"] is not None
+    assert result["applied"] is True
+    assert result["taskId"] is None

@@ -29,10 +29,12 @@ from sqlalchemy import Connection, text
 
 from audit_core.uc03_p2_document_health import TL_AFTER_SECONDS
 from audit_core.uc03_p2_names import (
+    dealership_word,
     display_name,
     is_firm_name,
     is_masked,
     masked_matches,
+    same_dealership_group,
     same_organisation,
     same_person,
 )
@@ -1645,10 +1647,20 @@ def sync_name_consistency_tasks(
         if not any(same_organisation(d["name"], name) for name in oem_names)
     ]
     anchor = next((d for d in reversed(dealers) if d["pair"].startswith("booking_form.")), dealers[0] if dealers else None)
+    # Variants of one dealership's name ("Shivnath Group" / "Shivnath Motors
+    # (India) Pvt Ltd") are the same dealership for now (product owner
+    # 2026-10-30), anchored on the tenant's own dealer master.
+    master_words = [
+        w for w in (dealership_word(n) for n in connection.execute(
+            text("SELECT dealer_name FROM auditcore.dealers WHERE tenant_id=:t"), {"t": tenant_id},
+        ).scalars().all()) if w
+    ] if anchor is not None else []
     if anchor is not None:
         anchor_template = registry.template_for_di_type(anchor["diType"], stage=anchor["stage"])
         for document in dealers:
-            if document["documentId"] == anchor["documentId"] or same_organisation(document["name"], anchor["name"]):
+            if (document["documentId"] == anchor["documentId"]
+                    or same_organisation(document["name"], anchor["name"])
+                    or same_dealership_group(document["name"], anchor["name"], master_words)):
                 continue
             template = registry.template_for_di_type(document["diType"], stage=document["stage"])
             raise_task(
