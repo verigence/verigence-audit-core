@@ -369,6 +369,37 @@ def _on_file(connection: Connection, *, tenant_id: str, journey_id: UUID) -> set
     ).scalars().all()}
 
 
+def required_documents(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """The documents the file needs to be complete (product owner 2026-10-30):
+    the same checklist the stage gates and the Missing tasks use -- mandatory
+    documents, and conditional ones the deal's own evidence made mandatory
+    (with why) -- for the booking and, once it has started, the delivery.
+    Documents sharing a group are one line met by any of them."""
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_stage import (
+        condition_reasons,
+        delivery_has_started,
+        requirement_items,
+    )
+
+    registry = get_registry()
+    reasons = condition_reasons(connection, tenant_id=tenant_id, journey_id=journey_id)
+    stages = ("BOOKING", "DELIVERY") if delivery_has_started(
+        connection, tenant_id=tenant_id, journey_id=journey_id) else ("BOOKING",)
+    out = []
+    for stage in stages:
+        for item in requirement_items(connection, registry, tenant_id=tenant_id, journey_id=journey_id,
+                                      stage=stage, reasons=reasons):
+            if not item["required"]:
+                continue
+            out.append({"key": item["key"], "label": item["label"], "stage": stage,
+                        "requirement": "MANDATORY" if item["requirement"] == "REQUIRED" else "CONDITIONAL",
+                        "reason": item["reason"], "onFile": bool(item["received"]),
+                        "count": int(item["readyCount"] or 0)})
+    # Missing first, then by stage as the deal runs.
+    return sorted(out, key=lambda d: (d["onFile"], stages.index(d["stage"])))
+
+
 def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     from audit_core import uc03_p2_journey360 as j360
     from audit_core.uc03_account_statement import statement_loan
@@ -480,6 +511,11 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     missing = []
     if not on_file & {"customer_invoice_dms", "tax_invoice_tally", "customer_ledger", "cost_sheet"}:
         missing.append("No invoice, account statement or cost sheet on file.")
+    file_documents = required_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+    still_needed = [d for d in file_documents if not d["onFile"]]
+    if still_needed:
+        missing.append(f"{len(still_needed)} required document{'s' if len(still_needed) != 1 else ''} "
+                       "not on file: " + ", ".join(d["label"] for d in still_needed) + ".")
     disputed = [r for r in charges + benefits + products if r["conclusion"] == DISPUTED]
     return {
         "generatedAtUtc": datetime.now(UTC).isoformat(),
@@ -495,4 +531,5 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         "funding": funding,
         "settlement": settle,
         "disputed": [{"label": r["label"], "documents": r["documents"]} for r in disputed],
+        "requiredDocuments": file_documents,
     }

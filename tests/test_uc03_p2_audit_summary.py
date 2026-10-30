@@ -244,3 +244,20 @@ def test_a_cash_deal_has_no_loan_and_is_judged() -> None:
     loan = summary.loan_received(matched=None, disbursement_known=False, financed=False, stated=None,
                                  receipt_amounts=[Decimal(100)])
     assert loan["unknown"] is False and loan["amount"] is None
+
+
+# ── documents required to complete the file (2026-10-30) ─────────────────────
+
+def test_the_required_documents_list_the_missing_first_and_make_the_verdict_incomplete(journey) -> None:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        documents = summary.required_documents(connection, tenant_id=journey.tenant_id,
+                                               journey_id=journey.journey_id)
+        result = summary.audit_summary(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert documents, "a new booking needs its mandatory documents"
+    assert all(d["stage"] == "BOOKING" for d in documents)  # delivery not started
+    on_file = [d["onFile"] for d in documents]
+    assert on_file == sorted(on_file)  # missing (False) first
+    assert result["requiredDocuments"] == documents
+    if not all(on_file):
+        assert result["verdict"]["status"] == "INCOMPLETE"
