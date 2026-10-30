@@ -557,53 +557,104 @@ def test_repeated_corrections_never_lose_the_machine_value(journey):
     assert row["is_modified"] is True
 
 
-def test_high_confidence_correction_approval_keeps_machine_value_and_detects_staleness(journey):
+def _waiting_correction(journey, *, di_document_id, canonical, proposed, current, field_key="p2_test_amount"):
+    """A FIELD_CORRECTION_REVIEW_P2 task as the old ≥90% band left them.
+
+    New corrections apply at once (2026-10-30), but the proposals raised before
+    that are still open until they are approved, so approval keeps its tests.
+    """
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return str(create_p2_task(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+            task_type="FIELD_CORRECTION_REVIEW_P2", category="CORRECTION_APPROVAL",
+            origin_kind="SYSTEM", source_type="DOCUMENT_FIELD", source_code="FIELD_CORRECTION_REVIEW_P2",
+            dedupe_key=f"field-correction:{journey.journey_id}:{di_document_id}:{canonical}:1:{uuid4().hex[:16]}",
+            title="Review correction", description="Review the proposed correction",
+            reference={
+                "kind": "FIELD_CORRECTION", "documentId": str(di_document_id),
+                "documentTypeKey": "booking_form", "stage": "BOOKING", "evidenceId": None,
+                "canonicalFieldId": canonical, "fieldKey": field_key, "sourceFactVersion": 1,
+                "confidenceScore": 98.0, "originalValue": "100", "currentEffectiveValue": current,
+                "proposedValue": proposed, "proposalRemarks": "Receipt shows it",
+            },
+            severity="MEDIUM", priority="NORMAL", assigned_role_code="TL", assigned_actor_id=None,
+            raised_by_actor_id=journey.actor_id, raised_by_role_code="PC",
+            allowed_actions=["APPROVE_CORRECTION", "REJECT_CORRECTION", "ADD_COMMENT"],
+            completion_protocol="MACHINE_VERIFIED",
+        ))
+
+
+def _amount_row(journey, di_document_id):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return connection.execute(
+            text("SELECT extracted_value, effective_value FROM auditcore.journey_document_extracted_fields "
+                 "WHERE tenant_id=:t AND di_document_id=:d AND field_key='p2_test_amount'"),
+            {"t": journey.tenant_id, "d": di_document_id},
+        ).mappings().one()
+
+
+def test_a_pc_correction_of_a_confident_value_applies_at_once_and_informs_tl_and_reviewer(journey):
+    """Product owner 2026-10-30: the PC's change goes through; TL and Reviewer are informed only."""
     di_document_id = uuid4()
     add_page(journey, di_document_id=di_document_id)
     canonical = add_extracted_field(
         journey, di_document_id=di_document_id, field_key="p2_test_amount", value="100", confidence=98.0,
     )
     with journey.engine.begin() as connection:
-        proposal = correct_p2_document_field(
-            tenant_id=journey.tenant_id,
-            journey_id=journey.journey_id,
-            document_id=di_document_id,
-            command=P2FieldCorrectionCommand(
-                canonicalFieldId=canonical, fieldKey="p2_test_amount",
-                sourceFactVersion=1, newValue="150", remarks="Receipt shows 150",
-            ),
-            human_principal=principal(journey),
-            authorization_client=AllowAllAuthorization(),
-            connection=connection,
-        )
-    assert proposal["applied"] is False
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        result = submit_action(
-            connection, tenant_id=journey.tenant_id, task_id=proposal["taskId"],
-            action="APPROVE_CORRECTION", actor_id="tl-1", actor_role_code="TL", comment=None,
-        )
-    assert result["status"] == "VERIFIED_COMPLETE"
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        row = connection.execute(
-            text("SELECT extracted_value, effective_value FROM auditcore.journey_document_extracted_fields "
-                 "WHERE tenant_id=:t AND di_document_id=:d AND field_key='p2_test_amount'"),
-            {"t": journey.tenant_id, "d": di_document_id},
-        ).mappings().one()
-    assert (row["extracted_value"], row["effective_value"]) == ("100", "150")
-
-    # A proposal made against 150 goes stale when the value changes first.
-    with journey.engine.begin() as connection:
-        stale = correct_p2_document_field(
+        result = correct_p2_document_field(
             tenant_id=journey.tenant_id, journey_id=journey.journey_id, document_id=di_document_id,
             command=P2FieldCorrectionCommand(
                 canonicalFieldId=canonical, fieldKey="p2_test_amount",
-                sourceFactVersion=1, newValue="175", remarks="typo",
+                sourceFactVersion=1, newValue="150",
             ),
             human_principal=principal(journey), authorization_client=AllowAllAuthorization(),
             connection=connection,
         )
+    assert result["applied"] is True and result["taskId"] is None
+    row = _amount_row(journey, di_document_id)
+    assert (row["extracted_value"], row["effective_value"]) == ("100", "150")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        tasks = connection.execute(
+            text("SELECT count(*) FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+                 "AND task_type='FIELD_CORRECTION_REVIEW_P2'"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).scalar_one()
+        notice = connection.execute(
+            text("SELECT details FROM auditcore.p2_activity_events WHERE tenant_id=:t AND journey_id=:j "
+                 "AND event_type='FIELD_CORRECTED_FOR_INFORMATION'"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).scalar_one()
+    assert tasks == 0
+    assert notice["fieldKey"] == "p2_test_amount" and notice["newValue"] == "150"
+    assert notice["previousValue"] == "100" and notice["informed"] == ["TL", "REVIEWER"]
+
+
+def test_an_already_waiting_correction_is_approved_keeping_the_machine_value_and_detects_staleness(journey):
+    di_document_id = uuid4()
+    add_page(journey, di_document_id=di_document_id)
+    canonical = add_extracted_field(
+        journey, di_document_id=di_document_id, field_key="p2_test_amount", value="100", confidence=98.0,
+    )
+    waiting = _waiting_correction(
+        journey, di_document_id=di_document_id, canonical=canonical, proposed="150", current="100",
+    )
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        result = submit_action(
+            connection, tenant_id=journey.tenant_id, task_id=waiting,
+            action="APPROVE_CORRECTION", actor_id="tl-1", actor_role_code="TL", comment=None,
+        )
+    assert result["status"] == "VERIFIED_COMPLETE"
+    row = _amount_row(journey, di_document_id)
+    assert (row["extracted_value"], row["effective_value"]) == ("100", "150")
+
+    # A proposal made against 150 goes stale when the value changes first.
+    stale = _waiting_correction(
+        journey, di_document_id=di_document_id, canonical=canonical, proposed="175", current="150",
+    )
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
@@ -613,7 +664,7 @@ def test_high_confidence_correction_approval_keeps_machine_value_and_detects_sta
         )
     with journey.engine.begin() as connection, pytest.raises(TaskStateError):
         set_tenant_context(connection, journey.tenant_id)
-        submit_action(connection, tenant_id=journey.tenant_id, task_id=stale["taskId"],
+        submit_action(connection, tenant_id=journey.tenant_id, task_id=stale,
                       action="APPROVE_CORRECTION", actor_id="tl-1", actor_role_code="TL", comment=None)
 
 
@@ -1017,7 +1068,7 @@ def test_a_classified_type_outside_the_catalogue_gets_a_repeatable_checklist_row
         ) == 0
 
 
-def test_a_field_with_a_correction_waiting_for_the_team_lead_cannot_be_edited_or_confirmed_again(journey):
+def test_a_field_with_a_correction_still_waiting_for_the_team_lead_cannot_be_edited_or_confirmed_again(journey):
     from fastapi import HTTPException
 
     from audit_core.uc03_p2_documents import (
@@ -1057,7 +1108,9 @@ def test_a_field_with_a_correction_waiting_for_the_team_lead_cannot_be_edited_or
         )
 
     assert pending_on_review() is None
-    first = propose("150")
+    first = {"taskId": _waiting_correction(
+        journey, di_document_id=di_document_id, canonical=canonical, proposed="150", current="100",
+    )}
     waiting = pending_on_review()
     assert waiting["taskId"] == first["taskId"] and waiting["proposedValue"] == "150"
 
@@ -1082,7 +1135,7 @@ def test_a_field_with_a_correction_waiting_for_the_team_lead_cannot_be_edited_or
             action="REJECT_CORRECTION", actor_id="tl-1", actor_role_code="TL", comment="Year is right",
         )
     assert pending_on_review() is None
-    assert propose("175")["applied"] is False
+    assert propose("175")["applied"] is True
 
 
 # ------------------------------------- opening a page DI never classified
@@ -1170,16 +1223,9 @@ def test_a_normal_document_review_returns_fields_with_the_correction_waiting_for
     canonical = add_extracted_field(
         journey, di_document_id=di_document_id, field_key="p2_test_amount", value="100", confidence=98.0,
     )
-    with journey.engine.begin() as connection:
-        proposal = correct_p2_document_field(
-            tenant_id=journey.tenant_id, journey_id=journey.journey_id, document_id=di_document_id,
-            command=P2FieldCorrectionCommand(
-                canonicalFieldId=canonical, fieldKey="p2_test_amount",
-                sourceFactVersion=1, newValue="150", remarks="wrong year captured",
-            ),
-            human_principal=principal(journey), authorization_client=AllowAllAuthorization(),
-            connection=connection,
-        )
+    proposal = {"taskId": _waiting_correction(
+        journey, di_document_id=di_document_id, canonical=canonical, proposed="150", current="100",
+    )}
     monkeypatch.setattr(documents, "_ensure_di_context", lambda **_: ("ctx", "token"))
 
     class Di:
@@ -1289,3 +1335,66 @@ def test_the_pcs_insurance_answer_changes_the_fact_fingerprint(journey):
                              via="TASK")
         after = fact_fingerprint(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     assert before != after
+
+
+# ------------------------------------ corrections left waiting (2026-10-30)
+
+def test_the_waiting_corrections_job_applies_them_and_dry_runs_by_default(journey):
+    from audit_core.uc03_waiting_corrections import run_waiting_corrections
+
+    di_document_id = uuid4()
+    add_page(journey, di_document_id=di_document_id)
+    canonical = add_extracted_field(
+        journey, di_document_id=di_document_id, field_key="p2_test_amount", value="100", confidence=98.0,
+    )
+    waiting = _waiting_correction(
+        journey, di_document_id=di_document_id, canonical=canonical, proposed="150", current="100",
+    )
+
+    def status():
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            return connection.execute(
+                text("SELECT task_status FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_id=:id"),
+                {"t": journey.tenant_id, "id": waiting},
+            ).scalar_one()
+
+    run_waiting_corrections(journey.engine, "t1", [journey.tenant_id])
+    assert status() == "READY" and _amount_row(journey, di_document_id)["effective_value"] == "100"
+
+    run_waiting_corrections(journey.engine, "t1-commit", [journey.tenant_id])
+    assert status() == "VERIFIED_COMPLETE"
+    assert _amount_row(journey, di_document_id)["effective_value"] == "150"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        notice = connection.execute(
+            text("SELECT details FROM auditcore.p2_activity_events WHERE tenant_id=:t AND journey_id=:j "
+                 "AND event_type='FIELD_CORRECTED_FOR_INFORMATION'"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).scalar_one()
+    assert notice["actorId"] == journey.actor_id and notice["appliedFromTask"] == waiting
+
+    # Run again: nothing left to apply.
+    run_waiting_corrections(journey.engine, "t1-commit", [journey.tenant_id])
+    assert _amount_row(journey, di_document_id)["effective_value"] == "150"
+
+
+def test_a_waiting_correction_whose_field_changed_is_left_open(journey):
+    from audit_core.uc03_waiting_corrections import run_waiting_corrections
+
+    di_document_id = uuid4()
+    add_page(journey, di_document_id=di_document_id)
+    canonical = add_extracted_field(
+        journey, di_document_id=di_document_id, field_key="p2_test_amount", value="100", confidence=98.0,
+    )
+    waiting = _waiting_correction(
+        journey, di_document_id=di_document_id, canonical=canonical, proposed="150", current="90",
+    )
+    run_waiting_corrections(journey.engine, "t2-commit", [journey.tenant_id])
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert connection.execute(
+            text("SELECT task_status FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_id=:id"),
+            {"t": journey.tenant_id, "id": waiting},
+        ).scalar_one() == "READY"
+    assert _amount_row(journey, di_document_id)["effective_value"] == "100"
