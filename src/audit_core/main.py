@@ -43,6 +43,7 @@ from audit_core.readiness import router as readiness_router
 from audit_core.role_mapping_policy import install_role_mapping_policy
 from audit_core.runtime_warmup import warm_runtime_dependencies
 from audit_core.system_health_api import router as system_health_router
+from audit_core.system_health_trends import router as system_health_trends_router
 from audit_core.task_manager_api import admin_router as task_manager_admin_router
 from audit_core.task_manager_api import router as task_manager_router
 from audit_core.tasks_api import router as task_router
@@ -354,6 +355,7 @@ def create_app() -> FastAPI:
     application.include_router(user_project_history_router)
     application.include_router(oem_price_masters_router)
     application.include_router(system_health_router)
+    application.include_router(system_health_trends_router)
 
     @application.get("/health")
     def health() -> dict[str, str]:

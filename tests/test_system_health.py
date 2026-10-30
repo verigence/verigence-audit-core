@@ -49,7 +49,7 @@ def test_heartbeat_writes_a_boot_beats_flushes_requests_and_stamps_the_stop(engi
     runtime = get_engine()  # the API's own engine: drops to audit_core_runtime
     platform_health.record_boot(runtime, "x")
     platform_health.record_request(200, "/p2/v1/x", 50, slow_ms=2000)
-    platform_health.record_request(404, "/p2/v1/x", 50, slow_ms=2000)
+    platform_health.record_request(404, "/p2/v1/x", 50, slow_ms=2000, error_code="VAC-NF-005")
     platform_health.record_request(500, "/p2/v1/y", 3000, slow_ms=2000)
     platform_health.record_stop(runtime, "x", "shutdown")
     with engine.begin() as connection:
@@ -64,7 +64,8 @@ def test_heartbeat_writes_a_boot_beats_flushes_requests_and_stamps_the_stop(engi
         ).scalar_one()
     assert boot.stopped_at_utc is not None and boot.stop_reason == "shutdown"
     assert tuple(stats) == (3, 1, 1, 1)
-    assert routes == {"/p2/v1/x": {"4xx": 1, "5xx": 0}, "/p2/v1/y": {"4xx": 0, "5xx": 1}}
+    assert routes == {"/p2/v1/x": {"4xx": 1, "5xx": 0, "codes": {"404 VAC-NF-005": 1}},
+                      "/p2/v1/y": {"4xx": 0, "5xx": 1, "codes": {"500": 1}}}
 
 
 def test_the_worker_heartbeat_thread_stops_cleanly(engine, monkeypatch):
@@ -347,3 +348,90 @@ def test_di_health_is_asked_with_a_di_service_token(monkeypatch):
                         lambda url, **kw: httpx.Response(403, request=httpx.Request("GET", url)))
     with pytest.raises(system_health_di.DiHealthUnavailable, match="403"):
         system_health_di.fetch_di_health(6)
+
+
+def _admin_get(monkeypatch, path, params):
+    from audit_core import system_health_trends
+    from audit_core.system_health_di import DiHealthUnavailable
+
+    def unreachable(hours):
+        raise DiHealthUnavailable("not in tests")
+
+    monkeypatch.setattr(system_health_trends, "fetch_di_health", unreachable)
+    client = TestClient(app, raise_server_exceptions=False)
+    try:
+        app.dependency_overrides[require_super_admin_request] = lambda: HumanAdminRequest(
+            user_id="sa", bearer_token="t",
+            admin_context=SecurityAdminContext(user_id="sa", is_super_admin=True, admin_scopes=()))
+        response = client.get(path, params=params)
+    finally:
+        app.dependency_overrides.clear()
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_failed_requests_are_broken_down_by_status_and_error_code(engine, monkeypatch):
+    svc = f"api-{uuid4().hex[:6]}"
+    auth_route, scope_route, old_route = (f"/p2/v1/{uuid4().hex[:8]}/{x}" for x in ("auth", "scope", "old"))
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO platform_ops.http_minute_stats (service_name, boot_id, minute_utc, total, client_errors, "
+                 "server_errors, failed_routes) VALUES (:s, :b, date_trunc('minute', now()) - interval '5 minutes', "
+                 "100, 9, 1, CAST(:r AS jsonb))"),
+            {"s": svc, "b": str(uuid4()), "r": json.dumps({
+                auth_route: {"4xx": 4, "5xx": 1, "codes": {"401 VAC-AUTH-001": 4, "500 VAC-SYS-001": 1}},
+                scope_route: {"4xx": 3, "5xx": 0, "codes": {"404 VAC-NF-005": 2, "403 VAC-AUTH-002": 1}},
+                old_route: {"4xx": 2, "5xx": 0},  # recorded before the codes were
+            })})
+    body = _admin_get(monkeypatch, "/v1/admin/system-health/errors", {"hours": 1})
+    routes = {r["route"]: r for r in body["byRoute"] if r["service"] == svc}
+    assert [c["key"] for c in routes[auth_route]["codes"]] == ["401 VAC-AUTH-001", "500 VAC-SYS-001"]
+    assert routes[scope_route]["notClassified"] == 0 and routes[old_route]["notClassified"] == 2
+    by_key = {c["key"]: c for c in body["byCode"]}
+    auth = by_key["401 VAC-AUTH-001"]
+    assert auth["status"] == 401 and auth["category"] == "SECURITY" and "token" in auth["meaning"]
+    assert {"service": svc, "route": auth_route, "count": 4} in auth["routes"]
+    assert "scope" in by_key["404 VAC-NF-005"]["meaning"]
+    # Server errors lead the list.
+    assert body["byCode"][0]["status"] >= 500
+    assert body["totals"]["notClassified"] >= 2
+
+
+def test_the_daily_trend_counts_di_outcomes_and_failures_per_ist_day(engine, monkeypatch):
+    from p2_support import add_page
+
+    journey = create_p2_journey(engine, prefix="daily")
+    add_page(journey, page_number=1, status="READY")
+    add_page(journey, page_number=2, status="READY")
+    _, blurred, _ = add_page(journey, page_number=3, status="FAILED")
+    _, late, _ = add_page(journey, page_number=4, status="FAILED")
+    with engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_document_queue SET last_error='DI_QUALITY_IMAGE_BLUR_SCORE' "
+                                "WHERE queue_id=:q"), {"q": blurred})
+        connection.execute(text("UPDATE auditcore.p2_document_queue SET last_error='NOT_READ_IN_30_MIN' "
+                                "WHERE queue_id=:q"), {"q": late})
+        connection.execute(
+            text("INSERT INTO auditcore.p2_work_queue (tenant_id, journey_id, work_type, work_key, work_status) "
+                 "VALUES (:t, :j, 'JOURNEY_RECONCILE', :k, 'DEAD_LETTER')"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "k": f"k-{uuid4().hex}"})
+    body = _admin_get(monkeypatch, "/v1/admin/system-health/daily",
+                      {"days": 7, "tenantId": journey.tenant_id})
+    assert len(body["days"]) == 7 and body["tenantId"] == journey.tenant_id
+    today = body["days"][-1]
+    assert (today["documents"], today["read"], today["badScan"], today["notReadInTime"]) == (4, 2, 1, 1)
+    assert today["diFailedPct"] == 50.0 and today["diSystemFailedPct"] == 25.0
+    assert today["deadLetters"] == 1
+    assert any(p["tenantId"] == journey.tenant_id for p in body["projects"])
+    assert any("Document Intelligence's restarts are missing" in n for n in body["notes"])
+    assert str(journey.journey_id) not in json.dumps(body)
+
+
+def test_the_middleware_counts_a_refused_request_with_its_error_code(monkeypatch):
+    monkeypatch.setattr(platform_health, "_minutes", {})
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.get("/p2/v1/tenants/t-1/journeys")  # no token
+    assert response.status_code == 401
+    [bucket] = platform_health._minutes.values()
+    codes = bucket["routes"]["/p2/v1/tenants/{tenant_id}/journeys"][2]
+    assert dict(codes) == {"401 VAC-AUTH-001": 1}

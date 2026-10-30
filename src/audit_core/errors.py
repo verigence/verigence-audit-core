@@ -178,6 +178,8 @@ def _problem(
             fields["module"] = frames[-1]
     getattr(logger, _LOG_LEVEL_BY_CATEGORY[category])("api_error", **fields)
     request.state.problem_logged = True
+    # Counted per route by the request middleware for System Health (2026-10-30).
+    request.state.error_code = error_code
     return JSONResponse(
         status_code=status_code,
         media_type="application/problem+json",
