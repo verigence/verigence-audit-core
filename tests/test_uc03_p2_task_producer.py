@@ -390,3 +390,45 @@ def test_a_statement_with_no_balance_read_is_not_held_against_its_lines(journey)
         assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
                                        journey_id=journey.journey_id) == {"RAISED": 1}
     assert _task(journey, f"field-review:{bad}") is not None
+
+
+def _stage_run(journey, code, *, status, stage):
+    registry = get_registry()
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        transition = write_control_state(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+            control=registry.controls[code], status=status, stage=stage,
+            reason="Fields still to verify" if status == "FAIL" else None,
+        )
+        counts = apply_control_transitions(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+            transitions=[transition], evaluation_started_at=datetime.now(UTC),
+        )
+        task = connection.execute(
+            text("SELECT task_status, round_number FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k"),
+            {"t": journey.tenant_id, "k": f"control:{journey.journey_id}:{code}"},
+        ).mappings().one_or_none()
+        return transition, counts, dict(task) if task else None
+
+
+def test_one_stage_passing_does_not_close_the_other_stage_failure(journey):
+    """MANUAL_VERIFICATION runs once per stage but keeps one task per Journey:
+    clean booking documents must not close the task the delivery documents keep
+    open, run after run (2,878 reopenings in three days, 2026-10-30)."""
+    _, _, task = _stage_run(journey, "MANUAL_VERIFICATION", status="FAIL", stage="DELIVERY")
+    assert task["task_status"] == "READY" and task["round_number"] == 1
+
+    transition, counts, task = _stage_run(journey, "MANUAL_VERIFICATION", status="PASS", stage="BOOKING")
+    assert transition.current == "FAIL" and transition.stage == "DELIVERY"
+    assert counts.get("VERIFIED", 0) == 0
+    assert task["task_status"] == "READY" and task["round_number"] == 1
+
+    # Repeating the pair changes nothing: no close, no reopen, no new round.
+    _stage_run(journey, "MANUAL_VERIFICATION", status="FAIL", stage="DELIVERY")
+    _, _, task = _stage_run(journey, "MANUAL_VERIFICATION", status="PASS", stage="BOOKING")
+    assert task["task_status"] == "READY" and task["round_number"] == 1
+
+    # The delivery documents' own run clearing is what closes it.
+    _, counts, task = _stage_run(journey, "MANUAL_VERIFICATION", status="PASS", stage="DELIVERY")
+    assert counts.get("VERIFIED") == 1 and task["task_status"] == "VERIFIED_COMPLETE"

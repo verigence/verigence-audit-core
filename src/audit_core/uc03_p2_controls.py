@@ -119,16 +119,40 @@ def write_control_state(
     finding_id: UUID | None = None,
     fact_version: int | None = None,
 ) -> Transition:
-    previous = connection.execute(
+    stored = connection.execute(
         text(
             """
-            SELECT control_status FROM auditcore.p2_control_state
+            SELECT control_status, stage_code, finding_id, details FROM auditcore.p2_control_state
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND control_code=:code
             FOR UPDATE
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id, "code": control.code},
-    ).scalar_one_or_none()
+    ).mappings().one_or_none()
+    previous = str(stored["control_status"]) if stored else None
+    if (
+        stored is not None and previous == "FAIL" and status in {"PASS", "NOT_APPLICABLE"}
+        and control.mode == "RERUN" and len(control.phases) > 1
+        and stage is not None and stored["stage_code"] is not None and str(stored["stage_code"]) != stage
+    ):
+        # A native check that runs once per stage keeps one state per Journey.
+        # One stage's clean documents do not clear a failure the other stage's
+        # run recorded: that stage's own run, queued alongside this one, is the
+        # only thing that can (2026-10-30: the Manual verification task of a
+        # Journey with clean booking documents and unreviewed delivery ones
+        # closed on every BOOKING run and reopened on every DELIVERY run).
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_control_state
+                SET last_evaluated_at_utc=now(), evaluation_count=evaluation_count + 1, updated_at_utc=now()
+                WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND control_code=:code
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "code": control.code},
+        )
+        kept = dict(stored["details"] or {})
+        return Transition(control.code, previous, previous, str(stored["stage_code"]), kept, stored["finding_id"])
     connection.execute(
         text(
             """

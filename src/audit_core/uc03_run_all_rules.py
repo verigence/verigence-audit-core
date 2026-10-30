@@ -233,6 +233,16 @@ def _run_audit_core_rules_for_stage(
     manual_verification_result = sync_manual_verification_findings(
         connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage, correlation_id=correlation_id
     )
+    if not manual_verification_result.get("error"):
+        # The sync is per stage; the control's verdict is per Journey (see
+        # manual_verification_pending): otherwise the BOOKING run passes and the
+        # DELIVERY run fails the same task, turn after turn.
+        from audit_core.uc03_manual_verification import manual_verification_pending
+
+        manual_verification_result = {
+            **manual_verification_result,
+            **manual_verification_pending(connection, tenant_id=tenant_id, journey_id=journey_id),
+        }
     record_from_summary(
         connection, tenant_id=tenant_id, journey_id=journey_id,
         rule_code="MANUAL_VERIFICATION", triggering_event=_TRIGGERING_EVENT,
