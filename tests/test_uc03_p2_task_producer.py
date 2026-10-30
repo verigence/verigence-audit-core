@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import pytest
 from conftest import delete_tenant_data
 from p2_support import (
     AllowAllAuthorization,
+    add_evidence,
     add_extracted_field,
     add_ready_document,
     create_p2_journey,
@@ -416,6 +418,9 @@ def test_one_stage_passing_does_not_close_the_other_stage_failure(journey):
     """MANUAL_VERIFICATION runs once per stage but keeps one task per Journey:
     clean booking documents must not close the task the delivery documents keep
     open, run after run (2,878 reopenings in three days, 2026-10-30)."""
+    # A delivery document on file: the delivery is active, so NATIVE:DELIVERY
+    # runs alongside NATIVE:BOOKING on every evaluation.
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
     _, _, task = _stage_run(journey, "MANUAL_VERIFICATION", status="FAIL", stage="DELIVERY")
     assert task["task_status"] == "READY" and task["round_number"] == 1
 

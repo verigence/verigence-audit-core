@@ -134,6 +134,11 @@ def write_control_state(
         stored is not None and previous == "FAIL" and status in {"PASS", "NOT_APPLICABLE"}
         and control.mode == "RERUN" and len(control.phases) > 1
         and stage is not None and stored["stage_code"] is not None and str(stored["stage_code"]) != stage
+        # ...but only while that other stage's run still happens: a failure the
+        # DELIVERY run recorded before the delivery went back (its documents
+        # voided) must not outlive the runs that could clear it.
+        and (str(stored["stage_code"]) != "DELIVERY"
+             or delivery_active(connection, tenant_id=tenant_id, journey_id=journey_id))
     ):
         # A native check that runs once per stage keeps one state per Journey.
         # One stage's clean documents do not clear a failure the other stage's

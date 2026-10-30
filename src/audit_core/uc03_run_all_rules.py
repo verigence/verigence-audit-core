@@ -30,6 +30,7 @@ from __future__ import annotations
 from typing import Annotated, Any
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 from sqlalchemy import Connection, Engine, text
@@ -50,6 +51,8 @@ from audit_core.uc03_rule_execution_log import (
     record_from_resolution,
     record_from_summary,
 )
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}/uc03", tags=["uc03-run-all-rules"]
@@ -239,10 +242,14 @@ def _run_audit_core_rules_for_stage(
         # DELIVERY run fails the same task, turn after turn.
         from audit_core.uc03_manual_verification import manual_verification_pending
 
-        manual_verification_result = {
-            **manual_verification_result,
-            **manual_verification_pending(connection, tenant_id=tenant_id, journey_id=journey_id),
-        }
+        try:
+            manual_verification_result = {
+                **manual_verification_result,
+                **manual_verification_pending(connection, tenant_id=tenant_id, journey_id=journey_id),
+            }
+        except Exception:
+            logger.warning("uc03_manual_verification_pending_failed", tenant_id=tenant_id,
+                           journey_id=str(journey_id), exc_info=True)
     record_from_summary(
         connection, tenant_id=tenant_id, journey_id=journey_id,
         rule_code="MANUAL_VERIFICATION", triggering_event=_TRIGGERING_EVENT,
