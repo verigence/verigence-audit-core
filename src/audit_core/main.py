@@ -118,6 +118,7 @@ from audit_core.uc03_nightly_reprocessing_reports import (
 )
 from audit_core.uc03_p2_api import router as uc03_p2_router
 from audit_core.uc03_p2_daily_report import router as uc03_p2_daily_report_router
+from audit_core.uc03_p2_day_stats import router as uc03_p2_day_stats_router
 from audit_core.uc03_p2_deal_actions import router as uc03_p2_deal_router
 from audit_core.uc03_p2_documents import router as uc03_p2_documents_router
 from audit_core.uc03_p2_gate_pass import router as uc03_p2_gate_pass_router
@@ -299,6 +300,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_reviewer_router)
     application.include_router(uc03_p2_journey_delete_router)
     application.include_router(uc03_p2_daily_report_router)
+    application.include_router(uc03_p2_day_stats_router)
     application.include_router(onboarding_router)
     application.include_router(uc03_p2_deal_router)
     application.include_router(uc03_sku_standard_router)

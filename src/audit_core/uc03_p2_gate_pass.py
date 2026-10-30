@@ -698,7 +698,16 @@ def gate_pass_summary(
     start = start or end
     if start > end or (end - start).days >= MAX_SUMMARY_DAYS:
         raise HTTPException(status_code=422, detail=f"Choose a range of 1 to {MAX_SUMMARY_DAYS} days.")
-    outlets = [o for o in scope_outlets(connection, tenant_id, principal.subject)
+    return build_gate_pass_summary(connection, tenant_id=tenant_id, actor_id=principal.subject, start=start, end=end)
+
+
+def build_gate_pass_summary(connection: Connection, *, tenant_id: str, actor_id: str,
+                            start: date, end: date) -> dict[str, Any]:
+    """The consolidated gate pass figures of ``gate_pass_summary`` for the
+    caller's onsite outlets over ``start``..``end`` (already validated). Shared
+    with the day-stats card on the Employee and Team Lead dashboards (2026-10-30),
+    so one definition of every figure serves both views."""
+    outlets = [o for o in scope_outlets(connection, tenant_id, actor_id)
                if o["outlet_classification"] == "ONSITE"]
     days = [start + timedelta(days=i) for i in range((end - start).days + 1)
             if (start + timedelta(days=i)).isoweekday() != 7]
