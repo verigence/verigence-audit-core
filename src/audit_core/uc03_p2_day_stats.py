@@ -366,6 +366,7 @@ def build_day_stats(connection: Connection, *, tenant_id: str, actor_id: str, fu
             tk["closedLate"] += 1
 
     me = {"uploads": _empty_uploads(), "tasks": _empty_tasks(), "tasksReviewed": 0}
+    unplaced_tasks = 0
     for t in _tasks(connection, params=params):
         done = t["done_at"]
         closed_in_range = done is not None and s <= done < e
@@ -386,7 +387,11 @@ def build_day_stats(connection: Connection, *, tenant_id: str, actor_id: str, fu
             add_task(day, t)
         oid, did = (str(t["outlet_id"]) if t["outlet_id"] else None), (str(t["dealer_id"]) if t["dealer_id"] else None)
         outlet = outlet_rows.get(oid or "")
-        if outlet is not None:
+        if outlet is None:
+            # A Project-wide Task Manager task has no outlet: it is in the totals,
+            # the days and the person's line, but in no outlet or dealership row.
+            unplaced_tasks += 1
+        else:
             add_task(outlet, t)
             if did in dealers:
                 add_task(dealers[did], t)
@@ -488,7 +493,10 @@ def build_day_stats(connection: Connection, *, tenant_id: str, actor_id: str, fu
         "pcs": flat_pcs if supervisor else [p for p in flat_pcs if p["actorId"] == actor_id],
         "days": day_list,
         "self": me,
+        "unplacedTasks": unplaced_tasks,
         "notes": [
+            *([(f"{unplaced_tasks} closed task(s) belong to the whole Project, not to an outlet: counted in the "
+                "totals and per person, in no outlet or dealership row.")] if unplaced_tasks else []),
             ("A file is a Delivery upload when the Journey was already in delivery (Booking complete or a "
              "Delivery stage) when it was uploaded; otherwise a Booking upload. A cancelled duplicate is not "
              "an upload."),
