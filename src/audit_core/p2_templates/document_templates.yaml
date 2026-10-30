@@ -1216,6 +1216,9 @@ document_types:
     stage: DELIVERY
     requirement: CONDITIONAL
     condition: financeCase
+    # Either one proves the financier's commitment (product owner 2026-10-30):
+    # one requirement, met by whichever is on file.
+    group: FINANCE_APPROVAL
     accepted_early: true
     pages:
       shape: MULTI_PAGE
@@ -1248,6 +1251,9 @@ document_types:
     stage: DELIVERY
     requirement: CONDITIONAL
     condition: financeCase
+    # Either one proves the financier's commitment (product owner 2026-10-30):
+    # one requirement, met by whichever is on file.
+    group: FINANCE_APPROVAL
     accepted_early: true
     pages:
       shape: MULTI_PAGE

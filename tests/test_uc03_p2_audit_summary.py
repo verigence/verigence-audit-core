@@ -203,3 +203,44 @@ def test_road_tax_and_registration_are_one_line_per_document() -> None:
     assert {s["documentType"]: s["amount"] for s in row["sources"]} == {"rto_challan": "132132", "cost_sheet": "132132"}
     out = summary.conclude_charge(row, on_file={"rto_challan"})
     assert (out["conclusion"], out["rule"], out["proof"]["amount"]) == (summary.OK, "AS-02", "132132.00")
+
+
+# ── the loan (2026-10-30, REBARANI GANTHIA) ──────────────────────────────────
+
+def test_a_financed_deal_with_no_loan_amount_cannot_be_judged_not_short() -> None:
+    loan = summary.loan_received(matched=None, disbursement_known=False, financed=True, stated=None,
+                                 receipt_amounts=[Decimal(325008)])
+    assert loan["unknown"] is True and loan["amount"] is None
+    settle = summary.settlement(Decimal(1950000), Decimal(325008), loan_unknown=True)
+    assert settle["conclusion"] == summary.CANNOT and settle["status"] is None and settle["balance"] is None
+
+
+def test_the_settlement_printouts_finance_do_is_the_loan_and_its_refund_is_paid_out() -> None:
+    stated = {"loan": Decimal(1649800), "refunds": Decimal(24143), "source": "Settlement (ERP printout)",
+              "documentId": "d"}
+    loan = summary.loan_received(matched=None, disbursement_known=False, financed=True, stated=stated,
+                                 receipt_amounts=[Decimal(50000), Decimal(275008)])
+    assert loan["amount"] == Decimal(1649800) and loan["source"] == "Settlement (ERP printout)"
+    received = Decimal(325008) + loan["amount"] - loan["refunds"]
+    settle = summary.settlement(Decimal(1900758), received)
+    assert settle["status"] == "EXCESS" and settle["balance"] == "-49907.00"
+
+
+def test_a_statement_loan_already_among_the_receipts_is_not_counted_twice() -> None:
+    stated = {"loan": Decimal(900000), "refunds": Decimal(0), "source": "NDC (account statement)", "documentId": "d"}
+    loan = summary.loan_received(matched=None, disbursement_known=False, financed=True, stated=stated,
+                                 receipt_amounts=[Decimal(900005)])
+    assert loan["amount"] == Decimal(0) and "not counted twice" in loan["note"]
+
+
+def test_a_disbursement_on_the_finance_record_wins_over_the_statement() -> None:
+    stated = {"loan": Decimal(900000), "refunds": Decimal(0), "source": "NDC (account statement)", "documentId": "d"}
+    loan = summary.loan_received(matched=Decimal(850000), disbursement_known=True, financed=True, stated=stated,
+                                 receipt_amounts=[])
+    assert loan["amount"] == Decimal(850000) and loan["source"] == "Loan disbursement on the finance record"
+
+
+def test_a_cash_deal_has_no_loan_and_is_judged() -> None:
+    loan = summary.loan_received(matched=None, disbursement_known=False, financed=False, stated=None,
+                                 receipt_amounts=[Decimal(100)])
+    assert loan["unknown"] is False and loan["amount"] is None
