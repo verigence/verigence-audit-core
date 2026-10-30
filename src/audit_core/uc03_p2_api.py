@@ -450,9 +450,11 @@ def cancel_p2_journey(
     from audit_core.uc03_p2_runtime import note_facts_changed
     from audit_core.uc03_p2_workflow import cancel_stuck_journey
 
-    access = _authorize(
+    # A Team Lead's bundle carries audit.work.update, not audit.journey.update
+    # (2026-10-30: every TL delete of a stuck booking was refused VAC-AUTH-002).
+    access = authorize_p2_any(
         connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
-        authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
+        authorization_client=authorization_client, permission_keys=(_UPDATE_PERMISSION, _WORK_UPDATE_PERMISSION),
     )
     set_tenant_context(connection, tenant_id)
     outcome = cancel_stuck_journey(

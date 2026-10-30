@@ -34,7 +34,7 @@ from audit_core.uc03_document_capture_v2 import (
 )
 from audit_core.uc03_document_field_corrections import _apply_field_value
 from audit_core.uc03_p2_access import (
-    authorize_p2,
+    authorize_p2_any,
     check_p2_permission,
     resolve_p2_scope,
 )
@@ -55,6 +55,9 @@ router = APIRouter(
 
 _READ_PERMISSION = "audit.journey.read"
 _UPDATE_PERMISSION = "audit.journey.update"
+# A Team Lead's bundle carries audit.work.update, not audit.journey.update: a
+# field confirmation or correction by a TL was refused VAC-AUTH-002 (2026-10-30).
+_FIELD_UPDATE_PERMISSIONS = (_UPDATE_PERMISSION, "audit.work.update")
 
 
 def _document_context(
@@ -814,13 +817,13 @@ def confirm_p2_document_field(
 ) -> dict[str, Any]:
     """The PC checked the page and the extracted value is right: record the
     review without changing the value (the machine value stays effective)."""
-    authorize_p2(
+    authorize_p2_any(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
-        permission_key=_UPDATE_PERMISSION,
+        permission_keys=_FIELD_UPDATE_PERMISSIONS,
     )
     _document_context(connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id)
     if _pending_for(
@@ -900,13 +903,13 @@ def correct_p2_document_field(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    access = authorize_p2(
+    access = authorize_p2_any(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         human_principal=human_principal,
         authorization_client=authorization_client,
-        permission_key=_UPDATE_PERMISSION,
+        permission_keys=_FIELD_UPDATE_PERMISSIONS,
     )
     context = _document_context(
         connection,

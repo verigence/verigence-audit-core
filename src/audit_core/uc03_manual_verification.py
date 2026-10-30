@@ -181,6 +181,31 @@ def _field_names_summary(field_keys: list[str]) -> str:
 
 
 # ── producer ──────────────────────────────────────────────────────────────────
+def manual_verification_pending(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, stages: tuple[str, ...] = ("BOOKING", "DELIVERY"),
+) -> dict[str, int]:
+    """How the MANUAL_VERIFICATION control stands for the whole Journey:
+    ``raised`` documents with unreviewed low-confidence fields and ``examined``
+    extracted fields, summed over ``stages``.
+
+    The control has one state per Journey (one Task Queue task, keyed without
+    a stage), but the checks run once per stage: judged by the stage's own
+    documents alone, a Journey whose booking documents are clean and whose
+    delivery documents are not was passed by the BOOKING run and failed by the
+    DELIVERY run every time, so its "Manual verification" task closed and
+    reopened on every evaluation -- 2,878 reopenings in three days on one
+    Project (2026-10-30). Summed over both stages, each run gives the one
+    answer there is."""
+    raised = examined = 0
+    for stage in stages:
+        pending = _by_document(
+            _unreviewed_low_confidence(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage)
+        )
+        raised += len(pending)
+        examined += _extracted_field_count(connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage)
+    return {"raised": raised, "examined": examined}
+
+
 def sync_manual_verification_findings(
     connection: Connection,
     *,

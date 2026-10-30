@@ -250,3 +250,33 @@ def test_legacy_finding_still_resolves_after_the_task_queue_move(journey) -> Non
         {"t": tenant_id},
     ).scalar_one()
     assert status == "RESOLVED"
+
+
+def test_the_control_verdict_counts_every_stage(journey) -> None:
+    """The MANUAL_VERIFICATION control is one per Journey, so its verdict must
+    not flip between the BOOKING run and the DELIVERY run (2026-10-30)."""
+    tenant_id, journey_id = journey.tenant_id, journey.journey_id
+    booking_doc, delivery_doc = uuid4(), uuid4()
+    _add_field(journey, tenant_id=tenant_id, journey_id=journey_id, document_id=booking_doc,
+               field_key="pan_number", value="ABCDE1234F", confidence=0.99)
+    journey.execute(
+        text("""INSERT INTO auditcore.journey_document_extracted_fields (
+                    tenant_id, journey_id, di_document_id, source_fact_ref, source_fact_version,
+                    stage_code, field_key, source_canonical_field_id, extracted_value, confidence_score,
+                    confidence_scale
+                ) VALUES (:t, :j, :doc, :ref, 1, 'DELIVERY', 'vin', 'vin', '"MA1"'::jsonb, 0.4, 'UNIT_INTERVAL')"""),
+        {"t": tenant_id, "j": journey_id, "doc": delivery_doc, "ref": uuid4()},
+    )
+
+    # Judged by its own documents alone, BOOKING passes and DELIVERY fails...
+    assert mv.manual_verification_pending(journey, tenant_id=tenant_id, journey_id=journey_id, stages=("BOOKING",)) == {
+        "raised": 0, "examined": 1}
+    assert mv.manual_verification_pending(journey, tenant_id=tenant_id, journey_id=journey_id, stages=("DELIVERY",)) == {
+        "raised": 1, "examined": 1}
+    # ...the Journey-wide verdict the control records is one FAIL, from either run.
+    assert mv.manual_verification_pending(journey, tenant_id=tenant_id, journey_id=journey_id) == {
+        "raised": 1, "examined": 2}
+
+    _mark_reviewed(journey, tenant_id=tenant_id, field_key="vin")
+    assert mv.manual_verification_pending(journey, tenant_id=tenant_id, journey_id=journey_id) == {
+        "raised": 0, "examined": 2}
