@@ -177,6 +177,15 @@ def test_finance_is_recorded() -> None:
         assert finance.status_code == 200, finance.text
         assert Decimal(str(finance.json()["financedAmount"])) == Decimal("1360000.00")
         assert client.get(finance_url).json() == finance.json()
+
+        # The "Loan amount" dialog's two calls are on the human token too
+        # (2026-10-30: on get_principal both were a guaranteed 401).
+        app.dependency_overrides.pop(get_principal)
+        candidates = client.get(f"{finance_url}/loan-disbursement-candidates")
+        assert candidates.status_code == 200, candidates.text
+        assert candidates.json() == []
+        chosen = client.put(f"{finance_url}/loan-disbursement", json={"paymentId": str(uuid4())})
+        assert chosen.status_code in (400, 404, 409, 422), chosen.text  # a real check, not a 401
     finally:
         app.dependency_overrides.clear()
         engine.dispose()
