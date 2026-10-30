@@ -11,7 +11,9 @@ storage with a presigned URL and one small finalize call records it.
                          short transaction inserts the row idempotently
 
 Photos are available at any stage (PCs often photograph the car at booking
-too). Delivery readiness counts them, and a machine-verified task asks for
+too). A PC may also add PDFs here (product owner 2026-10-30): at most
+``MAX_PDFS_PER_JOURNEY`` per booking, each up to ``MAX_PDF_BYTES``; they are
+stored as they are, like the photos, and count among them. Delivery readiness counts them, and a machine-verified task asks for
 them once Delivery is under way and none are on file.
 """
 from __future__ import annotations
@@ -46,8 +48,12 @@ _READ_PERMISSION = "audit.journey.read"
 _UPDATE_PERMISSION = "audit.journey.update"
 MAX_PHOTOS_PER_JOURNEY = 24
 MAX_PHOTO_BYTES = 15 * 1024 * 1024
+MAX_PDF_BYTES = 50 * 1024 * 1024
+MAX_PDFS_PER_JOURNEY = 3
+PDF_TYPE = "application/pdf"
 _CONTENT_TYPES = {
     "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/heic": "heic", "image/heif": "heif",
+    PDF_TYPE: "pdf",
 }
 VIEW_CODES = ("FRONT", "REAR", "LEFT", "RIGHT", "INTERIOR", "ODOMETER", "CHASSIS", "DELIVERY", "OTHER")
 _CLIENT_UPLOAD_ID = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
@@ -84,7 +90,7 @@ def _validate(file: PhotoFile | PhotoFinalize) -> tuple[str, str | None]:
     if content_type not in _CONTENT_TYPES:
         raise HTTPException(
             status_code=422,
-            detail=f"{file.filename}: vehicle photos must be JPEG, PNG, WEBP or HEIC images.",
+            detail=f"{file.filename}: only photos (JPEG, PNG, WEBP or HEIC) or PDF files can be added here.",
         )
     view = (file.viewCode or "").strip().upper() or None
     if view is not None and view not in VIEW_CODES:
@@ -104,6 +110,41 @@ def _active_count(connection: Connection, *, tenant_id: str, journey_id: UUID) -
             {"t": tenant_id, "j": journey_id},
         ).scalar_one()
     )
+
+
+def _active_pdf_count(connection: Connection, *, tenant_id: str, journey_id: UUID) -> int:
+    return int(
+        connection.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM auditcore.delivery_vehicle_photos
+                WHERE tenant_id=:t AND journey_id=:j AND deleted_at_utc IS NULL AND content_type=:pdf
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "pdf": PDF_TYPE},
+        ).scalar_one()
+    )
+
+
+def _megabytes(size: int) -> str:
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+def size_error(filename: str, content_type: str, size: int) -> str | None:
+    """Why a file of this size cannot be added, or None."""
+    if size <= 0:
+        return f"{filename} is empty."
+    if content_type == PDF_TYPE and size > MAX_PDF_BYTES:
+        return (f"{filename} is {_megabytes(size)}. A PDF can be at most {MAX_PDF_BYTES // (1024 * 1024)} MB: "
+                "split it or reduce its size and upload again.")
+    if content_type != PDF_TYPE and size > MAX_PHOTO_BYTES:
+        return f"{filename} is {_megabytes(size)}. A photo can be at most {MAX_PHOTO_BYTES // (1024 * 1024)} MB."
+    return None
+
+
+def pdf_limit_error(already: int) -> str:
+    return (f"At most {MAX_PDFS_PER_JOURNEY} PDFs can be added per booking ({already} already added). "
+            "Remove one to add another.")
 
 
 def _existing(connection: Connection, *, tenant_id: str, journey_id: UUID, client_upload_id: str):
@@ -168,6 +209,8 @@ def list_vehicle_photos(
         "photos": [_public(r, url=_signed_url(str(r["object_key"]))) for r in rows],
         "limit": MAX_PHOTOS_PER_JOURNEY,
         "maxBytes": MAX_PHOTO_BYTES,
+        "pdfLimit": MAX_PDFS_PER_JOURNEY,
+        "maxPdfBytes": MAX_PDF_BYTES,
         "views": list(VIEW_CODES),
     }
 
@@ -186,15 +229,17 @@ def create_vehicle_photo_intents(
         authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
     )
     for file in command.files:
-        _validate(file)
-        if file.sizeBytes > MAX_PHOTO_BYTES:
-            raise HTTPException(status_code=422, detail=f"{file.filename} is larger than 15 MB.")
+        content_type, _ = _validate(file)
+        problem = size_error(file.filename, content_type, file.sizeBytes)
+        if problem:
+            raise HTTPException(status_code=422, detail=problem)
     with engine.begin() as connection:
         resolve_p2_scope(
             connection, tenant_id=tenant_id, journey_id=journey_id,
             human_principal=human_principal, decision=decision,
         )
         active = _active_count(connection, tenant_id=tenant_id, journey_id=journey_id)
+        active_pdfs = _active_pdf_count(connection, tenant_id=tenant_id, journey_id=journey_id)
         stored = {
             f.clientUploadId: _existing(connection, tenant_id=tenant_id, journey_id=journey_id,
                                         client_upload_id=f.clientUploadId)
@@ -207,6 +252,8 @@ def create_vehicle_photo_intents(
             detail=f"At most {MAX_PHOTOS_PER_JOURNEY} vehicle photos are kept per booking "
                    f"({active} already on file).",
         )
+    if active_pdfs + sum(1 for f in new if f.contentType.strip().lower() == PDF_TYPE) > MAX_PDFS_PER_JOURNEY:
+        raise HTTPException(status_code=422, detail=pdf_limit_error(active_pdfs))
     try:
         storage = uc03_p2_storage.get_p2_document_storage()
     except RuntimeError as exc:
@@ -267,8 +314,9 @@ def finalize_vehicle_photo(
     except (RuntimeError, uc03_p2_storage.P2DocumentStorageError) as exc:
         raise HTTPException(status_code=409, detail="The photo has not finished uploading. Retry.") from exc
     size = int(metadata["contentLength"])
-    if size <= 0 or size > MAX_PHOTO_BYTES:
-        raise HTTPException(status_code=422, detail="The uploaded photo is empty or larger than 15 MB.")
+    problem = size_error(command.filename, content_type, size)
+    if problem:
+        raise HTTPException(status_code=422, detail=problem)
 
     correlation_id = get_correlation_id(request)
     with engine.begin() as connection:
@@ -286,6 +334,10 @@ def finalize_vehicle_photo(
             raise HTTPException(
                 status_code=422, detail=f"At most {MAX_PHOTOS_PER_JOURNEY} vehicle photos are kept per booking.",
             )
+        if content_type == PDF_TYPE:
+            pdfs = _active_pdf_count(connection, tenant_id=tenant_id, journey_id=journey_id)
+            if pdfs >= MAX_PDFS_PER_JOURNEY:
+                raise HTTPException(status_code=422, detail=pdf_limit_error(pdfs))
         row = connection.execute(
             text(
                 """
