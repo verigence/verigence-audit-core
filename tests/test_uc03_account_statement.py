@@ -698,3 +698,125 @@ def test_migration_0176_cancels_the_retired_ndc_signature_question(journey) -> N
                                         "WHERE tenant_id=:t AND task_id=:id"),
                                    {"t": journey.tenant_id, "id": task_id}).one()
     assert status == "CANCELLED" and result["outcome"] == "CHECK_RETIRED"
+
+
+# ── the ERP settlement printout (REBARANI GANTHIA, 2026-10-30) ────────────────
+
+SETTLEMENT = [  # ADI, REBARANI GANTHIA, the ERP "Settlement" printout as DI read it (2026-10-30)
+    {"particulars_raw": "Ex-Showroom", "debit_amount": 1234214.28},
+    {"particulars_raw": "Road Side Assistance", "debit_amount": 0},
+    {"particulars_raw": "Insurance", "debit_amount": 74827},
+    {"particulars_raw": "Registration Charges", "debit_amount": 142132},
+    {"particulars_raw": "TCS", "debit_amount": 16899},
+    {"particulars_raw": "Extended Warranty", "debit_amount": 0},
+    {"particulars_raw": "FASTAG", "debit_amount": 0},
+    {"particulars_raw": "Auto Card / Loyalty Card", "debit_amount": 0},
+    {"particulars_raw": "Accessories", "debit_amount": 0},
+    {"particulars_raw": "Sale Of Accessories", "debit_amount": 0},
+    {"particulars_raw": "CNG (Fitted)", "debit_amount": 0},
+    {"particulars_raw": "SALE OF PPF", "debit_amount": 0},
+    {"particulars_raw": "Round Off", "debit_amount": -0.4},
+    {"particulars_raw": "Total Vehicle Cost", "debit_amount": 1939472},
+    {"particulars_raw": "Other Discount", "credit_amount": -3000},
+    {"particulars_raw": "Corporate Discount", "credit_amount": 0},
+    {"particulars_raw": "Discount on Sale (Non GST)", "credit_amount": 0},
+    {"particulars_raw": "Exchange Discount", "credit_amount": 0},
+    {"particulars_raw": "Discount on Sale of Accessories (FOC)", "credit_amount": 0},
+    {"particulars_raw": "Discount on Sales (GST)", "credit_amount": 0},
+    {"particulars_raw": "Exchange Bonus", "credit_amount": 0},
+    {"particulars_raw": "Loyality Exchange UIO Claim (GST)", "credit_amount": 0},
+    {"particulars_raw": "Loyalty Discount", "credit_amount": 0},
+    {"particulars_raw": "Loyalty Exchange Discount", "credit_amount": 0},
+    {"particulars_raw": "CNG Discount", "credit_amount": 0},
+    {"particulars_raw": "Corporate Claim (CSD)", "credit_amount": 0},
+    {"particulars_raw": "Scheme Discount", "credit_amount": -35714},
+    {"particulars_raw": "Corporate", "credit_amount": 0},
+    {"particulars_raw": "Total Discount", "credit_amount": -38714},
+    {"particulars_raw": "Exchange of Old Car", "credit_amount": 0},
+    {"particulars_raw": "Old Car Value", "credit_amount": 0},
+    {"particulars_raw": "Net Vehicle Cost", "debit_amount": 1900758},
+    {"entry_date": "2026-09-29", "particulars_raw": "Bank Finance DO (BDO), 02204, Cholamandalam Investment & Finance Co. Ltd.(Finance)", "credit_amount": -1649800},
+    {"entry_date": "2026-10-04", "particulars_raw": "Journal_NonGST, 24890, REBARANI GANTHIA-EALPG1390E", "voucher_type": "Journal_NonGST", "voucher_number": "24890", "credit_amount": -325008},
+    {"particulars_raw": "Total Amount Received/Other Adjustment", "credit_amount": -1974808},
+    {"entry_date": "2026-09-28", "particulars_raw": "Journal_NonGST, 24885, DigiELV PURCHASE & SALE (COD)", "voucher_type": "Journal_NonGST", "voucher_number": "24885", "debit_amount": 24143},
+    {"particulars_raw": "Total Amount Refunded/Other Adjustment", "debit_amount": 24143},
+    {"particulars_raw": "Amount To Refund", "running_balance": -49907},
+]
+
+
+def test_the_erp_settlement_is_not_a_tally_printout_although_its_last_line_has_a_balance() -> None:
+    assert statement_kind(SETTLEMENT) == module.KIND_ERP
+
+
+def test_the_erp_settlement_gives_the_charges_without_gst_split_and_the_postings() -> None:
+    read = module.read_erp_settlement(SETTLEMENT)
+    assert read.components == {"tcs_amount": Decimal(16899), "insurance_amount": Decimal(74827),
+                               "registration_charges": Decimal(142132)}
+    assert read.financer == Decimal(1649800)
+    assert read.receipts == Decimal(1974808)  # finance DO + the customer's journal
+    assert read.refunds == Decimal(24143)
+    # Its ex-showroom and discounts are before GST: reported, never read.
+    assert {u["label"] for u in read.unmapped} == {"EX-SHOWROOM", "OTHER DISCOUNT", "SCHEME DISCOUNT"}
+    assert not read.discounts and read.conflicts == []
+
+
+def test_the_erp_settlement_is_recorded_for_the_deal_but_sets_nothing_canonical(journey) -> None:
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    document_id, _ = _ledger(journey, SETTLEMENT)
+    result = _sync(journey)
+    assert result["statements"] == 0 and result["tallies"] == 0
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        recorded = dict(c.execute(
+            text("SELECT component_key, amount FROM auditcore.commercial_line_source_values "
+                 "WHERE tenant_id=:t AND journey_id=:j AND source_document_type='erp_settlement'"),
+            {"t": journey.tenant_id, "j": journey.journey_id}).all())
+    assert recorded == {"tcs_amount": Decimal("16899.00"), "insurance_amount": Decimal("74827.00"),
+                        "registration_charges": Decimal("142132.00")}
+    assert all(source is None or not str(source).startswith("customer_ledger")
+               for _, source in _lines(journey).values())
+    assert _open_tasks(journey) == {}
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        loan = module.statement_loan(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert loan == {"loan": Decimal(1649800), "refunds": Decimal(24143), "source": "Settlement (ERP printout)",
+                    "documentId": str(document_id)}
+
+
+def test_a_statement_form_gives_its_financer_line_as_the_loan_and_none_without_one(journey) -> None:
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        assert module.statement_loan(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id) is None
+    _ledger(journey, [*ADITYA, {"particulars_raw": "FINANCER AMOUNT", "credit_amount": 900000}])
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        loan = module.statement_loan(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert loan["loan"] == Decimal(900000) and loan["source"] == "NDC (account statement)"
+    assert loan["refunds"] == Decimal(0)
+
+
+def test_the_settlement_printout_bills_its_charges_and_the_cost_sheet_still_gives_the_vehicle(journey) -> None:
+    """REBARANI GANTHIA: the Deal shows the settlement's TCS, insurance and
+    registration; the vehicle price (before GST on the printout) stays the
+    cost sheet's."""
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _cost_sheet(journey, {**AGREEING_SHEET, "ex_showroom_price": "1739901", "tcs_amount": "17399"})
+    _ledger(journey, SETTLEMENT)
+    _sync(journey)
+    rows = _deal_rows(journey)
+    assert D(str(rows["tcs_amount"]["billed"])) == D(16899)
+    assert any(s["document"] == "Settlement (ERP printout)" for s in rows["tcs_amount"]["sources"])
+    assert "INVOICES_DISAGREE" not in rows["tcs_amount"]["flags"]
+    # The cost sheet's insurance (40,825) does not stand in where the settlement gives one.
+    assert D(str(rows["insurance_amount"]["billed"])) == D(74827)
+    assert D(str(rows["ex_showroom_price"]["billed"])) == D(1739901)
+    assert any(s["document"] == "Cost sheet (no NDC on file)" for s in rows["ex_showroom_price"]["sources"])
+
+
+def test_a_statement_form_on_file_keeps_the_settlement_printout_out_of_the_deal(journey) -> None:
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _ndc(journey)
+    _ledger(journey, SETTLEMENT)
+    _sync(journey)
+    rows = _deal_rows(journey)
+    assert not any(s["document"] == "Settlement (ERP printout)" for r in rows.values() for s in r["sources"])

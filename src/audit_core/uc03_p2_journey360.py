@@ -287,9 +287,14 @@ _STATEMENT_COLUMN_TYPE = "account_statement"
 # which is available cost sheet or NDC you can pick any one"); under this name
 # the cost sheet stands in the billed column and says whose figures they are.
 _COST_SHEET_STANDIN_TYPE = "cost_sheet_in_place_of_ndc"
+# The ERP "Settlement" printout (uc03_account_statement.read_erp_settlement):
+# billed for the charges it carries without a GST split; the cost sheet keeps
+# standing in for the rest (2026-10-30).
+_SETTLEMENT_TYPE = "erp_settlement"
 _COLUMN_LABELS = {
     _STATEMENT_COLUMN_TYPE: "NDC (Account Statement)",
     _COST_SHEET_STANDIN_TYPE: "Cost sheet (no NDC on file)",
+    _SETTLEMENT_TYPE: "Settlement (ERP printout)",
 }
 _QUOTE_NORM = frozenset(_norm_type(t) for t in _QUOTE_SOURCES)
 
@@ -1048,11 +1053,18 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             for s in sources if not is_invoice_type(s["source_document_type"])
         ]
         if not any(s["source_document_type"] == _STATEMENT_COLUMN_TYPE for s in sources):
+            settled = {str(s["component_key"]) for s in sources
+                       if _norm_type(s["source_document_type"]) == _norm_type(_SETTLEMENT_TYPE)}
             sources = [
                 {**s, "source_document_type": _COST_SHEET_STANDIN_TYPE}
-                if _norm_type(s["source_document_type"]) in _QUOTE_NORM and s["line_kind"] == "COMMERCIAL" else s
+                if _norm_type(s["source_document_type"]) in _QUOTE_NORM and s["line_kind"] == "COMMERCIAL"
+                and str(s["component_key"]) not in settled else s
                 for s in sources
             ]
+        else:
+            # A statement form is the Deal's figures; the settlement printout
+            # does not add to it.
+            sources = [s for s in sources if _norm_type(s["source_document_type"]) != _norm_type(_SETTLEMENT_TYPE)]
     # Each invoice read on its own and counted once (2026-10-20, R1/R2).
     selection = deal_invoices(documents, booking_date=plausible_from(
         connection, tenant_id=tenant_id, journey_id=journey_id))

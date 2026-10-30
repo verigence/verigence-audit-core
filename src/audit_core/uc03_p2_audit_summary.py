@@ -283,10 +283,51 @@ def conclude_product(charge: dict[str, Any], *, on_file: set[str], taken: bool |
     return out
 
 
-def settlement(payable: Decimal | None, received: Decimal) -> dict[str, Any]:
+def loan_received(
+    *, matched: Decimal | None, disbursement_known: bool, financed: bool, stated: dict[str, Any] | None,
+    receipt_amounts: list[Decimal | None],
+) -> dict[str, Any]:
+    """The loan money to count as received, and from where (2026-10-30).
+
+    1. A disbursement on the finance record (matched to the bank / receipts)
+       -- ``matched`` is the part not already among the receipts.
+    2. Else the dealer's own statement: the NDC's financer line or the ERP
+       settlement's finance DO posting -- unless the same amount is already a
+       receipt (never counted twice).
+    3. Else, on a financed deal, the loan is NOT zero: it is unknown, and the
+       settlement cannot be judged (REBARANI GANTHIA: the summary showed the
+       whole loan as a shortfall).
+    Refunds the settlement printout records are money paid back out."""
+    refunds = (stated or {}).get("refunds") or Decimal(0)
+    out: dict[str, Any] = {"amount": None, "source": None, "note": None, "unknown": False,
+                           "refunds": refunds, "refundsSource": (stated or {}).get("source") if refunds else None}
+    if disbursement_known:
+        out.update(amount=matched or Decimal(0), source="Loan disbursement on the finance record")
+        return out
+    loan = (stated or {}).get("loan")
+    if loan is not None:
+        if any(r is not None and abs(r - loan) <= TOLERANCE for r in receipt_amounts):
+            out.update(amount=Decimal(0), source=stated["source"],
+                       note="The loan on the statement is already among the receipts; not counted twice.")
+        else:
+            out.update(amount=loan, source=stated["source"])
+        return out
+    if financed:
+        out.update(unknown=True, note="Financed deal: the loan amount is not on file (no disbursement on the "
+                                      "finance record, no financer line on the NDC or settlement).")
+    return out
+
+
+def settlement(payable: Decimal | None, received: Decimal, *, loan_unknown: bool = False) -> dict[str, Any]:
     if payable is None:
         return {"payable": None, "received": money(received), "balance": None, "status": None,
                 "conclusion": CANNOT, "rule": "AS-09", "reason": "No net payable could be worked out."}
+    if loan_unknown:
+        # The lender's money is part of what was received; without it the
+        # balance would be the loan itself, not a shortfall.
+        return {"payable": money(payable), "received": money(received), "balance": None, "status": None,
+                "conclusion": CANNOT, "rule": "AS-09", "impact": None,
+                "reason": "Financed deal: the loan amount is not on file, so the settlement cannot be judged."}
     balance = payable - received
     status = "SETTLED" if abs(balance) <= TOLERANCE else ("SHORT" if balance > 0 else "EXCESS")
     return {"payable": money(payable), "received": money(received), "balance": money(balance), "status": status,
@@ -330,6 +371,7 @@ def _on_file(connection: Connection, *, tenant_id: str, journey_id: UUID) -> set
 
 def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     from audit_core import uc03_p2_journey360 as j360
+    from audit_core.uc03_account_statement import statement_loan
     from audit_core.uc03_masters_alignment import ENTITLEMENT_UNKNOWN_RESULTS
 
     deal = j360.deal(connection, tenant_id=tenant_id, journey_id=journey_id)
@@ -367,7 +409,16 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         status = (item.get("bankStatement") or {}).get("status") or "NO_STATEMENT"
         by_status[status] = by_status.get(status, Decimal(0)) + (dec(item.get("amount")) or Decimal(0))
     receipts = dec(pays.get("receiptsTotal")) or Decimal(0)
-    loan = dec(pays.get("loanDisbursed")) or Decimal(0)
+    records = (addons.get("finance") or {}).get("records") or []
+    loan_on_file = loan_received(
+        matched=dec(pays.get("loanDisbursed")),
+        disbursement_known=any(dec(r.get("loan_disbursement_amount")) is not None for r in records),
+        financed=bool(records),
+        stated=statement_loan(connection, tenant_id=tenant_id, journey_id=journey_id),
+        receipt_amounts=[dec(i.get("amount")) for i in counted],
+    )
+    loan = loan_on_file["amount"] or Decimal(0)
+    refunds = loan_on_file["refunds"]
     verified = by_status.get("MATCHED", Decimal(0))
     non_cash = receipts - by_status.get("NOT_APPLICABLE", Decimal(0))
     bank_check = {
@@ -384,7 +435,7 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                    "No bank statement on file to verify the receipts." if non_cash > 0 else None),
     }
     loans = []
-    for record in (addons.get("finance") or {}).get("records") or []:
+    for record in records:
         sanctioned, disbursed = dec(record.get("sanctioned_amount")), dec(record.get("loan_disbursement_amount"))
         entry = {"lender": record.get("provider_name"), "sanctioned": money(sanctioned), "disbursed": money(disbursed),
                  "deliveryOrder": record.get("do_reference"), "rule": "AS-07"}
@@ -399,7 +450,10 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     credit_notes = [i for i in deal.get("invoices") or [] if i.get("documentType") == "credit_note"]
     trade_in = trade.get("tradeIn") or {}
     funding = {
-        "receipts": money(receipts), "loanDisbursed": money(loan), "received": money(receipts + loan),
+        "receipts": money(receipts), "loanDisbursed": money(loan_on_file["amount"]),
+        "loanSource": loan_on_file["source"], "loanNote": loan_on_file["note"],
+        "refunds": money(refunds) if refunds else None, "refundsSource": loan_on_file["refundsSource"],
+        "received": money(receipts + loan - refunds),
         "bankCheck": bank_check, "loans": loans,
         "bankApprovalOnFile": "bank_approval_letter" in on_file, "deliveryOrderOnFile": "delivery_order_cover" in on_file,
         "exchange": {"applicable": (trade.get("exchange") or {}).get("applicable"),
@@ -414,7 +468,8 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                       "decidedBy": (deal.get("insurance") or {}).get("decidedBy"),
                       "basis": (deal.get("insurance") or {}).get("basis")},
     }
-    settle = settlement(dec(summary.get("payable")), receipts + loan)
+    settle = settlement(dec(summary.get("payable")), receipts + loan - refunds,
+                        loan_unknown=loan_on_file["unknown"])
 
     rows = charges + benefits + products + [dict(bank_check, label="Payments verified with bank statement",
                                                   difference=None, impact=None),

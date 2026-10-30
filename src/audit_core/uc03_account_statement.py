@@ -192,12 +192,15 @@ def statement_kind(lines: list[dict[str, Any]]) -> str:
     # A form's own "TOTAL (A)" may come back with its figure as a running
     # balance (ADI-BM-261026-003, 2026-10-29); only a posting with one makes a
     # Tally printout.
+    labels = [_label(row.get("particulars_raw")) for row in lines]
+    # The ERP settlement first: its closing "Amount To Refund" carries its
+    # figure as a balance (REBARANI GANTHIA, 2026-10-30), which made it read as
+    # a Tally printout. A Tally printout has no TOTAL / NET VEHICLE COST line.
+    if any(_ERP_TOTALS.fullmatch(label) for label in labels):
+        return KIND_ERP
     if any(row.get("running_balance") and not _SUMMARY.fullmatch(_label(row.get("particulars_raw")))
            for row in lines):
         return KIND_TALLY
-    labels = [_label(row.get("particulars_raw")) for row in lines]
-    if any(_ERP_TOTALS.fullmatch(label) for label in labels):
-        return KIND_ERP
     if any(marker.match(label) for label in labels for marker in _FORM_MARKERS):
         return KIND_FORM
     return KIND_UNKNOWN
@@ -214,6 +217,9 @@ class StatementRead:
     old_vehicle_value: Decimal | None = None
     # the "Net value" / "Final price" the statement prints, when it has one
     printed_total: Decimal | None = None
+    # money paid back or adjusted against the customer (ERP settlement's
+    # "Payment Refund to Customer/Other Adjustment" postings)
+    refunds: Decimal = Decimal(0)
     # lines left blank on purpose, with why
     unmapped: list[dict[str, Any]] = field(default_factory=list)
     conflicts: list[dict[str, Any]] = field(default_factory=list)
@@ -276,6 +282,92 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             continue
         (out.components if kind == "COMMERCIAL" else out.discounts)[key] = distinct[0]
     return out
+
+
+# ── the ERP "Settlement" printout (Aditya, 2026-10-30) ───────────────────────
+# "Settlement: <customer>-<ledger code>": the deal's charges, its discounts and
+# the dated postings (finance DO, customer receipts, refunds). Its Ex-Showroom
+# is BEFORE GST (12,34,214.28 against a 17,39,901 price) and so are its
+# discounts (Scheme 35,714 = 50,000 before GST): neither is read. The charges
+# that carry no GST split -- TCS, insurance, registration, RSA, EW, FASTag,
+# accessories -- and the postings are (product owner 2026-10-30, REBARANI
+# GANTHIA: "TCS is there in customer ledger and ... the payment from financer,
+# but deal summary doesn't have these").
+SETTLEMENT_SOURCE_TYPE = "erp_settlement"
+_ERP_NOT_READ = re.compile(r"EX[- ]?SHOW ?ROOM( PRICE)?")
+_ERP_FINANCER = re.compile(r".*(\(FINANCE\)|\(FINANCER\)|FINANCE DO|BANK DO|\bBDO\b).*")
+_ERP_SUMMARY = re.compile(
+    r"(TOTAL|NET) VEHICLE COST|TOTAL DISCOUNT|DISCOUNT|EXCHANGE OF OLD CAR|ROUND OFF|"
+    r"TOTAL AMOUNT (RECEIVED|REFUNDED)(/OTHER ADJUSTMENT)?|AMOUNT TO (REFUND|RECEIVE)|"
+    r"PAYMENT RECEIPT FROM FINANCE DO|PAYMENT RECEIVED FROM CUSTOMER(/OTHER ADJUSTMENT)?|"
+    r"PAYMENT REFUND TO CUSTOMER(/OTHER ADJUSTMENT)?"
+)
+
+
+def read_erp_settlement(lines: list[dict[str, Any]]) -> StatementRead:
+    """Read the ERP settlement printout: the charges without a GST split and
+    the dated postings. A posting is a line with a date or voucher; a credit
+    is money received (from the financier when it names the finance DO), a
+    debit is a refund or adjustment paid out."""
+    out = StatementRead(kind=KIND_ERP)
+    found: dict[str, list[Decimal]] = {}
+    for row in lines:
+        label = _label(row.get("particulars_raw"))
+        side = _side_amount(row)
+        if not label or side is None:
+            continue
+        direction, amount = side
+        if row.get("entry_date") or row.get("voucher_number"):
+            if direction == "CR":
+                out.receipts += amount
+                if _ERP_FINANCER.fullmatch(label):
+                    out.financer = (out.financer or Decimal(0)) + amount
+            else:
+                out.refunds += amount
+            continue
+        if _ERP_NOT_READ.fullmatch(label):
+            out.unmapped.append({"label": label, "amount": amount, "why": "before GST on the ERP settlement"})
+            continue
+        key = next((k for k, pattern in _CHARGES if pattern.fullmatch(label)), None)
+        if key is not None and key != "ex_showroom_price":
+            found.setdefault(key, []).append(amount)
+            continue
+        if _ERP_SUMMARY.fullmatch(label):
+            continue
+        if any(pattern.fullmatch(label) for _, pattern in _DISCOUNTS) or "DISCOUNT" in label or "CLAIM" in label:
+            out.unmapped.append({"label": label, "amount": amount, "why": "discount before GST on the ERP settlement"})
+            continue
+        out.unmapped.append({"label": label, "amount": amount, "why": "label not in the mapping"})
+    for key, amounts in sorted(found.items()):
+        distinct = sorted(set(amounts))
+        if len(distinct) > 1:
+            out.conflicts.append({"kind": "COMMERCIAL", "key": key, "amounts": distinct})
+            continue
+        out.components[key] = distinct[0]
+    return out
+
+
+def statement_loan(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    """The loan the dealer's own statement records as received from the
+    financier, and the refunds it records: the handwritten statement form's
+    financer line, else the ERP settlement's finance DO posting. None when
+    neither is on file."""
+    for document in load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id):
+        rows = line_rows(document["fields"].get("line_items"))
+        kind = statement_kind(rows)
+        if kind == KIND_FORM:
+            read = read_statement(rows)
+            label = "NDC (account statement)"
+        elif kind == KIND_ERP:
+            read = read_erp_settlement(rows)
+            label = "Settlement (ERP printout)"
+        else:
+            continue
+        if read.financer is None and not read.refunds:
+            continue
+        return {"loan": read.financer, "refunds": read.refunds, "source": label,
+                "documentId": str(document["documentId"])}
+    return None
 
 
 def statement_total(fields: dict[str, Any], read: StatementRead) -> Decimal | None:
@@ -663,6 +755,22 @@ def sync_account_statement(
     _stale_statement_rows(connection, tenant_id=tenant_id, journey_id=journey_id,
                           keep_components=keep_components, keep_discounts=keep_discounts)
 
+    # No statement form, but the ERP settlement printout: its charges without a
+    # GST split are recorded for the Deal under their own name (the Deal view
+    # shows them billed; the cost sheet keeps standing in for the vehicle and
+    # the discounts). Nothing canonical is set from it.
+    settlements = [(d, rows) for d, rows, kind in parsed if kind == KIND_ERP]
+    settlement_lines = 0
+    if statement is None and settlements:
+        erp_document, erp_rows = settlements[0]
+        for key, amount in sorted(read_erp_settlement(erp_rows).components.items()):
+            record_source_value(
+                connection, tenant_id=tenant_id, journey_id=journey_id, line_kind="COMMERCIAL", component_key=key,
+                source_document_type=SETTLEMENT_SOURCE_TYPE, amount=amount, evidence_id=erp_document["evidenceId"],
+                document_id=erp_document["documentId"],
+            )
+            settlement_lines += 1
+
     # The cost sheet: its lines are recorded for the Deal (shown as the cost
     # sheet's, standing in the billed column only when no NDC is on file -- see
     # uc03_p2_journey360), and compared with the NDC when both are in.
@@ -739,7 +847,7 @@ def sync_account_statement(
         unmapped=len(statement.unmapped) if statement else 0, conflicts=len(statement.conflicts) if statement else 0,
         old_vehicle_value=str(statement.old_vehicle_value) if statement and statement.old_vehicle_value else None,
         invoice_actuals_cleared=cleared, tally_deviations=len(deviations),
-        cost_sheets=len(sheets), cost_sheet_differences=len(differences),
+        cost_sheets=len(sheets), cost_sheet_differences=len(differences), settlement_lines=settlement_lines,
     )
     # commercialLines / discountApplications are the keys the invoice path
     # returns, which its callers read.
@@ -771,6 +879,7 @@ __all__ = [
     "KIND_UNKNOWN",
     "NO_EX_SHOWROOM_TASK",
     "ORIGIN",
+    "SETTLEMENT_SOURCE_TYPE",
     "TALLY_DEVIATION_TASK",
     "CostSheetRead",
     "StatementRead",
@@ -778,8 +887,10 @@ __all__ = [
     "line_rows",
     "load_ledger_documents",
     "read_cost_sheet",
+    "read_erp_settlement",
     "read_statement",
     "statement_kind",
+    "statement_loan",
     "sync_account_statement",
     "sync_if_source_of_truth",
     "tally_deviations",

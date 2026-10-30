@@ -126,19 +126,23 @@ def test_invoice_evidence_makes_conditional_documents_mandatory(journey):
     result = _settle(journey)
     assert result["stage"] == "DELIVERY_DOCUMENT_UPLOAD"
     missing = {item["key"] for item in result["delivery"]["gates"]["REQUIRED_DOCUMENTS"]["missing"]}
-    assert {"delivery_order_cover", "bank_approval_letter", "accessory_invoice_dms",
-            "accessory_invoice_tally"} == missing
+    # The DO and the bank approval letter are one requirement, met by either
+    # (product owner 2026-10-30); the accessory invoices stay separate.
+    assert {"FINANCE_APPROVAL", "accessory_invoice_dms", "accessory_invoice_tally"} == missing
 
     tasks = {t["reference"]["requirementKey"]: t for t in _tasks(journey, "DOCUMENT_MISSING")}
     assert set(tasks) == missing
-    letter = tasks["bank_approval_letter"]
-    assert letter["assigned_role_code"] == "PC" and letter["title"] == "Upload the Bank Approval Letter"
+    letter = tasks["FINANCE_APPROVAL"]
+    assert letter["assigned_role_code"] == "PC"
+    assert letter["title"] == "Upload the Delivery Order (Financier) or Bank Approval Letter"
+    assert set(letter["reference"]["templateKeys"]) == {"delivery_order_cover", "bank_approval_letter"}
     assert "HDFC BANK LTD" in letter["description"]  # the RTO names the financier
     _settle(journey)
-    assert len(_tasks(journey, "DOCUMENT_MISSING")) == 4  # deduplicated, not raised again
+    assert len(_tasks(journey, "DOCUMENT_MISSING")) == 3  # deduplicated, not raised again
 
-    # the missing documents arrive; each task closes itself
-    for key in missing:
+    # the missing documents arrive -- only the bank approval letter of the
+    # two -- and each task closes itself
+    for key in ("bank_approval_letter", "accessory_invoice_dms", "accessory_invoice_tally"):
         _delivery_document(journey, key)
     result = _settle(journey)
     assert {t["task_status"] for t in _tasks(journey, "DOCUMENT_MISSING")} == {"VERIFIED_COMPLETE"}
