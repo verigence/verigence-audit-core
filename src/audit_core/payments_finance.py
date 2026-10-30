@@ -422,21 +422,31 @@ def get_finance(
 def get_loan_disbursement_candidates(
     tenant_id: str,
     journey_id: UUID,
-    principal: Annotated[Principal, Depends(get_principal)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[LoanDisbursementCandidate]:
     """Every payment after the minimum booking amount, in an eligible
     (never Cash/UPI/Card/QR) mode -- the exact same list the automatic
     resolver considers, so a PC's pick (Task Queue or the standalone
     Journey Documents correction) always matches what the system itself
-    already tried."""
+    already tried.
+
+    On the human token like get_finance (2026-10-30): on get_principal every
+    call from the app's "Loan amount" dialog was a 401, never once a 200, since
+    the human token carries no tenant_id/permissions claims."""
     from audit_core.uc03_finance_disbursement_resolution import (
         eligible_loan_disbursement_candidates,
     )
 
-    authorize(principal, tenant_id=tenant_id, permission="audit.payment.read")
+    _authorize_read_human(
+        authorization_client, human_principal=human_principal, tenant_id=tenant_id,
+        permission="audit.payment.read",
+    )
     set_tenant_context(connection, tenant_id)
-    _authorize_scope(connection, principal, tenant_id=tenant_id, journey_id=journey_id)
+    _authorize_scope_human(connection, human_principal=human_principal, tenant_id=tenant_id, journey_id=journey_id)
     candidates = eligible_loan_disbursement_candidates(
         connection, tenant_id=tenant_id, journey_id=journey_id,
     )
@@ -459,26 +469,33 @@ def put_loan_disbursement(
     tenant_id: str,
     journey_id: UUID,
     payload: LoanDisbursementConfirm,
-    principal: Annotated[Principal, Depends(get_principal)],
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> FinanceResponse:
     """Standalone correction path (Journey Documents' own "Update Loan
     Amount" action) -- same write, same TL notice, and the exact same
     candidate validation as confirming a FINANCE_DISBURSEMENT_REVIEW Task
-    Queue item (tasks_api.py), just without a task to complete."""
+    Queue item (tasks_api.py), just without a task to complete. On the
+    human token, as get_loan_disbursement_candidates (2026-10-30)."""
     from audit_core.uc03_finance_disbursement_resolution import (
         confirm_loan_disbursement,
     )
 
-    authorize(principal, tenant_id=tenant_id, permission="audit.payment.write")
+    _authorize_read_human(
+        authorization_client, human_principal=human_principal, tenant_id=tenant_id,
+        permission="audit.payment.write",
+    )
     set_tenant_context(connection, tenant_id)
-    _authorize_scope(connection, principal, tenant_id=tenant_id, journey_id=journey_id)
+    _authorize_scope_human(connection, human_principal=human_principal, tenant_id=tenant_id, journey_id=journey_id)
     confirm_loan_disbursement(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
         payment_id=payload.paymentId,
-        actor_id=principal.subject,
+        actor_id=human_principal.subject,
         correlation_id="",
     )
     return _finance_response(connection, tenant_id, journey_id)
