@@ -127,8 +127,9 @@ def test_invoice_evidence_makes_conditional_documents_mandatory(journey):
     assert result["stage"] == "DELIVERY_DOCUMENT_UPLOAD"
     missing = {item["key"] for item in result["delivery"]["gates"]["REQUIRED_DOCUMENTS"]["missing"]}
     # The DO and the bank approval letter are one requirement, met by either
-    # (product owner 2026-10-30); the accessory invoices stay separate.
-    assert {"FINANCE_APPROVAL", "accessory_invoice_dms", "accessory_invoice_tally"} == missing
+    # (product owner 2026-10-30); so are the two accessory invoice formats
+    # (product owner 2026-10-31: there is no separate Tally accessory invoice).
+    assert {"FINANCE_APPROVAL", "ACCESSORY_INVOICE"} == missing
 
     tasks = {t["reference"]["requirementKey"]: t for t in _tasks(journey, "DOCUMENT_MISSING")}
     assert set(tasks) == missing
@@ -137,12 +138,15 @@ def test_invoice_evidence_makes_conditional_documents_mandatory(journey):
     assert letter["title"] == "Upload the Delivery Order (Financier) or Bank Approval Letter"
     assert set(letter["reference"]["templateKeys"]) == {"delivery_order_cover", "bank_approval_letter"}
     assert "HDFC BANK LTD" in letter["description"]  # the RTO names the financier
+    accessory = tasks["ACCESSORY_INVOICE"]
+    assert accessory["title"] == "Upload the Accessory Invoice"
+    assert set(accessory["reference"]["templateKeys"]) == {"accessory_invoice_dms", "accessory_invoice_tally"}
     _settle(journey)
-    assert len(_tasks(journey, "DOCUMENT_MISSING")) == 3  # deduplicated, not raised again
+    assert len(_tasks(journey, "DOCUMENT_MISSING")) == 2  # deduplicated, not raised again
 
     # the missing documents arrive -- only the bank approval letter of the
-    # two -- and each task closes itself
-    for key in ("bank_approval_letter", "accessory_invoice_dms", "accessory_invoice_tally"):
+    # two, and only a Tally-format accessory invoice -- and each task closes itself
+    for key in ("bank_approval_letter", "accessory_invoice_tally"):
         _delivery_document(journey, key)
     result = _settle(journey)
     assert {t["task_status"] for t in _tasks(journey, "DOCUMENT_MISSING")} == {"VERIFIED_COMPLETE"}
