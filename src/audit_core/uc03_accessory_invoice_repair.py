@@ -175,12 +175,15 @@ def _open_missing_tasks(connection: Connection, tenant_id: str, journey_id: UUID
             SELECT task_id, journey_id, dedupe_key, task_status
             FROM auditcore.p2_tasks
             WHERE tenant_id=:t AND source_code='DOCUMENT_MISSING' AND task_status = ANY(:open)
-              AND (dedupe_key LIKE '%:accessory_invoice_dms' OR dedupe_key LIKE '%:accessory_invoice_tally')
+              AND (dedupe_key LIKE :dms OR dedupe_key LIKE :tally)
               AND (CAST(:j AS uuid) IS NULL OR journey_id = CAST(:j AS uuid))
             ORDER BY journey_id, dedupe_key
             """
         ),
-        {"t": tenant_id, "open": list(_OPEN), "j": str(journey_id) if journey_id else None},
+        # Patterns as parameters: ":accessory_invoice_dms" written in the SQL
+        # is read as a bind parameter by text().
+        {"t": tenant_id, "open": list(_OPEN), "j": str(journey_id) if journey_id else None,
+         "dms": "document-missing:%:accessory_invoice_dms", "tally": "document-missing:%:accessory_invoice_tally"},
     ).mappings().all()
     return [dict(r) for r in rows]
 
