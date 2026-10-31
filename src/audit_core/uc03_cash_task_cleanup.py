@@ -11,8 +11,9 @@ before, on every Journey of every Project:
   limit" (CASH_ABOVE_LIMIT, TL) and the Rule Engine's
   PAYMENT_MODE_CASH_UNRECEIPTED (PC) -- are CANCELLED with the reason on the
   task (completion_result outcome CHECK_RETIRED) and a CANCELLED task event;
-- the two retired checks (the cash intimation question and its finding) leave
-  no check row behind (p2_control_state). Findings are kept: an open
+- the two retired checks (the cash intimation question and its finding) are
+  no longer in the catalogue, so their p2_control_state rows are never read
+  (and the runtime role may not delete them). Findings are kept: an open
   CASH_NOT_INTIMATED finding is the PC's own "not intimated" answer, and
   CASH_ABOVE_LIMIT keeps its finding (the Sec 269ST limit stays on the Audit
   Summary); only the tasks were asked to go. The checks that still run keep
@@ -44,7 +45,7 @@ from audit_core.uc03_p2_tasks import record_task_event
 logger = structlog.get_logger(__name__)
 
 _CODES = sorted(SUPPRESSED_TASK_CODES)
-# The checks removed from the catalogue: their check rows go (their findings stay).
+# The checks removed from the catalogue (their rows and findings stay, unread / kept).
 RETIRED_CODES = ("CASH_INTIMATION_UNCONFIRMED", "CASH_NOT_INTIMATED")
 
 
@@ -108,7 +109,7 @@ def clean_tenant(connection: Connection, *, tenant_id: str, tag: str, commit: bo
         "findingsByCode": dict(Counter(str(f["rule_key"]) for f in findings)),
         "controlStateRows": sum(states.values()),
         "controlStateRowsByCode": dict(states),
-        "cancelled": 0, "controlStateRowsDeleted": 0,
+        "cancelled": 0,
     }
     if not commit:
         return summary
@@ -140,11 +141,10 @@ def clean_tenant(connection: Connection, *, tenant_id: str, tag: str, commit: bo
     # The findings stay: a CASH_NOT_INTIMATED finding is the PC's own answer
     # that the cash was not intimated, an audit fact the product owner did not
     # ask to remove (only the tasks, 2026-10-31). They are counted, not closed.
-    deleted = connection.execute(
-        text("DELETE FROM auditcore.p2_control_state WHERE tenant_id = :t AND control_code = ANY(:codes)"),
-        {"t": tenant_id, "codes": list(RETIRED_CODES)},
-    )
-    summary["controlStateRowsDeleted"] = int(deleted.rowcount or 0)
+    # The retired checks' rows stay too: the runtime role may not delete from
+    # p2_control_state (live, 2026-10-31: permission denied, the whole commit
+    # rolled back), and every reader lists checks from the catalogue, so a row
+    # of a check no longer in it is never shown or counted.
     return summary
 
 
