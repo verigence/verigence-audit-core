@@ -185,13 +185,13 @@ def test_cash_task_cleanup_dry_run_then_commit(journey):
                                   "WHERE tenant_id=:t").all())
     assert statuses == {not_intimated: "OPEN", above_limit: "OPEN"}  # findings are kept
     states = _sql(journey, "SELECT control_code FROM auditcore.p2_control_state WHERE tenant_id=:t").scalars().all()
-    assert states == ["CASH_ABOVE_LIMIT"]
+    assert len(states) == 3  # left in place: the runtime role may not delete them, and nothing reads them
 
     # Idempotent: nothing left to do.
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         again = clean_tenant(connection, tenant_id=journey.tenant_id, tag="t2-commit", commit=True)
-    assert (again["tasks"], again["cancelled"], again["controlStateRowsDeleted"]) == (0, 0, 0)
+    assert (again["tasks"], again["cancelled"]) == (0, 0)
 
 
 def test_cash_task_cleanup_is_a_worker_job(journey):

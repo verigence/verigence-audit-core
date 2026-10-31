@@ -163,6 +163,8 @@ _POLL_WORK_TYPES = frozenset({"JOURNEY_RECONCILE", "DOCUMENT_RECONCILE"})
 # A page failed on the clock, or uploaded again, has its DI document deleted
 # (review of #469, 2026-10-21): DI stops reading it, nothing is read twice.
 WITHDRAW_WORK_TYPE = "DI_DOCUMENT_WITHDRAW"
+# The same file uploaded again is deleted by the system (2026-10-31, uc03_p2_same_file).
+SAME_FILE_DELETE_WORK_TYPE = "SAME_FILE_DELETE"
 _POLL_RETRY_DELAYS_SECONDS = (60, 120, 300)
 _POLL_MAX_ATTEMPTS = 13
 
@@ -170,7 +172,9 @@ _POLL_MAX_ATTEMPTS = 13
 def _ladder(work_type: str, payload: dict[str, Any] | None = None) -> tuple[tuple[int, ...], int]:
     # Deleting a given-up page at DI is retried like a poll: soon, then
     # every 5 minutes, for about an hour (then the Team Lead is told).
-    if work_type in _POLL_WORK_TYPES or work_type == WITHDRAW_WORK_TYPE:
+    # Deleting the same file uploaded again (2026-10-31) is retried the same
+    # way: Document Intelligence or R2 not answering is soon over.
+    if work_type in _POLL_WORK_TYPES or work_type in (WITHDRAW_WORK_TYPE, SAME_FILE_DELETE_WORK_TYPE):
         return _POLL_RETRY_DELAYS_SECONDS, _POLL_MAX_ATTEMPTS
     if work_type in _DOCUMENT_WORK_TYPES:
         return _DOCUMENT_RETRY_DELAYS_SECONDS, _DOCUMENT_MAX_ATTEMPTS
@@ -246,6 +250,11 @@ class RescheduleWork(RuntimeError):
 
 class LeaseLost(RuntimeError):
     """The item was reclaimed by another worker; drop this result."""
+
+
+class JourneyDeleted(RuntimeError):
+    """The item deleted its own Journey (the same file uploaded again): its
+    queue row went with the Journey, so there is nothing left to settle."""
 
 
 @dataclass(frozen=True)
@@ -804,6 +813,12 @@ def _mark_dead(connection, work: WorkItem, *, attempts: int, retryable: bool, ca
             status="ERROR_TERMINAL",
             reason="The control could not be evaluated after repeated attempts.",
         )
+    elif work.work_type == SAME_FILE_DELETE_WORK_TYPE:
+        # The alert still goes out, saying the file could not be deleted; the
+        # Team Lead's task below says which step stopped.
+        from audit_core.uc03_p2_same_file import DELETE_FAILED, publish_alert
+
+        publish_alert(connection, tenant_id=work.tenant_id, journey_id=work.journey_id, outcome=DELETE_FAILED)
     elif work.work_type == "SPLIT_BATCH":
         connection.execute(
             text(
@@ -854,6 +869,7 @@ _BACKGROUND_STEP_WORDS = {
     "TASK_VERIFY": "verifying this booking's tasks",
     "CONTROL_EVALUATE": "evaluating this booking's checks",
     "DI_DOCUMENT_WITHDRAW": "withdrawing a failed or replaced page from the document service",
+    SAME_FILE_DELETE_WORK_TYPE: "deleting this booking (the same file as an earlier one)",
 }
 _BACKGROUND_STEP_EFFECT = {
     "JOURNEY_RECONCILE": "Pages may show as still being read although the document service has finished. ",
@@ -861,6 +877,8 @@ _BACKGROUND_STEP_EFFECT = {
     "STAGE_RECOMPUTE": "The booking's stage may be out of date. ",
     "CONTROL_EVALUATE": "Some checks may show as not evaluated. ",
     "DI_DOCUMENT_WITHDRAW": "The document service may still be reading a page Audit Core has already failed or replaced. ",
+    SAME_FILE_DELETE_WORK_TYPE: ("This booking is the same file as an earlier one (PAN, mobile, customer name "
+                                 "and model) and is still on file; delete it from the booking. "),
 }
 
 
@@ -3501,6 +3519,47 @@ def on_control_transitions(engine: Engine, *, work: WorkItem, transitions: list,
         logger.info("p2_control_tasks", tenant_id=work.tenant_id, journey_id=str(work.journey_id), **counts)
 
 
+def _same_file_delete(engine: Engine, work: WorkItem) -> None:
+    """Delete the same file uploaded again (product owner 2026-10-31). Runs as
+    its own item, never inside the check that found it: Document Intelligence
+    and R2 are called with no transaction open, and the Journey's own queue
+    rows -- this one too -- go with it (JourneyDeleted)."""
+    from audit_core.uc03_p2_same_file import (
+        REMOVED,
+        UploadInProgress,
+        publish_alert,
+        run_same_file_delete,
+    )
+
+    try:
+        outcome = run_same_file_delete(
+            engine, tenant_id=work.tenant_id, journey_id=work.journey_id,
+            correlation_id=_work_correlation_id(work),
+            security_client=get_security_oauth_client(), v2_client=get_di_capture_v2_client(),
+            storage=get_p2_document_storage(),
+            before_record=lambda connection: _owned(connection, work),
+        )
+    except UploadInProgress as exc:
+        # Pages are still arriving: not deleted under the PC's upload.
+        raise RescheduleWork(str(exc), delay_seconds=exc.delay_seconds) from None
+    except LeaseLost:
+        # The Journey may have gone another way (a Team Lead deleted it):
+        # then its queue row went with it and the alert is still to go out.
+        with engine.begin() as connection:
+            set_tenant_context(connection, work.tenant_id)
+            gone = connection.execute(
+                text("SELECT NOT EXISTS (SELECT 1 FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j)"),
+                {"t": work.tenant_id, "j": work.journey_id},
+            ).scalar_one()
+            if gone:
+                publish_alert(connection, tenant_id=work.tenant_id, journey_id=work.journey_id, outcome=REMOVED)
+        if gone:
+            raise JourneyDeleted(f"Journey {work.journey_id} was already deleted") from None
+        raise
+    if outcome in ("DELETED", "GONE"):
+        raise JourneyDeleted(f"Journey {work.journey_id} deleted as the same file uploaded again")
+
+
 def process_work(engine: Engine, work: WorkItem) -> None:
     handlers = {
         "SPLIT_BATCH": _split_batch,
@@ -3513,6 +3572,7 @@ def process_work(engine: Engine, work: WorkItem) -> None:
         "STAGE_RECOMPUTE": _stage_recompute,
         "TASK_VERIFY": _task_verify,
         "CONTROL_EVALUATE": _control_evaluate,
+        SAME_FILE_DELETE_WORK_TYPE: _same_file_delete,
     }
     handler = handlers.get(work.work_type)
     if handler is None:
@@ -4024,6 +4084,8 @@ def _settle_finished(engine: Engine, work: WorkItem, future: Future) -> None:
         logger.info("p2_work_rescheduled", retry_in_seconds=exc.delay_seconds,
                     reason=redact_text(str(exc), 200), duration_ms=duration_ms, **_work_fields(work))
         _settle(engine, work, _reschedule, exc)
+    except JourneyDeleted:
+        logger.info("p2_work_completed", duration_ms=duration_ms, journey_deleted=True, **_work_fields(work))
     except LeaseLost:
         logger.warning("p2_work_lease_lost", duration_ms=duration_ms, **_work_fields(work))
     except Exception as exc:  # noqa: BLE001 - every failure is settled (retry/dead-letter)
@@ -4500,6 +4562,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
     if kind == "PEOPLE_NAMES":
         from audit_core.people_names import refresh_people_names
         return refresh_people_names, (engine,)
+    if kind == "DUPLICATE_JOURNEY_PURGE":
+        # Only the journey references listed in ``reports``, of the one tenant
+        # the tag names (2026-10-31): see uc03_duplicate_journey_purge.
+        from audit_core.uc03_duplicate_journey_purge import run_duplicate_journey_purge
+        return run_duplicate_journey_purge, (engine, tag, reports)
     per_tenant = {
         "PAGE_RESEND": ("audit_core.uc03_p2_page_resend", "run_page_resend"),
         "INVOICE_RESCAN": ("audit_core.uc03_invoice_rescan", "run_invoice_rescan"),
