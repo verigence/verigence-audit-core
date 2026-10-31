@@ -183,7 +183,7 @@ def test_cash_task_cleanup_dry_run_then_commit(journey):
                          "AND task_status='VERIFIED_COMPLETE'").scalar_one() == 1
     statuses = dict(_sql(journey, "SELECT audit_finding_id::text, finding_status FROM auditcore.audit_findings "
                                   "WHERE tenant_id=:t").all())
-    assert statuses == {not_intimated: "RESOLVED", above_limit: "OPEN"}
+    assert statuses == {not_intimated: "OPEN", above_limit: "OPEN"}  # findings are kept
     states = _sql(journey, "SELECT control_code FROM auditcore.p2_control_state WHERE tenant_id=:t").scalars().all()
     assert states == ["CASH_ABOVE_LIMIT"]
 
@@ -191,7 +191,7 @@ def test_cash_task_cleanup_dry_run_then_commit(journey):
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         again = clean_tenant(connection, tenant_id=journey.tenant_id, tag="t2-commit", commit=True)
-    assert (again["tasks"], again["cancelled"], again["findings"], again["controlStateRowsDeleted"]) == (0, 0, 0, 0)
+    assert (again["tasks"], again["cancelled"], again["controlStateRowsDeleted"]) == (0, 0, 0)
 
 
 def test_cash_task_cleanup_is_a_worker_job(journey):

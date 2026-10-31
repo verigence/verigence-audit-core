@@ -12,10 +12,11 @@ before, on every Journey of every Project:
   PAYMENT_MODE_CASH_UNRECEIPTED (PC) -- are CANCELLED with the reason on the
   task (completion_result outcome CHECK_RETIRED) and a CANCELLED task event;
 - the two retired checks (the cash intimation question and its finding) leave
-  no check row behind (p2_control_state), and an open CASH_NOT_INTIMATED
-  finding is resolved, as it would be by a check that no longer fails. The
-  checks that still run keep their rows, and CASH_ABOVE_LIMIT keeps its
-  finding (the Sec 269ST limit stays on the Audit Summary).
+  no check row behind (p2_control_state). Findings are kept: an open
+  CASH_NOT_INTIMATED finding is the PC's own "not intimated" answer, and
+  CASH_ABOVE_LIMIT keeps its finding (the Sec 269ST limit stays on the Audit
+  Summary); only the tasks were asked to go. The checks that still run keep
+  their rows.
 
 Started as worker job ``CASH_TASK_CLEANUP``. A DRY RUN (counts logged, nothing
 written) unless the tag ends with "-commit". Idempotent: a cancelled task is
@@ -43,10 +44,8 @@ from audit_core.uc03_p2_tasks import record_task_event
 logger = structlog.get_logger(__name__)
 
 _CODES = sorted(SUPPRESSED_TASK_CODES)
-# The checks removed from the catalogue: their check rows go, their findings close.
+# The checks removed from the catalogue: their check rows go (their findings stay).
 RETIRED_CODES = ("CASH_INTIMATION_UNCONFIRMED", "CASH_NOT_INTIMATED")
-_FINDING_NOTE = ("Cash transactions raise no tasks (product owner, 2026-10-31): the cash intimation "
-                 "question is no longer asked.")
 
 
 def _open_tasks(connection: Connection, tenant_id: str) -> list[dict[str, Any]]:
@@ -109,7 +108,7 @@ def clean_tenant(connection: Connection, *, tenant_id: str, tag: str, commit: bo
         "findingsByCode": dict(Counter(str(f["rule_key"]) for f in findings)),
         "controlStateRows": sum(states.values()),
         "controlStateRowsByCode": dict(states),
-        "cancelled": 0, "findingsResolved": 0, "controlStateRowsDeleted": 0,
+        "cancelled": 0, "controlStateRowsDeleted": 0,
     }
     if not commit:
         return summary
@@ -138,15 +137,9 @@ def clean_tenant(connection: Connection, *, tenant_id: str, tag: str, commit: bo
         )
     summary["cancelled"] = len(cancelled)
 
-    from audit_core.uc03_manual_verification import _resolve_finding
-
-    for finding in findings:
-        _resolve_finding(
-            connection, tenant_id=tenant_id, journey_id=UUID(str(finding["journey_id"])),
-            stage_code=str(finding["stage_code"] or "BOOKING"), finding_id=UUID(str(finding["audit_finding_id"])),
-            actor_id=None, correlation_id=f"cash-task-cleanup:{tag}", note=_FINDING_NOTE,
-        )
-    summary["findingsResolved"] = len(findings)
+    # The findings stay: a CASH_NOT_INTIMATED finding is the PC's own answer
+    # that the cash was not intimated, an audit fact the product owner did not
+    # ask to remove (only the tasks, 2026-10-31). They are counted, not closed.
     deleted = connection.execute(
         text("DELETE FROM auditcore.p2_control_state WHERE tenant_id = :t AND control_code = ANY(:codes)"),
         {"t": tenant_id, "codes": list(RETIRED_CODES)},
