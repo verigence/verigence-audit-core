@@ -230,3 +230,36 @@ def test_the_open_dms_task_becomes_the_one_accessory_task_and_the_tally_one_is_m
         rows = dict(c.execute(text("SELECT dedupe_key, task_status FROM auditcore.p2_tasks "
                                    "WHERE tenant_id=:t AND journey_id=:j"), {"t": journey.tenant_id, "j": j}).all())
     assert rows == {key: "READY", f"document-missing:{j}:accessory_invoice_tally": "CANCELLED"}
+
+
+def test_the_repair_job_restores_another_bill_and_recomputes_on_commit_only(journey) -> None:
+    from audit_core.uc03_accessory_invoice_repair import run_accessory_invoice_repair
+    from audit_core.uc03_p2_task_producer import raise_or_refresh
+
+    j = journey.journey_id
+    add_ready_document(journey, "accessory_invoice_dms", process_area="DELIVERY", invoice_number="ACC-1",
+                       invoice_date="2026-10-05", grand_total_amount="18000")
+    other = add_ready_document(journey, "accessory_invoice_dms", process_area="DELIVERY", invoice_number="ACC-2",
+                               invoice_date="2026-10-09", grand_total_amount="12000")
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("UPDATE auditcore.evidence SET association_status='SUPERSEDED', "
+                       "void_reason='REPLACED_BY_NEWER_UPLOAD' WHERE tenant_id=:t AND di_document_id=:d"),
+                  {"t": journey.tenant_id, "d": other})
+        raise_or_refresh(
+            c, tenant_id=journey.tenant_id, journey_id=j, dedupe_key=f"document-missing:{j}:accessory_invoice_tally",
+            task_type="DOCUMENT_MISSING", source_type="DOCUMENT", source_code="DOCUMENT_MISSING",
+            title="Upload the Accessory Invoice (Tally)", description="x",
+            reference={"generatedBy": "SYSTEM", "requirementKey": "accessory_invoice_tally"}, severity="HIGH",
+            registry=get_registry())
+
+    def status():
+        with journey.engine.begin() as c:
+            set_tenant_context(c, journey.tenant_id)
+            return c.execute(text("SELECT association_status FROM auditcore.evidence WHERE tenant_id=:t "
+                                  "AND di_document_id=:d"), {"t": journey.tenant_id, "d": other}).scalar_one()
+
+    run_accessory_invoice_repair(journey.engine, "t", [journey.tenant_id])
+    assert status() == "SUPERSEDED"
+    run_accessory_invoice_repair(journey.engine, "t-commit", [journey.tenant_id])
+    assert status() == "ACTIVE"
