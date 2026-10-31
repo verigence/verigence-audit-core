@@ -104,14 +104,30 @@ def test_dms_and_tally_copies_of_one_sale_with_different_numbers_count_once(jour
                        grand_total_amount="500000")
     add_ready_document(journey, "accessory_invoice_dms", invoice_number="ACC/DMS/0091", invoice_date="2026-10-05",
                        grand_total_amount="7457.01")
-    add_ready_document(journey, "accessory_invoice_tally", invoice_number="TL-2231", invoice_date="2026-10-05",
-                       grand_total_amount="7457.01")
     _delivered(journey, days_ago=30)
     add_receipt_payment(journey, amount="507457.01", receipt_number="R-1", receipt_date="2026-09-01")
     result = _check(journey)
     assert result.outcome == "PASS", result.reason
     assert Decimal(result.details["invoiced"]) == Decimal("507457.01")
     assert len(result.details["invoices"]) == 2
+
+
+def test_two_accessory_invoices_with_different_numbers_are_two_bills(journey):
+    """2026-10-31 (product owner): there is no separate Tally accessory
+    invoice. A DMS-format and a Tally-format accessory bill with different
+    numbers are two accessory invoices, even at the same total and date."""
+    add_ready_document(journey, "customer_invoice_dms", invoice_number="DMS-1", vin_number="MA1VIN0001",
+                       grand_total_amount="500000")
+    add_ready_document(journey, "accessory_invoice_dms", invoice_number="ACC/DMS/0091", invoice_date="2026-10-05",
+                       grand_total_amount="7457.01")
+    add_ready_document(journey, "accessory_invoice_tally", invoice_number="TL-2231", invoice_date="2026-10-05",
+                       grand_total_amount="7457.01")
+    _delivered(journey, days_ago=30)
+    add_receipt_payment(journey, amount="514914.02", receipt_number="R-1", receipt_date="2026-09-01")
+    result = _check(journey)
+    assert result.outcome == "PASS", result.reason
+    assert Decimal(result.details["invoiced"]) == Decimal("514914.02")
+    assert len(result.details["invoices"]) == 3
 
 
 def test_a_tally_invoice_with_its_own_number_is_a_separate_invoice(journey):

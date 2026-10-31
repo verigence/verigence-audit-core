@@ -484,19 +484,22 @@ def test_dms_and_tally_copies_of_one_sale_with_different_numbers_are_one_invoice
     assert im.select_invoices([dms, other_vehicle])["multipleVehicle"] is True
 
 
-def test_dms_and_tally_accessory_bills_pair_by_total_and_date_else_the_pc_is_asked():
+def test_accessory_bills_are_one_bill_only_when_they_print_one_number():
+    """2026-10-31 (product owner): there is no separate Tally accessory
+    invoice, so a DMS-format and a Tally-format accessory bill are never
+    paired as two copies of one bill: different numbers are two bills (even
+    at one total and date) and the PC is never asked."""
     dms = im.read_invoice("accessory_invoice_dms", {"invoice_number": "ACC/DMS/0091", "invoice_date": "2026-10-05",
                                                     "grand_total_amount": "7457.01"}, document_id="a")
-    same = im.read_invoice("accessory_invoice_tally", {"invoice_number": "TL-2231", "invoice_date": "2026-10-06",
-                                                       "grand_total_amount": "7457.01"}, document_id="b")
-    one = im.select_invoices([dms, same])
+    same_total = im.read_invoice("accessory_invoice_tally", {"invoice_number": "TL-2231", "invoice_date": "2026-10-06",
+                                                             "grand_total_amount": "7457.01"}, document_id="b")
+    two = im.select_invoices([dms, same_total])
+    assert len(two["counted"]) == 2 and two["lines"]["accessories_cost"] == Decimal("14914.02")
+    assert two["sameBillQuestions"] == []
+    copy = im.read_invoice("accessory_invoice_tally", {"invoice_number": "ACC/DMS/0091", "invoice_date": "2026-10-05",
+                                                       "grand_total_amount": "7457.01"}, document_id="c")
+    one = im.select_invoices([dms, copy])
     assert len(one["counted"]) == 1 and one["lines"]["accessories_cost"] == Decimal("7457.01")
-    assert one["sameBillQuestions"] == []
-    other = im.read_invoice("accessory_invoice_tally", {"invoice_number": "TL-2231", "invoice_date": "2026-10-06",
-                                                        "grand_total_amount": "4746.01"}, document_id="c")
-    two = im.select_invoices([dms, other])
-    assert len(two["counted"]) == 2 and two["lines"]["accessories_cost"] == Decimal("12203.02")
-    assert len(two["sameBillQuestions"]) == 1
 
 
 def test_a_vehicle_line_rate_counts_only_when_it_agrees_with_the_header():
@@ -738,15 +741,15 @@ def test_one_number_with_different_totals_is_copies_that_disagree():
 
 def test_accessory_bills_as_seen_live():
     """UTK-SU-261019-001: DMS C1R27F00000002 (08 Sep, 7,457) and Tally
-    C1R27F000000053 (14 Oct, 4,746) are two bills and the PC is asked;
-    UTK-SU-261019-002: DMS and Tally both C1R27F000000053 (read once as
-    "CIR...") are one bill."""
+    C1R27F000000053 (14 Oct, 4,746) are two bills, both counted, and nobody
+    is asked (2026-10-31); UTK-SU-261019-002: DMS and Tally both
+    C1R27F000000053 (read once as "CIR...") are one bill."""
     def bill(document_id, document_type, number, day, total):
         return im.read_invoice(document_type, {"invoice_number": number, "invoice_date": day,
                                                "grand_total_amount": total}, document_id=document_id)
     two = im.select_invoices([bill("a", "accessory_invoice_dms", "C1R27F00000002", "2026-09-08", "7457"),
                               bill("b", "accessory_invoice_tally", "C1R27F000000053", "2026-10-14", "4746")])
-    assert len(two["counted"]) == 2 and len(two["sameBillQuestions"]) == 1
+    assert len(two["counted"]) == 2 and two["sameBillQuestions"] == []
     one = im.select_invoices([bill("c", "accessory_invoice_dms", "CIR27F000000053", "2026-10-14", "4746"),
                               bill("d", "accessory_invoice_tally", "C1R27F000000053", "2026-10-14", "4746")])
     assert len(one["counted"]) == 1 and one["lines"]["accessories_cost"] == Decimal(4746)

@@ -166,6 +166,8 @@ FAMILY_OTHER = "OTHER"
 VEHICLE_SALE_TYPES = frozenset({
     "customer_invoice_dms", "customer_invoice_dms_v2", "tax_invoice_tally", "tax_invoice_dms", "tax_invoice",
 })
+ACCESSORY_INVOICE_TYPES = frozenset({"accessory_invoice_dms", "accessory_invoice_tally"})
+_ACCESSORY_INVOICE_TYPES = ACCESSORY_INVOICE_TYPES
 _FAMILY_BY_TYPE = {
     "accessory_invoice_dms": FAMILY_ACCESSORY,
     "accessory_invoice_tally": FAMILY_ACCESSORY,
@@ -559,8 +561,13 @@ def _identity(document_type: str, raw: dict[str, Any]) -> dict[str, Any]:
         "vinTail": vin_tail,
         "grandTotal": _to_decimal(raw.get("grand_total_amount") or raw.get("total_amount")),
         # Which books the copy comes from: a DMS copy and a Tally copy of one
-        # bill can print different numbers (review B1).
-        "side": ("DMS" if "dms" in document_type else "TALLY" if "tally" in document_type
+        # bill can print different numbers (review B1). Not for accessories
+        # (product owner, 2026-10-31): there is no separate Tally accessory
+        # invoice -- a Tally-format accessory bill is one more accessory
+        # invoice, so two accessory bills are one only when they print the
+        # same number, and the PC is never asked "one bill or two?".
+        "side": ("ACCESSORY" if document_type in _ACCESSORY_INVOICE_TYPES
+                 else "DMS" if "dms" in document_type else "TALLY" if "tally" in document_type
                  else (_upper(raw.get("source_system")) or None)),
         "purposePrinted": _upper(raw.get("invoice_purpose")) or None,
     }
@@ -1274,6 +1281,7 @@ def _other_sets(readings: list[dict[str, Any]]) -> tuple[list[list[dict[str, Any
 
 def select_invoices(
     readings: list[dict[str, Any]], *, plausible_from: date | None = None, today: date | None = None,
+    count_credit_notes: bool = True,
 ) -> dict[str, Any]:
     """Group the invoices on file into distinct invoices and count each once.
 
@@ -1342,6 +1350,11 @@ def select_invoices(
     cancellation_questions = _mark_cancellations(built)
     for group in built:
         if group["cancelled"] or group.get("pendingCancellation"):
+            group["counted"] = False
+        elif not count_credit_notes and group["family"] == FAMILY_CREDIT_NOTE:
+            # The Deal shows a credit note and never adds it in (product owner,
+            # 2026-10-31: it is given in the scrappage case). A credit note that
+            # reverses a whole vehicle invoice still cancels it, above.
             group["counted"] = False
     questions = []
     for a, b in question_sets:

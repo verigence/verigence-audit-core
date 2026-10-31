@@ -677,6 +677,9 @@ document_types:
     stage: DELIVERY
     requirement: CONDITIONAL
     condition: accessoriesSold
+    # One requirement, met by either (product owner, 2026-10-31: there is no separate
+    # Tally accessory invoice; a Tally-format accessory bill is an accessory invoice).
+    group: ACCESSORY_INVOICE
     accepted_early: true
     pages: *id001
     extraction:
@@ -711,6 +714,9 @@ document_types:
     stage: DELIVERY
     requirement: CONDITIONAL
     condition: accessoriesSold
+    # One requirement, met by either (product owner, 2026-10-31: there is no separate
+    # Tally accessory invoice; a Tally-format accessory bill is an accessory invoice).
+    group: ACCESSORY_INVOICE
     accepted_early: true
     pages: *id001
     extraction:

@@ -40,6 +40,7 @@ from audit_core.uc03_duplicate_receipt_detection import (
     normalize_receipt_number,
 )
 from audit_core.uc03_invoice_materialization import (
+    ACCESSORY_INVOICE_TYPES,
     CUSTOMER_FAMILIES,
     FAMILY_ACCESSORY,
     FAMILY_EXTENDED_WARRANTY,
@@ -401,6 +402,55 @@ def _loan_received(connection: Connection, *, tenant_id: str, journey_id: UUID) 
         {"t": tenant_id, "j": journey_id},
     ).scalar_one()
     return Decimal(value or 0)
+
+
+def loan_without_receipt(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, receipt_amounts: list[Decimal] | None = None,
+) -> dict[str, Any] | None:
+    """The loan amount as the lender's own letter states it, when no dealership
+    receipt stands for the loan (product owner, 2026-10-31: some dealerships
+    give no receipt for the loan amount). Shown with an asterisk; gone the
+    moment a receipt is linked as the loan disbursement.
+
+    Only the Bank Approval Letter prints an amount (its sanctioned amount);
+    the Delivery Order carries none. None when a finance record already has
+    a disbursement (linked to a receipt or entered), or a counted receipt is
+    the same amount to the rupee (that receipt is the loan)."""
+    known = connection.execute(
+        text(
+            """
+            SELECT EXISTS (
+              SELECT 1 FROM auditcore.finance_records f
+              WHERE f.tenant_id=:t AND f.journey_id=:j
+                AND (f.loan_disbursement_payment_id IS NOT NULL OR f.loan_disbursement_amount IS NOT NULL))
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
+    if known:
+        return None
+    letters = []
+    for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               di_types=("bank_approval_letter",)):
+        amount = _dec(doc["fields"].get("finance_sanctioned_amount"))
+        if amount is None or amount <= 0:
+            continue
+        letters.append({
+            "amount": amount, "documentId": doc["documentId"], "document": _document_label("bank_approval_letter"),
+            "financier": doc["fields"].get("financier_name"),
+            "date": doc["fields"].get("finance_disbursement_date") or doc["fields"].get("finance_sanction_date"),
+            "letterNumber": doc["fields"].get("finance_sanction_letter_number"),
+        })
+    if not letters:
+        return None
+    # The newest letter on file (a revised sanction replaces the first);
+    # _document_facts lists the newest first.
+    letter = letters[0]
+    if any(r is not None and abs(r - letter["amount"]) <= 1 for r in receipt_amounts or []):
+        return None
+    return {**letter, "amount": _money(letter["amount"]),
+            "note": "No dealership receipt for the loan amount; taken from the Bank Approval Letter "
+                    "(sanctioned amount)."}
 
 
 def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Decimal]:
@@ -891,14 +941,35 @@ def _invoice_fields(fields: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def deal_invoices(documents: list[dict[str, Any]], *, booking_date: Any = None) -> dict[str, Any]:
+def deal_invoices(
+    documents: list[dict[str, Any]], *, booking_date: Any = None, count_credit_notes: bool = True,
+) -> dict[str, Any]:
     """The invoices on file (ACTIVE documents), each read on its own and
     counted once (uc03_invoice_materialization.select_invoices)."""
     readings = [
         read_invoice(d["documentType"], _invoice_fields(d["fields"]), document_id=d["documentId"])
         for d in documents if d["documentType"] in _INVOICE_TYPES
     ]
-    return select_invoices(readings, plausible_from=booking_date)
+    return select_invoices(readings, plausible_from=booking_date, count_credit_notes=count_credit_notes)
+
+
+def _credit_notes(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every credit note on file as the Deal shows it: information only."""
+    out = []
+    for doc in documents:
+        if doc["documentType"] != "credit_note":
+            continue
+        fields = doc["fields"]
+        reason = next((str(fields[k]) for k in ("narration", "invoice_heading_as_printed", "invoice_purpose")
+                       if fields.get(k) not in (None, "")), None)
+        out.append({
+            "documentId": doc["documentId"], "number": fields.get("invoice_number"),
+            "date": fields.get("invoice_date"),
+            "amount": _money(fields.get("grand_total_amount") or fields.get("total_amount")),
+            "taxable": _money(fields.get("taxable_amount")), "reason": reason,
+            "issuedTo": fields.get("buyer_name"),
+        })
+    return sorted(out, key=lambda c: (str(c["date"] or ""), str(c["number"] or "")))
 
 
 def _deal_closed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
@@ -1045,8 +1116,16 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # its own name, and a Journey without one has no billed figures. Every other
     # Project reads its invoices below, unchanged.
     statement_policy = account_statement_is_source_of_truth(connection, tenant_id=tenant_id)
+    # Credit notes on file, shown on the Deal for information and never added
+    # in (product owner, 2026-10-31: a credit note is given in the scrappage
+    # case), whichever source of truth the Project uses.
+    credit_notes = _credit_notes(documents)
     if statement_policy:
-        documents = [d for d in documents if d["documentType"] not in _INVOICE_TYPES]
+        # Except the accessory invoices (product owner, 2026-10-31): a deal can
+        # carry several, and every one of them is shown and counted on the
+        # accessories line; the statement's own figure stands beside them.
+        documents = [d for d in documents
+                     if d["documentType"] not in _INVOICE_TYPES or d["documentType"] in ACCESSORY_INVOICE_TYPES]
         sources = [
             {**s, "source_document_type": _STATEMENT_COLUMN_TYPE}
             if _norm_type(s["source_document_type"]) in _LEDGER_NORM else s
@@ -1065,9 +1144,10 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             # A statement form is the Deal's figures; the settlement printout
             # does not add to it.
             sources = [s for s in sources if _norm_type(s["source_document_type"]) != _norm_type(_SETTLEMENT_TYPE)]
-    # Each invoice read on its own and counted once (2026-10-20, R1/R2).
+    # Each invoice read on its own and counted once (2026-10-20, R1/R2); a
+    # credit note is never counted on the Deal (2026-10-31).
     selection = deal_invoices(documents, booking_date=plausible_from(
-        connection, tenant_id=tenant_id, journey_id=journey_id))
+        connection, tenant_id=tenant_id, journey_id=journey_id), count_credit_notes=False)
     read_ids = {str(r["documentId"]) for g in selection["groups"] for r in g["copies"]}
     # A document read here supersedes its own materialised rows; the
     # wholesale invoice is the dealer's purchase and never a customer line.
@@ -1540,7 +1620,10 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # invoice totals, debit notes, less credit notes), plus every line no
     # invoice bills (the RTO challan, the insurance cover, a line awaiting its
     # document at its booking figure) less any discount not on an invoice.
-    if selection["counted"]:
+    # Under the statement policy only the accessory invoices are read; the
+    # net stays the lines' current figures (each accessory invoice is in the
+    # accessories line), as it was before they were read (2026-10-31).
+    if selection["counted"] and not statement_policy:
         invoice_net = Decimal(0)
         for group in selection["counted"]:
             rep = group["representative"]
@@ -1649,6 +1732,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         # The invoices on file, each with what it bills and whether it is
         # the copy counted (retail and tax alike).
         "invoices": invoices,
+        # Credit notes on file: shown, never in the Deal's arithmetic (2026-10-31).
+        "creditNotes": credit_notes,
         # The OEM's wholesale invoice: the dealer's purchase, never Billed.
         "dealerPurchase": dealer_purchase,
         "declared": [
@@ -2146,12 +2231,18 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
 
     receipts = sum((Decimal(i["amount"]) for i in items if i["counted"]), Decimal(0))
     loan = _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # Shown, marked with an asterisk, and not in the receipts or paid totals:
+    # it is the lender's figure, not money a receipt shows (2026-10-31).
+    letter_loan = loan_without_receipt(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+        receipt_amounts=[Decimal(i["amount"]) for i in items if i["counted"]])
     credits = [_dec(line["credit"]) for line in lines if _dec(line["credit"]) is not None]
     matched_credit = [_dec(line["credit"]) for line in lines if line["matchedPaymentId"] and _dec(line["credit"]) is not None]
     return {
         "items": items,
         "receiptsTotal": str(receipts),
         "loanDisbursed": str(loan),
+        "loanWithoutReceipt": letter_loan,
         "paidTotal": str(receipts + loan),
         "byStage": {k: str(v) for k, v in by_stage.items()},
         "duplicates": len(duplicate_of),
