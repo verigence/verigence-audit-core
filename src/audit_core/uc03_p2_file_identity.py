@@ -71,10 +71,27 @@ _ACTOR = "p2-worker"
 STATUSES = ("BELONGS", "FOREIGN", "UNKNOWN")
 
 
-def enforce_enabled() -> bool:
-    """Whether a FOREIGN decision takes the file's documents out of the
-    booking (default off: the decision is recorded only)."""
-    return os.environ.get(ENFORCE_VARIABLE, "").strip().lower() in {"1", "true", "yes", "on"}
+def enforce_enabled(connection: Connection | None = None, *, tenant_id: str | None = None,
+                    journey_id: UUID | None = None) -> bool:
+    """Whether a FOREIGN decision takes the file's documents out of this
+    booking: P2_FILE_IDENTITY_ENFORCE set (a global override), or an enabled
+    row of p2_file_identity_enforcement for the journey or for its whole
+    Project -- switched from the database, no redeploy (a pilot on a few
+    bookings, off again at once). Off by default: the decision is recorded only."""
+    if os.environ.get(ENFORCE_VARIABLE, "").strip().lower() in {"1", "true", "yes", "on"}:
+        return True
+    if connection is None or not tenant_id:
+        return False
+    return bool(connection.execute(
+        text(
+            """
+            SELECT EXISTS (SELECT 1 FROM auditcore.p2_file_identity_enforcement
+                           WHERE tenant_id=:t AND enabled
+                             AND (journey_id IS NULL OR journey_id = CAST(:j AS uuid)))
+            """
+        ),
+        {"t": tenant_id, "j": str(journey_id) if journey_id else None},
+    ).scalar_one())
 
 
 # --------------------------------------------------------------- numbers
@@ -922,13 +939,36 @@ def _repeatable(requirement_key: str | None) -> bool:
     return _is_repeatable_requirement(requirement_key)
 
 
-def _enforce(connection: Connection, *, tenant_id: str, journey_id: UUID,
-             decision: JourneyDecision) -> dict[str, int]:
-    """Take the FOREIGN files' documents out of the booking, give back what
-    they had superseded, and undo it for a file no longer FOREIGN."""
-    foreign = decision.foreign()
-    counts = {"documents_foreign": 0, "documents_restored": 0, "documents_returned": 0, "tasks_closed": 0}
-    # 1. A file no longer FOREIGN: its documents come back as they were.
+def _applied_before(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """Whether enforcement left anything on this booking to put back."""
+    return bool(connection.execute(
+        text(
+            """
+            SELECT EXISTS (SELECT 1 FROM auditcore.evidence WHERE tenant_id=:t AND journey_id=:j
+                             AND (association_status='FOREIGN' OR foreign_restore_state IS NOT NULL))
+                OR EXISTS (SELECT 1 FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j
+                             AND completion_result ? 'foreignFile')
+                OR EXISTS (SELECT 1 FROM auditcore.p2_upload_batches WHERE tenant_id=:t AND journey_id=:j
+                             AND identity_enforced_at_utc IS NOT NULL)
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one())
+
+
+def _enforce(connection: Connection, *, tenant_id: str, journey_id: UUID, foreign: list[str]) -> dict[str, int]:
+    """Make the booking hold exactly the files that are not ``foreign``.
+
+    First everything done for a file no longer in ``foreign`` -- it was found
+    to belong, or enforcement was switched off for the booking (``foreign``
+    empty) -- is put back exactly as it was: its documents return to the
+    status they had, the customer's copies made active for it are superseded
+    again as they were, the tasks closed for it reopen as they were. Then the
+    ``foreign`` files' documents leave the booking and the customer's own
+    single-slot copies they had superseded become active again."""
+    counts = {"documents_foreign": 0, "documents_restored": 0, "documents_returned": 0,
+              "copies_superseded_again": 0, "tasks_closed": 0, "tasks_reopened": 0}
+    # 1. Back as it was: the documents of a file no longer FOREIGN...
     returned = connection.execute(
         text(
             """
@@ -939,12 +979,70 @@ def _enforce(connection: Connection, *, tenant_id: str, journey_id: UUID,
                 SELECT 1 FROM auditcore.p2_document_queue q
                 WHERE q.tenant_id=e.tenant_id AND q.journey_id=e.journey_id AND q.di_document_id=e.di_document_id
                   AND q.batch_id = ANY(CAST(:foreign AS uuid[])))
-            RETURNING e.evidence_id, e.journey_document_requirement_id
+            RETURNING e.evidence_id
             """
         ),
         {"t": tenant_id, "j": journey_id, "foreign": foreign},
     ).mappings().all()
     counts["documents_returned"] = len(returned)
+    # ...and the copies made active because of it, superseded again exactly
+    # as they were (their void reason, by whom, when; their capture row).
+    again = connection.execute(
+        text(
+            """
+            WITH copies AS (
+                SELECT e.evidence_id, e.foreign_restore_state AS state
+                FROM auditcore.evidence e
+                WHERE e.tenant_id=:t AND e.journey_id=:j AND e.foreign_restore_state IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM auditcore.evidence s
+                                  WHERE s.tenant_id=e.tenant_id AND s.supersedes_evidence_id=e.evidence_id
+                                    AND s.association_status='FOREIGN')
+                FOR UPDATE OF e
+            )
+            UPDATE auditcore.evidence e
+            SET association_status=CASE WHEN e.association_status='ACTIVE' THEN 'SUPERSEDED'
+                                        ELSE e.association_status END,
+                void_reason=CASE WHEN e.association_status='ACTIVE' THEN c.state->>'voidReason'
+                                 ELSE e.void_reason END,
+                voided_by_actor_id=CASE WHEN e.association_status='ACTIVE' THEN c.state->>'voidedBy'
+                                        ELSE e.voided_by_actor_id END,
+                voided_at_utc=CASE WHEN e.association_status='ACTIVE' THEN (c.state->>'voidedAt')::timestamptz
+                                   ELSE e.voided_at_utc END,
+                foreign_restore_state=NULL
+            FROM copies c
+            WHERE e.tenant_id=:t AND e.evidence_id=c.evidence_id
+            RETURNING e.di_document_id, e.association_status, c.state->>'captureStatus' AS capture_status
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    for copy in again:
+        if copy["association_status"] == "SUPERSEDED":
+            counts["copies_superseded_again"] += 1
+        if copy["capture_status"]:
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.document_capture_v2_documents SET capture_status=:s, updated_at_utc=now()
+                    WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d AND capture_status='CLASSIFIED'
+                    """
+                ),
+                {"t": tenant_id, "j": journey_id, "d": copy["di_document_id"], "s": copy["capture_status"]},
+            )
+    counts["tasks_reopened"] = _reopen_tasks(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                             foreign=foreign)
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_upload_batches SET identity_enforced_at_utc=NULL
+            WHERE tenant_id=:t AND journey_id=:j AND identity_enforced_at_utc IS NOT NULL
+              AND NOT (batch_id = ANY(CAST(:foreign AS uuid[])))
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "foreign": foreign},
+    )
+    if not foreign:
+        return counts
     # 2. A FOREIGN file's documents leave the booking.
     taken = connection.execute(
         text(
@@ -956,87 +1054,50 @@ def _enforce(connection: Connection, *, tenant_id: str, journey_id: UUID,
                 SELECT 1 FROM auditcore.p2_document_queue q
                 WHERE q.tenant_id=e.tenant_id AND q.journey_id=e.journey_id AND q.di_document_id=e.di_document_id
                   AND q.batch_id = ANY(CAST(:foreign AS uuid[])))
-            RETURNING e.evidence_id, e.journey_document_requirement_id
+            RETURNING e.evidence_id
             """
         ),
         {"t": tenant_id, "j": journey_id, "foreign": foreign},
     ).mappings().all()
     counts["documents_foreign"] = len(taken)
-    if foreign:
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.p2_upload_batches SET identity_enforced_at_utc=now()
-                WHERE tenant_id=:t AND batch_id = ANY(CAST(:foreign AS uuid[])) AND identity_enforced_at_utc IS NULL
-                """
-            ),
-            {"t": tenant_id, "foreign": foreign},
-        )
     connection.execute(
         text(
             """
-            UPDATE auditcore.p2_upload_batches SET identity_enforced_at_utc=NULL
-            WHERE tenant_id=:t AND journey_id=:j AND identity_enforced_at_utc IS NOT NULL
-              AND NOT (batch_id = ANY(CAST(:foreign AS uuid[])))
+            UPDATE auditcore.p2_upload_batches SET identity_enforced_at_utc=now()
+            WHERE tenant_id=:t AND batch_id = ANY(CAST(:foreign AS uuid[])) AND identity_enforced_at_utc IS NULL
             """
         ),
-        {"t": tenant_id, "j": journey_id, "foreign": foreign},
+        {"t": tenant_id, "foreign": foreign},
     )
-    requirements = {r["journey_document_requirement_id"] for r in [*returned, *taken]
-                    if r["journey_document_requirement_id"] is not None}
-    # Every single-slot requirement a FOREIGN document touches, this pass or
-    # an earlier one: the customer's own copy is given back.
-    requirements |= set(connection.execute(
+    # 3. Every single-slot requirement a FOREIGN document touches, this pass
+    # or an earlier one: the customer's own copy is given back, when nothing
+    # of the booking's own is active for it. What the copy was is kept on it
+    # (foreign_restore_state) so step 1 can put it back exactly.
+    rows = connection.execute(
         text(
             """
-            SELECT DISTINCT journey_document_requirement_id FROM auditcore.evidence
-            WHERE tenant_id=:t AND journey_id=:j AND association_status='FOREIGN'
-              AND journey_document_requirement_id IS NOT NULL
+            SELECT DISTINCT e.journey_document_requirement_id, r.requirement_key
+            FROM auditcore.evidence e
+            JOIN auditcore.journey_document_requirements r
+              ON r.tenant_id=e.tenant_id AND r.journey_document_requirement_id=e.journey_document_requirement_id
+            WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='FOREIGN'
             """
         ),
         {"t": tenant_id, "j": journey_id},
-    ).scalars().all())
-    keys = dict(connection.execute(
-        text(
-            """
-            SELECT journey_document_requirement_id, requirement_key FROM auditcore.journey_document_requirements
-            WHERE tenant_id=:t AND journey_id=:j AND journey_document_requirement_id = ANY(:ids)
-            """
-        ),
-        {"t": tenant_id, "j": journey_id, "ids": list(requirements)},
-    ).all()) if requirements else {}
-    for requirement in requirements:
-        if _repeatable(keys.get(requirement)):
+    ).mappings().all()
+    for row in rows:
+        if _repeatable(row["requirement_key"]):
             continue
-        active = connection.execute(
+        requirement = row["journey_document_requirement_id"]
+        if connection.execute(
             text(
                 """
-                SELECT evidence_id, di_document_id FROM auditcore.evidence
-                WHERE tenant_id=:t AND journey_id=:j AND journey_document_requirement_id=:r
-                  AND association_status='ACTIVE'
-                ORDER BY linked_at_utc DESC, evidence_id DESC
-                FOR UPDATE
+                SELECT EXISTS (SELECT 1 FROM auditcore.evidence WHERE tenant_id=:t AND journey_id=:j
+                               AND journey_document_requirement_id=:r AND association_status='ACTIVE')
                 """
             ),
             {"t": tenant_id, "j": journey_id, "r": requirement},
-        ).mappings().all()
-        if len(active) > 1:
-            # A file came back: the newest copy is current again, as the
-            # upload rule had it.
-            for older in active[1:]:
-                connection.execute(
-                    text(
-                        """
-                        UPDATE auditcore.evidence
-                        SET association_status='SUPERSEDED', void_reason='REPLACED_BY_NEWER_UPLOAD',
-                            voided_by_actor_id=:a, voided_at_utc=now()
-                        WHERE tenant_id=:t AND evidence_id=:e
-                        """
-                    ),
-                    {"t": tenant_id, "e": older["evidence_id"], "a": _ACTOR},
-                )
-            continue
-        if active:
+        ).scalar_one():
             continue
         restored = connection.execute(
             text(
@@ -1056,36 +1117,28 @@ def _enforce(connection: Connection, *, tenant_id: str, journey_id: UUID,
         ).mappings().first()
         if restored is None:
             continue
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.evidence
-                SET association_status='ACTIVE', void_reason=NULL, voided_by_actor_id=NULL, voided_at_utc=NULL
-                WHERE tenant_id=:t AND evidence_id=:e
-                """
-            ),
-            {"t": tenant_id, "e": restored["evidence_id"]},
-        )
-        connection.execute(
+        capture = connection.execute(
             text(
                 """
                 UPDATE auditcore.document_capture_v2_documents SET capture_status='CLASSIFIED', updated_at_utc=now()
                 WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d AND capture_status='SUPERSEDED'
+                RETURNING 'SUPERSEDED'
                 """
             ),
             {"t": tenant_id, "j": journey_id, "d": restored["di_document_id"]},
-        )
+        ).scalar_one_or_none()
         connection.execute(
             text(
                 """
-                UPDATE auditcore.journey_document_assessments a
-                SET evidence_id=:e, version_no=a.version_no+1, updated_at_utc=now()
-                WHERE a.tenant_id=:t AND a.journey_id=:j AND a.journey_document_requirement_id=:r
-                  AND EXISTS (SELECT 1 FROM auditcore.evidence f WHERE f.tenant_id=a.tenant_id
-                              AND f.evidence_id=a.evidence_id AND f.association_status='FOREIGN')
+                UPDATE auditcore.evidence
+                SET foreign_restore_state=jsonb_build_object(
+                        'voidReason', void_reason, 'voidedBy', voided_by_actor_id, 'voidedAt', voided_at_utc,
+                        'captureStatus', CAST(:capture AS text)),
+                    association_status='ACTIVE', void_reason=NULL, voided_by_actor_id=NULL, voided_at_utc=NULL
+                WHERE tenant_id=:t AND evidence_id=:e
                 """
             ),
-            {"t": tenant_id, "j": journey_id, "r": requirement, "e": restored["evidence_id"]},
+            {"t": tenant_id, "e": restored["evidence_id"], "capture": capture},
         )
         counts["documents_restored"] += 1
     counts["tasks_closed"] = _close_foreign_tasks(connection, tenant_id=tenant_id, journey_id=journey_id,
@@ -1197,31 +1250,31 @@ def plan_enforcement(connection: Connection, *, tenant_id: str, journey_id: UUID
 def _close_foreign_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID, foreign: list[str]) -> int:
     """An open task raised only from a FOREIGN file's documents or pages is
     closed (machine-verified, so the rule that raised it can raise it again
-    should the file come back)."""
+    should the file come back). What the task was -- status, verification
+    time, result -- is kept in its result, so it reopens exactly as it was
+    when the file is no longer taken out (_reopen_tasks)."""
     if not foreign:
         return 0
     from audit_core.uc03_p2_task_producer import _OPEN
     from audit_core.uc03_p2_tasks import record_task_event
 
-    documents = {str(d) for d in connection.execute(
+    pages = connection.execute(
         text(
             """
-            SELECT DISTINCT q.di_document_id FROM auditcore.p2_document_queue q
+            SELECT q.queue_id::text AS queue_id, q.di_document_id::text AS document_id, q.batch_id::text AS batch_id
+            FROM auditcore.p2_document_queue q
             WHERE q.tenant_id=:t AND q.journey_id=:j AND q.batch_id = ANY(CAST(:foreign AS uuid[]))
-              AND q.di_document_id IS NOT NULL
             """
         ),
         {"t": tenant_id, "j": journey_id, "foreign": foreign},
-    ).scalars().all()}
-    queues = {str(q) for q in connection.execute(
-        text("SELECT queue_id FROM auditcore.p2_document_queue WHERE tenant_id=:t AND journey_id=:j "
-             "AND batch_id = ANY(CAST(:foreign AS uuid[]))"),
-        {"t": tenant_id, "j": journey_id, "foreign": foreign},
-    ).scalars().all()}
+    ).mappings().all()
+    batch_of_document = {p["document_id"]: p["batch_id"] for p in pages if p["document_id"]}
+    batch_of_page = {p["queue_id"]: p["batch_id"] for p in pages}
     tasks = connection.execute(
         text(
             """
-            SELECT task_id, reference, source_code FROM auditcore.p2_tasks
+            SELECT task_id, dedupe_key, reference, source_code, task_status, verified_at_utc, completion_result
+            FROM auditcore.p2_tasks
             WHERE tenant_id=:t AND journey_id=:j AND task_status = ANY(:open)
             """
         ),
@@ -1234,17 +1287,32 @@ def _close_foreign_tasks(connection: Connection, *, tenant_id: str, journey_id: 
         ids = {str(i) for i in (reference.get("documentIds") or []) if i}
         if reference.get("documentId"):
             ids.add(str(reference["documentId"]))
-        pages = {str(i) for i in (reference.get("queueIds") or []) if i}
+        queue_ids = {str(i) for i in (reference.get("queueIds") or []) if i}
         if reference.get("queueId"):
-            pages.add(str(reference["queueId"]))
+            queue_ids.add(str(reference["queueId"]))
         batch = str(reference.get("batchId") or "")
-        if not (ids or pages or batch):
+        if not (ids or queue_ids or batch):
             continue
-        if not ((not ids or ids <= documents) and (not pages or pages <= queues) and (not batch or batch in batches)):
+        if not ((not ids or ids <= set(batch_of_document)) and (not queue_ids or queue_ids <= set(batch_of_page))
+                and (not batch or batch in batches)):
             continue
+        # Only a task about that document, page or file itself (its id is in
+        # the task's key: "field-review:<journey>:<document>"); a booking-level
+        # task that merely points at it (the booking date, from the docket on
+        # file) is its own rule's to move to the document now current.
+        key = str(task["dedupe_key"] or "")
+        if not any(i in key for i in (*ids, *queue_ids, *([batch] if batch else []))):
+            continue
+        from_files = sorted({batch_of_document[i] for i in ids} | {batch_of_page[q] for q in queue_ids}
+                            | ({batch} if batch else set()))
+        previous = dict(task["completion_result"] or {})
+        if "foreignFile" in previous:  # closed before, re-raised by its rule since
+            previous = previous["foreignFile"].get("previousResult") or {}
         result = {"machineVerification": "PASS", "outcome": "FOREIGN_FILE",
                   "reason": "Raised from another customer's file, which was taken out of this booking.",
-                  "verifiedAt": datetime.now(UTC).isoformat()}
+                  "verifiedAt": datetime.now(UTC).isoformat(),
+                  "foreignFile": {"batchIds": from_files, "previousStatus": task["task_status"],
+                                  "previousVerifiedAt": task["verified_at_utc"], "previousResult": previous}}
         closed_now = connection.execute(
             text(
                 """
@@ -1261,17 +1329,73 @@ def _close_foreign_tasks(connection: Connection, *, tenant_id: str, journey_id: 
             continue
         record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id, task_id=UUID(str(task["task_id"])),
                           event_type="MACHINE_VERIFICATION_PASS", actor_id="SYSTEM", actor_role_code="SYSTEM",
-                          details={**result, "sourceCode": task["source_code"]})
+                          details={k: v for k, v in result.items() if k != "foreignFile"}
+                          | {"sourceCode": task["source_code"], "batchIds": from_files})
         closed += 1
     return closed
+
+
+def _reopen_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID, foreign: list[str]) -> int:
+    """A task closed because its file was taken out (outcome FOREIGN_FILE)
+    reopens exactly as it was -- status, verification time, result -- once
+    none of its files is taken out any more (found to belong, or enforcement
+    switched off for the booking). One its own rule raised again meanwhile
+    keeps the status the rule gave it and gets its result back."""
+    from audit_core.uc03_p2_tasks import record_task_event
+
+    tasks = connection.execute(
+        text(
+            """
+            SELECT task_id, task_status, completion_result FROM auditcore.p2_tasks
+            WHERE tenant_id=:t AND journey_id=:j AND completion_result ? 'foreignFile'
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    still = set(foreign)
+    reopened = 0
+    for task in tasks:
+        result = dict(task["completion_result"] or {})
+        memo = dict(result.get("foreignFile") or {})
+        if set(memo.get("batchIds") or []) & still:
+            continue
+        closed_by_us = task["task_status"] == "VERIFIED_COMPLETE" and result.get("outcome") == "FOREIGN_FILE"
+        previous = memo.get("previousResult")
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_tasks
+                SET task_status=CASE WHEN :ours THEN :s ELSE task_status END,
+                    verified_at_utc=CASE WHEN :ours THEN CAST(:v AS timestamptz) ELSE verified_at_utc END,
+                    completion_result=COALESCE(CAST(:r AS jsonb), '{}'::jsonb), updated_at_utc=now()
+                WHERE tenant_id=:t AND task_id=:id
+                """
+            ),
+            {"t": tenant_id, "id": task["task_id"], "ours": closed_by_us, "s": memo.get("previousStatus") or "READY",
+             "v": memo.get("previousVerifiedAt"), "r": _json(previous) if previous is not None else None},
+        )
+        if closed_by_us:
+            record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id,
+                              task_id=UUID(str(task["task_id"])), event_type="REOPENED", actor_id="SYSTEM",
+                              actor_role_code="SYSTEM",
+                              details={"reason": "Its file is no longer taken out of this booking.",
+                                       "batchIds": memo.get("batchIds") or []})
+            reopened += 1
+    return reopened
 
 
 def apply_file_identity(connection: Connection, *, tenant_id: str, journey_id: UUID,
                         enforce: bool | None = None) -> dict[str, Any]:
     """Decide every file of the booking, record it and -- with enforcement
-    on -- act on it. Runs first in the journey recompute, so the canonical
-    tables it then rebuilds already leave a foreign file out."""
-    enforce = enforce_enabled() if enforce is None else enforce
+    on for the booking (enforce_enabled) -- act on it. Runs first in the
+    journey recompute, so the canonical tables it then rebuilds already leave
+    a foreign file out.
+
+    With enforcement off only the decision is written, and only when it
+    changed -- unless enforcement had been applied on the booking and was
+    switched off since: then this recompute puts everything back exactly as
+    it was (the documents, the copies given back, the tasks closed)."""
+    enforce = enforce_enabled(connection, tenant_id=tenant_id, journey_id=journey_id) if enforce is None else enforce
     files, recorded = load_files(connection, tenant_id=tenant_id, journey_id=journey_id)
     if not files:
         return {"files": 0}
@@ -1287,16 +1411,10 @@ def apply_file_identity(connection: Connection, *, tenant_id: str, journey_id: U
         logger.info("p2_file_identity_decided", tenant_id=tenant_id, journey_id=str(journey_id), batch_id=batch_id,
                     status=d.status, reason_code=d.reason_code, person=d.person_name, masked_pan=d.masked_pan,
                     customer=decision.customer_name, enforce=enforce)
-    if not enforce:
+    target = decision.foreign() if enforce else []
+    if not target and not _applied_before(connection, tenant_id=tenant_id, journey_id=journey_id):
         return summary
-    has_foreign_evidence = connection.execute(
-        text("SELECT EXISTS (SELECT 1 FROM auditcore.evidence WHERE tenant_id=:t AND journey_id=:j "
-             "AND association_status='FOREIGN')"),
-        {"t": tenant_id, "j": journey_id},
-    ).scalar_one()
-    if not decision.foreign() and not has_foreign_evidence:
-        return summary
-    counts = _enforce(connection, tenant_id=tenant_id, journey_id=journey_id, decision=decision)
+    counts = _enforce(connection, tenant_id=tenant_id, journey_id=journey_id, foreign=target)
     summary.update(counts)
     if any(counts.values()):
         reviewed = connection.execute(
@@ -1304,17 +1422,19 @@ def apply_file_identity(connection: Connection, *, tenant_id: str, journey_id: U
                  "WHERE tenant_id=:t AND journey_id=:j)"),
             {"t": tenant_id, "j": journey_id},
         ).scalar_one()
-        logger.info("p2_file_identity_applied", tenant_id=tenant_id, journey_id=str(journey_id),
-                    customer=decision.customer_name, reviewed=bool(reviewed), **counts)
+        event = "p2_file_identity_applied" if enforce else "p2_file_identity_switched_off"
+        logger.info(event, tenant_id=tenant_id, journey_id=str(journey_id), customer=decision.customer_name,
+                    reviewed=bool(reviewed), **counts)
         if reviewed:
             # Applied on a reviewed booking too (product owner: fixed by us).
             logger.warning("p2_file_identity_reviewed_journey", tenant_id=tenant_id, journey_id=str(journey_id),
-                           foreign_files=len(decision.foreign()))
+                           foreign_files=len(target), enforce=enforce)
         from audit_core.uc03_p2_runtime import record_activity
 
-        record_activity(connection, tenant_id=tenant_id, journey_id=journey_id, event_type="FILE_IDENTITY_APPLIED",
+        record_activity(connection, tenant_id=tenant_id, journey_id=journey_id,
+                        event_type="FILE_IDENTITY_APPLIED" if enforce else "FILE_IDENTITY_SWITCHED_OFF",
                         subject_type="JOURNEY", subject_id=str(journey_id),
-                        details={"customer": decision.customer_name, "foreignFiles": decision.foreign(), **counts})
+                        details={"customer": decision.customer_name, "foreignFiles": target, **counts})
     return summary
 
 
@@ -1368,6 +1488,7 @@ def files_view(connection: Connection, *, tenant_id: str, journey_id: UUID) -> d
             or (customer.get("legal_name") if customer.get("legal_name_status") == "VERIFIED" else None))
     return {
         "customerName": name,
+        "enforced": enforce_enabled(connection, tenant_id=tenant_id, journey_id=journey_id),
         "files": [
             {
                 "batchId": str(r["batch_id"]),

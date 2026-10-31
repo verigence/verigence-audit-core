@@ -1862,6 +1862,9 @@ def list_documents(
         "journeyId": str(journey_id),
         "customerName": identity["customerName"],
         "files": identity["files"],
+        # whether another customer's file is taken out of this booking
+        # (p2_file_identity_enforcement / P2_FILE_IDENTITY_ENFORCE)
+        "fileIdentityEnforced": identity["enforced"],
         "batches": result,
         "documents": documents,
         "checklist": checklist,

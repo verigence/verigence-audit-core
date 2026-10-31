@@ -3,9 +3,11 @@
 The journey recompute decides each file's identity by itself
 (uc03_p2_file_identity); this one-shot job reports the decision for every
 booking at once, so the product owner sees what enforcement would do before
-P2_FILE_IDENTITY_ENFORCE is turned on, and -- with "-commit" -- records it and
-asks for a recompute of every booking it changes (the recompute then applies
-it when enforcement is on). It never deletes anything.
+enforcement is turned on, and -- with "-commit" -- records it and asks for a
+recompute of every booking it changes (the recompute then applies it where
+enforcement is on). The job never turns enforcement on, "-commit" included:
+that is the p2_file_identity_enforcement table (per journey or Project) or
+P2_FILE_IDENTITY_ENFORCE. It never deletes anything.
 
 - the tenant comes from the tag, ``<tenant_id>:<label>``;
 - ``reports`` may list journey references to scan only those;
@@ -37,6 +39,7 @@ from audit_core.db import set_tenant_context
 from audit_core.uc03_p2_file_identity import (
     _record,
     classify,
+    enforce_enabled,
     load_files,
     plan_enforcement,
     same_serial,
@@ -98,6 +101,11 @@ def scan_journey(connection, *, tenant_id: str, journey_id: UUID, reference: str
         return item
     item["customer"] = decision.customer_name
     by_id = {f.batch_id: f for f in files}
+    # Whether the recompute would act on it: enforcement comes from the
+    # p2_file_identity_enforcement table or P2_FILE_IDENTITY_ENFORCE only --
+    # never from this job, "-commit" included.
+    enforced = enforce_enabled(connection, tenant_id=tenant_id, journey_id=journey_id)
+    item["enforced"] = enforced
     plan = plan_enforcement(connection, tenant_id=tenant_id, journey_id=journey_id, foreign=decision.foreign())
     for batch_id, d in decision.files.items():
         before = (recorded.get(batch_id) or {}).get("identity_status")
@@ -110,7 +118,7 @@ def scan_journey(connection, *, tenant_id: str, journey_id: UUID, reference: str
                   "journey_id": str(journey_id), "pc": pc_name, "batch_id": batch_id,
                   "file_name": by_id[batch_id].file_name, "status": d.status, "reason_code": d.reason_code,
                   "person": d.person_name, "masked_pan": d.masked_pan, "reason": d.reason,
-                  "customer": decision.customer_name, "previous_status": before}
+                  "customer": decision.customer_name, "previous_status": before, "enforced": enforced}
         if d.status == "BELONGS":
             logger.info("file_identity_scan_item", **common)
             continue
@@ -126,7 +134,7 @@ def scan_journey(connection, *, tenant_id: str, journey_id: UUID, reference: str
     if plan["restored"]:
         logger.info("file_identity_scan_restores", tag=tag, tenant_id=tenant_id, commit=commit,
                     journey_reference=reference, journey_id=str(journey_id), pc=pc_name,
-                    customer=decision.customer_name,
+                    customer=decision.customer_name, enforced=enforced,
                     restored=[f"{r['document']}: {r['whose']}" for r in plan["restored"]])
     item["checks"] = decision.checks
     for check in decision.checks:
@@ -136,8 +144,9 @@ def scan_journey(connection, *, tenant_id: str, journey_id: UUID, reference: str
     if not commit:
         return item
     _record(connection, tenant_id=tenant_id, journey_id=journey_id, decision=decision, recorded=recorded)
-    waiting = any(d.status == "FOREIGN" and not (recorded.get(b) or {}).get("identity_enforced_at_utc")
-                  for b, d in decision.files.items())
+    # A booking where enforcement is on and a foreign file still waits for it.
+    waiting = enforced and any(d.status == "FOREIGN" and not (recorded.get(b) or {}).get("identity_enforced_at_utc")
+                               for b, d in decision.files.items())
     if item["changed"] or waiting:
         from audit_core.uc03_p2_runtime import note_facts_changed
 

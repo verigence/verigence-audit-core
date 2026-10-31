@@ -18,6 +18,18 @@ Azizur's and his receipts counted as Azizur's payments.
 - auditcore.p2_journey_file_identity: the booking's customer as its files say,
   how many files are foreign or to be checked, and the checks reported, never
   acted on (two individual PANs in one kept file, more than one car).
+- auditcore.p2_file_identity_enforcement: where enforcement is on, switched
+  from the database without a redeploy -- one row per journey (a pilot) or a
+  Project-wide row (journey_id NULL), unique on (tenant_id, journey_id or
+  '*'). Enforcement is on for a journey when P2_FILE_IDENTITY_ENFORCE is set
+  (a global override) or an enabled row covers it; a row turned to enabled =
+  false puts the journey back as it was on its next recompute, which the
+  switch itself asks for (trigger). Row security
+  as p2_upload_pause: a Project reads its own rows, only a SuperAdmin request
+  (app.platform_super_admin) writes; never deleted by the runtime.
+- auditcore.evidence.foreign_restore_state: on a copy file identity made
+  active again, what it was before (void reason, who, when, capture status),
+  so switching enforcement off supersedes it again exactly as it was.
 """
 from __future__ import annotations
 
@@ -30,6 +42,7 @@ depends_on = None
 
 _RUNTIME_ROLE = "audit_core_runtime"
 _TABLE = "p2_journey_file_identity"
+_SWITCH = "p2_file_identity_enforcement"
 
 
 def upgrade() -> None:
@@ -51,7 +64,85 @@ def upgrade() -> None:
           DROP CONSTRAINT IF EXISTS evidence_association_status_check,
           ADD CONSTRAINT evidence_association_status_check
             CHECK (association_status IN ('ACTIVE', 'VOIDED', 'SUPERSEDED', 'UNLINKED', 'FOREIGN')),
-          ADD COLUMN IF NOT EXISTS pre_foreign_status varchar(30);
+          ADD COLUMN IF NOT EXISTS pre_foreign_status varchar(30),
+          ADD COLUMN IF NOT EXISTS foreign_restore_state jsonb;
+        """
+    )
+    op.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS auditcore.{_SWITCH} (
+            enforcement_id   uuid         NOT NULL DEFAULT gen_random_uuid() PRIMARY KEY,
+            tenant_id        varchar(128) NOT NULL,
+            journey_id       uuid,
+            enabled          boolean      NOT NULL,
+            set_by_actor_id  varchar(160),
+            set_at_utc       timestamptz  NOT NULL DEFAULT now(),
+            note             text,
+            FOREIGN KEY (tenant_id, journey_id) REFERENCES auditcore.journeys (tenant_id, journey_id)
+              ON DELETE CASCADE
+        )
+        """
+    )
+    op.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS ux_{_SWITCH}_scope "
+        f"ON auditcore.{_SWITCH} (tenant_id, (COALESCE(journey_id::text, '*')))"
+    )
+    op.execute(f"ALTER TABLE auditcore.{_SWITCH} ENABLE ROW LEVEL SECURITY")
+    op.execute(f"ALTER TABLE auditcore.{_SWITCH} FORCE ROW LEVEL SECURITY")
+    op.execute(f"DROP POLICY IF EXISTS {_SWITCH}_read ON auditcore.{_SWITCH}")
+    op.execute(
+        f"CREATE POLICY {_SWITCH}_read ON auditcore.{_SWITCH} FOR SELECT "
+        "USING (tenant_id = auditcore.current_tenant_id() OR auditcore.current_platform_super_admin())"
+    )
+    op.execute(f"DROP POLICY IF EXISTS {_SWITCH}_admin_insert ON auditcore.{_SWITCH}")
+    op.execute(
+        f"CREATE POLICY {_SWITCH}_admin_insert ON auditcore.{_SWITCH} FOR INSERT "
+        "WITH CHECK (auditcore.current_platform_super_admin())"
+    )
+    op.execute(f"DROP POLICY IF EXISTS {_SWITCH}_admin_update ON auditcore.{_SWITCH}")
+    op.execute(
+        f"CREATE POLICY {_SWITCH}_admin_update ON auditcore.{_SWITCH} FOR UPDATE "
+        "USING (auditcore.current_platform_super_admin()) "
+        "WITH CHECK (auditcore.current_platform_super_admin())"
+    )
+    op.execute(f"GRANT SELECT, INSERT, UPDATE ON auditcore.{_SWITCH} TO {_RUNTIME_ROLE}")
+    op.execute(f"REVOKE DELETE ON auditcore.{_SWITCH} FROM {_RUNTIME_ROLE}")
+    # A switch turned on or off takes effect on the worker's next pass: the
+    # booking (or, for a Project-wide row, every booking holding a foreign
+    # file or one taken out) is asked for a recompute. Under the row's own
+    # tenant, restored afterwards: the SuperAdmin session has none.
+    op.execute(
+        f"""
+        CREATE OR REPLACE FUNCTION auditcore.{_SWITCH}_changed()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $fn$
+        DECLARE
+            previous_tenant text := current_setting('app.tenant_id', true);
+            booking uuid;
+        BEGIN
+            IF TG_OP = 'UPDATE' AND NEW.enabled IS NOT DISTINCT FROM OLD.enabled THEN
+                RETURN NEW;
+            END IF;
+            PERFORM set_config('app.tenant_id', NEW.tenant_id, true);
+            FOR booking IN
+                SELECT b.journey_id FROM auditcore.p2_upload_batches b
+                WHERE b.tenant_id = NEW.tenant_id
+                  AND (b.journey_id = NEW.journey_id
+                       OR (NEW.journey_id IS NULL
+                           AND (b.identity_status = 'FOREIGN' OR b.identity_enforced_at_utc IS NOT NULL)))
+                GROUP BY b.journey_id
+            LOOP
+                PERFORM auditcore.p2_request_stage_recompute(NEW.tenant_id, booking);
+            END LOOP;
+            PERFORM set_config('app.tenant_id', COALESCE(previous_tenant, ''), true);
+            RETURN NEW;
+        END
+        $fn$;
+        DROP TRIGGER IF EXISTS trg_{_SWITCH}_changed ON auditcore.{_SWITCH};
+        CREATE TRIGGER trg_{_SWITCH}_changed
+          AFTER INSERT OR UPDATE OF enabled ON auditcore.{_SWITCH}
+          FOR EACH ROW EXECUTE FUNCTION auditcore.{_SWITCH}_changed();
         """
     )
     op.execute(
@@ -124,6 +215,14 @@ def downgrade() -> None:
     op.execute(
         f"""
         DROP FUNCTION IF EXISTS platform_ops.file_identity_health();
+        DROP TABLE IF EXISTS auditcore.{_SWITCH};
+        DROP FUNCTION IF EXISTS auditcore.{_SWITCH}_changed();
+        UPDATE auditcore.evidence
+           SET association_status = 'SUPERSEDED',
+               void_reason = foreign_restore_state->>'voidReason',
+               voided_by_actor_id = foreign_restore_state->>'voidedBy',
+               voided_at_utc = (foreign_restore_state->>'voidedAt')::timestamptz
+         WHERE foreign_restore_state IS NOT NULL AND association_status = 'ACTIVE';
         UPDATE auditcore.evidence
            SET association_status = COALESCE(pre_foreign_status, 'SUPERSEDED')
          WHERE association_status = 'FOREIGN';
@@ -131,7 +230,8 @@ def downgrade() -> None:
           DROP CONSTRAINT IF EXISTS evidence_association_status_check,
           ADD CONSTRAINT evidence_association_status_check
             CHECK (association_status IN ('ACTIVE', 'VOIDED', 'SUPERSEDED', 'UNLINKED')),
-          DROP COLUMN IF EXISTS pre_foreign_status;
+          DROP COLUMN IF EXISTS pre_foreign_status,
+          DROP COLUMN IF EXISTS foreign_restore_state;
         DROP TABLE IF EXISTS auditcore.{_TABLE};
         DROP INDEX IF EXISTS auditcore.ix_p2_upload_batches_foreign;
         ALTER TABLE auditcore.p2_upload_batches

@@ -466,7 +466,7 @@ def test_another_customers_file_leaves_the_booking_and_the_customers_own_documen
         set_tenant_context(connection, journey.tenant_id)
         task_id, _ = raise_or_refresh(
             connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
-            dedupe_key=f"test-document:{journey.journey_id}", task_type="DOCUMENT_MISSING", source_type="DOCUMENT",
+            dedupe_key=f"test-document:{journey.journey_id}:{tapan['pan_card:1']['document_id']}", task_type="DOCUMENT_MISSING", source_type="DOCUMENT",
             source_code="TEST", title="Check the PAN", description="x",
             reference={"documentId": str(tapan["pan_card:1"]["document_id"])}, severity="HIGH",
             registry=get_registry())
@@ -555,6 +555,132 @@ def test_with_enforcement_off_only_the_decision_is_written_and_only_when_it_chan
     assert _snapshot(journey) == first  # not one row rewritten (xmin unchanged)
 
 
+def _switch(journey, enabled: bool, *, whole_project: bool = False) -> None:
+    """The enforcement switch as a SuperAdmin request sets it (p2_file_identity_enforcement),
+    as the runtime role: row security and the switch's recompute trigger run for real."""
+    from audit_core.db import set_platform_super_admin_context
+    from audit_core.dependencies import get_engine
+
+    with get_engine().begin() as connection:
+        set_platform_super_admin_context(connection)
+        connection.execute(
+            text("INSERT INTO auditcore.p2_file_identity_enforcement (tenant_id, journey_id, enabled, set_by_actor_id, "
+                 "note) VALUES (:t, :j, :e, 'test-superadmin', 'pilot') "
+                 "ON CONFLICT (tenant_id, (COALESCE(journey_id::text, '*'))) DO UPDATE SET enabled=EXCLUDED.enabled, "
+                 "set_by_actor_id=EXCLUDED.set_by_actor_id, set_at_utc=now(), note=EXCLUDED.note"),
+            {"t": journey.tenant_id, "j": None if whole_project else journey.journey_id, "e": enabled})
+
+
+_STATE = {
+    "evidence": "SELECT evidence_id::text, association_status, void_reason, voided_by_actor_id, voided_at_utc, "
+                "pre_foreign_status, foreign_restore_state::text, supersedes_evidence_id::text "
+                "FROM auditcore.evidence WHERE tenant_id=:t ORDER BY 1",
+    "assessments": "SELECT journey_document_assessment_id::text, evidence_id::text, version_no, updated_at_utc "
+                   "FROM auditcore.journey_document_assessments WHERE tenant_id=:t ORDER BY 1",
+    "captures": "SELECT di_document_id::text, capture_status FROM auditcore.document_capture_v2_documents "
+                "WHERE tenant_id=:t ORDER BY 1",
+    "tasks": "SELECT task_id::text, dedupe_key, task_status, verified_at_utc, completion_result::text "
+             "FROM auditcore.p2_tasks WHERE tenant_id=:t ORDER BY 1",
+    "batches": "SELECT batch_id::text, identity_enforced_at_utc FROM auditcore.p2_upload_batches "
+               "WHERE tenant_id=:t ORDER BY 1",
+}
+
+
+def _booking_state(journey) -> dict[str, list]:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return {name: [tuple(r) for r in connection.execute(text(sql), {"t": journey.tenant_id}).all()]
+                for name, sql in _STATE.items()}
+
+
+def test_enforcement_is_switched_per_journey_or_project_from_the_database(journey, monkeypatch):
+    from audit_core.uc03_p2_file_identity import enforce_enabled
+
+    monkeypatch.delenv("P2_FILE_IDENTITY_ENFORCE", raising=False)
+    other = uuid4()
+
+    def on(journey_id) -> bool:
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            return enforce_enabled(connection, tenant_id=journey.tenant_id, journey_id=journey_id)
+
+    assert on(journey.journey_id) is False
+    _switch(journey, True)
+    assert (on(journey.journey_id), on(other)) == (True, False)
+    _switch(journey, False)
+    assert on(journey.journey_id) is False
+    _switch(journey, True, whole_project=True)
+    assert (on(journey.journey_id), on(other)) == (True, True)
+    _switch(journey, False, whole_project=True)
+    assert on(journey.journey_id) is False
+    monkeypatch.setenv("P2_FILE_IDENTITY_ENFORCE", "1")  # the global override
+    assert on(other) is True
+    # The runtime cannot write the switch: SuperAdmin requests only (row security).
+    from audit_core.dependencies import get_engine
+
+    with get_engine().connect() as connection, pytest.raises(Exception, match="row-level security"):
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("INSERT INTO auditcore.p2_file_identity_enforcement (tenant_id, journey_id, enabled) "
+                                "VALUES (:t, NULL, true)"), {"t": journey.tenant_id})
+
+
+def test_switching_enforcement_off_for_a_journey_puts_everything_back_exactly(journey, monkeypatch):
+    """A pilot on one booking: switched on, Tapan's file leaves the booking,
+    Azizur's copies come back and the task from Tapan's PAN closes; switched
+    off, the next recompute puts the evidence, assessments, capture rows and
+    tasks back exactly as they were before."""
+    monkeypatch.delenv("P2_FILE_IDENTITY_ENFORCE", raising=False)
+    requirements, azizur, tapan = _azizur_then_tapan(journey)
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_task_producer import raise_or_refresh
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.journey_document_assessments (tenant_id, journey_id, stage_code, "
+                 "journey_document_requirement_id, requirement_key, evidence_id) VALUES (:t, :j, 'BOOKING', :r, "
+                 "'pan_card', :e)"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "r": requirements["pan_card"],
+             "e": tapan["pan_card:1"]["evidence_id"]})
+        task_id, _ = raise_or_refresh(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+            dedupe_key=f"test-document:{journey.journey_id}:{tapan['pan_card:1']['document_id']}", task_type="DOCUMENT_MISSING", source_type="DOCUMENT",
+            source_code="TEST", title="Check the PAN", description="x",
+            reference={"documentId": str(tapan["pan_card:1"]["document_id"])}, severity="HIGH",
+            registry=get_registry())
+    _settle(journey)  # decided, not enforced
+    before = _booking_state(journey)
+    _settle(journey)
+    assert _booking_state(journey) == before
+
+    _switch(journey, True)
+    # The switch asks for the booking's recompute itself (the worker runs it).
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert connection.execute(text("SELECT work_status FROM auditcore.p2_work_queue WHERE tenant_id=:t "
+                                       "AND journey_id=:j AND work_type='STAGE_RECOMPUTE'"),
+                                  {"t": journey.tenant_id, "j": journey.journey_id}).scalar_one() == "PENDING"
+    _settle(journey)
+    assert _state(journey, *tapan.values()) == ["FOREIGN"] * 4
+    assert _state(journey, azizur["pan_card:1"], azizur["aadhaar:2"], azizur["booking_docket:3"]) == ["ACTIVE"] * 3
+    enforced = _booking_state(journey)
+    [task] = [t for t in enforced["tasks"] if t[0] == str(task_id)]
+    assert task[2] == "VERIFIED_COMPLETE" and json.loads(task[4])["outcome"] == "FOREIGN_FILE"
+
+    _switch(journey, False)
+    _settle(journey)
+    after = _booking_state(journey)
+    for name in ("evidence", "assessments", "captures", "batches"):
+        assert after[name] == before[name], name
+    assert after["tasks"] == before["tasks"]
+    assert _legal_name(journey) == "TAPAN KUMAR PATRA"  # the customer record follows, as it stood
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        view = files_view(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert view["enforced"] is False
+    assert next(f for f in view["files"] if f["fileName"] == "Tapan kumar patra.pdf")["identity"]["status"] == "UNKNOWN"
+
+
 def test_a_file_found_to_belong_after_all_comes_back_as_it_was(journey, monkeypatch):
     """A bank approval letter naming Tapan as co-applicant arrives in Azizur's
     own file later: Tapan's file belongs, its documents come back and the
@@ -594,6 +720,7 @@ def test_a_late_link_callback_does_not_bring_a_foreign_document_back():
 def test_the_scan_job_reports_and_with_commit_records_and_asks_for_a_recompute(journey, monkeypatch, capsys):
     from audit_core import uc03_file_identity_scan as scan
 
+    monkeypatch.delenv("P2_FILE_IDENTITY_ENFORCE", raising=False)
     _azizur_then_tapan(journey)
     events: list[tuple[str, dict]] = []
     monkeypatch.setattr(scan.logger, "info", lambda event, **kw: events.append((event, kw)))
@@ -632,6 +759,14 @@ def test_the_scan_job_reports_and_with_commit_records_and_asks_for_a_recompute(j
                                            "AND association_status='FOREIGN'"), {"t": journey.tenant_id}).scalar_one()
     assert statuses == {"Azizur Reheman.pdf": "BELONGS", "Tapan kumar patra.pdf": "FOREIGN"}
     assert queued == 1 and evidence == 0  # the recompute, not the job, acts on it
+    # "-commit" never turns enforcement on: the recompute it asked for decides only.
+    _settle(journey)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert connection.execute(text("SELECT count(*) FROM auditcore.p2_file_identity_enforcement "
+                                       "WHERE tenant_id=:t"), {"t": journey.tenant_id}).scalar_one() == 0
+        assert connection.execute(text("SELECT count(*) FROM auditcore.evidence WHERE tenant_id=:t "
+                                       "AND association_status='FOREIGN'"), {"t": journey.tenant_id}).scalar_one() == 0
     with pytest.raises(ValueError):
         scan.run_file_identity_scan(journey.engine, "no-tenant")
 
