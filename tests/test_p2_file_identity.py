@@ -703,6 +703,61 @@ def test_a_file_found_to_belong_after_all_comes_back_as_it_was(journey, monkeypa
     assert tapan_file["identity"]["status"] == "BELONGS" and "co-applicant" in tapan_file["identity"]["reason"]
 
 
+def _page_tasks(journey, batch_id: UUID) -> dict[str, tuple]:
+    """The file and page tasks of one uploaded file: kind -> (status, outcome)."""
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        rows = connection.execute(
+            text("SELECT split_part(dedupe_key, ':', 1), task_status, completion_result->>'outcome' "
+                 "FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j AND reference->>'batchId' = :b "
+                 "AND split_part(dedupe_key, ':', 1) IN ('unclassified', 'upload-quality', 'large-upload')"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "b": str(batch_id)}).all()
+    return {kind: (status, outcome) for kind, status, outcome in rows}
+
+
+def test_a_taken_out_files_page_tasks_stay_closed_and_come_back_with_the_file(journey, monkeypatch):
+    """Pilot 2026-10-31 (UTK-SU-261019-001, UTK-RM-261019-002): the task to
+    set the type of an unread page, and the image-quality task, of another
+    customer's file were closed when the file was taken out -- and reopened
+    by their own producers in the same recompute. While the file is out they
+    stay closed; switched off, they come back as they were."""
+    monkeypatch.delenv("P2_FILE_IDENTITY_ENFORCE", raising=False)
+    monkeypatch.setattr("audit_core.uc03_p2_task_producer.LARGE_UPLOAD_PAGES", 5)
+    _, azizur, tapan = _azizur_then_tapan(journey)
+    batch = tapan["pan_card:1"]["batch_id"]
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        for page, status, error, template in ((5, "SUPPORTING", None, "supporting_document"),
+                                              (6, "FAILED", "DI_QUALITY_IMAGE_BLUR_SCORE", None)):
+            connection.execute(
+                text("INSERT INTO auditcore.p2_document_queue (tenant_id, batch_id, journey_id, page_number, "
+                     "page_sha256, page_object_key, client_upload_id, queue_status, last_error, template_key, "
+                     "business_stage) VALUES (:t, :b, :j, :p, :sha, :k, :c, :s, :e, :tk, 'BOOKING')"),
+                {"t": journey.tenant_id, "b": batch, "j": journey.journey_id, "p": page, "sha": uuid4().hex,
+                 "k": f"p2/{batch}/{page}", "c": f"p2-{uuid4().hex}", "s": status, "e": error, "tk": template})
+        connection.execute(text("UPDATE auditcore.p2_upload_batches SET batch_status='PARTIAL_FAILURE', page_count=6 "
+                                "WHERE tenant_id=:t AND batch_id=:b"), {"t": journey.tenant_id, "b": batch})
+        # Azizur's file stays the larger one, so he stays the customer.
+        connection.execute(text("UPDATE auditcore.p2_upload_batches SET page_count=12 WHERE tenant_id=:t AND batch_id=:b"),
+                           {"t": journey.tenant_id, "b": azizur["pan_card:1"]["batch_id"]})
+    _settle(journey)  # decided, not taken out: the file's tasks are raised
+    assert _page_tasks(journey, batch) == {"unclassified": ("READY", None), "upload-quality": ("READY", None),
+                                    "large-upload": ("READY", None)}
+    before = _booking_state(journey)
+
+    _switch(journey, True)
+    for _ in range(2):  # and a later recompute does not raise them again
+        _settle(journey)
+        assert _page_tasks(journey, batch) == {kind: ("VERIFIED_COMPLETE", "FOREIGN_FILE")
+                                        for kind in ("unclassified", "upload-quality", "large-upload")}
+    _switch(journey, False)
+    _settle(journey)
+    assert _page_tasks(journey, batch) == {"unclassified": ("READY", None), "upload-quality": ("READY", None),
+                                           "large-upload": ("READY", None)}
+    assert _state(journey, *tapan.values()) == ["ACTIVE"] * 4  # back as the upload rule had it
+    assert _booking_state(journey)["tasks"] == before["tasks"]
+
+
 def test_a_late_link_callback_does_not_bring_a_foreign_document_back():
     """A delayed duplicate DI callback re-activated any non-active repeatable
     document (a receipt): a FOREIGN one is acknowledged and stays out."""
