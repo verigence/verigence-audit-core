@@ -86,6 +86,7 @@ from audit_core.uc03_p2_tasks import (
     submit_action,
     task_queue_tab,
 )
+from audit_core.uc03_p2_upload_pause import refuse_upload_if_paused
 from audit_core.uc03_requirement_satisfaction import (
     linked_documents_for_journey,
     requirements_for_journey,
@@ -378,6 +379,8 @@ def create_p2_journey(
     if chosen_journey_id is not None:
         customer_name = str(chosen_journey_id)
     set_tenant_context(connection, tenant_id)
+    # A booking starts with its first upload: none while uploads are paused.
+    refuse_upload_if_paused(connection, tenant_id)
     context = _create_context(
         connection, tenant_id=tenant_id, actor_id=human_principal.subject, outlet_id=command.outletId,
     )
@@ -1097,6 +1100,7 @@ def init_uploads(
         authorization_client=authorization_client,
         permission_key=_UPDATE_PERMISSION,
     )
+    refuse_upload_if_paused(connection, tenant_id)
     max_bytes = int(os.environ.get("P2_MAX_UPLOAD_BYTES", str(_DEFAULT_MAX_UPLOAD_BYTES)))
     correlation_id = get_correlation_id(request)
     try:
@@ -1269,6 +1273,7 @@ def replace_document(
         authorization_client=authorization_client,
         permission_key=_UPDATE_PERMISSION,
     )
+    refuse_upload_if_paused(connection, tenant_id)
     evidence = connection.execute(
         text(
             """

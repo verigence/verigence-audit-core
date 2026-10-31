@@ -41,6 +41,7 @@ from audit_core.uc03_booking_commands import (
 from audit_core.uc03_booking_commands import (
     _journey_context as _booking_journey_context,
 )
+from audit_core.uc03_p2_upload_pause import refuse_upload_if_paused
 
 router = APIRouter(
     prefix="/v1/tenants/{tenant_id}/journeys/{journey_id}/stages/BOOKING/documents",
@@ -156,6 +157,7 @@ def upload_booking_document(
 
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
+        refuse_upload_if_paused(connection, tenant_id)
         booking_context = _booking_journey_context(
             connection,
             tenant_id=tenant_id,

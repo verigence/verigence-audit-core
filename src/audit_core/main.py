@@ -129,6 +129,10 @@ from audit_core.uc03_p2_live import router as uc03_p2_live_router
 from audit_core.uc03_p2_resplit import router as uc03_p2_resplit_router
 from audit_core.uc03_p2_reviewer import router as uc03_p2_reviewer_router
 from audit_core.uc03_p2_tenant_alerts import router as uc03_p2_tenant_alerts_router
+from audit_core.uc03_p2_upload_pause import (
+    admin_router as uc03_p2_upload_pause_admin_router,
+)
+from audit_core.uc03_p2_upload_pause import router as uc03_p2_upload_pause_router
 from audit_core.uc03_p2_vehicle_photos import router as uc03_p2_vehicle_photos_router
 from audit_core.uc03_pc_booking_documents import (
     router as uc03_pc_booking_documents_router,
@@ -302,6 +306,8 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_reviewer_router)
     application.include_router(uc03_p2_journey_delete_router)
     application.include_router(uc03_p2_tenant_alerts_router)
+    application.include_router(uc03_p2_upload_pause_router)
+    application.include_router(uc03_p2_upload_pause_admin_router)
     application.include_router(uc03_p2_daily_report_router)
     application.include_router(onboarding_router)
     application.include_router(uc03_p2_deal_router)
