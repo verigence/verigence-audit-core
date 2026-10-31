@@ -703,6 +703,13 @@ def _resolve_prefix_except(connection: Connection, *, tenant_id: str, journey_id
 _UPLOAD_STATUS_AFTER_SECONDS = int(os.environ.get("P2_UPLOAD_STATUS_AFTER_SECONDS", str(60 * 60)))
 _SETTLED_PAGE_STATES = ("READY", "SUPPORTING", "NEEDS_REVIEW", "CANCELLED", "MERGED")
 _FAILED_PAGE_STATES = ("FAILED", "DEAD_LETTER")
+# A file file-identity enforcement took out of the booking (another
+# customer's file: uc03_p2_file_identity sets identity_enforced_at_utc and
+# clears it when the file comes back). Its file and page tasks were closed
+# with it (outcome FOREIGN_FILE); the producers below must not raise them
+# again while it is out, or every recompute reopens them (pilot 2026-10-31:
+# UTK-SU-261019-001, UTK-RM-261019-002, UTK-SA-261020-004).
+_NOT_TAKEN_OUT_SQL = "b.identity_enforced_at_utc IS NULL"
 
 
 def _pages_text(pages: list[int]) -> str:
@@ -936,6 +943,9 @@ def sync_processing_failure_tasks(
             ) q ON q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id
             WHERE b.tenant_id=:t AND b.journey_id=:j
               AND b.batch_status NOT IN ('CANCELLED','COMPLETED')
+              -- Another customer's file taken out of this booking raises no
+              -- file or page task here (pilot finding, 2026-10-31).
+              AND {_NOT_TAKEN_OUT_SQL}
             GROUP BY b.batch_id, b.original_filename, b.page_count, b.batch_status, b.created_at_utc,
                      b.failure_reason
             ORDER BY b.created_at_utc
@@ -1146,12 +1156,13 @@ def sync_large_upload_tasks(
     limit = LARGE_UPLOAD_PAGES if threshold is None else threshold
     batches = connection.execute(
         text(
-            """
-            SELECT batch_id, original_filename, page_count
-            FROM auditcore.p2_upload_batches
-            WHERE tenant_id=:t AND journey_id=:j AND page_count > :limit
-              AND batch_status NOT IN ('CANCELLED','FAILED','AWAITING_UPLOAD')
-            ORDER BY created_at_utc
+            f"""
+            SELECT b.batch_id, b.original_filename, b.page_count
+            FROM auditcore.p2_upload_batches b
+            WHERE b.tenant_id=:t AND b.journey_id=:j AND b.page_count > :limit
+              AND b.batch_status NOT IN ('CANCELLED','FAILED','AWAITING_UPLOAD')
+              AND {_NOT_TAKEN_OUT_SQL}
+            ORDER BY b.created_at_utc
             """
         ),
         {"t": tenant_id, "j": journey_id, "limit": limit},
@@ -1281,13 +1292,14 @@ def sync_unclassified_page_tasks(
     counts: dict[str, int] = {}
     rows = connection.execute(
         text(
-            """
+            f"""
             SELECT q.queue_id, b.batch_id, b.original_filename, q.page_numbers, q.page_number
             FROM auditcore.p2_document_queue q
             JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
             WHERE q.tenant_id=:t AND q.journey_id=:j AND q.queue_status='SUPPORTING'
               AND COALESCE(q.template_key, 'supporting_document') = 'supporting_document'
               AND q.type_overridden_by_actor_id IS NULL
+              AND {_NOT_TAKEN_OUT_SQL}
             ORDER BY b.created_at_utc, q.page_number
             """
         ),
