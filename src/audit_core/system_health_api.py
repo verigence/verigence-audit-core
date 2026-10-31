@@ -19,6 +19,9 @@ GET /v1/admin/system-health?hours=24 answers, for the whole platform:
 - Document Intelligence: DI keeps its own database, so its boots, CPU/memory,
   queues and database come from DI's GET /v1/platform/health and are merged
   into services, resources, pipeline.documentIntelligence and diDatabase;
+- Cloudflare (web Worker, R2) and Neon: their alerts join the banner; the
+  nodes themselves are GET /v1/admin/system-health/infrastructure
+  (system_health_cloud, 2026-10-31);
 - alerts: what needs attention now, most severe first, shown as a banner.
 
 Counts and error codes only; no Journey or customer data leaves this route.
@@ -32,6 +35,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import Connection, text
 
@@ -42,6 +46,7 @@ from audit_core.dependencies import (
     get_engine,
     require_super_admin_request,
 )
+from audit_core.system_health_cloud import infrastructure_health
 from audit_core.system_health_di import (
     DiHealthUnavailable,
     di_alerts,
@@ -52,6 +57,7 @@ from audit_core.system_health_di import (
 )
 
 router = APIRouter(tags=["system-health"])
+logger = structlog.get_logger(__name__)
 
 ALIVE_SECONDS = 180
 CPU_ALERT_RATIO = 0.8
@@ -401,7 +407,8 @@ def pipeline_health(connection: Connection, since: datetime) -> dict[str, Any]:
 
 
 def build_alerts(services: list[dict[str, Any]], railway: dict[str, Any], pipeline: dict[str, Any],
-                 database: dict[str, Any], resources: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+                 database: dict[str, Any], resources: list[dict[str, Any]] | None = None,
+                 infrastructure: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     resources = resources or []
     alerts: list[dict[str, Any]] = []
 
@@ -470,6 +477,9 @@ def build_alerts(services: list[dict[str, Any]], railway: dict[str, Any], pipeli
         add("WARNING", "DB_ROLLBACKS", f"{delta['rollbackRatio']:.1%} of database transactions rolled back in this window.")
     if delta.get("deadlocks"):
         add("WARNING", "DB_DEADLOCKS", f"{delta['deadlocks']} deadlock(s) in this window.")
+    # Cloudflare (web Worker, R2) and Neon (2026-10-31): web errors and probe, R2 probe and
+    # errors, connections near the limit, long queries, a low cache hit ratio.
+    alerts.extend((infrastructure or {}).get("alerts") or [])
     order = {"CRITICAL": 0, "WARNING": 1}
     alerts.sort(key=lambda a: order.get(a["severity"], 2))
     return alerts
@@ -506,7 +516,16 @@ def system_health(
         pipeline["documentIntelligence"] = di_pipeline(di, project_names(connection))
         if isinstance(di.get("database"), dict):
             di_database = {**di["database"], "window": None}
-    alerts = build_alerts(services, railway, pipeline, database, resources)
+    infrastructure: dict[str, Any] | None
+    try:
+        # Its own savepoint: the page still answers if the Neon samples cannot be read.
+        with connection.begin_nested():
+            infrastructure = infrastructure_health(connection, hours)
+    except Exception as exc:  # noqa: BLE001 - shown as an alert, never a failed page
+        logger.warning("system_health_infrastructure_failed", error_type=type(exc).__name__)
+        infrastructure = {"alerts": [{"severity": "WARNING", "code": "INFRASTRUCTURE_UNAVAILABLE",
+                                      "message": f"Cloudflare and Neon health could not be read ({type(exc).__name__})."}]}
+    alerts = build_alerts(services, railway, pipeline, database, resources, infrastructure)
     alerts += di_alerts(pipeline["documentIntelligence"], di_database)
     order = {"CRITICAL": 0, "WARNING": 1}
     alerts.sort(key=lambda a: order.get(a["severity"], 2))

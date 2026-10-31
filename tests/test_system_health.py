@@ -26,6 +26,19 @@ from audit_core.security_integration import SecurityAdminContext
 from audit_core.system_health_api import build_alerts, services_health
 
 
+@pytest.fixture(autouse=True)
+def _no_outside_calls(monkeypatch):
+    """The page also asks Cloudflare and Neon (system_health_cloud); never from these tests."""
+    from audit_core import system_health_cloud
+
+    for name in ("CLOUDFLARE_API_TOKEN", "NEON_API_KEY", "VERIGENCE_WEB_URL", "AUDIT_CORE_CORS_ALLOWED_ORIGINS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(system_health_cloud, "r2_bucket", lambda: (None, None))
+    system_health_cloud.clear_cache()
+    yield
+    system_health_cloud.clear_cache()
+
+
 @pytest.fixture
 def engine():
     engine = database_engine()
