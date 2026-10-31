@@ -9,11 +9,16 @@ it when enforcement is on). It never deletes anything.
 
 - the tenant comes from the tag, ``<tenant_id>:<label>``;
 - ``reports`` may list journey references to scan only those;
-- one ``file_identity_scan_item`` log line per file (journey reference, file
-  name, status, the person it names, why), one ``file_identity_scan_check``
-  line per check reported (two individual PANs in one kept file, more than
-  one car in a booking, one car in two customers' bookings) and a
-  ``file_identity_scan_finished`` summary.
+- for review, one ``file_identity_scan_review`` line per FOREIGN or UNKNOWN
+  file: journey reference, PC, file name, the person it names, masked PAN,
+  why, and what enforcement would do -- the documents and receipts it would
+  take out, the customer's own copies it would give back (worked out read
+  only, uc03_p2_file_identity.plan_enforcement); one
+  ``file_identity_scan_restores`` line per booking naming the documents given
+  back (type and whose); one ``file_identity_scan_item`` line per other file;
+- one ``file_identity_scan_check`` line per check reported (two individual
+  PANs in one kept file, more than one car in a booking, one car in two
+  customers' bookings) and a ``file_identity_scan_finished`` summary.
 
 Requested as a row of ``p2_worker_jobs``::
 
@@ -33,6 +38,7 @@ from audit_core.uc03_p2_file_identity import (
     _record,
     classify,
     load_files,
+    plan_enforcement,
     same_serial,
     vehicles_of,
 )
@@ -58,7 +64,7 @@ def _journeys(engine: Engine, tenant_id: str, references: list[str]) -> list[dic
         rows = connection.execute(
             text(
                 """
-                SELECT j.journey_id, j.journey_reference
+                SELECT j.journey_id, j.journey_reference, j.created_by_display_name AS pc_name
                 FROM auditcore.journeys j
                 WHERE j.tenant_id=:t
                   AND EXISTS (SELECT 1 FROM auditcore.p2_upload_batches b
@@ -73,19 +79,26 @@ def _journeys(engine: Engine, tenant_id: str, references: list[str]) -> list[dic
 
 
 def scan_journey(connection, *, tenant_id: str, journey_id: UUID, reference: str | None, tag: str,
-                 commit: bool) -> dict[str, Any]:
+                 commit: bool, pc_name: str | None = None) -> dict[str, Any]:
     """One booking: its files' decisions logged; with ``commit`` recorded and a
     recompute requested when anything changed or a foreign file still waits
-    for enforcement."""
+    for enforcement.
+
+    For review, each FOREIGN or UNKNOWN file is one ``file_identity_scan_review``
+    line (journey, PC, file, person, masked PAN, reason, and what enforcement
+    would take out and give back); each other file one ``file_identity_scan_item``
+    line; a booking where enforcement would give documents back one
+    ``file_identity_scan_restores`` line naming them."""
     files, recorded = load_files(connection, tenant_id=tenant_id, journey_id=journey_id)
     decision = classify(files) if files else None
     item: dict[str, Any] = {"files": len(files), "foreign": 0, "second_party": 0, "unknown": 0, "no_identity": 0,
                             "changed": 0, "checks": [], "vehicles": [], "customer": None,
-                            "recompute_requested": False}
+                            "recompute_requested": False, "documents_out": 0, "receipts_out": 0, "restores": 0}
     if decision is None:
         return item
     item["customer"] = decision.customer_name
     by_id = {f.batch_id: f for f in files}
+    plan = plan_enforcement(connection, tenant_id=tenant_id, journey_id=journey_id, foreign=decision.foreign())
     for batch_id, d in decision.files.items():
         before = (recorded.get(batch_id) or {}).get("identity_status")
         item["changed"] += int(before != d.status)
@@ -93,11 +106,28 @@ def scan_journey(connection, *, tenant_id: str, journey_id: UUID, reference: str
         item["unknown"] += int(d.status == "UNKNOWN")
         item["second_party"] += int(d.status == "BELONGS" and d.reason_code == "SECOND_PARTY")
         item["no_identity"] += int(d.reason_code == "NO_IDENTITY")
-        logger.info("file_identity_scan_item", tag=tag, tenant_id=tenant_id, commit=commit,
-                    journey_reference=reference, journey_id=str(journey_id), batch_id=batch_id,
-                    file_name=by_id[batch_id].file_name, status=d.status, reason_code=d.reason_code,
-                    person=d.person_name, masked_pan=d.masked_pan, reason=d.reason, customer=decision.customer_name,
-                    previous_status=before)
+        common = {"tag": tag, "tenant_id": tenant_id, "commit": commit, "journey_reference": reference,
+                  "journey_id": str(journey_id), "pc": pc_name, "batch_id": batch_id,
+                  "file_name": by_id[batch_id].file_name, "status": d.status, "reason_code": d.reason_code,
+                  "person": d.person_name, "masked_pan": d.masked_pan, "reason": d.reason,
+                  "customer": decision.customer_name, "previous_status": before}
+        if d.status == "BELONGS":
+            logger.info("file_identity_scan_item", **common)
+            continue
+        effect = plan["files"].get(batch_id) or {"documents": 0, "active": 0, "receipts": 0, "receipts_amount": 0,
+                                                 "restores": 0}
+        item["documents_out"] += effect["documents"]
+        item["receipts_out"] += effect["receipts"]
+        item["restores"] += effect["restores"]
+        logger.info("file_identity_scan_review", **common,
+                    would_take_out_documents=effect["documents"], of_which_active=effect["active"],
+                    would_stop_receipts=effect["receipts"], receipts_amount=round(effect["receipts_amount"], 2),
+                    would_restore_copies=effect["restores"])
+    if plan["restored"]:
+        logger.info("file_identity_scan_restores", tag=tag, tenant_id=tenant_id, commit=commit,
+                    journey_reference=reference, journey_id=str(journey_id), pc=pc_name,
+                    customer=decision.customer_name,
+                    restored=[f"{r['document']}: {r['whose']}" for r in plan["restored"]])
     item["checks"] = decision.checks
     for check in decision.checks:
         logger.info("file_identity_scan_check", tag=tag, tenant_id=tenant_id, journey_reference=reference,
@@ -124,6 +154,7 @@ def run_file_identity_scan(engine: Engine, tag: str, reports: list[str] | None =
     totals: dict[str, Any] = {"journeys": 0, "files": 0, "foreign_journeys": 0, "foreign_files": 0,
                               "second_party_files": 0, "unknown_files": 0, "unknown_journeys": 0,
                               "no_identity_files": 0, "changed_files": 0, "recomputes_requested": 0,
+                              "documents_out": 0, "receipts_out": 0, "copies_restored": 0,
                               "checks": {}, "failed": 0}
     logger.info("file_identity_scan_started", tag=tag, tenant_id=tenant_id, commit=commit, journeys=len(journeys))
     cars: list[tuple[str, str | None, str | None, str]] = []
@@ -133,7 +164,7 @@ def run_file_identity_scan(engine: Engine, tag: str, reports: list[str] | None =
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
                 item = scan_journey(connection, tenant_id=tenant_id, journey_id=journey_id, reference=reference,
-                                    tag=tag, commit=commit)
+                                    tag=tag, commit=commit, pc_name=row.get("pc_name"))
         except Exception:
             totals["failed"] += 1
             logger.warning("file_identity_scan_item_failed", tag=tag, tenant_id=tenant_id,
@@ -149,6 +180,9 @@ def run_file_identity_scan(engine: Engine, tag: str, reports: list[str] | None =
         totals["no_identity_files"] += item["no_identity"]
         totals["changed_files"] += item["changed"]
         totals["recomputes_requested"] += int(item["recompute_requested"])
+        totals["documents_out"] += item["documents_out"]
+        totals["receipts_out"] += item["receipts_out"]
+        totals["copies_restored"] += item["restores"]
         for check in item["checks"]:
             totals["checks"][check["check"]] = totals["checks"].get(check["check"], 0) + 1
         for car in item["vehicles"]:

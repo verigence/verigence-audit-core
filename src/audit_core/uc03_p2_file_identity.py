@@ -856,13 +856,17 @@ def load_files(connection: Connection, *, tenant_id: str, journey_id: UUID) -> t
 
 def _record(connection: Connection, *, tenant_id: str, journey_id: UUID, decision: JourneyDecision,
             recorded: dict[str, dict[str, Any]]) -> list[str]:
-    """Store each file's decision where it changed; the files whose status changed."""
+    """Store each file's decision, and the booking's, only where it changed
+    (a recompute that decides the same writes nothing); the files whose
+    status changed."""
     moved: list[str] = []
     for batch_id, d in decision.files.items():
         before = recorded.get(batch_id) or {}
+        values = {"s": d.status, "c": d.reason_code, "r": d.reason[:1000],
+                  "n": d.person_name[:300] if d.person_name else None, "p": d.masked_pan}
         if (before.get("identity_status"), before.get("identity_reason_code"), before.get("identity_reason"),
                 before.get("identity_person_name"), before.get("identity_masked_pan")) == (
-                d.status, d.reason_code, d.reason, d.person_name, d.masked_pan):
+                values["s"], values["c"], values["r"], values["n"], values["p"]):
             continue
         if before.get("identity_status") != d.status:
             moved.append(batch_id)
@@ -875,26 +879,23 @@ def _record(connection: Connection, *, tenant_id: str, journey_id: UUID, decisio
                 WHERE tenant_id=:t AND batch_id=CAST(:b AS uuid)
                 """
             ),
-            {"t": tenant_id, "b": batch_id, "s": d.status, "c": d.reason_code, "r": d.reason[:1000],
-             "n": (d.person_name or None) and d.person_name[:300], "p": d.masked_pan},
+            {"t": tenant_id, "b": batch_id, **values},
         )
     connection.execute(
         text(
             """
-            INSERT INTO auditcore.p2_journey_file_identity (
+            INSERT INTO auditcore.p2_journey_file_identity AS fi (
                 tenant_id, journey_id, customer_name, customer_masked_pan, customer_kind,
                 foreign_files, unknown_files, checks, decided_at_utc
             ) VALUES (:t, :j, :n, :p, :k, :f, :u, CAST(:c AS jsonb), now())
             ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
                 customer_name=EXCLUDED.customer_name, customer_masked_pan=EXCLUDED.customer_masked_pan,
                 customer_kind=EXCLUDED.customer_kind, foreign_files=EXCLUDED.foreign_files,
-                unknown_files=EXCLUDED.unknown_files, checks=EXCLUDED.checks,
-                decided_at_utc=CASE
-                  WHEN (auditcore.p2_journey_file_identity.customer_name, auditcore.p2_journey_file_identity.foreign_files,
-                        auditcore.p2_journey_file_identity.unknown_files, auditcore.p2_journey_file_identity.checks)
-                       IS DISTINCT FROM (EXCLUDED.customer_name, EXCLUDED.foreign_files, EXCLUDED.unknown_files,
-                                         EXCLUDED.checks)
-                  THEN now() ELSE auditcore.p2_journey_file_identity.decided_at_utc END
+                unknown_files=EXCLUDED.unknown_files, checks=EXCLUDED.checks, decided_at_utc=now()
+            WHERE (fi.customer_name, fi.customer_masked_pan, fi.customer_kind, fi.foreign_files, fi.unknown_files,
+                   fi.checks)
+                  IS DISTINCT FROM (EXCLUDED.customer_name, EXCLUDED.customer_masked_pan, EXCLUDED.customer_kind,
+                                    EXCLUDED.foreign_files, EXCLUDED.unknown_files, EXCLUDED.checks)
             """
         ),
         {"t": tenant_id, "j": journey_id, "n": decision.customer_name and decision.customer_name[:300],
@@ -965,8 +966,8 @@ def _enforce(connection: Connection, *, tenant_id: str, journey_id: UUID,
         connection.execute(
             text(
                 """
-                UPDATE auditcore.p2_upload_batches SET identity_enforced_at_utc=COALESCE(identity_enforced_at_utc, now())
-                WHERE tenant_id=:t AND batch_id = ANY(CAST(:foreign AS uuid[]))
+                UPDATE auditcore.p2_upload_batches SET identity_enforced_at_utc=now()
+                WHERE tenant_id=:t AND batch_id = ANY(CAST(:foreign AS uuid[])) AND identity_enforced_at_utc IS NULL
                 """
             ),
             {"t": tenant_id, "foreign": foreign},
@@ -1090,6 +1091,107 @@ def _enforce(connection: Connection, *, tenant_id: str, journey_id: UUID,
     counts["tasks_closed"] = _close_foreign_tasks(connection, tenant_id=tenant_id, journey_id=journey_id,
                                                   foreign=foreign)
     return counts
+
+
+_WHOSE_FIELDS = ("pan_name", "aadhaar_name", "customer_name", "buyer_name", "insured_name",
+                 "organisation_legal_name", "finance_applicant_name")
+
+
+def plan_enforcement(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                     foreign: list[str]) -> dict[str, Any]:
+    """What enforcement would do on this booking -- read only, for the scan's
+    review: per FOREIGN file the documents and receipts it takes out and the
+    customer's own copies it gives back, and the documents given back."""
+    plan: dict[str, Any] = {"files": {b: {"documents": 0, "active": 0, "receipts": 0, "receipts_amount": 0,
+                                          "restores": 0} for b in foreign}, "restored": []}
+    if not foreign:
+        return plan
+    rows = [dict(r) for r in connection.execute(
+        text(
+            """
+            SELECT e.evidence_id, e.di_document_id, e.document_type_key, e.association_status, e.pre_foreign_status,
+                   e.journey_document_requirement_id, e.void_reason, e.linked_at_utc, e.supersedes_evidence_id,
+                   e.process_area, jdr.requirement_key,
+                   (SELECT q.batch_id::text FROM auditcore.p2_document_queue q
+                     WHERE q.tenant_id=e.tenant_id AND q.journey_id=e.journey_id AND q.di_document_id=e.di_document_id
+                     LIMIT 1) AS batch_id
+            FROM auditcore.evidence e
+            LEFT JOIN auditcore.journey_document_requirements jdr
+              ON jdr.tenant_id=e.tenant_id AND jdr.journey_document_requirement_id=e.journey_document_requirement_id
+            WHERE e.tenant_id=:t AND e.journey_id=:j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()]
+    chosen = set(foreign)
+    out = {r["evidence_id"]: r for r in rows
+           if r["batch_id"] in chosen and r["association_status"] in ("ACTIVE", "SUPERSEDED", "FOREIGN")}
+    active_out = {r["di_document_id"] for r in out.values()
+                  if r["association_status"] == "ACTIVE"
+                  or (r["association_status"] == "FOREIGN" and r["pre_foreign_status"] == "ACTIVE")}
+    for r in out.values():
+        plan["files"][r["batch_id"]]["documents"] += 1
+        plan["files"][r["batch_id"]]["active"] += int(r["di_document_id"] in active_out)
+    if active_out:
+        batch_of = {r["di_document_id"]: r["batch_id"] for r in out.values()}
+        for payment in connection.execute(
+            text(
+                """
+                SELECT source_di_document_id, amount FROM auditcore.payments
+                WHERE tenant_id=:t AND journey_id=:j AND amount > 0 AND source_di_document_id = ANY(:d)
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "d": list(active_out)},
+        ).mappings().all():
+            entry = plan["files"][batch_of[payment["source_di_document_id"]]]
+            entry["receipts"] += 1
+            entry["receipts_amount"] += float(payment["amount"])
+    superseders: dict[Any, list[dict[str, Any]]] = {}
+    for r in rows:
+        if r["supersedes_evidence_id"] is not None:
+            superseders.setdefault(r["supersedes_evidence_id"], []).append(r)
+    requirements = {r["journey_document_requirement_id"] for r in out.values()
+                    if r["journey_document_requirement_id"] is not None and not _repeatable(r["requirement_key"])}
+    restored = []
+    for requirement in requirements:
+        kept = [r for r in rows if r["journey_document_requirement_id"] == requirement and r["evidence_id"] not in out]
+        if any(r["association_status"] == "ACTIVE" for r in kept):
+            continue
+        candidates = sorted(
+            (r for r in kept if r["association_status"] == "SUPERSEDED" and r["void_reason"] in _RESTORABLE
+             and any(s["evidence_id"] in out for s in superseders.get(r["evidence_id"], []))),
+            key=lambda r: (r["linked_at_utc"], str(r["evidence_id"])), reverse=True)
+        if candidates:
+            copy = candidates[0]
+            by = next(s for s in superseders[copy["evidence_id"]] if s["evidence_id"] in out)
+            plan["files"][by["batch_id"]]["restores"] += 1
+            restored.append(copy)
+    names: dict[Any, str] = {}
+    if restored:
+        for row in connection.execute(
+            text(
+                """
+                SELECT f.di_document_id, f.field_key, f.effective_value #>> '{}' AS value
+                FROM auditcore.journey_document_extracted_fields f
+                WHERE f.tenant_id=:t AND f.journey_id=:j AND f.di_document_id = ANY(:d) AND f.field_key = ANY(:k)
+                  AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "d": [r["di_document_id"] for r in restored],
+             "k": list(_WHOSE_FIELDS)},
+        ).mappings().all():
+            if row["value"] and str(row["value"]).strip():
+                names.setdefault(row["di_document_id"], " ".join(str(row["value"]).split()))
+    from audit_core.uc03_p2_registry import get_registry
+
+    registry = get_registry()
+    for copy in sorted(restored, key=lambda r: (str(r["document_type_key"]), str(r["evidence_id"]))):
+        template = registry.template_for_di_type(copy["document_type_key"],
+                                                 stage=str(copy["process_area"] or "").upper() or None)
+        plan["restored"].append({"document": template.display_name, "documentType": copy["document_type_key"],
+                                 "whose": names.get(copy["di_document_id"]) or "no name read",
+                                 "documentId": str(copy["di_document_id"])})
+    return plan
 
 
 def _close_foreign_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID, foreign: list[str]) -> int:
@@ -1216,13 +1318,33 @@ def apply_file_identity(connection: Connection, *, tenant_id: str, journey_id: U
     return summary
 
 
+def _shown_identity(row: dict[str, Any]) -> dict[str, Any]:
+    """A file's identity as the web shows it. The web says "taken out of this
+    booking" for FOREIGN, so FOREIGN is shown only for a file whose documents
+    really are out; a file decided another customer's but not taken out
+    (enforcement off, or the recompute not yet run) is UNKNOWN."""
+    status = row["identity_status"] if row["identity_status"] in STATUSES else "UNKNOWN"
+    reason = row["identity_reason"]
+    if status == "FOREIGN" and not row["taken_out"]:
+        status = "UNKNOWN"
+        reason = f"Looks like {row['identity_person_name'] or 'another customer'}'s file; not yet taken out"
+    return {"status": status, "personName": row["identity_person_name"], "maskedPan": row["identity_masked_pan"],
+            "reason": reason}
+
+
 def files_view(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     """The booking's files and whose each one is, for the documents API."""
     rows = connection.execute(
         text(
             """
             SELECT b.batch_id, b.original_filename, b.created_at_utc, b.identity_status, b.identity_reason,
-                   b.identity_person_name, b.identity_masked_pan
+                   b.identity_person_name, b.identity_masked_pan,
+                   EXISTS (SELECT 1 FROM auditcore.p2_document_queue q
+                           JOIN auditcore.evidence e
+                             ON e.tenant_id=q.tenant_id AND e.journey_id=q.journey_id
+                            AND e.di_document_id=q.di_document_id
+                           WHERE q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id
+                             AND e.association_status='FOREIGN') AS taken_out
             FROM auditcore.p2_upload_batches b
             WHERE b.tenant_id=:t AND b.journey_id=:j
             ORDER BY b.created_at_utc DESC, b.batch_id
@@ -1251,12 +1373,7 @@ def files_view(connection: Connection, *, tenant_id: str, journey_id: UUID) -> d
                 "batchId": str(r["batch_id"]),
                 "fileName": r["original_filename"],
                 "uploadedAtUtc": r["created_at_utc"],
-                "identity": {
-                    "status": r["identity_status"] if r["identity_status"] in STATUSES else "UNKNOWN",
-                    "personName": r["identity_person_name"],
-                    "maskedPan": r["identity_masked_pan"],
-                    "reason": r["identity_reason"],
-                },
+                "identity": _shown_identity(dict(r)),
                 "movedTo": None,
             }
             for r in rows

@@ -1,4 +1,4 @@
-"""0181_file_identity -- whose each uploaded file is; another customer's file leaves the booking (2026-10-31).
+"""0182_file_identity -- whose each uploaded file is; another customer's file leaves the booking (2026-10-31).
 
 Found live: on the web "New booking" screen the first file creates the booking
 and the page becomes that booking, so the next customer's PDF went into the
@@ -23,8 +23,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0181_file_identity"
-down_revision = "0180_worker_churn"
+revision = "0182_file_identity"
+down_revision = "0181_upload_pause"
 branch_labels = None
 depends_on = None
 

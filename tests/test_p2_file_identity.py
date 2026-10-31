@@ -451,8 +451,11 @@ def test_another_customers_file_leaves_the_booking_and_the_customers_own_documen
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         view = files_view(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    # Not taken out yet: the web is not told it was (it says "taken out" for FOREIGN).
     assert {f["fileName"]: f["identity"]["status"] for f in view["files"]} == {
-        "Azizur Reheman.pdf": "BELONGS", "Tapan kumar patra.pdf": "FOREIGN"}
+        "Azizur Reheman.pdf": "BELONGS", "Tapan kumar patra.pdf": "UNKNOWN"}
+    pending = next(f for f in view["files"] if f["fileName"] == "Tapan kumar patra.pdf")
+    assert pending["identity"]["reason"] == "Looks like TAPAN KUMAR PATRA's file; not yet taken out"
     assert _state(journey, *single) == ["SUPERSEDED"] * 3
 
     # A task raised from Tapan's PAN only.
@@ -502,6 +505,56 @@ def test_another_customers_file_leaves_the_booking_and_the_customers_own_documen
     assert _state(journey, *tapan.values()) == ["FOREIGN"] * 4 and _state(journey, *single) == ["ACTIVE"] * 3
 
 
+_WRITES = {
+    "evidence": "SELECT evidence_id::text, xmin::text, association_status FROM auditcore.evidence WHERE tenant_id=:t",
+    "tasks": "SELECT task_id::text, xmin::text, task_status FROM auditcore.p2_tasks WHERE tenant_id=:t",
+    "assessments": "SELECT journey_document_assessment_id::text, xmin::text, '' FROM "
+                   "auditcore.journey_document_assessments WHERE tenant_id=:t",
+    "activity": "SELECT event_id::text, xmin::text, event_type FROM auditcore.p2_activity_events "
+                "WHERE tenant_id=:t",
+    "captures": "SELECT di_document_id::text, xmin::text, capture_status FROM "
+                "auditcore.document_capture_v2_documents WHERE tenant_id=:t",
+    "payments": "SELECT payment_id::text, xmin::text, '' FROM auditcore.payments WHERE tenant_id=:t",
+    "batches": "SELECT batch_id::text, xmin::text, coalesce(identity_status, '') FROM auditcore.p2_upload_batches "
+               "WHERE tenant_id=:t",
+    "decision": "SELECT journey_id::text, xmin::text, coalesce(customer_name, '') FROM "
+                "auditcore.p2_journey_file_identity WHERE tenant_id=:t",
+}
+
+
+def _snapshot(journey) -> dict[str, set]:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return {name: {tuple(r) for r in connection.execute(text(sql), {"t": journey.tenant_id}).all()}
+                for name, sql in _WRITES.items()}
+
+
+def _apply(journey) -> dict:
+    from audit_core.uc03_p2_file_identity import apply_file_identity
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return apply_file_identity(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+
+def test_with_enforcement_off_only_the_decision_is_written_and_only_when_it_changes(journey, monkeypatch):
+    """The dry run (P2_FILE_IDENTITY_ENFORCE off) writes the decision columns and
+    the booking's decision row -- nothing else: no evidence, task, assessment,
+    capture, payment or activity change. A recompute deciding the same again
+    writes nothing at all."""
+    monkeypatch.delenv("P2_FILE_IDENTITY_ENFORCE", raising=False)
+    _azizur_then_tapan(journey)
+    before = _snapshot(journey)
+    summary = _apply(journey)
+    assert (summary["foreign"], summary["changed"], summary["enforce"]) == (1, 2, False)
+    first = _snapshot(journey)
+    for name in ("evidence", "tasks", "assessments", "activity", "captures", "payments"):
+        assert first[name] == before[name], name
+    assert first["batches"] != before["batches"] and len(first["decision"]) == 1
+    assert _apply(journey)["changed"] == 0
+    assert _snapshot(journey) == first  # not one row rewritten (xmin unchanged)
+
+
 def test_a_file_found_to_belong_after_all_comes_back_as_it_was(journey, monkeypatch):
     """A bank approval letter naming Tapan as co-applicant arrives in Azizur's
     own file later: Tapan's file belongs, its documents come back and the
@@ -547,8 +600,22 @@ def test_the_scan_job_reports_and_with_commit_records_and_asks_for_a_recompute(j
     totals = scan.run_file_identity_scan(journey.engine, f"{journey.tenant_id}:scan-2026-10-31")
     assert (totals["journeys"], totals["foreign_files"], totals["foreign_journeys"]) == (1, 1, 1)
     items = [kw for event, kw in events if event == "file_identity_scan_item"]
-    assert {(i["file_name"], i["status"]) for i in items} == {("Azizur Reheman.pdf", "BELONGS"),
-                                                             ("Tapan kumar patra.pdf", "FOREIGN")}
+    assert {(i["file_name"], i["status"]) for i in items} == {("Azizur Reheman.pdf", "BELONGS")}
+    # For review: one line per FOREIGN / UNKNOWN file with what enforcement would do.
+    [review] = [kw for event, kw in events if event == "file_identity_scan_review"]
+    assert {k: review[k] for k in ("journey_reference", "pc", "file_name", "status", "person", "masked_pan",
+                                   "would_take_out_documents", "of_which_active", "would_stop_receipts",
+                                   "receipts_amount", "would_restore_copies")} == {
+        "journey_reference": review["journey_reference"], "pc": None, "file_name": "Tapan kumar patra.pdf",
+        "status": "FOREIGN", "person": "TAPAN KUMAR PATRA", "masked_pan": "AVFPP****G",
+        "would_take_out_documents": 4, "of_which_active": 4, "would_stop_receipts": 1, "receipts_amount": 51000.0,
+        "would_restore_copies": 3}
+    assert "AZIZUR REHAMAN" in review["reason"]
+    [restores] = [kw for event, kw in events if event == "file_identity_scan_restores"]
+    assert sorted(restores["restored"]) == ["Aadhaar: AZIZUR REHAMAN", "Booking Docket: AZIZUR REHAMAN",
+                                            "PAN Card: AZIZUR REHAMAN"]
+    finished = next(kw for event, kw in events if event == "file_identity_scan_finished")
+    assert (finished["documents_out"], finished["receipts_out"], finished["copies_restored"]) == (4, 1, 3)
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         assert connection.execute(text("SELECT count(*) FROM auditcore.p2_upload_batches WHERE tenant_id=:t "
