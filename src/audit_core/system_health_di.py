@@ -129,6 +129,19 @@ def di_unavailable(message: str) -> dict[str, Any]:
     return {"available": False, "error": message, "projects": [], "leaseReclaims": 0, "schedulerProblems": []}
 
 
+# Failure codes that are not a failure to read (live, 2026-10-31): a Phase 2
+# page is classified and read, then DI's v1 step that links a document to a
+# checklist slot finds no requirement ref -- Phase 2 links pages itself -- and
+# marks the job FAILED. 501 such "failures" on 30-31 Oct were all pages that
+# were classified, read and MERGED or READY in Audit Core. They are shown with
+# their code, but not counted as failed jobs.
+NOT_READING_FAILURE_CODES = frozenset({"REQUIREMENT_REF_MISSING"})
+
+
+def not_reading_failures(reasons: list[dict[str, Any]]) -> int:
+    return sum(int(r.get("count") or 0) for r in reasons or [] if r.get("errorCode") in NOT_READING_FAILURE_CODES)
+
+
 def di_alerts(pipeline: dict[str, Any], database: dict[str, Any] | None) -> list[dict[str, Any]]:
     alerts: list[dict[str, Any]] = []
 
@@ -145,9 +158,11 @@ def di_alerts(pipeline: dict[str, Any], database: dict[str, Any] | None) -> list
                 f"{p['projectName']}: {over} Document Intelligence job(s) still waiting or running after 30 minutes.",
                 tenantId=p["tenantId"])
         failed = p["classification"]["failed"] + p["extraction"]["failed"]
-        if failed:
+        not_reading = not_reading_failures(p["failureReasons"])
+        real = max(failed - not_reading, 0)
+        if real:
             add("WARNING", "DI_JOBS_FAILED",
-                f"{p['projectName']}: {failed} Document Intelligence job(s) failed in this window.",
+                f"{p['projectName']}: {real} Document Intelligence job(s) failed in this window.",
                 tenantId=p["tenantId"])
     if pipeline["leaseReclaims"]:
         add("WARNING", "DI_LEASE_RECLAIMED",

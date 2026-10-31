@@ -448,3 +448,21 @@ def test_the_middleware_counts_a_refused_request_with_its_error_code(monkeypatch
     [bucket] = platform_health._minutes.values()
     codes = bucket["routes"]["/p2/v1/tenants/{tenant_id}/journeys"][2]
     assert dict(codes) == {"401 VAC-AUTH-001": 1}
+
+
+def test_a_page_dis_checklist_step_could_not_link_is_not_a_failed_read() -> None:
+    """Live, 2026-10-31: 501 Phase 2 pages DI read fine were marked FAILED with
+    REQUIREMENT_REF_MISSING (DI's v1 checklist link, which Phase 2 does not
+    use) and the banner reported them as failed jobs."""
+    from audit_core.system_health_di import di_alerts
+
+    def pipeline(reasons, failed):
+        project = {"tenantId": "t", "projectName": "P", "failureReasons": reasons,
+                   "classification": {"over30m": 0, "failed": failed}, "extraction": {"over30m": 0, "failed": 0}}
+        return {"available": True, "projects": [project], "leaseReclaims": 0, "schedulerProblems": []}
+
+    benign = [{"queue": "classification", "errorCode": "REQUIREMENT_REF_MISSING", "count": 114}]
+    assert not [a for a in di_alerts(pipeline(benign, 114), None) if a["code"] == "DI_JOBS_FAILED"]
+    mixed = benign + [{"queue": "classification", "errorCode": "DI_QUALITY_IMAGE_BLUR_SCORE", "count": 2}]
+    [alert] = [a for a in di_alerts(pipeline(mixed, 116), None) if a["code"] == "DI_JOBS_FAILED"]
+    assert "2 Document Intelligence job(s) failed" in alert["message"]
