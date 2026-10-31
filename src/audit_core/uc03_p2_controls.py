@@ -764,6 +764,30 @@ def _unit_fingerprint(connection: Connection, *, tenant_id: str, journey_id: UUI
     return hashlib.sha256(f"{facts}|{extra}".encode()).hexdigest()
 
 
+def _absorb_own_writes(connection: Connection, *, tenant_id: str, journey_id: UUID, version: int | None,
+                       facts_before: str) -> None:
+    """What a unit derived (the invoice's colour on the vehicle, a refreshed
+    deal) is not a fact change made elsewhere (2026-10-31, worker churn): the
+    Journey's stored fingerprint takes it in, as the recompute's own writes
+    are (_stage_recompute), so the 30-second fact sweep does not ask for a
+    recompute of what this run wrote -- which asked for every unit again.
+
+    Only when the stored fingerprint was current when the unit started and no
+    fact change was announced while it ran: a change made outside the P2
+    paths before the run is still the sweep's to find."""
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_journey_runtime SET fact_fingerprint=:fp
+            WHERE tenant_id=:t AND journey_id=:j AND fact_version IS NOT DISTINCT FROM :v
+              AND fact_fingerprint = :before AND fact_fingerprint IS DISTINCT FROM :fp
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "v": version, "before": facts_before,
+         "fp": fact_fingerprint(connection, tenant_id=tenant_id, journey_id=journey_id)},
+    )
+
+
 def evaluate_unit(
     engine: Engine,
     *,
@@ -784,6 +808,8 @@ def evaluate_unit(
         fingerprint = _unit_fingerprint(connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit)
         current = _unit_row(connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit)
         version_before = _fact_version(connection, tenant_id=tenant_id, journey_id=journey_id)
+        facts_before = (fingerprint if unit != "P2:DERIVED"
+                        else fact_fingerprint(connection, tenant_id=tenant_id, journey_id=journey_id))
     if not force and current and current["unit_status"] == "OK" and current["evaluated_fingerprint"] == fingerprint:
         return []
 
@@ -816,6 +842,8 @@ def evaluate_unit(
         # and the earlier fingerprint makes the next request run it again.
         if _fact_version(connection, tenant_id=tenant_id, journey_id=journey_id) == version_before:
             fingerprint = _unit_fingerprint(connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit)
+            _absorb_own_writes(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               version=version_before, facts_before=facts_before)
         _set_unit(connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit,
                   status="OK", fingerprint=fingerprint, error=None)
     return transitions
