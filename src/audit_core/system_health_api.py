@@ -361,6 +361,8 @@ def pipeline_health(connection: Connection, since: datetime) -> dict[str, Any]:
                      "byStatus": {}},
             "deadLettersOpen": 0, "outboxProblems": 0, "inboxProblems": 0,
             "failureReasons": [],
+            "fileIdentity": {"foreignJourneys": 0, "foreignFiles": 0, "enforcedFiles": 0,
+                             "unknownJourneys": 0, "unknownFiles": 0},
         })
 
     in_flight_docs = {"QUEUED", "PREPARING_PAGE", "DI_UPLOAD_PREPARING", "DI_UPLOADING", "DI_FINALIZING",
@@ -401,9 +403,26 @@ def pipeline_health(connection: Connection, since: datetime) -> dict[str, Any]:
         project(row["tenantId"])["outboxProblems"] += row["count"]
     for row in raw.get("inbox", []):
         project(row["tenantId"])["inboxProblems"] += row["count"]
+    # Bookings holding another customer's files (uc03_p2_file_identity, 2026-10-31).
+    for row in file_identity_health(connection):
+        project(row["tenantId"])["fileIdentity"] = {
+            key: int(row.get(key) or 0)
+            for key in ("foreignJourneys", "foreignFiles", "enforcedFiles", "unknownJourneys", "unknownFiles")
+        }
     ordered = sorted(per.values(), key=lambda p: (p["projectStatus"] != "ACTIVE", p["projectName"].lower()))
     return {"projects": ordered, "workerJobs": raw.get("workerJobs", []),
             "documentIntelligence": raw.get("documentIntelligence")}
+
+
+def file_identity_health(connection: Connection) -> list[dict[str, Any]]:
+    """Per Project: bookings and files of another customer, files to check.
+    Its own savepoint: the page still answers if the counts cannot be read."""
+    try:
+        with connection.begin_nested():
+            return list(connection.execute(text("SELECT platform_ops.file_identity_health()")).scalar_one() or [])
+    except Exception as exc:  # noqa: BLE001 - a missing count is never a failed page
+        logger.warning("system_health_file_identity_failed", error_type=type(exc).__name__)
+        return []
 
 
 def build_alerts(services: list[dict[str, Any]], railway: dict[str, Any], pipeline: dict[str, Any],
@@ -464,6 +483,17 @@ def build_alerts(services: list[dict[str, Any]], railway: dict[str, Any], pipeli
                 tenantId=p["tenantId"])
         if p["outboxProblems"]:
             add("WARNING", "OUTBOX_BACKLOG", f"{p['projectName']}: {p['outboxProblems']} event(s) not published.",
+                tenantId=p["tenantId"])
+        identity = p.get("fileIdentity") or {}
+        if identity.get("foreignFiles") or identity.get("unknownFiles"):
+            parts = []
+            if identity.get("foreignFiles"):
+                parts.append(f"{identity['foreignFiles']} file(s) of another customer in "
+                             f"{identity['foreignJourneys']} booking(s), {identity.get('enforcedFiles', 0)} taken out")
+            if identity.get("unknownFiles"):
+                parts.append(f"{identity['unknownFiles']} file(s) in {identity['unknownJourneys']} booking(s) "
+                             "to be checked")
+            add("WARNING", "FOREIGN_FILES", f"{p['projectName']}: " + "; ".join(parts) + ".",
                 tenantId=p["tenantId"])
     if database.get("idleInTransactionOver5m"):
         add("WARNING", "DB_IDLE_IN_TRANSACTION",

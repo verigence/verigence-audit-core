@@ -568,7 +568,9 @@ def acknowledge_booking_document_link(
             )
         evidence_id: UUID = existing_for_document["evidence_id"]
         if existing_for_document["association_status"] != "ACTIVE":
-            if not repeatable:
+            if not repeatable or existing_for_document["association_status"] == "FOREIGN":
+                # A document of another customer's file (uc03_p2_file_identity)
+                # stays out of the booking whatever the callback says.
                 # A delayed duplicate callback for an older replaced single-value
                 # document must ACK without making it current again.
                 return BookingDocumentLinkResponse(

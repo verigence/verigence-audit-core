@@ -2184,6 +2184,8 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         if original is not None:
             reason = "Duplicate: the same receipt number, amount and date as " + (
                 f"receipt {number_of.get(original)}" if number_of.get(original) else "an earlier receipt")
+        elif not evidenced and r["association_status"] == "FOREIGN":
+            reason = "In another customer's file, taken out of this booking"
         elif not evidenced:
             reason = "Document removed or replaced" if r["association_status"] else "No supporting document"
         else:

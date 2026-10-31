@@ -1558,6 +1558,75 @@ def _gst_trade_names(connection: Connection, *, tenant_id: str, journey_id: UUID
     ).scalars().all() if v and str(v).strip()]
 
 
+def _gst_certificate_people(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                            document_id: str | None) -> tuple[list[str], list[str]]:
+    """(the PAN inside the certificate's GSTIN, the people it names as its
+    authorised signatories)."""
+    from audit_core.uc03_p2_file_identity import gstin_pan
+
+    if not document_id:
+        return [], []
+    rows = connection.execute(
+        text(
+            """
+            SELECT f.field_key, f.effective_value FROM auditcore.journey_document_extracted_fields f
+            WHERE f.tenant_id=:t AND f.journey_id=:j AND f.di_document_id=CAST(:d AS uuid)
+              AND f.field_key IN ('gstin', 'gst_authorised_signatory_names', 'authorised_signatory_names')
+              AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "d": document_id},
+    ).mappings().all()
+    pans, people = [], []
+    for row in rows:
+        values = row["effective_value"] if isinstance(row["effective_value"], list) else [row["effective_value"]]
+        for value in values:
+            if not isinstance(value, str) or not value.strip():
+                continue
+            if row["field_key"] == "gstin":
+                pan = gstin_pan(value)
+                if pan:
+                    pans.append(pan)
+            else:
+                people.append(value)
+    return pans, people
+
+
+def _kyc_pans(connection: Connection, *, tenant_id: str, journey_id: UUID, document_ids: list[str]) -> dict[str, str]:
+    """The PAN each KYC document carries (a PAN card's number, a Customer
+    KYC's id number when it is a PAN)."""
+    from audit_core.uc03_p2_file_identity import normalise_aadhaar, normalise_pan
+
+    if not document_ids:
+        return {}
+    out: dict[str, str] = {}
+    for row in connection.execute(
+        text(
+            """
+            SELECT f.di_document_id, f.effective_value #>> '{}' AS value FROM auditcore.journey_document_extracted_fields f
+            WHERE f.tenant_id=:t AND f.journey_id=:j AND f.di_document_id = ANY(CAST(:d AS uuid[]))
+              AND f.field_key IN ('pan_number', 'id_number')
+              AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "d": document_ids},
+    ).mappings().all():
+        pan = None if normalise_aadhaar(row["value"]) else normalise_pan(row["value"])
+        if pan:
+            out.setdefault(str(row["di_document_id"]), pan)
+    return out
+
+
+GST_PROPRIETOR_STRICT_VARIABLE = "P2_GST_PROPRIETOR_STRICT"
+
+
+def gst_proprietor_strict() -> bool:
+    """Whether, under a GST certificate, a KYC must be proven the proprietor's
+    or signatory's (its PAN in the GSTIN, its name on the certificate). Off by
+    default (2026-10-31 review): the certificate's names are mostly not read."""
+    return os.environ.get(GST_PROPRIETOR_STRICT_VARIABLE, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 # A customer-name mismatch is the PC's, once per Journey (product owner
 # 2026-10-29: the TL routing reverted, "raises one PC task").
 CUSTOMER_NAME_TASK_TYPE = "DOCUMENT_MISSING"
@@ -1661,12 +1730,48 @@ def sync_name_consistency_tasks(
         # KYC documents are that person's own, so they only have to agree
         # with each other, not with a firm's name.
         gst_names: list[str] = []
+        proven: set[str] = set()
+        strict = False
         person: dict[str, Any] | None = None
         if kyc["diType"] == "gst_certificate":
             gst_names = [str(kyc["name"]), *_gst_trade_names(connection, tenant_id=tenant_id,
                                                              journey_id=journey_id, document_id=kyc["documentId"])]
-            by_pair = {doc["pair"]: doc for doc in reversed(references)}
-            person = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
+            strict = gst_proprietor_strict()
+            if not strict:
+                by_pair = {doc["pair"]: doc for doc in reversed(references)}
+                person = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
+            else:
+                # Whose KYC is the proprietor's / signatory's (2026-10-31): without
+                # it ANY person's PAN or Aadhaar passes under a GST certificate, so
+                # on ADI-RD-261022-022 another customer's KYC (Tapan Kumar Patra,
+                # his file dropped into Azizur Rehaman's booking) passed as the
+                # proprietor of Azizur's firm and the task closed itself. With
+                # P2_GST_PROPRIETOR_STRICT a KYC is the customer's only when its PAN
+                # is the PAN inside the GSTIN, or its name is the GST legal / trade
+                # name or an authorised signatory the certificate names. Off by
+                # default: live, most GST certificates carry the GSTIN only (no
+                # legal / trade / signatory names read), so an Aadhaar-only
+                # proprietor or a partner would newly raise the task.
+                from audit_core.uc03_p2_file_identity import same_pan
+
+                gst_pans, gst_people = _gst_certificate_people(connection, tenant_id=tenant_id,
+                                                               journey_id=journey_id, document_id=kyc["documentId"])
+                numbers = _kyc_pans(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                    document_ids=[d["documentId"] for d in references])
+
+                def proprietor(document: dict[str, Any]) -> bool:
+                    pan = numbers.get(document["documentId"])
+                    if pan and any(same_pan(pan, g) for g in gst_pans):
+                        return True
+                    names = [*gst_names, *gst_people]
+                    if is_masked(document["name"]):
+                        return any(masked_matches(document["name"], n) for n in names)
+                    return any(same_person(document["name"], n) for n in names)
+
+                proven_documents = [doc for doc in references if proprietor(doc)]
+                proven = {doc["documentId"] for doc in proven_documents}
+                by_pair = {doc["pair"]: doc for doc in reversed(proven_documents)}
+                person = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
 
         # A document in a firm's name is the customer's when the customer is a
         # person (product owner 2026-10-28: "firm name should be acceptable" --
@@ -1688,6 +1793,8 @@ def sync_name_consistency_tasks(
             if firm is not None and document["pair"] not in rules.customer_name_reference \
                     and same_organisation(document["name"], firm):
                 return True
+            if document["documentId"] in proven:
+                return True  # the GST certificate's proprietor or signatory (2026-10-31)
             # A masked PAN ("PXXXXJ KXXXR NXXXX") is the customer's when its
             # visible letters fit the customer's name (2026-10-28).
             if is_masked(document["name"]):
@@ -1701,6 +1808,9 @@ def sync_name_consistency_tasks(
                 # A proprietor's Aadhaar / PAN carries the name the GST certificate
                 # prints as the legal name ("BISWAJIT DAS", trade name "M/S DAS
                 # CONSTRUCTION"): that is the customer's own KYC (2026-10-28).
+                if strict:
+                    # the same person as a KYC proven above, and nobody else's
+                    return person is not None and same_person(document["name"], person["name"])
                 return (person is None or document["documentId"] == person["documentId"]
                         or same_person(document["name"], person["name"])
                         or any(same_person(document["name"], n) for n in gst_names))

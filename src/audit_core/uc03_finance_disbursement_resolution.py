@@ -156,9 +156,13 @@ def _payments_after_minimum_booking(
             SELECT payment_id, amount, payment_at_utc, receipt_date, receipt_number,
                    payment_method_code, payment_mode_code, receipt_bank_name,
                    receipt_remarks, payment_reference, currency_code
-            FROM auditcore.payments
+            FROM auditcore.payments p
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
               AND amount IS NOT NULL
+              -- another customer's receipt is no disbursement of this loan (2026-10-31)
+              AND NOT EXISTS (SELECT 1 FROM auditcore.evidence fe
+                              WHERE fe.tenant_id=p.tenant_id AND fe.di_document_id=p.source_di_document_id
+                                AND fe.association_status='FOREIGN')
             ORDER BY payment_at_utc NULLS LAST, created_at_utc, payment_id
             """
         ),
