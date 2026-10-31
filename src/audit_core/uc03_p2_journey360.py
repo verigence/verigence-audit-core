@@ -414,8 +414,9 @@ def loan_without_receipt(
 
     Only the Bank Approval Letter prints an amount (its sanctioned amount);
     the Delivery Order carries none. None when a finance record already has
-    a disbursement (linked to a receipt or entered), or a counted receipt is
-    the same amount to the rupee (that receipt is the loan)."""
+    a disbursement (linked to a receipt or entered), a counted receipt is the
+    same amount to the rupee, or a receipt names the financier (that receipt
+    is the loan)."""
     known = connection.execute(
         text(
             """
@@ -447,6 +448,24 @@ def loan_without_receipt(
     # _document_facts lists the newest first.
     letter = letters[0]
     if any(r is not None and abs(r - letter["amount"]) <= 1 for r in receipt_amounts or []):
+        return None
+    # A receipt after the minimum booking amount that names the financier is
+    # the loan's receipt even before it is linked (the disbursed amount is
+    # usually the sanctioned one less fees), so the letter would count it twice.
+    from audit_core.uc03_finance_disbursement_resolution import (
+        _name_matches,
+        _normalize_name,
+        eligible_loan_disbursement_candidates,
+    )
+
+    provider = connection.execute(
+        text("SELECT provider_name FROM auditcore.finance_records WHERE tenant_id=:t AND journey_id=:j "
+             "AND provider_name IS NOT NULL ORDER BY created_at_utc DESC LIMIT 1"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one_or_none()
+    names = [n for n in (letter["financier"], provider) if n]
+    candidates = eligible_loan_disbursement_candidates(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if any(_name_matches(c, _normalize_name(n)) for c in candidates for n in names):
         return None
     return {**letter, "amount": _money(letter["amount"]),
             "note": "No dealership receipt for the loan amount; taken from the Bank Approval Letter "

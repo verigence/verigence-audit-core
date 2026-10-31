@@ -29,7 +29,7 @@ from test_uc03_account_statement import UTKAL, _ledger, _set_policy, _sync
 
 from audit_core import uc03_p2_audit_summary as summary
 from audit_core.db import set_tenant_context
-from audit_core.uc03_accessory_invoice_repair import task_plan, to_restore
+from audit_core.uc03_accessory_invoice_repair import to_restore
 from audit_core.uc03_deal_source_policy import POLICY_ACCOUNT_STATEMENT
 from audit_core.uc03_invoice_materialization import read_invoice, select_invoices
 from audit_core.uc03_p2_registry import get_registry
@@ -114,25 +114,19 @@ def test_two_accessory_bills_add_up_and_are_not_disputed() -> None:
 def test_superseded_accessory_invoices_that_are_other_bills_are_restored() -> None:
     j = uuid4()
 
-    def doc(status, number, kind="accessory_invoice_dms"):
+    def doc(status, number, total="4746", day="2026-10-14", kind="accessory_invoice_dms"):
         return {"journey_id": j, "evidence_id": uuid4(), "di_document_id": uuid4(), "document_type_key": kind,
-                "association_status": status, "invoice_number": number}
+                "association_status": status, "invoice_number": number, "grand_total": total, "invoice_date": day}
 
-    active = doc("ACTIVE", "C1R27F000000053", "accessory_invoice_tally")
-    other = doc("SUPERSEDED", "C1R27F00000002")
+    active = doc("ACTIVE", "C1R27F000000053", kind="accessory_invoice_tally")
+    other = doc("SUPERSEDED", "C1R27F00000002", total="7457", day="2026-09-08")
     reupload = doc("SUPERSEDED", "CIR27F000000053")  # the same bill, read with I for 1
+    misread = doc("SUPERSEDED", "C1R27F000000054", day="2026-10-15")  # one total, a day apart: the same bill
     unread = doc("SUPERSEDED", None)
-    twice = doc("SUPERSEDED", "C1R27F00000002")
-    note = doc("SUPERSEDED", "CN-9", "credit_note")
-    assert to_restore([active, other, reupload, unread, twice, note]) == [other, note]
-
-
-def test_the_dms_task_becomes_the_one_accessory_task() -> None:
-    dms = {"task_id": uuid4(), "dedupe_key": "document-missing:j:accessory_invoice_dms"}
-    tally = {"task_id": uuid4(), "dedupe_key": "document-missing:j:accessory_invoice_tally"}
-    assert task_plan([tally, dms], group_key_taken=False) == [(dms, "MOVE"), (tally, "CANCEL")]
-    assert task_plan([tally], group_key_taken=False) == [(tally, "MOVE")]
-    assert task_plan([dms, tally], group_key_taken=True) == [(dms, "CANCEL"), (tally, "CANCEL")]
+    no_total = doc("SUPERSEDED", "C1R27F00000099", total=None)
+    twice = doc("SUPERSEDED", "C1R27F00000002", total="7457", day="2026-09-08")
+    note = doc("SUPERSEDED", "CN-9", total="25000", kind="credit_note")
+    assert to_restore([active, other, reupload, misread, unread, no_total, twice, note]) == [other, note]
 
 
 # ── 3. credit notes are shown, never added ───────────────────────────────────
@@ -203,3 +197,36 @@ def test_the_statement_loan_still_wins_over_the_letter() -> None:
     out = summary.loan_received(matched=None, disbursement_known=False, financed=True, stated=stated,
                                 receipt_amounts=[], letter={"amount": "650000.00"})
     assert out["amount"] == D(640000) and out["withoutReceipt"] is False
+
+
+def test_a_receipt_naming_the_financier_is_the_loan_even_unlinked(journey) -> None:
+    add_receipt_payment(journey, amount="50000", receipt_number="R-1", receipt_date="2026-10-01")
+    add_receipt_payment(journey, amount="641500", receipt_number="R-2", receipt_date="2026-10-12")
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("UPDATE auditcore.payments SET receipt_bank_name='HDFC BANK LTD', payment_mode_code='RTGS' "
+                       "WHERE tenant_id=:t AND journey_id=:j AND receipt_number='R-2'"),
+                  {"t": journey.tenant_id, "j": journey.journey_id})
+    _letter(journey)
+    assert _loan(journey) is None
+
+
+def test_the_open_dms_task_becomes_the_one_accessory_task_and_the_tally_one_is_merged(journey) -> None:
+    from audit_core.uc03_p2_task_producer import _adopt_member_tasks, raise_or_refresh
+
+    j = journey.journey_id
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        for template in ("accessory_invoice_dms", "accessory_invoice_tally"):
+            raise_or_refresh(
+                c, tenant_id=journey.tenant_id, journey_id=j, dedupe_key=f"document-missing:{j}:{template}",
+                task_type="DOCUMENT_MISSING", source_type="DOCUMENT", source_code="DOCUMENT_MISSING",
+                title=f"Upload the {template}", description="x",
+                reference={"generatedBy": "SYSTEM", "requirementKey": template}, severity="HIGH",
+                registry=get_registry())
+        key = f"document-missing:{j}:ACCESSORY_INVOICE"
+        _adopt_member_tasks(c, tenant_id=journey.tenant_id, journey_id=j, key=key,
+                            templates=["accessory_invoice_dms", "accessory_invoice_tally"])
+        rows = dict(c.execute(text("SELECT dedupe_key, task_status FROM auditcore.p2_tasks "
+                                   "WHERE tenant_id=:t AND journey_id=:j"), {"t": journey.tenant_id, "j": j}).all())
+    assert rows == {key: "READY", f"document-missing:{j}:accessory_invoice_tally": "CANCELLED"}
