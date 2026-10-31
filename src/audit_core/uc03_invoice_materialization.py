@@ -166,6 +166,8 @@ FAMILY_OTHER = "OTHER"
 VEHICLE_SALE_TYPES = frozenset({
     "customer_invoice_dms", "customer_invoice_dms_v2", "tax_invoice_tally", "tax_invoice_dms", "tax_invoice",
 })
+ACCESSORY_INVOICE_TYPES = frozenset({"accessory_invoice_dms", "accessory_invoice_tally"})
+_ACCESSORY_INVOICE_TYPES = ACCESSORY_INVOICE_TYPES
 _FAMILY_BY_TYPE = {
     "accessory_invoice_dms": FAMILY_ACCESSORY,
     "accessory_invoice_tally": FAMILY_ACCESSORY,
@@ -559,8 +561,12 @@ def _identity(document_type: str, raw: dict[str, Any]) -> dict[str, Any]:
         "vinTail": vin_tail,
         "grandTotal": _to_decimal(raw.get("grand_total_amount") or raw.get("total_amount")),
         # Which books the copy comes from: a DMS copy and a Tally copy of one
-        # bill can print different numbers (review B1).
-        "side": ("DMS" if "dms" in document_type else "TALLY" if "tally" in document_type
+        # bill can print different numbers (review B1). Not for accessories
+        # (product owner, 2026-10-31): there is no separate Tally accessory
+        # invoice, so the format never tells two accessory bills apart (see
+        # _accessory_bills) and the PC is never asked "one bill or two?".
+        "side": ("ACCESSORY" if document_type in _ACCESSORY_INVOICE_TYPES
+                 else "DMS" if "dms" in document_type else "TALLY" if "tally" in document_type
                  else (_upper(raw.get("source_system")) or None)),
         "purposePrinted": _upper(raw.get("invoice_purpose")) or None,
     }
@@ -1248,6 +1254,9 @@ def _other_sets(readings: list[dict[str, Any]]) -> tuple[list[list[dict[str, Any
     if not readings or readings[0]["family"] not in _FAMILY_COMPONENT:
         return sets, questions
 
+    if readings[0]["family"] == FAMILY_ACCESSORY:
+        return _accessory_bills(sets), questions
+
     def side(group: list[dict[str, Any]]) -> set[str]:
         return {r["side"] for r in group if r["side"] in ("DMS", "TALLY")}
 
@@ -1272,8 +1281,37 @@ def _other_sets(readings: list[dict[str, Any]]) -> tuple[list[list[dict[str, Any
     return merged, questions
 
 
+def _accessory_bills(sets: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
+    """Accessory invoices as distinct bills (product owner, 2026-10-31: every
+    accessory invoice is counted, and the Tally format is not a separate
+    invoice). Now that a second upload no longer replaces the first, one bill
+    is often on file twice with its number misread (live: C1R27C00000308 /
+    C1R27C000000309, C1R27H00000112 / ...113, a DMS copy C1R27C00000291 and
+    its Tally copy IN-26147692 -- each pair one total, one day). So two
+    readings are one bill when they print one number (grouped already), or
+    the same grand total to the rupee dated within a day, whatever their
+    numbers or format; only then is a second invoice a second bill. Two
+    genuine bills of the very same amount on the same day count once -- the
+    copy stays listed on the Deal, marked as such."""
+    groups = [list(s) for s in sets]
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(groups)):
+            for j in range(i + 1, len(groups)):
+                if any(_same_bill(a, b) for a in groups[i] for b in groups[j]):
+                    groups[i] = sorted(groups[i] + groups[j], key=_copy_order)
+                    del groups[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    return groups
+
+
 def select_invoices(
     readings: list[dict[str, Any]], *, plausible_from: date | None = None, today: date | None = None,
+    count_credit_notes: bool = True,
 ) -> dict[str, Any]:
     """Group the invoices on file into distinct invoices and count each once.
 
@@ -1342,6 +1380,11 @@ def select_invoices(
     cancellation_questions = _mark_cancellations(built)
     for group in built:
         if group["cancelled"] or group.get("pendingCancellation"):
+            group["counted"] = False
+        elif not count_credit_notes and group["family"] == FAMILY_CREDIT_NOTE:
+            # The Deal shows a credit note and never adds it in (product owner,
+            # 2026-10-31: it is given in the scrappage case). A credit note that
+            # reverses a whole vehicle invoice still cancels it, above.
             group["counted"] = False
     questions = []
     for a, b in question_sets:

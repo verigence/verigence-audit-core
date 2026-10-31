@@ -81,6 +81,14 @@ _REPEATABLE_REQUIREMENT_KEYS = {
     "delivery_bank_statement",
     "booking_scrappage_certificate",
     "delivery_scrappage_certificate",
+    # A deal can carry several accessory invoices and credit notes (product
+    # owner, 2026-10-31): a second one is another bill, not a newer copy of the
+    # first. 28 Mahindra Orissa Journeys had a genuine accessory invoice
+    # superseded this way. Copies of one bill are told apart by invoice number
+    # when the Deal counts them (uc03_invoice_materialization.select_invoices).
+    "accessory_invoice_dms",
+    "accessory_invoice_tally",
+    "delivery_credit_note",
 }
 
 

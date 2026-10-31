@@ -1363,6 +1363,9 @@ def sync_document_missing_tasks(
                 continue
             key = f"document-missing:{journey_id}:{item['key']}"
             wanted.add(key)
+            if item["key"] not in item["templates"]:
+                _adopt_member_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, key=key,
+                                    templates=item["templates"])
             conditions = ", ".join(CONDITION_TEXT.get(c, c) for c in item["conditions"])
             _, outcome = raise_or_refresh(
                 connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
@@ -1386,6 +1389,57 @@ def sync_document_missing_tasks(
     if closed:
         counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed
     return counts
+
+
+def _adopt_member_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID, key: str,
+                        templates: list[str]) -> None:
+    """When templates are grouped into one requirement after their own tasks
+    were raised (2026-10-31: the Accessory Invoice (DMS) and (Tally) are one
+    "Accessory Invoice"), the first open member task becomes the group's task
+    -- its comments and history stay -- and any other open one is cancelled as
+    merged, rather than closed as if the document had arrived."""
+    taken = connection.execute(
+        text("SELECT EXISTS (SELECT 1 FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k)"),
+        {"t": tenant_id, "k": key},
+    ).scalar_one()
+    members = connection.execute(
+        text(
+            """
+            SELECT task_id, dedupe_key FROM auditcore.p2_tasks
+            WHERE tenant_id=:t AND journey_id=:j AND dedupe_key = ANY(:keys) AND task_status = ANY(:open)
+            ORDER BY array_position(CAST(:keys AS text[]), CAST(dedupe_key AS text)), task_id
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "open": list(_OPEN),
+         "keys": [f"document-missing:{journey_id}:{t}" for t in templates]},
+    ).mappings().all()
+    for index, task in enumerate(members):
+        if index == 0 and not taken:
+            connection.execute(
+                text("UPDATE auditcore.p2_tasks SET dedupe_key=:k, updated_at_utc=now() "
+                     "WHERE tenant_id=:t AND task_id=:id"),
+                {"t": tenant_id, "id": task["task_id"], "k": key},
+            )
+            record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id, task_id=task["task_id"],
+                              event_type="REQUIREMENT_GROUPED", actor_id="SYSTEM", actor_role_code="SYSTEM",
+                              comment="This task now asks for the grouped requirement.",
+                              details={"previousDedupeKey": task["dedupe_key"], "dedupeKey": key})
+            continue
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_tasks
+                SET task_status='CANCELLED', updated_at_utc=now(),
+                    completion_result = COALESCE(completion_result, '{}'::jsonb)
+                        || jsonb_build_object('outcome', 'MERGED', 'mergedInto', CAST(:k AS text))
+                WHERE tenant_id=:t AND task_id=:id
+                """
+            ),
+            {"t": tenant_id, "id": task["task_id"], "k": key},
+        )
+        record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id, task_id=task["task_id"],
+                          event_type="CANCELLED", actor_id="SYSTEM", actor_role_code="SYSTEM",
+                          comment="Merged into one requirement.", details={"mergedInto": key})
 
 
 def _named_documents(connection: Connection, *, tenant_id: str, journey_id: UUID,

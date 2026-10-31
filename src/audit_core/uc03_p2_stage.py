@@ -724,8 +724,14 @@ def requirement_items(
                 item["conditions"].append(condition)
             item["reason"] = item["reason"] or reasons[condition]
     for item in items.values():
-        item["label"] = " or ".join(item["labels"])
+        item["label"] = GROUP_LABELS.get(item["key"]) or " or ".join(item["labels"])
     return list(items.values())
+
+
+# A group that is one document under two system names is asked for by its one
+# name (product owner, 2026-10-31: "Upload the Accessory Invoice", not "... (DMS)
+# or ... (Tally)").
+GROUP_LABELS = {"ACCESSORY_INVOICE": "Accessory Invoice"}
 
 
 def vehicle_proof(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
