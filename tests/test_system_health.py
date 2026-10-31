@@ -118,9 +118,17 @@ def test_the_page_is_superadmin_only_and_reads_every_project(engine):
     with engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
-            text("INSERT INTO auditcore.p2_work_queue (tenant_id, journey_id, work_type, work_key, created_at_utc) "
-                 "VALUES (:t, :j, 'JOURNEY_RECONCILE', :k, now() - interval '45 minutes')"),
+            text("INSERT INTO auditcore.p2_work_queue (tenant_id, journey_id, work_type, work_key, created_at_utc, "
+                 "queued_at_utc) VALUES (:t, :j, 'JOURNEY_RECONCILE', :k, now() - interval '45 minutes', "
+                 "now() - interval '45 minutes')"),
             {"t": journey.tenant_id, "j": journey.journey_id, "k": f"k-{uuid4().hex}"})
+        # A Journey's reused recompute row: created on its first day, asked for
+        # again a minute ago. It is not "waiting for 12 days" (2026-10-31).
+        connection.execute(
+            text("INSERT INTO auditcore.p2_work_queue (tenant_id, journey_id, work_type, work_key, created_at_utc, "
+                 "queued_at_utc) VALUES (:t, :j, 'STAGE_RECOMPUTE', :k, now() - interval '12 days', "
+                 "now() - interval '1 minute')"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "k": f"booking:{journey.journey_id}"})
         connection.execute(
             text("INSERT INTO platform_ops.service_resource_minutes (boot_id, service_name, minute_utc, cpu_cores_avg, "
                  "cpu_cores_max, cpu_limit_cores, memory_bytes_max, memory_limit_bytes) "
@@ -139,7 +147,9 @@ def test_the_page_is_superadmin_only_and_reads_every_project(engine):
     finally:
         app.dependency_overrides.clear()
     [mine] = [p for p in body["pipeline"]["projects"] if p["tenantId"] == journey.tenant_id]
-    assert mine["work"]["open"] == 1 and mine["work"]["over30m"] == 1
+    assert mine["work"]["open"] == 2 and mine["work"]["over30m"] == 1
+    oldest = datetime.fromisoformat(mine["work"]["oldestOpenAtUtc"])
+    assert timedelta(minutes=44) < datetime.now(UTC) - oldest < timedelta(minutes=46)
     codes = {a["code"] for a in body["alerts"]}
     assert {"WORK_OVER_30_MIN", "DEPLOY_FAILED", "CPU_HIGH"} <= codes
     [worker] = [r for r in body["resources"] if r["service"] == "di-worker-v2"]

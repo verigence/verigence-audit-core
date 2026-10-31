@@ -68,9 +68,17 @@ _FINGERPRINT_SQL = text(
                         SUM(hashtext(COALESCE(effective_value::text, ''))))
          FROM auditcore.journey_document_extracted_fields
         WHERE tenant_id=:tenant_id AND journey_id=:journey_id) AS facts,
-      (SELECT concat_ws(':', COUNT(*), MAX(updated_at_utc), SUM(amount))
-         FROM auditcore.payments
-        WHERE tenant_id=:tenant_id AND journey_id=:journey_id) AS payments,
+      -- What the rows say, not when they were last written (2026-10-31, worker
+      -- churn): the recompute rewrites payments, the vehicle, finance and
+      -- insurance on every pass (updated_at_utc, version_no), so a recompute
+      -- that changed nothing still changed a fingerprint built on timestamps
+      -- and every control unit ran again after it. The row's content less
+      -- its write stamps changes only when a value does.
+      (SELECT concat_ws(':', COUNT(*),
+                        md5(string_agg((to_jsonb(p) - 'updated_at_utc' - 'version_no')::text, ','
+                                       ORDER BY p.payment_id)))
+         FROM auditcore.payments p
+        WHERE p.tenant_id=:tenant_id AND p.journey_id=:journey_id) AS payments,
       (SELECT concat_ws(':', COUNT(*),
                         string_agg(evidence_id::text || association_status, ','
                                    ORDER BY evidence_id))
@@ -84,20 +92,26 @@ _FINGERPRINT_SQL = text(
                         MAX(COALESCE(deleted_at_utc, uploaded_at_utc)))
          FROM auditcore.delivery_vehicle_photos
         WHERE tenant_id=:tenant_id AND journey_id=:journey_id) AS photos,
-      (SELECT concat_ws(':', MAX(jp.updated_at_utc), MAX(jp.product_sku_id::text),
-                        (SELECT MAX(updated_at_utc) FROM auditcore.finance_records f
-                          WHERE f.tenant_id=:tenant_id AND f.journey_id=:journey_id),
-                        (SELECT pricing_effective_on FROM auditcore.bookings b
-                          WHERE b.tenant_id=:tenant_id AND b.journey_id=:journey_id),
-                        (SELECT COUNT(*) FROM auditcore.p2_vehicle_identifications vi
-                          WHERE vi.tenant_id=:tenant_id AND vi.journey_id=:journey_id),
-                        -- the PC's Self / Inhouse answer (2026-10-28: an answer
-                        -- that changed no fact left the checks skipped)
-                        (SELECT MAX(COALESCE(ir.insurance_source, '') || ir.updated_at_utc::text)
-                           FROM auditcore.insurance_records ir
-                          WHERE ir.tenant_id=:tenant_id AND ir.journey_id=:journey_id))
-         FROM auditcore.journey_products jp
-        WHERE jp.tenant_id=:tenant_id AND jp.journey_id=:journey_id) AS deal
+      concat_ws(':',
+        -- the vehicle and its SKU; when a check ran (decidedAtUtc) is not a fact
+        (SELECT md5(string_agg((to_jsonb(jp) - 'updated_at_utc' - 'match_evidence')::text
+                               || COALESCE((jp.match_evidence - 'decidedAtUtc')::text, ''), ','
+                               ORDER BY jp.journey_product_id))
+           FROM auditcore.journey_products jp
+          WHERE jp.tenant_id=:tenant_id AND jp.journey_id=:journey_id),
+        (SELECT md5(string_agg((to_jsonb(f) - 'updated_at_utc')::text, ',' ORDER BY f.finance_record_id))
+           FROM auditcore.finance_records f
+          WHERE f.tenant_id=:tenant_id AND f.journey_id=:journey_id),
+        (SELECT pricing_effective_on FROM auditcore.bookings b
+          WHERE b.tenant_id=:tenant_id AND b.journey_id=:journey_id),
+        (SELECT COUNT(*) FROM auditcore.p2_vehicle_identifications vi
+          WHERE vi.tenant_id=:tenant_id AND vi.journey_id=:journey_id),
+        -- the PC's Self / Inhouse answer (2026-10-28: an answer that changed
+        -- no fact left the checks skipped) moves insurance_source_set_at_utc
+        (SELECT md5(string_agg((to_jsonb(ir) - 'updated_at_utc' - 'version_no')::text, ','
+                               ORDER BY ir.insurance_record_id))
+           FROM auditcore.insurance_records ir
+          WHERE ir.tenant_id=:tenant_id AND ir.journey_id=:journey_id)) AS deal
     """
 )
 
@@ -108,6 +122,22 @@ def fact_fingerprint(connection: Connection, *, tenant_id: str, journey_id: UUID
     ).mappings().one()
     material = "|".join(str(row[key] or "") for key in ("facts", "payments", "evidence", "legacy_review", "photos", "deal"))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+# Set for the rest of a transaction whose writes follow from facts it already
+# read (the worker's recompute and its control units): the task a recompute
+# closes because the PC confirmed a field is not a new fact. The MANUAL_
+# VERIFICATION_REVIEW task trigger (migration 0180) then asks for no second
+# recompute -- before 2026-10-31 every such close asked for one, silently,
+# and the recompute could not store its fingerprint, so the fact sweep asked
+# for a third (FIELD_CORRECTED v51 -> silent v52 -> FACT_SWEEP v53).
+DERIVED_WRITES_SETTING = "audit_core.p2_derived_writes"
+
+
+def mark_derived_writes(connection: Connection) -> None:
+    """The rest of this transaction only writes what follows from facts it
+    has read: a task it raises or closes asks for no recompute of its own."""
+    connection.execute(text("SELECT set_config(:name, 'on', true)"), {"name": DERIVED_WRITES_SETTING})
 
 
 def note_facts_changed(

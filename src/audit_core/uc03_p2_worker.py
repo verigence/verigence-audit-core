@@ -101,6 +101,7 @@ from audit_core.uc03_p2_runtime import (
     enqueue_work,
     fact_fingerprint,
     hhmm,
+    mark_derived_writes,
     note_facts_changed,
     record_activity,
     request_page_reread,
@@ -300,6 +301,9 @@ def _active_tenants(engine: Engine) -> list[str]:
 # when nothing else of its Journey is running and it is the oldest waiting;
 # page work queued after it waits for it.
 PAGE_WORK_TYPES = ("SPLIT_BATCH", "DOCUMENT_INGEST", "PAGE_REREAD", "BATCH_GROUP", "DI_DOCUMENT_WITHDRAW")
+# How long a deletion that has started holds its Journey's work back. A
+# deletion takes seconds; one left STARTED by a crash stops holding it then.
+DELETION_HOLD_MINUTES = 15
 
 _CLAIM_SQL = text(
     """
@@ -314,7 +318,20 @@ _CLAIM_SQL = text(
     ),
     ready AS (
         SELECT work_id, journey_id, queued_at_utc, (work_type = ANY(:page_types)) AS page_work,
-               row_number() OVER (PARTITION BY journey_id ORDER BY queued_at_utc, work_id) AS journey_rank
+               row_number() OVER (PARTITION BY journey_id ORDER BY queued_at_utc, work_id) AS journey_rank,
+               -- Among a Journey's own work its checks come last (2026-10-31):
+               -- they read what the recompute, the reconcile and task
+               -- verification settle, and a recompute asked for again now
+               -- joins the back of the line (migration 0180) -- ahead of it,
+               -- a check left from the previous change would run on unsettled
+               -- facts and then once more after the recompute. The derived
+               -- unit comes after the other checks: it reads their execution
+               -- log, so run first it ran again on the next request. Pages
+               -- keep their place by queue time.
+               row_number() OVER (PARTITION BY journey_id, (work_type = ANY(:page_types))
+                                  ORDER BY (work_type = 'CONTROL_EVALUATE'), (work_key LIKE '%:P2:DERIVED'),
+                                           queued_at_utc, work_id)
+                 AS journey_work_rank
         FROM auditcore.p2_work_queue
         WHERE tenant_id=:tenant_id
           AND (
@@ -322,6 +339,17 @@ _CLAIM_SQL = text(
             OR (work_status IN ('CLAIMED','PROCESSING') AND lease_expires_at_utc <= now())
           )
           AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= now())
+          -- A Journey being deleted gets no new work (2026-10-31): a check
+          -- still writing its findings while the delete removed its rows
+          -- deadlocked with it (the delete takes the audit tables' trigger
+          -- locks). The delete waits for work already running
+          -- (uc03_p2_journey_delete._wait_for_journey_work); only the
+          -- delete's own item runs.
+          AND (work_type = :same_file_delete OR NOT EXISTS (
+                SELECT 1 FROM auditcore.p2_journey_deletions d
+                WHERE d.tenant_id=:tenant_id AND d.journey_id=p2_work_queue.journey_id
+                  AND d.deletion_status='STARTED'
+                  AND d.requested_at_utc > now() - (:deletion_hold_minutes * interval '1 minute')))
     ),
     first_journey_work AS (
         SELECT journey_id, MIN(journey_rank) AS journey_rank FROM ready WHERE NOT page_work GROUP BY journey_id
@@ -336,7 +364,7 @@ _CLAIM_SQL = text(
             COALESCE(i.running_journey_work, 0) = 0
             AND r.journey_rank + COALESCE(i.running, 0) <= :per_journey
             AND r.journey_rank < COALESCE(f.journey_rank, 2147483647)
-          ELSE COALESCE(i.running, 0) = 0 AND r.journey_rank = 1
+          ELSE COALESCE(i.running, 0) = 0 AND f.journey_rank = 1 AND r.journey_work_rank = 1
         END
         -- Reading first (2026-10-29): 383 of 554 pages failed by the 30-minute
         -- rule were never sent to Document Intelligence -- they waited behind
@@ -364,7 +392,8 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
         rows = connection.execute(
             _CLAIM_SQL,
             {"tenant_id": tenant_id, "limit": limit, "per_journey": _PER_JOURNEY_CONCURRENCY,
-             "page_types": list(PAGE_WORK_TYPES)},
+             "page_types": list(PAGE_WORK_TYPES), "same_file_delete": SAME_FILE_DELETE_WORK_TYPE,
+             "deletion_hold_minutes": DELETION_HOLD_MINUTES},
         ).mappings().all()
         for row in rows:
             token = uuid4()
@@ -3261,6 +3290,9 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     # the whole Journey 20 times, and a PC's correction reaches the Deal on the
     # recompute it requests. Identity, duplicate, SKU and payment checks run in
     # the NATIVE control units this recompute requests.
+    # Everything below follows from the facts on file: the review tasks it
+    # closes ask for no recompute of their own (2026-10-31, worker churn).
+    mark_derived_writes(connection)
     _materialize_journey(connection, tenant_id=tenant_id, journey_id=journey_id)
     # The booking date follows the receipts still on file: a receipt deleted,
     # re-read or replaced since the last pass no longer sets it (2026-10-20).
@@ -3463,6 +3495,22 @@ def _task_verify(engine: Engine, work: WorkItem) -> None:
                     connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
                     correlation_id=work.correlation_id, delay_seconds=0, force=True,
                 )
+            return
+        if source_type == "RESOLVER":
+            # A resolver's task (cost sheet vs NDC, the SKU and deal checks)
+            # is closed or returned by the resolver itself, which runs in the
+            # recompute (the account statement, invoices) and in the NATIVE
+            # units (SKU, deal): run both on fresh facts. Before 2026-10-31
+            # there was no adapter: a PC's "Review document" on a cost-sheet
+            # task was retried five times and gave up (dead letter).
+            # Forced, as for a rule's task: an unchanged fingerprint must not
+            # skip the very check the PC asked for.
+            settle_journey(connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                           started_at=datetime.now(UTC))
+            request_control_evaluation(
+                connection, tenant_id=work.tenant_id, journey_id=work.journey_id,
+                correlation_id=work.correlation_id, delay_seconds=0, force=True,
+            )
             return
         if source_type != "RULE" or not task["source_code"]:
             raise RuntimeError(

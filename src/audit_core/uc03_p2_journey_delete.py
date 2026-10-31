@@ -27,7 +27,10 @@ Order
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+import os
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -35,6 +38,7 @@ import structlog
 from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, Engine, text
+from sqlalchemy.exc import OperationalError
 
 from audit_core.authorization import AuthorizationError
 from audit_core.db import set_tenant_context
@@ -417,6 +421,74 @@ def delete_journey(
     )
 
 
+class JourneyWorkRunning(RuntimeError):
+    """The worker is still running one of the journey's items."""
+
+
+# How long the database delete waits for the journey's running work to finish
+# (it gets no new work once the deletion has started: the worker's claim
+# skips it). A check or a recompute takes seconds.
+_WORK_WAIT_ATTEMPTS = int(os.environ.get("P2_DELETE_WORK_WAIT_ATTEMPTS", "20"))
+_WORK_WAIT_SECONDS = float(os.environ.get("P2_DELETE_WORK_WAIT_SECONDS", "1.5"))
+# The worker's own item that drives a same-file delete is running by design.
+_OWN_WORK_TYPE = "SAME_FILE_DELETE"
+
+_RUNNING_WORK_SQL = """
+    SELECT 1 FROM auditcore.p2_work_queue
+    WHERE tenant_id=:t AND journey_id=:j AND work_type <> :own
+      AND work_status IN ('CLAIMED','PROCESSING') AND lease_expires_at_utc > now()
+    LIMIT 1
+"""
+
+
+def _hold_journey_work(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """Inside the delete's own transaction: True once none of the journey's
+    work is running and its queue rows are locked, so no claim can start one
+    until the delete commits (the claim skips locked rows).
+
+    Found live 2026-10-31: the duplicate purge deleted journey 74d751db while
+    the worker was still running its NATIVE:BOOKING check. The check had
+    written finding events and then waited, at its payment-match upsert, on a
+    row the delete had already removed; the delete (hard_delete_journey_
+    transactions disables the audit tables' append-only triggers, which takes
+    ShareRowExclusiveLock) waited for audit_finding_events, which the check's
+    insert held -- a deadlock, and the check was killed. NOWAIT: the delete never
+    waits on a row lock here, so it cannot close a cycle of its own."""
+    params = {"t": tenant_id, "j": journey_id, "own": _OWN_WORK_TYPE}
+    if connection.execute(text(_RUNNING_WORK_SQL), params).first() is not None:
+        return False
+    try:
+        with connection.begin_nested():
+            connection.execute(
+                text(
+                    "SELECT work_id FROM auditcore.p2_work_queue "
+                    "WHERE tenant_id=:t AND journey_id=:j AND work_type <> :own FOR UPDATE NOWAIT"
+                ),
+                params,
+            )
+    except OperationalError as exc:
+        if getattr(exc.orig, "sqlstate", None) == "55P03":  # lock_not_available: being claimed or settled
+            return False
+        raise
+    # A claim that committed before the lock: its item is running now.
+    return connection.execute(text(_RUNNING_WORK_SQL), params).first() is None
+
+
+@contextmanager
+def _journey_work_held(engine: Engine, *, tenant_id: str, journey_id: UUID) -> Iterator[Connection]:
+    """A transaction in which none of the journey's work runs, waiting a
+    little for running work to finish. Raises JourneyWorkRunning."""
+    for attempt in range(max(1, _WORK_WAIT_ATTEMPTS)):
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            if _hold_journey_work(connection, tenant_id=tenant_id, journey_id=journey_id):
+                yield connection
+                return
+        if attempt + 1 < _WORK_WAIT_ATTEMPTS:
+            time.sleep(_WORK_WAIT_SECONDS)
+    raise JourneyWorkRunning(f"Work on journey {journey_id} is still running")
+
+
 def _remove(
     engine: Engine,
     *,
@@ -469,8 +541,7 @@ def _remove(
         ) from exc
 
     try:
-        with engine.begin() as connection:
-            set_tenant_context(connection, tenant_id)
+        with _journey_work_held(engine, tenant_id=tenant_id, journey_id=journey_id) as connection:
             receipt = connection.execute(
                 text(
                     "SELECT auditcore.hard_delete_journey_transactions("
@@ -491,6 +562,12 @@ def _remove(
             from audit_core.uc03_p2_same_file import close_pending_alert
 
             close_pending_alert(connection, tenant_id=tenant_id, journey_id=journey_id)
+    except JourneyWorkRunning as exc:
+        logger.warning("p2_journey_delete_work_running", tenant_id=tenant_id, journey_id=str(journey_id))
+        raise _fail(
+            engine, tenant_id=tenant_id, deletion_id=deletion_id, di_documents=di_done, objects=object_count,
+            detail="The journey's checks were still running, so its records were not removed yet.",
+        ) from exc
     except Exception as exc:
         logger.error("p2_journey_delete_db_failed", tenant_id=tenant_id, journey_id=str(journey_id), error=str(exc))
         raise _fail(
