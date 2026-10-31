@@ -290,12 +290,14 @@ def test_a_gst_certificate_without_a_gstin_does_not_name_the_customer(journey):
 def test_a_company_customer_keeps_its_directors_kyc_and_its_trade_name_documents(journey):
     """The company is the customer; the director's PAN and Aadhaar are not the
     wrong documents, and a receipt in the director's or the trade name is fine.
-    A document in a third name is still the wrong document."""
+    A document in a third name is still the wrong document. Since 2026-10-31
+    the director is one the GST certificate names (its authorised signatory)."""
     add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="PRASANA KUMAR SENAPATI")
     add_ready_document(journey, "aadhaar", aadhaar_name="Prasana Kumar Senapati")
     add_ready_document(journey, "gst_certificate", gstin="21AAFCJ2048H1ZY",
                        organisation_legal_name="JAGANNATH POWER AND INFRA PRIVATE LIMITED",
-                       organisation_trade_name="JAGANNATH POWER")
+                       organisation_trade_name="JAGANNATH POWER",
+                       gst_authorised_signatory_names=["PRASANA KUMAR SENAPATI", "SATYABAN SAHOO"])
     assert _named(journey) == ("VERIFIED", "JAGANNATH POWER AND INFRA PRIVATE LIMITED")
     add_ready_document(journey, "customer_invoice_dms", buyer_name="Jagannath Power and Infra Pvt Ltd",
                        seller_name="Sarthak Motors", invoice_number="I1")
@@ -308,6 +310,56 @@ def test_a_company_customer_keeps_its_directors_kyc_and_its_trade_name_documents
     (task,) = _tasks(journey)
     assert task["reference"]["documentIds"] == [str(other)]
     assert "as per the GST certificate" in task["description"]
+
+
+def test_under_a_gst_certificate_another_persons_kyc_is_not_the_proprietors(journey):
+    """2026-10-31 (ADI-RD-261022-022): the GST certificate names the customer
+    (Azizur Rehaman, GSTIN ...AHOPR2948B...). Before, ANY person's PAN or
+    Aadhaar passed as the proprietor's, so another customer's KYC dropped
+    into the booking (Tapan Kumar Patra) closed the name task by itself."""
+    add_ready_document(journey, "gst_certificate", gstin="21AHOPR2948B2ZE", organisation_legal_name="AZIZUR REHAMAN",
+                       organisation_trade_name="RIDA INFRASTRUCTURE")
+    assert _named(journey) == ("VERIFIED", "AZIZUR REHAMAN")
+    tapan = add_ready_document(journey, "pan_card", pan_number="AVFPP9596G", pan_name="TAPAN KUMAR PATRA")
+    tapan_aadhaar = add_ready_document(journey, "aadhaar", aadhaar_number="5845 3895 7247",
+                                       aadhaar_name="TAPAN KUMAR PATRA")
+    docket = add_ready_document(journey, "booking_form", customer_name="TAPAN KUMAR PATRA",
+                                dealer_name="Sarthak Motors")
+    assert _sync(journey) == {"RAISED": 1}
+    (task,) = _tasks(journey)
+    assert set(task["reference"]["documentIds"]) == {str(tapan), str(tapan_aadhaar), str(docket)}
+    assert task["reference"]["customerName"] == "AZIZUR REHAMAN"
+
+
+def test_under_a_gst_certificate_the_proprietors_pan_is_the_one_in_the_gstin(journey):
+    """The proprietor's own KYC passes: its PAN is the PAN inside the GSTIN
+    (even when the name on it is printed differently), or its name is the GST
+    legal name; their booking form in their own name passes with it."""
+    add_ready_document(journey, "gst_certificate", gstin="21AHOPR2948B2ZE", organisation_legal_name="AZIZUR REHAMAN",
+                       organisation_trade_name="RIDA INFRASTRUCTURE")
+    add_ready_document(journey, "pan_card", pan_number="AHOPR2948B", pan_name="MD AZIJUR RAHMAN")
+    add_ready_document(journey, "aadhaar", aadhaar_number="7760 9413 4320", aadhaar_name="Azizur Rehaman")
+    add_ready_document(journey, "booking_form", customer_name="M/S RIDA INFRASTRUCTURE", dealer_name="Sarthak Motors")
+    assert _named(journey)[1] == "AZIZUR REHAMAN"
+    assert _sync(journey) == {}
+
+
+def test_a_company_customer_does_not_take_a_directors_kyc_the_certificate_does_not_name(journey):
+    """A person the company's GST certificate does not name (neither its
+    PAN nor a signatory) is not its director: the name task stays raised."""
+    add_ready_document(journey, "gst_certificate", gstin="21AAFCJ2048H1ZY",
+                       organisation_legal_name="JAGANNATH POWER AND INFRA PRIVATE LIMITED",
+                       gst_authorised_signatory_names=["PRAVAKAR SAHOO", "SATYABAN SAHOO"])
+    pan = add_ready_document(journey, "pan_card", pan_number="AONPS0726E", pan_name="PRASANA KUMAR SENAPATI")
+    assert _named(journey)[1] == "JAGANNATH POWER AND INFRA PRIVATE LIMITED"
+    assert _sync(journey) == {"RAISED": 1}
+    (task,) = _tasks(journey)
+    assert task["reference"]["documentIds"] == [str(pan)]
+    # The signatory's own PAN passes.
+    add_ready_document(journey, "pan_card", pan_number="BXYPS1234K", pan_name="Pravakar Sahoo")
+    _sync(journey)
+    (task,) = _tasks(journey)
+    assert task["reference"]["documentIds"] == [str(pan)]
 
 
 def test_a_masked_pan_gives_way_to_the_aadhaar_name(journey):

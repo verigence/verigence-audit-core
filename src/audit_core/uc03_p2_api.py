@@ -642,8 +642,12 @@ def list_p2_journeys(
               -- Only a fallback: the stage engine's derived booking total
               -- (pr.booking_receipt_total) is used when it has run.
               SELECT COALESCE(SUM(amount) FILTER (WHERE amount > 0), 0) AS booking_total
-              FROM auditcore.payments
-              WHERE tenant_id=p.tenant_id AND journey_id=p.journey_id
+              FROM auditcore.payments py
+              WHERE py.tenant_id=p.tenant_id AND py.journey_id=p.journey_id
+                -- another customer's receipt never counts (2026-10-31)
+                AND NOT EXISTS (SELECT 1 FROM auditcore.evidence fe
+                                WHERE fe.tenant_id=py.tenant_id AND fe.di_document_id=py.source_di_document_id
+                                  AND fe.association_status='FOREIGN')
             ) pay ON true
             LEFT JOIN LATERAL (
               -- The first receipt date at which the receipts (one per receipt
@@ -1848,8 +1852,16 @@ def list_documents(
                         ],
                     }
                 )
+    # Whose each uploaded file is (uc03_p2_file_identity, 2026-10-31): the web
+    # workspace shows a file of another customer apart. ``movedTo`` is filled
+    # once such a file is moved to its own booking (a later change).
+    from audit_core.uc03_p2_file_identity import files_view
+
+    identity = files_view(connection, tenant_id=tenant_id, journey_id=journey_id)
     return {
         "journeyId": str(journey_id),
+        "customerName": identity["customerName"],
+        "files": identity["files"],
         "batches": result,
         "documents": documents,
         "checklist": checklist,

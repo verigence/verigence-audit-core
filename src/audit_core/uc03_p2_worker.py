@@ -3278,6 +3278,20 @@ def _materialize_journey(connection, *, tenant_id: str, journey_id: UUID) -> Non
                            journey_id=str(journey_id), exc_info=True)
 
 
+def _apply_file_identity(connection, *, tenant_id: str, journey_id: UUID) -> None:
+    """A failure here is logged and does not stop the recompute (the booking
+    is then rebuilt as it stands); a deadlock fails the item so it is retried."""
+    from audit_core.uc03_db_transient import raise_if_worker_transient
+    from audit_core.uc03_p2_file_identity import apply_file_identity
+
+    try:
+        with connection.begin_nested():
+            apply_file_identity(connection, tenant_id=tenant_id, journey_id=journey_id)
+    except Exception as exc:
+        raise_if_worker_transient(exc)
+        logger.warning("p2_file_identity_failed", tenant_id=tenant_id, journey_id=str(journey_id), exc_info=True)
+
+
 def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
                    started_at: datetime | None = None) -> dict[str, Any]:
     """Recompute the stage from the documents, raise / close the rule tasks
@@ -3293,6 +3307,11 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     # Everything below follows from the facts on file: the review tasks it
     # closes ask for no recompute of their own (2026-10-31, worker churn).
     mark_derived_writes(connection)
+    # Whose each uploaded file is (2026-10-31): another customer's file dropped
+    # into this booking leaves it before anything is rebuilt from the
+    # documents, and the customer's own copies it had superseded come back
+    # (uc03_p2_file_identity; acts only with P2_FILE_IDENTITY_ENFORCE on).
+    _apply_file_identity(connection, tenant_id=tenant_id, journey_id=journey_id)
     _materialize_journey(connection, tenant_id=tenant_id, journey_id=journey_id)
     # The booking date follows the receipts still on file: a receipt deleted,
     # re-read or replaced since the last pass no longer sets it (2026-10-20).
@@ -4615,6 +4634,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # the tag names (2026-10-31): see uc03_duplicate_journey_purge.
         from audit_core.uc03_duplicate_journey_purge import run_duplicate_journey_purge
         return run_duplicate_journey_purge, (engine, tag, reports)
+    if kind == "FILE_IDENTITY_SCAN":
+        # Whose each uploaded file is, for the one tenant the tag names
+        # (2026-10-31): see uc03_file_identity_scan. Never deletes.
+        from audit_core.uc03_file_identity_scan import run_file_identity_scan
+        return run_file_identity_scan, (engine, tag, reports)
     per_tenant = {
         "PAGE_RESEND": ("audit_core.uc03_p2_page_resend", "run_page_resend"),
         "INVOICE_RESCAN": ("audit_core.uc03_invoice_rescan", "run_invoice_rescan"),

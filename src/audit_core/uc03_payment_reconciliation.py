@@ -200,8 +200,12 @@ def _payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> li
             """
             SELECT payment_id, amount, payment_method_code, payment_reference,
                    receipt_date, receipt_number
-            FROM auditcore.payments
+            FROM auditcore.payments p
             WHERE tenant_id = :tenant_id AND journey_id = :journey_id
+              -- another customer's receipt never counts (2026-10-31)
+              AND NOT EXISTS (SELECT 1 FROM auditcore.evidence fe
+                              WHERE fe.tenant_id=p.tenant_id AND fe.di_document_id=p.source_di_document_id
+                                AND fe.association_status='FOREIGN')
             ORDER BY created_at_utc, payment_id
             """
         ),
