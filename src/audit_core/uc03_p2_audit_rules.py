@@ -14,12 +14,16 @@ and answer the questions a manual deal audit asks:
   Financier (DO)           DO_PAYMENT_NOT_RECEIVED, DO_SHORT_PAYMENT
   Trade-in                 TRADE_IN_NOT_RESOLD, TRADE_IN_SOLD_AT_LOSS
   Refund                   POST_DELIVERY_REFUND
-  Receipts                 CASH_ABOVE_LIMIT, PAYMENT_BEFORE_BOOKING
+  Receipts                 CASH_ABOVE_LIMIT (finding only, no task), PAYMENT_BEFORE_BOOKING
   Third-party payer        THIRD_PARTY_PAYMENT_UNCONFIRMED (PC question),
                            THIRD_PARTY_PAYMENT_UNDECLARED (TL violation)
-  Cash intimation          CASH_INTIMATION_UNCONFIRMED (PC question), CASH_NOT_INTIMATED
   Accessories fitted       ACCESSORIES_FITTED_UNCONFIRMED (PC question), ACCESSORY_FITTED_UNBILLED
   Delivery in time         DELIVERY_NOT_COMPLETED_IN_TIME  complete within N days of the printed date
+
+Cash transactions raise no tasks (product owner, 2026-10-31): the cash
+intimation question (CASH_INTIMATION_UNCONFIRMED) and its finding
+(CASH_NOT_INTIMATED) are retired, and CASH_ABOVE_LIMIT raises its finding
+without a task (uc03_p2_task_producer.SUPPRESSED_TASK_CODES).
 
 A "Manual Observations" control cannot be read from a document: its task
 asks a question and fails until a PC, TL or PM answers it (the answer and
@@ -1127,31 +1131,6 @@ def _cash_lines(rows: list[dict[str, Any]]) -> str:
     )
 
 
-def cash_intimation_unconfirmed(facts: _Facts) -> RuleOutcome:
-    rows = _cash(facts)
-    return _question(
-        facts, "CASH_INTIMATION_UNCONFIRMED", subjects=[r["createdAt"] for r in rows],
-        none="No cash received on this deal.",
-        title="Confirm the cash collection was intimated",
-        question=f"{_cash_lines(rows)}. Was this cash collection intimated to the auditor before it was received?",
-        answers=[{"value": "YES", "label": "Yes, it was intimated"},
-                 {"value": "NO", "label": "No, it was not intimated", "requiresComment": True}],
-        details={"paymentIds": [r["paymentId"] for r in rows]},
-    )
-
-
-def cash_not_intimated(facts: _Facts) -> RuleOutcome:
-    code = "CASH_NOT_INTIMATED"
-    rows = _cash(facts)
-    answer = _answered(facts, "CASH_INTIMATION_UNCONFIRMED", [r["createdAt"] for r in rows])
-    if answer and answer["value"] == "NO":
-        return RuleOutcome(code, "FAIL", (
-            f"{_cash_lines(rows)}, collected without intimation to the auditor "
-            f"(confirmed on {_when(answer['at'])}){_remark(answer)}."
-        ), {"findingTitle": "Cash collected without intimation", "paymentIds": [r["paymentId"] for r in rows]})
-    return RuleOutcome(code, "PASS", "Cash collections were intimated." if rows else "No cash received on this deal.")
-
-
 def delivery_not_completed_in_time(facts: _Facts) -> RuleOutcome:
     code = "DELIVERY_NOT_COMPLETED_IN_TIME"
     clock = facts.delivery_clock
@@ -1269,7 +1248,9 @@ _BOOKING_RULES = (
     booking_date_unusable,
     deal_undercharged, excess_discount, tcs_short,
     third_party_payment_unconfirmed, third_party_payment_undeclared,
-    cash_intimation_unconfirmed, cash_not_intimated, cash_above_limit, payment_before_booking,
+    # Cash transactions raise no tasks (product owner, 2026-10-31): no cash
+    # intimation question, so neither it nor its finding runs.
+    cash_above_limit, payment_before_booking,
     insurance_invoice_missing, self_insurance_declared,
 )
 _DELIVERY_RULES = (

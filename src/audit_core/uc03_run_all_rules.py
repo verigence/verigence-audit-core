@@ -295,7 +295,7 @@ def _run_audit_core_rules_for_stage(
             _record("PAYMENT_BANK_UNMATCHED", outcome)
 
     # The deal-audit checks (price, discounts, settlement, financier, trade-in,
-    # third-party payer, cash intimation, NDC): journey-wide ones run with
+    # third-party payer, cash limit): journey-wide ones run with
     # BOOKING, delivery-dependent ones with DELIVERY.
     from audit_core.uc03_p2_audit_rules import run_p2_audit_rules
 

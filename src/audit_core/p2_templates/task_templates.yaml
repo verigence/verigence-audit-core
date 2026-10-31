@@ -684,8 +684,8 @@ task_types:
     actions:
     - COMPLETE_ACTION
     - ADD_COMMENT
-  # A yes/no question a check needs the PC to answer (cash intimation,
-  # third-party payer declaration, NDC signature). The answer is the task's
+  # A yes/no question a check needs the PC to answer (accessories fitted,
+  # third-party payer declaration). The answer is the task's
   # completion result; the check reads it and closes the task.
   PC_CONFIRMATION:
     category: PROCESS_CONFIRMATION

@@ -235,6 +235,53 @@ def _existing(connection: Connection, *, tenant_id: str, dedupe_key: str) -> dic
     return dict(row) if row else None
 
 
+# Cash transactions raise no tasks (product owner, 2026-10-31: "For any cash
+# transactions supress the Tasks and remove all the existing tasks for cash
+# transactions"). The one place that decides it: raise_or_refresh raises
+# nothing for these checks -- native or Rule Engine, whoever calls it -- and
+# cancels a task one of them left open. The checks that still run keep their
+# result on the ledger, and CASH_ABOVE_LIMIT keeps its Audit Finding (the
+# Sec 269ST limit, shown on the Audit Summary); the cash intimation question
+# and its finding are retired (uc03_p2_audit_rules). uc03_cash_task_cleanup
+# cancels the tasks raised before.
+SUPPRESSED_TASK_CODES = frozenset({
+    "CASH_INTIMATION_UNCONFIRMED",   # the PC's "was the cash intimated?" (retired)
+    "CASH_NOT_INTIMATED",            # the TL's finding on a "No" (retired)
+    "CASH_ABOVE_LIMIT",              # one cash receipt above P2_CASH_RECEIPT_LIMIT (finding kept)
+    "PAYMENT_MODE_CASH_UNRECEIPTED",  # Rule Engine: ledger cash credit vs the receipts
+})
+SUPPRESSED_TASK_RESULT = {
+    "outcome": "CHECK_RETIRED",
+    "reason": "Cash transactions raise no tasks (product owner, 2026-10-31)",
+}
+
+
+def cancel_suppressed_task(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                           dedupe_key: str) -> UUID | None:
+    """Cancel the open task under ``dedupe_key`` as a check that raises no
+    task (CHECK_RETIRED, with a CANCELLED task event). None if none is open."""
+    existing = _existing(connection, tenant_id=tenant_id, dedupe_key=dedupe_key)
+    if existing is None or str(existing["task_status"]) not in _OPEN:
+        return None
+    task_id = UUID(str(existing["task_id"]))
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_tasks
+            SET task_status='CANCELLED',
+                completion_result=COALESCE(completion_result, '{}'::jsonb) || CAST(:result AS jsonb),
+                updated_at_utc=now()
+            WHERE tenant_id=:t AND task_id=:id
+            """
+        ),
+        {"t": tenant_id, "id": task_id, "result": _json(SUPPRESSED_TASK_RESULT)},
+    )
+    record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id, task_id=task_id,
+                      event_type="CANCELLED", actor_id="SYSTEM", actor_role_code="SYSTEM",
+                      details={**SUPPRESSED_TASK_RESULT, "sourceCode": existing.get("source_code")})
+    return task_id
+
+
 def raise_or_refresh(
     connection: Connection,
     *,
@@ -250,9 +297,13 @@ def raise_or_refresh(
     severity: str,
     registry: Registry,
     evaluation_started_at: datetime | None = None,
-) -> tuple[UUID, str]:
+) -> tuple[UUID | None, str]:
     """Create, refresh, return or reopen the one task for a logical issue.
-    Returns (task_id, what happened)."""
+    Returns (task_id, what happened); (None or the cancelled task, "SUPPRESSED")
+    for a check that raises no task (SUPPRESSED_TASK_CODES)."""
+    if source_code in SUPPRESSED_TASK_CODES:
+        return cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                      dedupe_key=dedupe_key), "SUPPRESSED"
     template = registry.tasks[task_type]
     priority = _PRIORITY_BY_SEVERITY.get(severity, "NORMAL")
     reference = {**reference, "issueHash": _issue_hash(reference)}
@@ -433,8 +484,14 @@ def apply_control_transitions(
         if control is None:
             continue
         key = f"control:{journey_id}:{control.code}"
+        if control.code in SUPPRESSED_TASK_CODES:
+            # Cash transactions raise no tasks (product owner, 2026-10-31):
+            # whatever the result, no task; one left open is cancelled.
+            cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key)
+            counts["SUPPRESSED"] = counts.get("SUPPRESSED", 0) + 1
+            continue
         if transition.current == "FAIL" and control.task_type in QUESTION_TASK_TYPES:
-            # The PC's questions (cash intimated? accessories fitted? who paid?)
+            # The PC's questions (accessories fitted? who paid?)
             # are asked once delivery has started (product owner 2026-10-28:
             # fewer tasks); until then the check stays unanswered on the ledger
             # and an open question closes, to come back at delivery.
