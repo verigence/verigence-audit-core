@@ -271,6 +271,13 @@ def test_same_file_with_an_individual_pan_is_deleted_and_alerted(tenant):
     fields = {f["field"]: f for f in alert["payload"]["matchedFields"]}
     assert set(fields) == {"pan", "mobile", "name", "model"}
     assert fields["pan"]["newValue"] == "XXXXXX234F"
+    # The PC who entered the new file is named by id, so their own screen beeps (2026-10-31).
+    with new.engine.begin() as connection:
+        set_tenant_context(connection, new.tenant_id)
+        creator = connection.execute(text("SELECT created_by_actor_id FROM auditcore.journeys WHERE tenant_id=:t "
+                                          "AND journey_id=:j"), {"t": old.tenant_id, "j": old.journey_id}).scalar_one()
+    assert alert["payload"]["existingJourney"]["pcActorId"] == (str(creator) if creator else None)
+    assert "pcActorId" in alert["payload"]["newJourney"]
     with new.engine.begin() as connection:
         set_tenant_context(connection, new.tenant_id)
         record = connection.execute(
