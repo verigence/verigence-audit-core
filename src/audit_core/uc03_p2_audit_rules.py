@@ -60,7 +60,6 @@ from uuid import UUID
 import structlog
 from sqlalchemy import Connection, text
 
-from audit_core.uc03_masters_alignment import ENTITLEMENT_UNKNOWN_RESULTS
 from audit_core.uc03_p2_dates import parse_extracted_date
 from audit_core.uc03_p2_names import same_person
 from audit_core.uc03_p2_runtime import enqueue_work
@@ -493,30 +492,36 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
 
 
 def excess_discount(facts: _Facts) -> RuleOutcome:
+    # 2026-10-31 (product owner: "Excess Discount tab is empty"): what was
+    # given, the entitlement and the line tolerance are read through
+    # uc03_discount_given, which the Excess Discount tab reads too, so the tab
+    # lists exactly the discounts this rule raises its task on.
+    from audit_core import uc03_discount_given as dg
+
     code = "EXCESS_DISCOUNT"
     # A line no document gives anything on (the Management Referral line
     # is always on the sheet, opted out by default) is no discount yet.
-    rows = [r for r in facts.sheet["discounts"] if any(r[c] is not None for c in ("billed", "booking", "effective"))]
+    rows = [r for r in facts.sheet["discounts"] if dg.has_figure(r)]
     if not rows:
         return RuleOutcome(code, "PASS", "No discount on this deal.")
     # 2026-10-20 (review of PR 472): a discount whose entitlement is not
     # known (master not mapped, deal not reconciled, corporate category to
     # be confirmed) is not an over-grant; its own task says why.
-    rows = [r for r in rows if not (r.get("entitled") is None and r.get("eligibility") in ENTITLEMENT_UNKNOWN_RESULTS)]
+    rows = [r for r in rows if not dg.entitlement_unknown(r)]
     if not rows:
         return RuleOutcome(code, "SKIPPED", "The entitlement of the discounts given is not known yet.")
-    if not _standards_known(facts):
+    if not dg.standards_known(facts.sheet):
         return RuleOutcome(code, "SKIPPED", _NO_STANDARD)
     over: list[dict[str, Any]] = []
     total_given = total_entitled = Decimal(0)
     for row in rows:
-        given = next((_dec(row[c]) for c in ("billed", "booking", "effective") if row[c] is not None), None)
+        given, _column = dg.given(row)
         if given is None:
             continue
-        entitled = _dec(row["entitled"]) or Decimal(0)
+        entitled = dg.entitled(row)
         total_given += given
         total_entitled += entitled
-        if given - entitled > _LINE_TOLERANCE:
+        if dg.is_over(given, entitled):
             over.append({"key": row["key"], "label": row["label"], "entitled": str(entitled),
                          "given": str(given), "extra": str(given - entitled)})
     extra_total = total_given - total_entitled
