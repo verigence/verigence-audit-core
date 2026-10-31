@@ -85,6 +85,12 @@ _BILLED_ORDER = ("customer_ledger", "cost_sheet", "customer_invoice_dms", "tax_i
                  "credit_note", "debit_note")
 # Documents that print a billed figure (the booking form is the offer, not a bill).
 _BILLING_DOCUMENTS = frozenset(_BILLED_ORDER)
+# The dealership's own bills: distinct ones on one line add up. A credit note
+# is never added in (2026-10-31).
+_INVOICE_DOCUMENTS = frozenset({
+    "customer_invoice_dms", "tax_invoice_tally", "tax_invoice_dms", "tax_invoice", "customer_invoice_dms_v2",
+    "invoice_generic", "accessory_invoice_dms", "accessory_invoice_tally", "ew_invoice", "rsa_invoice",
+})
 # Lines whose figure is statutory or third-party: the price master's figure is
 # an estimate, so they are measured against their proof document.
 _STATUTORY = frozenset({"road_tax_registration", "road_tax_amount", "registration_charges", "insurance_amount"})
@@ -111,8 +117,24 @@ def _same(a: Decimal | None, b: Decimal | None) -> bool:
 
 
 def _billing_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [s for s in sources if s.get("documentType") in _BILLING_DOCUMENTS and dec(s.get("amount")) is not None
-            and s.get("counted") is not False]
+    """The documents that print a billed figure for the line, with distinct
+    invoices counted on it added up into one entry (2026-10-31): two accessory
+    invoices are two bills that together make the line, not two documents
+    that disagree (the Deal adds them the same way)."""
+    printed = [s for s in sources if s.get("documentType") in _BILLING_DOCUMENTS and dec(s.get("amount")) is not None
+               and s.get("counted") is not False]
+    bills = [s for s in printed if s.get("documentType") in _INVOICE_DOCUMENTS]
+    if len(bills) < 2:
+        return printed
+    numbers = [str(s["invoiceNumber"]) for s in bills if s.get("invoiceNumber")]
+    combined = {
+        "document": f"{len(bills)} invoices" + (f" ({', '.join(numbers)})" if numbers else ""),
+        "documentType": bills[0]["documentType"],
+        "amount": money(sum((dec(s["amount"]) or Decimal(0) for s in bills), Decimal(0))),
+        "invoices": [{"document": s.get("document"), "invoiceNumber": s.get("invoiceNumber"),
+                      "amount": s.get("amount")} for s in bills],
+    }
+    return [s for s in printed if s not in bills] + [combined]
 
 
 def billed_figure(row: dict[str, Any]) -> tuple[Decimal | None, str | None]:
@@ -285,7 +307,7 @@ def conclude_product(charge: dict[str, Any], *, on_file: set[str], taken: bool |
 
 def loan_received(
     *, matched: Decimal | None, disbursement_known: bool, financed: bool, stated: dict[str, Any] | None,
-    receipt_amounts: list[Decimal | None],
+    receipt_amounts: list[Decimal | None], letter: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The loan money to count as received, and from where (2026-10-30).
 
@@ -294,12 +316,16 @@ def loan_received(
     2. Else the dealer's own statement: the NDC's financer line or the ERP
        settlement's finance DO posting -- unless the same amount is already a
        receipt (never counted twice).
-    3. Else, on a financed deal, the loan is NOT zero: it is unknown, and the
+    3. Else the Bank Approval Letter's sanctioned amount, when no dealership
+       receipt stands for the loan (2026-10-31; ``letter``, from
+       uc03_p2_journey360.loan_without_receipt): counted, and marked
+       ``withoutReceipt`` so the screen shows it with an asterisk.
+    4. Else, on a financed deal, the loan is NOT zero: it is unknown, and the
        settlement cannot be judged (REBARANI GANTHIA: the summary showed the
        whole loan as a shortfall).
     Refunds the settlement printout records are money paid back out."""
     refunds = (stated or {}).get("refunds") or Decimal(0)
-    out: dict[str, Any] = {"amount": None, "source": None, "note": None, "unknown": False,
+    out: dict[str, Any] = {"amount": None, "source": None, "note": None, "unknown": False, "withoutReceipt": False,
                            "refunds": refunds, "refundsSource": (stated or {}).get("source") if refunds else None}
     if disbursement_known:
         out.update(amount=matched or Decimal(0), source="Loan disbursement on the finance record")
@@ -311,6 +337,11 @@ def loan_received(
                        note="The loan on the statement is already among the receipts; not counted twice.")
         else:
             out.update(amount=loan, source=stated["source"])
+        return out
+    letter_amount = dec((letter or {}).get("amount"))
+    if letter_amount is not None:
+        out.update(amount=letter_amount, source="Bank Approval Letter (sanctioned amount)", withoutReceipt=True,
+                   note="No dealership receipt for the loan amount; taken from the Bank Approval Letter.")
         return out
     if financed:
         out.update(unknown=True, note="Financed deal: the loan amount is not on file (no disbursement on the "
@@ -447,6 +478,7 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         financed=bool(records),
         stated=statement_loan(connection, tenant_id=tenant_id, journey_id=journey_id),
         receipt_amounts=[dec(i.get("amount")) for i in counted],
+        letter=pays.get("loanWithoutReceipt"),
     )
     loan = loan_on_file["amount"] or Decimal(0)
     refunds = loan_on_file["refunds"]
@@ -478,11 +510,14 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
             entry.update(conclusion=EXCEPTION, difference=money(sanctioned - disbursed),
                          reason="Disbursed differs from sanctioned.")
         loans.append(entry)
-    credit_notes = [i for i in deal.get("invoices") or [] if i.get("documentType") == "credit_note"]
+    # Every credit note on file (2026-10-31: the statement-policy Deal reads no
+    # invoices, so its invoice list never held one): shown, not settled against.
+    credit_notes = deal.get("creditNotes") or []
     trade_in = trade.get("tradeIn") or {}
     funding = {
         "receipts": money(receipts), "loanDisbursed": money(loan_on_file["amount"]),
         "loanSource": loan_on_file["source"], "loanNote": loan_on_file["note"],
+        "loanWithoutReceipt": loan_on_file["withoutReceipt"],
         "refunds": money(refunds) if refunds else None, "refundsSource": loan_on_file["refundsSource"],
         "received": money(receipts + loan - refunds),
         "bankCheck": bank_check, "loans": loans,
@@ -494,7 +529,8 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                      "valuationReports": len(trade.get("valuations") or [])},
         "scrappage": {"certificates": len(trade.get("certificates") or [])},
         "creditNotes": {"count": len(credit_notes),
-                        "total": money(sum((dec(c.get("total")) or Decimal(0) for c in credit_notes), Decimal(0)))},
+                        "total": money(sum((dec(c.get("amount")) or Decimal(0) for c in credit_notes), Decimal(0))),
+                        "items": credit_notes},
         "insurance": {"by": "Self (customer's own)" if self_insured else "In-house (through the dealership)",
                       "decidedBy": (deal.get("insurance") or {}).get("decidedBy"),
                       "basis": (deal.get("insurance") or {}).get("basis")},
