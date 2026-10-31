@@ -317,15 +317,21 @@ _CLAIM_SQL = text(
         GROUP BY journey_id
     ),
     ready AS (
-        -- Within a Journey its checks come last (2026-10-31): they read what
-        -- the recompute, the reconcile and the pages settle, and a recompute
-        -- asked for again now joins the back of the line (migration 0180) --
-        -- ahead of it, a check waiting from the previous change would run on
-        -- unsettled facts and then once more after the recompute.
         SELECT work_id, journey_id, queued_at_utc, (work_type = ANY(:page_types)) AS page_work,
-               row_number() OVER (PARTITION BY journey_id
-                                  ORDER BY (work_type = 'CONTROL_EVALUATE'), queued_at_utc, work_id)
-                 AS journey_rank
+               row_number() OVER (PARTITION BY journey_id ORDER BY queued_at_utc, work_id) AS journey_rank,
+               -- Among a Journey's own work its checks come last (2026-10-31):
+               -- they read what the recompute, the reconcile and task
+               -- verification settle, and a recompute asked for again now
+               -- joins the back of the line (migration 0180) -- ahead of it,
+               -- a check left from the previous change would run on unsettled
+               -- facts and then once more after the recompute. The derived
+               -- unit comes after the other checks: it reads their execution
+               -- log, so run first it ran again on the next request. Pages
+               -- keep their place by queue time.
+               row_number() OVER (PARTITION BY journey_id, (work_type = ANY(:page_types))
+                                  ORDER BY (work_type = 'CONTROL_EVALUATE'), (work_key LIKE '%:P2:DERIVED'),
+                                           queued_at_utc, work_id)
+                 AS journey_work_rank
         FROM auditcore.p2_work_queue
         WHERE tenant_id=:tenant_id
           AND (
@@ -358,7 +364,7 @@ _CLAIM_SQL = text(
             COALESCE(i.running_journey_work, 0) = 0
             AND r.journey_rank + COALESCE(i.running, 0) <= :per_journey
             AND r.journey_rank < COALESCE(f.journey_rank, 2147483647)
-          ELSE COALESCE(i.running, 0) = 0 AND r.journey_rank = 1
+          ELSE COALESCE(i.running, 0) = 0 AND f.journey_rank = 1 AND r.journey_work_rank = 1
         END
         -- Reading first (2026-10-29): 383 of 554 pages failed by the 30-minute
         -- rule were never sent to Document Intelligence -- they waited behind
