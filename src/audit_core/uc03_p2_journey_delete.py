@@ -27,6 +27,7 @@ Order
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -164,6 +165,105 @@ def storage_prefixes(tenant_id: str, journey_id: UUID) -> tuple[str, str]:
     )
 
 
+def _check_and_record(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    reason: str,
+    correlation_id: str,
+    actor_id: str,
+    role: str,
+) -> dict[str, Any]:
+    """Check the journey may be deleted, collect what to remove and write the
+    record, on a connection whose tenant context is set. The same guards for a
+    Team Lead and for the system (2026-10-31): never a reviewed or closed journey."""
+    row = connection.execute(
+        text(_SNAPSHOT_SQL), {"tenant_id": tenant_id, "journey_id": journey_id}
+    ).mappings().first()
+    if row is None:
+        raise NotFoundError(
+            error_code="VAC-NF-005",
+            title="Journey not found",
+            detail="Journey not found in your current Project scope.",
+        )
+    reviewed = connection.execute(
+        text(
+            "SELECT stage_code FROM auditcore.p2_stage_document_reviews "
+            "WHERE tenant_id=:tenant_id AND journey_id=:journey_id ORDER BY stage_code"
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).scalars().all()
+    if reviewed:
+        stages = " and ".join(str(stage).title() for stage in reviewed)
+        raise ConflictError(
+            error_code="VAC-CONFLICT-004",
+            title="Journey already reviewed",
+            detail=(
+                f"The {stages} documents of this journey are marked reviewed, so it can "
+                "no longer be deleted."
+            ),
+        )
+    if row["is_closed"]:
+        raise ConflictError(
+            error_code="VAC-CONFLICT-004",
+            title="Journey is closed",
+            detail="A closed journey cannot be deleted.",
+        )
+    params = {"tenant_id": tenant_id, "journey_id": journey_id}
+    document_ids = [
+        UUID(str(value)) for value in connection.execute(text(_DI_DOCUMENTS_SQL), params).scalars().all()
+    ]
+    object_keys = [
+        str(value) for value in connection.execute(text(_OBJECT_KEYS_SQL), params).scalars().all() if value
+    ]
+    deletion_id = connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.p2_journey_deletions (
+                tenant_id, journey_id, journey_reference, customer_name,
+                dealer_id, dealer_name, outlet_id, outlet_name, outlet_code,
+                pc_actor_id, pc_name, vehicle, current_stage, journey_created_at_utc,
+                document_count, reason, deleted_by_actor_id, deleted_by_role, correlation_id
+            ) VALUES (
+                :tenant_id, :journey_id, :journey_reference, :customer_name,
+                :dealer_id, :dealer_name, :outlet_id, :outlet_name, :outlet_code,
+                :pc_actor_id, :pc_name, :vehicle, :current_stage, :created_at,
+                :document_count, :reason, :actor_id, :role, :correlation_id
+            ) RETURNING deletion_id
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "journey_reference": row["journey_reference"],
+            "customer_name": row["customer_name"],
+            "dealer_id": row["dealer_id"],
+            "dealer_name": row["dealer_name"],
+            "outlet_id": row["outlet_id"],
+            "outlet_name": row["outlet_name"],
+            "outlet_code": row["outlet_code"],
+            "pc_actor_id": row["pc_actor_id"],
+            "pc_name": row["pc_name"],
+            "vehicle": row["vehicle"],
+            "current_stage": row["current_stage"],
+            "created_at": row["created_at_utc"],
+            "document_count": len(document_ids),
+            "reason": reason,
+            "actor_id": actor_id,
+            "role": role,
+            "correlation_id": correlation_id,
+        },
+    ).scalar_one()
+    return {
+        "deletion_id": UUID(str(deletion_id)),
+        "customer_id": UUID(str(row["customer_id"])),
+        "journey_reference": row["journey_reference"],
+        "document_ids": document_ids,
+        "object_keys": object_keys,
+    }
+
+
 def _start(
     engine: Engine,
     *,
@@ -191,89 +291,10 @@ def _start(
                 status_code=403,
                 title="Only a Team Lead can delete a journey",
             )
-        row = connection.execute(
-            text(_SNAPSHOT_SQL), {"tenant_id": tenant_id, "journey_id": journey_id}
-        ).mappings().first()
-        if row is None:
-            raise NotFoundError(
-                error_code="VAC-NF-005",
-                title="Journey not found",
-                detail="Journey not found in your current Project scope.",
-            )
-        reviewed = connection.execute(
-            text(
-                "SELECT stage_code FROM auditcore.p2_stage_document_reviews "
-                "WHERE tenant_id=:tenant_id AND journey_id=:journey_id ORDER BY stage_code"
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id},
-        ).scalars().all()
-        if reviewed:
-            stages = " and ".join(str(stage).title() for stage in reviewed)
-            raise ConflictError(
-                error_code="VAC-CONFLICT-004",
-                title="Journey already reviewed",
-                detail=(
-                    f"The {stages} documents of this journey are marked reviewed, so it can "
-                    "no longer be deleted."
-                ),
-            )
-        if row["is_closed"]:
-            raise ConflictError(
-                error_code="VAC-CONFLICT-004",
-                title="Journey is closed",
-                detail="A closed journey cannot be deleted.",
-            )
-        params = {"tenant_id": tenant_id, "journey_id": journey_id}
-        document_ids = [
-            UUID(str(value)) for value in connection.execute(text(_DI_DOCUMENTS_SQL), params).scalars().all()
-        ]
-        object_keys = [
-            str(value) for value in connection.execute(text(_OBJECT_KEYS_SQL), params).scalars().all() if value
-        ]
-        deletion_id = connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.p2_journey_deletions (
-                    tenant_id, journey_id, journey_reference, customer_name,
-                    dealer_id, dealer_name, outlet_id, outlet_name, outlet_code,
-                    pc_actor_id, pc_name, vehicle, current_stage, journey_created_at_utc,
-                    document_count, reason, deleted_by_actor_id, deleted_by_role, correlation_id
-                ) VALUES (
-                    :tenant_id, :journey_id, :journey_reference, :customer_name,
-                    :dealer_id, :dealer_name, :outlet_id, :outlet_name, :outlet_code,
-                    :pc_actor_id, :pc_name, :vehicle, :current_stage, :created_at,
-                    :document_count, :reason, :actor_id, 'TL', :correlation_id
-                ) RETURNING deletion_id
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "journey_reference": row["journey_reference"],
-                "customer_name": row["customer_name"],
-                "dealer_id": row["dealer_id"],
-                "dealer_name": row["dealer_name"],
-                "outlet_id": row["outlet_id"],
-                "outlet_name": row["outlet_name"],
-                "outlet_code": row["outlet_code"],
-                "pc_actor_id": row["pc_actor_id"],
-                "pc_name": row["pc_name"],
-                "vehicle": row["vehicle"],
-                "current_stage": row["current_stage"],
-                "created_at": row["created_at_utc"],
-                "document_count": len(document_ids),
-                "reason": reason,
-                "actor_id": access.actor_id,
-                "correlation_id": correlation_id,
-            },
-        ).scalar_one()
-    return {
-        "deletion_id": UUID(str(deletion_id)),
-        "customer_id": UUID(str(row["customer_id"])),
-        "journey_reference": row["journey_reference"],
-        "document_ids": document_ids,
-        "object_keys": object_keys,
-    }
+        return _check_and_record(
+            connection, tenant_id=tenant_id, journey_id=journey_id, reason=reason,
+            correlation_id=correlation_id, actor_id=access.actor_id, role="TL",
+        )
 
 
 def _finish(
@@ -381,6 +402,33 @@ def delete_journey(
         human_principal=human_principal,
         authorization_client=authorization_client,
     )
+    di_done, object_count = _remove(
+        engine, tenant_id=tenant_id, journey_id=journey_id, started=started,
+        security_client=security_client, v2_client=v2_client, storage=storage,
+    )
+    return DeleteJourneyResult(
+        deletionId=started["deletion_id"],
+        journeyId=journey_id,
+        journeyReference=started["journey_reference"],
+        diDocumentsDeleted=di_done,
+        storageObjectsDeleted=object_count,
+    )
+
+
+def _remove(
+    engine: Engine,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    started: dict[str, Any],
+    security_client: SecurityOAuthClient,
+    v2_client: DiCaptureV2Client,
+    storage: P2DocumentStorage,
+    on_deleted: Callable[[Connection], None] | None = None,
+) -> tuple[int, int]:
+    """Document Intelligence, R2, then the database, each outside any other
+    open transaction. ``on_deleted`` runs inside the database delete's own
+    transaction (the same-file alert is published with it)."""
     deletion_id: UUID = started["deletion_id"]
 
     di_done = 0
@@ -434,6 +482,8 @@ def delete_journey(
                 engine, tenant_id=tenant_id, deletion_id=deletion_id, status="COMPLETED",
                 di_documents=di_done, objects=object_count, detail=None, connection=connection,
             )
+            if on_deleted is not None:
+                on_deleted(connection)
     except Exception as exc:
         logger.error("p2_journey_delete_db_failed", tenant_id=tenant_id, journey_id=str(journey_id), error=str(exc))
         raise _fail(
@@ -449,8 +499,56 @@ def delete_journey(
         di_documents=di_done,
         storage_objects=object_count,
     )
+    return di_done, object_count
+
+
+# ── the system deletes a journey (2026-10-31) ─────────────────────────────────
+# Product owner: the same file uploaded again (same PAN, mobile, customer name
+# and model as an earlier journey) is deleted completely, and the journeys he
+# listed as duplicates are removed. No person presses the button: the record
+# names SYSTEM as who deleted it and why. The guards stay -- a journey whose
+# documents a reviewer marked reviewed, or a closed one, is never deleted
+# (ConflictError, for the caller to report).
+SYSTEM_ACTOR = "SYSTEM"
+SYSTEM_ROLE = "SYSTEM"
+
+
+def system_delete_journey(
+    engine: Engine,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    reason: str,
+    correlation_id: str,
+    security_client: SecurityOAuthClient,
+    v2_client: DiCaptureV2Client,
+    storage: P2DocumentStorage,
+    on_deleted: Callable[[Connection], None] | None = None,
+    before_record: Callable[[Connection], None] | None = None,
+) -> DeleteJourneyResult:
+    """Delete a journey with no human principal. Must not be called inside an
+    open transaction: Document Intelligence and R2 are called between the
+    record (committed first) and the database delete (its own transaction).
+    ``before_record`` runs in the record's transaction first (the worker
+    checks it still holds its work item there). Raises NotFoundError,
+    ConflictError (reviewed / closed) or DependencyUnavailableError."""
+    reason = reason.strip()
+    if len(reason) < MIN_REASON_LENGTH:
+        raise ValueError("A system deletion needs its reason.")
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        if before_record is not None:
+            before_record(connection)
+        started = _check_and_record(
+            connection, tenant_id=tenant_id, journey_id=journey_id, reason=reason[:2000],
+            correlation_id=correlation_id, actor_id=SYSTEM_ACTOR, role=SYSTEM_ROLE,
+        )
+    di_done, object_count = _remove(
+        engine, tenant_id=tenant_id, journey_id=journey_id, started=started,
+        security_client=security_client, v2_client=v2_client, storage=storage, on_deleted=on_deleted,
+    )
     return DeleteJourneyResult(
-        deletionId=deletion_id,
+        deletionId=started["deletion_id"],
         journeyId=journey_id,
         journeyReference=started["journey_reference"],
         diDocumentsDeleted=di_done,

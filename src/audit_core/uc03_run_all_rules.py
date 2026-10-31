@@ -177,6 +177,18 @@ def _run_audit_core_rules_for_stage(
         )
         _record("MODEL_NOT_IDENTIFIED", "ERROR" if model_result.get("error") else ("SKIPPED" if model_result.get("skipped") else ("FAIL" if model_result.get("raised") else "PASS")))
 
+        # Product owner 2026-10-31: the same file uploaded again -- PAN, mobile,
+        # customer name and model all those of an earlier journey -- is alerted
+        # to the whole Project and (an individual's PAN) deleted. After the SKU
+        # pin above, so the pinned model is compared; before a pin the booking
+        # form's model is. The delete is queued as its own work item and runs
+        # once this unit has committed. Never raises.
+        from audit_core.uc03_p2_same_file import sync_same_file_detection
+
+        sync_same_file_detection(
+            connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
+        )
+
         # Direct user correction (2026-09-24): price/discount standards
         # (uc03_deal_reconciliation.sync_deal_reconciliation) previously had
         # exactly one trigger -- the moment SKU resolution itself completes
