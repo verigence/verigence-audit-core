@@ -72,6 +72,43 @@ def _iso(value: Any) -> str | None:
     return value.isoformat() if isinstance(value, datetime) else value
 
 
+def _replaced_by_deploy(boot: dict[str, Any], rows: list[dict[str, Any]]) -> bool:
+    # Railway starts the new deployment, then stops the old one; the old
+    # process often cannot stamp its own stop in time (uvicorn waits for
+    # open streams), so a quiet boot whose newer deployment started before
+    # it went quiet was replaced, not crashed (live 2026-10-27).
+    return any(
+        other["started_at_utc"] > boot["started_at_utc"]
+        and other["deployment_id"] != boot["deployment_id"]
+        and other["started_at_utc"] <= boot["last_seen_at_utc"] + timedelta(seconds=ALIVE_SECONDS)
+        for other in rows
+    )
+
+
+def boot_events(rows: list[dict[str, Any]], alive_after: datetime) -> list[tuple[str, datetime]]:
+    """What each boot of one service was, in start order: ``("RESTART", started)`` for a
+    second start of the same replica within a deployment (crash, OOM, platform restart),
+    ``("DEPLOY", started)`` for the first start of a deployment not seen before, and
+    ``("UNCLEAN", last_seen)`` for a boot that went quiet without stamping its stop and
+    was not replaced by a newer deployment. The first boot ever seen is neither."""
+    events: list[tuple[str, datetime]] = []
+    seen_deployments: set[str | None] = set()
+    seen_replicas: set[tuple[str | None, str | None]] = set()
+    for b in rows:
+        key = (b["deployment_id"], b["replica_id"])
+        if seen_deployments:
+            if b["deployment_id"] and key in seen_replicas:
+                events.append(("RESTART", b["started_at_utc"]))
+            elif b["deployment_id"] not in seen_deployments:
+                events.append(("DEPLOY", b["started_at_utc"]))
+        seen_deployments.add(b["deployment_id"])
+        seen_replicas.add(key)
+        if (b["stopped_at_utc"] is None and b["last_seen_at_utc"] < alive_after
+                and not _replaced_by_deploy(b, rows)):
+            events.append(("UNCLEAN", b["last_seen_at_utc"]))
+    return events
+
+
 def services_health(connection: Connection, since: datetime, now: datetime,
                     extra_boots: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     boots = [dict(b) for b in connection.execute(
@@ -143,36 +180,12 @@ def services_health(connection: Connection, since: datetime, now: datetime,
         rows = by_service.get(name, [])
         alive = [b for b in rows if b["stopped_at_utc"] is None and b["last_seen_at_utc"] >= alive_after]
         in_window = [b for b in rows if b["started_at_utc"] >= since]
-        # A start in a deployment not seen before is a deploy; a second start of the
-        # same replica within a deployment is a restart (crash, OOM, platform restart).
-        restarts = deploys = 0
-        seen_deployments: set[str | None] = set()
-        seen_replicas: set[tuple[str | None, str | None]] = set()
-        for b in rows:
-            key = (b["deployment_id"], b["replica_id"])
-            if b["started_at_utc"] >= since and seen_deployments:
-                if b["deployment_id"] and key in seen_replicas:
-                    restarts += 1
-                elif b["deployment_id"] not in seen_deployments:
-                    deploys += 1
-            seen_deployments.add(b["deployment_id"])
-            seen_replicas.add(key)
-
-        def replaced_by_deploy(boot: dict[str, Any], rows: list[dict[str, Any]] = rows) -> bool:
-            # Railway starts the new deployment, then stops the old one; the old
-            # process often cannot stamp its own stop in time (uvicorn waits for
-            # open streams), so a quiet boot whose newer deployment started before
-            # it went quiet was replaced, not crashed (live 2026-10-27).
-            return any(
-                other["started_at_utc"] > boot["started_at_utc"]
-                and other["deployment_id"] != boot["deployment_id"]
-                and other["started_at_utc"] <= boot["last_seen_at_utc"] + timedelta(seconds=ALIVE_SECONDS)
-                for other in rows
-            )
-
+        events = boot_events(rows, alive_after)
+        restarts = sum(1 for kind, at in events if kind == "RESTART" and at >= since)
+        deploys = sum(1 for kind, at in events if kind == "DEPLOY" and at >= since)
         unclean = [b for b in rows
                    if b["stopped_at_utc"] is None and b["last_seen_at_utc"] < alive_after
-                   and b["last_seen_at_utc"] >= since and not replaced_by_deploy(b)]
+                   and b["last_seen_at_utc"] >= since and not _replaced_by_deploy(b, rows)]
         last_seen = max((b["last_seen_at_utc"] for b in rows), default=None)
         h = http.get(name, {})
         failing = sorted(routes.get(name, {}).items(), key=lambda kv: -(kv[1]["5xx"] * 1000 + kv[1]["4xx"]))[:10]

@@ -59,11 +59,21 @@ def _minute(now: float | None = None) -> datetime:
 
 # ---------------------------------------------------------------- requests
 
-def record_request(status_code: int, route: str, duration_ms: float, *, slow_ms: float) -> None:
-    """Count one answered request in the current minute (health probes excluded by the caller)."""
+def error_key(status_code: int, error_code: str | None) -> str:
+    """How a failed request is counted: ``"401 VAC-AUTH-001"``, or the status alone when the
+    response carried no catalogue code (a plain Response with an error status)."""
+    code = (error_code or "").strip()[:40]
+    return f"{status_code} {code}" if code else str(status_code)
+
+
+def record_request(status_code: int, route: str, duration_ms: float, *, slow_ms: float,
+                   error_code: str | None = None) -> None:
+    """Count one answered request in the current minute (health probes excluded by the caller).
+    A failed one is also counted per route by status and error code (2026-10-30: the System
+    Health page breaks failed requests down by error code)."""
     with _lock:
         bucket = _minutes.setdefault(_minute(), {"total": 0, "client": 0, "server": 0, "slow": 0,
-                                                 "routes": defaultdict(lambda: [0, 0])})
+                                                 "routes": defaultdict(lambda: [0, 0, defaultdict(int)])})
         bucket["total"] += 1
         if duration_ms > slow_ms:
             bucket["slow"] += 1
@@ -73,6 +83,7 @@ def record_request(status_code: int, route: str, duration_ms: float, *, slow_ms:
             routes = bucket["routes"]
             if route in routes or len(routes) < _MAX_ROUTES_PER_MINUTE:
                 routes[route][kind] += 1
+                routes[route][2][error_key(status_code, error_code)] += 1
 
 
 # ---------------------------------------------------------------- resources
@@ -207,7 +218,8 @@ def beat(engine: Engine, default_service: str, *, include_current_minute: bool =
                  "v": ident["version"]},
             )
         for minute, bucket in minutes.items():
-            routes = {route: {"4xx": counts[0], "5xx": counts[1]} for route, counts in bucket["routes"].items()}
+            routes = {route: {"4xx": counts[0], "5xx": counts[1], "codes": dict(counts[2])}
+                      for route, counts in bucket["routes"].items()}
             connection.execute(
                 text(
                     """

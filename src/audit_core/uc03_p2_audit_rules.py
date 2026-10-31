@@ -14,12 +14,16 @@ and answer the questions a manual deal audit asks:
   Financier (DO)           DO_PAYMENT_NOT_RECEIVED, DO_SHORT_PAYMENT
   Trade-in                 TRADE_IN_NOT_RESOLD, TRADE_IN_SOLD_AT_LOSS
   Refund                   POST_DELIVERY_REFUND
-  Receipts                 CASH_ABOVE_LIMIT, PAYMENT_BEFORE_BOOKING
+  Receipts                 CASH_ABOVE_LIMIT (finding only, no task), PAYMENT_BEFORE_BOOKING
   Third-party payer        THIRD_PARTY_PAYMENT_UNCONFIRMED (PC question),
                            THIRD_PARTY_PAYMENT_UNDECLARED (TL violation)
-  Cash intimation          CASH_INTIMATION_UNCONFIRMED (PC question), CASH_NOT_INTIMATED
   Accessories fitted       ACCESSORIES_FITTED_UNCONFIRMED (PC question), ACCESSORY_FITTED_UNBILLED
   Delivery in time         DELIVERY_NOT_COMPLETED_IN_TIME  complete within N days of the printed date
+
+Cash transactions raise no tasks (product owner, 2026-10-31): the cash
+intimation question (CASH_INTIMATION_UNCONFIRMED) and its finding
+(CASH_NOT_INTIMATED) are retired, and CASH_ABOVE_LIMIT raises its finding
+without a task (uc03_p2_task_producer.SUPPRESSED_TASK_CODES).
 
 A "Manual Observations" control cannot be read from a document: its task
 asks a question and fails until a PC, TL or PM answers it (the answer and
@@ -60,7 +64,6 @@ from uuid import UUID
 import structlog
 from sqlalchemy import Connection, text
 
-from audit_core.uc03_masters_alignment import ENTITLEMENT_UNKNOWN_RESULTS
 from audit_core.uc03_p2_dates import parse_extracted_date
 from audit_core.uc03_p2_names import same_person
 from audit_core.uc03_p2_runtime import enqueue_work
@@ -493,30 +496,36 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
 
 
 def excess_discount(facts: _Facts) -> RuleOutcome:
+    # 2026-10-31 (product owner: "Excess Discount tab is empty"): what was
+    # given, the entitlement and the line tolerance are read through
+    # uc03_discount_given, which the Excess Discount tab reads too, so the tab
+    # lists exactly the discounts this rule raises its task on.
+    from audit_core import uc03_discount_given as dg
+
     code = "EXCESS_DISCOUNT"
     # A line no document gives anything on (the Management Referral line
     # is always on the sheet, opted out by default) is no discount yet.
-    rows = [r for r in facts.sheet["discounts"] if any(r[c] is not None for c in ("billed", "booking", "effective"))]
+    rows = [r for r in facts.sheet["discounts"] if dg.has_figure(r)]
     if not rows:
         return RuleOutcome(code, "PASS", "No discount on this deal.")
     # 2026-10-20 (review of PR 472): a discount whose entitlement is not
     # known (master not mapped, deal not reconciled, corporate category to
     # be confirmed) is not an over-grant; its own task says why.
-    rows = [r for r in rows if not (r.get("entitled") is None and r.get("eligibility") in ENTITLEMENT_UNKNOWN_RESULTS)]
+    rows = [r for r in rows if not dg.entitlement_unknown(r)]
     if not rows:
         return RuleOutcome(code, "SKIPPED", "The entitlement of the discounts given is not known yet.")
-    if not _standards_known(facts):
+    if not dg.standards_known(facts.sheet):
         return RuleOutcome(code, "SKIPPED", _NO_STANDARD)
     over: list[dict[str, Any]] = []
     total_given = total_entitled = Decimal(0)
     for row in rows:
-        given = next((_dec(row[c]) for c in ("billed", "booking", "effective") if row[c] is not None), None)
+        given, _column = dg.given(row)
         if given is None:
             continue
-        entitled = _dec(row["entitled"]) or Decimal(0)
+        entitled = dg.entitled(row)
         total_given += given
         total_entitled += entitled
-        if given - entitled > _LINE_TOLERANCE:
+        if dg.is_over(given, entitled):
             over.append({"key": row["key"], "label": row["label"], "entitled": str(entitled),
                          "given": str(given), "extra": str(given - entitled)})
     extra_total = total_given - total_entitled
@@ -1127,31 +1136,6 @@ def _cash_lines(rows: list[dict[str, Any]]) -> str:
     )
 
 
-def cash_intimation_unconfirmed(facts: _Facts) -> RuleOutcome:
-    rows = _cash(facts)
-    return _question(
-        facts, "CASH_INTIMATION_UNCONFIRMED", subjects=[r["createdAt"] for r in rows],
-        none="No cash received on this deal.",
-        title="Confirm the cash collection was intimated",
-        question=f"{_cash_lines(rows)}. Was this cash collection intimated to the auditor before it was received?",
-        answers=[{"value": "YES", "label": "Yes, it was intimated"},
-                 {"value": "NO", "label": "No, it was not intimated", "requiresComment": True}],
-        details={"paymentIds": [r["paymentId"] for r in rows]},
-    )
-
-
-def cash_not_intimated(facts: _Facts) -> RuleOutcome:
-    code = "CASH_NOT_INTIMATED"
-    rows = _cash(facts)
-    answer = _answered(facts, "CASH_INTIMATION_UNCONFIRMED", [r["createdAt"] for r in rows])
-    if answer and answer["value"] == "NO":
-        return RuleOutcome(code, "FAIL", (
-            f"{_cash_lines(rows)}, collected without intimation to the auditor "
-            f"(confirmed on {_when(answer['at'])}){_remark(answer)}."
-        ), {"findingTitle": "Cash collected without intimation", "paymentIds": [r["paymentId"] for r in rows]})
-    return RuleOutcome(code, "PASS", "Cash collections were intimated." if rows else "No cash received on this deal.")
-
-
 def delivery_not_completed_in_time(facts: _Facts) -> RuleOutcome:
     code = "DELIVERY_NOT_COMPLETED_IN_TIME"
     clock = facts.delivery_clock
@@ -1269,7 +1253,9 @@ _BOOKING_RULES = (
     booking_date_unusable,
     deal_undercharged, excess_discount, tcs_short,
     third_party_payment_unconfirmed, third_party_payment_undeclared,
-    cash_intimation_unconfirmed, cash_not_intimated, cash_above_limit, payment_before_booking,
+    # Cash transactions raise no tasks (product owner, 2026-10-31): no cash
+    # intimation question, so neither it nor its finding runs.
+    cash_above_limit, payment_before_booking,
     insurance_invoice_missing, self_insurance_declared,
 )
 _DELIVERY_RULES = (

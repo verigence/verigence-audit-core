@@ -1,6 +1,6 @@
 """The deal-audit checks (uc03_p2_audit_rules): price, discounts, settlement
-after delivery, financier, trade-in, third-party payer, cash intimation and
-the No Dues Certificate, on a real Postgres."""
+after delivery, financier, trade-in, third-party payer, cash limit and
+delivery in time, on a real Postgres."""
 from __future__ import annotations
 
 import json
@@ -201,37 +201,55 @@ def test_deal_checks_wait_for_the_standard_prices(journey):
     assert "price list" in result["DEAL_UNDERCHARGED"].reason
 
 
-# ---------------------------------------------- cash intimation question
+# ------------------------------------------- cash transactions: no tasks
 
 
-def test_cash_intimation_is_asked_answered_and_asked_again(journey):
+def test_a_cash_receipt_raises_no_task(journey):
+    """Product owner 2026-10-31: cash transactions raise no tasks. The cash
+    intimation question is retired; a cash receipt above the limit is still an
+    Audit Finding (Sec 269ST, on the Audit Summary) but raises no task."""
     _start_delivery(journey)
-    _receipt(journey, "50000", TODAY - timedelta(days=3), "R-1", mode="CASH")
+    _receipt(journey, "250000", TODAY - timedelta(days=3), "R-1", mode="CASH")
+    _receipt(journey, "50000", TODAY - timedelta(days=2), "R-2", mode="CASH")
     _evaluate(journey, "NATIVE:BOOKING")
-    assert _states(journey)["CASH_INTIMATION_UNCONFIRMED"]["control_status"] == "FAIL"
-    question = _task(journey, "CASH_INTIMATION_UNCONFIRMED")
-    assert question["task_type"] == "PC_CONFIRMATION" and question["assigned_role_code"] == "PC"
-    assert [a["value"] for a in question["reference"]["answers"]] == ["YES", "NO"]
-    assert "₹50,000 in cash" in question["reference"]["question"]
-    assert _states(journey)["CASH_NOT_INTIMATED"]["control_status"] == "PASS"
-
-    _answer(journey, "CASH_INTIMATION_UNCONFIRMED", "NO", "Collected at the customer's home")
-    _evaluate(journey, "NATIVE:BOOKING")
-    assert _task(journey, "CASH_INTIMATION_UNCONFIRMED")["task_status"] == "VERIFIED_COMPLETE"
     state = _states(journey)
-    assert state["CASH_INTIMATION_UNCONFIRMED"]["control_status"] == "PASS"
-    assert state["CASH_NOT_INTIMATED"]["control_status"] == "FAIL"
-    assert "without intimation" in state["CASH_NOT_INTIMATED"]["status_reason"]
-    assert "Collected at the customer's home" in state["CASH_NOT_INTIMATED"]["status_reason"]
-    violation = _task(journey, "CASH_NOT_INTIMATED")
-    assert violation["task_type"] == "FINDING_REVIEW" and violation["assigned_role_code"] == "TL"
+    assert "CASH_INTIMATION_UNCONFIRMED" not in state and "CASH_NOT_INTIMATED" not in state
+    assert state["CASH_ABOVE_LIMIT"]["control_status"] == "FAIL"
+    assert _finding(journey, "CASH_ABOVE_LIMIT")[:2] == ("OPEN", "HIGH")
+    assert _task(journey, "CASH_ABOVE_LIMIT") is None
+    assert _task(journey, "CASH_INTIMATION_UNCONFIRMED") is None
+    tasks = _sql(journey, "SELECT source_code FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+                          "AND source_code LIKE 'CASH%'").scalars().all()
+    assert tasks == []
 
-    # Another cash receipt: the question is asked again.
-    _receipt(journey, "20000", TODAY - timedelta(days=1), "R-2", mode="CASH")
+
+def test_a_cash_task_left_open_is_cancelled_by_the_next_run(journey):
+    """A task raised before 2026-10-31 closes on the Journey's next evaluation."""
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_task_producer import _json
+
+    _receipt(journey, "250000", TODAY - timedelta(days=3), "R-1", mode="CASH")
+    key = f"control:{journey.journey_id}:CASH_ABOVE_LIMIT"
+    template = get_registry().tasks["FINDING_REVIEW"]
+    _sql(journey, "INSERT INTO auditcore.p2_tasks (tenant_id, journey_id, task_type, category, origin_kind, "
+                  "source_type, source_code, dedupe_key, title, description, reference, severity, priority, "
+                  "assigned_role_code, allowed_actions, completion_protocol) VALUES (:t, :j, 'FINDING_REVIEW', "
+                  ":cat, 'SYSTEM', 'RULE', 'CASH_ABOVE_LIMIT', :k, 'Cash receipt above the statutory limit', 'x', "
+                  "'{}'::jsonb, 'HIGH', 'HIGH', 'TL', CAST(:actions AS jsonb), 'MACHINE_VERIFIED')",
+         cat=template.category, k=key, actions=_json(list(template.actions)))
     _evaluate(journey, "NATIVE:BOOKING")
-    reopened = _task(journey, "CASH_INTIMATION_UNCONFIRMED")
-    assert reopened["task_status"] == "READY" and reopened["round_number"] == 2
-    assert _states(journey)["CASH_NOT_INTIMATED"]["control_status"] == "PASS"
+    task = _task(journey, "CASH_ABOVE_LIMIT")
+    assert task["task_status"] == "CANCELLED"
+    result = _sql(journey, "SELECT completion_result FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k",
+                  k=key).scalar_one()
+    assert result["outcome"] == "CHECK_RETIRED"
+    events = _sql(journey, "SELECT event_type FROM auditcore.p2_task_events WHERE tenant_id=:t AND task_id=:id",
+                  id=task["task_id"]).scalars().all()
+    assert "CANCELLED" in events
+    # ...and stays cancelled: the check still fails, but raises nothing.
+    _evaluate(journey, "NATIVE:BOOKING")
+    assert _task(journey, "CASH_ABOVE_LIMIT")["task_status"] == "CANCELLED"
+    assert _finding(journey, "CASH_ABOVE_LIMIT")[0] == "OPEN"
 
 
 # ------------------------------------------------------ third-party payer
@@ -686,10 +704,11 @@ def test_no_booking_form_yet_is_skipped_not_failed(journey):
 def test_the_pcs_questions_wait_until_delivery_has_started(journey):
     """Product owner 2026-10-28 (fewer tasks): the check still records the
     unanswered question, but the PC is asked only once delivery has started."""
-    _receipt(journey, "50000", TODAY - timedelta(days=3), "R-1", mode="CASH")
+    _name(journey, "RAVI KUMAR")
+    _receipt(journey, "50000", TODAY - timedelta(days=3), "R-1", payer="SURESH KUMAR")
     _evaluate(journey, "NATIVE:BOOKING")
-    assert _states(journey)["CASH_INTIMATION_UNCONFIRMED"]["control_status"] == "FAIL"
-    assert _task(journey, "CASH_INTIMATION_UNCONFIRMED") is None
+    assert _states(journey)["THIRD_PARTY_PAYMENT_UNCONFIRMED"]["control_status"] == "FAIL"
+    assert _task(journey, "THIRD_PARTY_PAYMENT_UNCONFIRMED") is None
     _start_delivery(journey)
     _evaluate(journey, "NATIVE:BOOKING")
-    assert _task(journey, "CASH_INTIMATION_UNCONFIRMED")["task_status"] == "READY"
+    assert _task(journey, "THIRD_PARTY_PAYMENT_UNCONFIRMED")["task_status"] == "READY"
