@@ -15,6 +15,7 @@ from conftest import delete_tenant_data
 from p2_support import (
     AllowAllAuthorization,
     P2Journey,
+    add_evidence,
     add_extracted_field,
     add_page,
     create_p2_journey,
@@ -105,6 +106,8 @@ def _journey(base: P2Journey, *, ref: str, created: datetime, pc: str = "Rakesh 
 def _file(journey: P2Journey, *, pan: str | None = INDIVIDUAL_PAN, mobile: str | None = "+91 98765 43210",
           name: str | None = "Amit Kumar Sahoo", model: str | None = "THAR", sku: UUID | None = None) -> None:
     doc = uuid4()
+    if pan or mobile:
+        add_evidence(journey, di_document_id=doc, document_type_key="pan_card")
     if pan:
         add_extracted_field(journey, di_document_id=doc, field_key="pan_number", value=pan, document_type="pan_card")
     if mobile:
@@ -132,6 +135,18 @@ def _pair(tenant: P2Journey, **new_overrides):
     _file(old)
     _file(new, **new_overrides)
     return old, new
+
+
+def _quiet(journey: P2Journey, minutes: int = 60) -> None:
+    """The journey's uploads are older than the delete's quiet period."""
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        for table in ("p2_upload_batches", "p2_document_queue"):
+            connection.execute(
+                text(f"UPDATE auditcore.{table} SET created_at_utc = now() - (:m * interval '1 minute') "
+                     "WHERE tenant_id=:t AND journey_id=:j"),
+                {"m": minutes, "t": journey.tenant_id, "j": journey.journey_id},
+            )
 
 
 def _detect(journey: P2Journey) -> dict:
@@ -231,6 +246,7 @@ def test_alert_text_names_customer_model_pc_and_dealership():
 def test_same_file_with_an_individual_pan_is_deleted_and_alerted(tenant):
     old, new = _pair(tenant)
     di_document = add_page(new)[2]
+    _quiet(new)
 
     result = _detect(new)
     assert result["raised"] == 1
@@ -478,10 +494,11 @@ def test_purge_dry_run_deletes_nothing_and_commit_only_the_listed(tenant):
     listed = _journey(tenant, ref="DUP-LISTED-1", created=now)
     kept = _journey(tenant, ref="DUP-KEPT-1", created=now - timedelta(days=1))
     add_page(listed)
+    _quiet(listed)
 
     dry = run_duplicate_journey_purge(tenant.engine, f"{tenant.tenant_id}:item8", ["DUP-LISTED-1", "NO-SUCH-REF"])
     assert dry == {"listed": 2, "found": 1, "deleted": 0, "would_delete": 1, "refused": 0, "not_found": 1,
-                   "ambiguous": 0, "failed": 0}
+                   "ambiguous": 0, "failed": 0, "would_refuse": 0}
     assert _exists(listed) and _exists(kept)
 
     di = FakeDi()
@@ -530,3 +547,237 @@ def test_deleting_the_new_file_rechecks_the_kept_copys_duplicate_finding(tenant)
             {"t": old.tenant_id, "j": old.journey_id},
         ).scalars().all()
     assert {"unit": "NATIVE:BOOKING", "force": True} in units
+
+
+# ── review of #594 (2026-10-31) ───────────────────────────────────────────────
+def _stage(journey: P2Journey, status: str) -> None:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code, business_status) "
+                 "VALUES (:t, :j, 'BOOKING', :s)"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "s": status},
+        )
+
+
+def _ready_to_delete(tenant: P2Journey, **new_overrides):
+    old, new = _pair(tenant, **new_overrides)
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    return old, new
+
+
+# 1. only a file uploaded in the last 48 hours
+def test_an_older_pair_is_left_to_the_duplicate_booking_rule(tenant, monkeypatch):
+    from audit_core import uc03_p2_same_file
+
+    now = datetime.now(UTC)
+    old = _journey(tenant, ref="HIST-OLD", created=now - timedelta(days=9))
+    new = _journey(tenant, ref="HIST-NEW", created=now - timedelta(days=3))
+    _file(old)
+    _file(new)
+    assert _detect(new)["raised"] == 0 and _detect(old)["raised"] == 0
+    assert _alerts(new) == [] and _queued(new) == []
+    monkeypatch.setattr(uc03_p2_same_file, "SAME_FILE_WINDOW_HOURS", 24 * 4)
+    assert _detect(old)["raised"] == 1
+
+
+# 2. a company booking with the signatory's personal PAN
+def test_looks_like_company():
+    from audit_core.uc03_p2_same_file import looks_like_company
+
+    for name in ("M/S Shree Shyam Enterprises", "Sarthak Motors Pvt. Ltd.", "Patra & Co.", "Maa Tarini Traders",
+                 "Odisha Infra Projects LLP", "Jena Agencies", "Mahakali Construction"):
+        assert looks_like_company(name), name
+    for name in ("Amit Kumar Sahoo", "Sunil Mallick", "Coral Das"):
+        assert not looks_like_company(name), name
+
+
+def test_a_company_pan_on_any_document_keeps_the_new_file(tenant):
+    old, new = _pair(tenant)
+    other = uuid4()
+    add_evidence(old, di_document_id=other, document_type_key="booking_form")
+    add_extracted_field(old, di_document_id=other, field_key="pan_number", value="AAACS1234K", confidence=40.0)
+    assert _detect(new)["outcomes"] == ["KEPT_NOT_INDIVIDUAL"]
+    [alert] = _alerts(new)
+    assert "a company or firm PAN is on file" in alert["body"] and _queued(new) == []
+
+
+def test_a_gstin_keeps_the_new_file(tenant):
+    _, new = _pair(tenant)
+    doc = uuid4()
+    add_evidence(new, di_document_id=doc, document_type_key="gst_certificate")
+    add_extracted_field(new, di_document_id=doc, field_key="gstin", value="21ABCPE1234F1ZV")
+    assert _detect(new)["outcomes"] == ["KEPT_NOT_INDIVIDUAL"]
+    assert "a GSTIN is on file" in _alerts(new)[0]["body"]
+
+
+def test_a_firm_name_keeps_the_new_file(tenant):
+    now = datetime.now(UTC)
+    old = _journey(tenant, ref="FIRM-OLD", created=now - timedelta(days=1))
+    new = _journey(tenant, ref="FIRM-NEW", created=now)
+    _file(old, name="M/S Shree Shyam Enterprises")
+    _file(new, name="M/S Shree Shyam Enterprises")
+    assert _detect(new)["outcomes"] == ["KEPT_NOT_INDIVIDUAL"]
+    assert "company's or firm's" in _alerts(new)[0]["body"]
+
+
+# 3. re-checked at delete time
+def test_the_original_closed_since_keeps_the_new_file(tenant):
+    old, new = _ready_to_delete(tenant)
+    _stage(old, "BOOKING_CANCELLED")
+    assert _delete(new) == "KEPT_CHANGED"
+    assert _exists(new)
+    [alert] = _alerts(new)
+    assert alert["alert_status"] == "PUBLISHED" and alert["outcome"] == "KEPT_CHANGED"
+    assert "is closed" in alert["body"]
+    with new.engine.begin() as connection:
+        set_tenant_context(connection, new.tenant_id)
+        assert connection.execute(text("SELECT count(*) FROM auditcore.p2_journey_deletions WHERE tenant_id=:t"),
+                                  {"t": new.tenant_id}).scalar_one() == 0
+
+
+def test_the_original_gone_since_keeps_the_new_file(tenant):
+    old, new = _ready_to_delete(tenant)
+    run_duplicate_journey_purge(tenant.engine, f"{tenant.tenant_id}:x-commit", [_ref(old)],
+                                security_client=FakeSecurity(), v2_client=FakeDi(), storage=FakeStorage())
+    assert _delete(new) == "KEPT_CHANGED" and _exists(new)
+    assert "no longer exists" in _alerts(new)[0]["body"]
+
+
+def test_a_value_changed_since_keeps_the_new_file(tenant):
+    _, new = _ready_to_delete(tenant)
+    with new.engine.begin() as connection:  # the KYC page carrying PAN and mobile is removed
+        set_tenant_context(connection, new.tenant_id)
+        connection.execute(text("UPDATE auditcore.evidence SET association_status='VOIDED' "
+                                "WHERE tenant_id=:t AND journey_id=:j"), {"t": new.tenant_id, "j": new.journey_id})
+    assert _delete(new) == "KEPT_CHANGED" and _exists(new)
+    assert "no longer match" in _alerts(new)[0]["body"]
+
+
+def test_a_gstin_uploaded_since_keeps_the_new_file(tenant):
+    _, new = _ready_to_delete(tenant)
+    doc = uuid4()
+    add_evidence(new, di_document_id=doc, document_type_key="gst_certificate")
+    add_extracted_field(new, di_document_id=doc, field_key="gstin", value="21ABCPE1234F1ZV")
+    assert _delete(new) == "KEPT_CHANGED" and _exists(new)
+
+
+# 4. values of removed documents
+def test_a_pan_from_a_removed_document_pairs_nothing(tenant):
+    old, new = _pair(tenant)
+    with old.engine.begin() as connection:
+        set_tenant_context(connection, old.tenant_id)
+        connection.execute(text("UPDATE auditcore.evidence SET association_status='SUPERSEDED' "
+                                "WHERE tenant_id=:t AND journey_id=:j"), {"t": old.tenant_id, "j": old.journey_id})
+    assert _detect(new).get("raised", 0) == 0 and _alerts(new) == []
+
+
+# 5. mid-upload
+def test_a_journey_still_receiving_pages_is_not_deleted_yet(tenant, monkeypatch):
+    from audit_core import uc03_p2_worker as worker
+    from audit_core.uc03_p2_same_file import UploadInProgress
+
+    _, new = _ready_to_delete(tenant)
+    add_page(new)  # uploaded just now
+    with pytest.raises(UploadInProgress) as waiting:
+        _delete(new)
+    assert 0 < waiting.value.delay_seconds <= 10 * 60 + 30
+    assert _exists(new) and _alerts(new)[0]["alert_status"] == "PENDING"
+    monkeypatch.setattr(worker, "get_security_oauth_client", FakeSecurity)
+    monkeypatch.setattr(worker, "get_di_capture_v2_client", FakeDi)
+    monkeypatch.setattr(worker, "get_p2_document_storage", FakeStorage)
+    [item] = [w for w in worker._claim_for_tenant(new.engine, new.tenant_id, 10) if w.work_type == DELETE_WORK_TYPE]
+    with pytest.raises(worker.RescheduleWork):
+        worker.process_work(new.engine, item)
+    _quiet(new)
+    assert _delete(new) == "DELETED"
+
+
+def test_files_written_during_the_delete_are_swept_afterwards(tenant):
+    _, new = _ready_to_delete(tenant)
+    late = f"p2-documents/{new.tenant_id}/{new.journey_id}/late-page.pdf"
+
+    class LateStorage(FakeStorage):
+        swept = False
+
+        def list_keys(self, prefix: str) -> list[str]:
+            # The late page appears only after the first sweep.
+            return [late] if self.swept and prefix.startswith("p2-documents/") else []
+
+        def delete_objects(self, keys: list[str]) -> int:
+            self.swept = True
+            return super().delete_objects(keys)
+
+    storage = LateStorage()
+    run_same_file_delete(new.engine, tenant_id=new.tenant_id, journey_id=new.journey_id, correlation_id="t",
+                         security_client=FakeSecurity(), v2_client=FakeDi(), storage=storage)
+    assert late in storage.deleted
+
+
+# 6. an unfinished system delete is finished
+def test_an_unfinished_system_delete_is_continued_past_the_reviewed_guard(tenant):
+    from audit_core.uc03_p2_journey_delete import system_delete_journey
+
+    _, new = _pair(tenant)
+    with new.engine.begin() as connection:
+        set_tenant_context(connection, new.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.p2_journey_deletions (tenant_id, journey_id, reason, deleted_by_actor_id, "
+                 "deleted_by_role, deletion_status) VALUES (:t, :j, 'Same file uploaded again: earlier try', "
+                 "'SYSTEM', 'SYSTEM', 'FAILED')"),
+            {"t": new.tenant_id, "j": new.journey_id},
+        )
+        connection.execute(
+            text("INSERT INTO auditcore.p2_stage_document_reviews (tenant_id, journey_id, stage_code, "
+                 "reviewed_by_actor_id, reviewed_by_role_code, document_count, dealer_id, outlet_id) "
+                 "VALUES (:t, :j, 'BOOKING', 'rev', 'REVIEWER', 1, :d, :o)"),
+            {"t": new.tenant_id, "j": new.journey_id, "d": new.dealer_id, "o": new.outlet_id},
+        )
+    system_delete_journey(new.engine, tenant_id=new.tenant_id, journey_id=new.journey_id,
+                          reason="Same file uploaded again: finishing", correlation_id="t",
+                          security_client=FakeSecurity(), v2_client=FakeDi(), storage=FakeStorage())
+    assert not _exists(new)
+
+
+def test_a_first_system_delete_still_refuses_a_reviewed_journey(tenant):
+    from audit_core.errors import ConflictError
+    from audit_core.uc03_p2_journey_delete import system_delete_journey
+
+    _, new = _pair(tenant)
+    with new.engine.begin() as connection:
+        set_tenant_context(connection, new.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.p2_stage_document_reviews (tenant_id, journey_id, stage_code, "
+                 "reviewed_by_actor_id, reviewed_by_role_code, document_count, dealer_id, outlet_id) "
+                 "VALUES (:t, :j, 'BOOKING', 'rev', 'REVIEWER', 1, :d, :o)"),
+            {"t": new.tenant_id, "j": new.journey_id, "d": new.dealer_id, "o": new.outlet_id},
+        )
+    with pytest.raises(ConflictError):
+        system_delete_journey(new.engine, tenant_id=new.tenant_id, journey_id=new.journey_id,
+                              reason="Same file uploaded again: first try", correlation_id="t",
+                              security_client=FakeSecurity(), v2_client=FakeDi(), storage=FakeStorage())
+    assert _exists(new)
+
+
+# 7. removed another way; purge dry run reports closed journeys
+def test_a_new_file_removed_another_way_publishes_its_alert(tenant):
+    _, new = _ready_to_delete(tenant)
+    run_duplicate_journey_purge(tenant.engine, f"{tenant.tenant_id}:x-commit", [_ref(new)],
+                                security_client=FakeSecurity(), v2_client=FakeDi(), storage=FakeStorage())
+    [alert] = _alerts(new)
+    assert alert["alert_status"] == "PUBLISHED" and alert["outcome"] == "REMOVED"
+    assert "has been removed" in alert["body"]
+
+
+def test_purge_dry_run_reports_closed_journeys(tenant):
+    closed = _journey(tenant, ref="DUP-CLOSED-1", created=datetime.now(UTC))
+    _stage(closed, "BOOKING_CANCELLED")
+    dry = run_duplicate_journey_purge(tenant.engine, f"{tenant.tenant_id}:item8", ["DUP-CLOSED-1"])
+    assert dry["would_refuse"] == 1 and dry["would_delete"] == 0
+
+
+def _ref(journey: P2Journey) -> str:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return connection.execute(text("SELECT journey_reference FROM auditcore.journeys WHERE tenant_id=:t "
+                                       "AND journey_id=:j"), {"t": journey.tenant_id, "j": journey.journey_id}).scalar_one()

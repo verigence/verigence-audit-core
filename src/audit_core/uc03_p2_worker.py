@@ -3525,7 +3525,8 @@ def _same_file_delete(engine: Engine, work: WorkItem) -> None:
     and R2 are called with no transaction open, and the Journey's own queue
     rows -- this one too -- go with it (JourneyDeleted)."""
     from audit_core.uc03_p2_same_file import (
-        DELETED,
+        REMOVED,
+        UploadInProgress,
         publish_alert,
         run_same_file_delete,
     )
@@ -3538,6 +3539,9 @@ def _same_file_delete(engine: Engine, work: WorkItem) -> None:
             storage=get_p2_document_storage(),
             before_record=lambda connection: _owned(connection, work),
         )
+    except UploadInProgress as exc:
+        # Pages are still arriving: not deleted under the PC's upload.
+        raise RescheduleWork(str(exc), delay_seconds=exc.delay_seconds) from None
     except LeaseLost:
         # The Journey may have gone another way (a Team Lead deleted it):
         # then its queue row went with it and the alert is still to go out.
@@ -3548,7 +3552,7 @@ def _same_file_delete(engine: Engine, work: WorkItem) -> None:
                 {"t": work.tenant_id, "j": work.journey_id},
             ).scalar_one()
             if gone:
-                publish_alert(connection, tenant_id=work.tenant_id, journey_id=work.journey_id, outcome=DELETED)
+                publish_alert(connection, tenant_id=work.tenant_id, journey_id=work.journey_id, outcome=REMOVED)
         if gone:
             raise JourneyDeleted(f"Journey {work.journey_id} was already deleted") from None
         raise

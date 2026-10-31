@@ -43,7 +43,7 @@ from audit_core.uc03_p2_journey_delete import (
     _OBJECT_KEYS_SQL,
     system_delete_journey,
 )
-from audit_core.uc03_p2_same_file import recheck_pairs_of
+from audit_core.uc03_p2_same_file import _CLOSED_SQL, recheck_pairs_of
 
 logger = structlog.get_logger(__name__)
 
@@ -60,7 +60,8 @@ _LOOKUP_SQL = """
              WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id AND e.association_status='ACTIVE')
              AS documents_on_file,
            EXISTS (SELECT 1 FROM auditcore.p2_stage_document_reviews r
-                    WHERE r.tenant_id=j.tenant_id AND r.journey_id=j.journey_id) AS reviewed
+                    WHERE r.tenant_id=j.tenant_id AND r.journey_id=j.journey_id) AS reviewed,
+           """ + _CLOSED_SQL + """ AS closed
     FROM auditcore.journeys j
     JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
     JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
@@ -100,7 +101,7 @@ def run_duplicate_journey_purge(
 ) -> dict[str, Any]:
     tenant_id, commit = parse_tag(tag)
     references = _references(reports)
-    totals: dict[str, Any] = {"listed": len(references), "found": 0, "deleted": 0, "would_delete": 0,
+    totals: dict[str, Any] = {"listed": len(references), "found": 0, "deleted": 0, "would_delete": 0, "would_refuse": 0,
                               "refused": 0, "not_found": 0, "ambiguous": 0, "failed": 0}
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
@@ -143,12 +144,16 @@ def run_duplicate_journey_purge(
             "customer": row["customer_name"], "pc": row["pc_name"], "dealer": row["dealer_name"],
             "outlet": row["outlet_name"], "vehicle": row["vehicle"], "di_documents": counts["di"], "files_recorded": counts["files"],
             "uploads": int(row["uploads"]), "documents_on_file": int(row["documents_on_file"]),
-            "reviewed": bool(row["reviewed"]),
+            "reviewed": bool(row["reviewed"]), "closed": bool(row["closed"]),
         }
         if not commit:
-            totals["would_delete"] += 1
+            # The same guards as the commit run (unless an earlier system
+            # attempt is being finished, which the commit run continues).
+            outcome = ("WOULD_BE_REFUSED_REVIEWED" if item["reviewed"]
+                       else "WOULD_BE_REFUSED_CLOSED" if item["closed"] else "WOULD_DELETE")
+            totals["would_delete" if outcome == "WOULD_DELETE" else "would_refuse"] += 1
             logger.info("duplicate_journey_purge_item", tag=tag, tenant_id=tenant_id, commit=False,
-                        outcome="WOULD_DELETE" if not item["reviewed"] else "WOULD_BE_REFUSED_REVIEWED", **item)
+                        outcome=outcome, **item)
             continue
         journey_id = UUID(str(row["journey_id"]))
 

@@ -174,10 +174,12 @@ def _check_and_record(
     correlation_id: str,
     actor_id: str,
     role: str,
+    skip_guards: bool = False,
 ) -> dict[str, Any]:
     """Check the journey may be deleted, collect what to remove and write the
     record, on a connection whose tenant context is set. The same guards for a
-    Team Lead and for the system (2026-10-31): never a reviewed or closed journey."""
+    Team Lead and for the system (2026-10-31): never a reviewed or closed journey.
+    ``skip_guards`` only to finish a system deletion already under way."""
     row = connection.execute(
         text(_SNAPSHOT_SQL), {"tenant_id": tenant_id, "journey_id": journey_id}
     ).mappings().first()
@@ -194,7 +196,7 @@ def _check_and_record(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).scalars().all()
-    if reviewed:
+    if reviewed and not skip_guards:
         stages = " and ".join(str(stage).title() for stage in reviewed)
         raise ConflictError(
             error_code="VAC-CONFLICT-004",
@@ -204,7 +206,7 @@ def _check_and_record(
                 "no longer be deleted."
             ),
         )
-    if row["is_closed"]:
+    if row["is_closed"] and not skip_guards:
         raise ConflictError(
             error_code="VAC-CONFLICT-004",
             title="Journey is closed",
@@ -484,6 +486,11 @@ def _remove(
             )
             if on_deleted is not None:
                 on_deleted(connection)
+            # A same-file alert still waiting on this journey's delete goes
+            # out now (2026-10-31): its delete item went with the journey.
+            from audit_core.uc03_p2_same_file import close_pending_alert
+
+            close_pending_alert(connection, tenant_id=tenant_id, journey_id=journey_id)
     except Exception as exc:
         logger.error("p2_journey_delete_db_failed", tenant_id=tenant_id, journey_id=str(journey_id), error=str(exc))
         raise _fail(
@@ -524,29 +531,66 @@ def system_delete_journey(
     v2_client: DiCaptureV2Client,
     storage: P2DocumentStorage,
     on_deleted: Callable[[Connection], None] | None = None,
-    before_record: Callable[[Connection], None] | None = None,
+    before_record: Callable[[Connection, bool], None] | None = None,
 ) -> DeleteJourneyResult:
     """Delete a journey with no human principal. Must not be called inside an
     open transaction: Document Intelligence and R2 are called between the
     record (committed first) and the database delete (its own transaction).
-    ``before_record`` runs in the record's transaction first (the worker
-    checks it still holds its work item there). Raises NotFoundError,
-    ConflictError (reviewed / closed) or DependencyUnavailableError."""
+    ``before_record(connection, continuing)`` runs in the record's transaction
+    first (the worker checks it still holds its work item, and re-checks the
+    match, there); it may raise to stop. Raises NotFoundError, ConflictError
+    (reviewed / closed) or DependencyUnavailableError.
+
+    An earlier system attempt on this journey that did not finish (STARTED,
+    or FAILED part way -- some of its Document Intelligence documents or files
+    may already be gone) is continued without the reviewed / closed guards
+    (2026-10-31 review): a journey is never left half deleted."""
     reason = reason.strip()
     if len(reason) < MIN_REASON_LENGTH:
         raise ValueError("A system deletion needs its reason.")
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
+        unfinished = connection.execute(
+            text(
+                "SELECT deletion_id, deletion_status FROM auditcore.p2_journey_deletions "
+                "WHERE tenant_id=:t AND journey_id=:j AND deleted_by_role=:role "
+                "AND deletion_status IN ('STARTED','FAILED') ORDER BY requested_at_utc DESC LIMIT 1"
+            ),
+            {"t": tenant_id, "j": journey_id, "role": SYSTEM_ROLE},
+        ).mappings().first()
+        continuing = unfinished is not None
         if before_record is not None:
-            before_record(connection)
+            before_record(connection, continuing)
+        if continuing:
+            logger.warning(
+                "p2_journey_delete_continued", tenant_id=tenant_id, journey_id=str(journey_id),
+                earlier_deletion_id=str(unfinished["deletion_id"]), earlier_status=unfinished["deletion_status"],
+            )
         started = _check_and_record(
             connection, tenant_id=tenant_id, journey_id=journey_id, reason=reason[:2000],
-            correlation_id=correlation_id, actor_id=SYSTEM_ACTOR, role=SYSTEM_ROLE,
+            correlation_id=correlation_id, actor_id=SYSTEM_ACTOR, role=SYSTEM_ROLE, skip_guards=continuing,
         )
     di_done, object_count = _remove(
         engine, tenant_id=tenant_id, journey_id=journey_id, started=started,
         security_client=security_client, v2_client=v2_client, storage=storage, on_deleted=on_deleted,
     )
+    # A page written to R2 while the deletion ran (an upload still finishing)
+    # is not left behind: the journey's folders are swept once more. Best
+    # effort -- the journey itself is already gone.
+    try:
+        keys: set[str] = set()
+        for prefix in storage_prefixes(tenant_id, journey_id):
+            keys.update(storage.list_keys(prefix))
+        for folder in sorted({f for k in started["object_keys"] if (f := journey_folder_of(k, journey_id))}):
+            keys.update(storage.list_keys(folder))
+        if keys:
+            swept = storage.delete_objects(sorted(keys))
+            object_count += swept
+            logger.info("p2_journey_delete_late_files_removed", tenant_id=tenant_id,
+                        journey_id=str(journey_id), files=swept)
+    except Exception as exc:  # noqa: BLE001 - the journey is deleted; a stray file is only logged
+        logger.warning("p2_journey_delete_late_sweep_failed", tenant_id=tenant_id, journey_id=str(journey_id),
+                       error=str(exc))
     return DeleteJourneyResult(
         deletionId=started["deletion_id"],
         journeyId=journey_id,

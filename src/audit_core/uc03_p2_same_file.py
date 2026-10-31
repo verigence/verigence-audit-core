@@ -43,6 +43,18 @@ What happens to it
     - A journey whose documents a reviewer already marked reviewed is kept
       too (the delete guard), and the alert says so.
 
+Safeguards (review of #594, 2026-10-31)
+    - Only a new file created within P2_SAME_FILE_WINDOW_HOURS (48) is acted
+      on; older pairs stay with DUPLICATE_BOOKING and the purge job.
+    - Never deleted when anything says the booking is a company's or firm's:
+      a non-individual PAN on any document on file of either journey, a
+      GSTIN on either, or a company / firm customer name.
+    - Only values of documents still on file (ACTIVE evidence) count.
+    - At delete time the earlier journey is locked and everything is checked
+      again; a journey still receiving pages waits ten quiet minutes; the R2
+      folders are swept once more after the delete; an unfinished system
+      delete is finished; a journey removed another way publishes its alert.
+
 Once per journey
     The alert row is the marker: (tenant, SAME_FILE_UPLOADED, new journey) is
     unique, so a recomputed check, or the two journeys' checks running at
@@ -51,6 +63,7 @@ Once per journey
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -61,8 +74,15 @@ import structlog
 from sqlalchemy import Connection, Engine, text
 
 from audit_core.errors import ConflictError, NotFoundError
-from audit_core.uc03_duplicate_booking_detection import _normalize_mobile, _valid_pan
+from audit_core.uc03_duplicate_booking_detection import (
+    _buyer_gstin,
+    _normalize_mobile,
+    _valid_gstin,
+    _valid_pan,
+)
 from audit_core.uc03_p2_names import (
+    _is_company,
+    is_firm_name,
     is_masked,
     masked_matches,
     person_tokens,
@@ -77,6 +97,14 @@ ALERT_KIND = "SAME_FILE_UPLOADED"
 DELETE_WORK_TYPE = "SAME_FILE_DELETE"
 ALERT_HOURS = 24
 ALERT_TITLE = "Same file being uploaded"
+# Only a new file uploaded within this window is acted on (review of #594,
+# 2026-10-31): the nightly forced re-run of every booking's checks must not
+# delete older pairs -- those stay with the DUPLICATE_BOOKING rule and the
+# product owner's own list (DUPLICATE_JOURNEY_PURGE).
+SAME_FILE_WINDOW_HOURS = int(os.environ.get("P2_SAME_FILE_WINDOW_HOURS", "48"))
+# A journey still receiving pages is not deleted under the PC's upload: the
+# delete waits until nothing was uploaded to it for this long.
+UPLOAD_QUIET_MINUTES = 10
 
 # Outcomes, as the alert states them.
 DELETED = "DELETED"
@@ -85,6 +113,24 @@ KEPT_REVIEWED = "KEPT_REVIEWED"
 KEPT_CLOSED = "KEPT_CLOSED"
 DELETE_FAILED = "DELETE_FAILED"
 PENDING_DELETE = "PENDING_DELETE"
+KEPT_CHANGED = "KEPT_CHANGED"  # re-checked at delete time: no longer the same file
+REMOVED = "REMOVED"  # the new journey went another way before the system deleted it
+
+
+class SameFileNoLongerHolds(RuntimeError):
+    """Re-checked at delete time, the two journeys are no longer the same file."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+class UploadInProgress(RuntimeError):
+    """Pages are still arriving on the new journey; try the delete later."""
+
+    def __init__(self, delay_seconds: int) -> None:
+        super().__init__(f"An upload to this journey is still in progress; deleting in {delay_seconds} s")
+        self.delay_seconds = delay_seconds
 
 # The PAN's 4th character is the holder type; "P" is an individual.
 _INDIVIDUAL_HOLDER = "P"
@@ -100,6 +146,14 @@ _CLOSED_SQL = """
     )
 """
 
+# A value counts only while its document is on file (review of #594): a PAN
+# or mobile read from a page since removed or replaced pairs nothing.
+_ON_ACTIVE_DOCUMENT = """
+    EXISTS (SELECT 1 FROM auditcore.evidence e
+            WHERE e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+              AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE')
+"""
+
 _IDENTITY_SQL = f"""
     WITH ranked AS (
         SELECT f.journey_id, f.field_key, f.effective_value #>> '{{}}' AS value,
@@ -111,6 +165,7 @@ _IDENTITY_SQL = f"""
         WHERE f.tenant_id = :tenant_id AND f.journey_id = ANY(:journey_ids)
           AND f.field_key IN ('pan_number', 'customer_phone')
           AND f.effective_value IS NOT NULL
+          AND {_ON_ACTIVE_DOCUMENT}
     )
     SELECT j.journey_id, j.created_at_utc, j.journey_reference,
            j.created_by_display_name AS pc_name,
@@ -134,11 +189,22 @@ _IDENTITY_SQL = f"""
 
 # Journeys whose extracted PAN, on any document, is this PAN: a narrowing
 # only -- each is then compared on its own highest-confidence PAN.
-_SAME_PAN_SQL = """
+_SAME_PAN_SQL = f"""
     SELECT DISTINCT f.journey_id
     FROM auditcore.journey_document_extracted_fields f
     WHERE f.tenant_id = :tenant_id AND f.field_key = 'pan_number' AND f.journey_id <> :journey_id
-      AND upper(regexp_replace(COALESCE(f.effective_value #>> '{}', ''), '[^A-Za-z0-9]', '', 'g')) = :pan
+      AND upper(regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^A-Za-z0-9]', '', 'g')) = :pan
+      AND {_ON_ACTIVE_DOCUMENT}
+"""
+
+# Every PAN and GSTIN on the journeys' documents still on file.
+_ACTIVE_TAX_IDS_SQL = f"""
+    SELECT f.journey_id, f.field_key, f.effective_value #>> '{{}}' AS value
+    FROM auditcore.journey_document_extracted_fields f
+    WHERE f.tenant_id = :tenant_id AND f.journey_id = ANY(:journey_ids)
+      AND f.field_key IN ('pan_number', 'gstin', 'buyer_gstin', 'customer_gstin')
+      AND f.effective_value IS NOT NULL
+      AND {_ON_ACTIVE_DOCUMENT}
 """
 
 
@@ -252,6 +318,47 @@ def is_individual_pan(pan: str | None) -> bool:
     return bool(pan) and len(pan) == 10 and pan[3] == _INDIVIDUAL_HOLDER
 
 
+# Words of a business's name not already in uc03_p2_names' company / firm words.
+_BUSINESS_WORDS = frozenset({"CO", "AGENCIES", "CONSTRUCTION", "INFRA", "TRADERS", "SERVICES"})
+
+
+def looks_like_company(name: str | None) -> bool:
+    """A customer name that is a company's or a firm's ("M/S ...", "... PVT
+    LTD", "... ENTERPRISES", "... & CO.")."""
+    if not name:
+        return False
+    words = set("".join(ch if ch.isalnum() else " " for ch in name.upper()).split())
+    return _is_company(name) or is_firm_name(name) or bool(words & _BUSINESS_WORDS)
+
+
+def business_reason(connection: Connection, *, tenant_id: str, files: list[FileIdentity]) -> str | None:
+    """Why this booking may be a company's or firm's although the PAN read as
+    the customer's is an individual's (review of #594: a company buying with
+    its signatory's personal PAN). None when nothing says so. Then the new
+    file is never deleted, only alerted and kept for review."""
+    for identity in files:
+        if not is_individual_pan(identity.pan):
+            return "the PAN is not an individual's"
+    for identity in files:
+        if looks_like_company(identity.name):
+            return "the customer name is a company's or firm's"
+    rows = connection.execute(
+        text(_ACTIVE_TAX_IDS_SQL), {"tenant_id": tenant_id, "journey_ids": [f.journey_id for f in files]},
+    ).mappings().all()
+    for row in rows:
+        if row["field_key"] == "pan_number":
+            pan = _valid_pan(row["value"])
+            if pan and not is_individual_pan(pan):
+                return "a company or firm PAN is on file"
+    for row in rows:
+        if row["field_key"] != "pan_number" and _valid_gstin(row["value"]):
+            return "a GSTIN is on file"
+    for identity in files:
+        if _valid_gstin(_buyer_gstin(connection, tenant_id=tenant_id, journey_id=identity.journey_id)):
+            return "a GSTIN is on file"
+    return None
+
+
 # ── the alert ─────────────────────────────────────────────────────────────────
 def _place(dealer: str | None, outlet: str | None) -> str:
     parts = [p for p in (dealer, outlet) if p and p.strip()]
@@ -266,6 +373,7 @@ def alert_body(payload: dict[str, Any], outcome: str) -> str:
     who = (f"{payload.get('customerName') or 'Unknown customer'}, {payload.get('model') or 'unknown model'}, "
            f"PC {new.get('pcName') or 'unknown'}, {_place(new.get('dealerName'), new.get('outletName'))}")
     ref = new.get("reference") or "the new journey"
+    kept = payload.get("keptReason") or "the PAN is not an individual's"
     matches = (f"It matches {existing.get('reference') or 'an earlier journey'} "
                f"(PC {existing.get('pcName') or 'unknown'}, "
                f"{_place(existing.get('dealerName'), existing.get('outletName'))}) "
@@ -273,8 +381,11 @@ def alert_body(payload: dict[str, Any], outcome: str) -> str:
     what = {
         DELETED: f"The new file {ref} was deleted.",
         PENDING_DELETE: f"The new file {ref} is being deleted.",
-        KEPT_NOT_INDIVIDUAL: (f"The new file {ref} was kept for review: the PAN is not an individual's "
+        KEPT_NOT_INDIVIDUAL: (f"The new file {ref} was kept for review: {kept} "
                               "(a company or firm may book two identical vehicles)."),
+        KEPT_CHANGED: (f"The new file {ref} was kept for review: "
+                       f"{payload.get('keptReason') or 'it no longer matches'}."),
+        REMOVED: f"The new file {ref} has been removed.",
         KEPT_REVIEWED: f"The new file {ref} was kept for review: its documents are already marked reviewed.",
         KEPT_CLOSED: f"The new file {ref} was kept for review: it is already closed.",
         DELETE_FAILED: f"The new file {ref} could not be deleted; the Team Lead has been told.",
@@ -293,7 +404,8 @@ def _journey_view(identity: FileIdentity) -> dict[str, Any]:
     }
 
 
-def publish_alert(connection: Connection, *, tenant_id: str, journey_id: UUID, outcome: str) -> bool:
+def publish_alert(connection: Connection, *, tenant_id: str, journey_id: UUID, outcome: str,
+                  kept_reason: str | None = None) -> bool:
     """Publish the same-file alert of a journey with its outcome (for 24 hours).
     True when a PENDING alert was published; an alert already published is
     left as it is."""
@@ -308,6 +420,8 @@ def publish_alert(connection: Connection, *, tenant_id: str, journey_id: UUID, o
     if row is None:
         return False
     payload = {**dict(row["payload"] or {}), "outcome": outcome}
+    if kept_reason:
+        payload["keptReason"] = kept_reason
     connection.execute(
         text(
             """
@@ -324,6 +438,12 @@ def publish_alert(connection: Connection, *, tenant_id: str, journey_id: UUID, o
     return True
 
 
+def close_pending_alert(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """A journey deleted by any path while its same-file alert waits: the
+    alert goes out as removed (its delete item went with the journey)."""
+    return publish_alert(connection, tenant_id=tenant_id, journey_id=journey_id, outcome=REMOVED)
+
+
 def _reviewed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
     return connection.execute(
         text("SELECT EXISTS (SELECT 1 FROM auditcore.p2_stage_document_reviews "
@@ -338,7 +458,8 @@ def _raise(
 ) -> str | None:
     """The alert for one new file, and its delete queued; None when this
     file was already handled (the marker)."""
-    if not is_individual_pan(new.pan):
+    kept_reason = business_reason(connection, tenant_id=tenant_id, files=[new, existing])
+    if kept_reason:
         outcome = KEPT_NOT_INDIVIDUAL
     elif _reviewed(connection, tenant_id=tenant_id, journey_id=new.journey_id):
         outcome = KEPT_REVIEWED
@@ -352,6 +473,7 @@ def _raise(
         "existingJourney": _journey_view(existing),
         "matchedFields": fields,
         "outcome": outcome,
+        **({"keptReason": kept_reason} if kept_reason else {}),
     }
     publish_now = outcome != PENDING_DELETE
     alert_id = connection.execute(
@@ -407,9 +529,15 @@ def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correla
         return {"examined": len(others), "raised": 0}
     group = [me, *matches]
     original = min(group, key=lambda identity: identity.order_key)
+    cutoff = connection.execute(
+        text("SELECT now() - (:hours * interval '1 hour')"), {"hours": SAME_FILE_WINDOW_HOURS},
+    ).scalar_one()
     outcomes: list[str] = []
     for new in sorted(group, key=lambda identity: identity.order_key):
         if new is original:
+            continue
+        if new.created_at < cutoff:
+            # Not a file just uploaded again: left to DUPLICATE_BOOKING.
             continue
         fields = matched_fields(new, original)
         if fields is None:  # matched this journey, not the oldest one
@@ -457,6 +585,58 @@ def recheck_pairs_of(connection: Connection, *, tenant_id: str, deleted_journey_
 
 
 # ── the delete, as its own work item ──────────────────────────────────────────
+def recheck_before_delete(
+    connection: Connection, *, tenant_id: str, new_journey_id: UUID, existing_journey_id: UUID | None,
+    existing_reference: str | None,
+) -> None:
+    """At delete time, in the deletion record's transaction (review of #594):
+    the earlier journey is locked and must still exist and be open, the two
+    must still agree on all four values, and nothing may say the booking is a
+    company's. Raises SameFileNoLongerHolds with the reason, NotFoundError
+    when the new journey itself is gone."""
+    ref = existing_reference or "the earlier journey"
+    if existing_journey_id is None:
+        raise SameFileNoLongerHolds("the earlier journey is not known")
+    locked = connection.execute(
+        text("SELECT journey_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j FOR UPDATE"),
+        {"t": tenant_id, "j": existing_journey_id},
+    ).scalar_one_or_none()
+    files = _identities(connection, tenant_id=tenant_id, journey_ids=[new_journey_id, existing_journey_id])
+    new = files.get(new_journey_id)
+    if new is None:
+        raise NotFoundError(error_code="VAC-NF-005", title="Journey not found", detail="The new journey is gone.")
+    existing = files.get(existing_journey_id) if locked is not None else None
+    if existing is None:
+        raise SameFileNoLongerHolds(f"{ref} no longer exists")
+    if existing.closed:
+        raise SameFileNoLongerHolds(f"{ref} is closed")
+    if new.closed:
+        raise SameFileNoLongerHolds("it is already closed")
+    if matched_fields(new, existing) is None:
+        raise SameFileNoLongerHolds(f"its PAN, mobile, customer name or model no longer match {ref}")
+    reason = business_reason(connection, tenant_id=tenant_id, files=[new, existing])
+    if reason:
+        raise SameFileNoLongerHolds(reason)
+
+
+def _upload_wait_seconds(connection: Connection, *, tenant_id: str, journey_id: UUID) -> int:
+    """Seconds until nothing was uploaded to the journey for UPLOAD_QUIET_MINUTES; 0 when quiet."""
+    remaining = connection.execute(
+        text(
+            """
+            SELECT EXTRACT(EPOCH FROM (GREATEST(
+                     (SELECT max(created_at_utc) FROM auditcore.p2_upload_batches
+                       WHERE tenant_id=:t AND journey_id=:j),
+                     (SELECT max(created_at_utc) FROM auditcore.p2_document_queue
+                       WHERE tenant_id=:t AND journey_id=:j))
+                   + (:minutes * interval '1 minute') - now()))
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "minutes": UPLOAD_QUIET_MINUTES},
+    ).scalar_one_or_none()
+    return max(0, int(float(remaining))) if remaining is not None else 0
+
+
 def run_same_file_delete(
     engine: Engine,
     *,
@@ -469,46 +649,66 @@ def run_same_file_delete(
     before_record: Callable[[Connection], None] | None = None,
 ) -> str:
     """Delete the new file and publish its alert. Returns DELETED, GONE (the
-    journey was already deleted), KEPT_REVIEWED / KEPT_CLOSED (the delete
-    guard refused it) or NOTHING (no pending alert: already handled). A
-    technical failure raises, for the work item to be retried."""
+    journey was already removed; the alert goes out as removed),
+    KEPT_REVIEWED / KEPT_CLOSED (the delete guard refused it), KEPT_CHANGED
+    (re-checked, no longer the same file) or NOTHING (no pending alert:
+    already handled). Raises UploadInProgress while pages are still
+    arriving, and a technical failure for the work item to be retried."""
     from audit_core.db import set_tenant_context
     from audit_core.uc03_p2_journey_delete import system_delete_journey
 
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
         alert = connection.execute(
-            text("SELECT payload FROM auditcore.p2_tenant_alerts WHERE tenant_id=:t AND alert_kind=:k "
-                 "AND subject_journey_id=:j AND alert_status='PENDING'"),
+            text("SELECT payload, related_journey_id FROM auditcore.p2_tenant_alerts WHERE tenant_id=:t "
+                 "AND alert_kind=:k AND subject_journey_id=:j AND alert_status='PENDING'"),
             {"t": tenant_id, "k": ALERT_KIND, "j": journey_id},
-        ).scalar_one_or_none()
+        ).mappings().one_or_none()
+        wait = _upload_wait_seconds(connection, tenant_id=tenant_id, journey_id=journey_id) if alert else 0
     if alert is None:
         return "NOTHING"
-    existing_ref = ((alert or {}).get("existingJourney") or {}).get("reference") or "an earlier journey"
-    reason = f"Same file uploaded again: matches {existing_ref} on PAN, mobile, name and model"
+    if wait > 0:
+        raise UploadInProgress(wait + 30)
+    existing_ref = (dict(alert["payload"] or {}).get("existingJourney") or {}).get("reference")
+    existing_id = UUID(str(alert["related_journey_id"])) if alert["related_journey_id"] else None
+    reason = f"Same file uploaded again: matches {existing_ref or 'an earlier journey'} on PAN, mobile, name and model"
 
-    def publish(outcome: str) -> Callable[[Connection], None]:
+    def publish(outcome: str, kept_reason: str | None = None) -> Callable[[Connection], None]:
         return lambda connection: publish_alert(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                                outcome=outcome)
+                                                outcome=outcome, kept_reason=kept_reason)
 
     def deleted(connection: Connection) -> None:
         publish(DELETED)(connection)
         recheck_pairs_of(connection, tenant_id=tenant_id, deleted_journey_id=journey_id,
                          correlation_id=correlation_id)
 
+    def check(connection: Connection, continuing: bool) -> None:
+        if before_record is not None:
+            before_record(connection)
+        if continuing:
+            # Part of it is already gone: finish it, whatever has changed.
+            return
+        recheck_before_delete(connection, tenant_id=tenant_id, new_journey_id=journey_id,
+                              existing_journey_id=existing_id, existing_reference=existing_ref)
+
+    kept_reason: str | None = None
     try:
         system_delete_journey(
             engine, tenant_id=tenant_id, journey_id=journey_id, reason=reason, correlation_id=correlation_id,
             security_client=security_client, v2_client=v2_client, storage=storage,
-            on_deleted=deleted, before_record=before_record,
+            on_deleted=deleted, before_record=check,
         )
         return DELETED
     except NotFoundError:
-        outcome, result = DELETED, "GONE"
+        outcome, result = REMOVED, "GONE"
+    except SameFileNoLongerHolds as exc:
+        outcome, result, kept_reason = KEPT_CHANGED, KEPT_CHANGED, exc.reason
     except ConflictError as exc:
         outcome = KEPT_REVIEWED if "reviewed" in exc.title.lower() else KEPT_CLOSED
         result = outcome
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
-        publish(outcome)(connection)
+        publish(outcome, kept_reason)(connection)
+    logger.info("p2_same_file_delete_settled", tenant_id=tenant_id, journey_id=str(journey_id), outcome=result,
+                kept_reason=kept_reason)
     return result
