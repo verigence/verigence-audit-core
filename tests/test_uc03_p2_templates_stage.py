@@ -35,9 +35,9 @@ from audit_core.uc03_p2_stage import (
 def test_templates_load_and_validate():
     registry = get_registry()
     assert validate_registry(registry) == []
-    # 26 + 24 deal-audit Audit Core + 40 Rule Engine (blueprint 8.1, seven retired; the two
-    # NDC signature checks retired 2026-10-28)
-    assert len(registry.controls) == 90
+    # 26 + 22 deal-audit Audit Core + 40 Rule Engine (blueprint 8.1, seven retired; the two
+    # NDC signature checks retired 2026-10-28, the two cash intimation checks 2026-10-31)
+    assert len(registry.controls) == 88
     assert SUPPORTING_TEMPLATE in registry.documents
 
 

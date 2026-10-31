@@ -66,7 +66,7 @@ CLOSE_INSTRUCTION = ('Once uploaded, come back and close the task with the comme
         # Not document work: stays where it was.
         ("FINDING_REMEDIATION", "FINDING_REMEDIATION", "MODEL_NOT_IDENTIFIED", None),
         ("SKU_CLOSEST_MATCH_CONFIRM", "CORRECTION_APPROVAL", None, None),
-        ("PC_CONFIRMATION", "PROCESS_CONFIRMATION", "CASH_INTIMATION_UNCONFIRMED", None),
+        ("PC_CONFIRMATION", "PROCESS_CONFIRMATION", "THIRD_PARTY_PAYMENT_UNCONFIRMED", None),
         ("PC_CONFIRMATION", "PROCESS_CONFIRMATION", "INSURANCE_INVOICE_MISSING", "MISSING_DOCUMENT"),
         # External rule engine checks for a document not on file.
         *[("RULE_DISCREPANCY_REVIEW", "CROSS_DOCUMENT_REVIEW", code, "MISSING_DOCUMENT") for code in (

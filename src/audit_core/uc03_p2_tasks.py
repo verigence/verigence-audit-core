@@ -413,7 +413,7 @@ def submit_action(
     assigned_actor_id = task.get("assigned_actor_id")
     assigned_role_code = str(task.get("assigned_role_code") or "")
     supervisory = action == "ACCEPT_EXCEPTION"
-    # An observation (cash intimated? NDC signed in your presence?) is keyed
+    # An observation (accessories fitted? who paid?) is keyed
     # in by whoever knows: the PC it is assigned to, or a TL / PM.
     observation = task["task_type"] == _OBSERVATION_TASK and actor_role_code in _EXCEPTION_ROLES
     if supervisory:
