@@ -4513,6 +4513,8 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         "INSURANCE_HYPOTHECATION_REREAD": ("audit_core.uc03_insurance_hypothecation_reread",
                                            "run_insurance_hypothecation_reread"),
         "WAITING_CORRECTIONS": ("audit_core.uc03_waiting_corrections", "run_waiting_corrections"),
+        "DISCOUNT_VARIANCE_RECOMPUTE": ("audit_core.uc03_discount_variance_recompute",
+                                        "run_discount_variance_recompute"),
     }
     if kind not in per_tenant:
         raise ValueError(f"unknown worker job kind {kind!r}")
