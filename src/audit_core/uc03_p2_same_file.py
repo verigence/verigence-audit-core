@@ -168,7 +168,7 @@ _IDENTITY_SQL = f"""
           AND {_ON_ACTIVE_DOCUMENT}
     )
     SELECT j.journey_id, j.created_at_utc, j.journey_reference,
-           j.created_by_display_name AS pc_name,
+           j.created_by_display_name AS pc_name, j.created_by_actor_id AS pc_actor_id,
            d.dealer_name, o.outlet_name,
            (SELECT r.value FROM ranked r
              WHERE r.journey_id = j.journey_id AND r.field_key = 'pan_number' AND r.row_rank = 1) AS pan,
@@ -223,6 +223,8 @@ class FileIdentity:
     model_name: str | None
     variant_name: str | None
     closed: bool
+    # Who entered the journey (2026-10-31): their own screen beeps on the alert.
+    pc_actor_id: str | None = None
 
     @property
     def model_key(self) -> str:
@@ -254,6 +256,7 @@ def _identities(connection: Connection, *, tenant_id: str, journey_ids: Iterable
             created_at=row["created_at_utc"],
             reference=row["journey_reference"],
             pc_name=row["pc_name"],
+            pc_actor_id=str(row["pc_actor_id"]) if row["pc_actor_id"] else None,
             dealer_name=row["dealer_name"],
             outlet_name=row["outlet_name"],
             pan=_valid_pan(row["pan"]),
@@ -398,6 +401,7 @@ def _journey_view(identity: FileIdentity) -> dict[str, Any]:
         "journeyId": str(identity.journey_id),
         "reference": identity.reference,
         "pcName": identity.pc_name,
+        "pcActorId": identity.pc_actor_id,
         "dealerName": identity.dealer_name,
         "outletName": identity.outlet_name,
         "createdAtUtc": identity.created_at.isoformat() if identity.created_at else None,
