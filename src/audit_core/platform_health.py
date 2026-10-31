@@ -37,6 +37,7 @@ logger = structlog.get_logger(__name__)
 SAMPLE_SECONDS = 5.0
 BEAT_EVERY_SAMPLES = 12          # a beat a minute
 DB_COUNTERS_EVERY_BEATS = 15     # API only: DB counters every 15 minutes
+# API only: the database's own health is sampled every beat (platform_ops.db_minute_stats).
 PRUNE_EVERY_BEATS = 60           # API only: retention once an hour
 _MAX_ROUTES_PER_MINUTE = 20
 
@@ -272,6 +273,32 @@ def snapshot_db_counters(engine: Engine) -> None:
         )
 
 
+_DB_MINUTE_COLUMNS = {
+    "connections_active": "connectionsActive", "connections_idle": "connectionsIdle",
+    "connections_idle_in_tx": "connectionsIdleInTx", "connections_other": "connectionsOther",
+    "max_connections": "maxConnections", "waiting_on_locks": "waitingOnLocks",
+    "longest_query_seconds": "longestQuerySeconds", "longest_transaction_seconds": "longestTransactionSeconds",
+    "xact_commit": "commits", "xact_rollback": "rollbacks", "blks_hit": "blocksHit", "blks_read": "blocksRead",
+    "deadlocks": "deadlocks", "temp_bytes": "tempBytes", "size_bytes": "sizeBytes",
+    "stats_reset_at_utc": "statsResetAtUtc", "lfc_hits": "lfcHits", "lfc_misses": "lfcMisses",
+}
+
+
+def sample_db_minute(engine: Engine, now: float | None = None) -> None:
+    """One row a minute of the database's own health (2026-10-31): connections by state,
+    locks, the longest query, and the counters behind TPS and the cache hit ratio. Every
+    API replica tries; the first one in a minute wins."""
+    with engine.begin() as connection:
+        sample = connection.execute(text("SELECT platform_ops.db_sample()")).scalar_one()
+        columns = ", ".join(_DB_MINUTE_COLUMNS)
+        values = ", ".join(f":{c}" for c in _DB_MINUTE_COLUMNS)
+        connection.execute(
+            text(f"INSERT INTO platform_ops.db_minute_stats (minute_utc, {columns}) VALUES (:m, {values}) "
+                 "ON CONFLICT (minute_utc) DO NOTHING"),
+            {"m": _minute(now), **{c: sample.get(k) for c, k in _DB_MINUTE_COLUMNS.items()}},
+        )
+
+
 def prune(engine: Engine) -> None:
     with engine.begin() as connection:
         for table, column, days in (
@@ -280,6 +307,7 @@ def prune(engine: Engine) -> None:
             ("service_resource_minutes", "minute_utc", 14),
             ("railway_events", "received_at_utc", 30),
             ("db_counter_snapshots", "taken_at_utc", 30),
+            ("db_minute_stats", "minute_utc", 14),
         ):
             connection.execute(text(
                 f"DELETE FROM platform_ops.{table} WHERE {column} < now() - make_interval(days => :d)"
@@ -315,6 +343,8 @@ def _tick(engine: Engine, default_service: str, n: int, *, api: bool) -> None:
         return
     beats = n // BEAT_EVERY_SAMPLES
     _safe("beat", beat, engine, default_service)
+    if api:
+        _safe("db_minute", sample_db_minute, engine)
     if api and beats % DB_COUNTERS_EVERY_BEATS == 1:
         _safe("db_counters", snapshot_db_counters, engine)
     if api and beats % PRUNE_EVERY_BEATS == 1:

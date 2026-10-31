@@ -41,6 +41,35 @@ class P2DocumentStorage:
             region_name=self._settings.region,
         )
 
+    @property
+    def bucket(self) -> str:
+        return self._settings.bucket
+
+    def probe_bucket(self, *, timeout_seconds: float = 5.0) -> None:
+        """HEAD the bucket once with short timeouts and no retries (System Health's live
+        probe, 2026-10-31). Raises P2DocumentStorageError when it does not answer."""
+        import boto3
+        from botocore.config import Config
+        from botocore.exceptions import BotoCoreError, ClientError
+
+        client = boto3.client(
+            "s3",
+            endpoint_url=self._settings.endpoint_url,
+            aws_access_key_id=self._settings.access_key_id,
+            aws_secret_access_key=self._settings.secret_access_key,
+            region_name=self._settings.region,
+            config=Config(connect_timeout=min(timeout_seconds, 3.0), read_timeout=timeout_seconds,
+                          retries={"max_attempts": 1, "mode": "standard"}),
+        )
+        try:
+            client.head_bucket(Bucket=self._settings.bucket)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code") or exc.response.get("ResponseMetadata", {}).get(
+                "HTTPStatusCode")
+            raise P2DocumentStorageError(f"R2 answered {code}") from exc
+        except BotoCoreError as exc:
+            raise P2DocumentStorageError(f"R2 did not answer ({type(exc).__name__})") from exc
+
     def presign_put(self, object_key: str, *, content_type: str, expires_seconds: int = 900) -> str:
         from botocore.exceptions import BotoCoreError, ClientError
 
