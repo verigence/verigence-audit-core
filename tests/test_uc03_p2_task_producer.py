@@ -555,3 +555,36 @@ def test_an_empty_field_on_another_document_asks_nothing(journey):
         set_tenant_context(connection, journey.tenant_id)
         assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
                                        journey_id=journey.journey_id) == {}
+# ── a check waiting for facts closes the task it raised (2026-11-01) ─────────
+def _wait(journey, code, reason="No standard price on record yet: the model must be resolved first."):
+    registry = get_registry()
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        transition = write_control_state(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+            control=registry.controls[code], status="WAITING_FOR_FACTS", stage="BOOKING", reason=reason,
+        )
+        return apply_control_transitions(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+            transitions=[transition], evaluation_started_at=datetime.now(UTC),
+        )
+
+
+def test_a_waiting_check_closes_its_task_and_a_new_failure_reopens_it(journey):
+    """SHI-SS-261031-007: "Ex-showroom Rs 5,000 short" stayed open once the
+    model had no price list and the check could not run."""
+    assert _fail(journey, "PRICE_BOOKING_VS_INVOICE") == {"RAISED": 1}
+    assert _wait(journey, "PRICE_BOOKING_VS_INVOICE") == {"CLOSED_WAITING": 1}
+    task = _task(journey, "control:PRICE_BOOKING_VS_INVOICE")
+    assert task["task_status"] == "VERIFIED_COMPLETE"
+    assert task["completion_result"]["machineVerification"] == "WAITING_FOR_FACTS"
+    assert task["completion_result"]["waitingFor"].startswith("No standard price on record yet")
+    assert _wait(journey, "PRICE_BOOKING_VS_INVOICE") == {}  # nothing open: nothing to close
+    assert _fail(journey, "PRICE_BOOKING_VS_INVOICE", right="2600000") == {"REOPENED": 1}
+    assert _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_status"] == "READY"
+
+
+def test_a_waiting_that_is_the_ask_keeps_its_task(journey):
+    assert _fail(journey, "BOOKING_DATE_UNUSABLE") == {"RAISED": 1}
+    assert _wait(journey, "BOOKING_DATE_UNUSABLE", reason="This deal has no date it can be priced on") == {}
+    assert _task(journey, "control:BOOKING_DATE_UNUSABLE")["task_status"] == "READY"

@@ -493,6 +493,32 @@ def resolve_if_open(connection: Connection, *, tenant_id: str, journey_id: UUID,
 # delivery has started (2026-10-28).
 QUESTION_TASK_TYPES = frozenset({"PC_CONFIRMATION"})
 
+# A check that cannot run now (WAITING_FOR_FACTS) closes the task it raised when
+# it failed (product owner 2026-11-01): the task's figures are ones the check no
+# longer stands behind ("Ex-showroom Rs 5,000 short" on SHI-SS-261031-007 once
+# its model had no price list), and what it waits for has its own task -- the
+# booking date, the model, the account statement. It is raised again, with the
+# figures as they then are, when the check fails again (a closed task reopens).
+# These checks' waiting IS the ask, so their task stays open.
+WAITING_IS_THE_ASK = frozenset({
+    "BOOKING_DATE_UNUSABLE",          # "No usable booking date": correct the date
+    "BK_MIN_BOOKING_AMOUNT_NOT_MET",  # upload receipts up to the minimum booking amount
+    "BK_MIN_BOOKING_PROOF_PRESENT",
+})
+
+
+def close_waiting_task(connection: Connection, *, tenant_id: str, journey_id: UUID, control_code: str,
+                       waiting_for: str | None) -> UUID | None:
+    """Close the open task of a check that is waiting for facts. None if none is open."""
+    return resolve_if_open(
+        connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=f"control:{journey_id}:{control_code}",
+        evidence={"machineVerification": "WAITING_FOR_FACTS", "controlCode": control_code,
+                  "controlStatus": "WAITING_FOR_FACTS", "waitingFor": waiting_for,
+                  "closedBecause": "The check cannot run until this is on file; it is raised again with "
+                                   "current figures if it fails then.",
+                  "verifiedAt": datetime.now(UTC).isoformat()},
+    )
+
 
 def apply_control_transitions(
     connection: Connection,
@@ -571,8 +597,18 @@ def apply_control_transitions(
                 evidence={"controlCode": control.code, "controlStatus": transition.current,
                           "verifiedAt": datetime.now(UTC).isoformat()},
             ) else "NONE"
+        elif transition.current == "WAITING_FOR_FACTS" and control.code not in WAITING_IS_THE_ASK:
+            waiting_for = connection.execute(
+                text("SELECT status_reason FROM auditcore.p2_control_state "
+                     "WHERE tenant_id=:t AND journey_id=:j AND control_code=:c"),
+                {"t": tenant_id, "j": journey_id, "c": control.code},
+            ).scalar_one_or_none()
+            if close_waiting_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                  control_code=control.code, waiting_for=waiting_for) is None:
+                continue
+            outcome = "CLOSED_WAITING"
         else:
-            continue  # waiting / technical states keep verification pending
+            continue  # technical states (and a waiting that is the ask) keep verification pending
         counts[outcome] = counts.get(outcome, 0) + 1
     return counts
 
