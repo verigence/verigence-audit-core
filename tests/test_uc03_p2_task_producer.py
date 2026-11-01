@@ -28,6 +28,7 @@ from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_task_producer import (
     apply_control_transitions,
     format_value,
+    raise_or_refresh,
     sync_booking_date_task,
     sync_field_review_tasks,
 )
@@ -415,25 +416,81 @@ def _stage_run(journey, code, *, status, stage):
 
 
 def test_one_stage_passing_does_not_close_the_other_stage_failure(journey):
-    """MANUAL_VERIFICATION runs once per stage but keeps one task per Journey:
+    """A native check that runs once per stage keeps one task per Journey:
     clean booking documents must not close the task the delivery documents keep
-    open, run after run (2,878 reopenings in three days, 2026-10-30)."""
+    open, run after run (MANUAL_VERIFICATION, 2,878 reopenings in three days,
+    2026-10-30; it raises no check task of its own since 2026-11-01, so the
+    rule is shown on PAYMENT_BANK_UNMATCHED, which runs the same way)."""
     # A delivery document on file: the delivery is active, so NATIVE:DELIVERY
     # runs alongside NATIVE:BOOKING on every evaluation.
     add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
-    _, _, task = _stage_run(journey, "MANUAL_VERIFICATION", status="FAIL", stage="DELIVERY")
+    code = "PAYMENT_BANK_UNMATCHED"
+    _, _, task = _stage_run(journey, code, status="FAIL", stage="DELIVERY")
     assert task["task_status"] == "READY" and task["round_number"] == 1
 
-    transition, counts, task = _stage_run(journey, "MANUAL_VERIFICATION", status="PASS", stage="BOOKING")
+    transition, counts, task = _stage_run(journey, code, status="PASS", stage="BOOKING")
     assert transition.current == "FAIL" and transition.stage == "DELIVERY"
     assert counts.get("VERIFIED", 0) == 0
     assert task["task_status"] == "READY" and task["round_number"] == 1
 
     # Repeating the pair changes nothing: no close, no reopen, no new round.
-    _stage_run(journey, "MANUAL_VERIFICATION", status="FAIL", stage="DELIVERY")
-    _, _, task = _stage_run(journey, "MANUAL_VERIFICATION", status="PASS", stage="BOOKING")
+    _stage_run(journey, code, status="FAIL", stage="DELIVERY")
+    _, _, task = _stage_run(journey, code, status="PASS", stage="BOOKING")
     assert task["task_status"] == "READY" and task["round_number"] == 1
 
     # The delivery documents' own run clearing is what closes it.
-    _, counts, task = _stage_run(journey, "MANUAL_VERIFICATION", status="PASS", stage="DELIVERY")
+    _, counts, task = _stage_run(journey, code, status="PASS", stage="DELIVERY")
     assert counts.get("VERIFIED") == 1 and task["task_status"] == "VERIFIED_COMPLETE"
+
+
+@pytest.mark.parametrize("code", ["WRONG_DOCUMENT", "MANUAL_VERIFICATION", "INVOICE_SKU_MISMATCH"])
+def test_a_check_whose_problem_has_its_own_task_raises_no_empty_one(journey, code):
+    """2026-11-01: these checks raised "The audit check failed. Review the
+    related documents." with no document (993 open); what they found is on the
+    PC's own task (the customer-name task, the field review task, the SKU
+    task). The result stays on the ledger; no check task is raised, and one
+    left open is cancelled with the reason."""
+    stage = "DELIVERY" if code == "INVOICE_SKU_MISMATCH" else "BOOKING"
+    transition, counts, task = _stage_run(journey, code, status="FAIL", stage=stage)
+    assert transition.current == "FAIL" and task is None and counts == {"OWN_TASK": 1}
+
+    # One raised before 2026-11-01 is cancelled on the next run, whatever the result.
+    registry = get_registry()
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        task_id, raised = raise_or_refresh(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+            dedupe_key=f"control:{journey.journey_id}:{code}", task_type=registry.controls[code].task_type,
+            source_type="RULE", source_code=code, title=code.replace("_", " ").capitalize(),
+            description="The audit check failed. Review the related documents.", reference={},
+            severity="HIGH", registry=registry,
+        )
+    assert raised == "RAISED"
+    _, counts, task = _stage_run(journey, code, status="FAIL", stage=stage)
+    assert task["task_status"] == "CANCELLED" and counts == {"OWN_TASK": 1}
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        result, event = connection.execute(
+            text("SELECT t.completion_result, (SELECT e.event_type FROM auditcore.p2_task_events e "
+                 "WHERE e.tenant_id=t.tenant_id AND e.task_id=t.task_id ORDER BY e.task_event_id DESC LIMIT 1) "
+                 "FROM auditcore.p2_tasks t WHERE t.tenant_id=:t AND t.task_id=:id"),
+            {"t": journey.tenant_id, "id": task_id},
+        ).one()
+    assert result["outcome"] == "OWN_TASK" and event == "CANCELLED"
+    # And it stays cancelled: a later failure raises nothing again.
+    _, _, task = _stage_run(journey, code, status="FAIL", stage=stage)
+    assert task["task_status"] == "CANCELLED"
+
+
+def test_the_field_review_task_of_manual_verification_is_untouched(journey):
+    """The field review tasks carry source code MANUAL_VERIFICATION too: only the
+    check's own task (control:<journey>:MANUAL_VERIFICATION) goes."""
+    document = add_ready_document(journey, "aadhaar", aadhaar_number="1234")
+    add_extracted_field(journey, di_document_id=document, field_key="aadhaar_name",
+                        value="SMRUTI", confidence=71.0, document_type="aadhaar")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {"RAISED": 1}
+    _stage_run(journey, "MANUAL_VERIFICATION", status="FAIL", stage="BOOKING")
+    assert _task(journey, f"field-review:{document}")["task_status"] == "READY"

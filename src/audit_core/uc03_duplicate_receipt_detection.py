@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
@@ -144,8 +145,14 @@ class DuplicateGroup:
 def _receipt_documents(
     connection: Connection, *, tenant_id: str, journey_id: UUID
 ) -> list[ReceiptRecord]:
-    """One row per receipt document with its latest receipt_number/amount_paid/
-    receipt_date, read from durable storage only (never DI directly)."""
+    """One row per receipt document still on the booking (ACTIVE evidence) with
+    its latest receipt_number/amount_paid/receipt_date, read from durable
+    storage only (never DI directly).
+
+    Only documents on the booking (2026-11-01): a copy replaced by a re-upload,
+    a page merged into its document, or another customer's file taken out of
+    the booking kept its read fields, and was paired with the copy that
+    replaced it as "the same receipt uploaded twice" (UTK-SU-261020-002)."""
     rows = connection.execute(
         text(
             """
@@ -163,6 +170,10 @@ def _receipt_documents(
                   AND f.source_document_type_key = ANY(:document_types)
                   AND f.field_key = ANY(:field_keys)
                   AND f.effective_value IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM auditcore.evidence e
+                      WHERE e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+                        AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE')
             )
             SELECT di_document_id, stage_code, document_type_key, field_key, effective_value
             FROM ranked WHERE row_rank = 1
@@ -262,6 +273,76 @@ def compute_duplicate_groups(documents: list[ReceiptRecord]) -> list[DuplicateGr
 
     return groups
 
+
+
+def describe_group(group: DuplicateGroup) -> dict[str, Any]:
+    """One group as plain facts: the receipt number (or none), the amount,
+    the dates read, whether they agree, and the documents."""
+    return {
+        "matchBasis": group.match_basis,
+        "receiptNumber": group.documents[0].receipt_number if group.documents else None,
+        "amount": str(group.amount),
+        "dates": sorted({d.receipt_date for d in group.documents if d.receipt_date}),
+        "datesMatch": group.dates_match,
+        "documentIds": [str(d.document_id) for d in group.documents],
+    }
+
+
+def _day(value: str) -> str:
+    try:
+        return date.fromisoformat(value[:10]).strftime("%d %b %Y")
+    except ValueError:
+        return value
+
+
+def duplicate_receipt_finding(groups: list[dict[str, Any]]) -> dict[str, Any]:
+    """What the check's task says (2026-11-01): which receipt is on the
+    booking more than once, for how much, and whether it is counted once.
+    Before, the task read "The audit check failed. Review the related
+    documents." and named none. ``groups`` as ``describe_group`` gives them.
+
+    Counted once: the payments drop a later copy with the same receipt
+    number, amount and date (uc03_p2_journey360._duplicate_receipts); copies
+    whose dates differ are each still counted until one is corrected."""
+    from audit_core.uc03_p2_task_producer import format_value
+
+    if not groups:
+        return {}
+    sentences: list[str] = []
+    titles: list[str] = []
+    for group in groups:
+        copies = len(group["documentIds"])
+        amount = format_value("amount", group["amount"])
+        dates = [_day(d) for d in group["dates"]]
+        if group["receiptNumber"]:
+            titles.append(str(group["receiptNumber"]))
+            if group["datesMatch"]:
+                when = f", dated {dates[0]}," if dates else ""
+                sentences.append(f"Receipt {group['receiptNumber']} for {amount}{when} is on the booking "
+                                 f"{copies} times. It is counted once toward what the customer paid.")
+            else:
+                sentences.append(f"Receipt {group['receiptNumber']} for {amount} is on the booking {copies} "
+                                 f"times, read with different dates ({', '.join(dates)}). Each copy is still "
+                                 "counted toward what the customer paid until the date is corrected or the "
+                                 "extra copy is deleted.")
+        else:
+            titles.append(f"{amount} on {dates[0] if dates else 'the same day'}")
+            sentences.append(f"{copies} receipts for {amount} dated {dates[0] if dates else 'the same day'} "
+                             "show no readable receipt number. They are counted once toward what the customer "
+                             "paid.")
+    if len(groups) == 1:
+        group = groups[0]
+        title = (f"Receipt {group['receiptNumber']} uploaded {len(group['documentIds'])} times"
+                 if group["receiptNumber"] else f"Receipts for {titles[0]} look like one receipt")
+    else:
+        title = f"{len(groups)} receipts uploaded more than once: {', '.join(titles)}"
+    sentences.append("Delete the extra copy if the same receipt was uploaded twice. If these are separate "
+                     "payments, correct the receipt number or date that was misread.")
+    return {
+        "findingTitle": title[:300],
+        "findingDescription": " ".join(sentences),
+        "documentIds": list(dict.fromkeys(d for g in groups for d in g["documentIds"])),
+    }
 
 
 def _effect_key(tenant_id: str, journey_id: UUID, rule_key: str) -> str:
@@ -435,6 +516,8 @@ def sync_duplicate_receipt_detection(
             "resolved": resolved,
             "groupCount": len(groups),
             "examined": len(documents),
+            # Which receipts, so the check's task can say so (2026-11-01).
+            "groups": [describe_group(g) for g in groups],
         }
     except Exception:
         logger.warning("sync_duplicate_receipt_detection failed", exc_info=True)

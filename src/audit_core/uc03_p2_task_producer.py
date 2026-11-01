@@ -255,11 +255,35 @@ SUPPRESSED_TASK_RESULT = {
     "reason": "Cash transactions raise no tasks (product owner, 2026-10-31)",
 }
 
+# Checks whose problem already has its own task, naming the documents
+# (2026-11-01). The check's result stays on the ledger (and the Audit
+# Summary); the check raises no second task, and one left open is cancelled.
+# Each of them raised "The audit check failed. Review the related documents."
+# with no document in it -- 993 open on 2026-11-01 -- because what they found
+# is written on those tasks, not on an Audit Finding the check task can read:
+#   WRONG_DOCUMENT       the PC's "Customer name differs on ..." / "names another
+#                        dealership" task (sync_name_consistency_tasks; product
+#                        owner 2026-10-29: a wrong name is one PC task per Journey);
+#   MANUAL_VERIFICATION  the PC's field review task, one per document
+#                        (sync_field_review_tasks);
+#   INVOICE_SKU_MISMATCH the SKU task the invoice raised -- invoices disagree, price
+#                        differs, review the SKU, booking forms disagree
+#                        (uc03_model_resolution._document_tasks).
+# Only the check's own task (control:<journey>:<code>) is affected: the field
+# review tasks also carry source code MANUAL_VERIFICATION and are untouched.
+OWN_TASK_CODES = frozenset({"WRONG_DOCUMENT", "MANUAL_VERIFICATION", "INVOICE_SKU_MISMATCH"})
+OWN_TASK_RESULT = {
+    "outcome": "OWN_TASK",
+    "reason": "This check's problem has its own task, which names the documents (2026-11-01)",
+}
+
 
 def cancel_suppressed_task(connection: Connection, *, tenant_id: str, journey_id: UUID,
-                           dedupe_key: str) -> UUID | None:
+                           dedupe_key: str, result: dict[str, Any] | None = None) -> UUID | None:
     """Cancel the open task under ``dedupe_key`` as a check that raises no
-    task (CHECK_RETIRED, with a CANCELLED task event). None if none is open."""
+    task (``result``, CHECK_RETIRED by default, with a CANCELLED task event).
+    None if none is open."""
+    result = result or SUPPRESSED_TASK_RESULT
     existing = _existing(connection, tenant_id=tenant_id, dedupe_key=dedupe_key)
     if existing is None or str(existing["task_status"]) not in _OPEN:
         return None
@@ -274,11 +298,12 @@ def cancel_suppressed_task(connection: Connection, *, tenant_id: str, journey_id
             WHERE tenant_id=:t AND task_id=:id
             """
         ),
-        {"t": tenant_id, "id": task_id, "result": _json(SUPPRESSED_TASK_RESULT)},
+        {"t": tenant_id, "id": task_id, "result": _json(result)},
     )
     record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id, task_id=task_id,
                       event_type="CANCELLED", actor_id="SYSTEM", actor_role_code="SYSTEM",
-                      details={**SUPPRESSED_TASK_RESULT, "sourceCode": existing.get("source_code")})
+                      details={**result, "sourceCode": existing.get("source_code"),
+                               "previousStatus": str(existing["task_status"])})
     return task_id
 
 
@@ -489,6 +514,13 @@ def apply_control_transitions(
             # whatever the result, no task; one left open is cancelled.
             cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key)
             counts["SUPPRESSED"] = counts.get("SUPPRESSED", 0) + 1
+            continue
+        if control.code in OWN_TASK_CODES:
+            # Its problem has its own task, naming the documents (2026-11-01):
+            # no second, empty one; one left open is cancelled.
+            cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                                   result=OWN_TASK_RESULT)
+            counts["OWN_TASK"] = counts.get("OWN_TASK", 0) + 1
             continue
         if transition.current == "FAIL" and control.task_type in QUESTION_TASK_TYPES:
             # The PC's questions (accessories fitted? who paid?)

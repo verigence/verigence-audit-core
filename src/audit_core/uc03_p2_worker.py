@@ -4698,6 +4698,9 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         "WAITING_CORRECTIONS": ("audit_core.uc03_waiting_corrections", "run_waiting_corrections"),
         # Cash transactions raise no tasks (product owner, 2026-10-31).
         "CASH_TASK_CLEANUP": ("audit_core.uc03_cash_task_cleanup", "run_cash_task_cleanup"),
+        # Audit tasks that named no document, and documents the old name check
+        # held out of their bookings (2026-11-01): see uc03_audit_task_cleanup.
+        "AUDIT_TASK_CLEANUP": ("audit_core.uc03_audit_task_cleanup", "run_audit_task_cleanup"),
         "DISCOUNT_VARIANCE_RECOMPUTE": ("audit_core.uc03_discount_variance_recompute",
                                         "run_discount_variance_recompute"),
         "ACCESSORY_INVOICE_REPAIR": ("audit_core.uc03_accessory_invoice_repair", "run_accessory_invoice_repair"),

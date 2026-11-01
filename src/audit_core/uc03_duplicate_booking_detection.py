@@ -758,6 +758,75 @@ def _void_open_finding_with_stale_basis(
         return False
 
 
+def _void_cleared_finding(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, rule_key: str, correlation_id: str,
+) -> bool:
+    """A pair the system cleared ("No longer matches an earlier booking after
+    correction") that matches again is raised afresh (2026-11-01).
+
+    ``_machine_flag`` reuses the latest finding that is not VOIDED, a
+    RESOLVED one included, so a pair cleared once and matched again was
+    counted as raised with no open finding: its check task had nothing to
+    show and read "The audit check failed. Review the related documents."
+    (UTK-RM-261019-002, UTK-SB-261027-004 and four more on 2026-11-01). The
+    system's own clearing (disposition FIXED, by no one) is voided, as a
+    finding raised on a stale basis is, and ``_machine_flag`` then raises a
+    fresh one with what matches now. A Team Lead's verdict (a confirmed
+    breach, a false positive) is a person's decision and stays."""
+    try:
+        with connection.begin_nested():
+            row = connection.execute(
+                text(
+                    """
+                    SELECT audit_finding_id, finding_status, disposition, resolved_by_actor_id
+                    FROM auditcore.audit_findings
+                    WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND stage_code=:stage
+                      AND rule_key=:rule_key AND finding_status <> 'VOIDED'
+                    ORDER BY created_at_utc DESC, audit_finding_id DESC
+                    LIMIT 1
+                    """
+                ),
+                {"tenant_id": tenant_id, "journey_id": journey_id, "stage": _STAGE, "rule_key": rule_key},
+            ).mappings().one_or_none()
+            if (row is None or row["finding_status"] != "RESOLVED" or row["disposition"] != "FIXED"
+                    or row["resolved_by_actor_id"] is not None):
+                return False
+            note = "Matches the other booking again after it was cleared; raised again with what matches now."
+            voided = connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.audit_findings
+                    SET finding_status = 'VOIDED', resolution_reason = :note,
+                        updated_at_utc = now(), version_no = version_no + 1
+                    WHERE tenant_id = :tenant_id AND audit_finding_id = :finding_id
+                      AND finding_status = 'RESOLVED'
+                    """
+                ),
+                {"tenant_id": tenant_id, "finding_id": row["audit_finding_id"], "note": note},
+            )
+            if voided.rowcount != 1:
+                return False
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO auditcore.audit_finding_events (
+                        tenant_id, audit_finding_id, journey_id, stage_code,
+                        event_type, actor_id, actor_role_snapshot, safe_payload, correlation_id
+                    ) VALUES (
+                        :tenant_id, :finding_id, :journey_id, :stage,
+                        'VOIDED', NULL, 'SYSTEM', CAST(:payload AS jsonb), :correlation_id
+                    )
+                    """
+                ),
+                {"tenant_id": tenant_id, "finding_id": row["audit_finding_id"], "journey_id": journey_id,
+                 "stage": _STAGE, "payload": json.dumps({"note": note}), "correlation_id": correlation_id},
+            )
+            return True
+    except Exception:
+        logger.warning("duplicate booking cleared finding refresh failed", exc_info=True)
+        return False
+
+
 def _resolve_reverse_finding(
     connection: Connection, *, tenant_id: str, holder_journey_id: UUID, duplicate_journey_id: UUID,
     correlation_id: str,
@@ -865,6 +934,10 @@ def sync_duplicate_booking_detection(
             _void_open_finding_with_stale_basis(
                 connection, tenant_id=tenant_id, journey_id=journey_id,
                 rule_key=rule_key, basis=basis, correlation_id=correlation_id,
+            )
+            _void_cleared_finding(
+                connection, tenant_id=tenant_id, journey_id=journey_id,
+                rule_key=rule_key, correlation_id=correlation_id,
             )
             _machine_flag(
                 connection,
