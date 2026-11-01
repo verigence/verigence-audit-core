@@ -169,3 +169,25 @@ def test_the_entered_name_guard_still_holds_without_the_setting(journey):
         connection.execute(text("UPDATE auditcore.customers SET display_name='Somebody Else' WHERE tenant_id=:t "
                                 "AND customer_id=:c"), {"t": journey.tenant_id, "c": journey.customer_id})
     assert _customer(journey)["display_name"] == "P2 Customer"
+
+
+def test_a_masked_entered_name_follows_the_full_name_of_the_same_customer(journey, monkeypatch):
+    """ADI-RD-261026-036: entered as "KXXXXXI RXXT" (the masked PAN, the first
+    name read); once the receipt names him KALANDI ROUT the entered name does too.
+    A masked entered name that does not fit stays."""
+    monkeypatch.delenv("P2_FILE_IDENTITY_ENFORCE", raising=False)
+    requirements = fid._requirements(journey)
+    fid._upload(journey, requirements, "Kalandi Rout.pdf", 0, [
+        ("pan_card", "pan_card", {"pan_number": "ASZPR9676E", "pan_name": "KXXXXXI RXXT"}),
+        ("payment_receipt", "dealer_receipt", {"customer_name": "KALANDI ROUT-ASZPR9676E"}),
+    ])
+    _entered(journey, "KXXXXXI RXXT")
+    fid._settle(journey)
+    assert _customer(journey) == {"display_name": "KALANDI ROUT", "legal_name": "KALANDI ROUT",
+                                  "legal_name_status": "VERIFIED"}
+    [followed] = _events(journey, "ENTERED_NAME_FOLLOWS_CUSTOMER")
+    assert followed["reason"] == "The entered name was the masked PAN name of the same customer."
+    _entered(journey, "SXXXXXXA SXXXO")  # somebody else's letters
+    fid._settle(journey)
+    assert _customer(journey)["display_name"] == "SXXXXXXA SXXXO"
+
