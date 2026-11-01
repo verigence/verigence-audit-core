@@ -388,6 +388,25 @@ class _Facts:
         ).scalar_one_or_none()
         return " ".join(str(row).split()) if row else None
 
+    @cached_property
+    def customer_pans(self) -> set[str]:
+        """The customer's PAN numbers, as read on the PAN cards on the booking."""
+        from audit_core.uc03_p2_file_identity import pans_in_text
+
+        rows = self.connection.execute(
+            text(
+                """
+                SELECT x.effective_value #>> '{}' FROM auditcore.evidence e
+                JOIN auditcore.journey_document_extracted_fields x
+                  ON x.tenant_id=e.tenant_id AND x.journey_id=e.journey_id AND x.di_document_id=e.di_document_id
+                WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='ACTIVE'
+                  AND e.document_type_key='pan_card' AND x.field_key='pan_number'
+                """
+            ),
+            self._params,
+        ).scalars().all()
+        return {pan for value in rows for pan in pans_in_text(value)}
+
     def documents(self, *types: str) -> list[dict[str, Any]]:
         from audit_core.uc03_p2_journey360 import _document_facts
 
@@ -1075,15 +1094,25 @@ def _remark(answer: dict[str, Any]) -> str:
 
 
 def _third_party(facts: _Facts) -> list[dict[str, Any]]:
+    from audit_core.uc03_p2_file_identity import pans_in_text
+
     name = facts.customer_name
     if not name:
         return []
+    own = facts.customer_pans
+
+    def customers(payer: str | None) -> bool:
+        # A payer printed with the customer's own PAN, or a GSTIN holding it, is
+        # the customer or their own firm (2026-11-01: "MATRUKRUPA ENTERPRISERS-
+        # AOIPS3191J" paid for Pradipta Kumar Sahoo, PAN AOIPS3191J).
+        return not payer or same_person(name, payer) or bool(own.intersection(pans_in_text(payer)))
+
     out = []
     for r in facts.receipts:
         payer = r["payer"]
         other = r["counterparty"] if r["counterparty"] and not any(ch.isdigit() or ch == "/" for ch in r["counterparty"]) else None
-        if (payer and not same_person(name, payer)) or (other and not same_person(name, other)):
-            out.append({**r, "by": payer if payer and not same_person(name, payer) else other})
+        if not customers(payer) or not customers(other):
+            out.append({**r, "by": payer if not customers(payer) else other})
     return out
 
 

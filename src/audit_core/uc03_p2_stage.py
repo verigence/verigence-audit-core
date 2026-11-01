@@ -578,6 +578,85 @@ def unread_receipt_amounts(
         )
     return pending
 
+
+# The name on a KYC document that was not read, while no KYC on the booking
+# names the customer (2026-11-01). The booking then has no customer name, the
+# old name check holds every other named document out of the booking until it
+# has one, and nothing asked for the name: SHI-SM-261023-003 and
+# UTK-SB-261029-006 (an Aadhaar whose name was not read; the invoices, the
+# insurance and the docket of UTK-SB-261029-006 all held).
+KYC_NAME_FIELDS = {"pan_card": "pan_name", "aadhaar": "aadhaar_name"}
+
+
+def unread_kyc_names(
+    connection: Connection, registry: Registry, *, tenant_id: str, journey_id: UUID,
+) -> list[dict[str, Any]]:
+    """KYC documents on a booking with no customer name whose name was not
+    read, not entered by a PC and not confirmed by one."""
+    named = connection.execute(
+        text(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM auditcore.journeys j
+                JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+                WHERE j.tenant_id=:t AND j.journey_id=:j AND c.legal_name_status='VERIFIED'
+                  AND c.legal_name IS NOT NULL AND btrim(c.legal_name) <> '')
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
+    if named:
+        return []
+    rows = connection.execute(
+        text(
+            """
+            SELECT DISTINCT ON (f.di_document_id)
+                   f.di_document_id, f.field_key, f.source_canonical_field_id, f.source_fact_version,
+                   e.document_type_key, e.process_area
+            FROM auditcore.journey_document_extracted_fields f
+            JOIN auditcore.evidence e
+              ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id
+             AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
+            WHERE f.tenant_id=:t AND f.journey_id=:j
+              AND ((e.document_type_key='pan_card' AND f.field_key='pan_name')
+                   OR (e.document_type_key='aadhaar' AND f.field_key='aadhaar_name'))
+              AND (f.effective_value IS NULL OR f.effective_value IN ('null'::jsonb, '""'::jsonb))
+              AND f.reviewed_at_utc IS NULL AND f.is_modified = false
+              AND NOT EXISTS (
+                  SELECT 1 FROM auditcore.journey_document_extracted_fields g
+                  WHERE g.tenant_id=f.tenant_id AND g.journey_id=f.journey_id AND g.di_document_id=f.di_document_id
+                    AND g.field_key=f.field_key
+                    AND (g.reviewed_at_utc IS NOT NULL OR g.is_modified
+                         OR (g.effective_value IS NOT NULL AND g.effective_value NOT IN ('null'::jsonb, '""'::jsonb))))
+            ORDER BY f.di_document_id, f.source_fact_version DESC NULLS LAST
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    pending: list[dict[str, Any]] = []
+    for row in rows:
+        area = str(row["process_area"] or "").upper() or None
+        template = registry.template_for_di_type(canonical_di_type(row["document_type_key"]), stage=area)
+        if template.is_supporting:
+            continue
+        field_key = str(row["field_key"])
+        pending.append(
+            {
+                "documentId": str(row["di_document_id"]),
+                "templateKey": template.key,
+                "documentName": template.display_name,
+                "fieldKey": field_key,
+                "canonicalFieldId": row["source_canonical_field_id"],
+                "sourceFactVersion": int(row["source_fact_version"] or 1),
+                "confidence": None,
+                "threshold": template.review_threshold_for(field_key),
+                "value": None,
+                "reasons": [NOT_READ],
+                "severity": "HIGH",
+            }
+        )
+    return pending
+
 # ── conditional -> mandatory, from document evidence ─────────────────────────
 # Conditions named by the requirements document (section 3). Each becomes
 # true from evidence on the Journey's own documents -- booking form,

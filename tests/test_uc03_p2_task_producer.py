@@ -588,3 +588,32 @@ def test_a_waiting_that_is_the_ask_keeps_its_task(journey):
     assert _fail(journey, "BOOKING_DATE_UNUSABLE") == {"RAISED": 1}
     assert _wait(journey, "BOOKING_DATE_UNUSABLE", reason="This deal has no date it can be priced on") == {}
     assert _task(journey, "control:BOOKING_DATE_UNUSABLE")["task_status"] == "READY"
+
+
+# ── a KYC name not read, on a booking with no customer name (2026-11-01) ────
+def test_an_aadhaar_with_no_name_read_asks_the_pc_to_enter_it_while_the_booking_is_unnamed(journey):
+    """UTK-SB-261029-006: the Aadhaar's name was not read; the booking had no
+    customer name and its invoices, insurance and docket stayed held."""
+    aadhaar = add_ready_document(journey, "aadhaar", aadhaar_number="123412341234")
+    add_extracted_field(journey, di_document_id=aadhaar, field_key="aadhaar_name", value=None, confidence=None,
+                        document_type="aadhaar")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {"RAISED": 1}
+    task = _task(journey, f"field-review:{aadhaar}")
+    assert task["title"] == "Enter the name on Aadhaar: it was not read"
+    assert "the booking has no customer name" in task["description"] and task["severity"] == "HIGH"
+    (field,) = task["reference"]["fields"]
+    assert field["fieldKey"] == "aadhaar_name" and field["reasons"] == ["NOT_READ"]
+    # Once the booking is named (a PAN read), the unread Aadhaar name asks nothing.
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("""UPDATE auditcore.customers c SET legal_name='P2 Customer', legal_name_status='VERIFIED'
+                    FROM auditcore.journeys j WHERE j.tenant_id=c.tenant_id AND j.customer_id=c.customer_id
+                      AND j.tenant_id=:t AND j.journey_id=:j"""),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {"VERIFIED": 1}

@@ -47,8 +47,10 @@ from audit_core.uc03_p2_runtime import (
 )
 from audit_core.uc03_p2_stage import (
     NOT_READ,
+    RECEIPT_AMOUNT_FIELD,
     statement_out_of_balance,
     statement_values,
+    unread_kyc_names,
     unread_receipt_amounts,
     unreviewed_fields,
 )
@@ -646,6 +648,9 @@ def sync_field_review_tasks(
     # A receipt whose amount was not read is not counted as paid: the PC enters
     # it from the page (2026-11-01).
     pending += unread_receipt_amounts(connection, registry, tenant_id=tenant_id, journey_id=journey_id)
+    # Nor is a booking whose KYC name was not read named, and its other named
+    # documents are held until it is: the PC enters the name (2026-11-01).
+    pending += unread_kyc_names(connection, registry, tenant_id=tenant_id, journey_id=journey_id)
     by_document: dict[str, list[dict[str, Any]]] = {}
     for item in pending:
         by_document.setdefault(item["documentId"], []).append(item)
@@ -663,10 +668,16 @@ def sync_field_review_tasks(
                  if f["severity"] == "HIGH" and f not in gst and f not in unbalanced and f not in unread]
         uncertain = [f for f in fields if f["severity"] != "HIGH"]
         sentences = []
-        if unread:
+        unread_amount = any(f["fieldKey"] == RECEIPT_AMOUNT_FIELD for f in unread)
+        if unread_amount:
             sentences.append(
                 f"The amount paid on the {name} was not read, so this receipt is not counted toward what the "
                 "customer paid. Enter the amount printed on the page; if the page is not a receipt, say so."
+            )
+        elif unread:
+            sentences.append(
+                f"The name on the {name} was not read, so the booking has no customer name and its other "
+                "documents are not used until it has one. Enter the name printed on the page."
             )
         if unbalanced:
             totals = statement_out_of_balance(statement_values(connection, tenant_id=tenant_id, document_id=document_id))
@@ -699,7 +710,8 @@ def sync_field_review_tasks(
         severity = "HIGH" if dated or gst or unbalanced or unread else "MEDIUM"
         count = len(fields)
         title = (
-            f"Enter the amount on {name}: it was not read" if unread and len(fields) == 1
+            f"Enter the amount on {name}: it was not read" if unread_amount and len(fields) == 1
+            else f"Enter the name on {name}: it was not read" if unread and len(fields) == 1
             else f"Check the lines on {name}: they do not add up" if unbalanced
             else f"Check the GST on {name}" if gst and not dated and not uncertain
             else f"Check {count} date{'s' if count != 1 else ''} on {name}" if dated and not uncertain and not gst

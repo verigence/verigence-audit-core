@@ -150,3 +150,10 @@ def test_compare_lists_payments_and_ignores_write_stamps_and_sku_names() -> None
     named = {"journey_products": {"p": {"product_sku_id": None, "model_name_snapshot": "SCORPIO N"}}}
     assert rebuild.compare(unresolved, named)["journey_products"]["changed"] == 1
     assert rebuild.compare(after, after) == {}
+
+
+def test_compare_shows_the_values_of_a_changed_row() -> None:
+    before = {"discount_applications": {"d": {"discount_key": "CORPORATE", "actual_discount_amount": 5000}}}
+    after = {"discount_applications": {"d": {"discount_key": "CORPORATE", "actual_discount_amount": 0}}}
+    entry = rebuild.compare(before, after)["discount_applications"]
+    assert entry["values"] == [{"key": "CORPORATE", "actual_discount_amount": {"before": 5000, "after": 0}}]

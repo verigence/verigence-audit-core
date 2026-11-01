@@ -273,6 +273,20 @@ def test_a_payment_by_the_customer_is_not_third_party(journey):
     assert result["THIRD_PARTY_PAYMENT_UNDECLARED"].outcome == "PASS"
 
 
+def test_a_payment_with_the_customers_own_pan_is_not_third_party(journey):
+    """UTK-SB-261028-001: "MATRUKRUPA ENTERPRISERS-AOIPS3191J" paid; the
+    customer's PAN is AOIPS3191J. ADI-BM-261026-003: a GSTIN holding his PAN."""
+    _name(journey, "PRADIPTA KUMAR SAHOO")
+    add_ready_document(journey, "pan_card", pan_number="AOIPS3191J", pan_name="PRADIPTA KUMAR SAHOO")
+    _receipt(journey, "3036490", TODAY - timedelta(days=2), "R-1", payer="MATRUKRUPA ENTERPRISERS-AOIPS3191J")
+    _receipt(journey, "500000", TODAY - timedelta(days=2), "R-2", payer="MESSRS JAGANATH AGENCIES-21AOIPS3191J1ZW")
+    assert _run(journey, "BOOKING")["THIRD_PARTY_PAYMENT_UNCONFIRMED"].outcome == "PASS"
+    # Another PAN is someone else.
+    _receipt(journey, "30000", TODAY - timedelta(days=1), "R-3", payer="MADHULINA DIGAL-FBCPD9965H")
+    asked = _run(journey, "BOOKING")["THIRD_PARTY_PAYMENT_UNCONFIRMED"]
+    assert asked.outcome == "FAIL" and "MADHULINA DIGAL" in asked.reason and "MATRUKRUPA" not in asked.reason
+
+
 # ---------------------------------------------------- settlement windows
 
 
