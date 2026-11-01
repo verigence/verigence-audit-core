@@ -14,7 +14,8 @@ This job, per Project, builds every booking with documents on file again in a
 savepoint that is ALWAYS rolled back, and compares what the build would write
 with what is stored: payments, the vehicle, the customer, the booking, the
 commercial lines, discounts, add-ons, finance, insurance, registration,
-vehicle and delivery records. It logs per booking what would change. With a
+vehicle and delivery records -- and the booking's field review tasks (a
+receipt whose amount was not read). It logs per booking what would change. With a
 tag ending in "-commit" it requests the stage recompute of the bookings that
 would change -- the worker's own recompute then builds them, exactly as after
 any document change. The job never writes a booking's values itself, and a
@@ -142,19 +143,40 @@ def compare(before: dict[str, dict[str, dict[str, Any]]],
     return changes
 
 
+def _field_review_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, str]:
+    return {str(r[0]): str(r[1]) for r in connection.execute(
+        text("SELECT dedupe_key, title FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+             "AND dedupe_key LIKE 'field-review:%' AND task_status = ANY(:open)"),
+        {"t": tenant_id, "j": journey_id, "open": list(_OPEN_TASKS)},
+    ).all()}
+
+
+_OPEN_TASKS = ("READY", "IN_PROGRESS", "RETURNED", "ACTION_COMPLETED", "VERIFYING")
+
+
 def rebuild_check(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     """Build the booking in a savepoint, always rolled back, and say what it
-    would change."""
+    would change. Its field review tasks too (2026-11-01): a receipt whose
+    amount was not read is asked for on the recompute this job requests."""
+    from audit_core.uc03_p2_task_producer import sync_field_review_tasks
     from audit_core.uc03_p2_worker import _materialize_journey
 
     before = snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
+    tasks_before = _field_review_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
     savepoint = connection.begin_nested()
     try:
         _materialize_journey(connection, tenant_id=tenant_id, journey_id=journey_id)
         after = snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
+        sync_field_review_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
+        tasks_after = _field_review_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
     finally:
         savepoint.rollback()
-    return compare(before, after)
+    changes = compare(before, after)
+    raised = sorted(title for key, title in tasks_after.items() if key not in tasks_before)
+    closed = sorted(title for key, title in tasks_before.items() if key not in tasks_after)
+    if raised or closed:
+        changes["fieldReviewTasks"] = {"raised": raised, "closed": closed}
+    return changes
 
 
 def _journeys(connection: Connection, tenant_id: str) -> list[dict[str, Any]]:
@@ -181,6 +203,7 @@ def rebuild_tenant(engine: Engine, *, tenant_id: str, tag: str, commit: bool) ->
     totals: dict[str, Any] = {"journeys": len(journeys), "wouldChange": 0, "byTable": Counter(),
                               "paymentsAdded": 0, "paymentsAddedAmount": Decimal("0.00"), "paymentsRemoved": 0,
                               "paymentsRemovedAmount": Decimal("0.00"), "paymentsChanged": 0, "vehicleChanged": 0,
+                              "fieldReviewRaised": 0, "fieldReviewClosed": 0,
                               "recomputeRequested": 0, "failed": 0}
     for journey in journeys:
         journey_id = UUID(str(journey["journey_id"]))
@@ -213,6 +236,8 @@ def rebuild_tenant(engine: Engine, *, tenant_id: str, tag: str, commit: bool) ->
                                                Decimal(0))
         totals["paymentsChanged"] += len(payments.get("changedPayments", []))
         totals["vehicleChanged"] += 1 if "journey_products" in changes else 0
+        totals["fieldReviewRaised"] += len(changes.get("fieldReviewTasks", {}).get("raised", []))
+        totals["fieldReviewClosed"] += len(changes.get("fieldReviewTasks", {}).get("closed", []))
         logger.info("booking_rebuild_item", tag=tag, tenant_id=tenant_id, commit=commit, journey_id=str(journey_id),
                     reference=journey["journey_reference"], changes=changes)
     totals["byTable"] = dict(totals["byTable"])

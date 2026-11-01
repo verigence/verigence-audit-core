@@ -71,7 +71,7 @@ def _receipt(engine, tenant_id, journey_id, *, amount: str, number: str) -> str:
                             source_fact_version, stage_code, source_document_type_key, source_canonical_field_id,
                             field_key, extracted_value, effective_value, confidence_score, is_modified)
                         VALUES (:t, :j, :ev, :d, NULL, 1, 'BOOKING', 'dealer_receipt', NULL, :fk,
-                                CAST(:v AS jsonb), CAST(:v AS jsonb), 0.92, false)"""),
+                                CAST(:v AS jsonb), CAST(:v AS jsonb), 92, false)"""),
                 {"t": tenant_id, "j": journey_id, "ev": evidence_id, "d": document_id, "fk": field_key,
                  "v": json.dumps(value)})
     return str(document_id)
@@ -141,3 +141,20 @@ def test_compare_lists_removed_and_changed_payments() -> None:
     assert changes["removed"] == 1 and changes["removedPayments"][0]["receiptNumber"] == "Y"
     assert changes["changedPayments"][0]["amountBefore"] == 100 and changes["changedPayments"][0]["columns"] == ["amount"]
     assert rebuild.compare(after, after) == {}
+
+
+def test_a_receipt_with_no_amount_read_is_found_for_its_field_review_task(booking) -> None:
+    """2026-11-01: 48 receipts on file had no amount read and no task; the
+    recompute this job requests raises it."""
+    engine, tenant_id, journey_id = booking
+    document_id = _receipt(engine, tenant_id, journey_id, amount="21000", number="R-3")
+    with engine.begin() as c:
+        set_tenant_context(c, tenant_id)
+        c.execute(text("UPDATE auditcore.journey_document_extracted_fields SET effective_value='null'::jsonb, "
+                       "extracted_value='null'::jsonb WHERE tenant_id=:t AND di_document_id=:d AND field_key='amount_paid'"),
+                  {"t": tenant_id, "d": document_id})
+        changes = rebuild.rebuild_check(c, tenant_id=tenant_id, journey_id=journey_id)
+    assert changes == {"fieldReviewTasks": {"raised": ["Enter the amount on Booking Payment Receipt: it was not read"],
+                                            "closed": []}}
+    totals = rebuild.rebuild_tenant(engine, tenant_id=tenant_id, tag="t", commit=False)
+    assert totals["wouldChange"] == 1 and totals["fieldReviewRaised"] == 1

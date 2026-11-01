@@ -134,3 +134,26 @@ def test_a_duplicate_booking_task_not_naming_the_other_booking_is_refreshed(jour
           description="This customer appears to match an earlier booking on this tenant (PAN match). Confirm ...")
     assert clean_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t", commit=False)["rerunByCode"] == {
         "DUPLICATE_BOOKING": 1}
+
+
+def _control_state(journey, code: str, status: str, reason: str) -> None:
+    _sql(journey, "INSERT INTO auditcore.p2_control_state (tenant_id, journey_id, control_code, executor_type, "
+                  "control_status, status_reason) VALUES (:t, :j, :c, 'NATIVE', :s, :r)", c=code, s=status, r=reason)
+
+
+def test_tasks_of_checks_now_waiting_are_closed_only_on_commit(journey):
+    waiting = _task(journey, "DEAL_UNDERCHARGED", description="Ex-showroom Rs 5,000 short")
+    _control_state(journey, "DEAL_UNDERCHARGED", "WAITING_FOR_FACTS", "No standard price on record yet.")
+    ask = _task(journey, "BOOKING_DATE_UNUSABLE", description="No usable booking date")
+    _control_state(journey, "BOOKING_DATE_UNUSABLE", "WAITING_FOR_FACTS", "This deal has no date it can be priced on")
+    failing = _task(journey, "PRICE_BOOKING_VS_INVOICE", description="Invoice total differs")
+    _control_state(journey, "PRICE_BOOKING_VS_INVOICE", "FAIL", "Invoice total differs")
+
+    dry = clean_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t", commit=False)
+    assert dry["waitingTasks"] == 1 and dry["waitingByCode"] == {"DEAL_UNDERCHARGED": 1} and dry["closedWaiting"] == 0
+    assert _status(journey, waiting) == "READY"
+    done = clean_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t-commit", commit=True)
+    assert done["closedWaiting"] == 1
+    assert _status(journey, waiting) == "VERIFIED_COMPLETE"
+    assert _status(journey, ask) == "READY" and _status(journey, failing) == "READY"
+    assert clean_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t-commit", commit=True)["waitingTasks"] == 0

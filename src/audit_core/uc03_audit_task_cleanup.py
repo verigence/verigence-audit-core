@@ -24,6 +24,10 @@ This job, per Project:
    The dry run checks each booking in a savepoint and rolls it back, logging
    what would be released and the released receipts with no payment yet.
 
+4. closes the open task of every check now waiting for facts (2026-11-01,
+   uc03_p2_task_producer.WAITING_IS_THE_ASK aside): its figures are ones the
+   check no longer stands behind; it is raised again if the check fails.
+
 Started as worker job ``AUDIT_TASK_CLEANUP``. A DRY RUN (logged, nothing
 written) unless the tag ends with "-commit". Idempotent: a second run finds
 no task to cancel, no fallback task, and no hold to release.
@@ -44,7 +48,9 @@ from audit_core.uc03_p2_task_producer import (
     _OPEN,
     OWN_TASK_CODES,
     OWN_TASK_RESULT,
+    WAITING_IS_THE_ASK,
     _json,
+    close_waiting_task,
 )
 from audit_core.uc03_p2_tasks import record_task_event
 
@@ -131,6 +137,24 @@ def _rerun_native(connection: Connection, tenant_id: str, journey_id: UUID, tag:
                      work_key=f"unit:{journey_id}:{unit}", payload={"unit": unit, "force": True},
                      correlation_id=f"{JOB.lower()}:{tag}")
     return units
+
+
+def _waiting_tasks(connection: Connection, tenant_id: str) -> list[dict[str, Any]]:
+    return [dict(r) for r in connection.execute(
+        text(
+            """
+            SELECT t.journey_id, t.source_code, s.status_reason
+            FROM auditcore.p2_tasks t
+            JOIN auditcore.p2_control_state s
+              ON s.tenant_id=t.tenant_id AND s.journey_id=t.journey_id AND s.control_code=t.source_code
+            WHERE t.tenant_id=:t AND t.dedupe_key = 'control:' || t.journey_id::text || ':' || t.source_code
+              AND t.task_status = ANY(:open) AND s.control_status='WAITING_FOR_FACTS'
+              AND NOT (t.source_code = ANY(:ask))
+            ORDER BY t.journey_id, t.source_code
+            """
+        ),
+        {"t": tenant_id, "open": list(_OPEN), "ask": sorted(WAITING_IS_THE_ASK)},
+    ).mappings().all()]
 
 
 def _held_journeys(connection: Connection, tenant_id: str) -> list[UUID]:
@@ -231,7 +255,8 @@ def clean_tenant(engine: Engine, *, tenant_id: str, tag: str, commit: bool) -> d
     totals: dict[str, Any] = {"shells": 0, "shellsByCode": {}, "cancelled": 0, "rerunJourneys": 0,
                               "rerunByCode": {}, "heldJourneys": 0, "heldBefore": 0, "released": 0,
                               "releasedByType": Counter(), "stillHeld": 0, "newlyHeld": 0, "unpaidReceipts": 0,
-                              "unpaidAmount": Decimal(0), "recomputed": 0, "failed": 0}
+                              "unpaidAmount": Decimal(0), "recomputed": 0, "failed": 0,
+                              "waitingTasks": 0, "waitingByCode": {}, "closedWaiting": 0}
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
         shells = _own_task_shells(connection, tenant_id)
@@ -239,6 +264,17 @@ def clean_tenant(engine: Engine, *, tenant_id: str, tag: str, commit: bool) -> d
         totals["shellsByCode"] = dict(Counter(str(t["source_code"]) for t in shells))
         if commit:
             totals["cancelled"] = _cancel_shells(connection, tenant_id, shells, tag)
+
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        waiting = _waiting_tasks(connection, tenant_id)
+        totals["waitingTasks"] = len(waiting)
+        totals["waitingByCode"] = dict(Counter(str(t["source_code"]) for t in waiting))
+        if commit:
+            for task in waiting:
+                if close_waiting_task(connection, tenant_id=tenant_id, journey_id=UUID(str(task["journey_id"])),
+                                      control_code=str(task["source_code"]), waiting_for=task["status_reason"]):
+                    totals["closedWaiting"] += 1
 
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
