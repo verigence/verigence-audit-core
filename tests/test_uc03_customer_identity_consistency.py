@@ -791,3 +791,26 @@ def test_another_customers_document_is_still_held_and_released_once_corrected(jo
                    "WHERE tenant_id=:t AND di_document_id=:d"),
               {"v": json.dumps("Sanjaya Kumar Mohanty"), "t": c.tenant_id, "d": cover})
     assert _sync(c)["raised"] == 0 and _status(c, cover) == "PASSED"
+
+
+def test_a_document_is_never_newly_held_by_the_current_rule_alone(journey) -> None:
+    """UTK-JI-261026-005 (2026-11-01 trial): the first KYC read was a customer
+    KYC form in another name, so the current rule found Subrat Kumar Mallick's
+    own PAN, Aadhaar and booking form "in another name". This check passed them;
+    a hold needs both rules to agree, so none is held."""
+    c = journey
+    stray = _set_named_field(c, stage_code="BOOKING", document_type_key="customer_kyc",
+                             field_key="customer_name", value="RAJKUMAR SINGH")
+    pan = _set_named_field(c, stage_code="BOOKING", document_type_key="pan_card",
+                           field_key="pan_name", value="SUBRAT KUMAR MALLICK")
+    aadhaar = _set_named_field(c, stage_code="BOOKING", document_type_key="aadhaar",
+                               field_key="aadhaar_name", value="Subrat Kumar Mallick")
+    form = _set_named_field(c, stage_code="BOOKING", document_type_key="booking_form",
+                            field_key="customer_name", value="Subrat Kumar Mallick")
+    c.execute(text("UPDATE auditcore.evidence SET linked_at_utc = now() - interval '1 day' "
+                   "WHERE tenant_id=:t AND di_document_id=:d"), {"t": c.tenant_id, "d": stray})  # read first
+    _hold(c, stray)
+    result = _sync(c)
+    assert result["raised"] == 0
+    assert [_status(c, d) for d in (pan, aadhaar, form)] == ["PASSED", "PASSED", "PASSED"]
+    assert _status(c, stray) == "PASSED"  # the current rule's reference: released, not flagged by it

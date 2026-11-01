@@ -604,16 +604,32 @@ def sync_customer_identity_consistency(
         live_rule_keys: set[str] = set()
 
         documents = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
-        # Whose name each document is in is decided by the current name rule
-        # (2026-11-01; uc03_p2_task_producer.customer_name_check), the one the
-        # PC's "Customer name differs" task follows -- masked PANs, a GST
-        # certificate's proprietor, a firm's name, honorifics and the PAN a
-        # receipt prints after the name included. This check's own fuzzy match
-        # held 741 documents' values out of their bookings on 2026-11-01, about
-        # 650 of them documents that rule accepts.
+        # A document is held only when BOTH rules say it is another customer's
+        # (2026-11-01): the current name rule (uc03_p2_task_producer.
+        # customer_name_check, the one the PC's "Customer name differs" task
+        # follows -- masked PANs, a GST certificate's proprietor, a firm's
+        # name, honorifics and the PAN a receipt prints after the name) and
+        # this check's own fuzzy match against its KYC. This check alone held
+        # 741 documents on 2026-11-01, about 650 of them documents the current
+        # rule accepts. The current rule alone would newly hold 57 others: its
+        # reference is the first KYC read, and on UTK-JI-261026-005 that is a
+        # customer KYC form in another name ("RAJKUMAR SINGH"), against which
+        # Subrat Kumar Mallick's own PAN, Aadhaar, booking form, invoices and
+        # insurance all differ. Both together hold only what both agree on, so
+        # a hold is never added where this check passed the document.
         from audit_core.uc03_p2_task_producer import customer_name_check
 
         check = customer_name_check(connection, tenant_id=tenant_id, journey_id=journey_id)
+        own_reference = _reference_name(documents)
+
+        def own_rule_flags(document: dict[str, Any], name: str) -> bool:
+            if own_reference is None:
+                return True  # no KYC of its own: it holds every named document
+            own_name, own_document_id = own_reference
+            if str(document["di_document_id"]) == str(own_document_id):
+                return False
+            return bool(name) and not _names_match(own_name, name)
+
         held: set[str] = set()
         if check is not None:
             reference_name = str(check["kyc"]["name"])
@@ -638,7 +654,7 @@ def sync_customer_identity_consistency(
                     continue
                 document_name = str(document["effective_value"] or "").strip()
                 examined += 1
-                if str(document_id) not in wrong:
+                if str(document_id) not in wrong or not own_rule_flags(document, document_name):
                     if _cancel_if_open(
                         connection,
                         tenant_id=tenant_id,
