@@ -114,6 +114,7 @@ UPLOAD_QUIET_MINUTES = 10
 DELETED = "DELETED"
 KEPT_NOT_INDIVIDUAL = "KEPT_NOT_INDIVIDUAL"
 KEPT_REVIEWED = "KEPT_REVIEWED"
+KEPT_OWN_DOCUMENTS = "KEPT_OWN_DOCUMENTS"  # the new file holds a document the earlier one does not
 KEPT_CLOSED = "KEPT_CLOSED"
 DELETE_FAILED = "DELETE_FAILED"
 PENDING_DELETE = "PENDING_DELETE"
@@ -451,6 +452,8 @@ def alert_body(payload: dict[str, Any], outcome: str) -> str:
                        f"{payload.get('keptReason') or 'it no longer matches'}."),
         REMOVED: f"The new file {ref} has been removed.",
         KEPT_REVIEWED: f"The new file {ref} was kept for review: its documents are already marked reviewed.",
+        KEPT_OWN_DOCUMENTS: (f"The new file {ref} was kept for review: it holds "
+                             f"{payload.get('keptReason') or 'documents the earlier journey does not'}."),
         KEPT_CLOSED: f"The new file {ref} was kept for review: it is already closed.",
         DELETE_FAILED: f"The new file {ref} could not be deleted; the Team Lead has been told.",
     }.get(outcome, f"The new file is {ref}.")
@@ -509,6 +512,39 @@ def close_pending_alert(connection: Connection, *, tenant_id: str, journey_id: U
     return publish_alert(connection, tenant_id=tenant_id, journey_id=journey_id, outcome=REMOVED)
 
 
+def documents_only_on(connection: Connection, *, tenant_id: str, new_journey_id: UUID,
+                      existing_journey_id: UUID) -> list[str]:
+    """The kinds of document on file on the new journey and on none of the
+    earlier one's (2026-11-01): deleting it would lose them -- Sarbeswar
+    Pradhan's Tally invoice was only on his second booking, Susama Naik's
+    booking form only on her first. A dealer and a payment receipt are one
+    kind, as are a booking form and a docket."""
+    from audit_core.uc03_document_capture_v2 import _canonical_document_type
+
+    rows = connection.execute(
+        text("SELECT journey_id, document_type_key FROM auditcore.evidence WHERE tenant_id=:t "
+             "AND journey_id = ANY(:ids) AND association_status='ACTIVE'"),
+        {"t": tenant_id, "ids": [new_journey_id, existing_journey_id]},
+    ).all()
+
+    def kind(key: Any) -> str:
+        canonical = _canonical_document_type(str(key or ""))
+        return "booking_form" if canonical in {"booking_form", "booking_docket"} else canonical
+
+    new_kinds = {kind(k) for j, k in rows if UUID(str(j)) == new_journey_id}
+    existing_kinds = {kind(k) for j, k in rows if UUID(str(j)) == existing_journey_id}
+    return sorted(new_kinds - existing_kinds)
+
+
+def _own_documents_reason(connection: Connection, *, tenant_id: str, new: FileIdentity,
+                          existing: FileIdentity) -> str | None:
+    only = documents_only_on(connection, tenant_id=tenant_id, new_journey_id=new.journey_id,
+                             existing_journey_id=existing.journey_id)
+    if not only:
+        return None
+    return f"a document {existing.reference or 'the earlier journey'} does not: {', '.join(only).replace('_', ' ')}"
+
+
 def _reviewed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
     return connection.execute(
         text("SELECT EXISTS (SELECT 1 FROM auditcore.p2_stage_document_reviews "
@@ -528,6 +564,8 @@ def _raise(
         outcome = KEPT_NOT_INDIVIDUAL
     elif _reviewed(connection, tenant_id=tenant_id, journey_id=new.journey_id):
         outcome = KEPT_REVIEWED
+    elif (own := _own_documents_reason(connection, tenant_id=tenant_id, new=new, existing=existing)):
+        outcome, kept_reason = KEPT_OWN_DOCUMENTS, own
     else:
         outcome = PENDING_DELETE
     payload = {
@@ -679,7 +717,8 @@ def recheck_before_delete(
         raise SameFileNoLongerHolds("it is already closed")
     if matched_fields(new, existing) is None:
         raise SameFileNoLongerHolds(f"its PAN, customer name, mobile, model or receipt no longer match {ref}")
-    reason = business_reason(connection, tenant_id=tenant_id, files=[new, existing])
+    reason = business_reason(connection, tenant_id=tenant_id, files=[new, existing]) or _own_documents_reason(
+        connection, tenant_id=tenant_id, new=new, existing=existing)
     if reason:
         raise SameFileNoLongerHolds(reason)
 

@@ -834,8 +834,29 @@ def test_a_booking_entered_twice_with_the_same_receipt_is_deleted(tenant):
 def test_a_sole_proprietors_gstin_on_their_own_pan_is_not_a_company(tenant):
     """Prahallad Behera (ADI-RD-261031-003, 2026-11-01): his GSTIN 21BYXPB9740G1Z8
     is built on his own PAN; the copy was kept as if a company's."""
-    _, new = _pair(tenant)
-    doc = uuid4()
-    add_evidence(new, di_document_id=doc, document_type_key="gst_certificate")
-    add_extracted_field(new, di_document_id=doc, field_key="gstin", value=f"21{INDIVIDUAL_PAN}1ZV")
+    old, new = _pair(tenant)
+    for journey in (old, new):  # the same file: the certificate on both copies
+        doc = uuid4()
+        add_evidence(journey, di_document_id=doc, document_type_key="gst_certificate")
+        add_extracted_field(journey, di_document_id=doc, field_key="gstin", value=f"21{INDIVIDUAL_PAN}1ZV")
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+
+
+def test_a_new_copy_holding_a_document_the_earlier_one_lacks_is_kept(tenant):
+    """Sarbeswar Pradhan (2026-11-01): the Tally invoice was only on his second
+    booking. Deleting it would lose the invoice; it is kept for review."""
+    old, new = _pair(tenant)
+    doc = uuid4()
+    add_evidence(new, di_document_id=doc, document_type_key="tax_invoice_tally")
+    assert _detect(new)["outcomes"] == ["KEPT_OWN_DOCUMENTS"]
+    [alert] = _alerts(new)
+    assert "it holds a document" in alert["body"] and "tax invoice tally" in alert["body"] and _queued(new) == []
+    # A payment receipt on one and a dealer receipt on the other are one kind.
+    from audit_core.uc03_p2_same_file import documents_only_on
+
+    add_evidence(old, di_document_id=uuid4(), document_type_key="dealer_receipt")
+    add_evidence(new, di_document_id=uuid4(), document_type_key="payment_receipt")
+    with tenant.engine.begin() as connection:
+        set_tenant_context(connection, tenant.tenant_id)
+        assert documents_only_on(connection, tenant_id=tenant.tenant_id, new_journey_id=new.journey_id,
+                                 existing_journey_id=old.journey_id) == ["tax_invoice_tally"]
