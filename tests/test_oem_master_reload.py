@@ -296,3 +296,11 @@ def test_a_carried_row_answers_only_when_the_words_fit_nothing_on_sale() -> None
     assert named("SCORPIO N", adas) == named("SCORPIO N", adas, on_sale)
     assert named("SCORPIO N", "Z8 G AT 2WD 7 STR BS6.2 - N", on_sale)[0] != "IDENTIFIED"
     assert named("SCORPIO N", "Z8 G AT 2WD 7 STR BS6.2 - N") == ("IDENTIFIED", "SCORPIO N::Z8 G AT 2WD 7 STR BS6.2 - N")
+    # Live trial, 1 Nov: "VEERO 1.6 XL HD V2" names no October Veero, and never
+    # the carried 1.6XL SD V2 - LNT (HD is not SD): the words are read against
+    # the whole book, not the carried rows alone.
+    veero = [row("VEERO", v) for v in ("1.6XL SD V2", "1.6XXL HD V2", "1.6XXL HD V2 - LNT", "1.5XXL HD V2",
+                                        "1.5XL CBC V2", "1.5XXL CBC V2 - LNT")]
+    veero += [row("VEERO", "1.6XL SD V2 - LNT", carried=True), row("VEERO", "1.5XXL CBC V2", carried=True)]
+    assert named("VEERO", "1.6 XL HD V2", veero)[0] != "IDENTIFIED"
+    assert named("VEERO", "1.6XL SD V2 LNT", veero) == ("IDENTIFIED", "VEERO::1.6XL SD V2 - LNT")
