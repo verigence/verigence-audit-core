@@ -448,3 +448,64 @@ def run_file_move(engine: Engine, tag: str, references: list[str] | None = None)
         counts[outcome] = counts.get(outcome, 0) + 1
     logger.info("file_move_finished", tenant_id=tenant_id, commit=commit, rows=len(moves), **counts)
     return counts
+
+
+# ── FILE_MOVE_RESEND ────────────────────────────────────────────────────────
+# Pages of a moved file that failed for our side, not the page's: reading 79
+# moved files at once (747 pages, 1 Nov) left 35 pages unread in the 30
+# minutes a file is given (NOT_READ_IN_30_MIN). They are sent again here, as a
+# PC's Retry would (request_page_recovery), only for the files this job moved.
+# Pages refused for scan quality (DI_QUALITY_*) are the page's own problem and
+# are never re-sent; nor is a page whose task the PC closed
+# (uc03_p2_retry_stop). Dry run unless the tag ends with "-commit"::
+#
+#     INSERT INTO auditcore.p2_worker_jobs (job_kind, tag, requested_by)
+#     VALUES ('FILE_MOVE_RESEND', '<tenant_id>:resend-2026-11-01-commit', '<who>');
+
+_NOT_RESENT_PREFIX = "DI_QUALITY_"
+
+
+def run_file_move_resend(engine: Engine, tag: str, references: list[str] | None = None) -> dict[str, int]:
+    from audit_core.uc03_p2_retry_stop import automatic_retry_stop_reason
+    from audit_core.uc03_p2_runtime import request_page_recovery
+
+    tenant_id, commit = parse_tag(tag)
+    counts = {"pages": 0, "resent": 0, "skipped": 0}
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        pages = connection.execute(
+            text(
+                """
+                SELECT q.queue_id, q.journey_id, q.page_number, coalesce(q.last_error, '') AS last_error,
+                       j.journey_reference, b.original_filename
+                FROM auditcore.p2_file_moves m
+                JOIN auditcore.p2_document_queue q ON q.tenant_id=m.tenant_id AND q.batch_id=m.new_batch_id
+                JOIN auditcore.journeys j ON j.tenant_id=q.tenant_id AND j.journey_id=q.journey_id
+                JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
+                WHERE m.tenant_id=:t AND m.status='DONE' AND m.action='NEW_BOOKING' AND m.new_batch_id IS NOT NULL
+                  AND q.queue_status='FAILED' AND coalesce(q.last_error, '') NOT LIKE :quality
+                  AND (cardinality(CAST(:refs AS text[])) = 0 OR j.journey_reference = ANY(CAST(:refs AS text[])))
+                ORDER BY j.journey_reference, q.page_number
+                """
+            ),
+            {"t": tenant_id, "quality": f"{_NOT_RESENT_PREFIX}%", "refs": list(references or [])},
+        ).mappings().all()
+        for page in pages:
+            counts["pages"] += 1
+            why = automatic_retry_stop_reason(connection, tenant_id=tenant_id, journey_id=page["journey_id"],
+                                              queue_id=page["queue_id"])
+            logger.info("file_move_resend_item", tenant_id=tenant_id, commit=commit, journey=page["journey_reference"],
+                        file=str(page["original_filename"])[:80], page=page["page_number"],
+                        reason=str(page["last_error"])[:160], skipped=why)
+            if why:
+                counts["skipped"] += 1
+                continue
+            if commit:
+                request_page_recovery(
+                    connection, tenant_id=tenant_id, journey_id=UUID(str(page["journey_id"])),
+                    queue_id=UUID(str(page["queue_id"])), marker="r", requested_by=f"system:{tag}",
+                    correlation_id=f"file-move-resend:{tag}",
+                )
+                counts["resent"] += 1
+    logger.info("file_move_resend_finished", tenant_id=tenant_id, commit=commit, **counts)
+    return counts

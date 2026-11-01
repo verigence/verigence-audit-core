@@ -296,3 +296,34 @@ def test_a_file_whose_uploader_is_no_longer_a_pc_is_booked_under_the_pc_named(jo
     started = _sql(journey, "SELECT details FROM auditcore.p2_activity_events WHERE tenant_id=:t AND journey_id=:j "
                             "AND event_type='JOURNEY_STARTED'", j=row["target_journey_id"]).scalar_one()
     assert started["originallyUploadedBy"] == journey.actor_id and started["fromBooking"]
+
+
+def test_the_moved_files_pages_that_failed_on_our_side_are_sent_again(journey):
+    """1 Nov: 35 pages of the 79 moved files were not read in their 30 minutes
+    (the load of reading them all at once). They are sent again, as a PC's
+    Retry would; a page refused for scan quality is not."""
+    case = _tapan_taken_out(journey)
+    fid._switch(journey, True)
+    fid._settle(journey)
+    move_id = _plan(journey, case["batch"])
+    assert _run(journey, commit=True) == {"DONE": 1}
+    row = _move_row(journey, move_id)
+    pages = {}
+    for page, error in ((1, "NOT_READ_IN_30_MIN"), (2, "DI_QUALITY_IMAGE_BLUR_SCORE")):
+        pages[error] = _sql(
+            journey,
+            "INSERT INTO auditcore.p2_document_queue (tenant_id, batch_id, journey_id, page_number, page_sha256, "
+            "page_object_key, client_upload_id, queue_status, last_error, business_stage) VALUES (:t, :b, :j, :p, "
+            ":sha, :k, :c, 'FAILED', :e, 'BOOKING') RETURNING queue_id",
+            b=row["new_batch_id"], j=row["target_journey_id"], p=page, sha=uuid4().hex, k=f"p/{page}",
+            c=f"p2-{uuid4().hex}", e=error).scalar_one()
+    tag = f"{journey.tenant_id}:resend-test"
+    assert move.run_file_move_resend(journey.engine, tag) == {"pages": 1, "resent": 0, "skipped": 0}
+    assert move.run_file_move_resend(journey.engine, tag + "-commit") == {"pages": 1, "resent": 1, "skipped": 0}
+    status = dict(_sql(journey, "SELECT queue_id, queue_status FROM auditcore.p2_document_queue WHERE tenant_id=:t "
+                                "AND batch_id=:b", b=row["new_batch_id"]).all())
+    assert status == {pages["NOT_READ_IN_30_MIN"]: "QUEUED", pages["DI_QUALITY_IMAGE_BLUR_SCORE"]: "FAILED"}
+    assert _sql(journey, "SELECT count(*) FROM auditcore.p2_work_queue WHERE tenant_id=:t AND work_type='DOCUMENT_INGEST' "
+                         "AND work_key=:k", k=str(pages["NOT_READ_IN_30_MIN"])).scalar_one() == 1
+    # Run again: nothing left to send.
+    assert move.run_file_move_resend(journey.engine, tag + "-commit")["pages"] == 0
