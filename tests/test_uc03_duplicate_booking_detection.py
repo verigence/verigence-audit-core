@@ -717,3 +717,41 @@ def test_a_wholesale_invoice_buyer_gstin_never_pairs_two_bookings(two_journeys) 
     for journey_id in (c.journey_a, c.journey_b):
         assert dbd.sync_duplicate_booking_detection(
             c, tenant_id=c.tenant_id, journey_id=journey_id, correlation_id="")["raised"] == 0
+
+
+def _take_out(c, journey_id, field_key: str) -> None:
+    """The document the field was read from is another customer's file's,
+    taken out of the booking (evidence FOREIGN, uc03_p2_file_identity)."""
+    document_id = c.execute(
+        text("SELECT di_document_id FROM auditcore.journey_document_extracted_fields "
+             "WHERE tenant_id=:t AND journey_id=:j AND field_key=:fk"),
+        {"t": c.tenant_id, "j": journey_id, "fk": field_key},
+    ).scalar_one()
+    customer_id = c.execute(text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+                            {"t": c.tenant_id, "j": journey_id}).scalar_one()
+    requirement_id = c.execute(
+        text("INSERT INTO auditcore.journey_document_requirements (tenant_id, journey_id, requirement_key, "
+             "document_type_key, process_area, requirement_level) VALUES (:t, :j, 'pan_card', 'pan_card', "
+             "'BOOKING', 'REQUIRED') RETURNING journey_document_requirement_id"),
+        {"t": c.tenant_id, "j": journey_id},
+    ).scalar_one()
+    c.execute(
+        text("INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, journey_document_requirement_id, "
+             "di_subject_id, di_document_id, document_type_key, evidence_purpose, process_area, association_status, "
+             "pre_foreign_status) VALUES (:t, :j, :c, :r, :s, :d, 'pan_card', 'BOOKING_DOCUMENT', 'BOOKING', "
+             "'FOREIGN', 'ACTIVE')"),
+        {"t": c.tenant_id, "j": journey_id, "c": customer_id, "r": requirement_id, "s": uuid4(), "d": document_id},
+    )
+
+
+def test_a_document_taken_out_of_its_booking_never_pairs_two_bookings(two_journeys) -> None:
+    """2026-11-01: a moved file's new booking (B) was paired with the booking
+    it was taken out of (A) on the PAN of the very document taken out."""
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="pan_card", field_key="pan_number", value="FFFFF6666F")
+    _set_field(c, journey_id=c.journey_b, document_type_key="pan_card", field_key="pan_number", value="FFFFF6666F")
+    _sync_both(c)
+    assert _open_findings(c, c.journey_a) or _open_findings(c, c.journey_b)
+    _take_out(c, c.journey_a, "pan_number")
+    _sync_both(c)
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
