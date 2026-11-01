@@ -4668,6 +4668,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # (2026-11-01): see uc03_file_move.run_file_move_resend.
         from audit_core.uc03_file_move import run_file_move_resend
         return run_file_move_resend, (engine, tag, reports)
+    if kind == "UNREAD_REREAD":
+        # Documents whose read never finished are read again from their
+        # stored pages (2026-11-01): see uc03_p2_unread_reread. A dry run lists them.
+        from audit_core.uc03_p2_unread_reread import run_unread_reread
+        return run_unread_reread, (engine, tag, _active_tenants(engine))
     if kind == "EARLIER_COPY_BACK":
         # The bookings holding a copy that comes back are recomputed
         # (2026-11-01): see uc03_p2_earlier_copy. A dry run lists them.
