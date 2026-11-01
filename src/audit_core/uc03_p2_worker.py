@@ -4645,6 +4645,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # changes or deletes the source file.
         from audit_core.uc03_file_move import run_file_move
         return run_file_move, (engine, tag, reports)
+    if kind == "FILE_MOVE_RESEND":
+        # The moved files' pages that failed on our side are sent again
+        # (2026-11-01): see uc03_file_move.run_file_move_resend.
+        from audit_core.uc03_file_move import run_file_move_resend
+        return run_file_move_resend, (engine, tag, reports)
     per_tenant = {
         "PAGE_RESEND": ("audit_core.uc03_p2_page_resend", "run_page_resend"),
         "INVOICE_RESCAN": ("audit_core.uc03_invoice_rescan", "run_invoice_rescan"),
