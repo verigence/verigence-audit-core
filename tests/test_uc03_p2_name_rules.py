@@ -413,6 +413,14 @@ def test_a_full_name_fits_a_masked_reference():
     assert masked_matches("SXXXXXXA SXXXO", "Mr. Sushanta Sahoo")
     assert masked_matches("SXXXXXE KXXXXI DXS", "SUSHREE KUMARI DAS")  # a name word, kept when it fits
     assert not masked_matches("SXXXXXXA SXXXO", "Mr. Susanta Sahoo")
+    # Words written together on one side are the same words (2026-11-01,
+    # ADI-BA-261019-004: the PAN prints SOUMYARANJAN, the docket Soumya Ranjan).
+    assert masked_matches("SXXXXXXXXXXN BXXXD", "Soumya Ranjan Barad")
+    assert masked_matches("SXXXXXXXXXXN BXXXD", "MR. SOUMYA RANJAN BARAD")
+    assert masked_matches("SXXXXA RXXXXN BXXXD", "Soumyaranjan Barad")
+    assert not masked_matches("SXXXXXXXXXXN BXXXD", "Subham Pradhan Barad")  # 13 letters, not 12
+    assert not masked_matches("SXXXXXXXXXXN BXXXD", "Soumya Ranjan")  # a word left over
+    assert not masked_matches("SXXXXXXXXXXN BXXXD", "Soumya Rajesh Barad")  # last shown letter differs
 
 
 def test_a_proprietors_kyc_in_the_gst_legal_name_is_the_customers(journey, strict):

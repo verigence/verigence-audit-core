@@ -152,18 +152,45 @@ def masked_matches(masked: Any, full: Any) -> bool:
     """Whether a masked name fits a full one: the same words, each of the same
     length, every letter that is not masked the same ("MXXXXI JXXa" is Minati Jena).
     The full name's honorific is not a word of the name (2026-11-01: "Mr.
-    Sushanta Sahoo" on a booking form fits "SXXXXXXA SXXXO"; a PAN prints none)."""
+    Sushanta Sahoo" on a booking form fits "SXXXXXXA SXXXO"; a PAN prints none).
+
+    Words written together on one side and apart on the other are the same
+    words (2026-11-01): "SXXXXXXXXXXN BXXXD" is Soumya Ranjan Barad -- the PAN
+    prints SOUMYARANJAN as one word, the booking docket as two. Each masked word
+    then covers whole words of the full name, or the other way round, and every
+    letter it shows is in its place."""
     left = [t for t in re.sub(r"[^A-Za-z ]+", " ", str(masked or "")).upper().split() if t]
     right = [t for t in re.sub(r"[^A-Za-z ]+", " ", str(full or "")).upper().split() if t]
     if not left:
         return False
 
-    def fits(words: list[str]) -> bool:
-        return len(left) == len(words) and all(
-            len(m) == len(f) and all(a == "X" or a == b for a, b in zip(m, f, strict=True))
-            for m, f in zip(left, words, strict=True))
+    def same(m: str, f: str) -> bool:
+        return len(m) == len(f) and all(a == "X" or a == b for a, b in zip(m, f, strict=True))
 
-    return fits(right) or fits(person_tokens(full))
+    def fits(words: list[str]) -> bool:
+        return len(left) == len(words) and all(same(m, f) for m, f in zip(left, words, strict=True))
+
+    def fits_joined(words: list[str]) -> bool:
+        i = j = 0
+        while i < len(left) and j < len(words):
+            m, f = left[i], words[j]
+            while len(m) != len(f):
+                if len(m) < len(f):
+                    i += 1
+                    if i == len(left):
+                        return False
+                    m += left[i]
+                else:
+                    j += 1
+                    if j == len(words):
+                        return False
+                    f += words[j]
+            if not same(m, f):
+                return False
+            i, j = i + 1, j + 1
+        return i == len(left) and j == len(words)
+
+    return fits(right) or fits(person_tokens(full)) or fits_joined(right) or fits_joined(person_tokens(full))
 
 
 def same_organisation(left: Any, right: Any) -> bool:
