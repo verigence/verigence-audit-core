@@ -222,7 +222,11 @@ def follow_entered_name(connection: Connection, *, tenant_id: str, journey_id: U
     ADI-RD-261022-018), and search and the reports show it. The booking's own
     customer is the name verified from its KYC, else the customer its own
     files are about (the file identity's decision). Returns the new entered
-    name, or None when it stays."""
+    name, or None when it stays.
+
+    Also (2026-11-01): an entered name set from a masked PAN ("KXXXXXI RXXT")
+    follows the full name the booking now has for the same customer, when the
+    masked letters fit it ("KALANDI ROUT")."""
     row = connection.execute(
         text(
             """
@@ -238,28 +242,28 @@ def follow_entered_name(connection: Connection, *, tenant_id: str, journey_id: U
     ).mappings().first()
     if row is None or not row["display_name"] or row["display_name"] == row["placeholder"]:
         return None
-    people = [p for p in connection.execute(
-        text(
-            """
-            SELECT identity_person_name FROM auditcore.p2_upload_batches
-            WHERE tenant_id=:t AND journey_id=:j AND identity_status='FOREIGN'
-              AND identity_enforced_at_utc IS NOT NULL AND identity_person_name IS NOT NULL
-            """
-        ),
-        {"t": tenant_id, "j": journey_id},
-    ).scalars().all() if str(p).strip()]
-    if not people:
-        return None
     legal = row["legal_name"] if row["legal_name_status"] == "VERIFIED" else None
     # The decided name as its document printed it, less an honorific or an
     # appended number ("Mr. Gurupada Mandal", "GURUPADA MANDAL-EPGPM0671J").
     customer = " ".join(str(legal).split()) if legal and not is_masked(legal) else (
         " ".join(person_tokens(row["decided"])) or None if row["decided"] else None)
     entered = str(row["display_name"])
-    if not customer or same_person(entered, customer):
+    if not customer or is_masked(customer) or same_person(entered, customer):
         return None
-    if not any(same_person(entered, person) for person in people):
-        return None  # not a name from a file taken out: as the PC or the first KYC left it
+    masked_self = is_masked(entered) and masked_matches(entered, customer)
+    if not masked_self:
+        people = [p for p in connection.execute(
+            text(
+                """
+                SELECT identity_person_name FROM auditcore.p2_upload_batches
+                WHERE tenant_id=:t AND journey_id=:j AND identity_status='FOREIGN'
+                  AND identity_enforced_at_utc IS NOT NULL AND identity_person_name IS NOT NULL
+                """
+            ),
+            {"t": tenant_id, "j": journey_id},
+        ).scalars().all() if str(p).strip()]
+        if not any(same_person(entered, person) for person in people):
+            return None  # not a name from a file taken out: as the PC or the first KYC left it
     connection.execute(text("SELECT set_config(:k, 'on', true)"), {"k": _ENTERED_NAME_SETTING})
     try:
         changed = connection.execute(
@@ -282,5 +286,7 @@ def follow_entered_name(connection: Connection, *, tenant_id: str, journey_id: U
     record_activity(connection, tenant_id=tenant_id, journey_id=journey_id, event_type="ENTERED_NAME_FOLLOWS_CUSTOMER",
                     subject_type="JOURNEY", subject_id=str(journey_id),
                     details={"from": entered, "to": customer, "by": _MACHINE_ACTOR,
-                             "reason": "The entered name was another customer's, whose file was taken out."})
+                             "reason": ("The entered name was the masked PAN name of the same customer."
+                                        if masked_self else
+                                        "The entered name was another customer's, whose file was taken out.")})
     return customer
