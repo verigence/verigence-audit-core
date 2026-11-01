@@ -19,7 +19,10 @@ What is "the same file"
         otherwise the model names (the master's once pinned, the booking
         form's until then) are one family by ``generation_key``
         ("NEW THAR 2WD" is "THAR"; "THAR ROXX" is not).
-    A journey missing any of the four is not compared. Closed journeys
+    Or (product owner 2026-11-01) the same PAN and customer name and the same
+    receipt number on a receipt of both, the model not differing (it may be
+    unidentified on one): two separate bookings never share a receipt.
+    A journey missing any of the four, and with no receipt number, is not compared. Closed journeys
     (delivered, booking cancelled, duplicate booking, no delivery) are never
     paired. The DUPLICATE_BOOKING rule (one basis is enough, a TL task) is
     unchanged; this is the stricter, all-four check on top of it.
@@ -48,7 +51,8 @@ Safeguards (review of #594, 2026-10-31)
       on; older pairs stay with DUPLICATE_BOOKING and the purge job.
     - Never deleted when anything says the booking is a company's or firm's:
       a non-individual PAN on any document on file of either journey, a
-      GSTIN on either, or a company / firm customer name.
+      GSTIN on either (not a sole proprietor's GSTIN built on the customer's
+      own PAN, 2026-11-01), or a company / firm customer name.
     - Only values of documents still on file (ACTIVE evidence) count.
     - At delete time the earlier journey is locked and everything is checked
       again; a journey still receiving pages waits ten quiet minutes; the R2
@@ -110,6 +114,7 @@ UPLOAD_QUIET_MINUTES = 10
 DELETED = "DELETED"
 KEPT_NOT_INDIVIDUAL = "KEPT_NOT_INDIVIDUAL"
 KEPT_REVIEWED = "KEPT_REVIEWED"
+KEPT_OWN_DOCUMENTS = "KEPT_OWN_DOCUMENTS"  # the new file holds a document the earlier one does not
 KEPT_CLOSED = "KEPT_CLOSED"
 DELETE_FAILED = "DELETE_FAILED"
 PENDING_DELETE = "PENDING_DELETE"
@@ -176,6 +181,11 @@ _IDENTITY_SQL = f"""
              WHERE r.journey_id = j.journey_id AND r.field_key = 'customer_phone' AND r.row_rank = 1) AS phone,
            CASE WHEN c.legal_name_status = 'VERIFIED' THEN c.legal_name END AS customer_name,
            s.model_id, jp.model_name_snapshot AS model_name, jp.variant_name_snapshot AS variant_name,
+           (SELECT array_agg(DISTINCT f.effective_value #>> '{{}}')
+              FROM auditcore.journey_document_extracted_fields f
+             WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id AND f.field_key = 'receipt_number'
+               AND f.source_document_type_key IN ('dealer_receipt', 'payment_receipt')
+               AND f.effective_value IS NOT NULL AND {_ON_ACTIVE_DOCUMENT}) AS receipts,
            {_CLOSED_SQL} AS is_closed
     FROM auditcore.journeys j
     JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
@@ -225,6 +235,9 @@ class FileIdentity:
     closed: bool
     # Who entered the journey (2026-10-31): their own screen beeps on the alert.
     pc_actor_id: str | None = None
+    # The receipt numbers on its receipts still on file (2026-11-01): the same
+    # receipt on two bookings is the same booking entered twice.
+    receipts: frozenset[str] = frozenset()
 
     @property
     def model_key(self) -> str:
@@ -233,6 +246,11 @@ class FileIdentity:
     @property
     def complete(self) -> bool:
         return bool(self.pan and self.mobile and self.name and (self.model_id or self.model_key))
+
+    @property
+    def comparable(self) -> bool:
+        """All four values, or a PAN, a customer name and a receipt number."""
+        return self.complete or bool(self.pan and self.name and self.receipts)
 
     @property
     def order_key(self) -> tuple[datetime, str]:
@@ -266,8 +284,16 @@ def _identities(connection: Connection, *, tenant_id: str, journey_ids: Iterable
             model_name=(str(row["model_name"]).strip() or None) if row["model_name"] else None,
             variant_name=(str(row["variant_name"]).strip() or None) if row["variant_name"] else None,
             closed=bool(row["is_closed"]),
+            receipts=frozenset(r for r in (normalize_receipt(v) for v in row["receipts"] or []) if r),
         )
     return out
+
+
+def normalize_receipt(value: Any) -> str | None:
+    """A receipt number as printed, upper case without spaces; None for a
+    value too short or without a digit to tell receipts apart."""
+    code = "".join(str(value or "").upper().split())
+    return code if len(code) >= 4 and any(ch.isdigit() for ch in code) else None
 
 
 # ── the four comparisons ──────────────────────────────────────────────────────
@@ -296,25 +322,46 @@ def _masked(value: str | None) -> str | None:
     return value if len(value) <= 4 else f"{'X' * (len(value) - 4)}{value[-4:]}"
 
 
+def _models_differ(left: FileIdentity, right: FileIdentity) -> bool:
+    """Both carry a model and it is not the same one."""
+    known = (left.model_id or left.model_key) and (right.model_id or right.model_key)
+    return bool(known) and not same_model(left, right)
+
+
 def matched_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
-    """The four fields, as a reviewer should see them, when the two files
-    agree on all four; None when any one differs or is missing."""
-    if not (new.complete and existing.complete):
+    """The fields, as a reviewer should see them, when the two files are the
+    same booking; None otherwise.
+
+    The same file is (a) all four -- PAN, mobile, customer name and model --
+    or (b) since 2026-11-01, the same PAN and customer name and the same
+    receipt number on both, the model not differing (product owner
+    2026-11-01). Two separate bookings never share a receipt; a booking
+    entered twice does, even when the mobile was read on one copy only or the
+    model not identified on one (13 such pairs found on 2026-11-01, among them
+    VJ2610-000061 / UTK-SB-261019-001 and UTK-RM-261024-008 / UTK-RM-261031-002)."""
+    if not (new.pan and new.pan == existing.pan and same_name(new.name, existing.name)):
         return None
-    if new.pan != existing.pan or new.mobile != existing.mobile:
+    pan = {"field": "pan", "label": "PAN", "newValue": _masked(new.pan), "existingValue": _masked(existing.pan),
+           "exact": True}
+    name = {"field": "name", "label": "Customer name", "newValue": new.name, "existingValue": existing.name,
+            "exact": new.name == existing.name}
+    model = {"field": "model", "label": "Model", "newValue": new.model_name, "existingValue": existing.model_name,
+             "exact": bool(new.model_id and new.model_id == existing.model_id) or new.model_name == existing.model_name}
+    mobile = {"field": "mobile", "label": "Mobile", "newValue": _masked(new.mobile),
+              "existingValue": _masked(existing.mobile), "exact": True}
+    if new.complete and existing.complete and new.mobile == existing.mobile and same_model(new, existing):
+        return [pan, mobile, name, model]
+    shared = sorted(new.receipts & existing.receipts)
+    if not shared or _models_differ(new, existing):
         return None
-    if not same_name(new.name, existing.name) or not same_model(new, existing):
-        return None
-    return [
-        {"field": "pan", "label": "PAN", "newValue": _masked(new.pan), "existingValue": _masked(existing.pan),
-         "exact": True},
-        {"field": "mobile", "label": "Mobile", "newValue": _masked(new.mobile),
-         "existingValue": _masked(existing.mobile), "exact": True},
-        {"field": "name", "label": "Customer name", "newValue": new.name, "existingValue": existing.name,
-         "exact": new.name == existing.name},
-        {"field": "model", "label": "Model", "newValue": new.model_name, "existingValue": existing.model_name,
-         "exact": bool(new.model_id and new.model_id == existing.model_id) or new.model_name == existing.model_name},
-    ]
+    receipt = {"field": "receipt", "label": "Receipt number", "newValue": ", ".join(shared),
+               "existingValue": ", ".join(shared), "exact": True}
+    fields = [pan, name, receipt]
+    if new.mobile and new.mobile == existing.mobile:
+        fields.insert(1, mobile)
+    if new.model_name or existing.model_name:
+        fields.append(model)
+    return fields
 
 
 def is_individual_pan(pan: str | None) -> bool:
@@ -353,11 +400,22 @@ def business_reason(connection: Connection, *, tenant_id: str, files: list[FileI
             pan = _valid_pan(row["value"])
             if pan and not is_individual_pan(pan):
                 return "a company or firm PAN is on file"
+    # A sole proprietor's GSTIN is built on their own personal PAN (2026-11-01:
+    # Prahallad Behera's 21BYXPB9740G1Z8 on PAN BYXPB9740G; Binapani Panda,
+    # Bishnu Charan Samal): it does not make the customer a company, so it is
+    # not a reason to keep the copy.
+    from audit_core.uc03_p2_file_identity import gstin_pan
+
+    own = {identity.pan for identity in files if identity.pan}
+
+    def a_business_gstin(value: Any) -> bool:
+        return _valid_gstin(value) and gstin_pan(value) not in own
+
     for row in rows:
-        if row["field_key"] != "pan_number" and _valid_gstin(row["value"]):
+        if row["field_key"] != "pan_number" and a_business_gstin(row["value"]):
             return "a GSTIN is on file"
     for identity in files:
-        if _valid_gstin(_buyer_gstin(connection, tenant_id=tenant_id, journey_id=identity.journey_id)):
+        if a_business_gstin(_buyer_gstin(connection, tenant_id=tenant_id, journey_id=identity.journey_id)):
             return "a GSTIN is on file"
     return None
 
@@ -377,10 +435,14 @@ def alert_body(payload: dict[str, Any], outcome: str) -> str:
            f"PC {new.get('pcName') or 'unknown'}, {_place(new.get('dealerName'), new.get('outletName'))}")
     ref = new.get("reference") or "the new journey"
     kept = payload.get("keptReason") or "the PAN is not an individual's"
+    labels = [str(f.get("label") or "").replace("Customer name", "customer name").replace("Receipt number",
+              "receipt number").replace("Mobile", "mobile").replace("Model", "model")
+              for f in payload.get("matchedFields") or []] or ["PAN", "mobile", "customer name", "model"]
+    on = labels[0] if len(labels) == 1 else f"{', '.join(labels[:-1])} and {labels[-1]}"
     matches = (f"It matches {existing.get('reference') or 'an earlier journey'} "
                f"(PC {existing.get('pcName') or 'unknown'}, "
                f"{_place(existing.get('dealerName'), existing.get('outletName'))}) "
-               "on PAN, mobile, customer name and model.")
+               f"on {on}.")
     what = {
         DELETED: f"The new file {ref} was deleted.",
         PENDING_DELETE: f"The new file {ref} is being deleted.",
@@ -390,6 +452,8 @@ def alert_body(payload: dict[str, Any], outcome: str) -> str:
                        f"{payload.get('keptReason') or 'it no longer matches'}."),
         REMOVED: f"The new file {ref} has been removed.",
         KEPT_REVIEWED: f"The new file {ref} was kept for review: its documents are already marked reviewed.",
+        KEPT_OWN_DOCUMENTS: (f"The new file {ref} was kept for review: it holds "
+                             f"{payload.get('keptReason') or 'documents the earlier journey does not'}."),
         KEPT_CLOSED: f"The new file {ref} was kept for review: it is already closed.",
         DELETE_FAILED: f"The new file {ref} could not be deleted; the Team Lead has been told.",
     }.get(outcome, f"The new file is {ref}.")
@@ -448,6 +512,39 @@ def close_pending_alert(connection: Connection, *, tenant_id: str, journey_id: U
     return publish_alert(connection, tenant_id=tenant_id, journey_id=journey_id, outcome=REMOVED)
 
 
+def documents_only_on(connection: Connection, *, tenant_id: str, new_journey_id: UUID,
+                      existing_journey_id: UUID) -> list[str]:
+    """The kinds of document on file on the new journey and on none of the
+    earlier one's (2026-11-01): deleting it would lose them -- Sarbeswar
+    Pradhan's Tally invoice was only on his second booking, Susama Naik's
+    booking form only on her first. A dealer and a payment receipt are one
+    kind, as are a booking form and a docket."""
+    from audit_core.uc03_document_capture_v2 import _canonical_document_type
+
+    rows = connection.execute(
+        text("SELECT journey_id, document_type_key FROM auditcore.evidence WHERE tenant_id=:t "
+             "AND journey_id = ANY(:ids) AND association_status='ACTIVE'"),
+        {"t": tenant_id, "ids": [new_journey_id, existing_journey_id]},
+    ).all()
+
+    def kind(key: Any) -> str:
+        canonical = _canonical_document_type(str(key or ""))
+        return "booking_form" if canonical in {"booking_form", "booking_docket"} else canonical
+
+    new_kinds = {kind(k) for j, k in rows if UUID(str(j)) == new_journey_id}
+    existing_kinds = {kind(k) for j, k in rows if UUID(str(j)) == existing_journey_id}
+    return sorted(new_kinds - existing_kinds)
+
+
+def _own_documents_reason(connection: Connection, *, tenant_id: str, new: FileIdentity,
+                          existing: FileIdentity) -> str | None:
+    only = documents_only_on(connection, tenant_id=tenant_id, new_journey_id=new.journey_id,
+                             existing_journey_id=existing.journey_id)
+    if not only:
+        return None
+    return f"a document {existing.reference or 'the earlier journey'} does not: {', '.join(only).replace('_', ' ')}"
+
+
 def _reviewed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
     return connection.execute(
         text("SELECT EXISTS (SELECT 1 FROM auditcore.p2_stage_document_reviews "
@@ -467,6 +564,8 @@ def _raise(
         outcome = KEPT_NOT_INDIVIDUAL
     elif _reviewed(connection, tenant_id=tenant_id, journey_id=new.journey_id):
         outcome = KEPT_REVIEWED
+    elif (own := _own_documents_reason(connection, tenant_id=tenant_id, new=new, existing=existing)):
+        outcome, kept_reason = KEPT_OWN_DOCUMENTS, own
     else:
         outcome = PENDING_DELETE
     payload = {
@@ -520,7 +619,7 @@ def _raise(
 
 def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str) -> dict[str, Any]:
     me = _identities(connection, tenant_id=tenant_id, journey_ids=[journey_id]).get(journey_id)
-    if me is None or me.closed or not me.complete:
+    if me is None or me.closed or not me.comparable:
         return {"examined": 0, "raised": 0}
     candidate_ids = [
         UUID(str(v)) for v in connection.execute(
@@ -617,8 +716,9 @@ def recheck_before_delete(
     if new.closed:
         raise SameFileNoLongerHolds("it is already closed")
     if matched_fields(new, existing) is None:
-        raise SameFileNoLongerHolds(f"its PAN, mobile, customer name or model no longer match {ref}")
-    reason = business_reason(connection, tenant_id=tenant_id, files=[new, existing])
+        raise SameFileNoLongerHolds(f"its PAN, customer name, mobile, model or receipt no longer match {ref}")
+    reason = business_reason(connection, tenant_id=tenant_id, files=[new, existing]) or _own_documents_reason(
+        connection, tenant_id=tenant_id, new=new, existing=existing)
     if reason:
         raise SameFileNoLongerHolds(reason)
 

@@ -613,7 +613,7 @@ def test_a_gstin_keeps_the_new_file(tenant):
     _, new = _pair(tenant)
     doc = uuid4()
     add_evidence(new, di_document_id=doc, document_type_key="gst_certificate")
-    add_extracted_field(new, di_document_id=doc, field_key="gstin", value="21ABCPE1234F1ZV")
+    add_extracted_field(new, di_document_id=doc, field_key="gstin", value="21AAKFS1234M1ZV")  # a firm's GSTIN, not on the customer's own PAN
     assert _detect(new)["outcomes"] == ["KEPT_NOT_INDIVIDUAL"]
     assert "a GSTIN is on file" in _alerts(new)[0]["body"]
 
@@ -665,7 +665,7 @@ def test_a_gstin_uploaded_since_keeps_the_new_file(tenant):
     _, new = _ready_to_delete(tenant)
     doc = uuid4()
     add_evidence(new, di_document_id=doc, document_type_key="gst_certificate")
-    add_extracted_field(new, di_document_id=doc, field_key="gstin", value="21ABCPE1234F1ZV")
+    add_extracted_field(new, di_document_id=doc, field_key="gstin", value="21AAKFS1234M1ZV")  # a firm's GSTIN, not on the customer's own PAN
     assert _delete(new) == "KEPT_CHANGED" and _exists(new)
 
 
@@ -788,3 +788,75 @@ def _ref(journey: P2Journey) -> str:
         set_tenant_context(connection, journey.tenant_id)
         return connection.execute(text("SELECT journey_reference FROM auditcore.journeys WHERE tenant_id=:t "
                                        "AND journey_id=:j"), {"t": journey.tenant_id, "j": journey.journey_id}).scalar_one()
+
+
+# ── the same receipt on both, and a sole proprietor's GSTIN (2026-11-01) ──────
+def _receipt(journey: P2Journey, number: str) -> None:
+    doc = uuid4()
+    add_evidence(journey, di_document_id=doc, document_type_key="dealer_receipt")
+    add_extracted_field(journey, di_document_id=doc, field_key="receipt_number", value=number,
+                        document_type="dealer_receipt")
+
+
+def test_the_same_receipt_on_both_is_the_same_file_without_the_mobile_or_one_model():
+    """13 pairs on 2026-11-01: the mobile read on one copy only, or the model not
+    identified on one (UTK-RM-261024-008), but the same receipt on both."""
+    base = _identity(receipts=frozenset({"BRKM/2627/03259"}))
+    assert matched_fields(_identity(mobile=None, receipts=frozenset({"BRKM/2627/03259"})), base) is not None
+    fields = matched_fields(_identity(model_name=None, mobile=None, receipts=frozenset({"BRKM/2627/03259"})), base)
+    assert [f["field"] for f in fields] == ["pan", "name", "receipt", "model"]
+    assert fields[2]["newValue"] == "BRKM/2627/03259"
+    # Not without the same receipt, nor when the model differs, nor for another person.
+    assert matched_fields(_identity(mobile=None, receipts=frozenset({"BRKM/2627/09999"})), base) is None
+    assert matched_fields(_identity(mobile=None, model_name="SCORPIO N",
+                                    receipts=frozenset({"BRKM/2627/03259"})), base) is None
+    assert matched_fields(_identity(mobile=None, name="Sunil Kumar Mallick",
+                                    receipts=frozenset({"BRKM/2627/03259"})), base) is None
+
+
+def test_a_receipt_number_must_look_like_one():
+    from audit_core.uc03_p2_same_file import normalize_receipt
+
+    assert normalize_receipt(" brkm/2627/ 03259 ") == "BRKM/2627/03259"
+    assert normalize_receipt("NA") is None and normalize_receipt("CASH") is None and normalize_receipt("12") is None
+
+
+def test_a_booking_entered_twice_with_the_same_receipt_is_deleted(tenant):
+    old, new = _pair(tenant, mobile=None)  # the mobile read on the old copy only
+    _receipt(old, "AMC-B/30640/26-27")
+    _receipt(new, "AMC-B/30640/26-27")
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    payload = _alerts(new)[0]["payload"]
+    assert [f["field"] for f in payload["matchedFields"]] == ["pan", "name", "receipt", "model"]
+    assert "on PAN, customer name, receipt number and model." in _alerts(new)[0]["body"]
+
+
+def test_a_sole_proprietors_gstin_on_their_own_pan_is_not_a_company(tenant):
+    """Prahallad Behera (ADI-RD-261031-003, 2026-11-01): his GSTIN 21BYXPB9740G1Z8
+    is built on his own PAN; the copy was kept as if a company's."""
+    old, new = _pair(tenant)
+    for journey in (old, new):  # the same file: the certificate on both copies
+        doc = uuid4()
+        add_evidence(journey, di_document_id=doc, document_type_key="gst_certificate")
+        add_extracted_field(journey, di_document_id=doc, field_key="gstin", value=f"21{INDIVIDUAL_PAN}1ZV")
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+
+
+def test_a_new_copy_holding_a_document_the_earlier_one_lacks_is_kept(tenant):
+    """Sarbeswar Pradhan (2026-11-01): the Tally invoice was only on his second
+    booking. Deleting it would lose the invoice; it is kept for review."""
+    old, new = _pair(tenant)
+    doc = uuid4()
+    add_evidence(new, di_document_id=doc, document_type_key="tax_invoice_tally")
+    assert _detect(new)["outcomes"] == ["KEPT_OWN_DOCUMENTS"]
+    [alert] = _alerts(new)
+    assert "it holds a document" in alert["body"] and "tax invoice tally" in alert["body"] and _queued(new) == []
+    # A payment receipt on one and a dealer receipt on the other are one kind.
+    from audit_core.uc03_p2_same_file import documents_only_on
+
+    add_evidence(old, di_document_id=uuid4(), document_type_key="dealer_receipt")
+    add_evidence(new, di_document_id=uuid4(), document_type_key="payment_receipt")
+    with tenant.engine.begin() as connection:
+        set_tenant_context(connection, tenant.tenant_id)
+        assert documents_only_on(connection, tenant_id=tenant.tenant_id, new_journey_id=new.journey_id,
+                                 existing_journey_id=old.journey_id) == ["tax_invoice_tally"]
