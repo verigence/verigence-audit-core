@@ -1,8 +1,14 @@
-"""Audit tasks that named no document (2026-11-01).
+"""Audit tasks that named no document, and documents the old name check held
+out of their bookings (2026-11-01).
 
 993 open tasks read only "The audit check failed. Review the related
 documents." -- the check's own task, raised with nothing to show because what
-the check found is written elsewhere. This job, per Project:
+the check found is written elsewhere. And the old name check
+(uc03_customer_identity_consistency) held 741 documents' values out of their
+bookings, about 650 of them documents the current name rule accepts -- all 346
+held receipts among them, 79 with no payment recorded.
+
+This job, per Project:
 
 1. cancels the open check tasks of WRONG_DOCUMENT, MANUAL_VERIFICATION and
    INVOICE_SKU_MISMATCH (``uc03_p2_task_producer.OWN_TASK_CODES``): each
@@ -10,15 +16,20 @@ the check found is written elsewhere. This job, per Project:
    (control:<journey>:<code>) -- never the PC's field review or name tasks;
 2. runs the native checks again (forced) on the bookings whose DUPLICATE_RECEIPT
    or DUPLICATE_BOOKING task reads the fallback sentence: the receipt task then
-   names the receipt, the pair is raised again with what matched.
+   names the receipt, the pair is raised again with what matched;
+3. checks every booking holding a document again by the current name rule;
+   what is released reaches the booking on its recompute, which is requested.
+   The dry run checks each booking in a savepoint and rolls it back, logging
+   what would be released and the released receipts with no payment yet.
 
 Started as worker job ``AUDIT_TASK_CLEANUP``. A DRY RUN (logged, nothing
 written) unless the tag ends with "-commit". Idempotent: a second run finds
-no task to cancel and no fallback task.
+no task to cancel, no fallback task, and no hold to release.
 """
 from __future__ import annotations
 
 from collections import Counter
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
 
@@ -40,6 +51,7 @@ logger = structlog.get_logger(__name__)
 JOB = "AUDIT_TASK_CLEANUP"
 FALLBACK = "The audit check failed. Review the related documents."
 _RERUN_CODES = ("DUPLICATE_RECEIPT", "DUPLICATE_BOOKING")
+_RECEIPTS = ("dealer_receipt", "payment_receipt")
 
 
 def _own_task_shells(connection: Connection, tenant_id: str) -> list[dict[str, Any]]:
@@ -116,9 +128,105 @@ def _rerun_native(connection: Connection, tenant_id: str, journey_id: UUID, tag:
     return units
 
 
+def _held_journeys(connection: Connection, tenant_id: str) -> list[UUID]:
+    return [UUID(str(j)) for j in connection.execute(
+        text(
+            """
+            SELECT DISTINCT journey_id FROM auditcore.evidence
+            WHERE tenant_id=:t AND association_status='ACTIVE' AND identity_check_status='HELD'
+            ORDER BY journey_id
+            """
+        ),
+        {"t": tenant_id},
+    ).scalars().all()]
+
+
+def _held(connection: Connection, tenant_id: str, journey_id: UUID) -> dict[str, dict[str, Any]]:
+    return {str(r["evidence_id"]): dict(r) for r in connection.execute(
+        text(
+            """
+            SELECT evidence_id, di_document_id, document_type_key FROM auditcore.evidence
+            WHERE tenant_id=:t AND journey_id=:j AND association_status='ACTIVE' AND identity_check_status='HELD'
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()}
+
+
+def _receipt_without_payment(connection: Connection, tenant_id: str, journey_id: UUID,
+                             document_id: Any) -> dict[str, Any] | None:
+    """A released receipt with no payment recorded: its amount and payer as read."""
+    row = connection.execute(
+        text(
+            """
+            SELECT
+              (SELECT f.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields f
+                WHERE f.tenant_id=:t AND f.di_document_id=:d AND f.field_key='amount_paid'
+                ORDER BY f.confidence_score DESC NULLS LAST LIMIT 1) AS amount,
+              (SELECT f.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields f
+                WHERE f.tenant_id=:t AND f.di_document_id=:d AND f.field_key='customer_name'
+                ORDER BY f.confidence_score DESC NULLS LAST LIMIT 1) AS payer,
+              EXISTS (SELECT 1 FROM auditcore.payments p
+                       WHERE p.tenant_id=:t AND p.journey_id=:j AND p.source_di_document_id=:d) AS paid
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "d": document_id},
+    ).mappings().one()
+    if row["paid"]:
+        return None
+    return {"documentId": str(document_id), "amount": row["amount"], "payer": row["payer"]}
+
+
+def _amount(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value).replace(",", "").replace("₹", "").strip())
+    except (InvalidOperation, ValueError):
+        return Decimal(0)
+
+
+def recheck_holds(connection: Connection, *, tenant_id: str, journey_id: UUID, commit: bool) -> dict[str, Any]:
+    """Check one booking's holds again by the current name rule. Without
+    ``commit`` the check runs in a savepoint that is rolled back."""
+    from audit_core.uc03_customer_identity_consistency import (
+        sync_customer_identity_consistency,
+    )
+
+    before = _held(connection, tenant_id, journey_id)
+    savepoint = connection.begin_nested()
+    try:
+        result = sync_customer_identity_consistency(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                                    correlation_id=f"{JOB.lower()}")
+        after = _held(connection, tenant_id, journey_id)
+    except Exception:
+        savepoint.rollback()
+        raise
+    if result.get("error"):
+        savepoint.rollback()
+        return {"error": True}
+    released = [before[e] for e in before if e not in after]
+    newly_held = [after[e] for e in after if e not in before]
+    unpaid = [r for r in (
+        _receipt_without_payment(connection, tenant_id, journey_id, d["di_document_id"])
+        for d in released if d["document_type_key"] in _RECEIPTS) if r]
+    if commit:
+        savepoint.commit()
+    else:
+        savepoint.rollback()
+    return {
+        "heldBefore": len(before),
+        "released": len(released),
+        "releasedByType": dict(Counter(str(d["document_type_key"]) for d in released)),
+        "stillHeld": len(after) - len(newly_held),
+        "newlyHeld": len(newly_held),
+        "unpaidReceipts": unpaid,
+    }
+
+
 def clean_tenant(engine: Engine, *, tenant_id: str, tag: str, commit: bool) -> dict[str, Any]:
     totals: dict[str, Any] = {"shells": 0, "shellsByCode": {}, "cancelled": 0, "rerunJourneys": 0,
-                              "rerunByCode": {}}
+                              "rerunByCode": {}, "heldJourneys": 0, "heldBefore": 0, "released": 0,
+                              "releasedByType": Counter(), "stillHeld": 0, "newlyHeld": 0, "unpaidReceipts": 0,
+                              "unpaidAmount": Decimal(0), "recomputed": 0, "failed": 0}
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
         shells = _own_task_shells(connection, tenant_id)
@@ -135,6 +243,47 @@ def clean_tenant(engine: Engine, *, tenant_id: str, tag: str, commit: bool) -> d
         for row in fallback:
             if commit:
                 _rerun_native(connection, tenant_id, UUID(str(row["journey_id"])), tag)
+        held_journeys = _held_journeys(connection, tenant_id)
+    totals["heldJourneys"] = len(held_journeys)
+
+    from audit_core.uc03_p2_runtime import note_facts_changed
+
+    for journey_id in held_journeys:
+        try:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                outcome = recheck_holds(connection, tenant_id=tenant_id, journey_id=journey_id, commit=commit)
+                if outcome.get("error"):
+                    totals["failed"] += 1
+                    logger.warning("audit_task_cleanup_hold_failed", tag=tag, tenant_id=tenant_id,
+                                   journey_id=str(journey_id))
+                    continue
+                reference = connection.execute(
+                    text("SELECT journey_reference FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+                    {"t": tenant_id, "j": journey_id},
+                ).scalar_one_or_none()
+                changed = outcome["released"] or outcome["newlyHeld"]
+                if commit and changed:
+                    note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                       reason="DOCUMENT_HOLD_RECHECKED", correlation_id=f"{JOB.lower()}:{tag}")
+                    totals["recomputed"] += 1
+        except Exception:
+            totals["failed"] += 1
+            logger.warning("audit_task_cleanup_hold_failed", tag=tag, tenant_id=tenant_id,
+                           journey_id=str(journey_id), exc_info=True)
+            continue
+        for key in ("heldBefore", "released", "stillHeld", "newlyHeld"):
+            totals[key] += outcome[key]
+        totals["releasedByType"].update(outcome["releasedByType"])
+        totals["unpaidReceipts"] += len(outcome["unpaidReceipts"])
+        totals["unpaidAmount"] += sum((_amount(r["amount"]) for r in outcome["unpaidReceipts"]), Decimal(0))
+        if changed:
+            logger.info("audit_task_cleanup_hold", tag=tag, tenant_id=tenant_id, commit=commit,
+                        journey_id=str(journey_id), reference=reference, released=outcome["released"],
+                        released_by_type=outcome["releasedByType"], still_held=outcome["stillHeld"],
+                        newly_held=outcome["newlyHeld"], unpaid_receipts=outcome["unpaidReceipts"])
+    totals["releasedByType"] = dict(totals["releasedByType"])
+    totals["unpaidAmount"] = str(totals["unpaidAmount"])
     return totals
 
 

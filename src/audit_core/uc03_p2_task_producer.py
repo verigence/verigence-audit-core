@@ -1695,6 +1695,163 @@ def _verified_by_a_person(connection: Connection, *, tenant_id: str, journey_id:
     return bool(text_) and "system" not in text_ and "worker" not in text_
 
 
+def customer_name_check(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    registry: Registry | None = None,
+) -> dict[str, Any] | None:
+    """The customer-name rule, as data: whom the KYC names (``kyc``, with its
+    template), the GST names when a GST certificate names the customer, and
+    the documents in another customer's name (``mismatched``). None while no
+    KYC names the customer yet.
+
+    The one place the rule is decided (2026-11-01): the PC's "Customer name
+    differs" task below, and the old name check's hold on a document's values
+    (uc03_customer_identity_consistency), both follow it."""
+    registry = registry or get_registry()
+    rules = registry.extraction_rules
+    # -- the customer, as the KYC names them (see the reference rule below).
+    # Every other document naming the customer, a second KYC document
+    # included, must be the same person.
+    references = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                  pairs=rules.customer_name_reference)
+    verified = connection.execute(
+        text(
+            """
+            SELECT c.legal_name, e.di_document_id, e.document_type_key, e.process_area
+            FROM auditcore.journeys j
+            JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            LEFT JOIN auditcore.evidence e
+              ON e.tenant_id=c.tenant_id AND e.evidence_id=c.legal_name_source_evidence_id
+            WHERE j.tenant_id=:t AND j.journey_id=:j AND c.legal_name_status='VERIFIED'
+              AND c.legal_name IS NOT NULL AND btrim(c.legal_name) <> ''
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().first()
+    # A stable reference (product owner 2026-10-29, calibration): a name a
+    # person verified; else the GST certificate's, when the customer record is
+    # named from one (2026-10-27); else the FIRST KYC document read. A later
+    # PAN no longer switches the reference -- the name the system settles for
+    # the customer record changes as documents arrive, and every switch
+    # re-flagged documents already checked.
+    if verified is not None and str(verified["document_type_key"] or "") != "gst_certificate" \
+            and not _verified_by_a_person(connection, tenant_id=tenant_id, journey_id=journey_id):
+        verified = None
+    if verified is None:
+        kyc = references[0] if references else None
+    else:
+        kyc = {
+            "name": verified["legal_name"],
+            "documentId": str(verified["di_document_id"]) if verified["di_document_id"] else None,
+            "diType": str(verified["document_type_key"] or "pan_card"),
+            "stage": str(verified["process_area"] or "BOOKING").upper(),
+        }
+    if kyc is None:
+        return None
+    kyc_template = registry.template_for_di_type(kyc["diType"], stage=kyc["stage"])
+    checked = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               pairs=rules.customer_name_checked)
+    checked += [doc for doc in references if doc["documentId"] != kyc["documentId"]]
+    # The customer named by a GST certificate (product owner 2026-10-27):
+    # a document may carry the GSTIN's legal or trade name, or the name of
+    # the person whose KYC is on file (the proprietor / signatory). The
+    # KYC documents are that person's own, so they only have to agree
+    # with each other, not with a firm's name.
+    gst_names: list[str] = []
+    proven: set[str] = set()
+    strict = False
+    person: dict[str, Any] | None = None
+    if kyc["diType"] == "gst_certificate":
+        gst_names = [str(kyc["name"]), *_gst_trade_names(connection, tenant_id=tenant_id,
+                                                         journey_id=journey_id, document_id=kyc["documentId"])]
+        strict = gst_proprietor_strict()
+        if not strict:
+            by_pair = {doc["pair"]: doc for doc in reversed(references)}
+            person = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
+        else:
+            # Whose KYC is the proprietor's / signatory's (2026-10-31): without
+            # it ANY person's PAN or Aadhaar passes under a GST certificate, so
+            # on ADI-RD-261022-022 another customer's KYC (Tapan Kumar Patra,
+            # his file dropped into Azizur Rehaman's booking) passed as the
+            # proprietor of Azizur's firm and the task closed itself. With
+            # P2_GST_PROPRIETOR_STRICT a KYC is the customer's only when its PAN
+            # is the PAN inside the GSTIN, or its name is the GST legal / trade
+            # name or an authorised signatory the certificate names. Off by
+            # default: live, most GST certificates carry the GSTIN only (no
+            # legal / trade / signatory names read), so an Aadhaar-only
+            # proprietor or a partner would newly raise the task.
+            from audit_core.uc03_p2_file_identity import same_pan
+
+            gst_pans, gst_people = _gst_certificate_people(connection, tenant_id=tenant_id,
+                                                           journey_id=journey_id, document_id=kyc["documentId"])
+            numbers = _kyc_pans(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                document_ids=[d["documentId"] for d in references])
+
+            def proprietor(document: dict[str, Any]) -> bool:
+                pan = numbers.get(document["documentId"])
+                if pan and any(same_pan(pan, g) for g in gst_pans):
+                    return True
+                names = [*gst_names, *gst_people]
+                if is_masked(document["name"]):
+                    return any(masked_matches(document["name"], n) for n in names)
+                return any(same_person(document["name"], n) for n in names)
+
+            proven_documents = [doc for doc in references if proprietor(doc)]
+            proven = {doc["documentId"] for doc in proven_documents}
+            by_pair = {doc["pair"]: doc for doc in reversed(proven_documents)}
+            person = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
+
+    # A document in a firm's name is the customer's when the customer is a
+    # person (product owner 2026-10-28: "firm name should be acceptable" --
+    # a proprietor's PAN is on file, the invoice or booking form is in the
+    # firm's name, "M/S SHREE SHYAM ENTERPRISES"). One firm per Journey:
+    # the firm most documents name is it, and a document naming another
+    # firm, or the dealership itself, is still the wrong document.
+    firm: str | None = None
+    if not gst_names:
+        dealership = [d["name"] for d in _named_documents(
+            connection, tenant_id=tenant_id, journey_id=journey_id, pairs=rules.dealer_name_checked)]
+        firms = [d["name"] for d in checked if is_firm_name(d["name"]) and not is_masked(d["name"])
+                 and not same_person(d["name"], kyc["name"])
+                 and not any(same_organisation(d["name"], n) for n in dealership)]
+        if firms:
+            firm = max(firms, key=lambda n: (sum(same_organisation(n, o) for o in firms), -firms.index(n)))
+
+    def matches(document: dict[str, Any]) -> bool:
+        if firm is not None and document["pair"] not in rules.customer_name_reference \
+                and same_organisation(document["name"], firm):
+            return True
+        if document["documentId"] in proven:
+            return True  # the GST certificate's proprietor or signatory (2026-10-31)
+        # A masked PAN ("PXXXXJ KXXXR NXXXX") is the customer's when its
+        # visible letters fit the customer's name (2026-10-28).
+        if is_masked(document["name"]):
+            return any(masked_matches(document["name"], n)
+                       for n in [kyc["name"], *gst_names, *([person["name"]] if person else [])])
+        if is_masked(kyc["name"]) and masked_matches(kyc["name"], document["name"]):
+            return True  # only a masked PAN names the customer: a full name that fits it is theirs
+        if not gst_names:
+            return same_person(document["name"], kyc["name"])
+        if document["pair"] in rules.customer_name_reference:
+            # A proprietor's Aadhaar / PAN carries the name the GST certificate
+            # prints as the legal name ("BISWAJIT DAS", trade name "M/S DAS
+            # CONSTRUCTION"): that is the customer's own KYC (2026-10-28).
+            if strict:
+                # the same person as a KYC proven above, and nobody else's
+                return person is not None and same_person(document["name"], person["name"])
+            return (person is None or document["documentId"] == person["documentId"]
+                    or same_person(document["name"], person["name"])
+                    or any(same_person(document["name"], n) for n in gst_names))
+        return (any(same_person(document["name"], n) or same_organisation(document["name"], n) for n in gst_names)
+                or (person is not None and same_person(document["name"], person["name"])))
+
+    mismatched = [document for document in checked if not matches(document)]
+    return {"kyc": kyc, "kycTemplate": kyc_template, "gstNames": gst_names, "mismatched": mismatched}
+
+
 def sync_name_consistency_tasks(
     connection: Connection,
     *,
@@ -1735,146 +1892,15 @@ def sync_name_consistency_tasks(
         )
         counts[outcome] = counts.get(outcome, 0) + 1
 
-    # -- the customer, as the KYC names them (see the reference rule below).
-    # Every other document naming the customer, a second KYC document
-    # included, must be the same person.
-    references = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                  pairs=rules.customer_name_reference)
-    verified = connection.execute(
-        text(
-            """
-            SELECT c.legal_name, e.di_document_id, e.document_type_key, e.process_area
-            FROM auditcore.journeys j
-            JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
-            LEFT JOIN auditcore.evidence e
-              ON e.tenant_id=c.tenant_id AND e.evidence_id=c.legal_name_source_evidence_id
-            WHERE j.tenant_id=:t AND j.journey_id=:j AND c.legal_name_status='VERIFIED'
-              AND c.legal_name IS NOT NULL AND btrim(c.legal_name) <> ''
-            """
-        ),
-        {"t": tenant_id, "j": journey_id},
-    ).mappings().first()
-    # A stable reference (product owner 2026-10-29, calibration): a name a
-    # person verified; else the GST certificate's, when the customer record is
-    # named from one (2026-10-27); else the FIRST KYC document read. A later
-    # PAN no longer switches the reference -- the name the system settles for
-    # the customer record changes as documents arrive, and every switch
-    # re-flagged documents already checked.
-    if verified is not None and str(verified["document_type_key"] or "") != "gst_certificate" \
-            and not _verified_by_a_person(connection, tenant_id=tenant_id, journey_id=journey_id):
-        verified = None
-    if verified is None:
-        kyc = references[0] if references else None
-    else:
-        kyc = {
-            "name": verified["legal_name"],
-            "documentId": str(verified["di_document_id"]) if verified["di_document_id"] else None,
-            "diType": str(verified["document_type_key"] or "pan_card"),
-            "stage": str(verified["process_area"] or "BOOKING").upper(),
-        }
-    if kyc is not None:
-        kyc_template = registry.template_for_di_type(kyc["diType"], stage=kyc["stage"])
-        checked = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                   pairs=rules.customer_name_checked)
-        checked += [doc for doc in references if doc["documentId"] != kyc["documentId"]]
-        # The customer named by a GST certificate (product owner 2026-10-27):
-        # a document may carry the GSTIN's legal or trade name, or the name of
-        # the person whose KYC is on file (the proprietor / signatory). The
-        # KYC documents are that person's own, so they only have to agree
-        # with each other, not with a firm's name.
-        gst_names: list[str] = []
-        proven: set[str] = set()
-        strict = False
-        person: dict[str, Any] | None = None
-        if kyc["diType"] == "gst_certificate":
-            gst_names = [str(kyc["name"]), *_gst_trade_names(connection, tenant_id=tenant_id,
-                                                             journey_id=journey_id, document_id=kyc["documentId"])]
-            strict = gst_proprietor_strict()
-            if not strict:
-                by_pair = {doc["pair"]: doc for doc in reversed(references)}
-                person = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
-            else:
-                # Whose KYC is the proprietor's / signatory's (2026-10-31): without
-                # it ANY person's PAN or Aadhaar passes under a GST certificate, so
-                # on ADI-RD-261022-022 another customer's KYC (Tapan Kumar Patra,
-                # his file dropped into Azizur Rehaman's booking) passed as the
-                # proprietor of Azizur's firm and the task closed itself. With
-                # P2_GST_PROPRIETOR_STRICT a KYC is the customer's only when its PAN
-                # is the PAN inside the GSTIN, or its name is the GST legal / trade
-                # name or an authorised signatory the certificate names. Off by
-                # default: live, most GST certificates carry the GSTIN only (no
-                # legal / trade / signatory names read), so an Aadhaar-only
-                # proprietor or a partner would newly raise the task.
-                from audit_core.uc03_p2_file_identity import same_pan
-
-                gst_pans, gst_people = _gst_certificate_people(connection, tenant_id=tenant_id,
-                                                               journey_id=journey_id, document_id=kyc["documentId"])
-                numbers = _kyc_pans(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                    document_ids=[d["documentId"] for d in references])
-
-                def proprietor(document: dict[str, Any]) -> bool:
-                    pan = numbers.get(document["documentId"])
-                    if pan and any(same_pan(pan, g) for g in gst_pans):
-                        return True
-                    names = [*gst_names, *gst_people]
-                    if is_masked(document["name"]):
-                        return any(masked_matches(document["name"], n) for n in names)
-                    return any(same_person(document["name"], n) for n in names)
-
-                proven_documents = [doc for doc in references if proprietor(doc)]
-                proven = {doc["documentId"] for doc in proven_documents}
-                by_pair = {doc["pair"]: doc for doc in reversed(proven_documents)}
-                person = next((by_pair[pair] for pair in rules.customer_name_reference if pair in by_pair), None)
-
-        # A document in a firm's name is the customer's when the customer is a
-        # person (product owner 2026-10-28: "firm name should be acceptable" --
-        # a proprietor's PAN is on file, the invoice or booking form is in the
-        # firm's name, "M/S SHREE SHYAM ENTERPRISES"). One firm per Journey:
-        # the firm most documents name is it, and a document naming another
-        # firm, or the dealership itself, is still the wrong document.
-        firm: str | None = None
-        if not gst_names:
-            dealership = [d["name"] for d in _named_documents(
-                connection, tenant_id=tenant_id, journey_id=journey_id, pairs=rules.dealer_name_checked)]
-            firms = [d["name"] for d in checked if is_firm_name(d["name"]) and not is_masked(d["name"])
-                     and not same_person(d["name"], kyc["name"])
-                     and not any(same_organisation(d["name"], n) for n in dealership)]
-            if firms:
-                firm = max(firms, key=lambda n: (sum(same_organisation(n, o) for o in firms), -firms.index(n)))
-
-        def matches(document: dict[str, Any]) -> bool:
-            if firm is not None and document["pair"] not in rules.customer_name_reference \
-                    and same_organisation(document["name"], firm):
-                return True
-            if document["documentId"] in proven:
-                return True  # the GST certificate's proprietor or signatory (2026-10-31)
-            # A masked PAN ("PXXXXJ KXXXR NXXXX") is the customer's when its
-            # visible letters fit the customer's name (2026-10-28).
-            if is_masked(document["name"]):
-                return any(masked_matches(document["name"], n)
-                           for n in [kyc["name"], *gst_names, *([person["name"]] if person else [])])
-            if is_masked(kyc["name"]) and masked_matches(kyc["name"], document["name"]):
-                return True  # only a masked PAN names the customer: a full name that fits it is theirs
-            if not gst_names:
-                return same_person(document["name"], kyc["name"])
-            if document["pair"] in rules.customer_name_reference:
-                # A proprietor's Aadhaar / PAN carries the name the GST certificate
-                # prints as the legal name ("BISWAJIT DAS", trade name "M/S DAS
-                # CONSTRUCTION"): that is the customer's own KYC (2026-10-28).
-                if strict:
-                    # the same person as a KYC proven above, and nobody else's
-                    return person is not None and same_person(document["name"], person["name"])
-                return (person is None or document["documentId"] == person["documentId"]
-                        or same_person(document["name"], person["name"])
-                        or any(same_person(document["name"], n) for n in gst_names))
-            return (any(same_person(document["name"], n) or same_organisation(document["name"], n) for n in gst_names)
-                    or (person is not None and same_person(document["name"], person["name"])))
-
+    # -- the customer, as the KYC names them (customer_name_check).
+    check = customer_name_check(connection, tenant_id=tenant_id, journey_id=journey_id, registry=registry)
+    if check is not None:
+        kyc, kyc_template, gst_names = check["kyc"], check["kycTemplate"], check["gstNames"]
+        mismatched = check["mismatched"]
         # A genuine mismatch is one PC task per Journey (product owner
         # 2026-10-29): one task naming every document in another name,
         # instead of a task per document (141 open on 89 Journeys, up to 8 on
         # one). It closes itself when every document matches or is removed.
-        mismatched = [document for document in checked if not matches(document)]
         if mismatched:
             # Its own key: an open TL task of 2026-10-29 (":customer") is not
             # turned into this one; it closes below as no longer wanted.

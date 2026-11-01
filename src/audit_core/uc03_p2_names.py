@@ -150,13 +150,20 @@ def is_masked(value: Any) -> bool:
 
 def masked_matches(masked: Any, full: Any) -> bool:
     """Whether a masked name fits a full one: the same words, each of the same
-    length, every letter that is not masked the same ("MXXXXI JXXa" is Minati Jena)."""
+    length, every letter that is not masked the same ("MXXXXI JXXa" is Minati Jena).
+    The full name's honorific is not a word of the name (2026-11-01: "Mr.
+    Sushanta Sahoo" on a booking form fits "SXXXXXXA SXXXO"; a PAN prints none)."""
     left = [t for t in re.sub(r"[^A-Za-z ]+", " ", str(masked or "")).upper().split() if t]
     right = [t for t in re.sub(r"[^A-Za-z ]+", " ", str(full or "")).upper().split() if t]
-    if not left or len(left) != len(right):
+    if not left:
         return False
-    return all(len(m) == len(f) and all(a == "X" or a == b for a, b in zip(m, f, strict=True))
-               for m, f in zip(left, right, strict=True))
+
+    def fits(words: list[str]) -> bool:
+        return len(left) == len(words) and all(
+            len(m) == len(f) and all(a == "X" or a == b for a, b in zip(m, f, strict=True))
+            for m, f in zip(left, words, strict=True))
+
+    return fits(right) or fits(person_tokens(full))
 
 
 def same_organisation(left: Any, right: Any) -> bool:

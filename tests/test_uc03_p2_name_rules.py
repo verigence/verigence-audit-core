@@ -409,6 +409,10 @@ def test_a_full_name_fits_a_masked_reference():
     assert masked_matches("PXXXXJ KXXXR NXXXX", "PANKAJ KUMAR NAYAK")
     assert not masked_matches("PXXXXJ KXXXR NXXXX", "PANKAJ KUMAR SAHOO")
     assert not masked_matches("SXXXXT KXXXR SXXXO", "Subrat Sahoo")
+    # The full name's honorific is not a word of the name (2026-11-01).
+    assert masked_matches("SXXXXXXA SXXXO", "Mr. Sushanta Sahoo")
+    assert masked_matches("SXXXXXE KXXXXI DXS", "SUSHREE KUMARI DAS")  # a name word, kept when it fits
+    assert not masked_matches("SXXXXXXA SXXXO", "Mr. Susanta Sahoo")
 
 
 def test_a_proprietors_kyc_in_the_gst_legal_name_is_the_customers(journey, strict):
