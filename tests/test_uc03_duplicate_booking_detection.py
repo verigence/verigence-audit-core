@@ -834,3 +834,67 @@ def test_a_team_leads_verdict_on_a_pair_stands_when_it_matches_again(two_journey
     _sync_both(c)
     [only] = _findings_with_basis(c)
     assert only["audit_finding_id"] == first["audit_finding_id"] and only["finding_status"] == "RESOLVED"
+
+
+# -------------------------------------- the same customer's other booking
+
+
+def _number_on(c, journey_id, document_type_key: str, field_key: str, value: str) -> None:
+    """A number read off an ACTIVE document of the booking."""
+    document_id = uuid4()
+    customer_id = c.execute(text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+                            {"t": c.tenant_id, "j": journey_id}).scalar_one()
+    requirement_id = c.execute(
+        text("INSERT INTO auditcore.journey_document_requirements (tenant_id, journey_id, requirement_key, "
+             "document_type_key, process_area, requirement_level) VALUES (:t, :j, :k, :k, 'BOOKING', 'REQUIRED') "
+             "RETURNING journey_document_requirement_id"),
+        {"t": c.tenant_id, "j": journey_id, "k": f"{document_type_key}-{uuid4().hex[:6]}"},
+    ).scalar_one()
+    c.execute(
+        text("INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, journey_document_requirement_id, "
+             "di_subject_id, di_document_id, document_type_key, evidence_purpose, process_area, association_status) "
+             "VALUES (:t, :j, :c, :r, :s, :d, :dt, 'BOOKING_DOCUMENT', 'BOOKING', 'ACTIVE')"),
+        {"t": c.tenant_id, "j": journey_id, "c": customer_id, "r": requirement_id, "s": uuid4(), "d": document_id,
+         "dt": document_type_key},
+    )
+    c.execute(
+        text("INSERT INTO auditcore.journey_document_extracted_fields (tenant_id, journey_id, evidence_id, "
+             "di_document_id, source_fact_ref, source_fact_version, stage_code, source_document_type_key, "
+             "source_canonical_field_id, field_key, extracted_value, effective_value, confidence_score, is_modified) "
+             "VALUES (:t, :j, NULL, :d, NULL, 1, 'BOOKING', :dt, NULL, :fk, CAST(:v AS jsonb), CAST(:v AS jsonb), "
+             "0.95, false)"),
+        {"t": c.tenant_id, "j": journey_id, "d": document_id, "dt": document_type_key, "fk": field_key,
+         "v": json.dumps(value)},
+    )
+
+
+def test_different_bookings_needs_differing_numbers_and_nothing_shared() -> None:
+    empty = {"B": set(), "R": set(), "C": set()}
+    a = {"B": {"OTF12145"}, "R": set(), "C": {"KT1H73515"[-8:]}}
+    b = {"B": {"INV27P000339"}, "R": {"BRMM262704196"}, "C": {"KT5H16927"[-8:]}}
+    assert dbd.different_bookings(a, b)  # Hrushikesh Mahanty's two pick-ups
+    assert not dbd.different_bookings(a, {**b, "C": {"T1H73515"}})  # one chassis in common
+    assert not dbd.different_bookings({**a, "R": {"X12345"}}, {**b, "R": {"X12345"}})  # one receipt in common
+    assert not dbd.different_bookings(empty, b)  # nothing to compare: the pair stays
+    assert not dbd.different_bookings({**empty, "R": {"R11111"}}, {**empty, "R": {"R22222"}})  # receipts alone
+
+
+def test_the_same_customers_other_booking_is_not_a_duplicate(two_journeys) -> None:
+    """UTK-PP-261023-012 / -013: same PAN, two pick-ups, different booking
+    numbers and chassis. Suryakant Parida's two copies share booking no. 17524."""
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="pan_card", field_key="pan_number", value="BAOPM0686H")
+    _set_field(c, journey_id=c.journey_b, document_type_key="pan_card", field_key="pan_number", value="BAOPM0686H")
+    _number_on(c, c.journey_a, "booking_docket", "booking_reference_number", "OTF-12145")
+    _number_on(c, c.journey_b, "booking_docket", "booking_reference_number", "B-13357657")
+    _number_on(c, c.journey_a, "vehicle_rc", "chassis_number", "MA1RE2TTKT1H73515")
+    _number_on(c, c.journey_b, "insurance_cover", "chassis_number", "MA1RE2TTKT5H16927")
+    # the other pick-up's accessory invoice filed on A does not make them one
+    _number_on(c, c.journey_a, "accessory_invoice_dms", "chassis_number", "T5H16927")
+    _sync_both(c)
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+    # One receipt in common: the same booking after all.
+    _number_on(c, c.journey_a, "dealer_receipt", "receipt_number", "BRMM/2627/04196")
+    _number_on(c, c.journey_b, "dealer_receipt", "receipt_number", "BRMM/2627/04196")
+    _sync_both(c)
+    assert _open_findings(c, c.journey_a) or _open_findings(c, c.journey_b)
