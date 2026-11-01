@@ -582,7 +582,9 @@ def test_discount_grid_ingests_per_model_and_reports_unknown_models(connection) 
     parsed.grid_rows = [
         GridRow(3, "Thar Roxx", ["Thar Roxx"], True, 60, Decimal(5000), Decimal(60), Decimal(3000)),
         GridRow(4, "PICKUP, MAXX", ["PICKUP", "MAXX"], True, 30, Decimal(7000), Decimal(50), Decimal(3000)),
-        GridRow(5, "SCORPIO N Old", ["SCORPIO N Old"], False, None, None, None, None),
+        # A model no book or catalogue carries (until 2026-11-01 this was the
+        # September grid's "SCORPIO N Old", which now names the SCORPIO N model).
+        GridRow(5, "QUANTO", ["QUANTO"], False, None, None, None, None),
     ]
     parsed.grid_parameters = [{"parameter": "Penalty Amount", "note": "₹30,000 per case"}]
     summary = ingest_discount_grid(
@@ -590,7 +592,7 @@ def test_discount_grid_ingests_per_model_and_reports_unknown_models(connection) 
         effective_from=date(2026, 9, 1), parsed=parsed, upload_id=None, actor_id="admin",
     )
     assert summary["published"] == 4 and summary["resolved"] == 2 and summary["parameters"] == 1
-    assert [u.split("'")[1] for u in summary["unresolved"]] == ["MAXX", "SCORPIO N Old"]
+    assert [u.split("'")[1] for u in summary["unresolved"]] == ["MAXX", "QUANTO"]
     thar_model = connection.execute(
         text("SELECT model_id FROM auditcore.product_skus WHERE product_sku_id = :s"),
         {"s": skus["THAR_ROXX::MX1 PMT 2WD"]},
