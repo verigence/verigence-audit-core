@@ -179,6 +179,21 @@ def _pc_can_book(connection: Connection, tenant_id: str, move: Move) -> str | No
     return None
 
 
+def _new_booking_problem(engine: Engine, tenant_id: str, move: Move) -> str | None:
+    """Dry run: why a new booking could not be made for this row, or None."""
+    if not move.target_journey_id:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            problem = _pc_can_book(connection, tenant_id, move)
+        if problem:
+            return problem
+    try:
+        get_p2_document_storage().head_object(move.object_key)
+    except (P2DocumentStorageError, RuntimeError) as exc:
+        return f"the stored original cannot be read ({type(exc).__name__})"
+    return None
+
+
 def _plan_line(engine: Engine, tenant_id: str, move: Move, *, commit: bool, outcome: str, **extra: Any) -> None:
     logger.info("file_move_plan", tenant_id=tenant_id, commit=commit, move_id=move.move_id, action=move.action,
                 source=move.source_reference, file_name=move.file_name, person=move.person_name,
@@ -316,8 +331,12 @@ def _carry_out(engine: Engine, tenant_id: str, move: Move, *, commit: bool) -> s
     """One row: 'DONE', 'WAITING', 'FAILED' or (dry run) 'WOULD_*'."""
     wait = _wait_reason(move)
     if wait:
-        _plan_line(engine, tenant_id, move, commit=commit, outcome="WAITING", reason=wait)
-        return "WAITING"
+        # A dry run still checks a new booking can be made, so a problem is
+        # known before the file is taken out.
+        problem = _new_booking_problem(engine, tenant_id, move) if not commit and move.action == "NEW_BOOKING" else None
+        _plan_line(engine, tenant_id, move, commit=commit, outcome="FAILED" if problem else "WAITING",
+                   reason=problem or wait)
+        return "FAILED" if problem else "WAITING"
     if move.action == "OWN_BOOKING":
         with engine.begin() as connection:
             set_tenant_context(connection, tenant_id)
@@ -365,25 +384,20 @@ def _carry_out(engine: Engine, tenant_id: str, move: Move, *, commit: bool) -> s
                         detail=f"The same file went to {other['journey_reference']}; nothing copied.")
             return "DONE" if commit else "WOULD_POINT"
     # NEW_BOOKING
-    with engine.begin() as connection:
-        set_tenant_context(connection, tenant_id)
-        problem = None if move.target_journey_id else _pc_can_book(connection, tenant_id, move)
-    if problem:
-        if commit:
-            with engine.begin() as connection:
-                set_tenant_context(connection, tenant_id)
+    if commit:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            problem = None if move.target_journey_id else _pc_can_book(connection, tenant_id, move)
+            if problem:
                 _finish(connection, tenant_id, move, status="FAILED", detail=problem)
+    else:
+        problem = _new_booking_problem(engine, tenant_id, move)
+    if problem:
         _plan_line(engine, tenant_id, move, commit=commit, outcome="FAILED", reason=problem)
         return "FAILED"
     if not commit:
-        try:
-            get_p2_document_storage().head_object(move.object_key)
-        except (P2DocumentStorageError, RuntimeError) as exc:  # reported in the dry run
-            _plan_line(engine, tenant_id, move, commit=False, outcome="FAILED",
-                       reason=f"the stored original cannot be read ({type(exc).__name__})")
-            return "FAILED"
         _plan_line(engine, tenant_id, move, commit=False, outcome="WOULD_CREATE", pc=move.pc_name,
-                   pages_bytes=move.size_bytes)
+                   size_bytes=move.size_bytes)
         return "WOULD_CREATE"
     # The original is read and checked before anything is created.
     payload = _original(move)

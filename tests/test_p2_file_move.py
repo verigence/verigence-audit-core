@@ -107,8 +107,13 @@ def _source_state(journey, case: dict) -> dict:
 def test_a_file_not_taken_out_yet_waits_and_nothing_is_created(journey):
     case = _tapan_taken_out(journey)
     move_id = _plan(journey, case["batch"])
+    assert _run(journey, commit=False) == {"WAITING": 1}
     assert _run(journey, commit=True) == {"WAITING": 1}
     assert len(_journeys(journey)) == 1
+    assert _move_row(journey, move_id)["status"] == "PLANNED"
+    # The dry run already says when the new booking could not be made.
+    _sql(journey, "UPDATE auditcore.business_assignments SET assignment_status='INACTIVE' WHERE tenant_id=:t")
+    assert _run(journey, commit=False) == {"FAILED": 1}
     assert _move_row(journey, move_id)["status"] == "PLANNED"
 
 
