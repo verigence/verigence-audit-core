@@ -89,7 +89,8 @@ def test_empty_check_tasks_are_cancelled_only_on_commit_and_only_the_checks_own(
 
 def test_a_fallback_duplicate_task_has_its_checks_run_again(journey):
     _task(journey, "DUPLICATE_RECEIPT")
-    _task(journey, "DUPLICATE_BOOKING", description="Possible duplicate booking for the same customer")
+    _task(journey, "DUPLICATE_BOOKING",
+          description="This booking matches the earlier booking ADI-RD-261001-001 on PAN XXXXXX267D. Confirm ...")
 
     def queued():
         return _sql(journey, "SELECT work_key, payload FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
@@ -126,3 +127,10 @@ def test_a_held_receipt_is_released_and_its_booking_recomputed_only_on_commit(jo
     assert _sql(journey, version).scalar_one_or_none() != before
     again = clean_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t-commit", commit=True)
     assert again["released"] == 0 and again["recomputed"] == 0 and again["stillHeld"] == 1
+
+
+def test_a_duplicate_booking_task_not_naming_the_other_booking_is_refreshed(journey):
+    _task(journey, "DUPLICATE_BOOKING",
+          description="This customer appears to match an earlier booking on this tenant (PAN match). Confirm ...")
+    assert clean_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t", commit=False)["rerunByCode"] == {
+        "DUPLICATE_BOOKING": 1}
