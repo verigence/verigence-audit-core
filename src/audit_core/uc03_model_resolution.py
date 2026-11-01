@@ -280,8 +280,11 @@ def _sku_rows_for_version(
                    SUM(pli.standard_amount) FILTER (WHERE pli.component_key = :exkey)
                                                                                 AS master_ex_showroom,
                    -- a variant the month's list no longer prints, at the
-                   -- previous month's price (2026-11-01): read last
-                   bool_or(pli.metadata ? 'carriedForwardFrom')                 AS carried
+                   -- previous month's price (2026-11-01): read last. Marked
+                   -- by "carriedReason", never "carriedForwardFrom" alone:
+                   -- a dealer sheet's version carries the rest of the book
+                   -- under that key, and those rows are on sale.
+                   bool_or(pli.metadata ? 'carriedReason')                      AS carried
             FROM auditcore.price_list_items pli
             JOIN auditcore.product_skus s      ON s.product_sku_id = pli.product_sku_id
             JOIN auditcore.product_models pm   ON pm.model_id  = s.model_id

@@ -244,6 +244,20 @@ def test_october_gets_septembers_price_for_the_variants_it_no_longer_lists(tenan
         on_sale = conn.execute(text(
             "SELECT pm.model_name FROM auditcore.product_models pm WHERE pm.model_id = ANY(:m)"),
             {"m": list(_models_in_book(conn, tenant_id=tenant_id, effective_on=on))}).scalars().all()
+        # The 7 Sep EV sheet's version carries the rest of the book
+        # ("carriedForwardFrom"): those rows are on sale, every model of it.
+        book_7_sep = conn.execute(text(
+            "SELECT DISTINCT s.model_id FROM auditcore.price_list_items i JOIN auditcore.product_skus s "
+            "ON s.product_sku_id = i.product_sku_id WHERE i.tenant_id = :t AND i.price_list_version_id = ("
+            "SELECT price_list_version_id FROM auditcore.price_list_versions WHERE tenant_id = :t "
+            "AND effective_from = '2026-09-07' ORDER BY version_no DESC LIMIT 1)"), {"t": tenant_id}).scalars().all()
+        sheet_carried = conn.execute(text(
+            "SELECT count(*) FROM auditcore.price_list_items i JOIN auditcore.price_list_versions v "
+            "ON v.price_list_version_id = i.price_list_version_id WHERE i.tenant_id = :t "
+            "AND v.effective_from = '2026-09-07' AND i.metadata ? 'carriedForwardFrom'"), {"t": tenant_id}).scalar_one()
+        on_sale_7_sep = _models_in_book(conn, tenant_id=tenant_id, effective_on=date(2026, 9, 7))
+        z8l = find_book_sku(conn, tenant_id=tenant_id, model_text="NEW SCORPIO N",
+                            variant_text="Z8 L D AT 2WD 7 STR BS6.2 - Refresh", effective_on=date(2026, 9, 7))
         marked = conn.execute(text(
             "SELECT count(DISTINCT product_sku_id) FROM auditcore.price_list_items WHERE tenant_id = :t "
             "AND price_list_version_id = :v AND metadata ? 'carriedForwardFrom'"),
@@ -253,6 +267,8 @@ def test_october_gets_septembers_price_for_the_variants_it_no_longer_lists(tenan
     assert veero["sku"] and veero["sku"]["model_name"] == "VEERO"
     assert "NEW SCORPIO N" in on_sale and "SCORPIO N" not in on_sale  # the old series is priced, not on sale
     assert marked == 29
+    assert sheet_carried > 0 and on_sale_7_sep == set(book_7_sep)
+    assert z8l["sku"] and z8l["sku"]["model_name"] == "NEW SCORPIO N"
     # Nothing left to carry: a second run publishes nothing.
     with engine.connect() as connection, connection.begin():
         again = complete_october_tenant(connection, tenant_id=tenant_id, tag=f"{tag}-octcarry-again", store=False)

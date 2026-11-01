@@ -651,7 +651,9 @@ def reload_grids_tenant(connection: Connection, *, tenant_id: str, tag: str, sto
 # is carried (32 live: the 24 old-series Scorpio N under the September model
 # "SCORPIO N", BE 6 One x2, BE 6 SPORTEQ THREE x2, four Veero) -- product
 # owner, 1 Nov: "old scorpio to be priced at sep price". A carried row is
-# priced, not on sale (``carriedForwardFrom``): October prints the NEW Scorpio
+# priced, not on sale (``carriedReason``; a dealer sheet's version marks the
+# rest of the book it carries with ``carriedForwardFrom`` alone, and those rows
+# are on sale): October prints the NEW Scorpio
 # N with the old series' names ("Z8 S D AT 2WD 7 STR BS6.2 - N" is Rs
 # 19,17,500 old in September and Rs 19,98,995 new in October), so the SKU
 # resolver and the book lookup read the words against the rows October prints
