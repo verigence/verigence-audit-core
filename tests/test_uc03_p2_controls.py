@@ -214,6 +214,33 @@ def test_native_runner_writes_rerun_controls(journey):
         assert state[code]["control_status"] in {"WAITING_FOR_FACTS", "PASS"}
 
 
+def test_a_duplicate_receipt_task_names_the_receipt(journey):
+    """2026-11-01: the check's task read "The audit check failed. Review the
+    related documents." and named no receipt (17 open)."""
+    from datetime import UTC, datetime
+
+    from audit_core.uc03_p2_task_producer import apply_control_transitions
+
+    for _ in range(2):
+        add_ready_document(journey, "dealer_receipt", receipt_number="AMC-B/30563/26-27", amount_paid="21000",
+                           receipt_date="2026-10-27")
+    transitions = _evaluate(journey, "NATIVE:BOOKING")
+    [receipt] = [t for t in transitions if t.control_code == "DUPLICATE_RECEIPT"]
+    assert receipt.current == "FAIL"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        apply_control_transitions(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                                  transitions=[receipt], evaluation_started_at=datetime.now(UTC))
+        task = connection.execute(
+            text("SELECT title, description, reference FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k"),
+            {"t": journey.tenant_id, "k": f"control:{journey.journey_id}:DUPLICATE_RECEIPT"},
+        ).mappings().one()
+    assert task["title"] == "Receipt AMC-B/30563/26-27 uploaded 2 times"
+    assert "Receipt AMC-B/30563/26-27 for ₹21,000, dated 27 Oct 2026, is on the booking 2 times." in \
+        task["description"]
+    assert len(task["reference"]["documentIds"]) == 2
+
+
 def test_statistics_are_attributed_to_stages(journey):
     _recompute_stage(journey)
     _evaluate(journey, "P2:DERIVED")

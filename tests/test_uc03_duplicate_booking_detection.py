@@ -789,3 +789,48 @@ def test_a_voided_copy_read_from_a_file_taken_out_never_pairs_two_bookings(two_j
     )
     _sync_both(c)
     assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+
+
+def test_a_pair_cleared_by_the_system_that_matches_again_is_raised_afresh(two_journeys) -> None:
+    """2026-11-01: _machine_flag reused the RESOLVED finding, so a pair cleared
+    once and matched again was counted as raised with no open finding, and its
+    task read "The audit check failed." with nothing to show (UTK-RM-261019-002
+    and five more). The system's clearing is voided and a fresh finding raised,
+    with what matches now."""
+    c = two_journeys
+    for journey_id in (c.journey_a, c.journey_b):
+        _set_field(c, journey_id=journey_id, document_type_key="pan_card", field_key="pan_number", value="HHHHH8888H")
+    _sync_both(c)
+    [first] = _findings_with_basis(c)
+    duplicate = first["journey_id"]
+    # A correction: the PANs differ after all -- cleared by the system.
+    _set_field(c, journey_id=duplicate, document_type_key="pan_card", field_key="pan_number", value="JJJJJ9999J")
+    _sync_both(c)
+    [cleared] = _findings_with_basis(c)
+    assert cleared["finding_status"] == "RESOLVED"
+    # Read again as the same PAN: the pair matches again.
+    _set_field(c, journey_id=duplicate, document_type_key="pan_card", field_key="pan_number", value="HHHHH8888H")
+    result = dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=duplicate, correlation_id="")
+    assert result["raised"] == 1
+    old, new = _findings_with_basis(c)
+    assert old["audit_finding_id"] == first["audit_finding_id"] and old["finding_status"] == "VOIDED"
+    assert new["finding_status"] == "OPEN" and new["journey_id"] == duplicate
+    assert new["raised"]["matchBasis"] == "PAN" and new["raised"]["matchedFields"]
+    _sync_both(c)  # idempotent
+    assert len(_findings_with_basis(c)) == 2 and len(_open_findings(c, duplicate)) == 1
+
+
+def test_a_team_leads_verdict_on_a_pair_stands_when_it_matches_again(two_journeys) -> None:
+    c = two_journeys
+    for journey_id in (c.journey_a, c.journey_b):
+        _set_field(c, journey_id=journey_id, document_type_key="pan_card", field_key="pan_number", value="KKKKK1111K")
+    _sync_both(c)
+    [first] = _findings_with_basis(c)
+    c.execute(
+        text("UPDATE auditcore.audit_findings SET finding_status='RESOLVED', disposition='FALSE_POSITIVE', "
+             "resolved_by_actor_id='tl-1', resolved_at_utc=now() WHERE tenant_id=:t AND audit_finding_id=:f"),
+        {"t": c.tenant_id, "f": first["audit_finding_id"]},
+    )
+    _sync_both(c)
+    [only] = _findings_with_basis(c)
+    assert only["audit_finding_id"] == first["audit_finding_id"] and only["finding_status"] == "RESOLVED"

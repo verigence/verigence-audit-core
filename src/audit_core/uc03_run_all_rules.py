@@ -130,8 +130,9 @@ def _run_audit_core_rules_for_stage(
 
     results: list[RunAllRulesRuleResult] = []
 
-    def _record(rule_code: str, outcome: str) -> None:
-        results.append(RunAllRulesRuleResult(ruleCode=rule_code, stage=stage, outcome=outcome))
+    def _record(rule_code: str, outcome: str, details: dict[str, Any] | None = None) -> None:
+        results.append(RunAllRulesRuleResult(ruleCode=rule_code, stage=stage, outcome=outcome,
+                                             details=details or {}))
 
     # These four are journey-wide (not scoped to one stage's documents), so
     # only run them once, on the first stage evaluated -- calling them a
@@ -155,7 +156,15 @@ def _run_audit_core_rules_for_stage(
             rule_code="DUPLICATE_RECEIPT", triggering_event=_TRIGGERING_EVENT,
             result=duplicate_receipt_result, skipped_reason="no receipt documents on this Journey yet",
         )
-        _record("DUPLICATE_RECEIPT", "ERROR" if duplicate_receipt_result.get("error") else ("SKIPPED" if duplicate_receipt_result.get("examined", 0) == 0 else ("FAIL" if duplicate_receipt_result.get("raised", 0) else "PASS")))
+        duplicate_receipt_outcome = "ERROR" if duplicate_receipt_result.get("error") else ("SKIPPED" if duplicate_receipt_result.get("examined", 0) == 0 else ("FAIL" if duplicate_receipt_result.get("raised", 0) else "PASS"))
+        # Which receipts, so the check's task names them (2026-11-01).
+        from audit_core.uc03_duplicate_receipt_detection import (
+            duplicate_receipt_finding,
+        )
+
+        _record("DUPLICATE_RECEIPT", duplicate_receipt_outcome,
+                duplicate_receipt_finding(duplicate_receipt_result.get("groups") or [])
+                if duplicate_receipt_outcome == "FAIL" else None)
 
         duplicate_booking_result = sync_duplicate_booking_detection(
             connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id

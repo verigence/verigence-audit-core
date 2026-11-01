@@ -114,6 +114,7 @@ def journey():
             c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
             c.tenant_id = tenant_id  # type: ignore[attr-defined]
             c.journey_id = journey_id  # type: ignore[attr-defined]
+            c.customer_id = customer_id  # type: ignore[attr-defined]
             yield c
     finally:
         delete_tenant_data(engine, tenant_id)
@@ -142,8 +143,19 @@ def _set_receipt_field(c, *, stage_code, document_type_key, field_key, value, do
     )
 
 
-def _seed_receipt(c, *, stage_code, document_type_key, receipt_number=None, amount, receipt_date, document_id=None):
-    document_id = document_id or uuid4()
+def _seed_receipt(c, *, stage_code, document_type_key, receipt_number=None, amount, receipt_date, document_id=None,
+                  status="ACTIVE"):
+    """A receipt on the booking (ACTIVE evidence, the check reads only those
+    since 2026-11-01) with its read fields; ``status`` for a copy that is not."""
+    if document_id is None:
+        document_id = uuid4()
+        c.execute(
+            text("INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id, di_document_id, "
+                 "document_type_key, evidence_purpose, process_area, association_status) "
+                 "VALUES (:t, :j, :c, :s, :d, :k, 'JOURNEY_DOCUMENT', :p, :st)"),
+            {"t": c.tenant_id, "j": c.journey_id, "c": c.customer_id, "s": uuid4(), "d": document_id,
+             "k": document_type_key, "p": stage_code, "st": status},
+        )
     if receipt_number is not None:
         _set_receipt_field(c, stage_code=stage_code, document_type_key=document_type_key,
                             field_key="receipt_number", value=receipt_number, document_id=document_id)
@@ -370,3 +382,45 @@ def test_legacy_finding_still_resolves_after_the_task_queue_move(journey) -> Non
         {"t": c.tenant_id, "j": c.journey_id},
     ).scalar_one()
     assert status == "RESOLVED"
+
+
+def test_a_copy_no_longer_on_the_booking_is_not_a_duplicate(journey) -> None:
+    """2026-11-01, UTK-SU-261020-002: the copy a re-upload replaced kept its
+    read fields and was paired with its replacement as "the same receipt
+    uploaded twice". Only receipts on the booking count."""
+    c = journey
+    _seed_receipt(c, stage_code="BOOKING", document_type_key="dealer_receipt",
+                  receipt_number="PLSM/2627/01014", amount="11000", receipt_date="2026-10-20", status="SUPERSEDED")
+    _seed_receipt(c, stage_code="BOOKING", document_type_key="dealer_receipt",
+                  receipt_number="PLSM/2627/01014", amount="11000", receipt_date="2026-10-20")
+    result = drd.sync_duplicate_receipt_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert result["raised"] == 0 and result["examined"] == 1 and result["groups"] == []
+
+
+def test_the_check_says_which_receipt_is_on_the_booking_twice(journey) -> None:
+    """2026-11-01: the check's task read "The audit check failed. Review the
+    related documents." and named no receipt."""
+    c = journey
+    first = _seed_receipt(c, stage_code="BOOKING", document_type_key="dealer_receipt",
+                          receipt_number="AMC-B/28968/26-27", amount="100000", receipt_date="2026-10-22")
+    second = _seed_receipt(c, stage_code="BOOKING", document_type_key="dealer_receipt",
+                           receipt_number="AMC-B/28968/26-27", amount="100000", receipt_date="2026-10-22")
+    result = drd.sync_duplicate_receipt_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    finding = drd.duplicate_receipt_finding(result["groups"])
+    assert finding["findingTitle"] == "Receipt AMC-B/28968/26-27 uploaded 2 times"
+    assert finding["findingDescription"].startswith(
+        "Receipt AMC-B/28968/26-27 for ₹1,00,000, dated 22 Oct 2026, is on the booking 2 times. "
+        "It is counted once toward what the customer paid.")
+    assert set(finding["documentIds"]) == {str(first), str(second)}
+
+
+def test_copies_read_with_different_dates_are_each_still_counted():
+    a, b = uuid4(), uuid4()
+    groups = [drd.describe_group(g) for g in drd.compute_duplicate_groups([
+        _record(a, receipt_number="BRMM/2627/08564", receipt_date="2026-10-20"),
+        _record(b, receipt_number="BRMM/2627/08564", receipt_date="2026-10-21"),
+    ])]
+    text_ = drd.duplicate_receipt_finding(groups)["findingDescription"]
+    assert "read with different dates (20 Oct 2026, 21 Oct 2026)" in text_
+    assert "Each copy is still counted" in text_
+    assert drd.duplicate_receipt_finding([]) == {}
