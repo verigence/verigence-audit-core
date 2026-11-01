@@ -932,6 +932,24 @@ def _json(value: Any) -> str:
 
 _RESTORABLE = ("REPLACED_BY_NEWER_UPLOAD", "REPLACED_BY_P2_REUPLOAD", "EARLIER_COPY_RESTORED")
 
+# A copy ``e`` was replaced by a FOREIGN file when the newer copy is one of
+# that file's documents -- whatever became of it. Found live 2026-11-01
+# (ADI-RD-261022-018): a page of Sudhanshu's file superseded Bikash's
+# Aadhaar, was then merged into the grouped Aadhaar document and voided as a
+# page (P2_MERGED_INTO_DOCUMENT), so only the grouped document went FOREIGN;
+# the superseding evidence itself stayed VOIDED and Bikash's own Aadhaar was
+# never given back. A page and the document it was merged into belong to the
+# same uploaded file (batch), so the file decides, not the evidence status.
+_REPLACED_BY_FOREIGN_FILE = """
+    EXISTS (SELECT 1 FROM auditcore.evidence s
+            WHERE s.tenant_id=e.tenant_id AND s.supersedes_evidence_id=e.evidence_id
+              AND (s.association_status='FOREIGN' OR EXISTS (
+                    SELECT 1 FROM auditcore.p2_document_queue sq
+                    WHERE sq.tenant_id=s.tenant_id AND sq.journey_id=s.journey_id
+                      AND sq.di_document_id=s.di_document_id
+                      AND sq.batch_id = ANY(CAST(:foreign AS uuid[])))))
+"""
+
 
 def _repeatable(requirement_key: str | None) -> bool:
     from audit_core.uc03_pc_booking_documents import _is_repeatable_requirement
@@ -989,14 +1007,12 @@ def _enforce(connection: Connection, *, tenant_id: str, journey_id: UUID, foreig
     # as they were (their void reason, by whom, when; their capture row).
     again = connection.execute(
         text(
-            """
+            f"""
             WITH copies AS (
                 SELECT e.evidence_id, e.foreign_restore_state AS state
                 FROM auditcore.evidence e
                 WHERE e.tenant_id=:t AND e.journey_id=:j AND e.foreign_restore_state IS NOT NULL
-                  AND NOT EXISTS (SELECT 1 FROM auditcore.evidence s
-                                  WHERE s.tenant_id=e.tenant_id AND s.supersedes_evidence_id=e.evidence_id
-                                    AND s.association_status='FOREIGN')
+                  AND NOT {_REPLACED_BY_FOREIGN_FILE}
                 FOR UPDATE OF e
             )
             UPDATE auditcore.evidence e
@@ -1014,7 +1030,7 @@ def _enforce(connection: Connection, *, tenant_id: str, journey_id: UUID, foreig
             RETURNING e.di_document_id, e.association_status, c.state->>'captureStatus' AS capture_status
             """
         ),
-        {"t": tenant_id, "j": journey_id},
+        {"t": tenant_id, "j": journey_id, "foreign": foreign},
     ).mappings().all()
     for copy in again:
         if copy["association_status"] == "SUPERSEDED":
@@ -1069,9 +1085,10 @@ def _enforce(connection: Connection, *, tenant_id: str, journey_id: UUID, foreig
         ),
         {"t": tenant_id, "foreign": foreign},
     )
-    # 3. Every single-slot requirement a FOREIGN document touches, this pass
-    # or an earlier one: the customer's own copy is given back, when nothing
-    # of the booking's own is active for it. What the copy was is kept on it
+    # 3. Every single-slot requirement a FOREIGN file touches, this pass or an
+    # earlier one -- its documents, and its pages voided as merged into one of
+    # them: the customer's own copy is given back, when nothing of the
+    # booking's own is active for it. What the copy was is kept on it
     # (foreign_restore_state) so step 1 can put it back exactly.
     rows = connection.execute(
         text(
@@ -1080,10 +1097,14 @@ def _enforce(connection: Connection, *, tenant_id: str, journey_id: UUID, foreig
             FROM auditcore.evidence e
             JOIN auditcore.journey_document_requirements r
               ON r.tenant_id=e.tenant_id AND r.journey_document_requirement_id=e.journey_document_requirement_id
-            WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='FOREIGN'
+            WHERE e.tenant_id=:t AND e.journey_id=:j
+              AND (e.association_status='FOREIGN' OR EXISTS (
+                    SELECT 1 FROM auditcore.p2_document_queue q
+                    WHERE q.tenant_id=e.tenant_id AND q.journey_id=e.journey_id AND q.di_document_id=e.di_document_id
+                      AND q.batch_id = ANY(CAST(:foreign AS uuid[]))))
             """
         ),
-        {"t": tenant_id, "j": journey_id},
+        {"t": tenant_id, "j": journey_id, "foreign": foreign},
     ).mappings().all()
     for row in rows:
         if _repeatable(row["requirement_key"]):
@@ -1101,19 +1122,17 @@ def _enforce(connection: Connection, *, tenant_id: str, journey_id: UUID, foreig
             continue
         restored = connection.execute(
             text(
-                """
+                f"""
                 SELECT e.evidence_id, e.di_document_id FROM auditcore.evidence e
                 WHERE e.tenant_id=:t AND e.journey_id=:j AND e.journey_document_requirement_id=:r
                   AND e.association_status='SUPERSEDED' AND e.void_reason = ANY(:reasons)
-                  AND EXISTS (SELECT 1 FROM auditcore.evidence s
-                              WHERE s.tenant_id=e.tenant_id AND s.supersedes_evidence_id=e.evidence_id
-                                AND s.association_status='FOREIGN')
+                  AND {_REPLACED_BY_FOREIGN_FILE}
                 ORDER BY e.linked_at_utc DESC, e.evidence_id DESC
                 LIMIT 1
                 FOR UPDATE
                 """
             ),
-            {"t": tenant_id, "j": journey_id, "r": requirement, "reasons": list(_RESTORABLE)},
+            {"t": tenant_id, "j": journey_id, "r": requirement, "reasons": list(_RESTORABLE), "foreign": foreign},
         ).mappings().first()
         if restored is None:
             continue
@@ -1203,20 +1222,23 @@ def plan_enforcement(connection: Connection, *, tenant_id: str, journey_id: UUID
     for r in rows:
         if r["supersedes_evidence_id"] is not None:
             superseders.setdefault(r["supersedes_evidence_id"], []).append(r)
-    requirements = {r["journey_document_requirement_id"] for r in out.values()
+    # As _enforce: any document of the file counts, a page of it voided as
+    # merged into one of its documents too (_REPLACED_BY_FOREIGN_FILE).
+    of_file = [r for r in rows if r["batch_id"] in chosen]
+    requirements = {r["journey_document_requirement_id"] for r in of_file
                     if r["journey_document_requirement_id"] is not None and not _repeatable(r["requirement_key"])}
     restored = []
     for requirement in requirements:
-        kept = [r for r in rows if r["journey_document_requirement_id"] == requirement and r["evidence_id"] not in out]
+        kept = [r for r in rows if r["journey_document_requirement_id"] == requirement and r["batch_id"] not in chosen]
         if any(r["association_status"] == "ACTIVE" for r in kept):
             continue
         candidates = sorted(
             (r for r in kept if r["association_status"] == "SUPERSEDED" and r["void_reason"] in _RESTORABLE
-             and any(s["evidence_id"] in out for s in superseders.get(r["evidence_id"], []))),
+             and any(s["batch_id"] in chosen for s in superseders.get(r["evidence_id"], []))),
             key=lambda r: (r["linked_at_utc"], str(r["evidence_id"])), reverse=True)
         if candidates:
             copy = candidates[0]
-            by = next(s for s in superseders[copy["evidence_id"]] if s["evidence_id"] in out)
+            by = next(s for s in superseders[copy["evidence_id"]] if s["batch_id"] in chosen)
             plan["files"][by["batch_id"]]["restores"] += 1
             restored.append(copy)
     names: dict[Any, str] = {}

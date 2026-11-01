@@ -3292,6 +3292,20 @@ def _apply_file_identity(connection, *, tenant_id: str, journey_id: UUID) -> Non
         logger.warning("p2_file_identity_failed", tenant_id=tenant_id, journey_id=str(journey_id), exc_info=True)
 
 
+def _bring_back_earlier_copies(connection, *, tenant_id: str, journey_id: UUID) -> None:
+    """As _apply_file_identity: a failure is logged and the recompute goes on;
+    a deadlock fails the item so it is retried."""
+    from audit_core.uc03_db_transient import raise_if_worker_transient
+    from audit_core.uc03_p2_earlier_copy import bring_back_earlier_copies
+
+    try:
+        with connection.begin_nested():
+            bring_back_earlier_copies(connection, tenant_id=tenant_id, journey_id=journey_id)
+    except Exception as exc:
+        raise_if_worker_transient(exc)
+        logger.warning("p2_earlier_copy_back_failed", tenant_id=tenant_id, journey_id=str(journey_id), exc_info=True)
+
+
 def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
                    started_at: datetime | None = None) -> dict[str, Any]:
     """Recompute the stage from the documents, raise / close the rule tasks
@@ -3312,6 +3326,10 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     # documents, and the customer's own copies it had superseded come back
     # (uc03_p2_file_identity; acts only with P2_FILE_IDENTITY_ENFORCE on).
     _apply_file_identity(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # A copy whose replacement never became a document (its pages merged into
+    # a document never read) is the booking's again (2026-11-01,
+    # uc03_p2_earlier_copy), before the booking is rebuilt from its documents.
+    _bring_back_earlier_copies(connection, tenant_id=tenant_id, journey_id=journey_id)
     _materialize_journey(connection, tenant_id=tenant_id, journey_id=journey_id)
     # The booking date follows the receipts still on file: a receipt deleted,
     # re-read or replaced since the last pass no longer sets it (2026-10-20).
@@ -4650,6 +4668,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # (2026-11-01): see uc03_file_move.run_file_move_resend.
         from audit_core.uc03_file_move import run_file_move_resend
         return run_file_move_resend, (engine, tag, reports)
+    if kind == "EARLIER_COPY_BACK":
+        # The bookings holding a copy that comes back are recomputed
+        # (2026-11-01): see uc03_p2_earlier_copy. A dry run lists them.
+        from audit_core.uc03_p2_earlier_copy import run_earlier_copy_back
+        return run_earlier_copy_back, (engine, tag, _active_tenants(engine))
     per_tenant = {
         "PAGE_RESEND": ("audit_core.uc03_p2_page_resend", "run_page_resend"),
         "INVOICE_RESCAN": ("audit_core.uc03_invoice_rescan", "run_invoice_rescan"),
