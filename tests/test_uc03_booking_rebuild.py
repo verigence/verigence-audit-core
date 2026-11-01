@@ -1,160 +1,139 @@
-"""BOOKING_REBUILD: a booking whose build would change is recomputed; the job
-never writes a booking's values itself (2026-11-01)."""
+"""BOOKING_REBUILD: a booking whose recompute would change something is
+recomputed; the job never writes a booking's values itself (2026-11-01)."""
 from __future__ import annotations
 
-import json
-import os
-from uuid import uuid4
-
 import pytest
-from sqlalchemy import create_engine, text
+from conftest import delete_tenant_data
+from p2_support import (
+    add_extracted_field,
+    add_ready_document,
+    create_p2_journey,
+    database_engine,
+)
+from sqlalchemy import text
 
 from audit_core import uc03_booking_rebuild as rebuild
 from audit_core.db import set_tenant_context
+from audit_core.uc03_p2_worker import _one_shot_target, settle_journey
 
 
 @pytest.fixture
-def booking():
-    database_url = os.environ.get("DATABASE_URL")
-    if not database_url:
-        pytest.skip("DATABASE_URL is required for booking rebuild integration tests")
-    engine = create_engine(database_url)
-    suffix = uuid4().hex[:10]
-    tenant_id = f"tenant-rb-{suffix}"
-    with engine.begin() as c:
-        category_id = c.execute(
-            text("INSERT INTO auditcore.product_categories (category_code, category_name) "
-                 "VALUES (:c, 'V') RETURNING product_category_id"), {"c": f"RB-CAT-{suffix}"}).scalar_one()
-        oem_id = c.execute(text("INSERT INTO auditcore.oems (oem_code, oem_name) VALUES (:c, 'O') RETURNING oem_id"),
-                           {"c": f"RB-OEM-{suffix}"}).scalar_one()
-        c.execute(
-            text("""INSERT INTO auditcore.projects
-                (tenant_id, project_code, project_name, oem_id, product_category_id,
-                 effective_start_date, timezone_name, project_status)
-                VALUES (:t, :pc, 'RB', :o, :cat, CURRENT_DATE - 1, 'Asia/Kolkata', 'ACTIVE')"""),
-            {"t": tenant_id, "pc": f"RB-{suffix}", "o": oem_id, "cat": category_id})
-        dealer_id = c.execute(text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
-                                   "VALUES (:t, :c, 'D') RETURNING dealer_id"),
-                              {"t": tenant_id, "c": f"RB-D-{suffix}"}).scalar_one()
-        outlet_id = c.execute(text("INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_code, outlet_name) "
-                                   "VALUES (:t, :d, :c, 'O') RETURNING outlet_id"),
-                              {"t": tenant_id, "d": dealer_id, "c": f"RB-O-{suffix}"}).scalar_one()
-        customer_id = c.execute(text("""INSERT INTO auditcore.customers
-                (tenant_id, dealer_id, outlet_id, customer_type_code, display_name)
-                VALUES (:t, :d, :o, 'INDIVIDUAL', 'C') RETURNING customer_id"""),
-                                {"t": tenant_id, "d": dealer_id, "o": outlet_id}).scalar_one()
-        journey_id = c.execute(text("""INSERT INTO auditcore.journeys
-                (tenant_id, dealer_id, outlet_id, customer_id, journey_reference)
-                VALUES (:t, :d, :o, :cu, :r) RETURNING journey_id"""),
-                               {"t": tenant_id, "d": dealer_id, "o": outlet_id, "cu": customer_id,
-                                "r": f"RB-J-{suffix}"}).scalar_one()
-    yield engine, tenant_id, journey_id
-    engine.dispose()
+def journey():
+    engine = database_engine()
+    created = create_p2_journey(engine, prefix="p2rb")
+    try:
+        yield created
+    finally:
+        delete_tenant_data(engine, created.tenant_id)
+        engine.dispose()
 
 
-def _receipt(engine, tenant_id, journey_id, *, amount: str, number: str) -> str:
-    document_id = uuid4()
-    with engine.begin() as c:
-        set_tenant_context(c, tenant_id)
-        evidence_id = c.execute(
-            text("""INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id,
-                        di_document_id, document_type_key, evidence_purpose, association_status)
-                    SELECT j.tenant_id, j.journey_id, j.customer_id, :s, :d, 'dealer_receipt', 'BOOKING_DOCUMENT', 'ACTIVE'
-                    FROM auditcore.journeys j WHERE j.tenant_id=:t AND j.journey_id=:j
-                    RETURNING evidence_id"""),
-            {"t": tenant_id, "j": journey_id, "d": document_id, "s": uuid4()}).scalar_one()
-        for field_key, value in (("amount_paid", amount), ("receipt_number", number),
-                                 ("receipt_date", "2026-09-25"), ("customer_name", "MATRUKRUPA ENTERPRISERS")):
-            c.execute(
-                text("""INSERT INTO auditcore.journey_document_extracted_fields (
-                            tenant_id, journey_id, evidence_id, di_document_id, source_fact_ref,
-                            source_fact_version, stage_code, source_document_type_key, source_canonical_field_id,
-                            field_key, extracted_value, effective_value, confidence_score, is_modified)
-                        VALUES (:t, :j, :ev, :d, NULL, 1, 'BOOKING', 'dealer_receipt', NULL, :fk,
-                                CAST(:v AS jsonb), CAST(:v AS jsonb), 92, false)"""),
-                {"t": tenant_id, "j": journey_id, "ev": evidence_id, "d": document_id, "fk": field_key,
-                 "v": json.dumps(value)})
+def _receipt(journey, *, amount: str | None, number: str):
+    document_id = add_ready_document(journey, "dealer_receipt", receipt_number=number, receipt_date="2026-09-25",
+                                     customer_name="MATRUKRUPA ENTERPRISERS")
+    add_extracted_field(journey, di_document_id=document_id, field_key="amount_paid", value=amount, confidence=99.0,
+                        document_type="dealer_receipt")
     return str(document_id)
 
 
-def _payments(engine, tenant_id, journey_id) -> list[dict]:
-    with engine.begin() as c:
-        set_tenant_context(c, tenant_id)
+def _payments(journey) -> list[dict]:
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
         return [dict(r) for r in c.execute(
-            text("SELECT amount, receipt_number, source_di_document_id FROM auditcore.payments "
-                 "WHERE tenant_id=:t AND journey_id=:j"), {"t": tenant_id, "j": journey_id}).mappings().all()]
+            text("SELECT amount, receipt_number FROM auditcore.payments WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": journey.tenant_id, "j": journey.journey_id}).mappings().all()]
 
 
-def _recompute_version(engine, tenant_id, journey_id) -> int:
-    with engine.begin() as c:
-        set_tenant_context(c, tenant_id)
+def _version(journey) -> int:
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
         return c.execute(text("SELECT COALESCE(MAX(fact_version), 0) FROM auditcore.p2_journey_runtime "
-                              "WHERE tenant_id=:t AND journey_id=:j"), {"t": tenant_id, "j": journey_id}).scalar_one()
+                              "WHERE tenant_id=:t AND journey_id=:j"),
+                         {"t": journey.tenant_id, "j": journey.journey_id}).scalar_one()
 
 
-def test_a_receipt_with_no_payment_is_found_and_nothing_is_written(booking) -> None:
-    """UTK-SB-261028-001: ₹30,36,490 read, no payment, booking unpaid."""
-    engine, tenant_id, journey_id = booking
-    document_id = _receipt(engine, tenant_id, journey_id, amount="3036490", number="BRMM/2627/08128")
-    with engine.begin() as c:
-        set_tenant_context(c, tenant_id)
-        changes = rebuild.rebuild_check(c, tenant_id=tenant_id, journey_id=journey_id)
+def _check(journey) -> dict:
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        return rebuild.rebuild_check(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+
+def _settle(journey) -> None:
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        settle_journey(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+
+def test_the_job_is_registered(journey) -> None:
+    target, args = _one_shot_target("BOOKING_REBUILD", journey.engine, "t", [])
+    assert target.__name__ == "run_booking_rebuild" and journey.tenant_id in args[2]
+
+
+def test_a_receipt_with_no_payment_is_found_and_nothing_is_written(journey) -> None:
+    """UTK-SB-261028-001: Rs 30,36,490 read, no payment, booking unpaid."""
+    document_id = _receipt(journey, amount="3036490", number="BRMM/2627/08128")
+    changes = _check(journey)
     added = changes["payments"]["addedPayments"]
     assert [(float(p["amount"]), p["receiptNumber"], p["documentId"]) for p in added] == [
         (3036490.0, "BRMM/2627/08128", document_id)]
-    assert _payments(engine, tenant_id, journey_id) == []  # always rolled back
+    assert _payments(journey) == []  # always rolled back
 
 
-def test_the_dry_run_requests_nothing_and_the_commit_requests_the_recompute(booking) -> None:
-    engine, tenant_id, journey_id = booking
-    _receipt(engine, tenant_id, journey_id, amount="1100000", number="R-1")
-    version = _recompute_version(engine, tenant_id, journey_id)
-    totals = rebuild.rebuild_tenant(engine, tenant_id=tenant_id, tag="t", commit=False)
+def test_the_dry_run_requests_nothing_and_the_commit_requests_the_recompute(journey) -> None:
+    _receipt(journey, amount="1100000", number="R-1")
+    version = _version(journey)
+    totals = rebuild.rebuild_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t", commit=False)
     assert totals["wouldChange"] == 1 and totals["paymentsAdded"] == 1
     assert totals["paymentsAddedAmount"] == "1100000.00" and totals["recomputeRequested"] == 0
-    assert _recompute_version(engine, tenant_id, journey_id) == version
-    totals = rebuild.rebuild_tenant(engine, tenant_id=tenant_id, tag="t-commit", commit=True)
+    assert _version(journey) == version
+    totals = rebuild.rebuild_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t-commit", commit=True)
     assert totals["recomputeRequested"] == 1 and totals["failed"] == 0
-    assert _recompute_version(engine, tenant_id, journey_id) == version + 1
-    assert _payments(engine, tenant_id, journey_id) == []  # the worker's recompute builds it
+    assert _version(journey) == version + 1
+    assert _payments(journey) == []  # the worker's recompute builds it
 
 
-def test_a_booking_already_built_is_not_touched(booking) -> None:
-    from audit_core.uc03_p2_worker import _materialize_journey
-
-    engine, tenant_id, journey_id = booking
-    _receipt(engine, tenant_id, journey_id, amount="21000", number="R-2")
-    with engine.begin() as c:
-        set_tenant_context(c, tenant_id)
-        _materialize_journey(c, tenant_id=tenant_id, journey_id=journey_id)
-    assert len(_payments(engine, tenant_id, journey_id)) == 1
-    version = _recompute_version(engine, tenant_id, journey_id)
-    totals = rebuild.rebuild_tenant(engine, tenant_id=tenant_id, tag="t-commit", commit=True)
+def test_a_booking_already_recomputed_is_not_touched(journey) -> None:
+    """When and by whom a row was written is not a change: a booking as its
+    last recompute left it would change nothing."""
+    add_ready_document(journey, "booking_form", model="SCORPIO N", variant="Z8L", color="RED",
+                       ex_showroom_price="1500000", customer_name="P2 Customer", booking_date="2026-10-01")
+    add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="P2 Customer")
+    _receipt(journey, amount="21000", number="R-2")
+    _settle(journey)
+    assert len(_payments(journey)) == 1
+    version = _version(journey)
+    assert _check(journey) == {}
+    totals = rebuild.rebuild_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t-commit", commit=True)
     assert totals["wouldChange"] == 0 and totals["recomputeRequested"] == 0
-    assert _recompute_version(engine, tenant_id, journey_id) == version
+    assert _version(journey) == version
 
 
-def test_compare_lists_removed_and_changed_payments() -> None:
-    before = {"payments": {"a": {"amount": 100, "receipt_number": "X"}, "b": {"amount": 5, "receipt_number": "Y"}}}
-    after = {"payments": {"a": {"amount": 150, "receipt_number": "X"}}}
-    changes = rebuild.compare(before, after)["payments"]
-    assert changes["removed"] == 1 and changes["removedPayments"][0]["receiptNumber"] == "Y"
-    assert changes["changedPayments"][0]["amountBefore"] == 100 and changes["changedPayments"][0]["columns"] == ["amount"]
-    assert rebuild.compare(after, after) == {}
-
-
-def test_a_receipt_with_no_amount_read_is_found_for_its_field_review_task(booking) -> None:
+def test_a_receipt_with_no_amount_read_is_found_for_its_task(journey) -> None:
     """2026-11-01: 48 receipts on file had no amount read and no task; the
     recompute this job requests raises it."""
-    engine, tenant_id, journey_id = booking
-    document_id = _receipt(engine, tenant_id, journey_id, amount="21000", number="R-3")
-    with engine.begin() as c:
-        set_tenant_context(c, tenant_id)
-        c.execute(text("UPDATE auditcore.journey_document_extracted_fields SET effective_value='null'::jsonb, "
-                       "extracted_value='null'::jsonb WHERE tenant_id=:t AND di_document_id=:d AND field_key='amount_paid'"),
-                  {"t": tenant_id, "d": document_id})
-        changes = rebuild.rebuild_check(c, tenant_id=tenant_id, journey_id=journey_id)
-    assert changes == {"fieldReviewTasks": {"raised": ["Enter the amount on Booking Payment Receipt: it was not read"],
-                                            "closed": []}}
-    totals = rebuild.rebuild_tenant(engine, tenant_id=tenant_id, tag="t", commit=False)
-    assert totals["wouldChange"] == 1 and totals["fieldReviewRaised"] == 1
+    _receipt(journey, amount=None, number="R-3")
+    changes = _check(journey)
+    assert "MANUAL_VERIFICATION: Enter the amount on Booking Payment Receipt: it was not read" in \
+        changes["tasks"]["raised"]
+    assert "payments" not in changes
+    totals = rebuild.rebuild_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t", commit=False)
+    assert totals["wouldChange"] == 1 and totals["raisedByCode"].get("MANUAL_VERIFICATION") == 1
+
+
+def test_compare_lists_payments_and_ignores_write_stamps_and_sku_names() -> None:
+    before = {"payments": {"a": {"amount": 100, "receipt_number": "X"}, "b": {"amount": 5, "receipt_number": "Y"}},
+              "customers": {"c": {"legal_name": "A", "legal_name_verified_at_utc": "t1", "updated_by_actor_id": "x"}},
+              "journey_products": {"p": {"product_sku_id": "sku", "model_name_snapshot": "XUV3XO EV"}}}
+    after = {"payments": {"a": {"amount": 150, "receipt_number": "X"}},
+             "customers": {"c": {"legal_name": "A", "legal_name_verified_at_utc": "t2", "updated_by_actor_id": "y"}},
+             "journey_products": {"p": {"product_sku_id": "sku", "model_name_snapshot": "XUV 3XO"}}}
+    changes = rebuild.compare(before, after)
+    assert set(changes) == {"payments"}
+    payments = changes["payments"]
+    assert payments["removed"] == 1 and payments["removedPayments"][0]["receiptNumber"] == "Y"
+    assert payments["changedPayments"][0]["amountBefore"] == 100 and payments["changedPayments"][0]["columns"] == [
+        "amount"]
+    unresolved = {"journey_products": {"p": {"product_sku_id": None, "model_name_snapshot": None}}}
+    named = {"journey_products": {"p": {"product_sku_id": None, "model_name_snapshot": "SCORPIO N"}}}
+    assert rebuild.compare(unresolved, named)["journey_products"]["changed"] == 1
+    assert rebuild.compare(after, after) == {}

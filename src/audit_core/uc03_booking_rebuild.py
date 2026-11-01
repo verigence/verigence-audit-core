@@ -10,12 +10,15 @@ P2 the check runs after the build), so a released receipt stayed without a
 payment: UTK-SB-261028-001's ₹30,36,490 receipt, ADI-BM-261026-005's
 ₹11,00,000, with the booking still waiting for its minimum payment.
 
-This job, per Project, builds every booking with documents on file again in a
-savepoint that is ALWAYS rolled back, and compares what the build would write
-with what is stored: payments, the vehicle, the customer, the booking, the
-commercial lines, discounts, add-ons, finance, insurance, registration,
-vehicle and delivery records -- and the booking's field review tasks (a
-receipt whose amount was not read). It logs per booking what would change. With a
+This job, per Project, recomputes every booking with documents on file in a
+savepoint that is ALWAYS rolled back (the stage recompute itself,
+uc03_p2_worker.settle_journey) and compares what it would write with what is
+stored: payments, the vehicle, the customer, the booking, the commercial
+lines, discounts, add-ons, finance, insurance, registration, vehicle and
+delivery records, and the booking's open tasks (raised and closed). When and
+by whom a row was written is not a change, nor a resolved vehicle's names
+(the SKU check writes them after the recompute). It logs per booking what
+would change. With a
 tag ending in "-commit" it requests the stage recompute of the bookings that
 would change -- the worker's own recompute then builds them, exactly as after
 any document change. The job never writes a booking's values itself, and a
@@ -108,6 +111,24 @@ def _payment(body: dict[str, Any]) -> dict[str, Any]:
             "receiptDate": body.get("receipt_date"), "documentId": body.get("source_di_document_id")}
 
 
+# The vehicle's names, once its SKU is resolved, are the price list's: the SKU
+# check (a control unit, after the recompute) writes them again, so the
+# recompute writing the booking docket's own names first is not a change.
+_SKU_OWNED = frozenset({
+    "model_code_snapshot", "model_name_snapshot", "variant_code_snapshot", "variant_name_snapshot",
+    "colour_code_snapshot", "colour_name_snapshot", "selection_source", "selection_status", "selection_method",
+    "selection_score", "sku_resolution_remarks", "vehicle_category", "match_basis", "match_evidence",
+})
+
+
+def _counts(table: str, column: str, row: dict[str, Any]) -> bool:
+    """Whether a column's change is a change of what the booking says: not when
+    or by whom it was written, nor a vehicle name the SKU check owns."""
+    if column == "version_no" or column.endswith(("_at_utc", "_at", "_actor_id")):
+        return False
+    return not (table == "journey_products" and row.get("product_sku_id") and column in _SKU_OWNED)
+
+
 def compare(before: dict[str, dict[str, dict[str, Any]]],
             after: dict[str, dict[str, dict[str, Any]]]) -> dict[str, Any]:
     """Per table, the rows the build would add, remove or change (and which
@@ -117,8 +138,14 @@ def compare(before: dict[str, dict[str, dict[str, Any]]],
         old = before.get(table, {})
         added = [new[i] for i in new if i not in old]
         removed = [old[i] for i in old if i not in new]
-        changed = {i: sorted(k for k in set(old[i]) | set(new[i]) if old[i].get(k) != new[i].get(k))
-                   for i in new if i in old and old[i] != new[i]}
+        changed = {}
+        for i in new:
+            if i not in old or old[i] == new[i]:
+                continue
+            columns = sorted(k for k in set(old[i]) | set(new[i])
+                             if old[i].get(k) != new[i].get(k) and _counts(table, k, old[i]))
+            if columns:
+                changed[i] = columns
         if not (added or removed or changed):
             continue
         entry: dict[str, Any] = {"added": len(added), "removed": len(removed), "changed": len(changed)}
@@ -143,39 +170,40 @@ def compare(before: dict[str, dict[str, dict[str, Any]]],
     return changes
 
 
-def _field_review_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, str]:
-    return {str(r[0]): str(r[1]) for r in connection.execute(
-        text("SELECT dedupe_key, title FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
-             "AND dedupe_key LIKE 'field-review:%' AND task_status = ANY(:open)"),
+_OPEN_TASKS = ("READY", "IN_PROGRESS", "RETURNED", "ACTION_COMPLETED", "VERIFYING")
+
+
+def _open_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, tuple[str, str]]:
+    return {str(r[0]): (str(r[1]), str(r[2] or "")) for r in connection.execute(
+        text("SELECT dedupe_key, title, source_code FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+             "AND task_status = ANY(:open)"),
         {"t": tenant_id, "j": journey_id, "open": list(_OPEN_TASKS)},
     ).all()}
 
 
-_OPEN_TASKS = ("READY", "IN_PROGRESS", "RETURNED", "ACTION_COMPLETED", "VERIFYING")
-
-
 def rebuild_check(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
-    """Build the booking in a savepoint, always rolled back, and say what it
-    would change. Its field review tasks too (2026-11-01): a receipt whose
-    amount was not read is asked for on the recompute this job requests."""
-    from audit_core.uc03_p2_task_producer import sync_field_review_tasks
-    from audit_core.uc03_p2_worker import _materialize_journey
+    """Recompute the booking in a savepoint, always rolled back -- the stage
+    recompute itself (uc03_p2_worker.settle_journey: the build, the booking
+    date, the customer's name, the stage and the tasks that follow) -- and say
+    what it would change, the tasks it would raise and close included (a
+    receipt whose amount was not read gets its task, 2026-11-01). The checks
+    the recompute then asks for (control units) are not run here."""
+    from audit_core.uc03_p2_worker import settle_journey
 
     before = snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
-    tasks_before = _field_review_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
+    tasks_before = _open_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
     savepoint = connection.begin_nested()
     try:
-        _materialize_journey(connection, tenant_id=tenant_id, journey_id=journey_id)
+        settle_journey(connection, tenant_id=tenant_id, journey_id=journey_id)
         after = snapshot(connection, tenant_id=tenant_id, journey_id=journey_id)
-        sync_field_review_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
-        tasks_after = _field_review_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
+        tasks_after = _open_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
     finally:
         savepoint.rollback()
     changes = compare(before, after)
-    raised = sorted(title for key, title in tasks_after.items() if key not in tasks_before)
-    closed = sorted(title for key, title in tasks_before.items() if key not in tasks_after)
+    raised = sorted(f"{code}: {title}" for key, (title, code) in tasks_after.items() if key not in tasks_before)
+    closed = sorted(f"{code}: {title}" for key, (title, code) in tasks_before.items() if key not in tasks_after)
     if raised or closed:
-        changes["fieldReviewTasks"] = {"raised": raised, "closed": closed}
+        changes["tasks"] = {"raised": raised, "closed": closed}
     return changes
 
 
@@ -203,7 +231,8 @@ def rebuild_tenant(engine: Engine, *, tenant_id: str, tag: str, commit: bool) ->
     totals: dict[str, Any] = {"journeys": len(journeys), "wouldChange": 0, "byTable": Counter(),
                               "paymentsAdded": 0, "paymentsAddedAmount": Decimal("0.00"), "paymentsRemoved": 0,
                               "paymentsRemovedAmount": Decimal("0.00"), "paymentsChanged": 0, "vehicleChanged": 0,
-                              "fieldReviewRaised": 0, "fieldReviewClosed": 0,
+                              "tasksRaised": 0, "tasksClosed": 0, "raisedByCode": Counter(),
+                              "closedByCode": Counter(),
                               "recomputeRequested": 0, "failed": 0}
     for journey in journeys:
         journey_id = UUID(str(journey["journey_id"]))
@@ -236,11 +265,16 @@ def rebuild_tenant(engine: Engine, *, tenant_id: str, tag: str, commit: bool) ->
                                                Decimal(0))
         totals["paymentsChanged"] += len(payments.get("changedPayments", []))
         totals["vehicleChanged"] += 1 if "journey_products" in changes else 0
-        totals["fieldReviewRaised"] += len(changes.get("fieldReviewTasks", {}).get("raised", []))
-        totals["fieldReviewClosed"] += len(changes.get("fieldReviewTasks", {}).get("closed", []))
+        tasks = changes.get("tasks", {})
+        totals["tasksRaised"] += len(tasks.get("raised", []))
+        totals["tasksClosed"] += len(tasks.get("closed", []))
+        totals["raisedByCode"].update(t.split(":", 1)[0] for t in tasks.get("raised", []))
+        totals["closedByCode"].update(t.split(":", 1)[0] for t in tasks.get("closed", []))
         logger.info("booking_rebuild_item", tag=tag, tenant_id=tenant_id, commit=commit, journey_id=str(journey_id),
                     reference=journey["journey_reference"], changes=changes)
     totals["byTable"] = dict(totals["byTable"])
+    totals["raisedByCode"] = dict(totals["raisedByCode"])
+    totals["closedByCode"] = dict(totals["closedByCode"])
     totals["paymentsAddedAmount"] = str(totals["paymentsAddedAmount"])
     totals["paymentsRemovedAmount"] = str(totals["paymentsRemovedAmount"])
     return totals
