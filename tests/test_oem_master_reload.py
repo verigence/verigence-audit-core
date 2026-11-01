@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 from datetime import date
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
@@ -147,3 +148,151 @@ def test_the_real_october_grid_binds_scorpio_n_to_the_model_the_october_book_pri
     finally:
         transaction.rollback()
         connection.close()
+
+
+def _with_mahindra_aliases(engine, tenant_id) -> None:
+    with engine.begin() as conn:
+        oem_code = conn.execute(text("SELECT o.oem_code FROM auditcore.projects p JOIN auditcore.oems o "
+                                     "ON o.oem_id = p.oem_id WHERE p.tenant_id = :t"), {"t": tenant_id}).scalar_one()
+        conn.execute(text("INSERT INTO auditcore.oem_model_aliases (oem_code, alias_text, canonical_model_name) "
+                          "SELECT :o, alias_text, canonical_model_name FROM auditcore.oem_model_aliases "
+                          "WHERE oem_code = 'MAHINDRA' ON CONFLICT DO NOTHING"), {"o": oem_code})
+
+
+def test_the_two_grids_load_alone_with_both_scorpio_n_lines_bound(tenant) -> None:
+    """2026-11-01: a "-grids" tag loads the September grid (the "Aug 2026"
+    file, effective 1 Sep) and the October grid (1 Oct) and nothing else.
+    Every line names a model -- the September "SCORPIO N Old" / "SCORPIO N
+    New" are the book's SCORPIO N and NEW SCORPIO N -- and each model gets
+    the line the file prints for it on each month."""
+    from audit_core.oem_price_masters import grid_row_for_model
+
+    engine, tenant_id = tenant
+    _with_mahindra_aliases(engine, tenant_id)
+    tag = f"test-{uuid4().hex[:6]}"
+    assert run_master_reload(engine, f"{tag}-commit", tenant_ids=[tenant_id])[0]["status"] == "COMMITTED"
+
+    (dry,) = run_master_reload(engine, f"{tag}-grids", tenant_ids=[tenant_id])
+    assert dry["status"] == "DRY_RUN_PASSED", [c for c in dry.get("checks", []) if not c["ok"]] or dry.get("error")
+    assert [(u["file"], u["effectiveFrom"]) for u in dry["uploads"]] == [
+        ("Odisha PV & CV Discount Grid-1 Oct 2026.xlsx", date(2026, 10, 1)),
+        ("Odisha PV & CV Discount Grid-1 Aug 2026.xlsx", date(2026, 9, 1))]
+    september = {r["model"]: r for r in dry["gridByModel"]["2026-09-15"]}
+    october = {r["model"]: r for r in dry["gridByModel"]["2026-10-15"]}
+    assert september["NEW SCORPIO N"]["line"] == "SCORPIO N New" and september["NEW SCORPIO N"]["inScope"]
+    assert september["SCORPIO N"]["line"] == "SCORPIO N Old" and not september["SCORPIO N"]["inScope"]
+    assert october["NEW SCORPIO N"]["line"] == "SCORPIO-N"
+    assert october["NEW SCORPIO N"]["tiers"] == {"BASE": "0.00", "WITH_INSURANCE": "0.00", "WITH_EW_INSURANCE": "5000.00"}
+    assert september["XUV400"]["line"] == "XUV400 EV" and october["XUV400"]["line"] is None  # not in October's grid
+
+    (done,) = run_master_reload(engine, f"{tag}-grids-commit", tenant_ids=[tenant_id])
+    assert done["status"] == "COMMITTED", [c for c in done.get("checks", []) if not c["ok"]] or done.get("error")
+    with engine.begin() as conn:
+        conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        starts = conn.execute(text("SELECT effective_from FROM auditcore.dealer_discount_grid_versions "
+                                   "WHERE tenant_id = :t ORDER BY effective_from"), {"t": tenant_id}).scalars().all()
+        schemes = conn.execute(text("SELECT count(*) FROM auditcore.discount_scheme_versions WHERE tenant_id = :t"),
+                               {"t": tenant_id}).scalar_one()
+        model_id = conn.execute(text(
+            "SELECT model_id FROM auditcore.product_models pm JOIN auditcore.projects p ON p.oem_id = pm.oem_id "
+            "WHERE p.tenant_id = :t AND pm.model_name = 'NEW SCORPIO N'"), {"t": tenant_id}).scalar_one()
+        line = grid_row_for_model(conn, tenant_id=tenant_id, model_id=model_id, effective_on=date(2026, 9, 20))
+    assert starts == [date(2026, 9, 1), date(2026, 10, 1)]
+    assert schemes == 0  # the bulletins are not touched
+    assert line["model_alias"] == "SCORPIO N New" and line["in_scope"]
+
+
+def test_october_gets_septembers_price_for_the_variants_it_no_longer_lists(tenant, monkeypatch) -> None:
+    """2026-11-01, product owner: "the model which are not available in Oct,
+    for them pls get the price of September"; "old scorpio to be priced at sep
+    price". The 3 Oct book is published again with every October row
+    unchanged plus September's rows for the SKUs October does not print,
+    marked carried. October's words still name what October sells: "SCORPIO
+    N Z8 S D AT ... - N" is the new Scorpio N at October's price; only an
+    old-only variant (ADAS) reaches the old series, at September's price."""
+    from audit_core.oem_master_reload import complete_october_tenant
+    from audit_core.oem_price_masters import _models_in_book, find_book_sku
+
+    engine, tenant_id = tenant
+    _with_mahindra_aliases(engine, tenant_id)
+    tag = f"test-{uuid4().hex[:6]}"
+    assert run_master_reload(engine, f"{tag}-commit", tenant_ids=[tenant_id])[0]["status"] == "COMMITTED"
+    # The five re-load files only (no live 19 Sep Veero LNT sheet): the 24 old
+    # Scorpio N, BE 6 One x2, BE 6 SPORTEQ THREE x2 and Veero 1.5XXL CBC V2.
+    monkeypatch.setattr(oem_master_reload, "OCTOBER_EXPECTED_CARRIED", 29)
+
+    (dry,) = run_master_reload(engine, f"{tag}-octcarry", tenant_ids=[tenant_id])
+    assert dry["status"] == "DRY_RUN_PASSED", [c for c in dry.get("checks", []) if not c["ok"]] or dry.get("error")
+    models = {}
+    for row in dry["carried"]:
+        models[row["model"]] = models.get(row["model"], 0) + 1
+    assert models == {"SCORPIO N": 24, "BE 6": 2, "BE6 SPORTEQ": 2, "VEERO": 1}
+    assert _versions(engine, tenant_id) == 5  # a dry run leaves nothing
+
+    (done,) = run_master_reload(engine, f"{tag}-octcarry-commit", tenant_ids=[tenant_id])
+    assert done["status"] == "COMMITTED", [c for c in done.get("checks", []) if not c["ok"]] or done.get("error")
+    assert _versions(engine, tenant_id) == 6
+    on = date(2026, 10, 20)
+    with engine.begin() as conn:
+        conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        new_car = find_book_sku(conn, tenant_id=tenant_id, model_text="SCORPIO N",
+                                variant_text="Z8 S D AT 2WD 7 STR BS6.2 - N", effective_on=on)
+        old_car = find_book_sku(conn, tenant_id=tenant_id, model_text="SCORPIO N",
+                                variant_text="Z8 L D AT 2WD 7 STR BS6.2 - N - ADAS", effective_on=on)
+        veero = find_book_sku(conn, tenant_id=tenant_id, model_text="VEERO", variant_text="1.5XXL CBC V2",
+                              effective_on=on)
+        on_sale = conn.execute(text(
+            "SELECT pm.model_name FROM auditcore.product_models pm WHERE pm.model_id = ANY(:m)"),
+            {"m": list(_models_in_book(conn, tenant_id=tenant_id, effective_on=on))}).scalars().all()
+        marked = conn.execute(text(
+            "SELECT count(DISTINCT product_sku_id) FROM auditcore.price_list_items WHERE tenant_id = :t "
+            "AND price_list_version_id = :v AND metadata ? 'carriedForwardFrom'"),
+            {"t": tenant_id, "v": done["newVersionId"]}).scalar_one()
+    assert new_car["sku"]["model_name"] == "NEW SCORPIO N"
+    assert old_car["sku"]["model_name"] == "SCORPIO N" and old_car["sku"]["ex_showroom"] == Decimal("2276499.58")
+    assert veero["sku"] and veero["sku"]["model_name"] == "VEERO"
+    assert "NEW SCORPIO N" in on_sale and "SCORPIO N" not in on_sale  # the old series is priced, not on sale
+    assert marked == 29
+    # Nothing left to carry: a second run publishes nothing.
+    with engine.connect() as connection, connection.begin():
+        again = complete_october_tenant(connection, tenant_id=tenant_id, tag=f"{tag}-octcarry-again", store=False)
+    assert again["passed"] and again["carried"] == []
+
+
+def test_a_carried_row_answers_only_when_the_words_fit_nothing_on_sale() -> None:
+    """The resolver (2026-11-01): October prints the new Scorpio N with the old
+    series' names. With the old series carried, every October spelling names
+    what it named before -- the new car, also when the words add "ADAS" (the
+    new Z8 L has it too: an old-stock car is set by the PC, and its price
+    mismatch asks for it) -- and only words that fit no car on sale (the old
+    Z8 G AT) name a carried one."""
+    from audit_core.oem_price_masters import _SUCCESSOR_IDENTITY, price_list_model_key
+    from audit_core.uc03_sku_words import identify
+
+    def row(model, variant, carried=False):
+        return {"product_sku_id": f"{model}::{variant}", "sku_code": f"{model}::{variant}", "model_name": model,
+                "variant_name": variant, "colour_name": None, "fuel_powertrain": "DIESEL", "transmission": None,
+                "drive": None, "seater": None, "trim": None, "category": "PV", "segment_code": "PASSENGER_VEHICLE",
+                "carried": carried}
+
+    book = [row("NEW SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - Refresh"),
+            row("NEW SCORPIO N", "Z8 L D AT 2WD 7 STR BS6.2 - Refresh"),
+            row("SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - N", carried=True),
+            row("SCORPIO N", "Z8 L D AT 2WD 7 STR BS6.2 - N - ADAS", carried=True),
+            {**row("SCORPIO N", "Z8 G AT 2WD 7 STR BS6.2 - N", carried=True), "fuel_powertrain": "PETROL"}]
+
+    def named(model, variant, rows=book):
+        result = identify(rows=rows, model_text=model, variant_text=variant, identity=price_list_model_key,
+                          successors=dict(_SUCCESSOR_IDENTITY))
+        return result.status, (result.row or {}).get("sku_code")
+
+    for model in ("SCORPIO N", "SCORPIO-N"):
+        assert named(model, "Z8 S D AT 2WD 7 STR BS6.2 - N") == (
+            "IDENTIFIED", "NEW SCORPIO N::Z8 S D AT 2WD 7 STR BS6.2 - Refresh")
+        assert named(model, "Z8 S D AT 2WD 7 STR BS6.2 - N") == named(model, "Z8 S D AT 2WD 7 STR BS6.2 - N",
+                                                                     [r for r in book if not r["carried"]])
+    on_sale = [r for r in book if not r["carried"]]
+    adas = "Z8 L D AT 2WD 7 STR BS6.2 - N - ADAS"
+    assert named("SCORPIO N", adas) == named("SCORPIO N", adas, on_sale)
+    assert named("SCORPIO N", "Z8 G AT 2WD 7 STR BS6.2 - N", on_sale)[0] != "IDENTIFIED"
+    assert named("SCORPIO N", "Z8 G AT 2WD 7 STR BS6.2 - N") == ("IDENTIFIED", "SCORPIO N::Z8 G AT 2WD 7 STR BS6.2 - N")

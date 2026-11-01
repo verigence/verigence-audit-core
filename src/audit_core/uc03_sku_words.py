@@ -520,7 +520,48 @@ def _pick_by_identity(
     return None
 
 
+# What the words of a book's own (on-sale) rows can say and still leave a
+# carried row to answer: they name nothing the book sells.
+_NOTHING_ON_SALE = frozenset({"NO_MATCH", "NO_MODEL", "UNRECOGNISED_WORD"})
+
+
 def identify(
+    *,
+    rows: list[dict[str, Any]],
+    model_text: str | None,
+    variant_text: str | None,
+    aliases: list[tuple[str, str]] | None = None,
+    registration: str | None = None,
+    gst_rate: Decimal | None = None,
+    identity: Callable[[str | None, str | None], str] | None = None,
+    successors: dict[str, str] | None = None,
+) -> WordResult:
+    """Name the SKU from one document's words (``_identify_rows``), the
+    book's carried rows last (2026-11-01).
+
+    A row marked ``carried`` is a variant the month's list no longer prints,
+    priced at the previous month's figure (the product owner: the old Scorpio
+    N, BE 6 One ... in October at September's price). It is priced, not on
+    sale: the words are read against the rows the list prints, exactly as
+    without it -- so "SCORPIO N" on an October invoice still names the new
+    Scorpio N, which October prints with the old series' names -- and only
+    words that fit nothing on sale (an old-only variant: "Z8 L ... ADAS",
+    "Z8 G AT") are read against the carried rows. A PC or Team Lead can set
+    a carried SKU directly."""
+    on_sale = [r for r in rows if not r.get("carried")]
+    carried = [r for r in rows if r.get("carried")]
+    args = {"model_text": model_text, "variant_text": variant_text, "aliases": aliases,
+            "registration": registration, "gst_rate": gst_rate, "identity": identity, "successors": successors}
+    result = _identify_rows(rows=on_sale, **args)
+    if carried and result.status in _NOTHING_ON_SALE:
+        fallback = _identify_rows(rows=carried, **args)
+        if fallback.status == "IDENTIFIED":
+            fallback.detail["carried"] = True
+            return fallback
+    return result
+
+
+def _identify_rows(
     *,
     rows: list[dict[str, Any]],
     model_text: str | None,
