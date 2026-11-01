@@ -268,3 +268,31 @@ def test_an_own_booking_at_another_dealership_is_refused(journey):
     own = _plan(journey, case["batch"], action="OWN_BOOKING", target=elsewhere)
     assert _run(journey, commit=True) == {"FAILED": 1}
     assert "another dealership" in _move_row(journey, own)["detail"]
+
+
+def test_a_file_whose_uploader_is_no_longer_a_pc_is_booked_under_the_pc_named(journey):
+    """ADI-BA-261019-004 (1 Nov 2026): uploaded by a PC who is now a Reviewer;
+    the product owner names another PC of the outlet to book it under."""
+    case = _tapan_taken_out(journey)
+    fid._switch(journey, True)
+    fid._settle(journey)
+    move_id = _plan(journey, case["batch"])
+    _sql(journey, "UPDATE auditcore.business_assignments SET assignment_status='INACTIVE' WHERE tenant_id=:t")
+    assert _run(journey, commit=False) == {"FAILED": 1}
+    other_pc = f"other-pc-{uuid4().hex[:8]}"
+    _sql(journey, "INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, "
+                  "dealer_id, outlet_id) VALUES (:t, :a, 'PC', :d, :o)",
+         a=other_pc, d=journey.dealer_id, o=journey.outlet_id)
+    _sql(journey, "UPDATE auditcore.p2_file_moves SET book_as_actor_id=:a, book_as_name='Radhakanta Das', "
+                  "status='PLANNED' WHERE tenant_id=:t AND move_id=CAST(:m AS uuid)", a=other_pc, m=move_id)
+    assert _run(journey, commit=False) == {"WOULD_CREATE": 1}
+    assert _run(journey, commit=True) == {"DONE": 1}
+    row = _move_row(journey, move_id)
+    new = _sql(journey, "SELECT created_by_actor_id, created_by_display_name FROM auditcore.journeys "
+                        "WHERE tenant_id=:t AND journey_id=:j", j=row["target_journey_id"]).one()
+    assert tuple(new) == (other_pc, "Radhakanta Das")
+    assert _sql(journey, "SELECT uploaded_by_actor_id FROM auditcore.p2_upload_batches WHERE tenant_id=:t "
+                         "AND batch_id=:b", b=row["new_batch_id"]).scalar_one() == other_pc
+    started = _sql(journey, "SELECT details FROM auditcore.p2_activity_events WHERE tenant_id=:t AND journey_id=:j "
+                            "AND event_type='JOURNEY_STARTED'", j=row["target_journey_id"]).scalar_one()
+    assert started["originallyUploadedBy"] == journey.actor_id and started["fromBooking"]

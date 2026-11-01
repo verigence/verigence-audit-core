@@ -7,7 +7,9 @@ plans each file's destination as a row of ``auditcore.p2_file_moves``
 (migration 0183), after review, and this one-shot job carries the plan out:
 
 - NEW_BOOKING: no booking of the customer's exists yet. A booking is started
-  at the source booking's outlet for the PC who uploaded the file (the PC's
+  at the source booking's outlet for the PC who uploaded the file -- or the
+  PC the row names (book_as_actor_id, migration 0184) when the uploader is no
+  longer a PC of the outlet -- (the PC's
   own New booking, uc03_p2_api.start_p2_journey), named after the person the
   file names until its documents name the customer. The original file is
   copied, byte for byte (its SHA-256 checked), to the new booking's storage
@@ -102,6 +104,18 @@ class Move:
     outlet_id: UUID
     dealer_id: UUID
     pc_name: str | None
+    # the PC to book a new booking under when the uploader is no longer a
+    # PC of the outlet (migration 0184); else the uploader
+    book_as: str | None = None
+    book_as_name: str | None = None
+
+    @property
+    def booking_pc(self) -> str:
+        return self.book_as or self.uploaded_by
+
+    @property
+    def booking_pc_name(self) -> str | None:
+        return self.book_as_name if self.book_as else self.pc_name
 
 
 def _moves(connection: Connection, tenant_id: str, references: list[str]) -> list[Move]:
@@ -112,7 +126,7 @@ def _moves(connection: Connection, tenant_id: str, references: list[str]) -> lis
                    m.source_batch_id, m.target_journey_id, m.same_as_move_id, m.person_name,
                    b.original_filename, b.content_type, b.size_bytes, b.sha256, b.original_object_key,
                    b.uploaded_by_actor_id, b.identity_status, b.identity_enforced_at_utc IS NOT NULL AS taken_out,
-                   sj.outlet_id, sj.dealer_id, sj.created_by_display_name
+                   sj.outlet_id, sj.dealer_id, sj.created_by_display_name, m.book_as_actor_id, m.book_as_name
             FROM auditcore.p2_file_moves m
             JOIN auditcore.journeys sj ON sj.tenant_id=m.tenant_id AND sj.journey_id=m.source_journey_id
             JOIN auditcore.p2_upload_batches b ON b.tenant_id=m.tenant_id AND b.batch_id=m.source_batch_id
@@ -133,7 +147,7 @@ def _moves(connection: Connection, tenant_id: str, references: list[str]) -> lis
         size_bytes=int(r["size_bytes"] or 0), sha256=r["sha256"], object_key=str(r["original_object_key"]),
         uploaded_by=str(r["uploaded_by_actor_id"]), identity_status=r["identity_status"],
         taken_out=bool(r["taken_out"]), outlet_id=r["outlet_id"], dealer_id=r["dealer_id"],
-        pc_name=r["created_by_display_name"],
+        pc_name=r["created_by_display_name"], book_as=r["book_as_actor_id"], book_as_name=r["book_as_name"],
     ) for r in rows]
 
 
@@ -173,7 +187,7 @@ def _pc_can_book(connection: Connection, tenant_id: str, move: Move) -> str | No
     from audit_core.uc03_create_booking import _create_context
 
     try:
-        _create_context(connection, tenant_id=tenant_id, actor_id=move.uploaded_by, outlet_id=move.outlet_id)
+        _create_context(connection, tenant_id=tenant_id, actor_id=move.booking_pc, outlet_id=move.outlet_id)
     except (AuditCoreError, AuthorizationError) as exc:  # reported, never raised
         return f"the PC who uploaded the file cannot start a booking at this outlet ({type(exc).__name__})"
     return None
@@ -217,10 +231,10 @@ def _create_booking(engine: Engine, tenant_id: str, move: Move) -> UUID:
         if current is not None:
             return UUID(str(current))
         created = start_p2_journey(
-            connection, tenant_id=tenant_id, actor_id=move.uploaded_by, outlet_id=move.outlet_id,
-            customer_name=move.person_name, created_by_name=move.pc_name,
+            connection, tenant_id=tenant_id, actor_id=move.booking_pc, outlet_id=move.outlet_id,
+            customer_name=move.person_name, created_by_name=move.booking_pc_name,
             idempotency_key=f"p2-file-move:{move.move_id}",
-            started_details={"startedBy": "FILE_MOVE", "fileName": move.file_name,
+            started_details={"startedBy": "FILE_MOVE", "fileName": move.file_name, "originallyUploadedBy": move.uploaded_by,
                              "fromBooking": move.source_reference, "fromJourneyId": str(move.source_journey_id)},
         )
         journey_id = UUID(created["journeyId"])
@@ -288,20 +302,21 @@ def _copy_file(engine: Engine, tenant_id: str, move: Move, journey_id: UUID, pay
             ),
             {"t": tenant_id, "b": batch_id, "j": journey_id, "client": f"file-move-{move.source_batch_id}",
              "name": move.file_name, "ct": move.content_type or "application/pdf", "size": len(payload),
-             "key": key, "by": move.uploaded_by, "correlation": correlation},
+             "key": key, "by": move.booking_pc, "correlation": correlation},
         ).scalar_one_or_none()
         if inserted is None:
             return batch_id
         enqueue_work(
             connection, tenant_id=tenant_id, journey_id=journey_id, work_type="SPLIT_BATCH", work_key=str(batch_id),
-            payload={"batchId": str(batch_id), "uploadedBy": move.uploaded_by, "uploadedByRole": "PC"},
+            payload={"batchId": str(batch_id), "uploadedBy": move.booking_pc, "uploadedByRole": "PC"},
             correlation_id=correlation,
         )
         record_activity(
             connection, tenant_id=tenant_id, journey_id=journey_id, event_type="UPLOAD_ACCEPTED",
             subject_type="UPLOAD_BATCH", subject_id=str(batch_id),
             details={"filename": move.file_name, "sizeBytes": len(payload), "movedFrom": move.source_reference,
-                     "movedFromJourneyId": str(move.source_journey_id), "by": "FILE_MOVE"},
+                     "movedFromJourneyId": str(move.source_journey_id), "by": "FILE_MOVE",
+                     "originallyUploadedBy": move.uploaded_by},
             correlation_id=correlation,
         )
     return batch_id
@@ -396,7 +411,7 @@ def _carry_out(engine: Engine, tenant_id: str, move: Move, *, commit: bool) -> s
         _plan_line(engine, tenant_id, move, commit=commit, outcome="FAILED", reason=problem)
         return "FAILED"
     if not commit:
-        _plan_line(engine, tenant_id, move, commit=False, outcome="WOULD_CREATE", pc=move.pc_name,
+        _plan_line(engine, tenant_id, move, commit=False, outcome="WOULD_CREATE", pc=move.booking_pc_name,
                    size_bytes=move.size_bytes)
         return "WOULD_CREATE"
     # The original is read and checked before anything is created.
