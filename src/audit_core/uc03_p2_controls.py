@@ -338,6 +338,32 @@ def _resolve_stale_rule_engine_findings(connection: Connection, *, tenant_id: st
     return len(rows)
 
 
+def _duplicate_booking_description(connection: Connection, *, tenant_id: str, other_journey_id: Any,
+                                   matched: list[dict[str, Any]]) -> tuple[str, str] | None:
+    """(the other booking's reference, what the task says): which booking this
+    one matches and on what (2026-11-01: the task said only "matches an earlier
+    booking on this tenant (PAN match)", naming neither the booking nor the
+    value). Values as the finding recorded them (a PAN or mobile masked)."""
+    if not other_journey_id:
+        return None
+    reference = connection.execute(
+        text("SELECT journey_reference FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=CAST(:j AS uuid)"),
+        {"t": tenant_id, "j": str(other_journey_id)},
+    ).scalar_one_or_none()
+    if not reference:
+        return None
+    shown = []
+    for field in matched:
+        label, this_value, other_value = field.get("label"), field.get("thisValue"), field.get("otherValue")
+        if not label or not this_value:
+            continue
+        shown.append(f"{label} {this_value}" if field.get("exact") or this_value == other_value
+                     else f"{label} {this_value} / {other_value}")
+    on = f" on {', '.join(shown)}" if shown else ""
+    return reference, (f"This booking matches the earlier booking {reference}{on}. Confirm whether this is a "
+                       "genuine repeat customer or a duplicate entry.")
+
+
 def _native_details(connection: Connection, *, tenant_id: str, control: ControlTemplate,
                     finding_id: UUID | None) -> dict[str, Any]:
     """Structured facts a reviewer needs from a native finding's payload."""
@@ -345,14 +371,20 @@ def _native_details(connection: Connection, *, tenant_id: str, control: ControlT
     if not payload:
         return {}
     if control.code == "DUPLICATE_BOOKING":
-        return {
+        other = payload.get("otherJourneyId") or payload.get("believedOriginalJourneyId")
+        details = {
             "matchBasis": payload.get("matchBasis"),
             "matchConfidencePercent": payload.get("matchConfidencePercent"),
             "matchConfidenceLabel": payload.get("matchConfidenceLabel"),
-            "otherJourneyId": payload.get("otherJourneyId") or payload.get("believedOriginalJourneyId"),
+            "otherJourneyId": other,
             "believedOriginalJourneyId": payload.get("believedOriginalJourneyId"),
             "originalityBasis": payload.get("originalityBasis"),
         }
+        description = _duplicate_booking_description(connection, tenant_id=tenant_id, other_journey_id=other,
+                                                     matched=payload.get("matchedFields") or [])
+        if description:
+            details["otherJourneyReference"], details["findingDescription"] = description
+        return details
     keep = ("leftValue", "rightValue", "expected", "observed", "variance", "standardNet", "actualNet")
     return {k: payload[k] for k in keep if k in payload}
 

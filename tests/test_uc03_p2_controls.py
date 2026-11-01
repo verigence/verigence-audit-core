@@ -433,3 +433,25 @@ def test_a_presence_check_waits_when_its_document_never_carries_the_field(journe
     state = _states(journey)["GATE_PASS_CHASSIS_EMPTY"]
     assert state["control_status"] == "NOT_APPLICABLE"
     assert "does not carry a chassis number" in state["status_reason"]
+
+
+def test_a_duplicate_booking_task_names_the_other_booking_and_what_matched(journey):
+    """2026-11-01: the task said only "matches an earlier booking on this
+    tenant (PAN match)", naming neither the booking nor the value."""
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        reference = connection.execute(
+            text("SELECT journey_reference FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).scalar_one()
+        got = controls._duplicate_booking_description(
+            connection, tenant_id=journey.tenant_id, other_journey_id=journey.journey_id,
+            matched=[{"label": "PAN", "thisValue": "XXXXXX267D", "otherValue": "XXXXXX267D", "exact": True},
+                     {"label": "KYC name vs relative on the other booking", "thisValue": "RAJESH BHOL",
+                      "otherValue": "RAJESH CH BHOL", "exact": False}],
+        )
+        assert got == (reference, f"This booking matches the earlier booking {reference} on PAN XXXXXX267D, "
+                                  "KYC name vs relative on the other booking RAJESH BHOL / RAJESH CH BHOL. Confirm "
+                                  "whether this is a genuine repeat customer or a duplicate entry.")
+        assert controls._duplicate_booking_description(connection, tenant_id=journey.tenant_id,
+                                                       other_journey_id=None, matched=[]) is None

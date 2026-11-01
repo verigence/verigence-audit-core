@@ -15,8 +15,10 @@ This job, per Project:
    problem has its own task naming the documents. Only the check's own task
    (control:<journey>:<code>) -- never the PC's field review or name tasks;
 2. runs the native checks again (forced) on the bookings whose DUPLICATE_RECEIPT
-   or DUPLICATE_BOOKING task reads the fallback sentence: the receipt task then
-   names the receipt, the pair is raised again with what matched;
+   or DUPLICATE_BOOKING task reads the fallback sentence, or whose duplicate
+   booking task does not yet name the other booking: the receipt task then
+   names the receipt, the pair is raised again with the booking it matches
+   and on what;
 3. checks every booking holding a document again by the current name rule;
    what is released reaches the booking on its recompute, which is requested.
    The dry run checks each booking in a savepoint and rolls it back, logging
@@ -106,7 +108,10 @@ def _fallback_journeys(connection: Connection, tenant_id: str) -> list[dict[str,
             SELECT journey_id, array_agg(DISTINCT source_code ORDER BY source_code) AS codes
             FROM auditcore.p2_tasks
             WHERE tenant_id=:t AND dedupe_key LIKE 'control:%' AND source_code = ANY(:codes)
-              AND task_status = ANY(:open) AND description = :fallback
+              AND task_status = ANY(:open)
+              AND (description = :fallback
+                   -- a duplicate booking task that does not yet name the other booking (2026-11-01)
+                   OR (source_code = 'DUPLICATE_BOOKING' AND description NOT LIKE 'This booking matches the earlier booking%'))
             GROUP BY journey_id ORDER BY journey_id
             """
         ),
