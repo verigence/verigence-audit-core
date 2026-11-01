@@ -469,6 +469,11 @@ def apply_wrong_document_verification(
             materialize_machine_booking_values(
                 connection, tenant_id=tenant_id, journey_id=journey_id,
             )
+        # The booking's stage, payments total and checks follow (2026-11-01).
+        from audit_core.uc03_p2_runtime import note_facts_changed
+
+        note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id,
+                           reason="DOCUMENT_HOLD_CHANGED", correlation_id=correlation_id or None)
 
 
 def _resolve_stale_legacy_findings(
@@ -714,7 +719,19 @@ def sync_customer_identity_consistency(
         # Every other document on the booking is released: what was held by an
         # earlier, cruder decision -- or for a name it no longer carries --
         # does not stay held (2026-11-01).
-        _apply_holds(connection, tenant_id=tenant_id, journey_id=journey_id, held=held)
+        holds = _apply_holds(connection, tenant_id=tenant_id, journey_id=journey_id, held=held)
+        # A hold that moves changes what the booking is built from: a released
+        # receipt becomes a payment, a held booking form stops setting the
+        # model. In P2 this check runs in the control unit, after the
+        # recompute has built the booking, and the fact fingerprint does not
+        # read a document's hold, so nothing asked for the booking to be built
+        # again: on 2026-11-01, receipts released by this check had no payment
+        # (UTK-SB-261028-001's ₹30,36,490, last built while it was held).
+        if holds["held"] or holds["released"]:
+            from audit_core.uc03_p2_runtime import note_facts_changed
+
+            note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               reason="DOCUMENT_HOLD_CHANGED", correlation_id=correlation_id or None)
 
         dealer_name = _journey_dealer_name(connection, tenant_id=tenant_id, journey_id=journey_id)
         if dealer_name:
@@ -773,6 +790,8 @@ def sync_customer_identity_consistency(
             "resolved": resolved,
             "examined": examined,
             "referenceName": reference_name,
+            "held": holds["held"],
+            "released": holds["released"],
         }
     except Exception as exc:
         raise_if_worker_transient(exc)  # retried, not skipped (uc03_db_transient)

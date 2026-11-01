@@ -162,7 +162,8 @@ def test_customer_name_check_is_a_noop_without_kyc_but_dealer_check_still_runs(j
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
-    assert result == {"raised": 0, "resolved": 0, "examined": 0, "referenceName": None}
+    # With no KYC yet the booking form is held (unchanged); the hold is new.
+    assert result == {"raised": 0, "resolved": 0, "examined": 0, "referenceName": None, "held": 1, "released": 0}
     assert _open_wrong_document_tasks(c) == []
 
 
@@ -814,3 +815,62 @@ def test_a_document_is_never_newly_held_by_the_current_rule_alone(journey) -> No
     assert result["raised"] == 0
     assert [_status(c, d) for d in (pan, aadhaar, form)] == ["PASSED", "PASSED", "PASSED"]
     assert _status(c, stray) == "PASSED"  # the current rule's reference: released, not flagged by it
+
+
+# ── a hold that moves asks for the booking to be built again (2026-11-01) ───
+def _recompute_requests(c) -> int:
+    return c.execute(
+        text("SELECT COALESCE(MAX(fact_version), 0) FROM auditcore.p2_journey_runtime "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+
+
+def _queued_recompute(c) -> bool:
+    return c.execute(
+        text("SELECT EXISTS (SELECT 1 FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
+             "AND work_type='STAGE_RECOMPUTE' AND work_status='PENDING')"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one()
+
+
+def test_a_released_hold_requests_the_booking_recompute(journey) -> None:
+    """UTK-SB-261028-001: the check released the ₹30,36,490 receipt in the
+    control unit, after the recompute had built the booking without it, and
+    nothing asked for the booking to be built again: no payment."""
+    c = journey
+    receipt = _set_named_field(c, stage_code="BOOKING", document_type_key="dealer_receipt",
+                               field_key="customer_name", value="MATRUKRUPA ENTERPRISERS-AOIPS3191J")
+    _hold(c, receipt)
+    before = _recompute_requests(c)
+    result = _sync(c)
+    assert _status(c, receipt) == "PASSED" and result["released"] == 1
+    assert _recompute_requests(c) == before + 1 and _queued_recompute(c)
+    # Nothing moves on the next pass: no recompute asked for.
+    again = _sync(c)
+    assert again["released"] == 0 and again["held"] == 0
+    assert _recompute_requests(c) == before + 1
+
+
+def test_a_new_hold_requests_the_booking_recompute(journey) -> None:
+    c = journey
+    _set_named_field(c, stage_code="BOOKING", document_type_key="aadhaar",
+                     field_key="aadhaar_name", value="Sanjaya Kumar Mohanty")
+    before = _recompute_requests(c)
+    cover = _set_named_field(c, stage_code="DELIVERY", document_type_key="insurance_cover",
+                             field_key="insured_name", value="Priya Nair")
+    result = _sync(c)
+    assert _status(c, cover) == "HELD" and result["held"] == 1
+    assert _recompute_requests(c) == before + 1
+
+
+def test_no_hold_change_requests_no_recompute(journey) -> None:
+    c = journey
+    _set_named_field(c, stage_code="BOOKING", document_type_key="pan_card",
+                     field_key="pan_name", value="Suryakanta Parida")
+    _set_named_field(c, stage_code="BOOKING", document_type_key="booking_form",
+                     field_key="customer_name", value="Suryakanta Parida")
+    before = _recompute_requests(c)
+    result = _sync(c)
+    assert result["held"] == 0 and result["released"] == 0
+    assert _recompute_requests(c) == before

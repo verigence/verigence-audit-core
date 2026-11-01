@@ -4701,6 +4701,8 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # Audit tasks that named no document, and documents the old name check
         # held out of their bookings (2026-11-01): see uc03_audit_task_cleanup.
         "AUDIT_TASK_CLEANUP": ("audit_core.uc03_audit_task_cleanup", "run_audit_task_cleanup"),
+        # Bookings built again where a build would change them (2026-11-01).
+        "BOOKING_REBUILD": ("audit_core.uc03_booking_rebuild", "run_booking_rebuild"),
         "DISCOUNT_VARIANCE_RECOMPUTE": ("audit_core.uc03_discount_variance_recompute",
                                         "run_discount_variance_recompute"),
         "ACCESSORY_INVOICE_REPAIR": ("audit_core.uc03_accessory_invoice_repair", "run_accessory_invoice_repair"),

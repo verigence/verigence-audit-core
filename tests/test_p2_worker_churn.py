@@ -106,8 +106,11 @@ def _a_booking(journey) -> None:
     # A low-confidence value: the recompute raises the PC's review task for it.
     add_ready_document(journey, "booking_form", model="SCORPIO N", variant="Z8L", color="RED",
                        ex_showroom_price="1500000", customer_name="P2 Customer", booking_date="2026-10-01")
-    add_ready_document(journey, "pan_card", confidence=40.0, pan_number="ABCDE1234F", name="P2 Customer")
-    add_ready_document(journey, "aadhaar", aadhaar_number="123412341234", name="P2 Customer")
+    # The KYC names the customer (pan_name, aadhaar_name): with no KYC the old
+    # name check holds the booking form, and a hold that moves asks for the
+    # booking to be built again (2026-11-01) -- a fact change, not churn.
+    add_ready_document(journey, "pan_card", confidence=40.0, pan_number="ABCDE1234F", pan_name="P2 Customer")
+    add_ready_document(journey, "aadhaar", aadhaar_number="123412341234", aadhaar_name="P2 Customer")
     add_receipt_payment(journey, amount="25000", receipt_number="R1", receipt_date="2026-10-01")
 
 
