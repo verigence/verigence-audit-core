@@ -554,8 +554,12 @@ def identify(
             "registration": registration, "gst_rate": gst_rate, "identity": identity, "successors": successors}
     result = _identify_rows(rows=on_sale, **args)
     if carried and result.status in _NOTHING_ON_SALE:
-        fallback = _identify_rows(rows=carried, **args)
-        if fallback.status == "IDENTIFIED":
+        # Read against the whole book, never the carried rows alone: on its
+        # own the small carried set leaves the document's other words
+        # unknown, and a word nothing carried has is ignored -- "VEERO 1.6 XL
+        # HD V2" would name the carried 1.6XL SD V2 - LNT (live trial, 1 Nov).
+        fallback = _identify_rows(rows=rows, **args)
+        if fallback.status == "IDENTIFIED" and (fallback.row or {}).get("carried"):
             fallback.detail["carried"] = True
             return fallback
     return result
