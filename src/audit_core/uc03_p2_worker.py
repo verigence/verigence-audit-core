@@ -4683,6 +4683,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # (2026-11-01): see uc03_p2_earlier_copy. A dry run lists them.
         from audit_core.uc03_p2_earlier_copy import run_earlier_copy_back
         return run_earlier_copy_back, (engine, tag, _active_tenants(engine))
+    if kind == "BOOKING_REBUILD":
+        # Bookings recomputed where a recompute would change them (2026-11-01):
+        # every booking of every Project, or only the references in ``reports``.
+        from audit_core.uc03_booking_rebuild import run_booking_rebuild
+        return run_booking_rebuild, (engine, tag, _active_tenants(engine), reports)
     per_tenant = {
         "PAGE_RESEND": ("audit_core.uc03_p2_page_resend", "run_page_resend"),
         "INVOICE_RESCAN": ("audit_core.uc03_invoice_rescan", "run_invoice_rescan"),
@@ -4701,8 +4706,6 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # Audit tasks that named no document, and documents the old name check
         # held out of their bookings (2026-11-01): see uc03_audit_task_cleanup.
         "AUDIT_TASK_CLEANUP": ("audit_core.uc03_audit_task_cleanup", "run_audit_task_cleanup"),
-        # Bookings built again where a build would change them (2026-11-01).
-        "BOOKING_REBUILD": ("audit_core.uc03_booking_rebuild", "run_booking_rebuild"),
         "DISCOUNT_VARIANCE_RECOMPUTE": ("audit_core.uc03_discount_variance_recompute",
                                         "run_discount_variance_recompute"),
         "ACCESSORY_INVOICE_REPAIR": ("audit_core.uc03_accessory_invoice_repair", "run_accessory_invoice_repair"),
