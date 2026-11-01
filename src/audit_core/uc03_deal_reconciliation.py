@@ -344,6 +344,14 @@ _CONDITIONAL_KEYS = frozenset(
     {"EXCHANGE_BONUS", "SCRAPPAGE_BONUS_DEALER", "SCRAPPAGE_BONUS_COD", "WELCOME_BONUS", "CORPORATE_PRIVILEGE"}
 )
 _DEALER_DISCOUNT_KEY = "ADDITIONAL_DISCOUNT"
+# A discount actual read from a document is the discount given: an invoice's,
+# or -- for a Project whose Deal comes from the account statement -- the
+# statement's (uc03_account_statement.ORIGIN). It is never replaced by a
+# booking-form value nor reset by this module, and it counts as claimed.
+# 2026-11-01: the statement's row was relabelled DEAL_RECONCILIATION by the
+# first run here and reset to empty by the next, so the statement's discounts
+# came and went with each run (27 values on live were empty).
+_EVIDENCE_ORIGINS = frozenset({"INVOICE_MATERIALIZATION", "ACCOUNT_STATEMENT"})
 # An invoice discount the printed words do not classify (uc03_invoice_materialization).
 _UNCLASSIFIED_KEY = "UNCLASSIFIED_DISCOUNT"
 _MR_KEY = "MANAGEMENT_REFERRAL"
@@ -910,9 +918,10 @@ def _write_discount_row(
     details: dict[str, Any],
     booking_actual: Decimal | None,
 ) -> None:
-    """One canonical row per key. An invoice-won actual is never replaced by a
-    booking-form value (uc03_invoice_materialization); the standard side
-    (entitlement, scheme version, eligibility) is refreshed every run."""
+    """One canonical row per key. An actual an invoice or the account statement
+    set (``_EVIDENCE_ORIGINS``) is never replaced by a booking-form value nor
+    reset, and keeps its origin; the standard side (entitlement, scheme
+    version, eligibility) is refreshed every run."""
     if existing is not None:
         # An older run may have left a second row under the same key: only
         # one row carries the entitlement, so a total never counts it twice.
@@ -928,7 +937,7 @@ def _write_discount_row(
             ),
             {"tenant_id": tenant_id, "journey_id": journey_id, "key": key, "id": existing["discount_application_id"]},
         )
-    if existing is not None and existing["details"].get("origin") == "INVOICE_MATERIALIZATION":
+    if existing is not None and existing["details"].get("origin") in _EVIDENCE_ORIGINS:
         connection.execute(
             text(
                 """
@@ -1215,7 +1224,7 @@ def _materialize_discount_standards(
 
     def invoice_actual(key: str) -> Decimal | None:
         row = existing.get(key)
-        if row is not None and row["details"].get("origin") == "INVOICE_MATERIALIZATION":
+        if row is not None and row["details"].get("origin") in _EVIDENCE_ORIGINS:
             amount = _to_decimal(row["actual_discount_amount"])
             return amount if amount else None
         return None
