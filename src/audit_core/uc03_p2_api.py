@@ -366,37 +366,60 @@ def create_p2_journey(
     way to create a Journey; the PC then lands on the document workspace and
     everything else is driven by the uploaded documents."""
     from audit_core.uc03_booking_commands import _authorize_security
+
+    _authorize_security(authorization_client, human_principal=human_principal, tenant_id=tenant_id)
+    set_tenant_context(connection, tenant_id)
+    # A booking starts with its first upload: none while uploads are paused.
+    refuse_upload_if_paused(connection, tenant_id)
+    return start_p2_journey(
+        connection, tenant_id=tenant_id, actor_id=human_principal.subject, outlet_id=command.outletId,
+        customer_name=command.customerName, created_by_name=command.createdByName,
+        idempotency_key=idempotency_key,
+    )
+
+
+def start_p2_journey(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    actor_id: str,
+    outlet_id: UUID,
+    customer_name: str | None,
+    created_by_name: str | None,
+    idempotency_key: str,
+    started_details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A new Booking Journey for ``actor_id`` (a PC of the outlet) -- the web's
+    New booking (create_p2_journey) and a file moved to its customer's own new
+    booking (uc03_file_move, 2026-11-01). Idempotent on ``idempotency_key``.
+    ``started_details`` is added to the JOURNEY_STARTED history entry."""
     from audit_core.uc03_create_booking import (
         _create_context,
         _execute_create_booking_atomic,
     )
 
-    _authorize_security(authorization_client, human_principal=human_principal, tenant_id=tenant_id)
-    customer_name = " ".join((command.customerName or "").split())
+    customer_name = " ".join((customer_name or "").split())
     # No name yet: the Journey id stands as the entered name until a
     # document names the customer (the placeholder migration 0058 defined).
     chosen_journey_id = uuid4() if not customer_name else None
     if chosen_journey_id is not None:
         customer_name = str(chosen_journey_id)
-    set_tenant_context(connection, tenant_id)
-    # A booking starts with its first upload: none while uploads are paused.
-    refuse_upload_if_paused(connection, tenant_id)
     context = _create_context(
-        connection, tenant_id=tenant_id, actor_id=human_principal.subject, outlet_id=command.outletId,
+        connection, tenant_id=tenant_id, actor_id=actor_id, outlet_id=outlet_id,
     )
     body = _execute_create_booking_atomic(
         connection,
         tenant_id=tenant_id,
         context=context,
         customer_name=customer_name,
-        actor_id=human_principal.subject,
+        actor_id=actor_id,
         idempotency_key=idempotency_key,
-        request_payload={"outletId": str(command.outletId),
+        request_payload={"outletId": str(outlet_id),
                          "customerName": "" if chosen_journey_id is not None else customer_name},
         journey_id=chosen_journey_id,
     )
     journey_id = UUID(str(body["journeyId"]))
-    created_by_name = " ".join((command.createdByName or "").split()) or None
+    created_by_name = " ".join((created_by_name or "").split()) or None
     if created_by_name:
         connection.execute(
             text(
@@ -418,7 +441,7 @@ def create_p2_journey(
                   AND created_by_display_name IS NULL
                 """
             ),
-            {"tenant_id": tenant_id, "actor_id": human_principal.subject, "name": created_by_name},
+            {"tenant_id": tenant_id, "actor_id": actor_id, "name": created_by_name},
         )
     _assign_readable_reference(
         connection, tenant_id=tenant_id, journey_id=journey_id, created_by_name=created_by_name,
@@ -426,7 +449,8 @@ def create_p2_journey(
     _activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type="JOURNEY_STARTED",
         subject_type="JOURNEY", subject_id=str(journey_id),
-        details={"customerName": None if chosen_journey_id is not None else customer_name},
+        details={"customerName": None if chosen_journey_id is not None else customer_name,
+                 **(started_details or {})},
         correlation_id=None,
     )
     return {"journeyId": str(journey_id), "customerId": str(body["customerId"]), "outletId": str(body["outletId"])}
@@ -1853,8 +1877,8 @@ def list_documents(
                     }
                 )
     # Whose each uploaded file is (uc03_p2_file_identity, 2026-10-31): the web
-    # workspace shows a file of another customer apart. ``movedTo`` is filled
-    # once such a file is moved to its own booking (a later change).
+    # workspace shows a file of another customer apart. ``movedTo`` names the
+    # customer's own booking once the file went there (uc03_file_move).
     from audit_core.uc03_p2_file_identity import files_view
 
     identity = files_view(connection, tenant_id=tenant_id, journey_id=journey_id)
