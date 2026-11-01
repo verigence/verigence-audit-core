@@ -647,29 +647,92 @@ def reload_grids_tenant(connection: Connection, *, tenant_id: str, tag: str, sto
 # September figures (every component), marked as carried. A variant October
 # prints keeps October's price.
 #
-# Only SKUs of a model October still prices are carried (BE 6 One, BE 6
-# SPORTEQ THREE, four Veero). The 24 variants of the September model "SCORPIO
-# N" -- the old series; October prints only the new one, as "SCORPIO-N" -- are
-# not: once that model is in the October book again, "SCORPIO N" on an October
-# invoice names it instead of the new Scorpio N (the resolver's successor rule,
-# PR #468), and October prints the new car with the old series' names ("Z8 S D
-# AT 2WD 7 STR BS6.2 - N" is Rs 19,17,500 old in September and Rs 19,98,995
-# new in October): 62 of the 93 October spellings of the new Scorpio N would
-# stop finding it, and the October grid's SCORPIO-N line would bind to the old
-# model alone. The two October bookings set to an old-series SKU print the
-# new car's October price (UTK-SA-261020-003: 22,35,147, the new Z8T D AT 2WD).
+# Every SKU the September book in force on 2 Oct prices and October does not
+# is carried (32 live: the 24 old-series Scorpio N under the September model
+# "SCORPIO N", BE 6 One x2, BE 6 SPORTEQ THREE x2, four Veero) -- product
+# owner, 1 Nov: "old scorpio to be priced at sep price". A carried row is
+# priced, not on sale (``carriedForwardFrom``): October prints the NEW Scorpio
+# N with the old series' names ("Z8 S D AT 2WD 7 STR BS6.2 - N" is Rs
+# 19,17,500 old in September and Rs 19,98,995 new in October), so the SKU
+# resolver and the book lookup read the words against the rows October prints
+# first and reach a carried row only when they fit nothing October sells (an
+# old-only variant: "Z8 L ... ADAS", "Z8 G AT"), and a book's "models on sale"
+# -- which a scheme or grid wording names -- leave carried rows out. The dry
+# run proves it on the live data: every October spelling and every document
+# reading on file names the same SKU as before, or (words that named nothing)
+# a carried one. An automatic pre-2026-10-20 pin on a carried variant still
+# asks the PC to set the SKU (``sync_sku_in_price_master_task``): the two
+# October bookings set to an old-series Scorpio N print the new car's October
+# price (UTK-SA-261020-003: 22,35,147, the new Z8T D AT 2WD).
 OCTOBER_FROM = date(2026, 10, 3)
 OCTOBER_CHECK_DATE = date(2026, 10, 15)
-OCTOBER_EXPECTED_CARRIED = 8
+OCTOBER_EXPECTED_CARRIED = 32
 OCTOBER_SPOT_PRICES = (
-    # October's own price stands for a variant it prints ...
+    # October's own price stands for a variant it prints, under either spelling ...
     ("MAXX CITY", "MAXX CITY 1.5 LX BS6.2", Decimal("852000.62")),
     ("SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - N", Decimal("1998995.45")),
+    ("SCORPIO-N", "Z8 S D AT 2WD 7 STR BS6.2 - N", Decimal("1998995.45")),
     # ... and September's for the ones it does not.
+    ("SCORPIO N", "Z8 L D AT 2WD 7 STR BS6.2 - N - ADAS", Decimal("2276499.58")),
+    ("SCORPIO N", "Z8 G AT 2WD 7 STR BS6.2 - N", Decimal("2026499.58")),
     ("VEERO", "1.5XXL CBC V2", Decimal("824500.12")),
     ("BE 6", "BE 6 One B59 R18 C11", Decimal("1965000.45")),
     ("BE6 SPORTEQ", "BE 6 SPORTEQ THREE B79 R19 C11", Decimal("2470000.00")),
 )
+
+
+def _readings_named(
+    connection: Connection, *, tenant_id: str, old_version: UUID, new_version: UUID,
+    printed: list[tuple[str, str]],
+) -> dict[str, Any]:
+    """What the SKU resolver names on the old and the new book: every
+    spelling the October list prints (and "SCORPIO N" for its "SCORPIO-N"),
+    and every booking-form / vehicle-invoice reading on file. Returns the
+    readings whose answer changed: ``changed`` (an answer that was a SKU or a
+    shortlist and is now something else -- must be none) and ``nowCarried``
+    (words that named nothing on sale and now name a carried SKU)."""
+    from audit_core.uc03_model_resolution import (
+        _booking_readings,
+        _identify,
+        _journey_registration,
+        _oem_code_for_tenant,
+        _oem_model_aliases,
+        _sku_rows_for_version,
+        _vehicle_invoice_readings,
+    )
+
+    aliases = _oem_model_aliases(connection, oem_code=_oem_code_for_tenant(connection, tenant_id=tenant_id) or "")
+    before = _sku_rows_for_version(connection, tenant_id=tenant_id, price_list_version_id=old_version)
+    after = _sku_rows_for_version(connection, tenant_id=tenant_id, price_list_version_id=new_version)
+    readings: list[tuple[str, dict[str, Any], str | None]] = [
+        (f"printed {model} | {variant}", {"model": model, "variant": variant}, None) for model, variant in printed]
+    for (journey_id, reference) in connection.execute(text(
+        "SELECT journey_id, journey_reference FROM auditcore.journeys WHERE tenant_id = :t ORDER BY 2"),
+            {"t": tenant_id}).all():
+        registration = _journey_registration(connection, tenant_id=tenant_id, journey_id=journey_id)["category"]
+        for reading in [*_booking_readings(connection, tenant_id=tenant_id, journey_id=journey_id),
+                        *_vehicle_invoice_readings(connection, tenant_id=tenant_id, journey_id=journey_id)]:
+            readings.append((f"{reference} {reading.get('documentType') or reading.get('source')}", reading,
+                             registration))
+
+    def answer(rows: list[dict[str, Any]], reading: dict[str, Any], registration: str | None) -> tuple:
+        result = _identify(rows, reading, aliases=aliases, registration=registration)
+        return (result.status, str(result.row["sku_code"]) if result.row else None,
+                tuple(sorted(str(c["sku_code"]) for c in result.candidates or [])))
+
+    changed: list[dict[str, Any]] = []
+    now_carried: list[dict[str, Any]] = []
+    for label, reading, registration in readings:
+        old, new = answer(before, reading, registration), answer(after, reading, registration)
+        if old == new:
+            continue
+        entry = {"reading": label, "words": " ".join(str(v) for v in (reading.get("model"), reading.get("variant")) if v),
+                 "before": f"{old[0]} {old[1] or ''}".strip(), "after": f"{new[0]} {new[1] or ''}".strip()}
+        if old[0] in ("NO_MATCH", "NO_MODEL", "UNRECOGNISED_WORD") and new[0] == "IDENTIFIED":
+            now_carried.append(entry)
+        else:
+            changed.append(entry)
+    return {"readings": len(readings), "changed": changed, "nowCarried": now_carried}
 
 
 def complete_october_tenant(connection: Connection, *, tenant_id: str, tag: str, store: bool) -> dict[str, Any]:
@@ -677,7 +740,7 @@ def complete_october_tenant(connection: Connection, *, tenant_id: str, tag: str,
     does not print, and check it; on one open transaction (the caller commits
     or rolls back). Idempotent: nothing left to carry, nothing published."""
     del store  # no file: the rows come from the two published books
-    from audit_core.oem_price_masters import _standing_items, price_list_model_key
+    from audit_core.oem_price_masters import _models_in_book, _standing_items
     from audit_core.price_lists import (
         create_price_list_version,
         publish_price_list_version,
@@ -709,33 +772,30 @@ def complete_october_tenant(connection: Connection, *, tenant_id: str, tag: str,
         check("an October book from 3 Oct and a September book before it", False, str(OCTOBER_FROM), str(october_on))
         return {"checks": checks, "passed": False, "carried": []}
 
-    names = {r[0]: (r[1], r[2]) for r in connection.execute(text(
+    names = {r[0]: (r[1], r[2], r[3]) for r in connection.execute(text(
         """
-        SELECT s.product_sku_id, m.model_name, v.variant_name FROM auditcore.product_skus s
+        SELECT s.product_sku_id, m.model_name, v.variant_name, s.model_id FROM auditcore.product_skus s
         JOIN auditcore.product_models m ON m.model_id = s.model_id
         JOIN auditcore.product_variants v ON v.variant_id = s.variant_id
         WHERE s.product_sku_id = ANY(:skus)
         """
     ), {"skus": list({sku for sku, _ in {**october, **september}})}).all()}
-
-    def identity(sku: UUID) -> str:
-        return price_list_model_key(*names[sku])
-
     october_skus = {sku for sku, _ in october}
-    october_models = {identity(sku) for sku in october_skus}
-    withdrawn = sorted({sku for sku, _ in september if sku not in october_skus}, key=lambda s: names[s])
-    carry_skus = [sku for sku in withdrawn if identity(sku) in october_models]
-    left_out = [sku for sku in withdrawn if identity(sku) not in october_models]
+    carry_skus = sorted({sku for sku, _ in september if sku not in october_skus}, key=lambda s: names[s][:2])
     carry = {key: row for key, row in september.items() if key[0] in set(carry_skus)}
     carried = [{"model": names[sku][0], "variant": names[sku][1],
                 "septemberExShowroom": str(september[(sku, "EX_SHOWROOM")]["standard_amount"])
                 if (sku, "EX_SHOWROOM") in september else None} for sku in carry_skus]
-    not_carried = [{"model": names[sku][0], "variant": names[sku][1]} for sku in left_out]
     for row in carried:
         logger.info("oem_october_carry_item", tenant_id=tenant_id, tag=tag, **row)
     if not carry:
-        check("every September SKU of a model October prices is priced from 3 Oct", True, 0, 0)
-        return {"checks": checks, "passed": True, "carried": [], "notCarried": not_carried}
+        check("every September SKU is priced from 3 Oct", True, 0, 0)
+        return {"checks": checks, "passed": True, "carried": []}
+    printed = sorted({(str(m), str(v)) for m, v in connection.execute(text(
+        "SELECT metadata -> 'printedAs' ->> 'model', metadata -> 'printedAs' ->> 'variant' "
+        "FROM auditcore.price_list_items WHERE tenant_id = :t AND price_list_version_id = :v "
+        "AND component_key = 'EX_SHOWROOM' AND metadata ? 'printedAs'"), {"t": tenant_id, "v": october_version}).all()})
+    printed += [("SCORPIO N", v) for m, v in printed if m.upper() == "SCORPIO-N"]
 
     version_no = int(connection.execute(text(
         "SELECT COALESCE(MAX(version_no), 0) + 1 FROM auditcore.price_list_versions "
@@ -774,20 +834,38 @@ def complete_october_tenant(connection: Connection, *, tenant_id: str, tag: str,
         sum(1 for key, row in carry.items() if in_force.get(key) == row["standard_amount"]))
     check("rows in the new book", len(in_force) == len(october) + len(carry), len(october) + len(carry), len(in_force))
     check("SKUs carried", len(carry_skus) == OCTOBER_EXPECTED_CARRIED, OCTOBER_EXPECTED_CARRIED, len(carry_skus))
-    in_force_models = {identity(sku) for sku, _ in in_force if sku in names}
-    check("the new book prices the same models as October (no model brought back)",
-          in_force_models == october_models, sorted(october_models), sorted(in_force_models))
+    on_sale = _models_in_book(connection, tenant_id=tenant_id, effective_on=OCTOBER_CHECK_DATE) or set()
+    october_models = {names[sku][2] for sku in october_skus}
+    check("the models on sale (what a scheme or grid wording names) are October's", on_sale == october_models,
+          len(october_models), len(on_sale))
     for model, variant, amount in OCTOBER_SPOT_PRICES:
         found = find_book_sku(connection, tenant_id=tenant_id, model_text=model, variant_text=variant,
                               effective_on=OCTOBER_CHECK_DATE)
         price = in_force.get((found["sku"]["product_sku_id"], "EX_SHOWROOM")) if found["sku"] else None
         check(f"{model} {variant} ex-showroom on {OCTOBER_CHECK_DATE}", price == amount, str(amount),
               str(price) if price is not None else found["reason"])
+    named = _readings_named(connection, tenant_id=tenant_id, old_version=october_version, new_version=new_version,
+                            printed=printed)
+    check(f"the resolver names the same SKU as before for every reading ({named['readings']})",
+          not named["changed"], [], named["changed"][:40])
+    for row in named["nowCarried"]:
+        logger.info("oem_october_reading_now_carried", tenant_id=tenant_id, tag=tag, **row)
     swept = sweep_price_master_tasks(connection, tenant_id=tenant_id)
+    open_tasks = [dict(r) for r in connection.execute(text(
+        """
+        SELECT j.journey_reference, t.task_type, t.reference ->> 'skuCode' AS sku
+        FROM auditcore.p2_tasks t JOIN auditcore.journeys j ON j.journey_id = t.journey_id
+        WHERE t.tenant_id = :t AND t.task_type IN ('SKU_NOT_IN_PRICE_MASTER', 'PRICE_MASTER_NOT_IN_FORCE')
+          AND t.task_status IN ('READY', 'IN_PROGRESS', 'RETURNED', 'ACTION_COMPLETED', 'VERIFYING')
+        ORDER BY 1
+        """
+    ), {"t": tenant_id}).mappings().all()]
     for row in checks:
         logger.info("oem_master_reload_check", tenant_id=tenant_id, tag=tag, **{k: str(v) for k, v in row.items()})
-    return {"checks": checks, "passed": all(c["ok"] for c in checks), "carried": carried, "notCarried": not_carried,
-            "newVersionId": str(new_version), "versionNo": version_no, "journeysRechecked": swept}
+    return {"checks": checks, "passed": all(c["ok"] for c in checks), "carried": carried,
+            "newVersionId": str(new_version), "versionNo": version_no, "journeysRechecked": swept,
+            "readingsChecked": named["readings"], "readingsNowCarried": named["nowCarried"],
+            "priceMasterTasksOpen": open_tasks}
 
 
 def run_master_reload(engine: Engine, tag: str, *, tenant_ids: list[str] | None = None) -> list[dict[str, Any]]:

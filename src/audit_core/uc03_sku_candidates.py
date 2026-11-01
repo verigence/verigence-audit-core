@@ -247,7 +247,7 @@ def sync_sku_in_price_master_task(
     sku = connection.execute(
         text(
             """
-            SELECT jp.product_sku_id, s.sku_code
+            SELECT jp.product_sku_id, s.sku_code, jp.selection_status, jp.match_basis
             FROM auditcore.journey_products jp
             JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id
             WHERE jp.tenant_id=:tenant_id AND jp.journey_id=:journey_id
@@ -257,13 +257,22 @@ def sync_sku_in_price_master_task(
     ).mappings().one_or_none()
     found = found or journey_price_plan(connection, tenant_id=tenant_id, journey_id=journey_id)
     plan, on = found["plan"], found["onDate"]
-    missing = bool(sku and plan) and connection.execute(
+    listed = connection.execute(
         text(
-            "SELECT NOT EXISTS (SELECT 1 FROM auditcore.price_list_items WHERE tenant_id=:t "
-            "AND price_list_version_id=:v AND product_sku_id=:s)"
+            "SELECT bool_or(metadata ? 'carriedForwardFrom') FROM auditcore.price_list_items WHERE tenant_id=:t "
+            "AND price_list_version_id=:v AND product_sku_id=:s"
         ),
         {"t": tenant_id, "v": plan["price_list_version_id"], "s": sku["product_sku_id"]},
-    ).scalar_one()
+    ).one() if sku and plan else None
+    # A variant the list no longer prints, carried at the previous month's
+    # price (2026-11-01), is priced only once the vehicle sold is known to be
+    # it: an automatic SKU from before the 2026-10-20 rules (AUTO_LEGACY,
+    # possibly chosen by price) still asks the PC to set it. Two October
+    # bookings were set to an old-series Scorpio N whose forms print the new
+    # car's October price.
+    carried_unconfirmed = bool(listed and listed[0]) and sku["selection_status"] != "CONFIRMED" and (
+        sku["match_basis"] in (None, "AUTO_LEGACY", "AUTO_UNCONFIRMED"))
+    missing = bool(sku and plan) and (listed[0] is None or carried_unconfirmed)
     if not missing:
         resolve_if_open(
             connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=_sku_not_in_book_key(journey_id),
@@ -290,6 +299,11 @@ def sync_sku_in_price_master_task(
         title=(f"No price available for {vehicle} on {on.isoformat()} — set the SKU" if vehicle
                else f"SKU {sku['sku_code']} is not in the price master for {on.isoformat()} — set the SKU"),
         description=(
+            f"The vehicle on this Journey ({vehicle + ', ' if vehicle else ''}{sku['sku_code']}) is not printed "
+            f"in the price list in force on {on.isoformat()} ({label}, from {plan.get('effective_from')}); it is "
+            "carried at the previous month's price, and the SKU was set automatically without the documents "
+            "naming it. Set the SKU to the vehicle sold (confirm this one only if it is the old variant)."
+            if carried_unconfirmed else
             f"The vehicle on this Journey ({vehicle + ', ' if vehicle else ''}{sku['sku_code']}) is not listed "
             f"in the price master in force on {on.isoformat()} ({label}, from {plan.get('effective_from')}). "
             "The OEM withdrew or renamed it; the deal has no standard price until the SKU is set to the "

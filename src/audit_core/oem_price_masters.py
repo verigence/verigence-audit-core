@@ -1150,7 +1150,8 @@ def find_book_sku(
             """
             SELECT s.product_sku_id, s.sku_code, pm.model_name, pv.variant_name,
                    pv.attributes ->> 'category' AS category, pv.fuel_powertrain,
-                   max(i.standard_amount) FILTER (WHERE i.component_key = 'EX_SHOWROOM') AS ex_showroom
+                   max(i.standard_amount) FILTER (WHERE i.component_key = 'EX_SHOWROOM') AS ex_showroom,
+                   bool_or(i.metadata ? 'carriedForwardFrom') AS carried
             FROM auditcore.price_list_items i
             JOIN auditcore.product_skus s ON s.product_sku_id = i.product_sku_id
             JOIN auditcore.product_models pm ON pm.model_id = s.model_id
@@ -1167,13 +1168,25 @@ def find_book_sku(
         return re.sub(r"\s+", " ", (value or "").strip().upper())
 
     keys = model_identity_keys(model_text, variant_text)
-    pool = [dict(r) for r in rows if price_list_model_key(r["model_name"]) in keys]
+    every = [dict(r) for r in rows if price_list_model_key(r["model_name"]) in keys]
     if suffix:
-        pool = [r for r in pool if _sku_name_part(r["sku_code"])[1] in ("", suffix)]
+        every = [r for r in every if _sku_name_part(r["sku_code"])[1] in ("", suffix)]
     wanted = norm(variant_text)
-    named = [r for r in pool if norm(_sku_name_part(r["sku_code"])[0]) == wanted]
-    if not named and wanted:
-        named = [r for r in pool if variant_core(_sku_name_part(r["sku_code"])[0]) == variant_core(variant_text)]
+
+    def naming(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        named = [r for r in pool if norm(_sku_name_part(r["sku_code"])[0]) == wanted]
+        if not named and wanted:
+            named = [r for r in pool if variant_core(_sku_name_part(r["sku_code"])[0]) == variant_core(variant_text)]
+        return named
+
+    # The rows the list prints first; a carried row (the previous month's
+    # price for a variant the list no longer prints, 2026-11-01) only when
+    # the words name none of them (the same rule as the SKU resolver).
+    pool = [r for r in every if not r["carried"]]
+    named = naming(pool)
+    if not named:
+        pool = every
+        named = naming([r for r in every if r["carried"]])
     out["candidates"] = named or pool
     if len(named) == 1:
         out["sku"] = named[0]
@@ -1400,7 +1413,11 @@ def _model_targets(
 
 
 def _models_in_book(connection: Connection, *, tenant_id: str, effective_on: date) -> set[UUID] | None:
-    """The models the price master in force on a date prices (None: no book)."""
+    """The models the price master in force on a date sells (None: no book).
+    A variant carried at the previous month's price (``carriedForwardFrom``,
+    2026-11-01) is priced, not on sale: it never makes its model one a
+    month's scheme or grid wording names (the October "SCORPIO-N" stays the
+    new Scorpio N with the old series carried)."""
     from audit_core.price_lists import find_effective_price_plan
 
     plan = find_effective_price_plan(connection, tenant_id=tenant_id, effective_on=effective_on)
@@ -1413,6 +1430,7 @@ def _models_in_book(connection: Connection, *, tenant_id: str, effective_on: dat
                 SELECT DISTINCT s.model_id FROM auditcore.price_list_items i
                 JOIN auditcore.product_skus s ON s.product_sku_id = i.product_sku_id
                 WHERE i.tenant_id = :t AND i.price_list_version_id = :v
+                  AND NOT (i.metadata ? 'carriedForwardFrom')
                 """
             ),
             {"t": tenant_id, "v": plan["price_list_version_id"]},
