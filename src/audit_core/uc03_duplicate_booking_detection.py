@@ -651,6 +651,66 @@ def _matched_fields(basis: str, signals: dict[str, Any], candidate: dict[str, An
     return fields
 
 
+# Two bookings of one customer are two bookings, not a duplicate, when what
+# each booking is shows they differ (2026-11-01: of 86 open duplicate tasks,
+# 58 paired bookings with different booking numbers, receipts and vehicles --
+# a repeat buyer such as Hrushikesh Mahanty's two pick-ups, chassis ...1H73515
+# and ...5H16927, or a relative or namesake). A booking's own numbers: the
+# booking number its docket / booking form prints, the receipt numbers, and
+# the chassis the vehicle invoice, insurance, RC or RTO challan prints (an
+# accessory invoice or credit note may be filed on the wrong booking, so it
+# does not count). One shared number keeps the pair; with nothing to compare,
+# the pair stays too.
+_BOOKING_NUMBERS_SQL = """
+    SELECT CASE
+             WHEN e.document_type_key IN ('booking_docket', 'booking_form') AND f.field_key = 'booking_reference_number'
+               THEN 'B'
+             WHEN e.document_type_key IN ('dealer_receipt', 'payment_receipt') AND f.field_key = 'receipt_number'
+               THEN 'R'
+             WHEN f.field_key IN ('chassis_number', 'vin_number') THEN 'C'
+           END AS kind,
+           upper(regexp_replace(f.effective_value #>> '{}', '[^A-Za-z0-9]', '', 'g')) AS number
+    FROM auditcore.journey_document_extracted_fields f
+    JOIN auditcore.evidence e
+      ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id AND e.di_document_id = f.di_document_id
+     AND e.association_status = 'ACTIVE'
+    WHERE f.tenant_id = :tenant_id AND f.journey_id = :journey_id
+      AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+      AND (
+        (e.document_type_key IN ('booking_docket', 'booking_form') AND f.field_key = 'booking_reference_number')
+        OR (e.document_type_key IN ('dealer_receipt', 'payment_receipt') AND f.field_key = 'receipt_number')
+        OR (e.document_type_key IN ('customer_invoice_dms', 'tax_invoice_tally', 'insurance_cover', 'vehicle_rc',
+                                    'rto_challan')
+            AND f.field_key IN ('chassis_number', 'vin_number'))
+      )
+      AND """ + _NOT_TAKEN_OUT + """
+"""
+_MIN_NUMBER_LENGTH = 5
+_CHASSIS_TAIL = 8
+
+
+def _booking_numbers(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {"B": set(), "R": set(), "C": set()}
+    for row in connection.execute(
+        text(_BOOKING_NUMBERS_SQL), {"tenant_id": tenant_id, "journey_id": journey_id}
+    ).mappings().all():
+        number = str(row["number"] or "")
+        if row["kind"] not in out or len(number) < _MIN_NUMBER_LENGTH:
+            continue
+        # A chassis is printed in full or by its last digits ("T2H36974").
+        out[row["kind"]].add(number[-_CHASSIS_TAIL:] if row["kind"] == "C" else number)
+    return out
+
+
+def different_bookings(left: dict[str, set[str]], right: dict[str, set[str]]) -> bool:
+    """Whether two bookings' own numbers show they are different bookings: no
+    booking number, receipt or chassis in common, and different booking
+    numbers or different vehicles on both."""
+    if any(left[kind] & right[kind] for kind in ("B", "R", "C")):
+        return False
+    return bool((left["B"] and right["B"]) or (left["C"] and right["C"]))
+
+
 def _booking_confirm_date(connection: Connection, *, tenant_id: str, journey_id: UUID) -> Any:
     """The receipt date on which this journey's running Booking payments
     first met the minimum booking amount -- set by
@@ -877,10 +937,16 @@ def sync_duplicate_booking_detection(
 
         raised = 0
         current_rule_keys: set[str] = set()
+        own_numbers: dict[str, set[str]] | None = None
         for candidate in candidates:
             basis = _match_basis(signals, candidate)
             if basis is None:
                 continue
+            if own_numbers is None:
+                own_numbers = _booking_numbers(connection, tenant_id=tenant_id, journey_id=journey_id)
+            if different_bookings(own_numbers, _booking_numbers(
+                    connection, tenant_id=tenant_id, journey_id=candidate["journey_id"])):
+                continue  # the same customer's other booking; any open finding resolves below
 
             this_confirm_date = _booking_confirm_date(
                 connection, tenant_id=tenant_id, journey_id=journey_id
