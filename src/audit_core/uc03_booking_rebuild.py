@@ -167,8 +167,30 @@ def compare(before: dict[str, dict[str, dict[str, Any]]],
             ]
         else:
             entry["columns"] = sorted({c for columns in changed.values() for c in columns})
+            # What each changed row says before and after (2026-11-01): a change
+            # is judged on its values, not on a column name.
+            entry["values"] = [
+                {"key": _row_label(old[i]), **{c: {"before": _shown(old[i].get(c)), "after": _shown(new[i].get(c))}
+                                               for c in columns}}
+                for i, columns in list(changed.items())[:5]
+            ]
+            if added:
+                entry["addedRows"] = [_row_label(b) for b in added[:5]]
         changes[table] = entry
     return changes
+
+
+def _row_label(body: dict[str, Any]) -> str | None:
+    """The row's own name, when it has one (a discount's key, a line's component)."""
+    for key in ("discount_key", "component_key", "addon_type_code", "finance_type_code", "insurer_name"):
+        if body.get(key):
+            return str(body[key])
+    return None
+
+
+def _shown(value: Any) -> Any:
+    text_value = json.dumps(value, default=str) if isinstance(value, (dict, list)) else value
+    return text_value[:160] if isinstance(text_value, str) else text_value
 
 
 _OPEN_TASKS = ("READY", "IN_PROGRESS", "RETURNED", "ACTION_COMPLETED", "VERIFYING")

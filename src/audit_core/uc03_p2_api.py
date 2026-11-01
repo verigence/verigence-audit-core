@@ -2117,102 +2117,21 @@ def restore_document_copy(
         connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
         authorization_client=authorization_client, permission_key=_UPDATE_PERMISSION,
     )
-    target = connection.execute(
-        text(
-            """
-            SELECT evidence_id, journey_document_requirement_id, di_document_id, association_status, process_area
-            FROM auditcore.evidence
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND evidence_id=:evidence_id
-            FOR UPDATE
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "evidence_id": evidence_id},
-    ).mappings().one_or_none()
-    if target is None:
-        raise HTTPException(status_code=404, detail="Document was not found.")
-    if target["association_status"] != "SUPERSEDED":
-        raise HTTPException(status_code=409, detail="Only a superseded copy can be restored.")
-    current = connection.execute(
-        text(
-            """
-            SELECT evidence_id, di_document_id FROM auditcore.evidence
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id
-              AND journey_document_requirement_id=:requirement_ref
-              AND association_status='ACTIVE'
-            ORDER BY linked_at_utc DESC LIMIT 1
-            FOR UPDATE
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id,
-         "requirement_ref": target["journey_document_requirement_id"]},
-    ).mappings().one_or_none()
-    if current is not None:
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.evidence
-                SET association_status='SUPERSEDED', void_reason='EARLIER_COPY_RESTORED',
-                    voided_by_actor_id=:actor, voided_at_utc=now()
-                WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
-                """
-            ),
-            {"tenant_id": tenant_id, "evidence_id": current["evidence_id"], "actor": human_principal.subject},
-        )
-        connection.execute(
-            text(
-                """
-                UPDATE auditcore.document_capture_v2_documents
-                SET capture_status='SUPERSEDED', updated_at_utc=now()
-                WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND di_document_id=:document_id
-                """
-            ),
-            {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": current["di_document_id"]},
-        )
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.evidence
-            SET association_status='ACTIVE', void_reason=NULL, voided_by_actor_id=NULL, voided_at_utc=NULL,
-                supersedes_evidence_id=:supersedes
-            WHERE tenant_id=:tenant_id AND evidence_id=:evidence_id
-            """
-        ),
-        {"tenant_id": tenant_id, "evidence_id": evidence_id,
-         "supersedes": current["evidence_id"] if current is not None else None},
+    from audit_core.uc03_p2_copy_restore import (
+        CopyNotFound,
+        NotSuperseded,
+        restore_superseded_copy,
     )
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.document_capture_v2_documents
-            SET capture_status='CLASSIFIED', updated_at_utc=now()
-            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND di_document_id=:document_id
-              AND capture_status='SUPERSEDED'
-            """
-        ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "document_id": target["di_document_id"]},
-    )
-    from audit_core.uc03_p2_worker import _rematerialize_stage
 
-    _rematerialize_stage(
-        connection, tenant_id=tenant_id, journey_id=journey_id,
-        stage_code=str(target["process_area"] or "BOOKING").upper(),
-    )
-    # The one STAGE_RECOMPUTE row of the Journey ('booking:<journey>'), with the
-    # fact version bumped (2026-10-29): a second key never merged with it.
-    from audit_core.uc03_p2_runtime import note_facts_changed
-
-    note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id,
-                       reason="DOCUMENT_COPY_RESTORED", correlation_id=get_correlation_id(request))
-    _activity(
-        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="DOCUMENT_COPY_RESTORED",
-        subject_type="DOCUMENT", subject_id=str(target["di_document_id"]),
-        details={"evidenceId": str(evidence_id),
-                 "supersededEvidenceId": str(current["evidence_id"]) if current is not None else None,
-                 "by": human_principal.subject},
-        correlation_id=get_correlation_id(request),
-    )
-    return {"evidenceId": str(evidence_id), "documentId": str(target["di_document_id"]), "status": "ACTIVE",
-            "supersededEvidenceId": str(current["evidence_id"]) if current is not None else None}
+    try:
+        return restore_superseded_copy(
+            connection, tenant_id=tenant_id, journey_id=journey_id, evidence_id=evidence_id,
+            actor_id=human_principal.subject, correlation_id=get_correlation_id(request),
+        )
+    except CopyNotFound as exc:
+        raise HTTPException(status_code=404, detail="Document was not found.") from exc
+    except NotSuperseded as exc:
+        raise HTTPException(status_code=409, detail="Only a superseded copy can be restored.") from exc
 
 
 @router.post("/journeys/{journey_id}/pages/{queue_id}:retry", status_code=202)
