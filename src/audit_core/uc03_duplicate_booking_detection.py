@@ -374,6 +374,17 @@ def _extract_signals(rows: list[Any], *, gst: str | None) -> dict[str, Any] | No
     }
 
 
+# A document of another customer's file, taken out of its booking
+# (association_status FOREIGN, uc03_p2_file_identity), is not the booking's:
+# its PAN, Aadhaar or mobile never pairs that booking with the customer's own
+# booking (2026-11-01: 25 moved files' new bookings were paired with the
+# booking they were taken out of).
+_NOT_TAKEN_OUT = """NOT EXISTS (
+                      SELECT 1 FROM auditcore.evidence fe
+                      WHERE fe.tenant_id = f.tenant_id AND fe.journey_id = f.journey_id
+                        AND fe.di_document_id = f.di_document_id AND fe.association_status = 'FOREIGN')"""
+
+
 def _identity_signals(
     connection: Connection, *, tenant_id: str, journey_id: UUID
 ) -> dict[str, Any] | None:
@@ -394,6 +405,7 @@ def _identity_signals(
                 WHERE f.tenant_id = :tenant_id AND f.journey_id = :journey_id
                   AND f.field_key = ANY(:field_keys)
                   AND f.effective_value IS NOT NULL
+                  AND """ + _NOT_TAKEN_OUT + """
             )
             SELECT field_key, effective_value FROM ranked WHERE row_rank = 1
             """
@@ -466,6 +478,7 @@ def _candidate_journeys(
                 WHERE f.tenant_id = :tenant_id AND f.journey_id <> :journey_id
                   AND f.field_key = ANY(:field_keys)
                   AND f.effective_value IS NOT NULL
+                  AND """ + _NOT_TAKEN_OUT + """
             )
             SELECT r.journey_id, r.field_key, r.effective_value, j.created_at_utc
             FROM ranked r
