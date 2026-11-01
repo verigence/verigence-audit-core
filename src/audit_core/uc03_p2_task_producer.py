@@ -46,8 +46,10 @@ from audit_core.uc03_p2_runtime import (
     swept_pending_sql,
 )
 from audit_core.uc03_p2_stage import (
+    NOT_READ,
     statement_out_of_balance,
     statement_values,
+    unread_receipt_amounts,
     unreviewed_fields,
 )
 from audit_core.uc03_p2_tasks import record_task_event
@@ -605,6 +607,9 @@ def sync_field_review_tasks(
     low-confidence fields; tasks close themselves when none remain."""
     registry = registry or get_registry()
     pending = unreviewed_fields(connection, registry, tenant_id=tenant_id, journey_id=journey_id)
+    # A receipt whose amount was not read is not counted as paid: the PC enters
+    # it from the page (2026-11-01).
+    pending += unread_receipt_amounts(connection, registry, tenant_id=tenant_id, journey_id=journey_id)
     by_document: dict[str, list[dict[str, Any]]] = {}
     for item in pending:
         by_document.setdefault(item["documentId"], []).append(item)
@@ -617,9 +622,16 @@ def sync_field_review_tasks(
         fields.sort(key=lambda f: (f["severity"] != "HIGH", f["confidence"] is not None, f["confidence"] or 0))
         gst = [f for f in fields if "GST_SLAB_RETIRED" in f.get("reasons", ())]
         unbalanced = [f for f in fields if "STATEMENT_DOES_NOT_BALANCE" in f.get("reasons", ())]
-        dated = [f for f in fields if f["severity"] == "HIGH" and f not in gst and f not in unbalanced]
+        unread = [f for f in fields if NOT_READ in f.get("reasons", ())]
+        dated = [f for f in fields
+                 if f["severity"] == "HIGH" and f not in gst and f not in unbalanced and f not in unread]
         uncertain = [f for f in fields if f["severity"] != "HIGH"]
         sentences = []
+        if unread:
+            sentences.append(
+                f"The amount paid on the {name} was not read, so this receipt is not counted toward what the "
+                "customer paid. Enter the amount printed on the page; if the page is not a receipt, say so."
+            )
         if unbalanced:
             totals = statement_out_of_balance(statement_values(connection, tenant_id=tenant_id, document_id=document_id))
             if totals is not None:
@@ -648,10 +660,11 @@ def sync_field_review_tasks(
             more = f" and {len(uncertain) - 6} more" if len(uncertain) > 6 else ""
             sentences.append(f"These values on the {name} were read with low confidence: {listed}{more}.")
         sentences.append("Open the document, compare each value with the page and confirm or correct it.")
-        severity = "HIGH" if dated or gst or unbalanced else "MEDIUM"
+        severity = "HIGH" if dated or gst or unbalanced or unread else "MEDIUM"
         count = len(fields)
         title = (
-            f"Check the lines on {name}: they do not add up" if unbalanced
+            f"Enter the amount on {name}: it was not read" if unread and len(fields) == 1
+            else f"Check the lines on {name}: they do not add up" if unbalanced
             else f"Check the GST on {name}" if gst and not dated and not uncertain
             else f"Check {count} date{'s' if count != 1 else ''} on {name}" if dated and not uncertain and not gst
             else f"Verify {count} field{'s' if count != 1 else ''} on {name}"
