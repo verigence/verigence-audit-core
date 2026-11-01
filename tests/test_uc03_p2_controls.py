@@ -450,8 +450,9 @@ def test_a_duplicate_booking_task_names_the_other_booking_and_what_matched(journ
                      {"label": "KYC name vs relative on the other booking", "thisValue": "RAJESH BHOL",
                       "otherValue": "RAJESH CH BHOL", "exact": False}],
         )
-        assert got == (reference, f"This booking matches the earlier booking {reference} on PAN XXXXXX267D, "
-                                  "KYC name vs relative on the other booking RAJESH BHOL / RAJESH CH BHOL. Confirm "
-                                  "whether this is a genuine repeat customer or a duplicate entry.")
+        expected = (f"This booking matches the earlier booking {reference} on PAN XXXXXX267D, "
+                    "KYC name vs relative on the other booking RAJESH BHOL / RAJESH CH BHOL. Confirm "
+                    "whether this is a genuine repeat customer or a duplicate entry.")
+        assert got == (reference, expected)
         assert controls._duplicate_booking_description(connection, tenant_id=journey.tenant_id,
                                                        other_journey_id=None, matched=[]) is None
