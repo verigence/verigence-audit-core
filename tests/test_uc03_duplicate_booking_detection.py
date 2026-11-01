@@ -755,3 +755,37 @@ def test_a_document_taken_out_of_its_booking_never_pairs_two_bookings(two_journe
     _take_out(c, c.journey_a, "pan_number")
     _sync_both(c)
     assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+
+
+def test_a_voided_copy_read_from_a_file_taken_out_never_pairs_two_bookings(two_journeys) -> None:
+    """2026-11-01: the taken-out file's earlier reading (voided when its pages
+    were grouped again) still carried the customer's Aadhaar and mobile."""
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="aadhaar", field_key="aadhaar_number",
+               value="2345 6789 0123")
+    _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_number",
+               value="2345 6789 0123")
+    _sync_both(c)
+    assert _open_findings(c, c.journey_a) or _open_findings(c, c.journey_b)
+    document_id = c.execute(
+        text("SELECT di_document_id FROM auditcore.journey_document_extracted_fields "
+             "WHERE tenant_id=:t AND journey_id=:j AND field_key='aadhaar_number'"),
+        {"t": c.tenant_id, "j": c.journey_a},
+    ).scalar_one()
+    batch_id = uuid4()
+    c.execute(
+        text("INSERT INTO auditcore.p2_upload_batches (tenant_id, batch_id, journey_id, original_filename, "
+             "content_type, size_bytes, page_count, original_object_key, batch_status, uploaded_by_actor_id, "
+             "identity_status, identity_enforced_at_utc) VALUES (:t, :b, :j, 'other.pdf', 'application/pdf', 1, 1, "
+             ":k, 'COMPLETED', 'pc', 'FOREIGN', now())"),
+        {"t": c.tenant_id, "b": batch_id, "j": c.journey_a, "k": f"p2/{batch_id}"},
+    )
+    c.execute(
+        text("INSERT INTO auditcore.p2_document_queue (tenant_id, batch_id, journey_id, page_number, page_sha256, "
+             "page_object_key, client_upload_id, di_document_id, queue_status, business_stage) VALUES (:t, :b, :j, 1, "
+             ":sha, :k, :c, :d, 'READY', 'BOOKING')"),
+        {"t": c.tenant_id, "b": batch_id, "j": c.journey_a, "sha": uuid4().hex, "k": f"p2/{batch_id}/1",
+         "c": f"p2-{uuid4().hex}", "d": document_id},
+    )
+    _sync_both(c)
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
