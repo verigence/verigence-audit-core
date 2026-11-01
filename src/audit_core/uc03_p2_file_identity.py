@@ -940,6 +940,15 @@ _RESTORABLE = ("REPLACED_BY_NEWER_UPLOAD", "REPLACED_BY_P2_REUPLOAD", "EARLIER_C
 # the superseding evidence itself stayed VOIDED and Bikash's own Aadhaar was
 # never given back. A page and the document it was merged into belong to the
 # same uploaded file (batch), so the file decides, not the evidence status.
+# A page merged into a document is not a document of its own: when that
+# document was never read, its pages are read again as one (2026-11-01,
+# product owner), never brought back page by page (UTK-JI-261026-005's GST
+# declaration and VAS pages).
+_MERGED_PAGE = """
+    EXISTS (SELECT 1 FROM auditcore.p2_document_queue oq
+            WHERE oq.tenant_id=e.tenant_id AND oq.journey_id=e.journey_id AND oq.di_document_id=e.di_document_id
+              AND oq.unit_kind='PAGE' AND oq.queue_status='MERGED')
+"""
 _REPLACED_BY_FOREIGN_FILE = """
     EXISTS (SELECT 1 FROM auditcore.evidence s
             WHERE s.tenant_id=e.tenant_id AND s.supersedes_evidence_id=e.evidence_id
@@ -1126,7 +1135,7 @@ def _enforce(connection: Connection, *, tenant_id: str, journey_id: UUID, foreig
                 SELECT e.evidence_id, e.di_document_id FROM auditcore.evidence e
                 WHERE e.tenant_id=:t AND e.journey_id=:j AND e.journey_document_requirement_id=:r
                   AND e.association_status='SUPERSEDED' AND e.void_reason = ANY(:reasons)
-                  AND {_REPLACED_BY_FOREIGN_FILE}
+                  AND {_REPLACED_BY_FOREIGN_FILE} AND NOT {_MERGED_PAGE}
                 ORDER BY e.linked_at_utc DESC, e.evidence_id DESC
                 LIMIT 1
                 FOR UPDATE
@@ -1180,13 +1189,14 @@ def plan_enforcement(connection: Connection, *, tenant_id: str, journey_id: UUID
         return plan
     rows = [dict(r) for r in connection.execute(
         text(
-            """
+            f"""
             SELECT e.evidence_id, e.di_document_id, e.document_type_key, e.association_status, e.pre_foreign_status,
                    e.journey_document_requirement_id, e.void_reason, e.linked_at_utc, e.supersedes_evidence_id,
                    e.process_area, jdr.requirement_key,
                    (SELECT q.batch_id::text FROM auditcore.p2_document_queue q
                      WHERE q.tenant_id=e.tenant_id AND q.journey_id=e.journey_id AND q.di_document_id=e.di_document_id
-                     LIMIT 1) AS batch_id
+                     LIMIT 1) AS batch_id,
+                   {_MERGED_PAGE} AS merged_page
             FROM auditcore.evidence e
             LEFT JOIN auditcore.journey_document_requirements jdr
               ON jdr.tenant_id=e.tenant_id AND jdr.journey_document_requirement_id=e.journey_document_requirement_id
@@ -1234,6 +1244,7 @@ def plan_enforcement(connection: Connection, *, tenant_id: str, journey_id: UUID
             continue
         candidates = sorted(
             (r for r in kept if r["association_status"] == "SUPERSEDED" and r["void_reason"] in _RESTORABLE
+             and not r["merged_page"]
              and any(s["batch_id"] in chosen for s in superseders.get(r["evidence_id"], []))),
             key=lambda r: (r["linked_at_utc"], str(r["evidence_id"])), reverse=True)
         if candidates:

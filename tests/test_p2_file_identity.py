@@ -804,6 +804,43 @@ def test_a_copy_replaced_by_a_page_of_the_foreign_file_comes_back_too(journey, m
         assert after[name] == before[name], name
 
 
+def test_a_page_of_the_customers_own_unread_document_is_not_given_back_page_by_page(journey, monkeypatch):
+    """UTK-JI-261026-005 (dry run 2026-11-01): the customer's GST declaration
+    page was superseded by a page of another customer's file, then merged into
+    the customer's own document -- never read. The page is not a document of its
+    own: it is read again with the rest of that document (product owner), not
+    given back as it was read alone."""
+    monkeypatch.delenv("P2_FILE_IDENTITY_ENFORCE", raising=False)
+    requirements = _requirements(journey)
+    bikash = _upload(journey, requirements, "Bikash Kumar Martha Booking .pdf", 0, [
+        ("pan_card", "pan_card", {"pan_number": "FJBPM5078P", "pan_name": "BIKASH KUMAR MARTHA"}),
+        ("aadhaar", "aadhaar", {"aadhaar_number": "4410 2290 8812", "aadhaar_name": "Bikash Kumar Martha"}),
+    ])
+    sudhanshu = _upload(journey, requirements, "Sudhanshu Sekhar Nayak.pdf", 4, [
+        ("aadhaar", "aadhaar", {"aadhaar_number": "9921 5530 1874", "aadhaar_name": "Aswini Kumar Nayak"}),
+        ("pan_card", "pan_card", {"pan_number": "ARSPN4417H", "pan_name": "SUDHANSU SEKHAR NAYAK"}),
+    ])
+    # Bikash's page (already superseded) went into his own document, never read;
+    # Sudhanshu's into his own, read.
+    _merge_into_document(journey, requirements, bikash["aadhaar:2"], requirement="aadhaar", read=False)
+    _merge_into_document(journey, requirements, sudhanshu["aadhaar:1"], requirement="aadhaar", read=True,
+                         fields={"aadhaar_number": "9921 5530 1874", "aadhaar_name": "Aswini Kumar Nayak"})
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_upload_batches SET page_count=12 WHERE tenant_id=:t AND batch_id=:b"),
+                           {"t": journey.tenant_id, "b": bikash["pan_card:1"]["batch_id"]})
+    from audit_core.uc03_p2_earlier_copy import plan_journey
+
+    _switch(journey, True)
+    _settle(journey)
+    assert _state(journey, bikash["pan_card:1"]) == ["ACTIVE"]  # a document of its own: back
+    assert _state(journey, bikash["aadhaar:2"]) == ["SUPERSEDED"]  # a page of an unread document: not
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert plan_journey(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id) == {
+            "neverRead": [], "foreignFile": []}
+
+
 def _page_tasks(journey, batch_id: UUID) -> dict[str, tuple]:
     """The file and page tasks of one uploaded file: kind -> (status, outcome)."""
     with journey.engine.begin() as connection:
