@@ -74,7 +74,7 @@ from audit_core.uc03_p2_controls import (
     mark_unit_controls,
     request_control_evaluation,
 )
-from audit_core.uc03_p2_customer import sync_customer_name
+from audit_core.uc03_p2_customer import follow_entered_name, sync_customer_name
 from audit_core.uc03_p2_grouping import (
     PageFact,
     merge_pdf_pages,
@@ -3346,8 +3346,13 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
                        exc_info=True)
     # The engine records STAGE_CHANGED only when the stage actually moves.
     named = sync_customer_name(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if named == "VERIFIED":
+    if named in ("VERIFIED", "CLEARED"):
         logger.info("p2_customer_named", tenant_id=tenant_id, journey_id=str(journey_id), how=named)
+    # The entered name of a booking another customer's file was dropped into
+    # follows the booking's own customer once that file is out (2026-11-01).
+    entered = follow_entered_name(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if entered is not None:
+        logger.info("p2_entered_name_follows_customer", tenant_id=tenant_id, journey_id=str(journey_id), name=entered)
     first = recompute_journey_stage(connection, tenant_id=tenant_id, journey_id=journey_id)
     _sync_rule_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, started_at=started_at)
     settled = recompute_journey_stage(connection, tenant_id=tenant_id, journey_id=journey_id, complete_delivery=True)

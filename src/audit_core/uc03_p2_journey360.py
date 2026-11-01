@@ -3134,6 +3134,7 @@ _ACTIVITY_KIND = {
     "DOCUMENTS_GROUPED": "document", "DOCUMENT_READY": "document", "DOCUMENT_SETTLED": "document",
     "DOCUMENT_REPLACEMENT_INITIALIZED": "document", "DOCUMENT_REPLACED": "document",
     "DOCUMENT_REMOVED": "document", "DOCUMENT_VOIDED": "document", "EARLIER_COPY_BACK": "document",
+    "CUSTOMER_NAME_CLEARED": "journey", "ENTERED_NAME_FOLLOWS_CUSTOMER": "journey",
     "PAGE_RETRY_REQUESTED": "document", "PAGE_RETYPED": "document",
     "VEHICLE_PHOTO_ADDED": "document", "VEHICLE_PHOTO_REMOVED": "document",
     "FIELD_CORRECTED": "review", "FIELD_CONFIRMED": "review", "RECHECK_REQUESTED": "review",
