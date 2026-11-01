@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -1093,19 +1094,39 @@ def _remark(answer: dict[str, Any]) -> str:
     return f': "{comment}"' if comment else ""
 
 
+# The receipt names the payer as the deal's financier: "HDFC Bank (Financer)",
+# "ICICI Finance (D.O)" (2026-11-01: 20 open third-party questions on live
+# were the loan's own disbursement).
+_FINANCIER_NOTE = re.compile(r"\(\s*(?:FINANC\w*|D\s*\.?\s*/?\s*O\.?)\s*\)", re.IGNORECASE)
+# "SIBARAM NAYAK ( HP TO UNION BANK OF INDIA )": the payer, with the loan's
+# hypothecation noted after the name.
+_HYPOTHECATION_NOTE = re.compile(r"\(\s*H\s*\.?\s*P\s*\.?\s+TO\b[^)]*\)", re.IGNORECASE)
+# The dealer's own posting of bank charges, not money anyone paid.
+_BANK_CHARGES = re.compile(r"BANK\s+CHARGES?", re.IGNORECASE)
+
+
 def _third_party(facts: _Facts) -> list[dict[str, Any]]:
     from audit_core.uc03_p2_file_identity import pans_in_text
+    from audit_core.uc03_p2_names import same_organisation
 
     name = facts.customer_name
     if not name:
         return []
     own = facts.customer_pans
+    finance = facts.finance or {}
+    provider = finance.get("provider") if finance.get("provider") != "the financier" else None
 
     def customers(payer: str | None) -> bool:
         # A payer printed with the customer's own PAN, or a GSTIN holding it, is
         # the customer or their own firm (2026-11-01: "MATRUKRUPA ENTERPRISERS-
-        # AOIPS3191J" paid for Pradipta Kumar Sahoo, PAN AOIPS3191J).
-        return not payer or same_person(name, payer) or bool(own.intersection(pans_in_text(payer)))
+        # AOIPS3191J" paid for Pradipta Kumar Sahoo, PAN AOIPS3191J). The
+        # deal's financier paying out the loan is not a third party either.
+        if not payer or _BANK_CHARGES.fullmatch(payer.strip()):
+            return True
+        if _FINANCIER_NOTE.search(payer) or (provider and same_organisation(payer, provider)):
+            return True
+        payer = " ".join(_HYPOTHECATION_NOTE.sub(" ", payer).split())
+        return same_person(name, payer) or bool(own.intersection(pans_in_text(payer)))
 
     out = []
     for r in facts.receipts:

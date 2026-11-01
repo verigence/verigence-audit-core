@@ -287,6 +287,22 @@ def test_a_payment_with_the_customers_own_pan_is_not_third_party(journey):
     assert asked.outcome == "FAIL" and "MADHULINA DIGAL" in asked.reason and "MATRUKRUPA" not in asked.reason
 
 
+def test_the_financiers_loan_payment_is_not_third_party(journey):
+    """ADI-BA-261019-004: "ICICI Finance (D.O)" paid Rs 7,93,274; ADI-RD-261030-018:
+    "ODISHA GRAMEEN BANK (FINANCER )". The financier, bank charges and the
+    customer with the loan's hypothecation noted are not third parties."""
+    _name(journey, "SIBARAM NAYAK")
+    _receipt(journey, "793274", TODAY - timedelta(days=3), "R-1", payer="ICICI Finance (D.O)")
+    _receipt(journey, "1064792", TODAY - timedelta(days=3), "R-2", payer="ODISHA GRAMEEN BANK (FINANCER )")
+    _receipt(journey, "590", TODAY - timedelta(days=3), "R-3", payer="BANK CHARGES")
+    _receipt(journey, "50000", TODAY - timedelta(days=2), "R-4", payer="SIBARAM NAYAK ( HP TO UNION BANK OF INDIA )")
+    assert _run(journey, "BOOKING")["THIRD_PARTY_PAYMENT_UNCONFIRMED"].outcome == "PASS"
+    # A company that is not the financier still is.
+    _receipt(journey, "200000", TODAY - timedelta(days=1), "R-5", payer="RAILTECH INFRA VENTURE PRIVATE LIMITED")
+    asked = _run(journey, "BOOKING")["THIRD_PARTY_PAYMENT_UNCONFIRMED"]
+    assert asked.outcome == "FAIL" and "RAILTECH" in asked.reason and "ICICI" not in asked.reason
+
+
 # ---------------------------------------------------- settlement windows
 
 

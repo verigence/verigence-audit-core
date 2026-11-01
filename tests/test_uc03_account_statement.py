@@ -395,6 +395,36 @@ def test_statement_replaces_the_invoice_data_and_is_idempotent(journey) -> None:
     assert _open_tasks(journey) == {}
 
 
+def test_the_deal_check_never_empties_a_discount_the_statement_gives(journey) -> None:
+    """2026-11-01: the deal check relabelled the statement's discount as its own
+    on one run and emptied it on the next (ADI-BM-261026-003's Rs 6,000 cash
+    discount and Rs 35,000 exchange claim came and went; 27 values were empty
+    on live)."""
+    from audit_core.uc03_deal_reconciliation import _discount_rows, _write_discount_row
+
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _ledger(journey, UTKAL)
+    _sync(journey)
+    assert _discounts(journey)["ADDITIONAL_DISCOUNT"] == (D(5000), "ACCOUNT_STATEMENT")
+    for _ in range(3):
+        with journey.engine.begin() as c:
+            set_tenant_context(c, journey.tenant_id)
+            existing = _discount_rows(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+            _write_discount_row(
+                c, tenant_id=journey.tenant_id, journey_id=journey.journey_id, key="ADDITIONAL_DISCOUNT",
+                existing=existing.get("ADDITIONAL_DISCOUNT"), standard=D(4000), result="ELIGIBLE", dsv=None,
+                details={"benefitKey": "ADDITIONAL_DISCOUNT", "source": "DEAL_DISCOUNT_GRID"}, booking_actual=None)
+        assert _discounts(journey)["ADDITIONAL_DISCOUNT"] == (D(5000), "ACCOUNT_STATEMENT")
+        _sync(journey)
+        assert _discounts(journey)["ADDITIONAL_DISCOUNT"] == (D(5000), "ACCOUNT_STATEMENT")
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        standard = c.execute(text("SELECT standard_eligible_amount FROM auditcore.discount_applications "
+                                  "WHERE tenant_id=:t AND journey_id=:j AND discount_key='ADDITIONAL_DISCOUNT'"),
+                             {"t": journey.tenant_id, "j": journey.journey_id}).scalar_one()
+    assert standard == D(4000)  # the entitlement side is still the check's
+
+
 def test_no_statement_leaves_the_invoice_blank(journey) -> None:
     _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
     _invoice_sets_the_deal(journey)
