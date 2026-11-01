@@ -368,6 +368,29 @@ def test_a_file_still_in_flight_after_hours_has_an_info_task_and_the_tl_after_a_
     assert {t["task_status"] for t in _tasks(journey, "upload-stuck-tl:")} == {"VERIFIED_COMPLETE"}
 
 
+def test_a_page_of_an_old_file_sent_again_raises_no_slow_or_stuck_task(journey):
+    """2026-11-01: documents of 23-26 Oct files read again (uc03_p2_unread_reread)
+    raised "not read for more than a day" for the Team Lead and the PC's
+    status task while they were being read. A page sent again starts its 30
+    minutes again: its file is as old as that, not as old as the upload."""
+    batch_id, queue_id, _ = add_page(journey, status="EXTRACTING", submitted_minutes_ago=2)
+    _age_batch(journey, batch_id, hours=7 * 24)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_document_queue SET read_clock_started_at_utc=now() - "
+                                "interval '2 minutes' WHERE queue_id=:q"), {"q": queue_id})
+        assert sync_processing_failure_tasks(connection, tenant_id=journey.tenant_id,
+                                             journey_id=journey.journey_id) == {}
+    assert _tasks(journey, "upload-status:") == [] and _tasks(journey, "upload-stuck-tl:") == []
+    # Still waiting a day after it was sent again: the Team Lead hears of it.
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_document_queue SET read_clock_started_at_utc=now() - "
+                                "interval '25 hours' WHERE queue_id=:q"), {"q": queue_id})
+        sync_processing_failure_tasks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert len(_tasks(journey, "upload-stuck-tl:")) == 1
+
+
 # ---------------------------------------------------------- the page actions
 
 def _call(endpoint, journey, **kwargs):

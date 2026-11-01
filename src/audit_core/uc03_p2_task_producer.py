@@ -918,6 +918,13 @@ def sync_processing_failure_tasks(
                    COUNT(q.queue_id) FILTER (WHERE q.queue_status NOT IN
                      ('READY','SUPPORTING','NEEDS_REVIEW','CANCELLED','MERGED','RETRY_WAIT','FAILED','DEAD_LETTER'))
                      AS working,
+                   -- Since when the pages still waiting have been waiting: a page
+                   -- sent again starts its 30 minutes again (2026-10-21), so a
+                   -- file is not "not read for more than a day" because an old
+                   -- page of it was just sent again (2026-11-01).
+                   MIN(q.read_clock_started_at_utc) FILTER (WHERE q.queue_status NOT IN
+                     ('READY','SUPPORTING','NEEDS_REVIEW','CANCELLED','MERGED','FAILED','DEAD_LETTER'))
+                     AS waiting_since,
                    COALESCE(jsonb_agg(jsonb_build_object(
                        'queueId', q.queue_id,
                        'pages', COALESCE(q.page_numbers, ARRAY[q.page_number]),
@@ -936,7 +943,7 @@ def sync_processing_failure_tasks(
             FROM auditcore.p2_upload_batches b
             LEFT JOIN (
               SELECT p.tenant_id, p.batch_id, p.queue_id, p.page_number, p.page_numbers, p.status_reason,
-                     p.last_error, p.template_key,
+                     p.last_error, p.template_key, p.read_clock_started_at_utc,
                      CASE WHEN {swept_pending_sql("p")} THEN 'FAILED' ELSE p.queue_status END AS queue_status
               FROM auditcore.p2_document_queue p
               WHERE p.tenant_id=:t AND p.journey_id=:j
@@ -972,7 +979,9 @@ def sync_processing_failure_tasks(
             counts[outcome] = counts.get(outcome, 0) + 1
         split_failed = row["batch_status"] == "FAILED" and int(row["page_count"] or 0) == 0
         in_progress = retrying + working > 0 or row["batch_status"] in ("AWAITING_UPLOAD", "UPLOADED", "SPLITTING")
-        age = (now - row["created_at_utc"]).total_seconds() if row["created_at_utc"] else 0.0
+        since = max(t for t in (row["created_at_utc"], row["waiting_since"]) if t is not None) \
+            if row["created_at_utc"] or row["waiting_since"] else None
+        age = (now - since).total_seconds() if since else 0.0
         setup_units = [u for u in failed_units if str(u.get("code") or "") == SETUP_FAILURE_CODE]
         if setup_units:
             cfg_key = f"ai-config-tl:{journey_id}:{row['batch_id']}"
