@@ -703,6 +703,107 @@ def test_a_file_found_to_belong_after_all_comes_back_as_it_was(journey, monkeypa
     assert tapan_file["identity"]["status"] == "BELONGS" and "co-applicant" in tapan_file["identity"]["reason"]
 
 
+def _merge_into_document(journey, requirements, page: dict, *, requirement: str, read: bool,
+                         fields: dict | None = None) -> dict:
+    """The page is grouped into a document of its own file, as the worker does
+    it: its unit MERGED into a GROUP unit and its evidence voided as merged
+    (uc03_p2_worker._retire_fragments). ``read``: the document was read and
+    linked (ACTIVE -- the page had already superseded the copy then active, so
+    there is nothing left to supersede); else never read (CANCELLED, "Not read
+    within 30 minutes")."""
+    group_id, document_id = uuid4(), uuid4()
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.p2_document_queue (tenant_id, queue_id, batch_id, journey_id, page_number, "
+                 "page_numbers, page_sha256, page_object_key, client_upload_id, di_document_id, queue_status, "
+                 "status_reason, classified_document_type, business_stage, unit_kind) "
+                 "SELECT tenant_id, :g, batch_id, journey_id, page_number, ARRAY[page_number], :sha, page_object_key, "
+                 ":c, :d, CAST(:s AS varchar), CAST(:why AS text), classified_document_type, business_stage, 'GROUP' "
+                 "FROM auditcore.p2_document_queue WHERE tenant_id=:t AND di_document_id=:page"),
+            {"t": journey.tenant_id, "g": group_id, "sha": uuid4().hex, "c": f"group-{uuid4().hex}",
+             "d": document_id, "s": "READY" if read else "CANCELLED",
+             "why": None if read else "Not read within 30 minutes. Please upload this page again.",
+             "page": page["document_id"]})
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET queue_status='MERGED', merged_into_queue_id=:g "
+                 "WHERE tenant_id=:t AND di_document_id=:page"),
+            {"t": journey.tenant_id, "g": group_id, "page": page["document_id"]})
+        connection.execute(
+            text("UPDATE auditcore.evidence SET association_status='VOIDED', void_reason='P2_MERGED_INTO_DOCUMENT', "
+                 "voided_at_utc=now() WHERE tenant_id=:t AND evidence_id=:e AND association_status='ACTIVE'"),
+            {"t": journey.tenant_id, "e": page["evidence_id"]})
+        evidence_id = None
+        if read:
+            evidence_id = connection.execute(
+                text("INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, "
+                     "journey_document_requirement_id, di_subject_id, di_document_id, document_type_key, "
+                     "evidence_purpose, process_area, association_status) VALUES (:t, :j, :c, :r, :s, :d, :dt, "
+                     "'BOOKING_DOCUMENT', 'BOOKING', 'ACTIVE') RETURNING evidence_id"),
+                {"t": journey.tenant_id, "j": journey.journey_id, "c": journey.customer_id,
+                 "r": requirements[requirement], "s": uuid4(), "d": document_id, "dt": requirement},
+            ).scalar_one()
+            connection.execute(
+                text("INSERT INTO auditcore.document_capture_v2_documents (tenant_id, journey_id, stage_code, "
+                     "di_document_id, client_upload_id, capture_status, created_by_actor_id) "
+                     "VALUES (:t, :j, 'BOOKING', :d, :c, 'CLASSIFIED', :a)"),
+                {"t": journey.tenant_id, "j": journey.journey_id, "d": document_id, "c": f"cap-{uuid4().hex}",
+                 "a": journey.actor_id})
+    for key, value in (fields or {}).items() if read else ():
+        add_extracted_field(journey, di_document_id=document_id, field_key=key, value=value,
+                            document_type=_SOURCE_TYPE.get(requirement, requirement))
+    return {"document_id": document_id, "evidence_id": UUID(str(evidence_id)) if evidence_id else None,
+            "batch_id": page["batch_id"], "group_id": group_id}
+
+
+def test_a_copy_replaced_by_a_page_of_the_foreign_file_comes_back_too(journey, monkeypatch):
+    """Live 2026-11-01 (ADI-RD-261022-018): a page of the other customer's file
+    superseded the customer's Aadhaar, then was merged into that file's
+    grouped Aadhaar and voided as a page. Only the grouped document went
+    FOREIGN, so the customer's own Aadhaar was never given back -- and with a
+    masked PAN the booking kept the masked name. Now a copy replaced by any
+    page of the file taken out comes back, and is superseded again exactly as
+    it was when the file stops being taken out."""
+    monkeypatch.delenv("P2_FILE_IDENTITY_ENFORCE", raising=False)
+    requirements = _requirements(journey)
+    bikash = _upload(journey, requirements, "Bikash Kumar Martha Booking .pdf", 0, [
+        ("pan_card", "pan_card", {"pan_number": "FJBPM5078P", "pan_name": "BXXXXH KXXXR MXXXXA"}),
+        ("aadhaar", "aadhaar", {"aadhaar_number": "4410 2290 8812", "aadhaar_name": "Bikash Kumar Martha"}),
+        ("booking_docket", "booking_docket", {"customer_name": "Bikash Kumar Martha", "dealer_name": "Aditya Motors"}),
+    ])
+    sudhanshu = _upload(journey, requirements, "Sudhanshu Sekhar Nayak.pdf", 4, [
+        ("aadhaar", "aadhaar", {"aadhaar_number": "9921 5530 1874", "aadhaar_name": "Aswini Kumar Nayak"}),
+        ("booking_docket", "booking_docket", {"customer_name": "Sudhansu Sekhar Nayak", "dealer_name": "Aditya Motors"}),
+        ("pan_card", "pan_card", {"pan_number": "ARSPN4417H", "pan_name": "SUDHANSU SEKHAR NAYAK"}),
+    ])
+    # Sudhanshu's Aadhaar page went into his file's grouped Aadhaar (read).
+    grouped = _merge_into_document(journey, requirements, sudhanshu["aadhaar:1"], requirement="aadhaar", read=True,
+                                   fields={"aadhaar_number": "9921 5530 1874", "aadhaar_name": "Aswini Kumar Nayak"})
+    with journey.engine.begin() as connection:  # Bikash's file stays the larger one
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_upload_batches SET page_count=12 WHERE tenant_id=:t AND batch_id=:b"),
+                           {"t": journey.tenant_id, "b": bikash["pan_card:1"]["batch_id"]})
+    _settle(journey)  # decided, not taken out
+    before = _booking_state(journey)
+    assert _state(journey, bikash["aadhaar:2"]) == ["SUPERSEDED"]
+
+    _switch(journey, True)
+    _settle(journey)
+    assert _state(journey, grouped, sudhanshu["booking_docket:2"], sudhanshu["pan_card:3"]) == ["FOREIGN"] * 3
+    assert _state(journey, sudhanshu["aadhaar:1"]) == ["VOIDED"]  # the page, as it was
+    assert _state(journey, *bikash.values()) == ["ACTIVE"] * 3
+    # Masked PAN, no GSTIN: the Aadhaar names him (product owner 2026-10-28).
+    assert _legal_name(journey) == "Bikash Kumar Martha"
+    _settle(journey)  # a repeated recompute changes nothing more
+    assert _state(journey, *bikash.values()) == ["ACTIVE"] * 3
+
+    _switch(journey, False)
+    _settle(journey)
+    after = _booking_state(journey)
+    for name in ("evidence", "captures", "batches"):
+        assert after[name] == before[name], name
+
+
 def _page_tasks(journey, batch_id: UUID) -> dict[str, tuple]:
     """The file and page tasks of one uploaded file: kind -> (status, outcome)."""
     with journey.engine.begin() as connection:

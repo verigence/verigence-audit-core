@@ -3133,7 +3133,7 @@ _ACTIVITY_KIND = {
     "UPLOAD_DUPLICATE": "document", "P2_WORK_DEAD_LETTER": "document", "JOURNEY_CANCELLED": "journey",
     "DOCUMENTS_GROUPED": "document", "DOCUMENT_READY": "document", "DOCUMENT_SETTLED": "document",
     "DOCUMENT_REPLACEMENT_INITIALIZED": "document", "DOCUMENT_REPLACED": "document",
-    "DOCUMENT_REMOVED": "document", "DOCUMENT_VOIDED": "document",
+    "DOCUMENT_REMOVED": "document", "DOCUMENT_VOIDED": "document", "EARLIER_COPY_BACK": "document",
     "PAGE_RETRY_REQUESTED": "document", "PAGE_RETYPED": "document",
     "VEHICLE_PHOTO_ADDED": "document", "VEHICLE_PHOTO_REMOVED": "document",
     "FIELD_CORRECTED": "review", "FIELD_CONFIRMED": "review", "RECHECK_REQUESTED": "review",
