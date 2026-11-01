@@ -65,8 +65,21 @@ def _settle(journey) -> None:
 
 
 def test_the_job_is_registered(journey) -> None:
-    target, args = _one_shot_target("BOOKING_REBUILD", journey.engine, "t", [])
+    target, args = _one_shot_target("BOOKING_REBUILD", journey.engine, "t", ["UTK-SB-261028-001"])
     assert target.__name__ == "run_booking_rebuild" and journey.tenant_id in args[2]
+    assert args[3] == ["UTK-SB-261028-001"]
+
+
+def test_only_the_listed_references_are_checked(journey) -> None:
+    _receipt(journey, amount="11000", number="R-9")
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        reference = c.execute(text("SELECT journey_reference FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+                              {"t": journey.tenant_id, "j": journey.journey_id}).scalar_one()
+    assert rebuild.rebuild_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t", commit=False,
+                                  references=["NOT-THIS-ONE"])["journeys"] == 0
+    assert rebuild.rebuild_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t", commit=False,
+                                  references=[reference])["wouldChange"] == 1
 
 
 def test_a_receipt_with_no_payment_is_found_and_nothing_is_written(journey) -> None:

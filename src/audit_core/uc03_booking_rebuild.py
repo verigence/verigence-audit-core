@@ -24,8 +24,9 @@ would change -- the worker's own recompute then builds them, exactly as after
 any document change. The job never writes a booking's values itself, and a
 booking whose build would change nothing is not touched.
 
-Started as worker job ``BOOKING_REBUILD``. A DRY RUN unless the tag ends with
-"-commit". Idempotent: once the recomputes have run, a second run finds
+Started as worker job ``BOOKING_REBUILD``, over every booking or only the
+journey references the job lists in ``reports``. A DRY RUN unless the tag ends
+with "-commit". Idempotent: once the recomputes have run, a second run finds
 nothing to change.
 """
 from __future__ import annotations
@@ -207,7 +208,7 @@ def rebuild_check(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     return changes
 
 
-def _journeys(connection: Connection, tenant_id: str) -> list[dict[str, Any]]:
+def _journeys(connection: Connection, tenant_id: str, references: list[str] | None = None) -> list[dict[str, Any]]:
     return [dict(r) for r in connection.execute(
         text(
             """
@@ -215,19 +216,23 @@ def _journeys(connection: Connection, tenant_id: str) -> list[dict[str, Any]]:
             WHERE j.tenant_id=:t AND EXISTS (
                 SELECT 1 FROM auditcore.evidence e
                 WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id AND e.association_status='ACTIVE')
+              AND (CAST(:refs AS text[]) IS NULL OR j.journey_reference = ANY(CAST(:refs AS text[])))
             ORDER BY j.journey_reference
             """
         ),
-        {"t": tenant_id},
+        {"t": tenant_id, "refs": list(references) if references else None},
     ).mappings().all()]
 
 
-def rebuild_tenant(engine: Engine, *, tenant_id: str, tag: str, commit: bool) -> dict[str, Any]:
+def rebuild_tenant(engine: Engine, *, tenant_id: str, tag: str, commit: bool,
+                   references: list[str] | None = None) -> dict[str, Any]:
+    """Every booking of the Project with documents on file, or only those of
+    ``references`` (journey references)."""
     from audit_core.uc03_p2_runtime import note_facts_changed
 
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
-        journeys = _journeys(connection, tenant_id)
+        journeys = _journeys(connection, tenant_id, references)
     totals: dict[str, Any] = {"journeys": len(journeys), "wouldChange": 0, "byTable": Counter(),
                               "paymentsAdded": 0, "paymentsAddedAmount": Decimal("0.00"), "paymentsRemoved": 0,
                               "paymentsRemovedAmount": Decimal("0.00"), "paymentsChanged": 0, "vehicleChanged": 0,
@@ -280,11 +285,13 @@ def rebuild_tenant(engine: Engine, *, tenant_id: str, tag: str, commit: bool) ->
     return totals
 
 
-def run_booking_rebuild(engine: Engine, tag: str, tenant_ids: list[str]) -> None:
+def run_booking_rebuild(engine: Engine, tag: str, tenant_ids: list[str], references: list[str] | None = None) -> None:
+    """``references``: journey references to limit the run to (a job's
+    ``reports``); none means every booking."""
     commit = tag.endswith("-commit")
     for tenant_id in tenant_ids:
         try:
-            totals = rebuild_tenant(engine, tenant_id=tenant_id, tag=tag, commit=commit)
+            totals = rebuild_tenant(engine, tenant_id=tenant_id, tag=tag, commit=commit, references=references)
         except Exception:
             logger.warning("booking_rebuild_tenant_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
             continue
