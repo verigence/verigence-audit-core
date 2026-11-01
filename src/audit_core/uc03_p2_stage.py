@@ -509,6 +509,75 @@ def unreviewed_fields(
     return pending
 
 
+
+# A receipt's amount that was not read (2026-11-01). The receipt is then never
+# a payment, so the booking's paid total leaves it out, and the field review
+# above never names it: it reviews values that were read. 48 receipts on file
+# had no amount read and no task (the Utkal receipts whose left edge is not
+# read: "ANTA SAHOO" for Umakant Sahoo, no receipt number, no amount).
+RECEIPT_AMOUNT_FIELD = "amount_paid"
+RECEIPT_DOCUMENT_TYPES = ("dealer_receipt", "payment_receipt")
+NOT_READ = "NOT_READ"
+
+
+def unread_receipt_amounts(
+    connection: Connection, registry: Registry, *, tenant_id: str, journey_id: UUID,
+) -> list[dict[str, Any]]:
+    """Receipts on the booking whose amount was not read, not entered by a PC,
+    not confirmed by a PC, and not already a payment."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT DISTINCT ON (f.di_document_id)
+                   f.di_document_id, f.source_canonical_field_id, f.source_fact_version,
+                   e.document_type_key, e.process_area
+            FROM auditcore.journey_document_extracted_fields f
+            JOIN auditcore.evidence e
+              ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id
+             AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
+            WHERE f.tenant_id=:t AND f.journey_id=:j
+              AND e.document_type_key = ANY(:types)
+              AND f.field_key = :field
+              AND (f.effective_value IS NULL OR f.effective_value IN ('null'::jsonb, '""'::jsonb))
+              AND f.reviewed_at_utc IS NULL AND f.is_modified = false
+              AND NOT EXISTS (
+                  SELECT 1 FROM auditcore.journey_document_extracted_fields g
+                  WHERE g.tenant_id=f.tenant_id AND g.journey_id=f.journey_id AND g.di_document_id=f.di_document_id
+                    AND g.field_key=f.field_key
+                    AND (g.reviewed_at_utc IS NOT NULL OR g.is_modified
+                         OR (g.effective_value IS NOT NULL AND g.effective_value NOT IN ('null'::jsonb, '""'::jsonb))))
+              AND NOT EXISTS (
+                  SELECT 1 FROM auditcore.payments p
+                  WHERE p.tenant_id=f.tenant_id AND p.journey_id=f.journey_id
+                    AND (p.source_di_document_id=f.di_document_id OR p.source_evidence_id=e.evidence_id))
+            ORDER BY f.di_document_id, f.source_fact_version DESC NULLS LAST
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "types": list(RECEIPT_DOCUMENT_TYPES), "field": RECEIPT_AMOUNT_FIELD},
+    ).mappings().all()
+    pending: list[dict[str, Any]] = []
+    for row in rows:
+        area = str(row["process_area"] or "").upper() or None
+        template = registry.template_for_di_type(canonical_di_type(row["document_type_key"]), stage=area)
+        if template.is_supporting:
+            continue
+        pending.append(
+            {
+                "documentId": str(row["di_document_id"]),
+                "templateKey": template.key,
+                "documentName": template.display_name,
+                "fieldKey": RECEIPT_AMOUNT_FIELD,
+                "canonicalFieldId": row["source_canonical_field_id"],
+                "sourceFactVersion": int(row["source_fact_version"] or 1),
+                "confidence": None,
+                "threshold": template.review_threshold_for(RECEIPT_AMOUNT_FIELD),
+                "value": None,
+                "reasons": [NOT_READ],
+                "severity": "HIGH",
+            }
+        )
+    return pending
+
 # ── conditional -> mandatory, from document evidence ─────────────────────────
 # Conditions named by the requirements document (section 3). Each becomes
 # true from evidence on the Journey's own documents -- booking form,

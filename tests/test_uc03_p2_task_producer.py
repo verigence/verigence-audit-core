@@ -11,6 +11,7 @@ from p2_support import (
     add_evidence,
     add_extracted_field,
     add_ready_document,
+    add_receipt_payment,
     create_p2_journey,
     database_engine,
     principal,
@@ -494,3 +495,63 @@ def test_the_field_review_task_of_manual_verification_is_untouched(journey):
                                        journey_id=journey.journey_id) == {"RAISED": 1}
     _stage_run(journey, "MANUAL_VERIFICATION", status="FAIL", stage="BOOKING")
     assert _task(journey, f"field-review:{document}")["task_status"] == "READY"
+
+
+# ── a receipt whose amount was not read (2026-11-01) ─────────────────────────
+def test_a_receipt_with_no_amount_read_asks_the_pc_to_enter_it(journey):
+    """UTK-PP-261024-003: name, phone and date read, no amount: the receipt was
+    never a payment and no task said so."""
+    receipt = add_ready_document(journey, "dealer_receipt", confidence=92.0, customer_name="BA PRASAD SATAPATHY",
+                                 receipt_date="2026-10-01")
+    add_extracted_field(journey, di_document_id=receipt, field_key="amount_paid", value=None, confidence=None,
+                        document_type="dealer_receipt")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {"RAISED": 1}
+    task = _task(journey, f"field-review:{receipt}")
+    assert task["title"] == "Enter the amount on Booking Payment Receipt: it was not read"
+    assert task["severity"] == "HIGH" and task["assigned_role_code"] == "PC"
+    assert "not counted toward what the customer paid" in task["description"]
+    (field,) = task["reference"]["fields"]
+    assert field["fieldKey"] == "amount_paid" and field["reasons"] == ["NOT_READ"]
+
+    # the PC enters the amount from the page: the task closes itself
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("""UPDATE auditcore.journey_document_extracted_fields
+                    SET effective_value='"21000"'::jsonb, is_modified=true
+                    WHERE tenant_id=:t AND di_document_id=:d AND field_key='amount_paid'"""),
+            {"t": journey.tenant_id, "d": receipt},
+        )
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {"VERIFIED": 1}
+    assert _task(journey, f"field-review:{receipt}")["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_a_receipt_amount_read_in_a_later_version_or_already_paid_asks_nothing(journey):
+    later = add_ready_document(journey, "dealer_receipt", receipt_date="2026-10-01")
+    add_extracted_field(journey, di_document_id=later, field_key="amount_paid", value=None, confidence=None,
+                        document_type="dealer_receipt", canonical_field_id="cf-amount-v1")
+    add_extracted_field(journey, di_document_id=later, field_key="amount_paid", value="15000",
+                        document_type="dealer_receipt", canonical_field_id="cf-amount-v2")
+    paid = add_receipt_payment(journey, amount="11000", receipt_number="R-9", receipt_date="2026-10-02")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("""UPDATE auditcore.journey_document_extracted_fields SET effective_value='null'::jsonb
+                    WHERE tenant_id=:t AND di_document_id=:d AND field_key='amount_paid'"""),
+            {"t": journey.tenant_id, "d": paid},
+        )
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {}
+
+
+def test_an_empty_field_on_another_document_asks_nothing(journey):
+    form = add_ready_document(journey, "booking_form", customer_name="P2 Customer")
+    add_extracted_field(journey, di_document_id=form, field_key="ex_showroom_price", value=None, confidence=None)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert sync_field_review_tasks(connection, tenant_id=journey.tenant_id,
+                                       journey_id=journey.journey_id) == {}
