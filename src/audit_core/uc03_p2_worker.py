@@ -4639,6 +4639,12 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # (2026-10-31): see uc03_file_identity_scan. Never deletes.
         from audit_core.uc03_file_identity_scan import run_file_identity_scan
         return run_file_identity_scan, (engine, tag, reports)
+    if kind == "FILE_MOVE":
+        # Files taken out of a booking go to their customer's own booking, as
+        # planned in p2_file_moves (2026-11-01): see uc03_file_move. Never
+        # changes or deletes the source file.
+        from audit_core.uc03_file_move import run_file_move
+        return run_file_move, (engine, tag, reports)
     per_tenant = {
         "PAGE_RESEND": ("audit_core.uc03_p2_page_resend", "run_page_resend"),
         "INVOICE_RESCAN": ("audit_core.uc03_invoice_rescan", "run_invoice_rescan"),

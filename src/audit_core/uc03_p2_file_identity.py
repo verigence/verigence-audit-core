@@ -1464,8 +1464,14 @@ def files_view(connection: Connection, *, tenant_id: str, journey_id: UUID) -> d
                              ON e.tenant_id=q.tenant_id AND e.journey_id=q.journey_id
                             AND e.di_document_id=q.di_document_id
                            WHERE q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id
-                             AND e.association_status='FOREIGN') AS taken_out
+                             AND e.association_status='FOREIGN') AS taken_out,
+                   -- where it went (uc03_file_move, 2026-11-01): the customer's own booking
+                   moved.target_journey_id AS moved_to_journey_id, tj.journey_reference AS moved_to_reference
             FROM auditcore.p2_upload_batches b
+            LEFT JOIN auditcore.p2_file_moves moved
+              ON moved.tenant_id=b.tenant_id AND moved.source_batch_id=b.batch_id AND moved.status='DONE'
+            LEFT JOIN auditcore.journeys tj
+              ON tj.tenant_id=moved.tenant_id AND tj.journey_id=moved.target_journey_id
             WHERE b.tenant_id=:t AND b.journey_id=:j
             ORDER BY b.created_at_utc DESC, b.batch_id
             """
@@ -1495,7 +1501,10 @@ def files_view(connection: Connection, *, tenant_id: str, journey_id: UUID) -> d
                 "fileName": r["original_filename"],
                 "uploadedAtUtc": r["created_at_utc"],
                 "identity": _shown_identity(dict(r)),
-                "movedTo": None,
+                # Only for a file taken out of this booking, and only while
+                # the booking it went to is still there.
+                "movedTo": ({"journeyId": str(r["moved_to_journey_id"]), "reference": r["moved_to_reference"]}
+                            if r["taken_out"] and r["moved_to_reference"] else None),
             }
             for r in rows
         ],
