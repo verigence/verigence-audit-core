@@ -1,9 +1,10 @@
-"""AUDIT_TASK_CLEANUP (2026-11-01): the open check tasks that named no document."""
+"""AUDIT_TASK_CLEANUP (2026-11-01): the open check tasks that named no
+document, and the documents the old name check held out of their bookings."""
 from __future__ import annotations
 
 import pytest
 from conftest import delete_tenant_data
-from p2_support import create_p2_journey, database_engine
+from p2_support import add_ready_document, create_p2_journey, database_engine
 from sqlalchemy import text
 
 from audit_core.db import set_tenant_context
@@ -51,6 +52,16 @@ def _status(journey, task_id: str) -> str:
                 id=task_id).scalar_one()
 
 
+def _hold(journey, document_id) -> None:
+    _sql(journey, "UPDATE auditcore.evidence SET identity_check_status='HELD' WHERE tenant_id=:t AND di_document_id=:d",
+         d=document_id)
+
+
+def _hold_status(journey, document_id) -> str:
+    return _sql(journey, "SELECT identity_check_status FROM auditcore.evidence WHERE tenant_id=:t AND di_document_id=:d",
+                d=document_id).scalar_one()
+
+
 def test_the_job_is_registered(journey):
     target, args = _one_shot_target("AUDIT_TASK_CLEANUP", journey.engine, "t", [])
     assert target.__name__ == "run_audit_task_cleanup" and args[1] == "t" and journey.tenant_id in args[2]
@@ -89,3 +100,29 @@ def test_a_fallback_duplicate_task_has_its_checks_run_again(journey):
     clean_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t-commit", commit=True)
     [unit] = queued()
     assert unit["work_key"].endswith(":NATIVE:BOOKING") and unit["payload"]["force"] is True
+
+
+def test_a_held_receipt_is_released_and_its_booking_recomputed_only_on_commit(journey):
+    """ADI-RD-261026-036: Kalandi Rout's own receipt was held and its ₹11,000
+    never became a payment."""
+    add_ready_document(journey, "pan_card", pan_number="ASZPR9676E", pan_name="KXXXXXI RXXT")
+    receipt = add_ready_document(journey, "dealer_receipt", amount_paid="11000",
+                                 customer_name="KALANDI ROUT-ASZPR9676E", receipt_number="AMC-B/30001")
+    cover = add_ready_document(journey, "insurance_cover", insured_name="Priya Nair")
+    for document in (receipt, cover):
+        _hold(journey, document)
+
+    version = "SELECT fact_version FROM auditcore.p2_journey_runtime WHERE tenant_id=:t AND journey_id=:j"
+    before = _sql(journey, version).scalar_one_or_none()
+    dry = clean_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t", commit=False)
+    assert dry["heldJourneys"] == 1 and dry["heldBefore"] == 2 and dry["released"] == 1
+    assert dry["releasedByType"] == {"dealer_receipt": 1} and dry["stillHeld"] == 1
+    assert dry["unpaidReceipts"] == 1 and dry["unpaidAmount"] == "11000"
+    assert _hold_status(journey, receipt) == "HELD" and dry["recomputed"] == 0
+
+    done = clean_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t-commit", commit=True)
+    assert done["released"] == 1 and done["recomputed"] == 1
+    assert _hold_status(journey, receipt) == "PASSED" and _hold_status(journey, cover) == "HELD"
+    assert _sql(journey, version).scalar_one_or_none() != before
+    again = clean_tenant(journey.engine, tenant_id=journey.tenant_id, tag="t-commit", commit=True)
+    assert again["released"] == 0 and again["recomputed"] == 0 and again["stillHeld"] == 1

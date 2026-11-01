@@ -153,8 +153,14 @@ def _names_match(a: Any, b: Any) -> bool:
 def _named_documents(
     connection: Connection, *, tenant_id: str, journey_id: UUID
 ) -> list[dict[str, Any]]:
-    """One row per document that carries a mapped name field: its highest-
-    confidence, most-recent value. Reads durable storage only, never DI."""
+    """One row per document still on the booking (ACTIVE evidence) that
+    carries a mapped name field: its highest-confidence, most-recent value.
+    Reads durable storage only, never DI.
+
+    Only documents on the booking (2026-11-01): a copy replaced by a re-upload,
+    a page merged into its document, or another customer's file taken out of
+    the booking kept its read fields, and was checked -- or taken as the KYC
+    every other document was checked against."""
     mapping_values = ", ".join(
         f"(:doc_type_{i}, :field_key_{i})"
         for i in range(len(_NAME_FIELDS_BY_DOCUMENT_TYPE))
@@ -185,6 +191,10 @@ def _named_documents(
                  AND m.field_key = f.field_key
                 WHERE f.tenant_id = :tenant_id AND f.journey_id = :journey_id
                   AND f.effective_value IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM auditcore.evidence e
+                      WHERE e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+                        AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE')
             )
             SELECT di_document_id, evidence_id, stage_code, document_type_key, effective_value
             FROM ranked WHERE row_rank = 1
@@ -231,7 +241,8 @@ def _journey_dealer_name(
 def _receipt_dealer_names(
     connection: Connection, *, tenant_id: str, journey_id: UUID
 ) -> list[dict[str, Any]]:
-    """One row per receipt document with its latest dealer_name value."""
+    """One row per receipt document still on the booking (ACTIVE evidence)
+    with its latest dealer_name value."""
     rows = connection.execute(
         text(
             """
@@ -249,6 +260,10 @@ def _receipt_dealer_names(
                   AND f.source_document_type_key = ANY(:document_types)
                   AND f.field_key = :field_key
                   AND f.effective_value IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM auditcore.evidence e
+                      WHERE e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+                        AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE')
             )
             SELECT di_document_id, stage_code, document_type_key, effective_value
             FROM ranked WHERE row_rank = 1
@@ -262,6 +277,38 @@ def _receipt_dealer_names(
         },
     ).mappings().all()
     return [dict(row) for row in rows]
+
+
+# A receipt's customer_name is the payer's, often a relative, a company or the
+# financier: receipts are not checked for the customer's name and never held
+# for it (product owner 2026-10-28; p2_templates/document_templates.yaml,
+# extraction_rules.customer_name.checked). 346 receipts were held on 2026-11-01,
+# 79 of them with no payment recorded. Their dealer name is still checked below.
+def _is_receipt(document: dict[str, Any]) -> bool:
+    return str(document.get("document_type_key") or "") in _RECEIPT_DOCUMENT_TYPES
+
+
+def _apply_holds(connection: Connection, *, tenant_id: str, journey_id: UUID, held: set[str]) -> dict[str, int]:
+    """Hold exactly the documents ``held`` (DI document ids) of this Journey
+    that are on the booking, and release every other one this check holds. A
+    row a Team Lead REJECTED is never touched. Returns what changed."""
+    held_ids = sorted(held)
+    rows = connection.execute(
+        text(
+            """
+            UPDATE auditcore.evidence
+            SET identity_check_status = CASE WHEN di_document_id = ANY(CAST(:held AS uuid[])) THEN 'HELD'
+                                             ELSE 'PASSED' END
+            WHERE tenant_id = :tenant_id AND journey_id = :journey_id AND association_status = 'ACTIVE'
+              AND COALESCE(identity_check_status, 'PASSED') <> 'REJECTED'
+              AND (di_document_id = ANY(CAST(:held AS uuid[])))
+                  <> (COALESCE(identity_check_status, 'PASSED') = 'HELD')
+            RETURNING identity_check_status
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "held": held_ids},
+    ).scalars().all()
+    return {"held": sum(1 for r in rows if r == "HELD"), "released": sum(1 for r in rows if r == "PASSED")}
 
 
 def _set_identity_check_status(
@@ -557,27 +604,41 @@ def sync_customer_identity_consistency(
         live_rule_keys: set[str] = set()
 
         documents = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
-        reference = _reference_name(documents)
-        # Unlike the dealer-name check below (checked against a master
-        # record, always available), there is nothing to check customer
-        # names against until a KYC document exists -- skip only this half,
-        # not the whole producer, so the dealer-name check still runs.
-        if reference is not None:
-            reference_name, reference_document_id = reference
+        # Whose name each document is in is decided by the current name rule
+        # (2026-11-01; uc03_p2_task_producer.customer_name_check), the one the
+        # PC's "Customer name differs" task follows -- masked PANs, a GST
+        # certificate's proprietor, a firm's name, honorifics and the PAN a
+        # receipt prints after the name included. This check's own fuzzy match
+        # held 741 documents' values out of their bookings on 2026-11-01, about
+        # 650 of them documents that rule accepts.
+        from audit_core.uc03_p2_task_producer import customer_name_check
+
+        check = customer_name_check(connection, tenant_id=tenant_id, journey_id=journey_id)
+        held: set[str] = set()
+        if check is not None:
+            reference_name = str(check["kyc"]["name"])
+            reference_document_id = check["kyc"]["documentId"]
+            wrong = {str(d["documentId"]): d for d in check["mismatched"]}
             for document in documents:
                 document_id = document["di_document_id"]
-                if document_id == reference_document_id:
+                rule_key = f"{_RULE_PREFIX}:{document_id}"
+                if _is_receipt(document):
+                    if _cancel_if_open(
+                        connection,
+                        tenant_id=tenant_id,
+                        journey_id=journey_id,
+                        task_type=TASK_TYPE,
+                        rule_key=rule_key,
+                        reason="A receipt is not checked for the customer's name: the payer may be "
+                               "someone else.",
+                    ):
+                        resolved += 1
+                    continue
+                if str(document_id) == str(reference_document_id):
                     continue
                 document_name = str(document["effective_value"] or "").strip()
                 examined += 1
-                rule_key = f"{_RULE_PREFIX}:{document_id}"
-                if not document_name or _names_match(reference_name, document_name):
-                    _set_identity_check_status(
-                        connection,
-                        tenant_id=tenant_id,
-                        evidence_id=document.get("evidence_id"),
-                        status="PASSED",
-                    )
+                if str(document_id) not in wrong:
                     if _cancel_if_open(
                         connection,
                         tenant_id=tenant_id,
@@ -597,12 +658,7 @@ def sync_customer_identity_consistency(
                 # runs after this producer, so a freshly-flagged document's
                 # data is protected before it ever gets a chance to
                 # materialize wrongly, not just on some later pass.
-                _set_identity_check_status(
-                    connection,
-                    tenant_id=tenant_id,
-                    evidence_id=document.get("evidence_id"),
-                    status="HELD",
-                )
+                held.add(str(document["di_document_id"]))
                 _create_task_if_absent(
                     connection,
                     tenant_id=tenant_id,
@@ -615,7 +671,7 @@ def sync_customer_identity_consistency(
                         "diDocumentId": str(document_id),
                         "extractedName": document_name,
                         "kycName": reference_name,
-                        "kycDocumentId": str(reference_document_id),
+                        "kycDocumentId": str(reference_document_id) if reference_document_id else None,
                         "comment": (
                             f"This {document['document_type_key']} shows the name "
                             f"'{document_name}', which does not match the customer's "
@@ -627,22 +683,22 @@ def sync_customer_identity_consistency(
                     correlation_id=correlation_id,
                 )
         else:
-            # No KYC document has been extracted on this Journey yet, so
-            # there is nothing to check any other named document against --
-            # hold them all rather than trusting an unverifiable name. This
-            # doesn't raise its own task: the existing document-
-            # completeness rules (e.g. BK_PAN_PRESENT) already tell PC to
-            # upload KYC; once one is extracted, the very next sync
-            # re-evaluates every held document through the branch above.
+            # No KYC names the customer on this Journey yet, so there is
+            # nothing to check any other named document against -- hold them
+            # all rather than trusting an unverifiable name. This doesn't raise
+            # its own task: the existing document-completeness rules (e.g.
+            # BK_PAN_PRESENT) already tell PC to upload KYC; once one is read,
+            # the very next sync re-evaluates every held document through the
+            # branch above. A receipt is not held: its payer's name is not the
+            # customer's to match (product owner 2026-10-28).
             for document in documents:
-                if document["document_type_key"] in _KYC_DOCUMENT_TYPES:
+                if document["document_type_key"] in _KYC_DOCUMENT_TYPES or _is_receipt(document):
                     continue
-                _set_identity_check_status(
-                    connection,
-                    tenant_id=tenant_id,
-                    evidence_id=document.get("evidence_id"),
-                    status="HELD",
-                )
+                held.add(str(document["di_document_id"]))
+        # Every other document on the booking is released: what was held by an
+        # earlier, cruder decision -- or for a name it no longer carries --
+        # does not stay held (2026-11-01).
+        _apply_holds(connection, tenant_id=tenant_id, journey_id=journey_id, held=held)
 
         dealer_name = _journey_dealer_name(connection, tenant_id=tenant_id, journey_id=journey_id)
         if dealer_name:

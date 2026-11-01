@@ -101,7 +101,17 @@ def journey():
 def _set_named_field(
     c, *, stage_code, document_type_key, field_key, value, confidence=0.95, document_id=None
 ):
-    document_id = document_id or uuid4()
+    """A read field of a document on the booking: the check reads only
+    documents with ACTIVE evidence (2026-11-01). A second field of the same
+    document (``document_id``) shares its evidence."""
+    if document_id is None:
+        document_id = uuid4()
+        evidence_id, _ = _link_evidence(c, di_document_id=document_id, document_type_key=document_type_key)
+    else:
+        evidence_id = c.execute(
+            text("SELECT evidence_id FROM auditcore.evidence WHERE tenant_id=:t AND di_document_id=:d LIMIT 1"),
+            {"t": c.tenant_id, "d": document_id},
+        ).scalar_one()
     c.execute(
         text(
             """
@@ -111,14 +121,14 @@ def _set_named_field(
                 source_document_type_key, source_canonical_field_id, field_key,
                 extracted_value, effective_value, confidence_score, is_modified
             ) VALUES (
-                :t, :j, NULL, :doc,
+                :t, :j, :ev, :doc,
                 NULL, 1, :stage,
                 :dtk, NULL, :fk,
                 CAST(:v AS jsonb), CAST(:v AS jsonb), :conf, false
             )
             """
         ),
-        {"t": c.tenant_id, "j": c.journey_id, "doc": document_id, "stage": stage_code,
+        {"t": c.tenant_id, "j": c.journey_id, "ev": evidence_id, "doc": document_id, "stage": stage_code,
          "dtk": document_type_key, "fk": field_key, "v": json.dumps(value), "conf": confidence},
     )
     return document_id
@@ -321,10 +331,12 @@ def test_matching_dealer_name_raises_nothing(journey) -> None:
     assert _open_wrong_document_tasks(c) == []
 
 
-def test_dealer_check_and_customer_check_track_independently_on_one_document(journey) -> None:
-    # A single receipt document can fail both checks (wrong customer AND
-    # wrong dealer) -- each must raise and resolve on its own rule_key,
-    # never clobbering the other.
+def test_a_receipt_is_checked_for_its_dealer_but_never_for_the_customers_name(journey) -> None:
+    """Product owner 2026-10-28: a receipt's payer is often a relative, a
+    company or the financier, which the third-party payment question covers;
+    receipts are not checked for the customer's name, and (2026-11-01) never
+    held for it -- 346 were, 79 with no payment recorded. The dealer-name
+    check on the same receipt still runs, raises and resolves on its own key."""
     c = journey
     _set_named_field(
         c, stage_code="BOOKING", document_type_key="aadhaar",
@@ -344,15 +356,17 @@ def test_dealer_check_and_customer_check_track_independently_on_one_document(jou
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
 
-    assert result["raised"] == 2
-    rule_keys = {t["task_payload"]["ruleKey"] for t in _open_wrong_document_tasks(c)}
-    assert rule_keys == {
-        f"WRONG_DOCUMENT:{receipt_doc}",
+    assert result["raised"] == 1
+    assert {t["task_payload"]["ruleKey"] for t in _open_wrong_document_tasks(c)} == {
         f"WRONG_DOCUMENT:DEALER:{receipt_doc}",
     }
+    status = c.execute(
+        text("SELECT identity_check_status FROM auditcore.evidence WHERE tenant_id=:t AND di_document_id=:d"),
+        {"t": c.tenant_id, "d": receipt_doc},
+    ).scalar_one()
+    assert status == "PASSED"
 
-    # Correcting only the dealer name cancels that one task and leaves
-    # the customer-name mismatch's task open.
+    # Correcting the dealer name cancels that task.
     c.execute(
         text("UPDATE auditcore.journey_document_extracted_fields "
              "SET effective_value = CAST(:v AS jsonb) "
@@ -362,9 +376,8 @@ def test_dealer_check_and_customer_check_track_independently_on_one_document(jou
     result2 = cic.sync_customer_identity_consistency(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert result2["resolved"] == 1
-    remaining = {t["task_payload"]["ruleKey"] for t in _open_wrong_document_tasks(c)}
-    assert remaining == {f"WRONG_DOCUMENT:{receipt_doc}"}
+    assert result2["resolved"] == 1 and result2["raised"] == 0
+    assert _open_wrong_document_tasks(c) == []
 
 
 def test_non_receipt_document_types_are_not_dealer_checked(journey) -> None:
@@ -701,3 +714,80 @@ def test_legacy_wrong_document_finding_still_resolves_after_the_task_queue_move(
         {"t": c.tenant_id, "j": c.journey_id},
     ).scalar_one()
     assert status == "RESOLVED"
+
+
+# ── the hold follows the current name rule (2026-11-01) ─────────────────────
+def _status(c, document_id) -> str:
+    return c.execute(
+        text("SELECT identity_check_status FROM auditcore.evidence WHERE tenant_id=:t AND di_document_id=:d"),
+        {"t": c.tenant_id, "d": document_id},
+    ).scalar_one()
+
+
+def _hold(c, document_id) -> None:
+    c.execute(text("UPDATE auditcore.evidence SET identity_check_status='HELD' WHERE tenant_id=:t AND di_document_id=:d"),
+              {"t": c.tenant_id, "d": document_id})
+
+
+def _sync(c) -> dict:
+    return cic.sync_customer_identity_consistency(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+
+def test_a_receipt_held_before_is_released_with_or_without_kyc(journey) -> None:
+    """ADI-RD-261026-036: Kalandi Rout's own receipt ("KALANDI ROUT-ASZPR9676E")
+    was held against his masked PAN and its ₹11,000 never became a payment."""
+    c = journey
+    receipt = _set_named_field(c, stage_code="BOOKING", document_type_key="dealer_receipt",
+                               field_key="customer_name", value="ODISHA GRAMEEN BANK (FINANCER )")
+    _hold(c, receipt)
+    _sync(c)  # no KYC yet
+    assert _status(c, receipt) == "PASSED"
+    _set_named_field(c, stage_code="BOOKING", document_type_key="pan_card",
+                     field_key="pan_name", value="KXXXXXI RXXT")
+    _hold(c, receipt)
+    _sync(c)
+    assert _status(c, receipt) == "PASSED"
+
+
+def test_a_document_the_name_rule_accepts_is_not_held(journey) -> None:
+    """A masked PAN names the customer and the booking form's full name fits
+    its letters: the current rule accepts it; this check's fuzzy match held it."""
+    c = journey
+    _set_named_field(c, stage_code="BOOKING", document_type_key="pan_card",
+                     field_key="pan_name", value="SXXXXXXA SXXXO")
+    form = _set_named_field(c, stage_code="BOOKING", document_type_key="booking_form",
+                            field_key="customer_name", value="Mr. Sushanta Sahoo")
+    _hold(c, form)
+    result = _sync(c)
+    assert result["raised"] == 0 and _status(c, form) == "PASSED"
+    assert _open_wrong_document_tasks(c, cic.TASK_TYPE) == []
+
+
+def test_a_document_no_longer_on_the_booking_is_never_the_kyc(journey) -> None:
+    """UTK-SA-261019-005 shape: another customer's Aadhaar, taken out of the
+    booking, was the KYC every other document was checked against."""
+    c = journey
+    foreign = _set_named_field(c, stage_code="BOOKING", document_type_key="aadhaar",
+                               field_key="aadhaar_name", value="Rakesh Kumar Pattanayak")
+    c.execute(text("UPDATE auditcore.evidence SET association_status='FOREIGN' WHERE tenant_id=:t AND di_document_id=:d"),
+              {"t": c.tenant_id, "d": foreign})
+    _set_named_field(c, stage_code="BOOKING", document_type_key="pan_card",
+                     field_key="pan_name", value="Suryakanta Parida")
+    form = _set_named_field(c, stage_code="BOOKING", document_type_key="booking_form",
+                            field_key="customer_name", value="Suryakanta Parida")
+    result = _sync(c)
+    assert result["raised"] == 0 and result["referenceName"] == "Suryakanta Parida"
+    assert _status(c, form) == "PASSED"
+
+
+def test_another_customers_document_is_still_held_and_released_once_corrected(journey) -> None:
+    c = journey
+    _set_named_field(c, stage_code="BOOKING", document_type_key="aadhaar",
+                     field_key="aadhaar_name", value="Sanjaya Kumar Mohanty")
+    cover = _set_named_field(c, stage_code="DELIVERY", document_type_key="insurance_cover",
+                             field_key="insured_name", value="Priya Nair")
+    assert _sync(c)["raised"] == 1 and _status(c, cover) == "HELD"
+    c.execute(text("UPDATE auditcore.journey_document_extracted_fields SET effective_value=CAST(:v AS jsonb) "
+                   "WHERE tenant_id=:t AND di_document_id=:d"),
+              {"v": json.dumps("Sanjaya Kumar Mohanty"), "t": c.tenant_id, "d": cover})
+    assert _sync(c)["raised"] == 0 and _status(c, cover) == "PASSED"
