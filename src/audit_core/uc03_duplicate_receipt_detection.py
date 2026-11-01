@@ -143,16 +143,18 @@ class DuplicateGroup:
 
 
 def _receipt_documents(
-    connection: Connection, *, tenant_id: str, journey_id: UUID
+    connection: Connection, *, tenant_id: str, journey_id: UUID, on_booking_only: bool = False,
 ) -> list[ReceiptRecord]:
-    """One row per receipt document still on the booking (ACTIVE evidence) with
-    its latest receipt_number/amount_paid/receipt_date, read from durable
-    storage only (never DI directly).
+    """One row per receipt document with its latest receipt_number/amount_paid/
+    receipt_date, read from durable storage only (never DI directly).
 
-    Only documents on the booking (2026-11-01): a copy replaced by a re-upload,
-    a page merged into its document, or another customer's file taken out of
-    the booking kept its read fields, and was paired with the copy that
-    replaced it as "the same receipt uploaded twice" (UTK-SU-261020-002)."""
+    ``on_booking_only``: only receipts still on the booking (ACTIVE evidence),
+    as the duplicate check reads them (2026-11-01): a copy replaced by a
+    re-upload, a page merged into its document, or another customer's file
+    taken out of the booking kept its read fields, and was paired with the
+    copy that replaced it as "the same receipt uploaded twice"
+    (UTK-SU-261020-002). The upload screen's running total
+    (uc03_unified_document_capture) reads them as before."""
     rows = connection.execute(
         text(
             """
@@ -170,10 +172,10 @@ def _receipt_documents(
                   AND f.source_document_type_key = ANY(:document_types)
                   AND f.field_key = ANY(:field_keys)
                   AND f.effective_value IS NOT NULL
-                  AND EXISTS (
+                  AND (NOT :on_booking_only OR EXISTS (
                       SELECT 1 FROM auditcore.evidence e
                       WHERE e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
-                        AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE')
+                        AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'))
             )
             SELECT di_document_id, stage_code, document_type_key, field_key, effective_value
             FROM ranked WHERE row_rank = 1
@@ -184,6 +186,7 @@ def _receipt_documents(
             "journey_id": journey_id,
             "document_types": list(_RECEIPT_DOCUMENT_TYPES),
             "field_keys": list(_FIELD_KEYS),
+            "on_booking_only": on_booking_only,
         },
     ).mappings().all()
 
@@ -427,7 +430,8 @@ def sync_duplicate_receipt_detection(
     once; cancel the task once a correction breaks the match. Idempotent,
     self-heals, never raises."""
     try:
-        documents = _receipt_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+        documents = _receipt_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                       on_booking_only=True)
         groups = compute_duplicate_groups(documents)
 
         # raised counts every currently-outstanding group, not just ones
