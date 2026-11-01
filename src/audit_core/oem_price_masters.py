@@ -2135,9 +2135,15 @@ _PRICE_COMPONENT_PREVIEW_LABELS: dict[str, str] = {
 # How the dealer's grid spells models (2026-10-20). They name the price list's
 # own models; "MAXX" is "MAXX City" (the October grid spells the same row
 # "PICKUP, MAXX City, MAXX HD"); "MAXX HD 2.0" is the 2.0 L variants of MAXX
-# HD (a variant group). "SCORPIO N Old / New" is not mapped: which variants
-# are "old" is not written anywhere, so those rows stay unresolved.
+# HD (a variant group). The September grid's "SCORPIO N Old" / "SCORPIO N
+# New" are the two models the September book sells (2026-11-01): "SCORPIO N"
+# -- the series the October list no longer prints, the OLD Scorpio N of the
+# model identity above -- and "NEW SCORPIO N" (the "New SCORPIO N" sheets,
+# which October prints as SCORPIO-N). Until then the two lines had no model
+# and a September New Scorpio N deal had no grid line.
 _GRID_MODEL_ALIASES: dict[str, str] = {
+    "SCORPIO N OLD": "SCORPIO N",
+    "SCORPIO N NEW": "NEW SCORPIO N",
     "3XO": "XUV3XO",
     "7XO": "XUV 7XO",
     "9E": "XEV 9E",

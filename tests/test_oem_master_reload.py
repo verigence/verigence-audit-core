@@ -147,3 +147,102 @@ def test_the_real_october_grid_binds_scorpio_n_to_the_model_the_october_book_pri
     finally:
         transaction.rollback()
         connection.close()
+
+
+def _with_mahindra_aliases(engine, tenant_id) -> None:
+    with engine.begin() as conn:
+        oem_code = conn.execute(text("SELECT o.oem_code FROM auditcore.projects p JOIN auditcore.oems o "
+                                     "ON o.oem_id = p.oem_id WHERE p.tenant_id = :t"), {"t": tenant_id}).scalar_one()
+        conn.execute(text("INSERT INTO auditcore.oem_model_aliases (oem_code, alias_text, canonical_model_name) "
+                          "SELECT :o, alias_text, canonical_model_name FROM auditcore.oem_model_aliases "
+                          "WHERE oem_code = 'MAHINDRA' ON CONFLICT DO NOTHING"), {"o": oem_code})
+
+
+def test_the_two_grids_load_alone_with_both_scorpio_n_lines_bound(tenant) -> None:
+    """2026-11-01: a "-grids" tag loads the September grid (the "Aug 2026"
+    file, effective 1 Sep) and the October grid (1 Oct) and nothing else.
+    Every line names a model -- the September "SCORPIO N Old" / "SCORPIO N
+    New" are the book's SCORPIO N and NEW SCORPIO N -- and each model gets
+    the line the file prints for it on each month."""
+    from audit_core.oem_price_masters import grid_row_for_model
+
+    engine, tenant_id = tenant
+    _with_mahindra_aliases(engine, tenant_id)
+    tag = f"test-{uuid4().hex[:6]}"
+    assert run_master_reload(engine, f"{tag}-commit", tenant_ids=[tenant_id])[0]["status"] == "COMMITTED"
+
+    (dry,) = run_master_reload(engine, f"{tag}-grids", tenant_ids=[tenant_id])
+    assert dry["status"] == "DRY_RUN_PASSED", [c for c in dry.get("checks", []) if not c["ok"]] or dry.get("error")
+    assert [(u["file"], u["effectiveFrom"]) for u in dry["uploads"]] == [
+        ("Odisha PV & CV Discount Grid-1 Oct 2026.xlsx", date(2026, 10, 1)),
+        ("Odisha PV & CV Discount Grid-1 Aug 2026.xlsx", date(2026, 9, 1))]
+    september = {r["model"]: r for r in dry["gridByModel"]["2026-09-15"]}
+    october = {r["model"]: r for r in dry["gridByModel"]["2026-10-15"]}
+    assert september["NEW SCORPIO N"]["line"] == "SCORPIO N New" and september["NEW SCORPIO N"]["inScope"]
+    assert september["SCORPIO N"]["line"] == "SCORPIO N Old" and not september["SCORPIO N"]["inScope"]
+    assert october["NEW SCORPIO N"]["line"] == "SCORPIO-N"
+    assert october["NEW SCORPIO N"]["tiers"] == {"BASE": "0.00", "WITH_INSURANCE": "0.00", "WITH_EW_INSURANCE": "5000.00"}
+    assert september["XUV400"]["line"] == "XUV400 EV" and october["XUV400"]["line"] is None  # not in October's grid
+
+    (done,) = run_master_reload(engine, f"{tag}-grids-commit", tenant_ids=[tenant_id])
+    assert done["status"] == "COMMITTED", [c for c in done.get("checks", []) if not c["ok"]] or done.get("error")
+    with engine.begin() as conn:
+        conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        starts = conn.execute(text("SELECT effective_from FROM auditcore.dealer_discount_grid_versions "
+                                   "WHERE tenant_id = :t ORDER BY effective_from"), {"t": tenant_id}).scalars().all()
+        schemes = conn.execute(text("SELECT count(*) FROM auditcore.discount_scheme_versions WHERE tenant_id = :t"),
+                               {"t": tenant_id}).scalar_one()
+        model_id = conn.execute(text(
+            "SELECT model_id FROM auditcore.product_models pm JOIN auditcore.projects p ON p.oem_id = pm.oem_id "
+            "WHERE p.tenant_id = :t AND pm.model_name = 'NEW SCORPIO N'"), {"t": tenant_id}).scalar_one()
+        line = grid_row_for_model(conn, tenant_id=tenant_id, model_id=model_id, effective_on=date(2026, 9, 20))
+    assert starts == [date(2026, 9, 1), date(2026, 10, 1)]
+    assert schemes == 0  # the bulletins are not touched
+    assert line["model_alias"] == "SCORPIO N New" and line["in_scope"]
+
+
+def test_october_gets_septembers_price_for_the_variants_it_no_longer_lists(tenant, monkeypatch) -> None:
+    """2026-11-01, product owner: "the model which are not available in Oct,
+    for them pls get the price of September". The 3 Oct book is published
+    again with every October row unchanged plus September's rows for the
+    SKUs October does not print -- of the models October still prices. The
+    old Scorpio N series is not brought back: its words would name it again
+    on an October invoice instead of the new Scorpio N."""
+    from audit_core.oem_master_reload import complete_october_tenant
+    from audit_core.oem_price_masters import find_book_sku
+
+    engine, tenant_id = tenant
+    _with_mahindra_aliases(engine, tenant_id)
+    tag = f"test-{uuid4().hex[:6]}"
+    assert run_master_reload(engine, f"{tag}-commit", tenant_ids=[tenant_id])[0]["status"] == "COMMITTED"
+    # The five re-load files only (no live 19 Sep Veero LNT sheet): BE 6 One x2,
+    # BE 6 SPORTEQ THREE x2 and Veero 1.5XXL CBC V2 are September-only here.
+    monkeypatch.setattr(oem_master_reload, "OCTOBER_EXPECTED_CARRIED", 5)
+
+    (dry,) = run_master_reload(engine, f"{tag}-octcarry", tenant_ids=[tenant_id])
+    assert dry["status"] == "DRY_RUN_PASSED", [c for c in dry.get("checks", []) if not c["ok"]] or dry.get("error")
+    assert sorted(r["variant"] for r in dry["carried"]) == [
+        "1.5XXL CBC V2", "BE 6 One B59 R18 C11", "BE 6 One B59 R18 NCH",
+        "BE 6 SPORTEQ THREE B79 R19 C11", "BE 6 SPORTEQ THREE B79 R19 NCH"]
+    assert dry["notCarried"] and {r["model"] for r in dry["notCarried"]} == {"SCORPIO N"}
+    assert _versions(engine, tenant_id) == 5  # a dry run leaves nothing
+
+    (done,) = run_master_reload(engine, f"{tag}-octcarry-commit", tenant_ids=[tenant_id])
+    assert done["status"] == "COMMITTED", [c for c in done.get("checks", []) if not c["ok"]] or done.get("error")
+    assert _versions(engine, tenant_id) == 6
+    with engine.begin() as conn:
+        conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        veero = find_book_sku(conn, tenant_id=tenant_id, model_text="VEERO", variant_text="1.5XXL CBC V2",
+                              effective_on=date(2026, 10, 20))
+        scorpio = find_book_sku(conn, tenant_id=tenant_id, model_text="SCORPIO N",
+                                variant_text="Z8 S D AT 2WD 7 STR BS6.2 - N", effective_on=date(2026, 10, 20))
+        marked = conn.execute(text(
+            "SELECT count(*) FROM auditcore.price_list_items WHERE tenant_id = :t AND price_list_version_id = :v "
+            "AND metadata ? 'carriedForwardFrom'"), {"t": tenant_id, "v": done["newVersionId"]}).scalar_one()
+    assert veero["sku"] and veero["sku"]["model_name"] == "VEERO"
+    assert scorpio["sku"]["model_name"] == "NEW SCORPIO N"  # October's new Scorpio N, at October's price
+    assert marked > 0
+    # Nothing left to carry: a second run publishes nothing.
+    with engine.connect() as connection, connection.begin():
+        again = complete_october_tenant(connection, tenant_id=tenant_id, tag=f"{tag}-octcarry-again", store=False)
+    assert again["passed"] and again["carried"] == []
