@@ -48,6 +48,23 @@ COST_SHEET_DIFFERENCE_TASK = "COST_SHEET_NDC_DIFFERENCE"
 # Copies of the NDC or cost sheet that differ: information too (2026-11-02).
 COPIES_DIFFERENCE_TASK = "NDC_COPIES_DIFFERENCE"
 CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK, COST_SHEET_DIFFERENCE_TASK, COPIES_DIFFERENCE_TASK})
+# "Upload the ..." tasks (a conditional document, or the booking docket) close
+# by hand too (product owner 2026-11-02): a single page uploaded for them is
+# often refused for scan quality and never read, so the machine check cannot
+# close them. The PC closes them as the image-quality task: "Document
+# uploaded" or "Document not required to be uploaded", with the comment. Not
+# the wrong customer / dealer name tasks, which share the task type. Accepted
+# whatever the row's stored allowed_actions say, so open rows need no backfill;
+# the producer does not reopen them (raise_or_refresh keeps acceptedIssueHash).
+MISSING_DOCUMENT_TASK = "DOCUMENT_MISSING"
+MISSING_DOCUMENT_CLOSE_CODES = frozenset({"DOCUMENT_MISSING", "BOOKING_FORM_MISSING"})
+
+
+def closes_by_hand(task: dict[str, Any]) -> bool:
+    """A task the PC closes by hand with a comment (CLOSE_TASK)."""
+    if task.get("task_type") in CLOSE_TASK_TYPES:
+        return True
+    return task.get("task_type") == MISSING_DOCUMENT_TASK and task.get("source_code") in MISSING_DOCUMENT_CLOSE_CODES
 
 
 class TaskStateError(ValueError):
@@ -214,7 +231,7 @@ def _task(connection: Connection, *, tenant_id: str, task_id: UUID) -> dict[str,
 
 def _close_quality_task(
     connection: Connection, *, tenant_id: str, task: dict[str, Any], actor_id: str, actor_role_code: str,
-    reason: str,
+    reason: str, choice: str | None = None,
 ) -> None:
     """The PC closes the image-quality task by hand. The task event (written by
     ``submit_action``) carries the comment, who and when; the result repeats
@@ -227,6 +244,9 @@ def _close_quality_task(
         "closedBy": actor_id, "closedRole": actor_role_code, "closedAt": datetime.now(UTC).isoformat(),
         "reason": reason,
     }
+    if choice:
+        # The button the PC chose ("Document uploaded" / "Document not required to be uploaded").
+        result["choice"] = choice
     connection.execute(
         text(
             """
@@ -402,6 +422,8 @@ def submit_action(
 ) -> dict[str, Any]:
     task = _task(connection, tenant_id=tenant_id, task_id=task_id)
     allowed = list(task["allowed_actions"] or [])
+    if action == CLOSE_TASK and task["task_type"] == MISSING_DOCUMENT_TASK and closes_by_hand(task):
+        allowed.append(CLOSE_TASK)
     if action not in allowed:
         raise ValueError(f"Action {action} is not allowed for this task")
     status = str(task["task_status"])
@@ -433,8 +455,9 @@ def submit_action(
         )
 
     if action == CLOSE_TASK:
-        if task["task_type"] not in CLOSE_TASK_TYPES:
-            raise ValueError(f"Action {action} is only for the image-quality, large-upload, cost-sheet and copies tasks")
+        if not closes_by_hand(task):
+            raise ValueError(f"Action {action} is only for the image-quality, large-upload, cost-sheet, copies "
+                             "and missing-document tasks")
         # Checked here, on the server, before anything is written: the web
         # page asks for the comment too, but is not what enforces it.
         comment = (comment or "").strip()
@@ -458,6 +481,7 @@ def submit_action(
         _close_quality_task(
             connection, tenant_id=tenant_id, task=task, actor_id=actor_id,
             actor_role_code=actor_role_code, reason=str(comment),
+            choice=str((details or {}).get("choice") or "") or None,
         )
         return {"taskId": str(task_id), "status": "VERIFIED_COMPLETE", "outcome": "CLOSED_BY_PC"}
 
