@@ -200,3 +200,21 @@ def test_the_premium_counts_only_when_confirmed_in_house(journey) -> None:
     view = _deal(journey)
     assert view["insurance"]["inDeal"] is True
     assert D(view["summary"]["net"]["current"]) == D(1066643)
+
+
+def test_an_invoice_discount_the_ndc_does_not_show_is_a_check_not_an_addition(journey) -> None:
+    """The NDC gives the deal's benefits (5,000 here); the invoice prints a
+    discount of another amount: one discount split differently, not a second
+    one. It is flagged, never added beside the NDC's."""
+    _statement(journey, UTKAL)
+    before = _deal(journey)
+    invoice = {**OEM_DISCOUNT_INVOICE, "taxable_amount": "716102.54", "cgst_amount": "64449.23",
+               "sgst_amount": "64449.23", "grand_total_amount": "845001.00",
+               "line_items": [OEM_DISCOUNT_INVOICE["line_items"][0],
+                              {"line_category": "DISCOUNT_LINE", "description_raw": "OEM Discount",
+                               "taxable_amount": 5931.36}]}
+    add_ready_document(journey, "customer_invoice_dms", process_area="DELIVERY", **invoice)
+    view = _deal(journey)
+    oem = _benefit(view, "CASH_DISCOUNT")
+    assert oem["current"] is None and "INVOICES_DISAGREE" in oem["flags"]
+    assert D(view["summary"]["discounts"]["current"]) == D(before["summary"]["discounts"]["current"])

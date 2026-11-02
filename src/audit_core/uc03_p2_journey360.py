@@ -1104,25 +1104,39 @@ def _near(value: Any, amount: Decimal, tolerance: Decimal) -> bool:
 
 def _one_benefit_per_figure(discount_rows: list[dict[str, Any]]) -> None:
     """One benefit printed by two billing documents counts once (product owner
-    2026-11-02). An invoice's discount of the same amount (within ₹10) as a
-    benefit the dealer's statement gives is that benefit: the statement's
-    stands (it names the benefit, the invoice prints "OEM Discount"), the
-    invoice's checks it and leaves the totals."""
-    given_by_statement = [r for r in discount_rows if r["current"] is not None and any(
-        _norm_type(s.get("documentType")) in _DEALER_BOOKS_NORM and _near(s.get("amount"), Decimal(r["current"]),
-                                                                       _SAME_BENEFIT_TOLERANCE)
-        for s in r["sources"])]
+    2026-11-02).
+
+    * An invoice's discount of the same amount (within ₹10) as a benefit the
+      dealer's books give is that benefit: the books' stands (they name it,
+      the invoice prints "OEM Discount"), the invoice's checks it and leaves
+      the totals (``sameAs``).
+    * When the dealer's statement (NDC, cost sheet, settlement) gives the
+      deal's benefits, it is the deal sheet: an invoice discount it does not
+      show stays out of the totals and is flagged as a disagreement -- never
+      added beside the statement's own (one discount split differently on
+      the two documents would otherwise count twice).
+    * With no benefit on the statement, the invoice's discounts are the
+      deal's (live 2026-11-02: the Tally invoice's "OEM Discount" of Rs 30,000
+      on Biswadeep Jena, the NDC filed as a booking docket)."""
+    def from_books(row: dict[str, Any], norm: frozenset[str]) -> bool:
+        return row["current"] is not None and any(
+            _norm_type(s.get("documentType")) in norm and _near(s.get("amount"), Decimal(row["current"]),
+                                                                _SAME_BENEFIT_TOLERANCE)
+            for s in row["sources"])
+
+    given_by_books = [r for r in discount_rows if from_books(r, _DEALER_BOOKS_NORM)]
+    statement_gives = any(from_books(r, _STATEMENT_NORM) for r in discount_rows)
     for row in discount_rows:
-        if row["currentSource"] != "invoice" or row["current"] is None or row in given_by_statement:
+        if row["currentSource"] != "invoice" or row["current"] is None or row in given_by_books:
             continue
         amount = Decimal(row["current"])
-        same = next((r for r in given_by_statement if _near(r["current"], amount, _SAME_BENEFIT_TOLERANCE)), None)
-        if same is None:
-            continue
-        same["sources"] = [*same["sources"], *[{**e, "checks": True} for e in row["sources"]]]
-        row["current"], row["currentSource"], row["variance"] = None, None, None
-        row["sameAs"] = {"key": same["key"], "label": same["label"]}
-        row["flags"] = [f for f in row["flags"] if f not in _STANDARD_FLAGS]
+        same = next((r for r in given_by_books if _near(r["current"], amount, _SAME_BENEFIT_TOLERANCE)), None)
+        if same is not None:
+            same["sources"] = [*same["sources"], *[{**e, "checks": True} for e in row["sources"]]]
+            _take_back(row, same_as=same)
+        elif statement_gives:
+            row["current"], row["currentSource"], row["variance"] = None, None, None
+            row["flags"] = [*(f for f in row["flags"] if f not in _STANDARD_FLAGS), "INVOICES_DISAGREE"]
 
 
 def _benefit_row_for(discount_rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
