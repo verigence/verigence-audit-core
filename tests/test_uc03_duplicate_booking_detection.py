@@ -886,6 +886,8 @@ def test_different_bookings_needs_differing_numbers_and_nothing_shared() -> None
                                       {**empty, "R": {"BRMM262709541"}, "M": {"XUV700"}})
     # ... and the same model with nothing to compare stays
     assert not dbd.different_bookings({**empty, "M": {"XEV9S"}}, {**empty, "M": {"XEV9S"}})
+    # ... and for a relative's name or a surname match (not the same customer) the model never decides
+    assert not dbd.different_bookings({**empty, "M": {"XEV9S"}}, {**empty, "M": {"XUV700"}}, by_model=False)
 
 
 def test_the_same_customers_other_booking_is_not_a_duplicate(two_journeys) -> None:

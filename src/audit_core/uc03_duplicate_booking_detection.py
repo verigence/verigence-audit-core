@@ -712,7 +712,14 @@ def _booking_numbers(connection: Connection, *, tenant_id: str, journey_id: UUID
     return out
 
 
-def different_bookings(left: dict[str, set[str]], right: dict[str, set[str]]) -> bool:
+# The bases that name the same customer (the high-probability levels): only
+# for these does a different model make two separate bookings. A relative's
+# name or a shared surname and pincode stays for the Team Lead (product
+# owner, 2026-11-02: "Keep, TL closes them").
+_SAME_CUSTOMER_BASES = frozenset({"PAN", "AADHAAR", "GST", "MOBILE"})
+
+
+def different_bookings(left: dict[str, set[str]], right: dict[str, set[str]], *, by_model: bool = True) -> bool:
     """Whether two bookings' own numbers show they are different bookings: no
     booking number, receipt or chassis in common, and different booking
     numbers or different vehicles on both -- a different chassis, or (product
@@ -725,7 +732,7 @@ def different_bookings(left: dict[str, set[str]], right: dict[str, set[str]]) ->
         return False
     if (left["B"] and right["B"]) or (left["C"] and right["C"]):
         return True
-    return bool(left.get("M") and right.get("M") and not left["M"] & right["M"])
+    return by_model and bool(left.get("M") and right.get("M") and not left["M"] & right["M"])
 
 
 def _withdrawn(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
@@ -982,7 +989,8 @@ def sync_duplicate_booking_detection(
             if own_numbers is None:
                 own_numbers = _booking_numbers(connection, tenant_id=tenant_id, journey_id=journey_id)
             if different_bookings(own_numbers, _booking_numbers(
-                    connection, tenant_id=tenant_id, journey_id=candidate["journey_id"])):
+                    connection, tenant_id=tenant_id, journey_id=candidate["journey_id"]),
+                    by_model=basis in _SAME_CUSTOMER_BASES):
                 continue  # the same customer's other booking; any open finding resolves below
 
             this_confirm_date = _booking_confirm_date(
