@@ -83,7 +83,7 @@ _PROOF_OF_PRODUCT: dict[str, tuple[str, ...]] = {
 # comes first, so the insurance and RTO checks set the policy and the challan
 # against the statement, never against themselves (2026-11-02).
 _BILLED_ORDER = ("account_statement", "erp_settlement", "cost_sheet_in_place_of_ndc",
-                 "customer_ledger", "cost_sheet", "customer_invoice_dms", "tax_invoice_tally", "tax_invoice_dms",
+                 "customer_ledger", "cost_sheet", "customer_ledger_tally", "customer_invoice_dms", "tax_invoice_tally", "tax_invoice_dms",
                  "tax_invoice", "customer_invoice_dms_v2", "invoice_generic", "accessory_invoice_dms",
                  "accessory_invoice_tally", "ew_invoice", "rsa_invoice", "insurance_cover", "rto_challan",
                  "credit_note", "debit_note")

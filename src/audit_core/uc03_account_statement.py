@@ -547,6 +547,61 @@ def tally_postings(lines: list[dict[str, Any]]) -> dict[str, Decimal]:
     return out
 
 
+# The customer ledger's own charge and benefit postings (product owner
+# 2026-11-02: any line item read on a billing document counts; the customer
+# ledger is one). Its vehicle sale is one net figure (ex-showroom with TCS,
+# less what was given off the vehicle) and is only set against the NDC
+# (tally_deviations), never split into lines.
+TALLY_LEDGER_TYPE = "customer_ledger_tally"
+_TALLY_CHARGES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r".*(INS POLICY|INSURANCE|\(INS\b).*"), "insurance_amount"),
+    (re.compile(r".*\bRTO\b.*"), "road_tax_registration"),
+    (re.compile(r".*ACCESSOR.*"), "accessories_cost"),
+    (re.compile(r".*\bFAST ?TAG\b.*"), "fastag_amount"),
+    (re.compile(r".*(EXTENDED WARRANTY|EXT\.? ?WARRANTY|SHIELD).*"), "extended_warranty_amount"),
+    (re.compile(r".*(\bRSA\b|ROAD ?SIDE).*"), "rsa_amount"),
+)
+_TALLY_BENEFIT_VOUCHER = re.compile(r".*CREDIT ?NOTE.*")
+
+
+@dataclass
+class TallyLines:
+    components: dict[str, Decimal] = field(default_factory=dict)
+    discounts: dict[str, Decimal] = field(default_factory=dict)
+    # credit-note voucher number -> the benefit its row names
+    credit_notes: dict[str, str] = field(default_factory=dict)
+
+
+def read_tally_lines(lines: list[dict[str, Any]]) -> TallyLines:
+    """The charges the customer ledger debits (insurance, RTO, accessories,
+    FASTag, warranty, RSA) and the benefits its credit notes give, each
+    summed per line. Receipts, the vehicle sale, round-off and journal
+    transfers are not lines of the deal."""
+    from audit_core.uc03_invoice_materialization import (
+        UNCLASSIFIED_DISCOUNT,
+        classify_discount,
+    )
+
+    out = TallyLines()
+    for row in lines:
+        label = _label(row.get("particulars_raw"))
+        debit, credit = _amount(row.get("debit_amount")), _amount(row.get("credit_amount"))
+        voucher = _label(row.get("voucher_type"))
+        if debit and debit > 0 and not (_TALLY_VEHICLE.fullmatch(label) and "ACCESS" not in label):
+            key = next((k for pattern, k in _TALLY_CHARGES if pattern.fullmatch(label)), None)
+            if key is not None:
+                out.components[key] = out.components.get(key, Decimal(0)) + debit
+        elif credit and credit > 0 and _TALLY_BENEFIT_VOUCHER.fullmatch(voucher):
+            key = classify_discount(label)
+            if key == UNCLASSIFIED_DISCOUNT:
+                continue
+            out.discounts[key] = out.discounts.get(key, Decimal(0)) + credit
+            number = str(row.get("voucher_number") or "").strip()
+            if number:
+                out.credit_notes[number] = key
+    return out
+
+
 def tally_deviations(statement: StatementRead, tally: dict[str, Decimal]) -> list[dict[str, Any]]:
     """Where the Tally ledger disagrees with the statement by more than the
     tolerance. The Tally's vehicle posting is the invoice total, so it may equal
@@ -983,6 +1038,34 @@ def _withdraw_invoice_actuals(connection: Connection, *, tenant_id: str, journey
     return int(lines or 0) + int(discounts or 0)
 
 
+def _record_tally_lines(
+    connection: Connection, *, tenant_id: str, journey_id: UUID,
+    tallies: list[tuple[dict[str, Any], list[dict[str, Any]]]],
+) -> int:
+    from audit_core.uc03_deal_source_history import record_source_value
+
+    connection.execute(
+        text("DELETE FROM auditcore.commercial_line_source_values "
+             "WHERE tenant_id=:t AND journey_id=:j AND source_document_type=:type"),
+        {"t": tenant_id, "j": journey_id, "type": TALLY_LEDGER_TYPE},
+    )
+    if not tallies:
+        return 0
+    origin = max((d for d, _ in tallies), key=lambda d: (
+        d.get("linkedAtUtc").timestamp() if hasattr(d.get("linkedAtUtc"), "timestamp") else 0.0))
+    read = read_tally_lines(combined_tally_rows(tallies))
+    written = 0
+    for kind, figures in (("COMMERCIAL", read.components), ("DISCOUNT", read.discounts)):
+        for key, amount in sorted(figures.items()):
+            record_source_value(
+                connection, tenant_id=tenant_id, journey_id=journey_id, line_kind=kind, component_key=key,
+                source_document_type=TALLY_LEDGER_TYPE, amount=amount, evidence_id=origin["evidenceId"],
+                document_id=origin["documentId"],
+            )
+            written += 1
+    return written
+
+
 def _stale_statement_rows(
     connection: Connection, *, tenant_id: str, journey_id: UUID, keep_components: set[str],
     keep_discounts: set[str],
@@ -1175,6 +1258,11 @@ def sync_account_statement(
             )
             settlement_lines += 1
 
+    # The customer ledger's own charges and credit-note benefits, recorded for
+    # the Deal under their own name: below the NDC and the cost sheet, above
+    # the invoices (product owner 2026-11-02). Rewritten on every sync.
+    tally_lines = _record_tally_lines(connection, tenant_id=tenant_id, journey_id=journey_id, tallies=tallies)
+
     # The cost sheet: its lines are recorded for the Deal (shown as the cost
     # sheet's, standing in the billed column only when no NDC is on file -- see
     # uc03_p2_journey360), and compared with the NDC when both are in.
@@ -1270,7 +1358,8 @@ def sync_account_statement(
 
     logger.info(
         "account_statement_synced", tenant_id=tenant_id, journey_id=str(journey_id), correlation_id=correlation_id,
-        statements=len(forms), tallies=len(tallies), components=len(keep_components), discounts=len(keep_discounts),
+        statements=len(forms), tallies=len(tallies), tally_lines=tally_lines,
+        components=len(keep_components), discounts=len(keep_discounts),
         unmapped=len(statement.unmapped) if statement else 0, conflicts=len(statement.conflicts) if statement else 0,
         old_vehicle_value=str(statement.old_vehicle_value) if statement and statement.old_vehicle_value else None,
         invoice_actuals_cleared=cleared, tally_deviations=len(deviations),
@@ -1317,6 +1406,7 @@ __all__ = [
     "SCRAPPAGE_DEALER_KEY",
     "SETTLEMENT_SOURCE_TYPE",
     "TALLY_DEVIATION_TASK",
+    "TALLY_LEDGER_TYPE",
     "CostSheetRead",
     "StatementRead",
     "chosen_copies",
@@ -1330,6 +1420,7 @@ __all__ = [
     "read_cost_sheet",
     "read_erp_settlement",
     "read_statement",
+    "read_tally_lines",
     "read_working",
     "statement_kind",
     "statement_loan",

@@ -287,6 +287,9 @@ _LEDGER_NORM = frozenset(_norm_type(t) for t in _LEDGER_SOURCES)
 # a billed source (no column of its own); this name keeps it out of the
 # "ledger" column and labels it for the person reading the Deal.
 _STATEMENT_COLUMN_TYPE = "account_statement"
+# The customer ledger's postings, as uc03_account_statement records them
+# (TALLY_LEDGER_TYPE; not imported: that module imports this one).
+TALLY_LEDGER_TYPE = "customer_ledger_tally"
 # A Journey of that Project with no NDC (account statement) on file takes the
 # billed figures from its cost sheet (product owner 2026-10-28: "depending upon
 # which is available cost sheet or NDC you can pick any one"); under this name
@@ -300,9 +303,14 @@ _COLUMN_LABELS = {
     _STATEMENT_COLUMN_TYPE: "NDC (Account Statement)",
     _COST_SHEET_STANDIN_TYPE: "Cost sheet (no NDC on file)",
     _SETTLEMENT_TYPE: "Settlement (ERP printout)",
+    TALLY_LEDGER_TYPE: "Customer ledger (Tally)",
 }
 # The dealer's statement, under any of the names it stands in the billed column.
 _STATEMENT_NORM = frozenset(_norm_type(t) for t in (_STATEMENT_COLUMN_TYPE, _COST_SHEET_STANDIN_TYPE, _SETTLEMENT_TYPE))
+# The dealer's own books: the statement, and the customer ledger's postings,
+# which stand before any invoice (product owner 2026-11-02: NDC, cost sheet,
+# customer ledger, then the invoice).
+_DEALER_BOOKS_NORM = _STATEMENT_NORM | {_norm_type(TALLY_LEDGER_TYPE)}
 _QUOTE_NORM = frozenset(_norm_type(t) for t in _QUOTE_SOURCES)
 
 
@@ -699,7 +707,7 @@ def _column_for(document_type: Any) -> str:
 _SOURCE_ORDER = tuple(_norm_type(t) for t in (
     "booking_form", "booking_docket", "order_taking_form",
     _STATEMENT_COLUMN_TYPE, _SETTLEMENT_TYPE, _COST_SHEET_STANDIN_TYPE,
-    "customer_ledger", "cost_sheet",
+    "customer_ledger", "cost_sheet", TALLY_LEDGER_TYPE,
     "tax_invoice_tally", "customer_invoice_dms", "invoice_generic", "customer_invoice_dms_v2", "tax_invoice",
     "tax_invoice_dms", "accessory_invoice_dms", "accessory_invoice_tally", "ew_invoice", "rsa_invoice",
     "insurance_cover_note", "insurance_policy", "insurance_cover", "rto_challan", "rto_tax_receipt",
@@ -899,7 +907,7 @@ def _fold_registration(rows: list[dict[str, Any]], *, invoice_on_file: bool) -> 
     # statement policy it is the billed figure, and the challan's parts added
     # up are set against it, whole against whole (2026-11-02, defect 8).
     statement_whole = (combined["billed"] if combined and combined.get("billed") is not None and any(
-        _norm_type(s.get("documentType")) in _STATEMENT_NORM for s in combined["sources"]) else None)
+        _norm_type(s.get("documentType")) in _DEALER_BOOKS_NORM for s in combined["sources"]) else None)
     parts_billed = total("billed")
     if statement_whole is not None:
         billed = statement_whole
@@ -1101,7 +1109,7 @@ def _one_benefit_per_figure(discount_rows: list[dict[str, Any]]) -> None:
     stands (it names the benefit, the invoice prints "OEM Discount"), the
     invoice's checks it and leaves the totals."""
     given_by_statement = [r for r in discount_rows if r["current"] is not None and any(
-        _norm_type(s.get("documentType")) in _STATEMENT_NORM and _near(s.get("amount"), Decimal(r["current"]),
+        _norm_type(s.get("documentType")) in _DEALER_BOOKS_NORM and _near(s.get("amount"), Decimal(r["current"]),
                                                                        _SAME_BENEFIT_TOLERANCE)
         for s in r["sources"])]
     for row in discount_rows:
@@ -1349,7 +1357,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     charged_on_a_bill = "insurance_amount" in selection["lines"] or any(
         s["line_kind"] == "COMMERCIAL" and s["component_key"] in _ADDON_COMPONENTS["insurance"]
         and (_dec(s["amount"]) or Decimal(0)) > 0
-        and (_norm_type(s["source_document_type"]) in _STATEMENT_NORM | _LEDGER_NORM
+        and (_norm_type(s["source_document_type"]) in _DEALER_BOOKS_NORM | _LEDGER_NORM
              or is_invoice_type(s["source_document_type"]))
         for s in sources)
     insurance["inDeal"] = insurance["source"] == "INHOUSE" and (
@@ -1745,7 +1753,7 @@ def _invoices_on_file(
         # The dealer's statement (NDC, cost sheet in its place, settlement) is
         # a bill as much as an invoice is: with either on file, a line none of
         # them carries is not billed rather than awaited (2026-11-02).
-        statement_rows = [s for s in sources if _norm_type(s["source_document_type"]) in _STATEMENT_NORM]
+        statement_rows = [s for s in sources if _norm_type(s["source_document_type"]) in _DEALER_BOOKS_NORM]
         invoice_on_file = invoice_on_file or bool(statement_rows)
         if any(str(s["component_key"]) == "ex_showroom_price" for s in statement_rows):
             families.add(FAMILY_VEHICLE)
@@ -1868,7 +1876,7 @@ def _component_row(
     billed_from = None
     invoiced = selection["lines"].get(key)
     statement_charge = statement_policy and any(
-        _norm_type(s["source_document_type"]) in _STATEMENT_NORM and _dec(s["amount"]) is not None for s in per_source)
+        _norm_type(s["source_document_type"]) in _DEALER_BOOKS_NORM and _dec(s["amount"]) is not None for s in per_source)
     if invoiced is not None and not statement_charge:
         # Each invoice bills its own lines; distinct invoices add up,
         # copies of one invoice count once (R2).
@@ -2049,7 +2057,7 @@ def _benefit_row(
     # stands before the invoice when both give the benefit; the invoice then
     # checks it (product owner 2026-11-02: NDC, cost sheet, customer ledger,
     # then the invoice).
-    on_statement = any(_norm_type(s["source_document_type"]) in _STATEMENT_NORM and _dec(s["amount"]) is not None
+    on_statement = any(_norm_type(s["source_document_type"]) in _DEALER_BOOKS_NORM and _dec(s["amount"]) is not None
                        for s in per_source)
     invoice_disagrees = False
     if invoiced_discount is not None and not on_statement:
