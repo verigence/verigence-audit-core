@@ -4852,6 +4852,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # every booking of every Project, or only the references in ``reports``.
         from audit_core.uc03_booking_rebuild import run_booking_rebuild
         return run_booking_rebuild, (engine, tag, _active_tenants(engine), reports)
+    if kind == "PAGE_IMAGES":
+        # A picture of up to three stored pages, returned on the job row, read
+        # only (2026-11-02): see uc03_page_images.
+        from audit_core.uc03_page_images import run_page_images
+        return run_page_images, (engine, tag, reports)
     if kind == "PAGE_RETYPE":
         # Stored pages read again as a named type, as a PC's "Set the
         # document type" does (2026-11-02): see uc03_page_retype.
@@ -4868,6 +4873,15 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # journey references in ``reports`` only (2026-11-01).
         from audit_core.uc03_own_copy_restore import run_own_copy_restore
         return run_own_copy_restore, (engine, tag, _active_tenants(engine), reports)
+    if kind == "JOURNEY_SNAPSHOT":
+        # What Journey 360 shows for every booking, kept under a tag, read
+        # only (2026-11-02): see uc03_journey_snapshot.
+        from audit_core.uc03_journey_snapshot import run_journey_snapshot
+        return run_journey_snapshot, (engine, tag, reports)
+    if kind == "JOURNEY_SNAPSHOT_DIFF":
+        # What changed between two snapshot tags (reports: before, after).
+        from audit_core.uc03_journey_snapshot import run_journey_snapshot_diff
+        return run_journey_snapshot_diff, (engine, tag, reports)
     per_tenant = {
         "PAGE_RESEND": ("audit_core.uc03_p2_page_resend", "run_page_resend"),
         "INVOICE_RESCAN": ("audit_core.uc03_invoice_rescan", "run_invoice_rescan"),
