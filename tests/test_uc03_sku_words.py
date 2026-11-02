@@ -221,7 +221,11 @@ def test_xuv_700_on_a_booking_form_is_read_as_the_xuv_7xo_and_the_variant_still_
     """Product owner 2 Nov 2026: no book since September prints an XUV 700, only
     the XUV 7XO that replaced it, so "XUV 700" names the XUV 7XO -- tried after
     the model the words name, never instead of it."""
-    from audit_core.oem_price_masters import _SUCCESSOR_IDENTITY, model_identity_keys, price_list_model_key
+    from audit_core.oem_price_masters import (
+        _SUCCESSOR_IDENTITY,
+        model_identity_keys,
+        price_list_model_key,
+    )
 
     assert model_identity_keys("XUV 700") == ["XUV700", "XUV7XO"]
     assert model_identity_keys("XUV700") == ["XUV700", "XUV7XO"]
