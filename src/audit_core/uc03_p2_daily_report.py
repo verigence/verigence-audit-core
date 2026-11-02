@@ -37,7 +37,22 @@ Every figure is read from what Audit Core stores -- nothing is estimated:
 - failed pages (2026-10-21, also its own endpoint /reports/failed-pages):
   every page now FAILED, and every file that failed before it was split,
   with the reason, the attempts, when it was uploaded and failed (the
-  page's last DOCUMENT_STATUS_CHANGED to FAILED) and a link that opens it.
+  page's last DOCUMENT_STATUS_CHANGED to FAILED) and a link that opens it;
+- delivery files closed (2026-11-02, ``delivery_files_closed``): "a delivery
+  file is closed when all mandatory documents are uploaded and all the
+  document-related tasks are closed by the PC". A Journey counts when it has
+  a delivery (a ``p2_document_queue`` page with business_stage DELIVERY), no
+  open PC document task (``p2_tasks`` on the Task Queue's Documents tab,
+  assigned to the PC role or to the Journey's PC) and no open DOCUMENT_MISSING
+  task, and every document its stored DELIVERY REQUIRED_DOCUMENTS gate
+  (``p2_stage_gate_state``) still lists as missing has its DOCUMENT_MISSING
+  task closed (the PC's "Document uploaded" / "Document not required to be
+  uploaded"). A mandatory document with no such task (the invoice, insurance,
+  dealer statement, receipt) must be in. It closed at the later of the last
+  such task closing (verified / action completed / cancelled) and the last
+  delivery page uploaded; it counts on that day, under the Journey's PC
+  (``journeys.created_by_actor_id``), with the list of files. No delivery
+  stage is ever marked complete, so stage completion is not used.
 
 Day boundaries are the Project's own timezone. Known gaps, stated in the
 response rather than guessed: the actor of a journey Re-sync is not stored,
@@ -480,7 +495,20 @@ def build_daily_processing_report(
     )
     status = _document_status(file_list["files"], pcs, names)
     team = _team_work(connection, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end, names=names)
-    large = [f for f in file_list["files"] if f["large"]]
+    closed_files = delivery_files_closed(
+        connection, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end, names=names,
+    )
+    closed_by_pc = {entry["pcActorId"] or "": entry["deliveryFilesClosed"] for entry in closed_files["byPc"]}
+    for pc_key in closed_by_pc.keys() - pcs.keys():
+        # A PC whose files closed on a day they uploaded nothing still has a row.
+        pcs[pc_key] = {
+            "pcActorId": pc_key or None, "pcName": names.get(pc_key) or None, "journeys": 0, "journeysUploaded": 0,
+            "firstUploadAt": None, "lastFinishedAt": None, "stillProcessing": 0, **_empty_counts(),
+            "earlier": {"journeys": 0, **_empty_counts()}, "pagesPerJourney": None, "spanMinutes": None,
+        }
+    for pc_key, summary in pcs.items():
+        summary["deliveryFilesClosed"] = closed_by_pc.get(pc_key, 0)
+    large =[f for f in file_list["files"] if f["large"]]
     from audit_core.task_manager_reports import build_task_status
 
     return {
@@ -490,6 +518,7 @@ def build_daily_processing_report(
         "timezone": timezone_name,
         "documentStatus": status,
         "teamWork": team,
+        "deliveryFilesClosed": closed_files,
         "files": file_list["files"],
         "filesTruncated": file_list["truncated"],
         "linkExpiresInSeconds": _LINK_SECONDS,
@@ -532,6 +561,10 @@ def build_daily_processing_report(
              "system's own task updates are not work. Tasks closed = worked by that person and closed on the day. "
              "A Team Lead's name is not stored with the task, so the account id shows unless a name is known."),
             "File links open the original as uploaded and are valid 30 minutes from when the report was loaded.",
+            ("Delivery files closed: journeys with a delivery upload whose mandatory delivery documents are in "
+             "(or whose 'Upload the ...' task the PC closed) and whose document tasks are all closed, counted on "
+             "the day the last of those closed (or the last delivery page was uploaded), under the journey's PC. "
+             "A task reopened later takes the file out until it closes again."),
         ],
     }
 
@@ -792,6 +825,108 @@ def _team_work(
             "actions": sum(p["actions"] for p in out), "tasksClosed": sum(p["tasksClosed"] for p in out),
         },
     }
+
+
+_CLOSED_TASK_STATUSES = ("VERIFIED_COMPLETE", "CANCELLED", "FAILED", "DEAD_LETTER")
+
+
+def delivery_files_closed(
+    connection: Connection, *, tenant_id: str, actor_id: str, start: datetime, end: datetime,
+    names: dict[str, str],
+) -> dict[str, Any]:
+    """The delivery files (Journeys) that closed in [start, end), per PC, with
+    the list of files (product owner 2026-11-02: "a delivery file is closed
+    when all mandatory documents are uploaded and all the document-related
+    tasks are closed by the PC"). The rule is in the module docstring. One
+    statement for the whole Project, within the reader's dealers and
+    outlets; a file counts on the day it last closed, so a file whose task
+    is reopened drops out and counts again on the day it closes again. A
+    Journey the stage engine has not evaluated yet (no stored DELIVERY
+    REQUIRED_DOCUMENTS gate) is not counted."""
+    # The Task Queue's Documents tab (uc03_p2_tasks.task_queue_tab), in SQL.
+    from audit_core.uc03_p2_tasks import (
+        _DOCUMENT_CATEGORIES,
+        _DOCUMENT_TASKS,
+        _MANUAL_VERIFICATION_TASKS,
+    )
+
+    rows = connection.execute(
+        text(
+            f"""
+            WITH delivery AS (
+              SELECT q.journey_id, MAX(q.created_at_utc) AS last_upload
+              FROM auditcore.p2_document_queue q
+              WHERE q.tenant_id=:t AND q.business_stage='DELIVERY'
+              GROUP BY q.journey_id
+            ),
+            doc_tasks AS (
+              SELECT tk.journey_id,
+                     bool_or(tk.task_status <> ALL(:closed)) AS any_open,
+                     MAX(COALESCE(tk.verified_at_utc, tk.action_completed_at_utc, tk.updated_at_utc))
+                       FILTER (WHERE tk.task_status = ANY(:closed)) AS last_closed
+              FROM auditcore.p2_tasks tk
+              JOIN delivery dv ON dv.journey_id=tk.journey_id
+              JOIN auditcore.journeys j ON j.tenant_id=tk.tenant_id AND j.journey_id=tk.journey_id
+              WHERE tk.tenant_id=:t
+                AND (tk.task_type='DOCUMENT_MISSING'
+                     OR ((tk.task_type = ANY(:doc_types) OR tk.category = ANY(:doc_categories))
+                         AND tk.task_type <> ALL(:mv_types) AND tk.category <> 'CORRECTION_APPROVAL'
+                         AND (upper(tk.assigned_role_code)='PC' OR tk.assigned_actor_id=j.created_by_actor_id)))
+              GROUP BY tk.journey_id
+            )
+            SELECT j.journey_id, j.journey_reference, j.created_by_actor_id AS pc_actor_id,
+                   COALESCE(c.legal_name, c.display_name) AS customer_name,
+                   d.dealer_name, o.outlet_name, o.outlet_code,
+                   GREATEST(dv.last_upload, dt.last_closed) AS closed_at
+            FROM delivery dv
+            JOIN auditcore.journeys j ON j.tenant_id=:t AND j.journey_id=dv.journey_id
+            JOIN auditcore.p2_stage_gate_state g
+              ON g.tenant_id=j.tenant_id AND g.journey_id=j.journey_id
+             AND g.stage_code='DELIVERY' AND g.gate_key='REQUIRED_DOCUMENTS'
+            LEFT JOIN doc_tasks dt ON dt.journey_id=dv.journey_id
+            LEFT JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+            LEFT JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+            LEFT JOIN auditcore.dealer_outlets o
+              ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
+            WHERE NOT COALESCE(dt.any_open, false)
+              AND GREATEST(dv.last_upload, dt.last_closed) >= :s
+              AND GREATEST(dv.last_upload, dt.last_closed) < :e
+              -- Every mandatory delivery document still missing has its
+              -- "Upload the ..." task closed by the PC; one with no such task
+              -- (invoice, insurance, dealer statement, receipt) must be in.
+              AND NOT EXISTS (
+                SELECT 1 FROM jsonb_array_elements(COALESCE(g.details->'missing', '[]'::jsonb)) m
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM auditcore.p2_tasks mt
+                  WHERE mt.tenant_id=j.tenant_id AND mt.journey_id=j.journey_id
+                    AND mt.task_type='DOCUMENT_MISSING' AND mt.task_status='VERIFIED_COMPLETE'
+                    AND mt.reference->>'requirementKey' = m->>'key'))
+              AND {_SCOPE}
+            ORDER BY closed_at
+            """
+        ),
+        {"t": tenant_id, "actor_id": actor_id, "s": start, "e": end, "closed": list(_CLOSED_TASK_STATUSES),
+         "doc_types": sorted(_DOCUMENT_TASKS), "doc_categories": sorted(_DOCUMENT_CATEGORIES),
+         "mv_types": sorted(_MANUAL_VERIFICATION_TASKS)},
+    ).mappings().all()
+    by_pc: dict[str, dict[str, Any]] = {}
+    files: list[dict[str, Any]] = []
+    for row in rows:
+        pc = row["pc_actor_id"] or ""
+        file = {
+            "journeyId": str(row["journey_id"]), "journeyReference": row["journey_reference"],
+            "customerName": row["customer_name"], "dealerName": row["dealer_name"],
+            "outletName": row["outlet_name"], "outletCode": row["outlet_code"],
+            "pcActorId": pc or None, "pcName": names.get(pc),
+            "closedAtUtc": row["closed_at"].isoformat() if row["closed_at"] else None,
+        }
+        files.append(file)
+        entry = by_pc.setdefault(pc, {"pcActorId": pc or None, "pcName": names.get(pc),
+                                      "deliveryFilesClosed": 0, "files": []})
+        entry["deliveryFilesClosed"] += 1
+        entry["files"].append(file)
+    people = sorted(by_pc.values(), key=lambda e: (-e["deliveryFilesClosed"], e["pcName"] or e["pcActorId"] or "~"))
+    return {"total": len(files), "byPc": people, "files": files}
 
 
 def _rejection_trend(
