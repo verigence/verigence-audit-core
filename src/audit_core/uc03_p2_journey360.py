@@ -539,7 +539,33 @@ def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[s
     receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids), Decimal(0))
     loan_receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] in loan_ids), Decimal(0))
     loan = loan_receipts + _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
-    return {"receipts": receipts, "loan": loan, "total": receipts + loan}
+    return {"receipts": receipts, "loan": loan, "total": receipts + loan,
+            "customerAmounts": [Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids],
+            "countedAmounts": [Decimal(r["amount"]) for r in counted]}
+
+
+def _loan_counted(connection: Connection, *, tenant_id: str, journey_id: UUID, paid: dict[str, Any]) -> dict[str, Any]:
+    """The loan counted as received, by the Audit Summary's own rule
+    (uc03_p2_audit_summary.loan_received): the disbursement on the finance
+    record, else the dealer's statement financier row, else the bank letter's
+    sanction, else unknown on a financed deal -- so the Deal's balance and the
+    Summary's are the same (2026-11-02, Deal defect 5)."""
+    from audit_core.uc03_account_statement import statement_loan
+    from audit_core.uc03_p2_audit_summary import loan_received
+
+    records = connection.execute(
+        text("SELECT loan_disbursement_amount FROM auditcore.finance_records WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalars().all()
+    return loan_received(
+        matched=paid["loan"],
+        disbursement_known=any(_dec(r) is not None for r in records),
+        financed=bool(records),
+        stated=statement_loan(connection, tenant_id=tenant_id, journey_id=journey_id),
+        receipt_amounts=paid["customerAmounts"],
+        letter=loan_without_receipt(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                    receipt_amounts=paid["countedAmounts"]),
+    )
 
 
 # ── summary ──────────────────────────────────────────────────────────────────
@@ -1320,10 +1346,14 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     awaiting_delta = _awaiting_delta(counted_rows, standard_discounts)
 
     paid = _paid(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # The loan as the Audit Summary counts it, so both give one balance.
+    loan_view = _loan_counted(connection, tenant_id=tenant_id, journey_id=journey_id, paid=paid)
+    loan = loan_view["amount"] or Decimal(0)
+    refunds = loan_view["refunds"] or Decimal(0)
     # The old vehicle the NDC takes against the price ("Exchanged vehicle",
     # or its "Trade in value" row) is paid in kind (2026-11-02, Deal defect 4).
     old_vehicle = _old_vehicle_in_kind(declared) if statement_policy else None
-    paid_total = paid["total"] + (old_vehicle or Decimal(0))
+    paid_total = paid["receipts"] + loan + (old_vehicle or Decimal(0)) - refunds
     # What the customer owes is the current net; with none worked out it is
     # unknown, never the price master's standard (2026-11-02, Deal defect 12).
     payable = net_cur
@@ -1387,11 +1417,16 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             # Lines with no standard on record, taken in the standard at what
             # is charged for them.
             "standardTakenAsCharged": [r["key"] for r in taken_as_charged] if net_std is not None else [],
-            "paid": {"receipts": str(paid["receipts"]), "loan": str(paid["loan"]),
+            "paid": {"receipts": str(paid["receipts"]), "loan": str(loan),
+                     "loanSource": loan_view["source"], "loanWithoutReceipt": loan_view["withoutReceipt"],
+                     "loanUnknown": loan_view["unknown"],
+                     "refunds": str(refunds) if refunds else None,
                      "oldVehicle": str(old_vehicle) if old_vehicle is not None else None,
                      "total": str(paid_total)},
             "payable": payable,
-            "balanceDue": _minus(payable, paid_total),
+            # A financed deal whose loan is not on file has no balance yet:
+            # it would be the loan itself, not a shortfall (as the Summary).
+            "balanceDue": None if loan_view["unknown"] else _minus(payable, paid_total),
         },
         "flagged": sum(1 for r in counted_rows + discount_rows if r["flags"]),
     }

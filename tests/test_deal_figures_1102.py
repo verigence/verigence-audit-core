@@ -256,3 +256,20 @@ def test_the_trade_in_value_is_the_old_vehicle_and_the_printed_totals_are_declar
     assert D(declared["net_amount"]["billed"]) == D(1900000)
     assert D(declared["received_amount"]["billed"]) == D(1964155)
     assert D(declared["balance_amount"]["billed"]) == D(0)
+
+
+# ── 5. one balance: the Deal's header and the Audit Summary ─────────────────
+def test_the_deal_counts_the_loan_as_the_audit_summary_does(journey) -> None:
+    from audit_core.uc03_p2_audit_summary import audit_summary
+
+    _statement(journey, UTKAL)  # Finance D/O 10,60,000; no disbursement on a finance record
+    view = _deal(journey)
+    paid = view["summary"]["paid"]
+    assert D(paid["loan"]) == D(1060000) and paid["loanSource"] == "NDC (account statement)"
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        summary = audit_summary(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert D(summary["funding"]["loanDisbursed"]) == D(paid["loan"])
+    assert D(summary["funding"]["received"]) == D(paid["total"])
+    if view["summary"]["balanceDue"] is not None:
+        assert D(summary["settlement"]["balance"]) == D(view["summary"]["balanceDue"])
