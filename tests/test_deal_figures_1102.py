@@ -89,8 +89,10 @@ def test_tcs_the_statement_does_not_print_comes_from_the_vehicle_invoice(journey
     view = _deal(journey)
     tcs = _row(view, "tcs_amount")
     assert D(tcs["billed"]) == D("8272.00")
-    assert [s["documentType"] for s in tcs["sources"]] == ["vehicle_invoice_where_ndc_is_silent"]
-    assert tcs["sources"][0]["document"] == "Vehicle invoice (not on the NDC)"
+    # The invoice is a billing document: it stands where the NDC is silent,
+    # under its own name (product owner 2026-11-02).
+    assert [s["documentType"] for s in tcs["sources"]] == ["customer_invoice_dms"]
+    assert tcs["billedFrom"] == "invoice"
     # The statement still prices the vehicle; the invoice adds nothing else.
     assert D(_row(view, "ex_showroom_price")["billed"]) == D(1039000)
     assert view["summary"]["billedSource"] == "ACCOUNT_STATEMENT"
@@ -100,8 +102,7 @@ def test_the_statement_tcs_wins_over_the_invoice(journey) -> None:
     _statement(journey, UTKAL)  # prints TCS 10,390
     add_ready_document(journey, "customer_invoice_dms", process_area="DELIVERY", **VEHICLE_INVOICE)
     tcs = _row(_deal(journey), "tcs_amount")
-    assert D(tcs["billed"]) == D(10390)
-    assert "vehicle_invoice_where_ndc_is_silent" not in [s["documentType"] for s in tcs["sources"]]
+    assert D(tcs["billed"]) == D(10390) and tcs["billedFrom"] == "document"
 
 
 # ── 2. registration ──────────────────────────────────────────────────────────
@@ -163,7 +164,10 @@ def test_the_vehicle_line_awaits_the_ndc_not_a_vehicle_invoice(journey) -> None:
 
 
 # ── 4. credit notes ──────────────────────────────────────────────────────────
-def test_a_credit_note_is_linked_to_the_benefit_of_its_amount(journey) -> None:
+def test_a_credit_note_is_linked_to_the_benefit_of_its_amount_and_counted_once(journey) -> None:
+    """2026-11-02: a credit note is a billing document. CN-1 pays the 5,000
+    the NDC already gives: checked, not added. CN-2 names no benefit and
+    matches none: a benefit of its own, counted."""
     _statement(journey, UTKAL)  # Other Discount (if any) 5,000
     add_ready_document(journey, "credit_note", process_area="DELIVERY", invoice_number="CN-1",
                        invoice_date="2026-10-20", grand_total_amount="5000")
@@ -172,9 +176,11 @@ def test_a_credit_note_is_linked_to_the_benefit_of_its_amount(journey) -> None:
     view = _deal(journey)
     notes = {c["number"]: c for c in view["creditNotes"]}
     assert notes["CN-1"]["benefit"]["key"] == "ADDITIONAL_DISCOUNT"
-    assert notes["CN-2"]["benefit"] is None and notes["CN-2"]["benefitCandidates"] == []
+    assert notes["CN-2"]["benefit"]["key"] == "CREDIT_NOTE" and notes["CN-2"]["benefitCandidates"] == []
     benefit = next(d for d in view["discounts"] if d["key"] == "ADDITIONAL_DISCOUNT")
-    assert [c["number"] for c in benefit["paidByCreditNotes"]] == ["CN-1"]
+    assert [c["number"] for c in benefit["paidByCreditNotes"]] == ["CN-1"] and D(benefit["current"]) == D(5000)
+    unnamed = next(d for d in view["discounts"] if d["key"] == "CREDIT_NOTE")
+    assert D(unnamed["current"]) == D(7777) and "BENEFIT_NOT_NAMED" in unnamed["flags"]
 
 
 # ── 5. payable ───────────────────────────────────────────────────────────────

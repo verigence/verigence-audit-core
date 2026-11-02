@@ -241,6 +241,17 @@ def _seed_reviewed_booking(c, **fields):
     )
 
 
+def _given_on_statement(c, **given) -> None:
+    """The benefits a billing document gives (the dealer's statement here):
+    the booking docket's are never counted (product owner 2026-11-02), so a
+    test of what the deal gives sets them on a billing document."""
+    for key, amount in given.items():
+        c.execute(text("INSERT INTO auditcore.commercial_line_source_values (tenant_id, journey_id, line_kind, "
+                       "component_key, source_document_type, amount, source_document_id) "
+                       "VALUES (:t, :j, 'DISCOUNT', :k, 'account_statement', :a, :doc)"),
+                  {"t": c.tenant_id, "j": c.journey_id, "k": key, "a": amount, "doc": uuid4()})
+
+
 def _details(c, key) -> dict:
     return c.execute(
         text("SELECT details FROM auditcore.discount_applications "
@@ -718,7 +729,7 @@ def test_positive_variance_is_not_flagged(journey) -> None:
     # standard (extra options) without any discount involved.
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     c.execute(
-        text("UPDATE auditcore.commercial_lines SET actual_amount=2100000, source_reference='booking_form:test' "
+        text("UPDATE auditcore.commercial_lines SET actual_amount=2100000, source_reference='account_statement:test' "
              "WHERE tenant_id=:t AND journey_id=:j AND component_key='ex_showroom_price'"),
         {"t": c.tenant_id, "j": c.journey_id},
     )
@@ -759,7 +770,7 @@ def test_negative_variance_raises_high_finding_and_tl_task(journey) -> None:
     _seed_pinned_sku(c, model="THAR", variant="LX", components={"EX_SHOWROOM": "1500000"})
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     c.execute(
-        text("UPDATE auditcore.commercial_lines SET actual_amount=1400000, source_reference='booking_form:test' "
+        text("UPDATE auditcore.commercial_lines SET actual_amount=1400000, source_reference='account_statement:test' "
              "WHERE tenant_id=:t AND journey_id=:j AND component_key='ex_showroom_price'"),
         {"t": c.tenant_id, "j": c.journey_id},
     )
@@ -793,7 +804,7 @@ def test_no_shortfall_finding_before_delivery_has_started(journey) -> None:
     _seed_pinned_sku(c, model="THAR", variant="LX", components={"EX_SHOWROOM": "1500000"})
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     c.execute(
-        text("UPDATE auditcore.commercial_lines SET actual_amount=1400000, source_reference='booking_form:test' "
+        text("UPDATE auditcore.commercial_lines SET actual_amount=1400000, source_reference='account_statement:test' "
              "WHERE tenant_id=:t AND journey_id=:j AND component_key='ex_showroom_price'"),
         {"t": c.tenant_id, "j": c.journey_id},
     )
@@ -810,7 +821,7 @@ def test_negative_variance_resolves_once_corrected(journey) -> None:
     _seed_pinned_sku(c, model="BOLERO", variant="B4", components={"EX_SHOWROOM": "1000000"})
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     c.execute(
-        text("UPDATE auditcore.commercial_lines SET actual_amount=900000, source_reference='booking_form:test' "
+        text("UPDATE auditcore.commercial_lines SET actual_amount=900000, source_reference='account_statement:test' "
              "WHERE tenant_id=:t AND journey_id=:j AND component_key='ex_showroom_price'"),
         {"t": c.tenant_id, "j": c.journey_id},
     )
@@ -822,7 +833,7 @@ def test_negative_variance_resolves_once_corrected(journey) -> None:
     ).scalar_one() == "OPEN"
 
     c.execute(
-        text("UPDATE auditcore.commercial_lines SET actual_amount=1000000, source_reference='booking_form:test' "
+        text("UPDATE auditcore.commercial_lines SET actual_amount=1000000, source_reference='account_statement:test' "
              "WHERE tenant_id=:t AND journey_id=:j AND component_key='ex_showroom_price'"),
         {"t": c.tenant_id, "j": c.journey_id},
     )
@@ -1190,9 +1201,10 @@ def test_unclaimed_exchange_and_scrappage_are_not_counted_in_the_total(journey) 
         _scheme(c, category=category, effective_from=_SEPT_SCHEMES, benefits={key: amount},
                 eligibility=[{"model_id": model, "criteria": {"scope": "MODEL"}}])
     _seed_reviewed_booking(c, sales_discount_amount="30000", other_discount_amount="100000")
+    _given_on_statement(c, CASH_DISCOUNT="30000", ADDITIONAL_DISCOUNT="100000")
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     c.execute(text("UPDATE auditcore.commercial_lines SET actual_amount=standard_amount, "
-                   "source_reference='booking_form:test' "
+                   "source_reference='account_statement:test' "
                    "WHERE tenant_id=:t AND journey_id=:j AND standard_amount IS NOT NULL"),
               {"t": c.tenant_id, "j": c.journey_id})
     result = dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
@@ -1215,6 +1227,7 @@ def test_corporate_privilege_follows_the_registry_category_and_is_never_assumed(
                 eligibility=[{"model_id": seeded["model_id"], "customer_type_code": f"CORPORATE:{category}",
                               "criteria": {"scope": "MODEL", "privilegeCategory": category}}])
     _seed_reviewed_booking(c, corporate_discount_amount="10000")
+    _given_on_statement(c, CORPORATE_PRIVILEGE="10000")
 
     # A company buyer is not, by itself, a listed corporate: never assumed.
     for _ in range(2):
@@ -1356,6 +1369,7 @@ def test_b1_an_unmatched_master_row_is_not_known_never_an_over_grant(journey) ->
                 "unresolvedVariantTexts": ["MX3 PRO PM AT & MT"]}}])
     _price_on(c, _UTKAL_PRICING_DATE)
     _seed_reviewed_booking(c, sales_discount_amount="60000")
+    _given_on_statement(c, CASH_DISCOUNT="60000")
     for _ in range(2):
         dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     row = _discount(c, "CASH_DISCOUNT")
@@ -1476,9 +1490,10 @@ def test_b3_a_deal_that_can_no_longer_be_reconciled_keeps_no_over_grant_and_no_s
     seeded = _seed_pinned_sku(c, model="THAR", variant="LX", components={"EX_SHOWROOM": "1500000"})
     _seed_scheme(c, category="CONSUMER", benefit_key="CASH_DISCOUNT", amount="10000", model_id=seeded["model_id"])
     _seed_reviewed_booking(c, sales_discount_amount="30000")
+    _given_on_statement(c, CASH_DISCOUNT="30000")
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     c.execute(text("UPDATE auditcore.commercial_lines SET actual_amount=standard_amount, "
-                   "source_reference='booking_form:test' WHERE tenant_id=:t AND journey_id=:j"),
+                   "source_reference='account_statement:test' WHERE tenant_id=:t AND journey_id=:j"),
               {"t": c.tenant_id, "j": c.journey_id})
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     finding = _open_finding(c, "DEAL_TOTAL_VARIANCE_NEGATIVE")
@@ -1569,6 +1584,7 @@ def test_s5_the_corporate_list_is_dated_per_tenant_and_an_inexact_name_is_a_pc_t
     _insert_registry_entries(c, tenant_id=c.tenant_id, oem_code=oem_code, upload_id=uuid4(),
                              effective_from=date(2026, 10, 3), companies=[_Company("C1", "Focus Hospitals Limited", "Z")])
     _seed_reviewed_booking(c, corporate_discount_amount="10000")
+    _given_on_statement(c, CORPORATE_PRIVILEGE="10000")
     _old_vehicle_document(c, document_type="corporate_id", fields={"employer_name": "Focus Hospitals Ltd."})
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert _discount(c, "CORPORATE_PRIVILEGE")["eligibility_result"] == "NEEDS_CORPORATE_EVIDENCE"
@@ -1601,9 +1617,10 @@ def test_n1_a_model_no_bulletin_in_force_covers_is_not_known_ev_included(journey
                      components={"EX_SHOWROOM": "1990000"})
     _price_on(c, _UTKAL_PRICING_DATE)
     _seed_reviewed_booking(c, sales_discount_amount="50000")
+    _given_on_statement(c, CASH_DISCOUNT="50000")
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     c.execute(text("UPDATE auditcore.commercial_lines SET actual_amount=standard_amount, "
-                   "source_reference='booking_form:test' WHERE tenant_id=:t AND journey_id=:j"),
+                   "source_reference='account_statement:test' WHERE tenant_id=:t AND journey_id=:j"),
               {"t": c.tenant_id, "j": c.journey_id})
     result = dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     row = _discount(c, "CASH_DISCOUNT")
@@ -1628,6 +1645,7 @@ def _be6_not_in_force(c) -> None:
                      components={"EX_SHOWROOM": "1990000"})
     _price_on(c, _UTKAL_PRICING_DATE)
     _seed_reviewed_booking(c, sales_discount_amount="50000")
+    _given_on_statement(c, CASH_DISCOUNT="50000")
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
 
 
@@ -1676,7 +1694,7 @@ def test_n1b_the_team_lead_accepts_a_discount_no_scheme_covers_and_the_task_stay
 
     # The deal is unchanged by the accept: still not in force, still taken as given, no shortfall.
     c.execute(text("UPDATE auditcore.commercial_lines SET actual_amount=standard_amount, "
-                   "source_reference='booking_form:test' WHERE tenant_id=:t AND journey_id=:j"),
+                   "source_reference='account_statement:test' WHERE tenant_id=:t AND journey_id=:j"),
               {"t": c.tenant_id, "j": c.journey_id})
     result = dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert _discount(c, "CASH_DISCOUNT")["eligibility_result"] == "SCHEME_NOT_IN_FORCE"
@@ -1707,6 +1725,7 @@ def test_n2_a_welcome_bonus_with_no_rc_read_is_unverified_not_an_over_grant(jour
     c = journey
     _welcome_masters(c)
     _seed_reviewed_booking(c, loyalty_discount_amount="20000")
+    _given_on_statement(c, WELCOME_BONUS="20000")
     dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     row = _discount(c, "WELCOME_BONUS")
     assert row["eligibility_result"] == "OLD_VEHICLE_UNVERIFIED" and row["standard_eligible_amount"] is None

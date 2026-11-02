@@ -62,7 +62,8 @@ def test_a_lone_booking_figure_is_the_whole_amount():
     rows = [_row("registration_charges", standard="160000", booking="158000")]
     folded = _fold_registration(rows, invoice_on_file=False)
     assert folded[0]["booking"] == "158000"
-    assert folded[0]["variance"] == "-2000"
+    # Shown as offered; never a variance (product owner 2026-11-02).
+    assert folded[0]["variance"] is None
     assert folded[1]["booking"] is None
 
 

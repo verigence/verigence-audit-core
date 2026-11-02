@@ -309,9 +309,9 @@ def test_the_financiers_loan_payment_is_not_third_party(journey):
 def test_short_payment_at_delivery_and_the_seven_day_windows(journey):
     delivered = TODAY - timedelta(days=20)
     _line(journey, "ex_showroom_price", "1000000", "1000000")
-    # What the deal stands at (the booking form here), never the price master's
-    # standard, is what is payable (2026-11-02).
-    _source(journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
+    # What a billing document charges, never the price master's standard nor
+    # the booking docket's offer, is what is payable (2026-11-02).
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "1000000")
     _deliver(journey, delivered)
     _receipt(journey, "600000", delivered - timedelta(days=2), "R-1")
     _receipt(journey, "300000", delivered + timedelta(days=3), "R-2")
@@ -335,9 +335,9 @@ def test_short_payment_at_delivery_and_the_seven_day_windows(journey):
 
 def test_balance_still_outstanding_waits_for_the_window_then_fails(journey):
     _line(journey, "ex_showroom_price", "1000000", "1000000")
-    # What the deal stands at (the booking form here), never the price master's
-    # standard, is what is payable (2026-11-02).
-    _source(journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
+    # What a billing document charges, never the price master's standard nor
+    # the booking docket's offer, is what is payable (2026-11-02).
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "1000000")
     _deliver(journey, TODAY - timedelta(days=2))
     _receipt(journey, "900000", TODAY - timedelta(days=3), "R-1")
     result = _run(journey, "DELIVERY")
@@ -355,9 +355,9 @@ def test_balance_still_outstanding_waits_for_the_window_then_fails(journey):
 
 def test_financier_windows(journey):
     _line(journey, "ex_showroom_price", "1000000", "1000000")
-    # What the deal stands at (the booking form here), never the price master's
-    # standard, is what is payable (2026-11-02).
-    _source(journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
+    # What a billing document charges, never the price master's standard nor
+    # the booking docket's offer, is what is payable (2026-11-02).
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "1000000")
     _deliver(journey, TODAY - timedelta(days=20))
     _receipt(journey, "500000", TODAY - timedelta(days=22), "R-1")
     _sql(journey, "INSERT INTO auditcore.finance_records (tenant_id, journey_id, provider_name, financed_amount) "
@@ -430,6 +430,7 @@ def test_cash_limit_tcs_and_payment_before_booking(journey):
     _receipt(journey, "10000", date(2026, 9, 1), "R-0")
     _line(journey, "ex_showroom_price", "1500000", "1500000")
     _line(journey, "tcs_amount", "15000", "5000")
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "1500000")
     _source(journey, "COMMERCIAL", "tcs_amount", "tax_invoice_tally", "5000")
     result = _run(journey, "BOOKING")
     assert result["CASH_ABOVE_LIMIT"].outcome == "FAIL" and "₹2,50,000 in cash" in result["CASH_ABOVE_LIMIT"].reason

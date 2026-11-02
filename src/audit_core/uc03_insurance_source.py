@@ -170,7 +170,7 @@ def premium_on_dealer_invoice(connection: Connection, *, tenant_id: str, journey
 
 # The dealer's own deal sheets: the NDC / account statement, the cost sheet
 # and the ERP settlement printout (as the statement reader records them).
-_STATEMENT_TYPES = frozenset({"customer_ledger", "cost_sheet", "erp_settlement"})
+_STATEMENT_TYPES = frozenset({"customer_ledger", "cost_sheet", "erp_settlement", "customer_ledger_tally"})
 
 
 def premium_on_dealer_statement(connection: Connection, *, tenant_id: str, journey_id: UUID) -> float | None:

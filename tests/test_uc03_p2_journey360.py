@@ -98,8 +98,10 @@ def test_deal_lays_out_standard_booking_billed_ledger_and_variance(journey):
     [price] = groups["VEHICLE"]["components"]
     assert Decimal(price["booking"]) == 1000000 and Decimal(price["billed"]) == 1005000
     assert Decimal(price["ledger"]) == 1005000
-    assert Decimal(price["bookingVsBilled"]) == 5000
-    assert "BOOKING_VS_BILLED" in price["flags"]
+    # The booking docket is information only: never compared, never flagged
+    # (product owner 2026-11-02).
+    assert price["bookingVsBilled"] is None
+    assert "BOOKING_VS_BILLED" not in price["flags"]
     [insurance] = groups["INSURANCE"]["components"]
     assert insurance["flags"] == []
 
@@ -113,8 +115,11 @@ def test_deal_lays_out_standard_booking_billed_ledger_and_variance(journey):
     assert Decimal(cash["variance"]) == -5000 and "UNDER_ENTITLEMENT" in cash["flags"]
 
     summary = view["summary"]
-    assert Decimal(summary["gross"]["booking"]) == 1055000
-    assert Decimal(summary["net"]["booking"]) == 1025000
+    # The insurance is not confirmed in-house (no dealer code, no billing
+    # document charging it): kept out of every total (2026-11-02).
+    assert view["insurance"]["inDeal"] is False
+    assert Decimal(summary["gross"]["booking"]) == 1015000
+    assert Decimal(summary["net"]["booking"]) == 985000
     assert Decimal(summary["paid"]["receipts"]) == 50000
     assert Decimal(summary["balanceDue"]) == Decimal(summary["payable"]) - 50000
 
@@ -254,12 +259,17 @@ def test_compliance_report_extends_legacy_with_ledger_and_verdict(journey):
     assert body["review"]["status"] == "DRAFT" and body["review"]["label"].startswith("Draft")
     assert "BOOKING" in body["controls"] and body["controls"]["BOOKING"]
     labels = {line["label"] for line in body["deal"]["flaggedLines"]}
-    assert "Ex-showroom price" in labels
+    # The essential kit is offered on the booking only: not billed. The
+    # ex-showroom price is billed and has no standard: nothing to flag (the
+    # booking's figure is never compared, 2026-11-02).
+    assert "Essential kit" in labels and "Ex-showroom price" not in labels
     assert client.get(f"{base}/duplicates").json() == {"pairs": []}
 
 
-def test_before_any_invoice_the_booking_prices_the_deal(journey):
-    """No invoice yet: the booking form's figures are the current ones."""
+def test_before_any_billing_document_nothing_is_current(journey):
+    """No billing document yet: the booking docket's figures are shown as
+    offered, never current (product owner 2026-11-02: no line item in the
+    booking is confirmed; only what a billing document carries is)."""
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
@@ -275,8 +285,10 @@ def test_before_any_invoice_the_booking_prices_the_deal(journey):
         _source(connection, journey, "COMMERCIAL", "accessories_cost", "booking_form", "20000")
         summary = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["summary"]
     assert summary["invoiceIsSourceOfTruth"] is False
-    assert Decimal(summary["net"]["current"]) == 1020000
-    assert Decimal(summary["variance"]["currentVsStandard"]) == 0
+    assert summary["net"]["current"] is None and summary["payable"] is None
+    assert Decimal(summary["net"]["booking"]) == 1020000
+    assert summary["variance"]["currentVsStandard"] is None
+    assert {a["key"] for a in summary["awaiting"]} == {"ex_showroom_price", "accessories_cost"}
 
 
 def test_a_line_awaits_its_own_document_and_is_never_zeroed_by_another_invoice(journey):
@@ -307,15 +319,17 @@ def test_a_line_awaits_its_own_document_and_is_never_zeroed_by_another_invoice(j
     rows = {r["key"]: r for g in view["categories"] for r in g["components"]}
     assert Decimal(rows["accessories_cost"]["variance"]) == 2000
     vehicle = rows["ex_showroom_price"]
-    assert vehicle["awaiting"] == "vehicle invoice" and Decimal(vehicle["current"]) == 1000000
-    assert vehicle["currentSource"] == "booking" and vehicle["variance"] is None
+    # Awaiting its own bill, with no amount: the booking's figure is never
+    # current (2026-11-02).
+    assert vehicle["awaiting"] == "vehicle invoice" and vehicle["current"] is None
+    assert vehicle["currentSource"] is None and vehicle["variance"] is None
     assert "AWAITING_DOCUMENT" in vehicle["flags"] and "NOT_INVOICED" not in vehicle["flags"]
     warranty = rows["extended_warranty_amount"]
-    assert warranty["awaiting"] == "extended warranty invoice" and Decimal(warranty["current"]) == 15000
-    # Variance vs standard is Current net less Standard net.
-    assert Decimal(summary["net"]["current"]) == 1037000 and Decimal(summary["net"]["standard"]) == 1035000
+    assert warranty["awaiting"] == "extended warranty invoice" and warranty["current"] is None
+    # Variance vs standard is Current net less Standard net, on the billed lines.
+    assert Decimal(summary["net"]["current"]) == 22000 and Decimal(summary["net"]["standard"]) == 20000
     assert Decimal(summary["variance"]["currentVsStandard"]) == 2000
-    assert Decimal(summary["variance"]["awaiting"]) == 0
+    assert summary["variance"]["awaiting"] is None
 
 
 def test_once_the_vehicle_invoice_is_on_file_only_the_invoice_counts(journey):
@@ -354,17 +368,20 @@ def test_once_the_vehicle_invoice_is_on_file_only_the_invoice_counts(journey):
         view = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     summary = view["summary"]
     assert summary["invoiceIsSourceOfTruth"] is True
-    # Booking still shown for comparison, never used for a billed line.
+    # Booking still shown as offered, never used for a billed line.
     assert Decimal(summary["net"]["booking"]) == 1110000
     rows = {r["key"]: r for g in view["categories"] for r in g["components"]}
     assert Decimal(rows["ex_showroom_price"]["variance"]) == 0
     rto = rows["road_tax_registration"]
-    assert rto["awaiting"] == "RTO challan" and Decimal(rto["current"]) == 95000 and rto["variance"] is None
+    assert rto["awaiting"] == "RTO challan" and rto["current"] is None and rto["variance"] is None
     assert "NOT_INVOICED" not in rto["flags"]
     assert rows["registration_charges"]["partOf"] == "road_tax_registration"
-    assert Decimal(summary["net"]["current"]) == 1095000
-    assert Decimal(summary["variance"]["currentVsStandard"]) == 5000
-    assert Decimal(summary["variance"]["awaiting"]) == 5000
+    # The corporate discount is on the booking only: not given (2026-11-02).
+    corporate = next(d for d in view["discounts"] if d["key"] == "CORPORATE_PRIVILEGE")
+    assert corporate["current"] is None and "NOT_INVOICED" in corporate["flags"]
+    assert Decimal(summary["net"]["current"]) == 1000000
+    assert Decimal(summary["variance"]["currentVsStandard"]) == 0
+    assert summary["variance"]["awaiting"] is None
     corporate = next(d for d in view["discounts"] if d["key"] == "CORPORATE_PRIVILEGE")
     assert corporate["current"] is None and corporate["variance"] is None
 
@@ -394,7 +411,9 @@ def test_discount_without_entitlement_is_an_over_grant(journey):
             ),
             {"t": journey.tenant_id, "j": journey.journey_id},
         )
-        _source(connection, journey, "DISCOUNT", "CORPORATE_PRIVILEGE", "booking_form", "5000")
+        # Given on a billing document (a booking docket's offer is never
+        # measured, 2026-11-02).
+        _source(connection, journey, "DISCOUNT", "CORPORATE_PRIVILEGE", "tax_invoice_tally", "5000")
         row = next(d for d in deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["discounts"]
                    if d["key"] != "MANAGEMENT_REFERRAL")
     assert Decimal(row["entitled"]) == 0 and Decimal(row["variance"]) == 5000
@@ -631,8 +650,9 @@ def test_opted_lines_read_the_invoice_once_one_exists_else_the_booking_form(jour
     assert rows["essential_kit_amount"]["opted"] == {"taken": True, "source": "booking"}
     assert rows["additional_warranty_amount"]["opted"] == {"taken": False, "source": "booking"}
     assert view["discounts"][0]["opted"] == {"taken": True, "source": "booking"}
+    # Not confirmed in-house: shown, kept out of the deal (2026-11-02).
     assert view["insurance"] == {"source": "INHOUSE", "decidedBy": "DEFAULT", "decidedAt": None, "actorId": None,
-                                 "basis": None, "invoiceOnFile": False, "vehicleInvoiced": False}
+                                 "basis": None, "invoiceOnFile": False, "vehicleInvoiced": False, "inDeal": False}
 
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
@@ -656,21 +676,29 @@ def test_self_insurance_keeps_the_premium_out_of_every_total(journey):
     add_ready_document(journey, "tax_invoice_tally", invoice_number="INV-1")
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
+        unconfirmed = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        # The premium counts once it is confirmed in-house (2026-11-02).
+        set_insurance_source(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, source="INHOUSE",
+                             actor_id=journey.actor_id, reason="Dealer policy", correlation_id="c0", via="DEAL_TAB")
         before = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
         set_insurance_source(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, source="SELF",
                              actor_id=journey.actor_id, reason="Customer brought own policy", correlation_id="c",
                              via="DEAL_TAB")
         after = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert unconfirmed["insurance"]["inDeal"] is False
+    assert next(g for g in unconfirmed["categories"] if g["code"] == "INSURANCE")["excluded"] is True
     assert before["insurance"]["source"] == "INHOUSE" and before["insurance"]["vehicleInvoiced"] is True
+    assert before["insurance"]["inDeal"] is True
     assert before["insurance"]["invoiceOnFile"] is False  # the cover note is not an invoice
-    assert Decimal(before["summary"]["gross"]["booking"]) == 1055000 and before["summary"]["components"] == 3
+    # The essential kit is on the booking only: offered, not billed.
+    assert Decimal(before["summary"]["gross"]["booking"]) == 1055000 and before["summary"]["components"] == 2
     assert after["insurance"]["source"] == "SELF" and after["insurance"]["decidedBy"] == "PC"
     insurance = next(g for g in after["categories"] if g["code"] == "INSURANCE")
     assert insurance["excluded"] is True and insurance["components"][0]["excluded"] is True
     assert insurance["components"][0]["opted"] == {"taken": False, "source": "insurance"}
     assert next(g for g in before["categories"] if g["code"] == "INSURANCE")["components"][0]["opted"] == {"taken": True, "source": "insurance"}
     assert Decimal(insurance["components"][0]["billed"]) == 40000  # still shown
-    assert Decimal(after["summary"]["gross"]["booking"]) == 1015000 and after["summary"]["components"] == 2
+    assert Decimal(after["summary"]["gross"]["booking"]) == 1015000 and after["summary"]["components"] == 1
     assert Decimal(after["summary"]["net"]["current"]) == Decimal(before["summary"]["net"]["current"]) - 40000
     assert Decimal(after["summary"]["payable"]) == Decimal(before["summary"]["payable"]) - 40000
 
@@ -785,7 +813,7 @@ def test_the_deal_screen_shows_no_variance_until_delivery_has_started(journey):
         connection.execute(
             text("INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, standard_amount, "
                  "actual_amount, actual_source_kind, source_reference) VALUES (:t, :j, 'insurance_amount', 71809, "
-                 "62029, 'EVIDENCE', 'booking_form:x')"),
+                 "62029, 'EVIDENCE', 'insurance_cover:x')"),
             {"t": journey.tenant_id, "j": journey.journey_id})
         computed = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     client = TestClient(app, raise_server_exceptions=False)
