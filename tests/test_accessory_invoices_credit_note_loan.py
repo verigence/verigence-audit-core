@@ -85,7 +85,10 @@ def test_the_statement_deal_adds_every_accessory_invoice_and_keeps_the_statement
                        invoice_date="2026-10-05", grand_total_amount="18000")
     view = _deal(journey)
     row = _row(view, "accessories_cost")
-    assert D(row["billed"]) == D(30000) and row["billedFrom"] == "invoice"
+    # What was charged is the statement's figure; the two bills are what was
+    # invoiced, beside it (product owner 2026-11-02).
+    assert D(row["billed"]) == D(30000) and row["billedFrom"] == "document"
+    assert D(row["invoiced"]) == D(30000) and row["freeByInvoice"] is None
     assert "INVOICES_DISAGREE" not in row["flags"]  # the statement agrees with the two bills
     shown = [i for i in view["invoices"] if i["documentType"].startswith("accessory_invoice")]
     assert len(shown) == 3 and sum(1 for i in shown if i.get("counted")) == 2

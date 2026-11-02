@@ -292,11 +292,23 @@ _COST_SHEET_STANDIN_TYPE = "cost_sheet_in_place_of_ndc"
 # billed for the charges it carries without a GST split; the cost sheet keeps
 # standing in for the rest (2026-10-30).
 _SETTLEMENT_TYPE = "erp_settlement"
+# A line the NDC / cost sheet does not print (TCS on many of them), taken from
+# the vehicle invoice under this name (product owner 2026-11-02: "TCS should
+# be there in NDC, Cost Sheet, worst case can be from the Invoice, same goes
+# for Ex showroom").
+_INVOICE_FALLBACK_TYPE = "vehicle_invoice_where_ndc_is_silent"
+_INVOICE_FALLBACK_KEYS = ("ex_showroom_price", "tcs_amount")
+# Invoices read under the statement policy: each bills an add-on the NDC may
+# also charge (accessories, extended warranty, RSA), never the vehicle.
+_ADDON_INVOICE_TYPES = frozenset(ACCESSORY_INVOICE_TYPES | {"ew_invoice", "rsa_invoice"})
 _COLUMN_LABELS = {
     _STATEMENT_COLUMN_TYPE: "NDC (Account Statement)",
     _COST_SHEET_STANDIN_TYPE: "Cost sheet (no NDC on file)",
     _SETTLEMENT_TYPE: "Settlement (ERP printout)",
+    _INVOICE_FALLBACK_TYPE: "Vehicle invoice (not on the NDC)",
 }
+# The dealer's statement, under any of the names it stands in the billed column.
+_STATEMENT_NORM = frozenset(_norm_type(t) for t in (_STATEMENT_COLUMN_TYPE, _COST_SHEET_STANDIN_TYPE, _SETTLEMENT_TYPE))
 _QUOTE_NORM = frozenset(_norm_type(t) for t in _QUOTE_SOURCES)
 
 
@@ -630,8 +642,13 @@ def _column_for(document_type: Any) -> str:
 # fixed order of document types, then the document id -- never the time a
 # row was last re-written (2026-10-20: "newest wins" made the Deal depend on
 # which document happened to be re-processed last).
+# The dealer's own statement comes first among the billed documents (product
+# owner 2026-11-02: the statement is first for every charge; the policy, the
+# challan and the invoices are checked against it).
 _SOURCE_ORDER = tuple(_norm_type(t) for t in (
-    "booking_form", "booking_docket", "order_taking_form", "customer_ledger", "cost_sheet",
+    "booking_form", "booking_docket", "order_taking_form",
+    _STATEMENT_COLUMN_TYPE, _SETTLEMENT_TYPE, _COST_SHEET_STANDIN_TYPE, _INVOICE_FALLBACK_TYPE,
+    "customer_ledger", "cost_sheet",
     "tax_invoice_tally", "customer_invoice_dms", "invoice_generic", "customer_invoice_dms_v2", "tax_invoice",
     "tax_invoice_dms", "accessory_invoice_dms", "accessory_invoice_tally", "ew_invoice", "rsa_invoice",
     "insurance_cover_note", "insurance_policy", "insurance_cover", "rto_challan", "rto_tax_receipt",
@@ -783,6 +800,8 @@ def _source_list(per_source: list[Any]) -> list[dict[str, Any]]:
 
 
 _RTO_COMBINED = "road_tax_registration"
+# The statement's whole RTO amount and the challan's parts added up agree within this.
+_RTO_TOLERANCE = Decimal(10)
 _RTO_PARTS = ("road_tax_amount", "registration_charges")
 
 
@@ -823,11 +842,23 @@ def _fold_registration(rows: list[dict[str, Any]], *, invoice_on_file: bool) -> 
     else:
         # Both parts on the form are added; a lone figure is the whole amount.
         booking = _money(total("booking"))
-    billed = first(_money(total("billed")), combined["billed"] if combined else None)
+    # The dealer's statement prints the whole RTO amount once: under the
+    # statement policy it is the billed figure, and the challan's parts added
+    # up are set against it, whole against whole (2026-11-02, defect 8).
+    statement_whole = (combined["billed"] if combined and combined.get("billed") is not None and any(
+        _norm_type(s.get("documentType")) in _STATEMENT_NORM for s in combined["sources"]) else None)
+    parts_billed = total("billed")
+    if statement_whole is not None:
+        billed = statement_whole
+    else:
+        billed = first(_money(parts_billed), combined["billed"] if combined else None)
     ledger = first(_money(total("ledger")), combined["ledger"] if combined else None)
     reference = _reference({"booking": booking, "billed": billed}, invoice_on_file)
     flags = _flags("COMMERCIAL", standard, booking, billed, ledger)
     if any("INVOICES_DISAGREE" in r["flags"] for r in parts) or (combined and "INVOICES_DISAGREE" in combined["flags"]):
+        flags.append("INVOICES_DISAGREE")
+    if (statement_whole is not None and parts_billed is not None
+            and abs(parts_billed - _dec(statement_whole)) > _RTO_TOLERANCE and "INVOICES_DISAGREE" not in flags):
         flags.append("INVOICES_DISAGREE")
     sources = [*(combined["sources"] if combined else []), *(src for r in parts for src in r["sources"])]
     folded = {
@@ -995,6 +1026,36 @@ def _credit_notes(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(out, key=lambda c: (str(c["date"] or ""), str(c["number"] or "")))
 
 
+# A credit note and the benefit it pays agree to the rupee (GST-inclusive on
+# both sides: ₹20,000 credit note = ₹20,000 scrappage bonus on the NDC).
+_CREDIT_NOTE_TOLERANCE = Decimal(1)
+
+
+def _link_credit_notes(credit_notes: list[dict[str, Any]], discount_rows: list[dict[str, Any]]) -> None:
+    """Which benefit each credit note pays. The credit notes print no reason
+    (Aditya and Shivnath DMS credit notes, seen 2026-11-02), so a credit note
+    is matched by its total to the one benefit of the deal with that amount
+    (the figure the Deal stands at, else what the booking offered, else the
+    entitlement). Two benefits with that amount, or none, leave it unmatched
+    and listed. Shown only: a credit note never moves the Deal's arithmetic."""
+    for note in credit_notes:
+        note["benefit"] = None
+        amount = _dec(note.get("amount"))
+        if amount is None or amount <= 0:
+            continue
+        matches = [row for row in discount_rows if any(
+            _dec(row.get(column)) is not None and abs(_dec(row.get(column)) - amount) <= _CREDIT_NOTE_TOLERANCE
+            for column in ("current", "billed", "booking", "entitled"))]
+        if len(matches) != 1:
+            note["benefitCandidates"] = [row["key"] for row in matches]
+            continue
+        row = matches[0]
+        note["benefit"] = {"key": row["key"], "label": row["label"]}
+        row.setdefault("paidByCreditNotes", []).append(
+            {"documentId": note["documentId"], "number": note["number"], "date": note["date"],
+             "amount": note["amount"]})
+
+
 def _deal_closed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
     """Delivered and past the settlement window: a line whose document never
     came is then not invoiced, no longer awaited."""
@@ -1082,12 +1143,15 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # in (product owner, 2026-10-31: a credit note is given in the scrappage
     # case), whichever source of truth the Project uses.
     credit_notes = _credit_notes(documents)
+    booking_date = plausible_from(connection, tenant_id=tenant_id, journey_id=journey_id)
+    fallback_vehicle: dict[str, Any] | None = None
     if statement_policy:
-        documents, sources = _statement_policy_sources(documents, sources)
+        policy_documents, sources = _statement_policy_sources(documents, sources)
+        sources, fallback_vehicle = _invoice_where_statement_silent(documents, sources, booking_date=booking_date)
+        documents = policy_documents
     # Each invoice read on its own and counted once (2026-10-20, R1/R2); a
     # credit note is never counted on the Deal (2026-10-31).
-    selection = deal_invoices(documents, booking_date=plausible_from(
-        connection, tenant_id=tenant_id, journey_id=journey_id), count_credit_notes=False)
+    selection = deal_invoices(documents, booking_date=booking_date, count_credit_notes=False)
     sources = _without_read_invoices(sources, selection)
     invoice_on_file, families = _invoices_on_file(sources, selection, statement_policy=statement_policy)
     vehicle_on_file = FAMILY_VEHICLE in families
@@ -1129,7 +1193,10 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # invoice is on file its standard is the statutory rate on that sale
     # value (2026-10-20), not on the list price.
     vehicle_reading = selection["vehicle"]["representative"] if selection["vehicle"] else None
-    sale_value = (vehicle_reading.get("vehicle") or {}).get("saleValue") if vehicle_reading else None
+    # Under the statement policy the vehicle invoice is not a billed source,
+    # but what it was sold for is still the sale value TCS is due on.
+    sale_reading = vehicle_reading or fallback_vehicle
+    sale_value = (sale_reading.get("vehicle") or {}).get("saleValue") if sale_reading else None
     if sale_value is not None:
         _tcs_on_sale_value(all_rows, sale_value)
 
@@ -1160,12 +1227,14 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     situation = _DealSituation(
         invoice_on_file=invoice_on_file, vehicle_on_file=vehicle_on_file, closed=closed,
         vehicle_reading=vehicle_reading, vehicle_taxes_read=vehicle_taxes_read, document_on_file=document_on_file,
+        statement_policy=statement_policy,
     )
     for row in all_rows:
         _settle_component(row, situation)
     for row in discount_rows:
         _settle_discount(row, situation, mr_key=mr_key)
 
+    _link_credit_notes(credit_notes, discount_rows)
     insurance["invoiceOnFile"] = _insurance_accounted(documents, sources, selection)
     insurance["vehicleInvoiced"] = vehicle_on_file
 
@@ -1212,7 +1281,9 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     awaiting_delta = _awaiting_delta(counted_rows, standard_discounts)
 
     paid = _paid(connection, tenant_id=tenant_id, journey_id=journey_id)
-    payable = net_cur or net_std
+    # What the customer owes is the current net; with none worked out it is
+    # unknown, never the price master's standard (2026-11-02, Deal defect 12).
+    payable = net_cur
     invoiced = sum(1 for r in counted_rows if r["billed"] is not None)
     return {
         "sku": _deal_sku_block(sku, price_plan),
@@ -1399,7 +1470,7 @@ def _statement_policy_sources(
     their own column; with no statement form, the cost sheet stands in for
     the lines the ERP settlement printout does not give."""
     documents = [d for d in documents
-                 if d["documentType"] not in _INVOICE_TYPES or d["documentType"] in ACCESSORY_INVOICE_TYPES]
+                 if d["documentType"] not in _INVOICE_TYPES or d["documentType"] in _ADDON_INVOICE_TYPES]
     sources = [
         {**s, "source_document_type": _STATEMENT_COLUMN_TYPE}
         if _norm_type(s["source_document_type"]) in _LEDGER_NORM else s
@@ -1408,15 +1479,55 @@ def _statement_policy_sources(
     if any(s["source_document_type"] == _STATEMENT_COLUMN_TYPE for s in sources):
         # A statement form is the Deal's figures; the settlement printout
         # does not add to it.
-        return documents, [s for s in sources if _norm_type(s["source_document_type"]) != _norm_type(_SETTLEMENT_TYPE)]
-    settled = {str(s["component_key"]) for s in sources
-               if _norm_type(s["source_document_type"]) == _norm_type(_SETTLEMENT_TYPE)}
+        sources = [s for s in sources if _norm_type(s["source_document_type"]) != _norm_type(_SETTLEMENT_TYPE)]
+    else:
+        settled = {str(s["component_key"]) for s in sources
+                   if _norm_type(s["source_document_type"]) == _norm_type(_SETTLEMENT_TYPE)}
+        sources = [
+            {**s, "source_document_type": _COST_SHEET_STANDIN_TYPE}
+            if _norm_type(s["source_document_type"]) in _QUOTE_NORM and s["line_kind"] == "COMMERCIAL"
+            and str(s["component_key"]) not in settled else s
+            for s in sources
+        ]
+    # The statement prints the whole RTO amount as one figure: it stands on
+    # "Road tax + registration", set against the challan's total, never on the
+    # challan's registration part (2026-11-02, Deal defect 8).
     return documents, [
-        {**s, "source_document_type": _COST_SHEET_STANDIN_TYPE}
-        if _norm_type(s["source_document_type"]) in _QUOTE_NORM and s["line_kind"] == "COMMERCIAL"
-        and str(s["component_key"]) not in settled else s
+        {**s, "component_key": _RTO_COMBINED}
+        if s["line_kind"] == "COMMERCIAL" and str(s["component_key"]) == "registration_charges"
+        and _norm_type(s["source_document_type"]) in _STATEMENT_NORM else s
         for s in sources
     ]
+
+
+def _invoice_where_statement_silent(
+    documents: list[dict[str, Any]], sources: list[dict[str, Any]], *, booking_date: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Under the statement policy: ex-showroom and TCS the NDC / cost sheet /
+    settlement does not print are taken from the vehicle invoice, under their
+    own name (_INVOICE_FALLBACK_TYPE), so the Deal shows where they came from.
+    The invoice stays out of every other line and out of "invoice on file".
+    Returns the sources with those rows added, and the vehicle invoice read
+    (its sale value is what TCS is due on)."""
+    invoices = [d for d in documents if d["documentType"] in _VEHICLE_INVOICE_TYPES]
+    if not invoices:
+        return sources, None
+    vehicle = deal_invoices(invoices, booking_date=booking_date, count_credit_notes=False)["vehicle"]
+    reading = vehicle["representative"] if vehicle else None
+    if reading is None:
+        return sources, None
+    carried = {str(s["component_key"]) for s in sources
+               if _norm_type(s["source_document_type"]) in _STATEMENT_NORM and _dec(s["amount"])}
+    added = []
+    for key in _INVOICE_FALLBACK_KEYS:
+        amount = _dec(reading["lines"].get(key))
+        if key in carried or amount is None or amount <= 0:
+            continue
+        added.append({
+            "line_kind": "COMMERCIAL", "component_key": key, "source_document_type": _INVOICE_FALLBACK_TYPE,
+            "amount": amount, "source_document_id": reading["documentId"], "invoice_number": reading["number"],
+        })
+    return list(sources) + added, reading
 
 
 def _without_read_invoices(sources: list[dict[str, Any]], selection: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1564,11 +1675,17 @@ def _component_row(
     own = [s for s in invoice_sources if s["line_kind"] == "COMMERCIAL" and s["component_key"] == key]
     cols = _columns(per_source)
     billed_from = None
-    if key in selection["lines"]:
+    invoiced = selection["lines"].get(key)
+    statement_charge = statement_policy and any(
+        _norm_type(s["source_document_type"]) in _STATEMENT_NORM and _dec(s["amount"]) is not None for s in per_source)
+    if invoiced is not None and not statement_charge:
         # Each invoice bills its own lines; distinct invoices add up,
         # copies of one invoice count once (R2).
-        cols["billed"], billed_from = selection["lines"][key], "invoice"
+        cols["billed"], billed_from = invoiced, "invoice"
     elif cols["billed"] is not None:
+        # Under the statement policy the NDC's figure is what was charged;
+        # the add-on invoices (accessories, EW, RSA) stand beside it as what
+        # was invoiced (product owner 2026-11-02).
         billed_from = "document"
     standard = line["standard_amount"] if line else None
     effective_source = None
@@ -1584,6 +1701,15 @@ def _component_row(
     if (len(other_billed) > 1 or key in disagreeing
             or (billed_from == "invoice" and other_billed and other_billed != {_dec(cols["billed"])})):
         flags.append("INVOICES_DISAGREE")
+    # The NDC charges less than the invoices bill on the accessories line when
+    # part of them is given free; on any other add-on the two must agree.
+    invoiced_beside = invoiced if statement_charge and invoiced is not None else None
+    if (invoiced_beside is not None and key not in _ADDON_COMPONENTS["accessories"]
+            and abs(_dec(invoiced_beside) - _dec(cols["billed"])) > _RTO_TOLERANCE
+            and "INVOICES_DISAGREE" not in flags):
+        flags.append("INVOICES_DISAGREE")
+    free_by_invoice = (_dec(invoiced_beside) - _dec(cols["billed"])
+                       if invoiced_beside is not None and key in _ADDON_COMPONENTS["accessories"] else None)
     return {
         "key": key,
         "label": component_label(key),
@@ -1600,6 +1726,10 @@ def _component_row(
         "bookingVsBilled": _minus(cols["billed"], cols["booking"]),
         "flags": flags,
         "sources": _source_list(per_source + own),
+        # What the add-on invoices bill for the line when the NDC's charge is
+        # the billed figure, and (accessories) the part of it not charged.
+        "invoiced": _money(invoiced_beside),
+        "freeByInvoice": _money(free_by_invoice) if free_by_invoice is not None and free_by_invoice > 0 else None,
     }
 
 
@@ -1614,7 +1744,11 @@ def _place_canonical_value(
     if statement_policy and _norm_type(effective_type) in _LEDGER_NORM:
         effective_type = _STATEMENT_COLUMN_TYPE
     column = _column_for(effective_type)
-    if (line["actual_amount"] is not None and cols[column] is None
+    # The statement's whole RTO figure stands on "Road tax + registration"
+    # (see _statement_policy_sources), never again on one of its parts.
+    statement_rto_part = (statement_policy and str(line["component_key"]) in _RTO_PARTS
+                          and _norm_type(effective_type) in _STATEMENT_NORM | _QUOTE_NORM)
+    if (line["actual_amount"] is not None and cols[column] is None and not statement_rto_part
             and _norm_type(effective_type) not in _ALL_INVOICE_NORM):
         cols[column] = line["actual_amount"]
         if column == "billed":
@@ -1789,6 +1923,7 @@ class _DealSituation:
         "closed",
         "document_on_file",
         "invoice_on_file",
+        "statement_policy",
         "vehicle_on_file",
         "vehicle_reading",
         "vehicle_taxes_read",
@@ -1796,13 +1931,22 @@ class _DealSituation:
 
     def __init__(self, *, invoice_on_file: bool, vehicle_on_file: bool, closed: bool,
                  vehicle_reading: dict[str, Any] | None, vehicle_taxes_read: bool,
-                 document_on_file: dict[str, bool]) -> None:
+                 document_on_file: dict[str, bool], statement_policy: bool = False) -> None:
         self.invoice_on_file = invoice_on_file
         self.vehicle_on_file = vehicle_on_file
         self.closed = closed
         self.vehicle_reading = vehicle_reading
         self.vehicle_taxes_read = vehicle_taxes_read
         self.document_on_file = document_on_file
+        self.statement_policy = statement_policy
+
+    def awaited(self, document: str) -> str:
+        """The document a line waits for. Under the statement policy the
+        vehicle's own figures come from the NDC, never a vehicle invoice
+        (2026-11-02, Deal defect 7)."""
+        if self.statement_policy and document == "VEHICLE":
+            return _COLUMN_LABELS[_STATEMENT_COLUMN_TYPE]
+        return _LINE_DOCUMENT_LABELS[document]
 
 
 def _settle_component(row: dict[str, Any], situation: _DealSituation) -> None:
@@ -1853,7 +1997,7 @@ def _component_current(row: dict[str, Any], situation: _DealSituation) -> None:
     row["currentSource"] = "booking" if row["booking"] is not None else None
     # Its document on file without a readable figure for it is
     # still awaited (the figure is to be read), never a nil.
-    row["awaiting"] = _LINE_DOCUMENT_LABELS[document] + (
+    row["awaiting"] = situation.awaited(document) + (
         " (on file, figure not read)" if situation.document_on_file[document] else "")
     row["flags"] = [*row["flags"], "AWAITING_DOCUMENT"]
 
@@ -1900,7 +2044,7 @@ def _discount_current(row: dict[str, Any], situation: _DealSituation) -> None:
     row["current"] = row["booking"]
     row["currentSource"] = "booking" if row["booking"] is not None else None
     if row["booking"] is not None:
-        row["awaiting"] = _LINE_DOCUMENT_LABELS["VEHICLE"]
+        row["awaiting"] = situation.awaited("VEHICLE")
         row["flags"] = [*row["flags"], "AWAITING_DOCUMENT"]
 
 

@@ -79,7 +79,12 @@ _PROOF_OF_PRODUCT: dict[str, tuple[str, ...]] = {
     "fastag_amount": ("value_added_service_document",),
 }
 # Which document the billed figure is taken from when the Deal has none.
-_BILLED_ORDER = ("customer_ledger", "cost_sheet", "customer_invoice_dms", "tax_invoice_tally", "tax_invoice_dms",
+# The dealer's statement (as the Deal names it under the statement policy)
+# comes first, so the insurance and RTO checks set the policy and the challan
+# against the statement, never against themselves (2026-11-02).
+_BILLED_ORDER = ("account_statement", "erp_settlement", "cost_sheet_in_place_of_ndc",
+                 "vehicle_invoice_where_ndc_is_silent",
+                 "customer_ledger", "cost_sheet", "customer_invoice_dms", "tax_invoice_tally", "tax_invoice_dms",
                  "tax_invoice", "customer_invoice_dms_v2", "invoice_generic", "accessory_invoice_dms",
                  "accessory_invoice_tally", "ew_invoice", "rsa_invoice", "insurance_cover", "rto_challan",
                  "credit_note", "debit_note")

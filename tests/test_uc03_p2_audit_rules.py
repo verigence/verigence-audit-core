@@ -309,6 +309,9 @@ def test_the_financiers_loan_payment_is_not_third_party(journey):
 def test_short_payment_at_delivery_and_the_seven_day_windows(journey):
     delivered = TODAY - timedelta(days=20)
     _line(journey, "ex_showroom_price", "1000000", "1000000")
+    # What the deal stands at (the booking form here), never the price master's
+    # standard, is what is payable (2026-11-02).
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
     _deliver(journey, delivered)
     _receipt(journey, "600000", delivered - timedelta(days=2), "R-1")
     _receipt(journey, "300000", delivered + timedelta(days=3), "R-2")
@@ -332,6 +335,9 @@ def test_short_payment_at_delivery_and_the_seven_day_windows(journey):
 
 def test_balance_still_outstanding_waits_for_the_window_then_fails(journey):
     _line(journey, "ex_showroom_price", "1000000", "1000000")
+    # What the deal stands at (the booking form here), never the price master's
+    # standard, is what is payable (2026-11-02).
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
     _deliver(journey, TODAY - timedelta(days=2))
     _receipt(journey, "900000", TODAY - timedelta(days=3), "R-1")
     result = _run(journey, "DELIVERY")
@@ -349,6 +355,9 @@ def test_balance_still_outstanding_waits_for_the_window_then_fails(journey):
 
 def test_financier_windows(journey):
     _line(journey, "ex_showroom_price", "1000000", "1000000")
+    # What the deal stands at (the booking form here), never the price master's
+    # standard, is what is payable (2026-11-02).
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
     _deliver(journey, TODAY - timedelta(days=20))
     _receipt(journey, "500000", TODAY - timedelta(days=22), "R-1")
     _sql(journey, "INSERT INTO auditcore.finance_records (tenant_id, journey_id, provider_name, financed_amount) "
