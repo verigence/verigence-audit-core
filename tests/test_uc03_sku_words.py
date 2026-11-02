@@ -215,3 +215,28 @@ def test_r1_nothing_to_go_on():
     assert invoice_ex_showroom({})[0] is None
     # A generic invoice that prints no purpose is no vehicle invoice on its own.
     assert invoice_ex_showroom({**_R1_BASE, "gross_amount_before_discount": "722033.90"}, "invoice_generic")[0] is None
+
+
+def test_xuv_700_on_a_booking_form_is_read_as_the_xuv_7xo_and_the_variant_still_decides() -> None:
+    """Product owner 2 Nov 2026: no book since September prints an XUV 700, only
+    the XUV 7XO that replaced it, so "XUV 700" names the XUV 7XO -- tried after
+    the model the words name, never instead of it."""
+    from audit_core.oem_price_masters import (
+        _SUCCESSOR_IDENTITY,
+        model_identity_keys,
+        price_list_model_key,
+    )
+
+    assert model_identity_keys("XUV 700") == ["XUV700", "XUV7XO"]
+    assert model_identity_keys("XUV700") == ["XUV700", "XUV7XO"]
+    assert model_identity_keys("XUV 7XO") == ["XUV7XO"]
+
+    def named(model, variant):
+        result = identify(rows=ROWS, model_text=model, variant_text=variant, aliases=ALIASES,
+                          identity=price_list_model_key, successors=dict(_SUCCESSOR_IDENTITY))
+        return result.status, (result.row or {}).get("sku_code")
+
+    assert named("XUV 700", "AX7L DSL AT 6 STR") == ("IDENTIFIED", "XUV 7XO::AX7L DSL AT 6 STR")
+    assert named("XUV 700", "AX7L DSL AT 6 STR") == named("XUV 7XO", "AX7L DSL AT 6 STR")
+    # An electric pack's words fit no XUV 7XO: never pinned to one.
+    assert named("XUV 700", "Pack 3 B79")[0] != "IDENTIFIED"
