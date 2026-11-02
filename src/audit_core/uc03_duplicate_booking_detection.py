@@ -690,7 +690,7 @@ _CHASSIS_TAIL = 8
 
 
 def _booking_numbers(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, set[str]]:
-    out: dict[str, set[str]] = {"B": set(), "R": set(), "C": set()}
+    out: dict[str, set[str]] = {"B": set(), "R": set(), "C": set(), "M": set()}
     for row in connection.execute(
         text(_BOOKING_NUMBERS_SQL), {"tenant_id": tenant_id, "journey_id": journey_id}
     ).mappings().all():
@@ -699,16 +699,50 @@ def _booking_numbers(connection: Connection, *, tenant_id: str, journey_id: UUID
             continue
         # A chassis is printed in full or by its last digits ("T2H36974").
         out[row["kind"]].add(number[-_CHASSIS_TAIL:] if row["kind"] == "C" else number)
+    # The vehicle model (2026-11-02): its identity across spellings, the
+    # Bolero family split by series (#468).
+    vehicle = connection.execute(
+        text("SELECT model_name_snapshot, variant_name_snapshot FROM auditcore.journey_products "
+             "WHERE tenant_id = :t AND journey_id = :j"), {"t": tenant_id, "j": journey_id},
+    ).first()
+    if vehicle is not None and vehicle[0]:
+        from audit_core.oem_price_masters import price_list_model_key
+
+        out["M"].add(price_list_model_key(vehicle[0], vehicle[1]))
     return out
 
 
 def different_bookings(left: dict[str, set[str]], right: dict[str, set[str]]) -> bool:
     """Whether two bookings' own numbers show they are different bookings: no
     booking number, receipt or chassis in common, and different booking
-    numbers or different vehicles on both."""
+    numbers or different vehicles on both -- a different chassis, or (product
+    owner, 2026-11-02: "different booking numbers or vehicles") a different
+    model (SAROJ KUMAR PANIGRAHI: an XEV 9S at one dealership and an XUV 700
+    at another, nothing in common). A shared number always keeps the pair: a
+    misread model never splits one booking (Monika Sahu's copies share a
+    receipt)."""
     if any(left[kind] & right[kind] for kind in ("B", "R", "C")):
         return False
-    return bool((left["B"] and right["B"]) or (left["C"] and right["C"]))
+    if (left["B"] and right["B"]) or (left["C"] and right["C"]):
+        return True
+    return bool(left.get("M") and right.get("M") and not left["M"] & right["M"])
+
+
+def _withdrawn(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """A booking the team cancelled or closed as a duplicate (2026-11-02):
+    the duplicate is dealt with, and a cancelled booking is no one's copy --
+    it is never paired."""
+    return bool(connection.execute(
+        text(
+            """
+            SELECT EXISTS (
+              SELECT 1 FROM auditcore.journey_stage_states
+              WHERE tenant_id = :t AND journey_id = :j AND stage_code = 'BOOKING'
+                AND business_status IN ('BOOKING_CANCELLED', 'DUPLICATE_BOOKING'))
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one())
 
 
 def _booking_confirm_date(connection: Connection, *, tenant_id: str, journey_id: UUID) -> Any:
@@ -928,7 +962,8 @@ def sync_duplicate_booking_detection(
         # clear it but by hand. Fall through with no candidates instead.
         candidates = (
             _candidate_journeys(connection, tenant_id=tenant_id, journey_id=journey_id)
-            if signals is not None else []
+            if signals is not None and not _withdrawn(connection, tenant_id=tenant_id, journey_id=journey_id)
+            else []
         )
         this_journey_created = connection.execute(
             text("SELECT created_at_utc FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
@@ -942,6 +977,8 @@ def sync_duplicate_booking_detection(
             basis = _match_basis(signals, candidate)
             if basis is None:
                 continue
+            if _withdrawn(connection, tenant_id=tenant_id, journey_id=candidate["journey_id"]):
+                continue  # cancelled or closed as a duplicate: never paired
             if own_numbers is None:
                 own_numbers = _booking_numbers(connection, tenant_id=tenant_id, journey_id=journey_id)
             if different_bookings(own_numbers, _booking_numbers(
