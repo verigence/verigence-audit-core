@@ -94,3 +94,47 @@ def test_a_ledger_receipt_not_in_the_file_is_counted_once_and_the_loan_never_twi
     # Synced again: nothing added twice.
     _sync(journey)
     assert D(_payments(journey)["receiptsTotal"]) == D(291000)
+
+
+def test_each_receipt_stands_for_one_posting_whatever_the_date_gap(journey) -> None:
+    """Live 2026-11-02: Balabhadra Dash's Rs 70,000 cash booking amount of
+    03-10 posted 21 days later as a transfer from "SABITA RANI DASH"; Debasmita
+    Pradhan's two Rs 1,00,000 receipts. Same money is counted once; two equal
+    payments are two."""
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    add_receipt_payment(journey, amount="70000", receipt_number="R-1", receipt_date="2026-10-03")
+    add_receipt_payment(journey, amount="100000", receipt_number="R-2", receipt_date="2026-09-30")
+    _ledger(journey, [
+        {"entry_date": "2026-10-24", "particulars_raw": "SABITA RANI DASH", "voucher_type": "Journal_NonGST",
+         "voucher_number": "TRANS/OCT/T6K88982", "credit_amount": 70000, "running_balance": "70,000.00 Cr"},
+        {"entry_date": "2026-09-30", "particulars_raw": "ICICI BANK (788005000453)", "voucher_type": "Receipt",
+         "voucher_number": "PB/26-27/0501", "credit_amount": 100000, "running_balance": "1,70,000.00 Cr"},
+        {"entry_date": "2026-09-30", "particulars_raw": "ICICI BANK (788005000453)", "voucher_type": "Receipt",
+         "voucher_number": "PB/26-27/0502", "credit_amount": 100000, "running_balance": "2,70,000.00 Cr"},
+    ])
+    _sync(journey)
+    view = _payments(journey)
+    assert [(i["receiptNumber"], D(i["amount"])) for i in view["items"] if i.get("fromLedger")] == [
+        ("PB/26-27/0502", D(100000))]
+    assert D(view["receiptsTotal"]) == D(270000)
+
+
+def test_a_disbursement_net_of_the_lenders_charges_is_the_loan(journey) -> None:
+    """Live 2026-11-02 (Chinmay Kumar Gajendra): sanction Rs 12,57,000, the
+    ledger's credit Rs 12,50,000 -- the loan, never a customer payment too."""
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    add_ready_document(journey, "bank_approval_letter", process_area="DELIVERY",
+                       finance_sanctioned_amount="1257000", financier_name="KOTAK MAHINDRA BANK LTD",
+                       finance_sanction_date="2026-09-15")
+    _ledger(journey, [
+        {"entry_date": "2026-09-23", "particulars_raw": "ICICI BANK (788005000453) BRS Date: 23",
+         "voucher_type": "Receipt", "voucher_number": "PB/26-27/0400", "credit_amount": 1250000,
+         "running_balance": "12,50,000.00 Cr"},
+        {"entry_date": "2026-09-23", "particulars_raw": "ICICI BANK (788005000453) BRS Date: 23",
+         "voucher_type": "Receipt", "voucher_number": "PB/26-27/0401", "credit_amount": 582229,
+         "running_balance": "18,32,229.00 Cr"},
+    ])
+    _sync(journey)
+    view = _payments(journey)
+    assert [(i["receiptNumber"], D(i["amount"])) for i in view["items"] if i.get("fromLedger")] == [
+        ("PB/26-27/0401", D(582229))]
