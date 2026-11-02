@@ -619,8 +619,6 @@ def summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
             LEFT JOIN auditcore.journey_products jp
               ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
             LEFT JOIN auditcore.product_skus sku ON sku.product_sku_id=jp.product_sku_id
-            LEFT JOIN auditcore.product_models pm ON pm.model_id=sku.model_id
-            LEFT JOIN auditcore.product_variants pv ON pv.variant_id=sku.variant_id
             WHERE j.tenant_id=:t AND j.journey_id=:j
             """
         ),
@@ -1622,6 +1620,8 @@ def _deal_sku(connection: Connection, params: dict[str, Any]) -> Any:
             LEFT JOIN auditcore.journey_products jp
               ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
             LEFT JOIN auditcore.product_skus sku ON sku.product_sku_id=jp.product_sku_id
+            LEFT JOIN auditcore.product_models pm ON pm.model_id=sku.model_id
+            LEFT JOIN auditcore.product_variants pv ON pv.variant_id=sku.variant_id
             WHERE j.tenant_id=:t AND j.journey_id=:j
             """
         ),
