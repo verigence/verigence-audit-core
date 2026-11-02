@@ -435,11 +435,12 @@ def _standards_known(facts: _Facts) -> bool:
 
 
 def _charged(row: dict[str, Any] | None) -> Decimal | None:
-    """What the customer is charged for a component: the invoice, else the
-    booking form, else the reconciled actual."""
+    """What the customer is charged for a component: what a billing document
+    charges, never the booking docket's offer (product owner 2026-11-02: no
+    booking value is used to calculate a variance)."""
     if row is None:
         return None
-    return next((_dec(row[c]) for c in ("billed", "booking", "effective") if row[c] is not None), None)
+    return _dec(row["billed"]) if row.get("billed") is not None else None
 
 
 _NO_STANDARD = "No standard price on record yet: the model must be resolved against a published price list first."

@@ -83,7 +83,6 @@ _PROOF_OF_PRODUCT: dict[str, tuple[str, ...]] = {
 # comes first, so the insurance and RTO checks set the policy and the challan
 # against the statement, never against themselves (2026-11-02).
 _BILLED_ORDER = ("account_statement", "erp_settlement", "cost_sheet_in_place_of_ndc",
-                 "vehicle_invoice_where_ndc_is_silent",
                  "customer_ledger", "cost_sheet", "customer_invoice_dms", "tax_invoice_tally", "tax_invoice_dms",
                  "tax_invoice", "customer_invoice_dms_v2", "invoice_generic", "accessory_invoice_dms",
                  "accessory_invoice_tally", "ew_invoice", "rsa_invoice", "insurance_cover", "rto_challan",
@@ -455,6 +454,7 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     summary = deal.get("summary") or {}
     delivery_started = bool(summary.get("deliveryStarted"))
     self_insured = (deal.get("insurance") or {}).get("source") == "SELF"
+    in_deal = bool((deal.get("insurance") or {}).get("inDeal"))
 
     charges, products = [], []
     for group in deal.get("categories") or []:
@@ -549,7 +549,9 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         "creditNotes": {"count": len(credit_notes),
                         "total": money(sum((dec(c.get("amount")) or Decimal(0) for c in credit_notes), Decimal(0))),
                         "items": credit_notes},
-        "insurance": {"by": "Self (customer's own)" if self_insured else "In-house (through the dealership)",
+        "insurance": {"by": "Self (customer's own)" if self_insured
+                      else "In-house (through the dealership)" if in_deal
+                      else "Not confirmed: kept out of the deal until the PC confirms",
                       "decidedBy": (deal.get("insurance") or {}).get("decidedBy"),
                       "basis": (deal.get("insurance") or {}).get("basis")},
     }

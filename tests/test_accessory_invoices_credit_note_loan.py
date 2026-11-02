@@ -155,7 +155,10 @@ def test_the_statement_deal_lists_the_credit_note(journey) -> None:
     view = _deal(journey)
     assert [(c["number"], D(c["amount"]), c["reason"]) for c in view["creditNotes"]] == \
         [("CN-7", D(25000), "Scrappage incentive")]
-    assert view["summary"]["net"]["current"] == before  # information only
+    # A billing document (2026-11-02): its reason names the benefit, which the
+    # statement does not give, so the scrappage bonus is given by it, once.
+    assert view["creditNotes"][0]["benefit"]["key"] == "SCRAPPAGE_BONUS_DEALER"
+    assert D(view["summary"]["net"]["current"]) == D(before) - 25000
 
 
 # ── 4. the loan without a receipt ────────────────────────────────────────────

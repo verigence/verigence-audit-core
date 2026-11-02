@@ -336,12 +336,13 @@ def test_an_accessory_invoice_alone_zeroes_neither_the_vehicle_nor_the_insurance
     rows = _rows(view)
     assert rows["ex_showroom_price"]["awaiting"] == "vehicle invoice"
     assert rows["insurance_amount"]["awaiting"] == "insurance cover"
-    assert Decimal(rows["ex_showroom_price"]["current"]) == 852000
-    assert Decimal(rows["insurance_amount"]["current"]) == 45225
+    # Awaiting their own bills with no amount: the booking's figures are
+    # never current (product owner 2026-11-02).
+    assert rows["ex_showroom_price"]["current"] is None and rows["insurance_amount"]["current"] is None
     assert Decimal(rows["accessories_cost"]["current"]) == Decimal("7457.01")
     summary = view["summary"]
-    assert Decimal(summary["net"]["current"]) == Decimal("904682.01")
-    assert Decimal(summary["payable"]) == Decimal("904682.01")
+    assert Decimal(summary["net"]["current"]) == Decimal("7457.01")
+    assert Decimal(summary["payable"]) == Decimal("7457.01")
     assert not any("NOT_INVOICED" in r["flags"] for r in rows.values())
 
 
@@ -388,8 +389,11 @@ def test_utkal_like_totals_variance_is_current_net_less_standard_net(journey):
     assert discounts["ADDITIONAL_DISCOUNT"]["billed"] == "5000.00"
     # Unclaimed exchange / scrappage are shown, not subtracted from the standard.
     assert discounts["EXCHANGE_BONUS"]["inStandard"] is False and discounts["SCRAPPAGE_BONUS_COD"]["inStandard"] is False
-    assert Decimal(summary["net"]["standard"]) == Decimal("1151376.54")
-    assert Decimal(summary["net"]["current"]) == Decimal("1146376.53")
+    # The RSA and the FASTag are on the booking only, and the policy carries no
+    # dealer code (insurance not confirmed in-house): none of them is billed,
+    # so none is in either net (2026-11-02).
+    assert Decimal(summary["net"]["standard"]) == Decimal("1103630.54")
+    assert Decimal(summary["net"]["current"]) == Decimal("1098630.53")
     assert Decimal(summary["variance"]["currentVsStandard"]) == (
         Decimal(summary["net"]["current"]) - Decimal(summary["net"]["standard"])) == Decimal("-5000.01")
 
