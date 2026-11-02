@@ -177,7 +177,7 @@ def _requirement(journey, key: str):
             {"t": journey.tenant_id, "j": journey.journey_id, "k": key}).scalar_one()
 
 
-def _copy_on_file(journey, requirement, *, batch, page: int, sha: str):
+def _copy_on_file(journey, requirement, *, batch, page: int, sha: str, group: bool = False):
     document_id = uuid4()
     with journey.engine.begin() as c:
         set_tenant_context(c, journey.tenant_id)
@@ -187,7 +187,7 @@ def _copy_on_file(journey, requirement, *, batch, page: int, sha: str):
                        "'DELIVERY_DOCUMENT', 'DELIVERY', 'ACTIVE')"),
                   {"t": journey.tenant_id, "j": journey.journey_id, "c": journey.customer_id, "s": uuid4(),
                    "d": document_id, "r": requirement})
-        _queue(c, journey, batch=batch, page=page, sha=sha, document_id=document_id)
+        _queue(c, journey, batch=batch, page=page, sha=sha, document_id=document_id, group=group)
     return document_id
 
 
@@ -248,3 +248,64 @@ def test_the_ndc_and_cost_sheet_keep_every_copy() -> None:
     # not repeatable: a late callback for a replaced reading of the same page
     # never brings it back
     assert not _is_repeatable_requirement("customer_ledger")
+
+
+# ── STATEMENT_COPY_RESTORE ───────────────────────────────────────────────────
+def _superseded(journey, document_id) -> None:
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("UPDATE auditcore.evidence SET association_status='SUPERSEDED', "
+                       "void_reason='REPLACED_BY_NEWER_UPLOAD' WHERE tenant_id=:t AND di_document_id=:d"),
+                  {"t": journey.tenant_id, "d": document_id})
+
+
+def _status(journey, document_id) -> str:
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        return c.execute(text("SELECT association_status FROM auditcore.evidence WHERE tenant_id=:t "
+                              "AND di_document_id=:d"), {"t": journey.tenant_id, "d": document_id}).scalar_one()
+
+
+def _fields(journey, document_id, lines) -> None:
+    add_extracted_field(journey, di_document_id=document_id, field_key="line_items", value=lines,
+                        document_type="customer_ledger")
+
+
+def test_the_restore_job_brings_back_a_page_of_its_own_only(journey) -> None:
+    from audit_core.uc03_statement_copy_restore import run_statement_copy_restore
+
+    tally = [{"entry_date": "2026-10-01", "particulars_raw": "Vehicle Sales 28%", "debit_amount": 1000000,
+              "running_balance": 1000000}]
+    requirement = _requirement(journey, "customer_ledger")
+    batch = _batch(journey)
+    ndc = _copy_on_file(journey, requirement, batch=batch, page=1, sha="a" * 64)
+    _fields(journey, ndc, UTKAL)
+    _superseded(journey, ndc)  # hidden by the Tally ledger below
+    ledger = _copy_on_file(journey, requirement, batch=batch, page=2, sha="b" * 64)
+    _fields(journey, ledger, tally)
+    older_read = _copy_on_file(journey, requirement, batch=batch, page=2, sha="c" * 64, group=True)
+    _fields(journey, older_read, tally[:0])
+    _superseded(journey, older_read)  # an earlier reading of the ledger's own page
+    twin = _copy_on_file(journey, requirement, batch=batch, page=3, sha="d" * 64)
+    _fields(journey, twin, tally)
+    _superseded(journey, twin)  # the same reading on another page: adds nothing
+
+    dry = run_statement_copy_restore(journey.engine, f"{journey.tenant_id}:check")
+    assert dry["commit"] is False and dry["copies"] == 1 and dry["byKind"] == {"customer_ledger:FORM": 1}
+    assert [i["documentId"] for i in dry["items"]] == [str(ndc)]
+    assert _status(journey, ndc) == "SUPERSEDED"  # a dry run changes nothing
+
+    done = run_statement_copy_restore(journey.engine, f"{journey.tenant_id}:fix-commit")
+    assert done["commit"] is True and done["failed"] == []
+    assert (_status(journey, ndc), _status(journey, older_read), _status(journey, twin)) == (
+        "ACTIVE", "SUPERSEDED", "SUPERSEDED")
+    # idempotent
+    assert run_statement_copy_restore(journey.engine, f"{journey.tenant_id}:again")["copies"] == 0
+
+
+def test_the_restore_job_is_a_one_shot_kind() -> None:
+    from audit_core.uc03_p2_worker import _one_shot_target
+    from audit_core.uc03_statement_copy_restore import run_statement_copy_restore
+
+    target, args = _one_shot_target("STATEMENT_COPY_RESTORE", None, "t:x", [])
+    assert target is run_statement_copy_restore and args == (None, "t:x", [])

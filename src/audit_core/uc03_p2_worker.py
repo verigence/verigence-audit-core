@@ -4853,6 +4853,12 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # document type" does (2026-11-02): see uc03_page_retype.
         from audit_core.uc03_page_retype import run_page_retype
         return run_page_retype, (engine, tag, reports)
+    if kind == "STATEMENT_COPY_RESTORE":
+        # The NDC and cost-sheet pages a newer page hid when the requirement
+        # kept one document, brought back for the tenant the tag names
+        # (2026-11-02): see uc03_statement_copy_restore. A dry run lists them.
+        from audit_core.uc03_statement_copy_restore import run_statement_copy_restore
+        return run_statement_copy_restore, (engine, tag, reports)
     if kind == "OWN_COPY_RESTORE":
         # A customer's own KYC copy replaced by someone else's, restored on the
         # journey references in ``reports`` only (2026-11-01).
