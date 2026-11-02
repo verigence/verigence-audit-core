@@ -183,7 +183,10 @@ def test_the_two_grids_load_alone_with_both_scorpio_n_lines_bound(tenant) -> Non
     assert september["SCORPIO N"]["line"] == "SCORPIO N Old" and not september["SCORPIO N"]["inScope"]
     assert october["NEW SCORPIO N"]["line"] == "SCORPIO-N"
     assert october["NEW SCORPIO N"]["tiers"] == {"BASE": "0.00", "WITH_INSURANCE": "0.00", "WITH_EW_INSURANCE": "5000.00"}
-    assert september["XUV400"]["line"] == "XUV400 EV" and october["XUV400"]["line"] is None  # not in October's grid
+    # Not in the October grid: September's line (product owner, 2026-11-02).
+    assert september["XUV400"]["line"] == "XUV400 EV"
+    assert october["XUV400"]["line"] == "XUV400 EV" and october["XUV400"]["fromPreviousGrid"]
+    assert september["BOLERO NEO PLUS"]["line"] == "BOLERO NEO" and october["BOLERO NEO PLUS"]["line"] == "BOLERO NEO"
 
     (done,) = run_master_reload(engine, f"{tag}-grids-commit", tenant_ids=[tenant_id])
     assert done["status"] == "COMMITTED", [c for c in done.get("checks", []) if not c["ok"]] or done.get("error")
