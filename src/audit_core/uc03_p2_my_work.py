@@ -7,9 +7,7 @@ PC
     journeysTotal       every Journey they ever opened at the outlet
     journeysUploaded    Journeys they uploaded a file to in the period
     bookingsUploaded    of those, Journeys uploaded to while still at booking
-    deliveriesUpdated   of those, Journeys uploaded to once in delivery (the Booking
-                        & Delivery screen's "in delivery" reading: the Journey had
-                        reached BOOKING_COMPLETE or a DELIVERY stage before the file)
+    deliveriesUpdated   of those, Journeys with a delivery page in those uploads
     gateRegister        per gate register day of the period: uploaded or not, total
                         on the register, intimated to the PC, uploaded in the tool,
                         pending with the PC and not intimated
@@ -64,9 +62,6 @@ router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-my-wo
 _READ_PERMISSION = "audit.journey.read"
 _FALLBACK_TIMEZONE = "Asia/Kolkata"
 MAX_DAYS = 31
-
-# The stages at which a Journey is in delivery (journeys:summary's "in delivery" chip).
-_DELIVERY_STAGES = ("BOOKING_COMPLETE", "DELIVERY_DOCUMENT_UPLOAD", "DELIVERY_VERIFY_DOCUMENTS", "DELIVERY_COMPLETE")
 
 # What a person does on a task (as the Daily Processing report counts work).
 _WORK_EVENTS = (
@@ -166,8 +161,11 @@ def gate_register(connection: Connection, tenant_id: str, outlets: list[dict[str
 
 def _uploads(connection: Connection, *, tenant_id: str, actor_id: str, tz: str, start: date,
              end: date) -> list[dict[str, Any]]:
-    """Journeys the caller uploaded to in the period, per outlet, and whether each
-    upload went to a Journey already in delivery."""
+    """Journeys the caller uploaded to in the period, per outlet, and whether any page of those
+    uploads was a delivery page (p2_document_queue.business_stage = 'DELIVERY'). The page's own stage
+    is used, not the Journey's stage trail: on live data most Journeys never recorded a stage change,
+    which counted 1 delivery where the PC had uploaded 73 (checked 2026-11-02). A Journey uploaded to
+    with no delivery page counts as a booking upload."""
     return [dict(r) for r in connection.execute(
         text(
             """
@@ -176,24 +174,19 @@ def _uploads(connection: Connection, *, tenant_id: str, actor_id: str, tz: str, 
                        (CAST(:b AS date) + 1)::timestamp AT TIME ZONE :tz AS e
             )
             SELECT ub.journey_id, j.outlet_id,
-                   COALESCE(LEAST(
-                      (SELECT MIN(e.created_at_utc) FROM auditcore.p2_activity_events e
-                       WHERE e.tenant_id=ub.tenant_id AND e.journey_id=ub.journey_id
-                         AND e.event_type='STAGE_CHANGED' AND (e.details->>'to') = ANY(:stages)),
-                      ds.first_started_at_utc
-                   ) <= ub.created_at_utc, false) AS delivery
+                   COALESCE(bool_or(q.business_stage = 'DELIVERY'), false) AS delivery
             FROM auditcore.p2_upload_batches ub
             CROSS JOIN b
             JOIN auditcore.journeys j ON j.tenant_id=ub.tenant_id AND j.journey_id=ub.journey_id
-            LEFT JOIN auditcore.journey_stage_states ds
-              ON ds.tenant_id=j.tenant_id AND ds.journey_id=j.journey_id AND ds.stage_code='DELIVERY'
+            LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id=ub.tenant_id AND q.batch_id=ub.batch_id
             WHERE ub.tenant_id=:t AND ub.uploaded_by_actor_id=:me
               AND ub.created_at_utc >= b.s AND ub.created_at_utc < b.e
               AND ub.batch_status <> 'AWAITING_UPLOAD'
               AND NOT (ub.batch_status='CANCELLED' AND ub.page_count=0)
+            GROUP BY ub.journey_id, j.outlet_id
             """
         ),
-        {"t": tenant_id, "me": actor_id, "tz": tz, "a": start, "b": end, "stages": list(_DELIVERY_STAGES)},
+        {"t": tenant_id, "me": actor_id, "tz": tz, "a": start, "b": end},
     ).mappings().all()]
 
 
@@ -227,12 +220,15 @@ def _tasks_pending(connection: Connection, *, tenant_id: str, actor_id: str, rol
             LEFT JOIN auditcore.journeys j ON j.tenant_id = t.tenant_id AND j.journey_id = t.journey_id
             WHERE t.tenant_id = :t AND {_OPEN_SQL}
               AND (t.assigned_actor_id = :me
-                   OR (t.assigned_actor_id IS NULL AND upper(t.assigned_role_code) = ANY(CAST(:roles AS text[]))))
+                   OR (t.assigned_actor_id IS NULL AND upper(t.assigned_role_code) = ANY(CAST(:roles AS text[]))
+                       -- A PC's Journey tasks are those of the Journeys they opened; another PC's
+                       -- bookings at the same outlet are not theirs to clear.
+                       AND (:role <> 'PC' OR t.journey_id IS NULL OR j.created_by_actor_id = :me)))
               AND COALESCE(t.outlet_id, j.outlet_id) = ANY(CAST(:ids AS uuid[]))
             GROUP BY 1
             """
         ),
-        {"t": tenant_id, "me": actor_id, "roles": roles_closable_by(role), "ids": outlet_ids},
+        {"t": tenant_id, "me": actor_id, "roles": roles_closable_by(role), "ids": outlet_ids, "role": role},
     ).mappings().all()}
 
 
