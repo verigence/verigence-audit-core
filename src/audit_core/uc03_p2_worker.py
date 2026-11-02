@@ -4678,6 +4678,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # file (2026-11-02): see uc03_p2_our_side_reupload. A dry run lists them.
         from audit_core.uc03_p2_our_side_reupload import run_our_side_reupload
         return run_our_side_reupload, (engine, tag, reports)
+    if kind == "DUPLICATE_MERGE":
+        # The documents only a duplicate copy holds go to the booking kept
+        # (2026-11-02), before the copy is purged: see uc03_duplicate_merge.
+        from audit_core.uc03_duplicate_merge import run_duplicate_merge
+        return run_duplicate_merge, (engine, tag, reports)
     if kind == "UNREAD_REREAD":
         # Documents whose read never finished are read again from their
         # stored pages (2026-11-01): see uc03_p2_unread_reread. A dry run lists them.
