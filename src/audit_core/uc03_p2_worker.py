@@ -4848,6 +4848,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # every booking of every Project, or only the references in ``reports``.
         from audit_core.uc03_booking_rebuild import run_booking_rebuild
         return run_booking_rebuild, (engine, tag, _active_tenants(engine), reports)
+    if kind == "PAGE_IMAGES":
+        # A picture of up to three stored pages, returned on the job row, read
+        # only (2026-11-02): see uc03_page_images.
+        from audit_core.uc03_page_images import run_page_images
+        return run_page_images, (engine, tag, reports)
     if kind == "OWN_COPY_RESTORE":
         # A customer's own KYC copy replaced by someone else's, restored on the
         # journey references in ``reports`` only (2026-11-01).
