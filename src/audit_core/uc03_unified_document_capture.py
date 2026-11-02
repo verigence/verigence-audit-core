@@ -597,9 +597,16 @@ def apply_di_classification(
     delivery_started = False
     corrected_to_delivery = False
     corrected_to_booking = False
+    # A document its reading filed as a Form 21 (uc03_form_21) stays one: DI's
+    # own classification of it, read again on every poll, is an invoice type.
+    from audit_core.uc03_form_21 import FORM_21_DI_TYPE, form_21_documents
+
+    filed_form_21 = form_21_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
     for item in di_documents:
         document_id = UUID(str(item["documentId"]))
-        classified_type = item.get("classifiedDocumentTypeKey")
+        classified_type = (
+            FORM_21_DI_TYPE if str(document_id) in filed_form_21 else item.get("classifiedDocumentTypeKey")
+        )
         stage_code, requirement_key = resolve_document_stage(
             connection,
             classified_type,

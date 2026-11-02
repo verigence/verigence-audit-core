@@ -309,6 +309,9 @@ def test_the_financiers_loan_payment_is_not_third_party(journey):
 def test_short_payment_at_delivery_and_the_seven_day_windows(journey):
     delivered = TODAY - timedelta(days=20)
     _line(journey, "ex_showroom_price", "1000000", "1000000")
+    # What the deal stands at (the booking form here), never the price master's
+    # standard, is what is payable (2026-11-02).
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
     _deliver(journey, delivered)
     _receipt(journey, "600000", delivered - timedelta(days=2), "R-1")
     _receipt(journey, "300000", delivered + timedelta(days=3), "R-2")
@@ -332,6 +335,9 @@ def test_short_payment_at_delivery_and_the_seven_day_windows(journey):
 
 def test_balance_still_outstanding_waits_for_the_window_then_fails(journey):
     _line(journey, "ex_showroom_price", "1000000", "1000000")
+    # What the deal stands at (the booking form here), never the price master's
+    # standard, is what is payable (2026-11-02).
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
     _deliver(journey, TODAY - timedelta(days=2))
     _receipt(journey, "900000", TODAY - timedelta(days=3), "R-1")
     result = _run(journey, "DELIVERY")
@@ -349,6 +355,9 @@ def test_balance_still_outstanding_waits_for_the_window_then_fails(journey):
 
 def test_financier_windows(journey):
     _line(journey, "ex_showroom_price", "1000000", "1000000")
+    # What the deal stands at (the booking form here), never the price master's
+    # standard, is what is payable (2026-11-02).
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "booking_form", "1000000")
     _deliver(journey, TODAY - timedelta(days=20))
     _receipt(journey, "500000", TODAY - timedelta(days=22), "R-1")
     _sql(journey, "INSERT INTO auditcore.finance_records (tenant_id, journey_id, provider_name, financed_amount) "
@@ -521,7 +530,7 @@ def test_delivery_not_completed_in_time_lists_everything_pending_for_the_tl(jour
     waiting = _run(journey, "DELIVERY")["DELIVERY_NOT_COMPLETED_IN_TIME"]
     assert waiting.outcome == "SKIPPED"
     assert f"Delivery due by {(TODAY + timedelta(days=4)).strftime('%d %b %Y')}" in waiting.reason  # from the cover note
-    assert "insurance cover dated" in waiting.reason and "NDC (Account Statement)" in waiting.reason
+    assert "insurance cover dated" in waiting.reason and "Dealer statement (NDC / cost sheet)" in waiting.reason
 
     # An earlier-dated gate pass moves the clock: 8 days ago, so the window has closed.
     add_ready_document(journey, "gate_pass", delivery_date=(TODAY - timedelta(days=8)).isoformat())

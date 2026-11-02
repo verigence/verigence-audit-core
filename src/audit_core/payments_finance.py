@@ -125,12 +125,13 @@ class FinanceResponse(FinancePut):
     journeyId: UUID
     # The actual loan amount a bank/NBFC disbursed to the dealer -- distinct
     # from financedAmount above (the RTO Challan's own hypothecation
-    # charges). No document states this directly; it's resolved from the
-    # journey's own payment receipts (uc03_finance_disbursement_
-    # resolution.py). loanDisbursementConfidence is one of HIGH/MEDIUM
-    # (automatic), PC_CONFIRMED (a human picked it), AMBIGUOUS/UNVERIFIED
+    # charges). It is the receipt linked as the loan (uc03_finance_disbursement_
+    # resolution.py: in the financier's name, or equal to the loan amount the
+    # dealer statement / Bank Approval Letter states). loanDisbursementConfidence
+    # is HIGH (automatic), PC_CONFIRMED (a human picked it), UNVERIFIED
     # (couldn't resolve -- see the FINANCE_DISBURSEMENT_REVIEW Task Queue
-    # item), or null (no financer named at all, nothing to resolve).
+    # item), or null (no financer named at all, nothing to resolve). MEDIUM is
+    # no longer written (2026-11-02: it was a guess).
     loanDisbursementAmount: Decimal | None = None
     loanDisbursementPaymentId: UUID | None = None
     loanDisbursementConfidence: str | None = None
@@ -428,11 +429,11 @@ def get_loan_disbursement_candidates(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> list[LoanDisbursementCandidate]:
-    """Every payment after the minimum booking amount, in an eligible
-    (never Cash/UPI/Card/QR) mode -- the exact same list the automatic
-    resolver considers, so a PC's pick (Task Queue or the standalone
-    Journey Documents correction) always matches what the system itself
-    already tried.
+    """Every payment of the booking in an eligible (never Cash/UPI/Card/QR)
+    mode, wherever it falls against the minimum booking amount -- the exact
+    same list the automatic resolver considers, so a PC's pick (Task Queue
+    or the standalone Journey Documents correction) always matches what the
+    system itself already tried.
 
     On the human token like get_finance (2026-10-30): on get_principal every
     call from the app's "Loan amount" dialog was a 401, never once a 200, since

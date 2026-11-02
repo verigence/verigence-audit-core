@@ -25,9 +25,10 @@ from audit_core.db import set_tenant_context
 from audit_core.uc03_account_statement import (
     KIND_FORM,
     KIND_TALLY,
+    combine_statements,
+    combined_tally_rows,
     line_rows,
     load_ledger_documents,
-    read_statement,
     statement_kind,
     statement_total,
     sync_account_statement,
@@ -120,10 +121,11 @@ def rebuild_journey(
     documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
     parsed = [(d, rows, statement_kind(rows)) for d in documents for rows in [line_rows(d["fields"].get("line_items"))]]
     forms = [rows for _, rows, kind in parsed if kind == KIND_FORM]
-    forms_fields = [d["fields"] for d, _, kind in parsed if kind == KIND_FORM]
-    tallies = [rows for _, rows, kind in parsed if kind == KIND_TALLY]
-    statement = read_statement(forms[0]) if forms else None
-    deviations = (tally_deviations(statement, tally_postings(tallies[0])) if statement and tallies else [])
+    tallies = [(d, rows) for d, rows, kind in parsed if kind == KIND_TALLY]
+    # Every copy on file, as the sync reads them (combine_statements).
+    statement, copies = combine_statements([(d, rows) for d, rows, kind in parsed if kind == KIND_FORM])
+    deviations = (tally_deviations(statement, tally_postings(combined_tally_rows(tallies)))
+                  if statement and tallies else [])
     item: dict[str, Any] = {
         "statements": len(forms), "tallies": len(tallies),
         # None when the statement has no vehicle line (str(None) is "None", which
@@ -135,7 +137,7 @@ def rebuild_journey(
         "unmapped": statement.unmapped if statement else [],
         "conflicts": statement.conflicts if statement else [],
         "tallyDeviations": [d["line"] for d in deviations],
-        "printedTotal": (str(total) if statement and (total := statement_total(forms_fields[0], statement)) is not None
+        "printedTotal": (str(total) if statement and (total := statement_total(copies.primary["fields"], statement)) is not None
                          else None),
         # information only, to spot a misread statement: never used for a check
         "chargesLessDiscounts": (str(sum(statement.components.values(), Decimal(0))

@@ -97,7 +97,9 @@ def test_a_ledger_alone_does_not_meet_the_ndc(journey):
         set_tenant_context(connection, journey.tenant_id)
         counts, items = _checklist(connection, journey)
     assert counts["customer_ledger"] == 0 and counts[PAYMENT_LEDGER_TEMPLATE] == 1
-    assert items["customer_ledger"]["required"] and not items["customer_ledger"]["received"]
+    # the NDC is met by the NDC or the cost sheet ("Dealer statement"), never by the ledger
+    assert items["DEALER_STATEMENT"]["required"] and not items["DEALER_STATEMENT"]["received"]
+    assert items["DEALER_STATEMENT"]["label"] == "Dealer statement (NDC / cost sheet)"
     assert items[PAYMENT_LEDGER_TEMPLATE]["received"] and not items[PAYMENT_LEDGER_TEMPLATE]["required"]
 
 

@@ -1656,13 +1656,16 @@ def plausible_from(connection: Connection, *, tenant_id: str, journey_id: UUID) 
 
 def load_invoice_readings(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
     """Every invoice persisted for this journey whose document is still on
-    file, read on its own."""
+    file, read on its own. A row whose document was filed as something else
+    since -- a Form 21 read as an invoice (uc03_form_21) -- is no invoice;
+    the row itself stays (the runtime role may not delete it)."""
     rows = connection.execute(
         text(
             """
             SELECT v.*
             FROM auditcore.invoice_review_values v
             WHERE v.tenant_id=:tenant_id AND v.journey_id=:journey_id
+              AND v.document_type_key = ANY(:invoice_types)
               AND NOT EXISTS (
                 SELECT 1 FROM auditcore.evidence e
                 WHERE e.tenant_id=v.tenant_id AND e.journey_id=v.journey_id
@@ -1672,7 +1675,7 @@ def load_invoice_readings(connection: Connection, *, tenant_id: str, journey_id:
             ORDER BY v.source_di_document_id
             """
         ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
+        {"tenant_id": tenant_id, "journey_id": journey_id, "invoice_types": sorted(INVOICE_DOCUMENT_TYPES)},
     ).mappings().all()
     readings = []
     for row in rows:

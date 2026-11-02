@@ -226,7 +226,7 @@ def test_delivery_readiness_lists_missing_required_documents(journey):
     result = _recompute(journey)
     missing = {item["key"] for item in result["delivery"]["missing"]}
     assert {"customer_invoice_dms", "tax_invoice_tally", "insurance_cover",
-            "customer_ledger", "cost_sheet", "payment_receipt", "vehicle_proof"} <= missing
+            "DEALER_STATEMENT", "payment_receipt", "vehicle_proof"} <= missing
     # the lender's loan-closure letter is optional; the NDC is the account statement (2026-10-28)
     assert "no_dues_certificate" not in missing
     assert "gate_pass" not in missing  # optional

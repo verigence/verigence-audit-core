@@ -168,10 +168,33 @@ def premium_on_dealer_invoice(connection: Connection, *, tenant_id: str, journey
     return best
 
 
+# The dealer's own deal sheets: the NDC / account statement, the cost sheet
+# and the ERP settlement printout (as the statement reader records them).
+_STATEMENT_TYPES = frozenset({"customer_ledger", "cost_sheet", "erp_settlement"})
+
+
+def premium_on_dealer_statement(connection: Connection, *, tenant_id: str, journey_id: UUID) -> float | None:
+    """The insurance premium the dealer's statement charges the customer, if
+    any (2026-11-02: the NDC's insurance row shows the dealer collected the
+    premium, so the insurance is in-house; it was never consulted)."""
+    from audit_core.uc03_deal_source_history import active_source_rows
+
+    amounts = [
+        _dec(row["amount"]) for row in active_source_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if row["line_kind"] == "COMMERCIAL" and str(row["component_key"]) == "insurance_amount"
+        and str(row["source_document_type"]) in _STATEMENT_TYPES
+    ]
+    positive = [a for a in amounts if a is not None and a > 0]
+    return max(positive) if positive else None
+
+
 def document_decision(connection: Connection, *, tenant_id: str, journey_id: UUID,
                       policy: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """In-house from the documents, with the reason, or None when they do not show it."""
     policy = policy if policy is not None else _policy(connection, tenant_id=tenant_id, journey_id=journey_id)
+    charged = premium_on_dealer_statement(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if charged is not None:
+        return {"source": INHOUSE, "basis": f"The dealer's statement charges the insurance premium (Rs {charged:,.0f})."}
     if policy is not None:
         known = dealer_codes(connection, tenant_id=tenant_id, dealer_id=policy["dealer_id"])
         for label, key in (("MISP code", "misp_code"), ("Agent code", "agent_intermediary_code")):

@@ -27,7 +27,9 @@ Three handwritten layouts exist and one computer layout:
 Reading is by label, deterministic, and never guesses: a label that names two
 things ("SHIELD WARANTY TCS"), a charge that two lines give different amounts
 for, or a label the table below does not know, is reported as unmapped and
-leaves that line blank rather than putting a figure on the wrong line.
+leaves that line blank rather than putting a figure on the wrong line. The
+working a dealer writes beside a label ("ACCESSORIES 6691 - 5000 FREE") is
+read only when it agrees with the amount printed on that line.
 
 Tally validation: when a Tally ledger and a statement are both on file for one
 Journey, the Tally's vehicle posting, finance D/O and insurance posting must
@@ -119,22 +121,50 @@ def line_rows(value: Any) -> list[dict[str, Any]]:
 # Each pattern is matched against the WHOLE normalised label, so a label that
 # carries a second item ("FASTAG CHARGESRSA", "HANDLING CHARGES TCS") matches
 # nothing and is reported, never read as the first item.
+_VLTD = r"V\.?L\.?T\.?D\.?"
+# Other charges: the Deal has one line for them, but each printed row is a
+# charge of its own, so two rows add up (a permit and a tracking device on one
+# statement, 2026-11-02); the same row given two amounts is a conflict. The
+# vehicle location tracking device ("VLTD", "VLTD COD") and the workshop billing
+# ("WORKSHOP BILLING AMOUNT COD") have no line of their own
+# (product owner 2026-11-02).
+_OTHER_CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (item, re.compile(pattern)) for item, pattern in (
+        ("PERMIT", r"PERMIT( CHARGES)?"),
+        ("IF_ANY_OTHERS", r"IF ANY OTHERS?"),
+        ("MISC", r"MISC( \(IF ANY\))?"),
+        ("VLTD", rf"{_VLTD}( COD)?"),
+        ("WORKSHOP_BILLING", r"WORKSHOP BILLING( AMOUNT)?( COD)?"),
+    )
+)
 _CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (key, re.compile(pattern)) for key, pattern in (
         ("ex_showroom_price", r"EX[- ]?SHOW ?ROOM( PRICE( OF VEHICLE)?)?|VEHICLE COST"),
-        ("tcs_amount", r"TCS( ON INVOICE)?( \d+(\.\d+)?%)?"),
+        # The Utkal form prints its TCS row as "W/s billing TCS (1%)"; read also
+        # as "W/S BILLING", "W/S BILLING TCS(1%)" and "W/S BILLING TU (1%)", and
+        # every amount on it is 1% of the sale (five live statements, 2026-11-02).
+        ("tcs_amount", r"TCS( ON INVOICE)?( \d+(\.\d+)?%)?|W/S BILLING( TCS| TU)? ?(\( ?1 ?%\)|1 ?%)?"),
         ("insurance_amount", r"INSURANCE( AMOUNT| COST)?( \((NORMAL|NIL DEP)\))?"),
-        ("registration_charges", r"REGISTRATION( COST| CHARGES)?( BH)?|ONLINE RTO|RTO CHARGES.*"),
-        ("other_charges", r"PERMIT( CHARGES)?|IF ANY OTHERS?|MISC( \(IF ANY\))?"),
+        ("registration_charges", r"REGISTRATION( COST| CHARGES)?( BH| \(BH\)| RTO)?|ONLINE RTO|RTO CHARGES.*"),
+        ("other_charges", "|".join(f"(?:{p.pattern})" for _, p in _OTHER_CHARGES)),
         ("accessories_cost", r"ACCESSORIES|SALE OF ACCESSORIES"),
         ("fastag_amount", r"FAST ?T?AG( CHARGES)?"),
-        ("rsa_amount", r"RSA|ROAD SIDE ASSISTANCE"),
+        # Not "RSA COD" / "RSA COP": their amounts are the certificate of
+        # deposit bought for a scrappage (Rs 20,700 / 24,143 against an RSA of
+        # Rs 2,021 on live statements, 2026-11-02), written in the RSA row.
+        ("rsa_amount", r"(RSA|ROAD SIDE ASSISTANCE)( 1 ?(YEAR|YR))?"),
         ("additional_warranty_amount",
-         r"(SHIELD|EXTENDED|EXT\.?) WARR?ANT(Y|IES)?"),
+         r"(SHIELD|EXTENDED|EXT\.?) WARR?ANT(Y|IES)?( \(\d(ST|ND|RD|TH)( ?[-+&] ?\d(ST|ND|RD|TH))? ?(YR|YEAR)S?\))?"),
         ("service_package_amount", r"SERVICE PACK(AGE)?"),
         ("handling_charges", r"HANDLING CHARGES"),
     )
 )
+# The canonical keys of the benefits the statement gives as a line of their
+# own (uc03_masters_alignment): free accessories, and the scrappage bonus of
+# the dealer or of the certificate of deposit.
+FREE_ACCESSORIES_KEY = "ACCESSORIES_KIT"
+SCRAPPAGE_DEALER_KEY = "SCRAPPAGE_BONUS_DEALER"
+SCRAPPAGE_COD_KEY = "SCRAPPAGE_BONUS_COD"
 # Discounts, to the canonical discount keys the Deal already uses
 # (uc03_masters_alignment: consumer offer -> CASH_DISCOUNT, the dealer's own
 # cash discount -> ADDITIONAL_DISCOUNT). The statement's figures are the final
@@ -144,8 +174,9 @@ _DISCOUNTS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("CASH_DISCOUNT", r"(SCHEME DISCOUNT|CONSUMER OFFER|CONSUMER SCHEME)( .*)?"),
         ("CORPORATE_PRIVILEGE", r"CORPORATE (DISCOUNT|OFFER)( .*)?"),
         # "EXCHANGE CLAIM" is the exchange bonus (product owner 2026-10-29, the
-        # Aditya form; written "EXCHANNGE CLAIM" on it).
-        ("EXCHANGE_BONUS", r"EXCHAN+GE (LOYALTY|BONUS|CLAIM)( .*)?"),
+        # Aditya form; written "EXCHANNGE CLAIM" on it, and read "EXCHANNG
+        # CLAIM"); "EXCHANGE LOYALITY" is the loyalty bonus misspelt.
+        ("EXCHANGE_BONUS", r"EXCHAN+GE? (LOYALI?TY|BONUS|CLAIM)( .*)?"),
         ("ADDITIONAL_DISCOUNT", r"(OTHER DISCOUNT( \(IF ANY\))?|CASH DISCOUNT)( .*)?"),
     )
 )
@@ -166,12 +197,25 @@ _SUMMARY = re.compile(
 # bonus (that is "EXCHANGE CLAIM") -- and, being already netted off the net
 # receivable, not one of the statement's received lines either.
 _OLD_VEHICLE = re.compile(r"EXCHANGED VEHICLE( VALUE)?")
-# A discount line that names a scrappage bonus does not say whether it is the
-# dealer's or the certificate of deposit's, and the two are different
-# benefits: it is reported, not filed under either.
-_SCRAPPAGE = re.compile(r".*SCRAPPAGE.*")
-# Lines that are what the customer paid, not what was billed.
-_FINANCER = re.compile(r"(FINANCER AMOUNT|FINANCE D/?O|BANK DO)( .*)?")
+_TRADE_IN = re.compile(r"TRADE IN VALUE( .*)?")
+# Scrappage is a Deal line of its own (product owner 2026-11-02): the row that
+# names the scrappage bonus is the benefit -- the certificate of deposit's
+# when it says COD, else the dealer's. The handwriting reading spells the word
+# "SCORPIGE". A row that names the scrappage but no bonus is not read as one:
+# the certificate of deposit bought for the scrappage is written that way
+# among the charges ("Scorpige" 29,143 beside "Scorpige Bonus" 20,000, whose
+# printed net value only adds up with the 29,143 charged).
+_SCRAPPAGE = re.compile(r".*\bSC(RA|OR|AR|RO)P+[AIE]?GE\b.*")
+_SCRAPPAGE_BONUS = re.compile(r".*\b(BONUS|BONOUS|BENEFIT|DISCOUNT|INCENTIVE|CLAIM)\b.*")
+_COD = re.compile(r".*(\bCOD\b|\bC\.O\.D\b|CERTIFICATE OF DEPOSIT).*")
+# Lines that are what the customer paid, not what was billed. The finance D/O
+# is also read run into what follows it ("FINANCE D/OMMFSL", "FINANCE
+# D/O-1963"), as "FINANCE D/P", as the bank's money receipt ("FINANCE HDFC MR
+# NO. PLSM/1066") or as "FINANCE" alone (product owner 2026-11-02).
+_FINANCER = re.compile(
+    r"FINANCER AMOUNT( .*)?|BANK DO( .*)?|"
+    r"FINANCE( D/?O( .*)?| D/O\S.*| D/P( .*)?| [A-Z][A-Z&.]*( [A-Z][A-Z&.]*)* MR NO\.?.*)?"
+)
 _RECEIPT = re.compile(
     r"(BOOKING AMOUNT|DEPOSITED INTO BANK|CASH|CHEQUE|ONLINE TRANSFER|TRADE IN VALUE|CASH SHORTAGE|"
     r"MR NO\.?.*|PAYMENT A/C DETAILS|REFUND)( .*)?"
@@ -182,6 +226,66 @@ _FORM_MARKERS = tuple(re.compile(p) for p in (
     r"BANK DO", r"TRADE IN VALUE", r"ONLINE TRANSFER",
 ))
 _ERP_TOTALS = re.compile(r"(TOTAL|NET) VEHICLE COST")
+
+# Handwritten working beside a charge (product owner 2026-11-02), read only
+# when it agrees with the amount printed on the line:
+#   * terms that add up to it: "ACCESSORIES (19215 + 3339)", "V.L.T.D + FITNESS
+#     = 14,000+1,000", or the amount written again: "RSA 2021";
+#   * free accessories taken off the accessories' value: "ACCESSORIES 6691 -
+#     5000 FREE", "ACCESSORIES 20785 - SCHEME 20000/-", "ACCESSORIES 5255 - 5000
+#     = 255". The amount printed is what is left to pay (the statement's net
+#     value adds up with it); the accessories are billed at their value and the
+#     free part is the free-accessories benefit. The free part is the term
+#     marked FREE / SCHEME, else the one taken off.
+# Working that does not agree ("ACCESSORIES 5000(FREE)" against 5,153,
+# "ACCESSORIES SCHEME 5000 TRUE" against 112) leaves the line unmapped.
+_WORKING_ITEMS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("accessories_cost", re.compile(r"ACCESSORIES")),
+    ("rsa_amount", re.compile(r"(MISC( \(IF ANY\))? )?RSA")),
+    ("other_charges", re.compile(rf"{_VLTD}( ?\+ ?FITNESS)?")),
+)
+_WORKING = re.compile(r"(?P<item>.+?)(?: ?=)? (?P<working>(?:\(|FREE |SCHEME )?\d.*)")
+_NUMBER = r"\d[\d,]*(?:\.\d+)?"
+_PLAIN_TERM = re.compile(rf"(?P<n>{_NUMBER})")
+_FREE_TERM = re.compile(rf"(?:(?P<before>FREE|SCHEME) )?(?P<n>{_NUMBER})(?: ?(?P<after>FREE|\(FREE\)))?")
+
+
+def _figure(text_: str) -> Decimal:
+    return Decimal(text_.replace(",", ""))
+
+
+def read_working(working: str, amount: Decimal) -> tuple[Decimal, Decimal] | None:
+    """What a line's handwritten working gives -- (the value billed, the free
+    part) -- when it agrees with the amount printed on the line; None when it
+    does not, or is not working this reads."""
+    body = re.sub(r"/[-=]+", "", working).strip()
+    left, equals, right = body.partition("=")
+    if equals and (_PLAIN_TERM.fullmatch(right.strip()) is None or _figure(right.strip()) != amount):
+        return None
+    left = left.strip()
+    if left.startswith("(") and left.endswith(")"):
+        left = left[1:-1].strip()
+    if "+" in left and "-" not in left:
+        terms = [_PLAIN_TERM.fullmatch(t.strip()) for t in left.split("+")]
+        if any(t is None for t in terms) or sum((_figure(t["n"]) for t in terms if t), Decimal(0)) != amount:
+            return None
+        return amount, Decimal(0)
+    if "-" in left and "+" not in left:
+        parts = [_FREE_TERM.fullmatch(t.strip()) for t in left.split("-")]
+        if len(parts) != 2 or parts[0] is None or parts[1] is None:
+            return None
+        marked = [bool(p["before"] or p["after"]) for p in parts]
+        if all(marked):
+            return None
+        free_at = marked.index(True) if any(marked) else 1
+        free, value = _figure(parts[free_at]["n"]), _figure(parts[1 - free_at]["n"])
+        if free <= 0 or value - free != amount:
+            return None
+        return value, free
+    single = _PLAIN_TERM.fullmatch(left)
+    if single is None or _figure(single["n"]) != amount:
+        return None
+    return amount, Decimal(0)
 
 
 def statement_kind(lines: list[dict[str, Any]]) -> str:
@@ -237,7 +341,13 @@ def _side_amount(row: dict[str, Any]) -> tuple[str, Decimal] | None:
 def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
     """Read a handwritten account statement (``FORM``) line by line."""
     out = StatementRead(kind=statement_kind(lines))
-    found: dict[tuple[str, str], list[Decimal]] = {}
+    # (kind, key, row) -> the amounts given; "row" tells apart the printed rows
+    # that add up to one line (other charges) and is "" for every other line.
+    found: dict[tuple[str, str, str], list[Decimal]] = {}
+
+    def give(kind: str, key: str, amount: Decimal, row: str = "") -> None:
+        found.setdefault((kind, key, row), []).append(amount)
+
     for row in lines:
         label = _label(row.get("particulars_raw"))
         side = _side_amount(row)
@@ -245,19 +355,25 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             continue  # a zero or empty line is not a figure
         _, amount = side
         if _OLD_VEHICLE.fullmatch(label):
-            found.setdefault(("OLD_VEHICLE", "old_vehicle_value"), []).append(amount)
+            give("OLD_VEHICLE", "old_vehicle_value", amount)
             continue
         if _SCRAPPAGE.fullmatch(label):
-            out.unmapped.append({"label": label, "amount": amount,
-                                 "why": "scrappage: the statement does not say dealer or certificate of deposit"})
+            if not _SCRAPPAGE_BONUS.fullmatch(label):
+                out.unmapped.append({"label": label, "amount": amount, "why": (
+                    "names the scrappage but no bonus: it may be the certificate of deposit bought for it")})
+                continue
+            give("DISCOUNT", SCRAPPAGE_COD_KEY if _COD.fullmatch(label) else SCRAPPAGE_DEALER_KEY, amount)
             continue
-        key = next((("COMMERCIAL", k) for k, pattern in _CHARGES if pattern.fullmatch(label)), None)
-        if key is None:
-            key = next((("DISCOUNT", k) for k, pattern in _DISCOUNTS if pattern.fullmatch(label)), None)
-        if key is None and _PRINTED_TOTAL.fullmatch(label):
-            key = ("TOTAL", "printed_total")
-        if key is not None:
-            found.setdefault(key, []).append(amount)
+        charge = next((k for k, pattern in _CHARGES if pattern.fullmatch(label)), None)
+        if charge is not None:
+            give("COMMERCIAL", charge, amount, _other_charge_row(label) if charge == "other_charges" else "")
+            continue
+        discount = next((k for k, pattern in _DISCOUNTS if pattern.fullmatch(label)), None)
+        if discount is not None:
+            give("DISCOUNT", discount, amount)
+            continue
+        if _PRINTED_TOTAL.fullmatch(label):
+            give("TOTAL", "printed_total", amount)
             continue
         if _SUMMARY.fullmatch(label):
             continue
@@ -267,21 +383,48 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             continue
         if _RECEIPT.fullmatch(label):
             out.receipts += amount
+            if _TRADE_IN.fullmatch(label):
+                # the old vehicle taken against the price, among the received
+                # lines on the Shivnath / Utkal forms: paid in kind
+                give("OLD_VEHICLE", "old_vehicle_value", amount)
+            continue
+        working = _WORKING.fullmatch(label)
+        item = next((k for k, pattern in _WORKING_ITEMS if working and pattern.fullmatch(working["item"])), None)
+        if working is not None and item is not None:
+            read = read_working(working["working"], amount)
+            if read is None or (read[1] and item != "accessories_cost"):
+                out.unmapped.append({"label": label, "amount": amount,
+                                     "why": "the working written beside it does not agree with the amount"})
+                continue
+            value, free = read
+            give("COMMERCIAL", item, value, "VLTD" if item == "other_charges" else "")
+            if free:
+                give("DISCOUNT", FREE_ACCESSORIES_KEY, free)
             continue
         out.unmapped.append({"label": label, "amount": amount, "why": "label not in the mapping"})
-    for (kind, key), amounts in sorted(found.items()):
+    totals: dict[tuple[str, str], Decimal] = {}
+    in_conflict: set[tuple[str, str]] = set()
+    for (kind, key, _), amounts in sorted(found.items()):
         distinct = sorted(set(amounts))
         if len(distinct) > 1:
             out.conflicts.append({"kind": kind, "key": key, "amounts": distinct})
+            in_conflict.add((kind, key))
             continue
+        totals[(kind, key)] = totals.get((kind, key), Decimal(0)) + distinct[0]
+    for (kind, key), value in totals.items():
+        if (kind, key) in in_conflict:
+            continue  # one of the rows that add up to it is uncertain
         if kind == "TOTAL":
-            out.printed_total = distinct[0]
-            continue
-        if kind == "OLD_VEHICLE":
-            out.old_vehicle_value = distinct[0]
-            continue
-        (out.components if kind == "COMMERCIAL" else out.discounts)[key] = distinct[0]
+            out.printed_total = value
+        elif kind == "OLD_VEHICLE":
+            out.old_vehicle_value = value
+        else:
+            (out.components if kind == "COMMERCIAL" else out.discounts)[key] = value
     return out
+
+
+def _other_charge_row(label: str) -> str:
+    return next(item for item, pattern in _OTHER_CHARGES if pattern.fullmatch(label))
 
 
 # ── the ERP "Settlement" printout (Aditya, 2026-10-30) ───────────────────────
@@ -352,20 +495,20 @@ def statement_loan(connection: Connection, *, tenant_id: str, journey_id: UUID) 
     financier, and the refunds it records: the handwritten statement form's
     financer line, else the ERP settlement's finance DO posting. None when
     neither is on file."""
-    for document in load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id):
-        rows = line_rows(document["fields"].get("line_items"))
-        kind = statement_kind(rows)
-        if kind == KIND_FORM:
-            read = read_statement(rows)
-            label = "NDC (account statement)"
-        elif kind == KIND_ERP:
-            read = read_erp_settlement(rows)
-            label = "Settlement (ERP printout)"
-        else:
+    documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+    parsed = [(d, rows, statement_kind(rows)) for d in documents for rows in [line_rows(d["fields"].get("line_items"))]]
+    statement, copies = combine_statements([(d, rows) for d, rows, kind in parsed if kind == KIND_FORM])
+    if statement is not None and (statement.financer is not None or statement.refunds):
+        origin = copies.origin.get(("STATEMENT", "financer"), copies.primary)
+        return {"loan": statement.financer, "refunds": statement.refunds, "source": "NDC (account statement)",
+                "documentId": str(origin["documentId"]) if origin else None}
+    for document, rows, kind in parsed:
+        if kind != KIND_ERP:
             continue
+        read = read_erp_settlement(rows)
         if read.financer is None and not read.refunds:
             continue
-        return {"loan": read.financer, "refunds": read.refunds, "source": label,
+        return {"loan": read.financer, "refunds": read.refunds, "source": "Settlement (ERP printout)",
                 "documentId": str(document["documentId"])}
     return None
 
@@ -413,7 +556,8 @@ def tally_deviations(statement: StatementRead, tally: dict[str, Decimal]) -> lis
     exs = statement.components.get("ex_showroom_price")
     if "vehicle" in tally and exs is not None:
         tcs = statement.components.get("tcs_amount", Decimal(0))
-        given = sum(statement.discounts.values(), Decimal(0))
+        # free accessories are taken off the accessories' bill, not the vehicle's
+        given = sum((v for k, v in statement.discounts.items() if k != FREE_ACCESSORIES_KEY), Decimal(0))
         accepted = {exs, exs + tcs, exs - given, exs + tcs - given}
         if all(abs(tally["vehicle"] - value) > TOLERANCE for value in accepted):
             out.append({"line": "vehicle", "tally": tally["vehicle"], "statement": exs,
@@ -500,6 +644,221 @@ def _difference_text(rows: list[dict[str, Any]]) -> str:
     def rupees(value: Decimal) -> str:
         return f"Rs {value:,.0f}"
     return "; ".join(f"{r['label']}: NDC {rupees(r['ndc'])}, cost sheet {rupees(r['costSheet'])}" for r in rows)
+
+
+# ── several copies of one document (2026-11-02, Deal defect 15) ──────────────
+# The NDC and the cost sheet may be on file more than once: an offer letter and
+# the final statement, two pages of one statement, a corrected copy. Every copy
+# is read; copies are never added together. The latest dated copy that prints
+# the vehicle line is the statement and gives every figure it prints; a copy
+# without the vehicle line (another page) adds only the figures that one does
+# not print; an older full copy is only compared. A figure two copies give
+# differently by more than Rs 100, or one the latest full copy no longer
+# prints, raises an information task for the PC (COPIES_DIFFERENCE_TASK).
+COPIES_DIFFERENCE_TASK = "NDC_COPIES_DIFFERENCE"
+_STATEMENT_DATE_FIELDS = ("invoice_date", "delivery_date", "period_to")
+_COST_SHEET_DATE_FIELDS = ("cost_sheet_date",)
+_FIGURE_LABELS = {
+    ("STATEMENT", "financer"): "Finance D/O",
+    ("STATEMENT", "old_vehicle_value"): "Exchanged vehicle",
+    ("STATEMENT", "printed_total"): "Net value",
+    ("SHEET", "discount_total"): "Total discount",
+    ("SHEET", "total"): "On-road total",
+}
+
+
+@dataclass
+class Copy:
+    """One copy on file: its document, its date as printed, and its figures
+    keyed (kind, key)."""
+    document: dict[str, Any]
+    day: Any
+    figures: dict[tuple[str, str], Decimal]
+    full: bool
+
+
+@dataclass
+class Combined:
+    """What the copies give together: each figure with the copy it came from,
+    the copy standing as the document, and where copies differ."""
+    figures: dict[tuple[str, str], Decimal] = field(default_factory=dict)
+    origin: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    primary: dict[str, Any] | None = None
+    used: list[dict[str, Any]] = field(default_factory=list)
+    differences: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _copy_day(fields: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    from audit_core.uc03_p2_dates import parse_extracted_date
+
+    days = []
+    for key in keys:
+        value = fields.get(key)
+        if isinstance(value, str):
+            value = value.strip().strip('"')
+        day = parse_extracted_date(value)
+        if day is not None:
+            days.append(day)
+    return max(days) if days else None
+
+
+def _newest_first(copies: list[Copy]) -> list[Copy]:
+    def order(copy: Copy) -> tuple[bool, str, float]:
+        linked = copy.document.get("linkedAtUtc")
+        stamp = linked.timestamp() if hasattr(linked, "timestamp") else 0.0
+        return (copy.day is not None, copy.day.isoformat() if copy.day is not None else "", stamp)
+
+    return sorted(copies, key=order, reverse=True)
+
+
+def combine_copies(copies: list[Copy]) -> Combined:
+    """Each figure from the copy that gives it (see the section comment)."""
+    out = Combined()
+    if not copies:
+        return out
+    ordered = _newest_first(copies)
+    primary = next((c for c in ordered if c.full), ordered[0])
+    out.primary = primary.document
+    other_full = [c for c in ordered if c.full and c is not primary]
+    pages = [c for c in ordered if not c.full and c is not primary]
+    keys = list(dict.fromkeys(k for c in ordered for k in c.figures))
+    used = {id(primary.document): primary.document}
+    for key in keys:
+        if key in primary.figures:
+            chosen: Copy | None = primary
+        elif any(key in c.figures for c in other_full):
+            chosen = None  # the latest full copy no longer prints it
+        else:
+            chosen = next(c for c in pages if key in c.figures)
+        taken = chosen.figures[key] if chosen is not None else None
+        if chosen is not None and taken is not None:
+            out.figures[key] = taken
+            out.origin[key] = chosen.document
+            used.setdefault(id(chosen.document), chosen.document)
+        for copy in ordered:
+            if copy is chosen or key not in copy.figures:
+                continue
+            if taken is None or abs(copy.figures[key] - taken) > TOLERANCE:
+                out.differences.append({
+                    "kind": key[0], "key": key[1], "label": _FIGURE_LABELS.get(key, key[1]),
+                    "taken": taken, "takenFrom": str(chosen.document["documentId"]) if chosen else None,
+                    "other": copy.figures[key], "otherFrom": str(copy.document["documentId"]),
+                })
+    out.used = list(used.values())
+    return out
+
+
+def _statement_figures(read: StatementRead) -> dict[tuple[str, str], Decimal]:
+    figures = {("COMMERCIAL", k): v for k, v in read.components.items()}
+    figures.update({("DISCOUNT", k): v for k, v in read.discounts.items()})
+    for name in ("financer", "old_vehicle_value", "printed_total"):
+        value = getattr(read, name)
+        if value is not None:
+            figures[("STATEMENT", name)] = value
+    return figures
+
+
+def combine_statements(
+    forms: list[tuple[dict[str, Any], list[dict[str, Any]]]],
+) -> tuple[StatementRead | None, Combined]:
+    """The statement the Deal reads, from every statement form on file. With
+    one copy this is exactly read_statement of it."""
+    reads = {id(document): read_statement(rows) for document, rows in forms}
+    copies = [
+        Copy(document=document, day=_copy_day(document["fields"], _STATEMENT_DATE_FIELDS),
+             figures=_statement_figures(reads[id(document)]),
+             full="ex_showroom_price" in reads[id(document)].components)
+        for document, _ in forms
+    ]
+    combined = combine_copies(copies)
+    if combined.primary is None:
+        return None, combined
+    out = StatementRead(kind=KIND_FORM)
+    for (kind, key), value in combined.figures.items():
+        if kind == "COMMERCIAL":
+            out.components[key] = value
+        elif kind == "DISCOUNT":
+            out.discounts[key] = value
+        else:
+            setattr(out, key, value)
+    # The money received is the statement's own, never added across copies:
+    # the standing copy's, else the newest other page's that prints any.
+    in_use = [reads[id(d)] for d in combined.used]
+    primary = reads[id(combined.primary)]
+    out.receipts = primary.receipts or next((r.receipts for r in in_use if r.receipts), Decimal(0))
+    out.refunds = primary.refunds or next((r.refunds for r in in_use if r.refunds), Decimal(0))
+    for read in in_use:
+        out.unmapped.extend(read.unmapped)
+        out.conflicts.extend(read.conflicts)
+    return out, combined
+
+
+def combine_cost_sheets(sheets: list[dict[str, Any]]) -> tuple[CostSheetRead | None, Combined]:
+    """The cost sheet the Deal reads, from every cost sheet on file, by the
+    same rule as the statement's copies; a copy that reads nothing is not one."""
+    copies = []
+    for document in sheets:
+        read = read_cost_sheet(document["fields"])
+        figures = {("COMMERCIAL", k): v for k, v in read.components.items()}
+        if read.discount_total is not None:
+            figures[("SHEET", "discount_total")] = read.discount_total
+        if read.total is not None:
+            figures[("SHEET", "total")] = read.total
+        if figures:
+            copies.append(Copy(document=document, day=_copy_day(document["fields"], _COST_SHEET_DATE_FIELDS),
+                               figures=figures, full="ex_showroom_price" in read.components))
+    combined = combine_copies(copies)
+    if combined.primary is None:
+        return None, combined
+    out = CostSheetRead()
+    for (kind, key), value in combined.figures.items():
+        if kind == "COMMERCIAL":
+            out.components[key] = value
+        elif key == "discount_total":
+            out.discount_total = value
+        else:
+            out.total = value
+    return out, combined
+
+
+def combined_tally_rows(tallies: list[tuple[dict[str, Any], list[dict[str, Any]]]]) -> list[dict[str, Any]]:
+    """Every voucher row of the Tally ledger pages on file, each once (a page
+    on file twice is one page), newest copy first."""
+    seen: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    ordered = sorted(tallies, key=lambda t: (
+        t[0].get("linkedAtUtc").timestamp() if hasattr(t[0].get("linkedAtUtc"), "timestamp") else 0.0),
+        reverse=True)
+    for _, lines in ordered:
+        for row in lines:
+            key = json.dumps(row, sort_keys=True, default=str)
+            if key not in seen:
+                seen.add(key)
+                rows.append(row)
+    return rows
+
+
+def _copies_text(differences: list[dict[str, Any]]) -> str:
+    def rupees(value: Decimal | None) -> str:
+        return "not printed" if value is None else f"Rs {value:,.0f}"
+
+    return "; ".join(f"{d['label']}: {rupees(d['taken'])} taken, another copy {rupees(d['other'])}"
+                     for d in differences)
+
+
+def chosen_copies(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, dict[tuple[str, str], str]]:
+    """For the Deal: which document each statement and cost-sheet figure is
+    taken from, as (line kind, key) -> document id (the sync's own choice)."""
+    documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+    forms = [(d, rows) for d in documents for rows in [line_rows(d["fields"].get("line_items"))]
+             if statement_kind(rows) == KIND_FORM]
+    _, statement = combine_statements(forms)
+    _, sheet = combine_cost_sheets(load_ledger_documents(
+        connection, tenant_id=tenant_id, journey_id=journey_id, document_type=COST_SHEET_TYPE))
+    return {
+        ACCOUNT_STATEMENT_TYPE: {k: str(d["documentId"]) for k, d in statement.origin.items()},
+        COST_SHEET_TYPE: {k: str(d["documentId"]) for k, d in sheet.origin.items()},
+    }
 
 
 # ── the journey ──────────────────────────────────────────────────────────────
@@ -705,6 +1064,36 @@ def _json_amounts(value: Any) -> Any:
     return value
 
 
+# The statement's printed figures recorded as the Deal's declared totals
+# (uc03_p2_journey360._DECLARED_TOTAL_KEYS), from the copy standing as the
+# statement.
+DECLARED_NET = "net_amount"
+DECLARED_RECEIVED = "received_amount"
+DECLARED_BALANCE = "balance_amount"
+DECLARED_OLD_VEHICLE = "old_vehicle_value"
+
+
+def _declared_figures(statement: StatementRead, copies: Combined) -> list[tuple[str, Decimal, dict[str, Any]]]:
+    primary = copies.primary
+    if primary is None:
+        return []
+    fields = primary["fields"]
+    out: list[tuple[str, Decimal, dict[str, Any]]] = []
+    net = statement_total(fields, statement)
+    if net is not None:
+        out.append((DECLARED_NET, net, copies.origin.get(("STATEMENT", "printed_total"), primary)))
+    received = _amount(fields.get("total_receipts"))
+    if received is not None and received > 0:
+        out.append((DECLARED_RECEIVED, received, primary))
+    balance = _amount(fields.get("balance_amount"))
+    if balance is not None:
+        out.append((DECLARED_BALANCE, balance, primary))
+    if statement.old_vehicle_value is not None and statement.old_vehicle_value > 0:
+        out.append((DECLARED_OLD_VEHICLE, statement.old_vehicle_value,
+                    copies.origin.get(("STATEMENT", "old_vehicle_value"), primary)))
+    return out
+
+
 def sync_account_statement(
     connection: Connection, *, tenant_id: str, journey_id: UUID,
     stage_code: Literal["BOOKING", "DELIVERY"] = "DELIVERY", correlation_id: str = "",
@@ -725,35 +1114,50 @@ def sync_account_statement(
     tallies = [(d, rows) for d, rows, kind in parsed if kind == KIND_TALLY]
 
     cleared = _withdraw_invoice_actuals(connection, tenant_id=tenant_id, journey_id=journey_id)
-    statement = read_statement(forms[0][1]) if forms else None
-    document = forms[0][0] if forms else None
+    # Every statement copy on file is read; each figure comes from the copy
+    # that gives it (combine_statements), recorded under that copy.
+    statement, copies = combine_statements(forms)
+    document = copies.primary
     keep_components = set(statement.components) if statement else set()
     keep_discounts = set(statement.discounts) if statement else set()
     lines_written = discounts_written = 0
     if statement and document:
         for key, amount in sorted(statement.components.items()):
+            origin = copies.origin.get(("COMMERCIAL", key), document)
             record_source_value(
                 connection, tenant_id=tenant_id, journey_id=journey_id, line_kind="COMMERCIAL", component_key=key,
-                source_document_type=ACCOUNT_STATEMENT_TYPE, amount=amount, evidence_id=document["evidenceId"],
-                document_id=document["documentId"],
+                source_document_type=ACCOUNT_STATEMENT_TYPE, amount=amount, evidence_id=origin["evidenceId"],
+                document_id=origin["documentId"],
             )
             if upsert_commercial_actual(
                 connection, tenant_id=tenant_id, journey_id=journey_id, component_key=key, amount=amount,
-                document_type=ACCOUNT_STATEMENT_TYPE, document_id=document["documentId"],
-                evidence_id=document["evidenceId"], record=False,
+                document_type=ACCOUNT_STATEMENT_TYPE, document_id=origin["documentId"],
+                evidence_id=origin["evidenceId"], record=False,
             ):
                 lines_written += 1
         for key, amount in sorted(statement.discounts.items()):
+            origin = copies.origin.get(("DISCOUNT", key), document)
             record_source_value(
                 connection, tenant_id=tenant_id, journey_id=journey_id, line_kind="DISCOUNT", component_key=key,
-                source_document_type=ACCOUNT_STATEMENT_TYPE, amount=amount, evidence_id=document["evidenceId"],
-                document_id=document["documentId"],
+                source_document_type=ACCOUNT_STATEMENT_TYPE, amount=amount, evidence_id=origin["evidenceId"],
+                document_id=origin["documentId"],
             )
             _write_discount(connection, tenant_id=tenant_id, journey_id=journey_id, key=key, amount=amount,
-                            document_id=document["documentId"], evidence_id=document["evidenceId"])
+                            document_id=origin["documentId"], evidence_id=origin["evidenceId"])
             discounts_written += 1
     _stale_statement_rows(connection, tenant_id=tenant_id, journey_id=journey_id,
                           keep_components=keep_components, keep_discounts=keep_discounts)
+    # The statement's own totals as it prints them, and the old vehicle's value
+    # it deducts: recorded beside the Deal (its declared totals), so the Deal is
+    # set against them and the old vehicle counts as paid in kind (2026-11-02,
+    # Deal defects 4 and 13). Never computed, never a charge.
+    if statement and document:
+        for key, amount, origin in _declared_figures(statement, copies):
+            record_source_value(
+                connection, tenant_id=tenant_id, journey_id=journey_id, line_kind="COMMERCIAL", component_key=key,
+                source_document_type=ACCOUNT_STATEMENT_TYPE, amount=amount, evidence_id=origin["evidenceId"],
+                document_id=origin["documentId"],
+            )
 
     # No statement form, but the ERP settlement printout: its charges without a
     # GST split are recorded for the Deal under their own name (the Deal view
@@ -776,13 +1180,14 @@ def sync_account_statement(
     # uc03_p2_journey360), and compared with the NDC when both are in.
     sheets = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
                                    document_type=COST_SHEET_TYPE)
-    sheet = read_cost_sheet(sheets[0]["fields"]) if sheets else None
+    sheet, sheet_copies = combine_cost_sheets(sheets)
     if sheet is not None:
         for key, amount in sorted(sheet.components.items()):
+            origin = sheet_copies.origin[("COMMERCIAL", key)]
             record_source_value(
                 connection, tenant_id=tenant_id, journey_id=journey_id, line_kind="COMMERCIAL", component_key=key,
-                source_document_type=COST_SHEET_TYPE, amount=amount, evidence_id=sheets[0]["evidenceId"],
-                document_id=sheets[0]["documentId"],
+                source_document_type=COST_SHEET_TYPE, amount=amount, evidence_id=origin["evidenceId"],
+                document_id=origin["documentId"],
             )
     differences = (cost_sheet_differences(statement, document["fields"], sheet)
                    if statement is not None and document is not None and sheet is not None else [])
@@ -797,12 +1202,34 @@ def sync_account_statement(
             ),
             reference=_json_amounts({"differences": differences,
                                      "ndcDocumentId": str(document["documentId"]) if document else None,
-                                     "costSheetDocumentId": str(sheets[0]["documentId"]) if sheets else None}),
+                                     "costSheetDocumentId": (str(sheet_copies.primary["documentId"])
+                                                             if sheet_copies.primary else None)}),
             severity="HIGH",
         )
     else:
         _resolve_task(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=COST_SHEET_DIFFERENCE_TASK,
                       evidence={"ndcOnFile": statement is not None, "costSheetOnFile": sheet is not None})
+
+    # Copies of the NDC, or of the cost sheet, that give a figure differently:
+    # for information, the PC closes it with a comment.
+    copy_differences = [{**d, "document": "NDC"} for d in copies.differences] + [
+        {**d, "document": "Cost sheet"} for d in sheet_copies.differences]
+    if copy_differences:
+        _raise_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id, task_type=COPIES_DIFFERENCE_TASK,
+            title="Copies of the NDC or cost sheet differ",
+            description=(
+                "More than one copy of the NDC or of the cost sheet is on file and they differ by more than "
+                "Rs 100 on: " + "; ".join(f"{d['document']} {_copies_text([d])}" for d in copy_differences)
+                + ". For information: the latest dated copy that prints the vehicle line gives the Deal's "
+                "figures. Check which is right and close this task with a comment."
+            ),
+            reference=_json_amounts({"differences": copy_differences}),
+            severity="HIGH",
+        )
+    else:
+        _resolve_task(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=COPIES_DIFFERENCE_TASK,
+                      evidence={"statementCopies": len(forms), "costSheetCopies": len(sheets)})
 
     # A statement is on file but its vehicle line was not read: CRITICAL, and it
     # says which lines were read (the Deal has no ex-showroom for this Journey).
@@ -825,7 +1252,7 @@ def sync_account_statement(
     # The Tally ledger validates the statement.
     deviations: list[dict[str, Any]] = []
     if statement is not None and tallies:
-        deviations = tally_deviations(statement, tally_postings(tallies[0][1]))
+        deviations = tally_deviations(statement, tally_postings(combined_tally_rows(tallies)))
     if deviations:
         _raise_task(
             connection, tenant_id=tenant_id, journey_id=journey_id, task_type=TALLY_DEVIATION_TASK,
@@ -848,6 +1275,7 @@ def sync_account_statement(
         old_vehicle_value=str(statement.old_vehicle_value) if statement and statement.old_vehicle_value else None,
         invoice_actuals_cleared=cleared, tally_deviations=len(deviations),
         cost_sheets=len(sheets), cost_sheet_differences=len(differences), settlement_lines=settlement_lines,
+        copy_differences=len(copy_differences),
     )
     # commercialLines / discountApplications are the keys the invoice path
     # returns, which its callers read.
@@ -871,24 +1299,38 @@ def sync_if_source_of_truth(
 
 
 __all__ = [
+    "COPIES_DIFFERENCE_TASK",
     "COST_SHEET_DIFFERENCE_TASK",
     "COST_SHEET_TYPE",
+    "DECLARED_BALANCE",
+    "DECLARED_NET",
+    "DECLARED_OLD_VEHICLE",
+    "DECLARED_RECEIVED",
+    "FREE_ACCESSORIES_KEY",
     "KIND_ERP",
     "KIND_FORM",
     "KIND_TALLY",
     "KIND_UNKNOWN",
     "NO_EX_SHOWROOM_TASK",
     "ORIGIN",
+    "SCRAPPAGE_COD_KEY",
+    "SCRAPPAGE_DEALER_KEY",
     "SETTLEMENT_SOURCE_TYPE",
     "TALLY_DEVIATION_TASK",
     "CostSheetRead",
     "StatementRead",
+    "chosen_copies",
+    "combine_copies",
+    "combine_cost_sheets",
+    "combine_statements",
+    "combined_tally_rows",
     "cost_sheet_differences",
     "line_rows",
     "load_ledger_documents",
     "read_cost_sheet",
     "read_erp_settlement",
     "read_statement",
+    "read_working",
     "statement_kind",
     "statement_loan",
     "sync_account_statement",

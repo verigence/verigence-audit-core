@@ -801,9 +801,9 @@ def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
     statement, used as printed -- not with the invoices. The statement's own received lines are not used."""
     from audit_core.uc03_account_statement import (
         KIND_FORM,
+        combine_statements,
         line_rows,
         load_ledger_documents,
-        read_statement,
         statement_kind,
         statement_total,
     )
@@ -816,8 +816,11 @@ def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
             forms.append((document, rows))
     if not forms:
         return RuleOutcome(code, "SKIPPED", "No account statement has been read yet.")
-    document, rows = forms[0]
-    read = read_statement(rows)
+    # Every copy on file is read; the latest dated full copy is the statement.
+    read, copies = combine_statements(forms)
+    document = copies.primary
+    if read is None or document is None:
+        return RuleOutcome(code, "SKIPPED", "No account statement has been read yet.")
     if read.conflicts or read.unmapped:
         lines = [str(u["label"]) for u in read.unmapped] + [str(c["key"]) for c in read.conflicts]
         return RuleOutcome(code, "SKIPPED", (

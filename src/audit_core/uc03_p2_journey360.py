@@ -179,6 +179,10 @@ _DECLARED_TOTAL_KEYS = {
     "bonus_amount": "Total bonus (declared)",
     "booking_amount_paid": "Booking amount paid (declared)",
     "balance_amount": "Balance (declared)",
+    # The NDC's received total and the old vehicle's value it deducts
+    # (2026-11-02): printed figures, never a charge.
+    "received_amount": "Received (declared)",
+    "old_vehicle_value": "Exchanged vehicle (declared)",
 }
 # The booking form's declared total discount as the discount writer records
 # it (legacy key "TOTAL"): set apart with the declared totals, never read as
@@ -292,11 +296,23 @@ _COST_SHEET_STANDIN_TYPE = "cost_sheet_in_place_of_ndc"
 # billed for the charges it carries without a GST split; the cost sheet keeps
 # standing in for the rest (2026-10-30).
 _SETTLEMENT_TYPE = "erp_settlement"
+# A line the NDC / cost sheet does not print (TCS on many of them), taken from
+# the vehicle invoice under this name (product owner 2026-11-02: "TCS should
+# be there in NDC, Cost Sheet, worst case can be from the Invoice, same goes
+# for Ex showroom").
+_INVOICE_FALLBACK_TYPE = "vehicle_invoice_where_ndc_is_silent"
+_INVOICE_FALLBACK_KEYS = ("ex_showroom_price", "tcs_amount")
+# Invoices read under the statement policy: each bills an add-on the NDC may
+# also charge (accessories, extended warranty, RSA), never the vehicle.
+_ADDON_INVOICE_TYPES = frozenset(ACCESSORY_INVOICE_TYPES | {"ew_invoice", "rsa_invoice"})
 _COLUMN_LABELS = {
     _STATEMENT_COLUMN_TYPE: "NDC (Account Statement)",
     _COST_SHEET_STANDIN_TYPE: "Cost sheet (no NDC on file)",
     _SETTLEMENT_TYPE: "Settlement (ERP printout)",
+    _INVOICE_FALLBACK_TYPE: "Vehicle invoice (not on the NDC)",
 }
+# The dealer's statement, under any of the names it stands in the billed column.
+_STATEMENT_NORM = frozenset(_norm_type(t) for t in (_STATEMENT_COLUMN_TYPE, _COST_SHEET_STANDIN_TYPE, _SETTLEMENT_TYPE))
 _QUOTE_NORM = frozenset(_norm_type(t) for t in _QUOTE_SOURCES)
 
 
@@ -378,11 +394,11 @@ def _duplicate_receipts(rows: list[Any]) -> dict[Any, Any]:
 
 
 def _loan_received(connection: Connection, *, tenant_id: str, journey_id: UUID) -> Decimal:
-    """Loan disbursements not already booked as a receipt (a disbursement
-    matched to a payment row is counted once, as that payment). A bank loan
-    is paid to the dealer against a dealer receipt, so an unlinked
-    disbursement with a receipt of the same amount (to the rupee) on an
-    active document is that receipt, not more money (2026-10-20)."""
+    """Loan disbursements not linked to a receipt (a disbursement linked to a
+    payment row is that receipt: _loan_receipt_ids). A bank loan is paid to
+    the dealer against a dealer receipt, so an unlinked disbursement with a
+    receipt of the same amount (to the rupee) on an active document is that
+    receipt, not more money (2026-10-20)."""
     value = connection.execute(
         text(
             """
@@ -402,6 +418,45 @@ def _loan_received(connection: Connection, *, tenant_id: str, journey_id: UUID) 
         {"t": tenant_id, "j": journey_id},
     ).scalar_one()
     return Decimal(value or 0)
+
+
+def _loan_receipt_ids(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, duplicate_of: dict[Any, Any],
+) -> set[Any]:
+    """The receipts that are the loan's own (product owner, 2026-11-02): the
+    payment linked as the loan disbursement (finance_records.loan_disbursement_
+    payment_id). Each is counted as the loan, never as a customer receipt. A
+    link to the second copy of a receipt uploaded twice stands for the copy
+    that is counted."""
+    linked = connection.execute(
+        text(
+            """
+            SELECT DISTINCT loan_disbursement_payment_id FROM auditcore.finance_records
+            WHERE tenant_id=:t AND journey_id=:j AND loan_disbursement_payment_id IS NOT NULL
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).scalars().all()
+    return {duplicate_of.get(payment_id, payment_id) for payment_id in linked}
+
+
+def bank_approval_sanction(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    """The newest Bank Approval Letter's sanctioned amount (a revised sanction
+    replaces the first), or None when no letter on file prints one. The
+    Delivery Order carries no amount."""
+    for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               di_types=("bank_approval_letter",)):
+        amount = _dec(doc["fields"].get("finance_sanctioned_amount"))
+        if amount is None or amount <= 0:
+            continue
+        # _document_facts lists the newest first.
+        return {
+            "amount": amount, "documentId": doc["documentId"], "document": _document_label("bank_approval_letter"),
+            "financier": doc["fields"].get("financier_name"),
+            "date": doc["fields"].get("finance_disbursement_date") or doc["fields"].get("finance_sanction_date"),
+            "letterNumber": doc["fields"].get("finance_sanction_letter_number"),
+        }
+    return None
 
 
 def loan_without_receipt(
@@ -430,32 +485,18 @@ def loan_without_receipt(
     ).scalar_one()
     if known:
         return None
-    letters = []
-    for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
-                               di_types=("bank_approval_letter",)):
-        amount = _dec(doc["fields"].get("finance_sanctioned_amount"))
-        if amount is None or amount <= 0:
-            continue
-        letters.append({
-            "amount": amount, "documentId": doc["documentId"], "document": _document_label("bank_approval_letter"),
-            "financier": doc["fields"].get("financier_name"),
-            "date": doc["fields"].get("finance_disbursement_date") or doc["fields"].get("finance_sanction_date"),
-            "letterNumber": doc["fields"].get("finance_sanction_letter_number"),
-        })
-    if not letters:
+    letter = bank_approval_sanction(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if letter is None:
         return None
-    # The newest letter on file (a revised sanction replaces the first);
-    # _document_facts lists the newest first.
-    letter = letters[0]
     if any(r is not None and abs(r - letter["amount"]) <= 1 for r in receipt_amounts or []):
         return None
-    # A receipt after the minimum booking amount that names the financier is
-    # the loan's receipt even before it is linked (the disbursed amount is
-    # usually the sanctioned one less fees), so the letter would count it twice.
+    # A receipt in the financier's name is the loan's receipt even before it
+    # is linked (the disbursed amount is usually the sanctioned one less
+    # fees), so the letter would count it twice.
     from audit_core.uc03_finance_disbursement_resolution import (
-        _name_matches,
-        _normalize_name,
         eligible_loan_disbursement_candidates,
+        journey_customer_names,
+        names_financier,
     )
 
     provider = connection.execute(
@@ -465,7 +506,8 @@ def loan_without_receipt(
     ).scalar_one_or_none()
     names = [n for n in (letter["financier"], provider) if n]
     candidates = eligible_loan_disbursement_candidates(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if any(_name_matches(c, _normalize_name(n)) for c in candidates for n in names):
+    customers = journey_customer_names(connection, tenant_id=tenant_id, journey_id=journey_id) if names else ()
+    if any(names_financier(c, n, customer_names=customers) for c in candidates for n in names):
         return None
     return {**letter, "amount": _money(letter["amount"]),
             "note": "No dealership receipt for the loan amount; taken from the Bank Approval Letter "
@@ -474,7 +516,9 @@ def loan_without_receipt(
 
 def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Decimal]:
     """Money actually received: evidenced receipts on ACTIVE documents, the
-    same receipt uploaded twice counted once, plus the loan received."""
+    same receipt uploaded twice counted once, split as payments() splits it:
+    the customer's receipts, and the loan (its linked receipt plus any
+    disbursement on the finance record not linked to a receipt)."""
     rows = connection.execute(
         text(
             """
@@ -490,9 +534,38 @@ def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[s
         {"t": tenant_id, "j": journey_id},
     ).mappings().all()
     duplicates = _duplicate_receipts(rows)
-    receipts = sum((Decimal(r["amount"]) for r in rows if r["payment_id"] not in duplicates), Decimal(0))
-    loan = _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
-    return {"receipts": receipts, "loan": loan, "total": receipts + loan}
+    loan_ids = _loan_receipt_ids(connection, tenant_id=tenant_id, journey_id=journey_id, duplicate_of=duplicates)
+    counted = [r for r in rows if r["payment_id"] not in duplicates]
+    receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids), Decimal(0))
+    loan_receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] in loan_ids), Decimal(0))
+    loan = loan_receipts + _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return {"receipts": receipts, "loan": loan, "total": receipts + loan,
+            "customerAmounts": [Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids],
+            "countedAmounts": [Decimal(r["amount"]) for r in counted]}
+
+
+def _loan_counted(connection: Connection, *, tenant_id: str, journey_id: UUID, paid: dict[str, Any]) -> dict[str, Any]:
+    """The loan counted as received, by the Audit Summary's own rule
+    (uc03_p2_audit_summary.loan_received): the disbursement on the finance
+    record, else the dealer's statement financier row, else the bank letter's
+    sanction, else unknown on a financed deal -- so the Deal's balance and the
+    Summary's are the same (2026-11-02, Deal defect 5)."""
+    from audit_core.uc03_account_statement import statement_loan
+    from audit_core.uc03_p2_audit_summary import loan_received
+
+    records = connection.execute(
+        text("SELECT loan_disbursement_amount FROM auditcore.finance_records WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalars().all()
+    return loan_received(
+        matched=paid["loan"],
+        disbursement_known=any(_dec(r) is not None for r in records),
+        financed=bool(records),
+        stated=statement_loan(connection, tenant_id=tenant_id, journey_id=journey_id),
+        receipt_amounts=paid["customerAmounts"],
+        letter=loan_without_receipt(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                    receipt_amounts=paid["countedAmounts"]),
+    )
 
 
 # ── summary ──────────────────────────────────────────────────────────────────
@@ -630,8 +703,13 @@ def _column_for(document_type: Any) -> str:
 # fixed order of document types, then the document id -- never the time a
 # row was last re-written (2026-10-20: "newest wins" made the Deal depend on
 # which document happened to be re-processed last).
+# The dealer's own statement comes first among the billed documents (product
+# owner 2026-11-02: the statement is first for every charge; the policy, the
+# challan and the invoices are checked against it).
 _SOURCE_ORDER = tuple(_norm_type(t) for t in (
-    "booking_form", "booking_docket", "order_taking_form", "customer_ledger", "cost_sheet",
+    "booking_form", "booking_docket", "order_taking_form",
+    _STATEMENT_COLUMN_TYPE, _SETTLEMENT_TYPE, _COST_SHEET_STANDIN_TYPE, _INVOICE_FALLBACK_TYPE,
+    "customer_ledger", "cost_sheet",
     "tax_invoice_tally", "customer_invoice_dms", "invoice_generic", "customer_invoice_dms_v2", "tax_invoice",
     "tax_invoice_dms", "accessory_invoice_dms", "accessory_invoice_tally", "ew_invoice", "rsa_invoice",
     "insurance_cover_note", "insurance_policy", "insurance_cover", "rto_challan", "rto_tax_receipt",
@@ -783,6 +861,8 @@ def _source_list(per_source: list[Any]) -> list[dict[str, Any]]:
 
 
 _RTO_COMBINED = "road_tax_registration"
+# The statement's whole RTO amount and the challan's parts added up agree within this.
+_RTO_TOLERANCE = Decimal(10)
 _RTO_PARTS = ("road_tax_amount", "registration_charges")
 
 
@@ -823,11 +903,23 @@ def _fold_registration(rows: list[dict[str, Any]], *, invoice_on_file: bool) -> 
     else:
         # Both parts on the form are added; a lone figure is the whole amount.
         booking = _money(total("booking"))
-    billed = first(_money(total("billed")), combined["billed"] if combined else None)
+    # The dealer's statement prints the whole RTO amount once: under the
+    # statement policy it is the billed figure, and the challan's parts added
+    # up are set against it, whole against whole (2026-11-02, defect 8).
+    statement_whole = (combined["billed"] if combined and combined.get("billed") is not None and any(
+        _norm_type(s.get("documentType")) in _STATEMENT_NORM for s in combined["sources"]) else None)
+    parts_billed = total("billed")
+    if statement_whole is not None:
+        billed = statement_whole
+    else:
+        billed = first(_money(parts_billed), combined["billed"] if combined else None)
     ledger = first(_money(total("ledger")), combined["ledger"] if combined else None)
     reference = _reference({"booking": booking, "billed": billed}, invoice_on_file)
     flags = _flags("COMMERCIAL", standard, booking, billed, ledger)
     if any("INVOICES_DISAGREE" in r["flags"] for r in parts) or (combined and "INVOICES_DISAGREE" in combined["flags"]):
+        flags.append("INVOICES_DISAGREE")
+    if (statement_whole is not None and parts_billed is not None
+            and abs(parts_billed - _dec(statement_whole)) > _RTO_TOLERANCE and "INVOICES_DISAGREE" not in flags):
         flags.append("INVOICES_DISAGREE")
     sources = [*(combined["sources"] if combined else []), *(src for r in parts for src in r["sources"])]
     folded = {
@@ -892,6 +984,8 @@ _VEHICLE_INVOICE_TYPES = tuple(sorted(VEHICLE_SALE_TYPES))
 # on file the line is "awaiting" it: the booking figure is shown, labelled,
 # and the line has no variance of its own. It is "not invoiced" only when its
 # own document is on file without it, or the deal is closed.
+# Under the statement policy the NDC bills these lines itself (2026-11-02).
+_STATEMENT_BILLED_DOCUMENTS = frozenset({"VEHICLE", "FASTAG"})
 _LINE_DOCUMENT_LABELS = {
     "VEHICLE": "vehicle invoice",
     "ACCESSORY": "accessory invoice",
@@ -995,6 +1089,36 @@ def _credit_notes(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(out, key=lambda c: (str(c["date"] or ""), str(c["number"] or "")))
 
 
+# A credit note and the benefit it pays agree to the rupee (GST-inclusive on
+# both sides: ₹20,000 credit note = ₹20,000 scrappage bonus on the NDC).
+_CREDIT_NOTE_TOLERANCE = Decimal(1)
+
+
+def _link_credit_notes(credit_notes: list[dict[str, Any]], discount_rows: list[dict[str, Any]]) -> None:
+    """Which benefit each credit note pays. The credit notes print no reason
+    (Aditya and Shivnath DMS credit notes, seen 2026-11-02), so a credit note
+    is matched by its total to the one benefit of the deal with that amount
+    (the figure the Deal stands at, else what the booking offered, else the
+    entitlement). Two benefits with that amount, or none, leave it unmatched
+    and listed. Shown only: a credit note never moves the Deal's arithmetic."""
+    for note in credit_notes:
+        note["benefit"] = None
+        amount = _dec(note.get("amount"))
+        if amount is None or amount <= 0:
+            continue
+        matches = [row for row in discount_rows if any(
+            _dec(row.get(column)) is not None and abs(_dec(row.get(column)) - amount) <= _CREDIT_NOTE_TOLERANCE
+            for column in ("current", "billed", "booking", "entitled"))]
+        if len(matches) != 1:
+            note["benefitCandidates"] = [row["key"] for row in matches]
+            continue
+        row = matches[0]
+        note["benefit"] = {"key": row["key"], "label": row["label"]}
+        row.setdefault("paidByCreditNotes", []).append(
+            {"documentId": note["documentId"], "number": note["number"], "date": note["date"],
+             "amount": note["amount"]})
+
+
 def _deal_closed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
     """Delivered and past the settlement window: a line whose document never
     came is then not invoiced, no longer awaited."""
@@ -1082,12 +1206,16 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # in (product owner, 2026-10-31: a credit note is given in the scrappage
     # case), whichever source of truth the Project uses.
     credit_notes = _credit_notes(documents)
+    booking_date = plausible_from(connection, tenant_id=tenant_id, journey_id=journey_id)
+    fallback_vehicle: dict[str, Any] | None = None
     if statement_policy:
-        documents, sources = _statement_policy_sources(documents, sources)
+        sources = _standing_copies(connection, tenant_id=tenant_id, journey_id=journey_id, sources=sources)
+        policy_documents, sources = _statement_policy_sources(documents, sources)
+        sources, fallback_vehicle = _invoice_where_statement_silent(documents, sources, booking_date=booking_date)
+        documents = policy_documents
     # Each invoice read on its own and counted once (2026-10-20, R1/R2); a
     # credit note is never counted on the Deal (2026-10-31).
-    selection = deal_invoices(documents, booking_date=plausible_from(
-        connection, tenant_id=tenant_id, journey_id=journey_id), count_credit_notes=False)
+    selection = deal_invoices(documents, booking_date=booking_date, count_credit_notes=False)
     sources = _without_read_invoices(sources, selection)
     invoice_on_file, families = _invoices_on_file(sources, selection, statement_policy=statement_policy)
     vehicle_on_file = FAMILY_VEHICLE in families
@@ -1129,7 +1257,10 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # invoice is on file its standard is the statutory rate on that sale
     # value (2026-10-20), not on the list price.
     vehicle_reading = selection["vehicle"]["representative"] if selection["vehicle"] else None
-    sale_value = (vehicle_reading.get("vehicle") or {}).get("saleValue") if vehicle_reading else None
+    # Under the statement policy the vehicle invoice is not a billed source,
+    # but what it was sold for is still the sale value TCS is due on.
+    sale_reading = vehicle_reading or fallback_vehicle
+    sale_value = (sale_reading.get("vehicle") or {}).get("saleValue") if sale_reading else None
     if sale_value is not None:
         _tcs_on_sale_value(all_rows, sale_value)
 
@@ -1148,7 +1279,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         "INSURANCE": "insurance_cover" in proof_on_file,
         "RTO": "rto_challan" in proof_on_file or any(
             _norm_type(s["source_document_type"]) == "rtochallan" for s in sources),
-        "FASTAG": False,
+        # No FASTag invoice exists; under the statement policy the NDC bills it.
+        "FASTAG": statement_policy and vehicle_on_file,
     }
     vehicle_taxes_read = bool(vehicle_reading and (vehicle_reading.get("vehicle") or {}).get("taxesRead"))
     # Opted: read from the line's own document once it is on file (a line it
@@ -1160,12 +1292,14 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     situation = _DealSituation(
         invoice_on_file=invoice_on_file, vehicle_on_file=vehicle_on_file, closed=closed,
         vehicle_reading=vehicle_reading, vehicle_taxes_read=vehicle_taxes_read, document_on_file=document_on_file,
+        statement_policy=statement_policy,
     )
     for row in all_rows:
         _settle_component(row, situation)
     for row in discount_rows:
         _settle_discount(row, situation, mr_key=mr_key)
 
+    _link_credit_notes(credit_notes, discount_rows)
     insurance["invoiceOnFile"] = _insurance_accounted(documents, sources, selection)
     insurance["vehicleInvoiced"] = vehicle_on_file
 
@@ -1212,7 +1346,17 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     awaiting_delta = _awaiting_delta(counted_rows, standard_discounts)
 
     paid = _paid(connection, tenant_id=tenant_id, journey_id=journey_id)
-    payable = net_cur or net_std
+    # The loan as the Audit Summary counts it, so both give one balance.
+    loan_view = _loan_counted(connection, tenant_id=tenant_id, journey_id=journey_id, paid=paid)
+    loan = loan_view["amount"] or Decimal(0)
+    refunds = loan_view["refunds"] or Decimal(0)
+    # The old vehicle the NDC takes against the price ("Exchanged vehicle",
+    # or its "Trade in value" row) is paid in kind (2026-11-02, Deal defect 4).
+    old_vehicle = _old_vehicle_in_kind(declared) if statement_policy else None
+    paid_total = paid["receipts"] + loan + (old_vehicle or Decimal(0)) - refunds
+    # What the customer owes is the current net; with none worked out it is
+    # unknown, never the price master's standard (2026-11-02, Deal defect 12).
+    payable = net_cur
     invoiced = sum(1 for r in counted_rows if r["billed"] is not None)
     return {
         "sku": _deal_sku_block(sku, price_plan),
@@ -1273,9 +1417,16 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             # Lines with no standard on record, taken in the standard at what
             # is charged for them.
             "standardTakenAsCharged": [r["key"] for r in taken_as_charged] if net_std is not None else [],
-            "paid": {"receipts": str(paid["receipts"]), "loan": str(paid["loan"]), "total": str(paid["total"])},
+            "paid": {"receipts": str(paid["receipts"]), "loan": str(loan),
+                     "loanSource": loan_view["source"], "loanWithoutReceipt": loan_view["withoutReceipt"],
+                     "loanUnknown": loan_view["unknown"],
+                     "refunds": str(refunds) if refunds else None,
+                     "oldVehicle": str(old_vehicle) if old_vehicle is not None else None,
+                     "total": str(paid_total)},
             "payable": payable,
-            "balanceDue": _minus(payable, paid["total"]),
+            # A financed deal whose loan is not on file has no balance yet:
+            # it would be the loan itself, not a shortfall (as the Summary).
+            "balanceDue": None if loan_view["unknown"] else _minus(payable, paid_total),
         },
         "flagged": sum(1 for r in counted_rows + discount_rows if r["flags"]),
     }
@@ -1389,6 +1540,38 @@ def _deal_sku_block(sku: Any, price_plan: dict[str, Any] | None) -> dict[str, An
 # deal(), stage 2: which document stands in which column.
 
 
+def _standing_copies(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Several copies of the NDC or of the cost sheet on file (2026-11-02, Deal
+    defect 15): each figure stands from the copy the statement sync took it
+    from (uc03_account_statement.combine_statements); another copy's row of
+    that figure leaves the Deal -- the copies-differ task lists it. With one
+    copy per figure nothing is read and nothing changes."""
+    documents: dict[tuple[str, str, str], set[str]] = {}
+    for s in sources:
+        kind = _norm_type(s["source_document_type"])
+        if kind in _LEDGER_NORM or kind in _QUOTE_NORM:
+            documents.setdefault((kind, str(s["line_kind"]), str(s["component_key"])), set()).add(
+                str(s["source_document_id"]))
+    if all(len(ids) <= 1 for ids in documents.values()):
+        return sources
+    from audit_core.uc03_account_statement import COST_SHEET_TYPE, chosen_copies
+    from audit_core.uc03_deal_source_policy import ACCOUNT_STATEMENT_TYPE
+
+    chosen = chosen_copies(connection, tenant_id=tenant_id, journey_id=journey_id)
+    kept = []
+    for s in sources:
+        kind = _norm_type(s["source_document_type"])
+        key = (kind, str(s["line_kind"]), str(s["component_key"]))
+        if len(documents.get(key, ())) > 1:
+            table = chosen[COST_SHEET_TYPE if kind in _QUOTE_NORM else ACCOUNT_STATEMENT_TYPE]
+            if table.get((str(s["line_kind"]), str(s["component_key"]))) != str(s["source_document_id"]):
+                continue
+        kept.append(s)
+    return kept
+
+
 def _statement_policy_sources(
     documents: list[dict[str, Any]], sources: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1399,7 +1582,7 @@ def _statement_policy_sources(
     their own column; with no statement form, the cost sheet stands in for
     the lines the ERP settlement printout does not give."""
     documents = [d for d in documents
-                 if d["documentType"] not in _INVOICE_TYPES or d["documentType"] in ACCESSORY_INVOICE_TYPES]
+                 if d["documentType"] not in _INVOICE_TYPES or d["documentType"] in _ADDON_INVOICE_TYPES]
     sources = [
         {**s, "source_document_type": _STATEMENT_COLUMN_TYPE}
         if _norm_type(s["source_document_type"]) in _LEDGER_NORM else s
@@ -1408,15 +1591,55 @@ def _statement_policy_sources(
     if any(s["source_document_type"] == _STATEMENT_COLUMN_TYPE for s in sources):
         # A statement form is the Deal's figures; the settlement printout
         # does not add to it.
-        return documents, [s for s in sources if _norm_type(s["source_document_type"]) != _norm_type(_SETTLEMENT_TYPE)]
-    settled = {str(s["component_key"]) for s in sources
-               if _norm_type(s["source_document_type"]) == _norm_type(_SETTLEMENT_TYPE)}
+        sources = [s for s in sources if _norm_type(s["source_document_type"]) != _norm_type(_SETTLEMENT_TYPE)]
+    else:
+        settled = {str(s["component_key"]) for s in sources
+                   if _norm_type(s["source_document_type"]) == _norm_type(_SETTLEMENT_TYPE)}
+        sources = [
+            {**s, "source_document_type": _COST_SHEET_STANDIN_TYPE}
+            if _norm_type(s["source_document_type"]) in _QUOTE_NORM and s["line_kind"] == "COMMERCIAL"
+            and str(s["component_key"]) not in settled else s
+            for s in sources
+        ]
+    # The statement prints the whole RTO amount as one figure: it stands on
+    # "Road tax + registration", set against the challan's total, never on the
+    # challan's registration part (2026-11-02, Deal defect 8).
     return documents, [
-        {**s, "source_document_type": _COST_SHEET_STANDIN_TYPE}
-        if _norm_type(s["source_document_type"]) in _QUOTE_NORM and s["line_kind"] == "COMMERCIAL"
-        and str(s["component_key"]) not in settled else s
+        {**s, "component_key": _RTO_COMBINED}
+        if s["line_kind"] == "COMMERCIAL" and str(s["component_key"]) == "registration_charges"
+        and _norm_type(s["source_document_type"]) in _STATEMENT_NORM else s
         for s in sources
     ]
+
+
+def _invoice_where_statement_silent(
+    documents: list[dict[str, Any]], sources: list[dict[str, Any]], *, booking_date: Any,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """Under the statement policy: ex-showroom and TCS the NDC / cost sheet /
+    settlement does not print are taken from the vehicle invoice, under their
+    own name (_INVOICE_FALLBACK_TYPE), so the Deal shows where they came from.
+    The invoice stays out of every other line and out of "invoice on file".
+    Returns the sources with those rows added, and the vehicle invoice read
+    (its sale value is what TCS is due on)."""
+    invoices = [d for d in documents if d["documentType"] in _VEHICLE_INVOICE_TYPES]
+    if not invoices:
+        return sources, None
+    vehicle = deal_invoices(invoices, booking_date=booking_date, count_credit_notes=False)["vehicle"]
+    reading = vehicle["representative"] if vehicle else None
+    if reading is None:
+        return sources, None
+    carried = {str(s["component_key"]) for s in sources
+               if _norm_type(s["source_document_type"]) in _STATEMENT_NORM and _dec(s["amount"])}
+    added = []
+    for key in _INVOICE_FALLBACK_KEYS:
+        amount = _dec(reading["lines"].get(key))
+        if key in carried or amount is None or amount <= 0:
+            continue
+        added.append({
+            "line_kind": "COMMERCIAL", "component_key": key, "source_document_type": _INVOICE_FALLBACK_TYPE,
+            "amount": amount, "source_document_id": reading["documentId"], "invoice_number": reading["number"],
+        })
+    return list(sources) + added, reading
 
 
 def _without_read_invoices(sources: list[dict[str, Any]], selection: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1564,11 +1787,17 @@ def _component_row(
     own = [s for s in invoice_sources if s["line_kind"] == "COMMERCIAL" and s["component_key"] == key]
     cols = _columns(per_source)
     billed_from = None
-    if key in selection["lines"]:
+    invoiced = selection["lines"].get(key)
+    statement_charge = statement_policy and any(
+        _norm_type(s["source_document_type"]) in _STATEMENT_NORM and _dec(s["amount"]) is not None for s in per_source)
+    if invoiced is not None and not statement_charge:
         # Each invoice bills its own lines; distinct invoices add up,
         # copies of one invoice count once (R2).
-        cols["billed"], billed_from = selection["lines"][key], "invoice"
+        cols["billed"], billed_from = invoiced, "invoice"
     elif cols["billed"] is not None:
+        # Under the statement policy the NDC's figure is what was charged;
+        # the add-on invoices (accessories, EW, RSA) stand beside it as what
+        # was invoiced (product owner 2026-11-02).
         billed_from = "document"
     standard = line["standard_amount"] if line else None
     effective_source = None
@@ -1584,6 +1813,15 @@ def _component_row(
     if (len(other_billed) > 1 or key in disagreeing
             or (billed_from == "invoice" and other_billed and other_billed != {_dec(cols["billed"])})):
         flags.append("INVOICES_DISAGREE")
+    # The NDC charges less than the invoices bill on the accessories line when
+    # part of them is given free; on any other add-on the two must agree.
+    invoiced_beside = invoiced if statement_charge and invoiced is not None else None
+    if (invoiced_beside is not None and key not in _ADDON_COMPONENTS["accessories"]
+            and abs(_dec(invoiced_beside) - _dec(cols["billed"])) > _RTO_TOLERANCE
+            and "INVOICES_DISAGREE" not in flags):
+        flags.append("INVOICES_DISAGREE")
+    free_by_invoice = (_dec(invoiced_beside) - _dec(cols["billed"])
+                       if invoiced_beside is not None and key in _ADDON_COMPONENTS["accessories"] else None)
     return {
         "key": key,
         "label": component_label(key),
@@ -1600,6 +1838,10 @@ def _component_row(
         "bookingVsBilled": _minus(cols["billed"], cols["booking"]),
         "flags": flags,
         "sources": _source_list(per_source + own),
+        # What the add-on invoices bill for the line when the NDC's charge is
+        # the billed figure, and (accessories) the part of it not charged.
+        "invoiced": _money(invoiced_beside),
+        "freeByInvoice": _money(free_by_invoice) if free_by_invoice is not None and free_by_invoice > 0 else None,
     }
 
 
@@ -1614,7 +1856,11 @@ def _place_canonical_value(
     if statement_policy and _norm_type(effective_type) in _LEDGER_NORM:
         effective_type = _STATEMENT_COLUMN_TYPE
     column = _column_for(effective_type)
-    if (line["actual_amount"] is not None and cols[column] is None
+    # The statement's whole RTO figure stands on "Road tax + registration"
+    # (see _statement_policy_sources), never again on one of its parts.
+    statement_rto_part = (statement_policy and str(line["component_key"]) in _RTO_PARTS
+                          and _norm_type(effective_type) in _STATEMENT_NORM | _QUOTE_NORM)
+    if (line["actual_amount"] is not None and cols[column] is None and not statement_rto_part
             and _norm_type(effective_type) not in _ALL_INVOICE_NORM):
         cols[column] = line["actual_amount"]
         if column == "billed":
@@ -1789,6 +2035,7 @@ class _DealSituation:
         "closed",
         "document_on_file",
         "invoice_on_file",
+        "statement_policy",
         "vehicle_on_file",
         "vehicle_reading",
         "vehicle_taxes_read",
@@ -1796,13 +2043,28 @@ class _DealSituation:
 
     def __init__(self, *, invoice_on_file: bool, vehicle_on_file: bool, closed: bool,
                  vehicle_reading: dict[str, Any] | None, vehicle_taxes_read: bool,
-                 document_on_file: dict[str, bool]) -> None:
+                 document_on_file: dict[str, bool], statement_policy: bool = False) -> None:
         self.invoice_on_file = invoice_on_file
         self.vehicle_on_file = vehicle_on_file
         self.closed = closed
         self.vehicle_reading = vehicle_reading
         self.vehicle_taxes_read = vehicle_taxes_read
         self.document_on_file = document_on_file
+        self.statement_policy = statement_policy
+
+    def awaited(self, document: str) -> str:
+        """The document a line waits for. Under the statement policy the
+        vehicle's own figures and the FASTag come from the NDC, never a
+        vehicle invoice or a "FASTag invoice", a type that does not exist
+        (2026-11-02, Deal defect 7)."""
+        if self.statement_policy and document in _STATEMENT_BILLED_DOCUMENTS:
+            return _COLUMN_LABELS[_STATEMENT_COLUMN_TYPE]
+        return _LINE_DOCUMENT_LABELS[document]
+
+    def billed_on_vehicle_bill(self, document: str) -> bool:
+        """The line is billed on the vehicle's own bill: the vehicle invoice,
+        or under the statement policy the NDC, which bills the FASTag too."""
+        return document == "VEHICLE" or (self.statement_policy and document in _STATEMENT_BILLED_DOCUMENTS)
 
 
 def _settle_component(row: dict[str, Any], situation: _DealSituation) -> None:
@@ -1837,7 +2099,7 @@ def _component_current(row: dict[str, Any], situation: _DealSituation) -> None:
         rate_unclear = (vehicle_reading.get("vehicle") or {}).get("rateUnclear")
         row["flags"] = [*row["flags"], "RATE_UNCLEAR" if rate_unclear else "TAXES_NOT_READ"]
         return
-    if (document == "VEHICLE" and situation.vehicle_on_file) or situation.closed:
+    if (situation.billed_on_vehicle_bill(document) and situation.vehicle_on_file) or situation.closed:
         if row["key"] in _OPTED_COMPONENTS:
             row["current"] = None
             return
@@ -1853,7 +2115,7 @@ def _component_current(row: dict[str, Any], situation: _DealSituation) -> None:
     row["currentSource"] = "booking" if row["booking"] is not None else None
     # Its document on file without a readable figure for it is
     # still awaited (the figure is to be read), never a nil.
-    row["awaiting"] = _LINE_DOCUMENT_LABELS[document] + (
+    row["awaiting"] = situation.awaited(document) + (
         " (on file, figure not read)" if situation.document_on_file[document] else "")
     row["flags"] = [*row["flags"], "AWAITING_DOCUMENT"]
 
@@ -1896,11 +2158,17 @@ def _discount_current(row: dict[str, Any], situation: _DealSituation) -> None:
     if situation.vehicle_on_file or situation.closed:
         # The vehicle invoice is on file and does not give it: not claimed.
         row["current"] = None
+        # Under the statement policy a benefit the booking offered, or the
+        # scheme gives, that the NDC does not list is shown so, never dropped
+        # silently (2026-11-02, Deal defect 3).
+        offered = any((_dec(row[c]) or Decimal(0)) > 0 for c in ("booking", "entitled"))
+        if situation.statement_policy and offered:
+            row["flags"] = [*row["flags"], "NOT_ON_STATEMENT"]
         return
     row["current"] = row["booking"]
     row["currentSource"] = "booking" if row["booking"] is not None else None
     if row["booking"] is not None:
-        row["awaiting"] = _LINE_DOCUMENT_LABELS["VEHICLE"]
+        row["awaiting"] = situation.awaited("VEHICLE")
         row["flags"] = [*row["flags"], "AWAITING_DOCUMENT"]
 
 
@@ -1986,6 +2254,17 @@ def _matched(
     charges = sum((Decimal(a) - Decimal(b) for a, b in pairs), Decimal(0))
     discounts_delta = sum((Decimal(a) - Decimal(b) for a, b in d_pairs), Decimal(0))
     return str(charges - discounts_delta)
+
+
+def _old_vehicle_in_kind(declared: dict[str, list[Any]]) -> Decimal | None:
+    """The old vehicle's value the dealer's statement takes against the price
+    (its declared old_vehicle_value), else None: only the statement says the
+    old vehicle was taken in part payment; a valuation or trade-in record
+    alone does not."""
+    values = [_dec(s["amount"]) for s in declared.get("old_vehicle_value", [])
+              if _norm_type(s["source_document_type"]) in _STATEMENT_NORM]
+    present = [v for v in values if v is not None and v > 0]
+    return present[0] if present else None
 
 
 def _awaiting_delta(counted_rows: list[dict[str, Any]], standard_discounts: list[dict[str, Any]]) -> Decimal:
@@ -2365,7 +2644,9 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     uploaded twice (same number, amount and date) counts once, a receipt
     whose document was removed counts nothing, and each counted receipt is
     tied to the bank statement credit it stands for when a statement is on
-    file."""
+    file. The receipt linked as the loan disbursement is marked
+    ``isLoanReceipt`` and counted in ``loanDisbursed``, not in
+    ``receiptsTotal`` (the customer's receipts); ``paidTotal`` is both."""
     rows = connection.execute(
         text(
             """
@@ -2415,6 +2696,9 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     derived_stage = {
         entry["paymentId"]: stage for stage in ("BOOKING", "DELIVERY") for entry in split[stage]
     }
+    # The receipt linked as the loan disbursement is the loan's, not the
+    # customer's (product owner, 2026-11-02).
+    loan_ids = _loan_receipt_ids(connection, tenant_id=tenant_id, journey_id=journey_id, duplicate_of=duplicate_of)
     items = []
     by_stage: dict[str, Decimal] = {}
     for r in rows:
@@ -2446,6 +2730,8 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
             "documentId": str(r["source_di_document_id"]) if r["source_di_document_id"] else None,
             "document": _document_label(r["document_type_key"]) if r["document_type_key"] else None,
             "counted": counted,
+            # Counted as the loan received, not among the customer's receipts.
+            "isLoanReceipt": counted and r["payment_id"] in loan_ids,
             "notCountedReason": reason,
             "duplicateOf": str(original) if original is not None else None,
             "bankMatch": None,
@@ -2494,8 +2780,12 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     for item in items:
         item.pop("bank_", None)
 
-    receipts = sum((Decimal(i["amount"]) for i in items if i["counted"]), Decimal(0))
-    loan = _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # One split of the money received (2026-11-02): the customer's receipts,
+    # and the loan -- its linked receipt plus a disbursement on the finance
+    # record not linked to a receipt. The paid total is the same either way.
+    receipts = sum((Decimal(i["amount"]) for i in items if i["counted"] and not i["isLoanReceipt"]), Decimal(0))
+    loan_receipts = sum((Decimal(i["amount"]) for i in items if i["isLoanReceipt"]), Decimal(0))
+    loan = loan_receipts + _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
     # Shown, marked with an asterisk, and not in the receipts or paid totals:
     # it is the lender's figure, not money a receipt shows (2026-10-31).
     letter_loan = loan_without_receipt(
@@ -2505,8 +2795,11 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     matched_credit = [_dec(line["credit"]) for line in lines if line["matchedPaymentId"] and _dec(line["credit"]) is not None]
     return {
         "items": items,
+        # The customer's receipts (the loan's own receipt is not among them).
         "receiptsTotal": str(receipts),
+        # The loan received: its linked receipt plus any unlinked disbursement.
         "loanDisbursed": str(loan),
+        "loanReceiptsTotal": str(loan_receipts),
         "loanWithoutReceipt": letter_loan,
         "paidTotal": str(receipts + loan),
         "byStage": {k: str(v) for k, v in by_stage.items()},

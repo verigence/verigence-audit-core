@@ -1359,6 +1359,10 @@ _P2_ONLY_REQUIREMENTS = (
     ("p2_purchase_order", "purchase_order"),
     ("p2_debit_note", "debit_note"),
     ("p2_valuation_report", "valuation_report"),
+    # The Form 21 (sale certificate) is never an invoice (2026-11-02): its own
+    # OPTIONAL row, so a Form 21 is filed there (uc03_form_21) and, once DI
+    # has the type, DI links it there itself.
+    ("p2_form_21", "form_21"),
 )
 
 
@@ -4853,6 +4857,17 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # only (2026-11-02): see uc03_page_images.
         from audit_core.uc03_page_images import run_page_images
         return run_page_images, (engine, tag, reports)
+    if kind == "PAGE_RETYPE":
+        # Stored pages read again as a named type, as a PC's "Set the
+        # document type" does (2026-11-02): see uc03_page_retype.
+        from audit_core.uc03_page_retype import run_page_retype
+        return run_page_retype, (engine, tag, reports)
+    if kind == "STATEMENT_COPY_RESTORE":
+        # The NDC and cost-sheet pages a newer page hid when the requirement
+        # kept one document, brought back for the tenant the tag names
+        # (2026-11-02): see uc03_statement_copy_restore. A dry run lists them.
+        from audit_core.uc03_statement_copy_restore import run_statement_copy_restore
+        return run_statement_copy_restore, (engine, tag, reports)
     if kind == "OWN_COPY_RESTORE":
         # A customer's own KYC copy replaced by someone else's, restored on the
         # journey references in ``reports`` only (2026-11-01).
@@ -4867,6 +4882,12 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # What changed between two snapshot tags (reports: before, after).
         from audit_core.uc03_journey_snapshot import run_journey_snapshot_diff
         return run_journey_snapshot_diff, (engine, tag, reports)
+    if kind == "LOAN_RECEIPT_RESOLVE":
+        # The loan receipt of every financed booking re-resolved by the
+        # no-guessing rules (2026-11-02), or only the references in
+        # ``reports``: see uc03_loan_receipt_resolve. A dry run returns the report.
+        from audit_core.uc03_loan_receipt_resolve import run_loan_receipt_resolve
+        return run_loan_receipt_resolve, (engine, tag, _active_tenants(engine), reports)
     per_tenant = {
         "PAGE_RESEND": ("audit_core.uc03_p2_page_resend", "run_page_resend"),
         "INVOICE_RESCAN": ("audit_core.uc03_invoice_rescan", "run_invoice_rescan"),
@@ -4888,6 +4909,9 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         "DISCOUNT_VARIANCE_RECOMPUTE": ("audit_core.uc03_discount_variance_recompute",
                                         "run_discount_variance_recompute"),
         "ACCESSORY_INVOICE_REPAIR": ("audit_core.uc03_accessory_invoice_repair", "run_accessory_invoice_repair"),
+        # Form 21s read as invoices filed as Form 21s, and the documents they
+        # set aside given back (2026-11-02): see uc03_form_21.
+        "FORM_21_REFILE": ("audit_core.uc03_form_21", "run_form_21_refile"),
     }
     if kind not in per_tenant:
         raise ValueError(f"unknown worker job kind {kind!r}")
