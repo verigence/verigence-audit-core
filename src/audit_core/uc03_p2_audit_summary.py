@@ -487,6 +487,9 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     )
     loan = loan_on_file["amount"] or Decimal(0)
     refunds = loan_on_file["refunds"]
+    # The old vehicle the NDC takes against the price: paid in kind, as the
+    # Deal counts it (2026-11-02, Deal defect 4).
+    old_vehicle = dec((summary.get("paid") or {}).get("oldVehicle")) or Decimal(0)
     verified = by_status.get("MATCHED", Decimal(0))
     non_cash = receipts - by_status.get("NOT_APPLICABLE", Decimal(0))
     bank_check = {
@@ -524,7 +527,8 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         "loanSource": loan_on_file["source"], "loanNote": loan_on_file["note"],
         "loanWithoutReceipt": loan_on_file["withoutReceipt"],
         "refunds": money(refunds) if refunds else None, "refundsSource": loan_on_file["refundsSource"],
-        "received": money(receipts + loan - refunds),
+        "oldVehicle": money(old_vehicle) if old_vehicle else None,
+        "received": money(receipts + loan + old_vehicle - refunds),
         "bankCheck": bank_check, "loans": loans,
         "bankApprovalOnFile": "bank_approval_letter" in on_file, "deliveryOrderOnFile": "delivery_order_cover" in on_file,
         "exchange": {"applicable": (trade.get("exchange") or {}).get("applicable"),
@@ -540,7 +544,7 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                       "decidedBy": (deal.get("insurance") or {}).get("decidedBy"),
                       "basis": (deal.get("insurance") or {}).get("basis")},
     }
-    settle = settlement(dec(summary.get("payable")), receipts + loan - refunds,
+    settle = settlement(dec(summary.get("payable")), receipts + loan + old_vehicle - refunds,
                         loan_unknown=loan_on_file["unknown"])
 
     rows = charges + benefits + products + [dict(bank_check, label="Payments verified with bank statement",

@@ -245,6 +245,14 @@ def test_the_trade_in_value_is_the_old_vehicle_and_the_printed_totals_are_declar
     # the old vehicle is paid in kind: in what is received, and off the balance
     paid = view["summary"]["paid"]
     assert D(paid["oldVehicle"]) == D(53155) and D(paid["total"]) == D(paid["receipts"]) + D(paid["loan"]) + D(53155)
+    # the Audit Summary counts it the same way
+    from audit_core.uc03_p2_audit_summary import audit_summary
+
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        funding = audit_summary(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["funding"]
+    assert D(funding["oldVehicle"]) == D(53155)
+    assert D(funding["received"]) == D(funding["receipts"]) + D(funding["loanDisbursed"] or 0) + D(53155)
     assert D(declared["net_amount"]["billed"]) == D(1900000)
     assert D(declared["received_amount"]["billed"]) == D(1964155)
     assert D(declared["balance_amount"]["billed"]) == D(0)
