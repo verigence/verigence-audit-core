@@ -197,6 +197,7 @@ _SUMMARY = re.compile(
 # bonus (that is "EXCHANGE CLAIM") -- and, being already netted off the net
 # receivable, not one of the statement's received lines either.
 _OLD_VEHICLE = re.compile(r"EXCHANGED VEHICLE( VALUE)?")
+_TRADE_IN = re.compile(r"TRADE IN VALUE( .*)?")
 # Scrappage is a Deal line of its own (product owner 2026-11-02): the row that
 # names the scrappage bonus is the benefit -- the certificate of deposit's
 # when it says COD, else the dealer's. The handwriting reading spells the word
@@ -382,6 +383,10 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             continue
         if _RECEIPT.fullmatch(label):
             out.receipts += amount
+            if _TRADE_IN.fullmatch(label):
+                # the old vehicle taken against the price, among the received
+                # lines on the Shivnath / Utkal forms: paid in kind
+                give("OLD_VEHICLE", "old_vehicle_value", amount)
             continue
         working = _WORKING.fullmatch(label)
         item = next((k for k, pattern in _WORKING_ITEMS if working and pattern.fullmatch(working["item"])), None)
@@ -1059,6 +1064,36 @@ def _json_amounts(value: Any) -> Any:
     return value
 
 
+# The statement's printed figures recorded as the Deal's declared totals
+# (uc03_p2_journey360._DECLARED_TOTAL_KEYS), from the copy standing as the
+# statement.
+DECLARED_NET = "net_amount"
+DECLARED_RECEIVED = "received_amount"
+DECLARED_BALANCE = "balance_amount"
+DECLARED_OLD_VEHICLE = "old_vehicle_value"
+
+
+def _declared_figures(statement: StatementRead, copies: Combined) -> list[tuple[str, Decimal, dict[str, Any]]]:
+    primary = copies.primary
+    if primary is None:
+        return []
+    fields = primary["fields"]
+    out: list[tuple[str, Decimal, dict[str, Any]]] = []
+    net = statement_total(fields, statement)
+    if net is not None:
+        out.append((DECLARED_NET, net, copies.origin.get(("STATEMENT", "printed_total"), primary)))
+    received = _amount(fields.get("total_receipts"))
+    if received is not None and received > 0:
+        out.append((DECLARED_RECEIVED, received, primary))
+    balance = _amount(fields.get("balance_amount"))
+    if balance is not None:
+        out.append((DECLARED_BALANCE, balance, primary))
+    if statement.old_vehicle_value is not None and statement.old_vehicle_value > 0:
+        out.append((DECLARED_OLD_VEHICLE, statement.old_vehicle_value,
+                    copies.origin.get(("STATEMENT", "old_vehicle_value"), primary)))
+    return out
+
+
 def sync_account_statement(
     connection: Connection, *, tenant_id: str, journey_id: UUID,
     stage_code: Literal["BOOKING", "DELIVERY"] = "DELIVERY", correlation_id: str = "",
@@ -1112,6 +1147,17 @@ def sync_account_statement(
             discounts_written += 1
     _stale_statement_rows(connection, tenant_id=tenant_id, journey_id=journey_id,
                           keep_components=keep_components, keep_discounts=keep_discounts)
+    # The statement's own totals as it prints them, and the old vehicle's value
+    # it deducts: recorded beside the Deal (its declared totals), so the Deal is
+    # set against them and the old vehicle counts as paid in kind (2026-11-02,
+    # Deal defects 4 and 13). Never computed, never a charge.
+    if statement and document:
+        for key, amount, origin in _declared_figures(statement, copies):
+            record_source_value(
+                connection, tenant_id=tenant_id, journey_id=journey_id, line_kind="COMMERCIAL", component_key=key,
+                source_document_type=ACCOUNT_STATEMENT_TYPE, amount=amount, evidence_id=origin["evidenceId"],
+                document_id=origin["documentId"],
+            )
 
     # No statement form, but the ERP settlement printout: its charges without a
     # GST split are recorded for the Deal under their own name (the Deal view
@@ -1256,6 +1302,10 @@ __all__ = [
     "COPIES_DIFFERENCE_TASK",
     "COST_SHEET_DIFFERENCE_TASK",
     "COST_SHEET_TYPE",
+    "DECLARED_BALANCE",
+    "DECLARED_NET",
+    "DECLARED_OLD_VEHICLE",
+    "DECLARED_RECEIVED",
     "FREE_ACCESSORIES_KEY",
     "KIND_ERP",
     "KIND_FORM",

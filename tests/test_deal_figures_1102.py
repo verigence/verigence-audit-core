@@ -198,3 +198,49 @@ def test_an_insurance_premium_on_the_statement_makes_the_insurance_in_house(jour
         decided = resolve(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     assert decided["source"] == "INHOUSE" and decided["decidedBy"] == "DOCUMENT"
     assert "statement charges the insurance premium" in decided["basis"]
+
+
+# ── 7. FASTag and 3. a benefit the NDC does not list ─────────────────────────
+def test_fastag_is_billed_by_the_ndc_not_a_fastag_invoice(journey) -> None:
+    _statement(journey, [line for line in UTKAL if line["particulars_raw"] != "Fastag charges"])
+    _source(journey, "fastag_amount", "booking_form", "600")
+    row = _row(_deal(journey), "fastag_amount")
+    # the NDC is on file and does not charge it: not charged, never awaited
+    assert row["awaiting"] is None
+    assert (row["current"], row["currentSource"]) == ("0", "not_invoiced")
+
+
+def test_fastag_awaits_the_ndc_while_the_ndc_has_no_vehicle_line(journey) -> None:
+    _statement(journey, ADITYA_NO_VEHICLE)
+    _source(journey, "fastag_amount", "booking_form", "600")
+    assert _row(_deal(journey), "fastag_amount")["awaiting"].startswith("NDC (Account Statement)")
+
+
+def test_a_benefit_the_booking_offered_that_the_ndc_does_not_list_is_flagged(journey) -> None:
+    _statement(journey, UTKAL)  # lists only "Other Discount (if any)"
+    _source(journey, "CORPORATE_PRIVILEGE", "booking_form", "10000", kind="DISCOUNT")
+    view = _deal(journey)
+    benefit = next(d for d in view["discounts"] if d["key"] == "CORPORATE_PRIVILEGE")
+    assert benefit["current"] is None and "NOT_ON_STATEMENT" in benefit["flags"]
+
+
+# ── 4 / 13. the old vehicle and the statement's printed totals ───────────────
+def test_the_trade_in_value_is_the_old_vehicle_and_the_printed_totals_are_declared(journey) -> None:
+    from test_uc03_account_statement import SHIVNATH
+
+    from audit_core.uc03_account_statement import read_statement
+
+    assert read_statement(SHIVNATH).old_vehicle_value == D(53155)
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    document_id, _ = _ledger(journey, SHIVNATH)
+    from p2_support import add_extracted_field
+
+    for key, value in {"net_value": "1900000", "total_receipts": "1964155", "balance_amount": "0"}.items():
+        add_extracted_field(journey, di_document_id=document_id, field_key=key, value=value,
+                            document_type="customer_ledger")
+    _sync(journey)
+    declared = {d["key"]: d for d in _deal(journey)["declared"]}
+    assert D(declared["old_vehicle_value"]["billed"]) == D(53155)
+    assert D(declared["net_amount"]["billed"]) == D(1900000)
+    assert D(declared["received_amount"]["billed"]) == D(1964155)
+    assert D(declared["balance_amount"]["billed"]) == D(0)

@@ -179,6 +179,10 @@ _DECLARED_TOTAL_KEYS = {
     "bonus_amount": "Total bonus (declared)",
     "booking_amount_paid": "Booking amount paid (declared)",
     "balance_amount": "Balance (declared)",
+    # The NDC's received total and the old vehicle's value it deducts
+    # (2026-11-02): printed figures, never a charge.
+    "received_amount": "Received (declared)",
+    "old_vehicle_value": "Exchanged vehicle (declared)",
 }
 # The booking form's declared total discount as the discount writer records
 # it (legacy key "TOTAL"): set apart with the declared totals, never read as
@@ -923,6 +927,8 @@ _VEHICLE_INVOICE_TYPES = tuple(sorted(VEHICLE_SALE_TYPES))
 # on file the line is "awaiting" it: the booking figure is shown, labelled,
 # and the line has no variance of its own. It is "not invoiced" only when its
 # own document is on file without it, or the deal is closed.
+# Under the statement policy the NDC bills these lines itself (2026-11-02).
+_STATEMENT_BILLED_DOCUMENTS = frozenset({"VEHICLE", "FASTAG"})
 _LINE_DOCUMENT_LABELS = {
     "VEHICLE": "vehicle invoice",
     "ACCESSORY": "accessory invoice",
@@ -1216,7 +1222,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         "INSURANCE": "insurance_cover" in proof_on_file,
         "RTO": "rto_challan" in proof_on_file or any(
             _norm_type(s["source_document_type"]) == "rtochallan" for s in sources),
-        "FASTAG": False,
+        # No FASTag invoice exists; under the statement policy the NDC bills it.
+        "FASTAG": statement_policy and vehicle_on_file,
     }
     vehicle_taxes_read = bool(vehicle_reading and (vehicle_reading.get("vehicle") or {}).get("taxesRead"))
     # Opted: read from the line's own document once it is on file (a line it
@@ -1975,11 +1982,17 @@ class _DealSituation:
 
     def awaited(self, document: str) -> str:
         """The document a line waits for. Under the statement policy the
-        vehicle's own figures come from the NDC, never a vehicle invoice
+        vehicle's own figures and the FASTag come from the NDC, never a
+        vehicle invoice or a "FASTag invoice", a type that does not exist
         (2026-11-02, Deal defect 7)."""
-        if self.statement_policy and document == "VEHICLE":
+        if self.statement_policy and document in _STATEMENT_BILLED_DOCUMENTS:
             return _COLUMN_LABELS[_STATEMENT_COLUMN_TYPE]
         return _LINE_DOCUMENT_LABELS[document]
+
+    def billed_on_vehicle_bill(self, document: str) -> bool:
+        """The line is billed on the vehicle's own bill: the vehicle invoice,
+        or under the statement policy the NDC, which bills the FASTag too."""
+        return document == "VEHICLE" or (self.statement_policy and document in _STATEMENT_BILLED_DOCUMENTS)
 
 
 def _settle_component(row: dict[str, Any], situation: _DealSituation) -> None:
@@ -2014,7 +2027,7 @@ def _component_current(row: dict[str, Any], situation: _DealSituation) -> None:
         rate_unclear = (vehicle_reading.get("vehicle") or {}).get("rateUnclear")
         row["flags"] = [*row["flags"], "RATE_UNCLEAR" if rate_unclear else "TAXES_NOT_READ"]
         return
-    if (document == "VEHICLE" and situation.vehicle_on_file) or situation.closed:
+    if (situation.billed_on_vehicle_bill(document) and situation.vehicle_on_file) or situation.closed:
         if row["key"] in _OPTED_COMPONENTS:
             row["current"] = None
             return
@@ -2073,6 +2086,12 @@ def _discount_current(row: dict[str, Any], situation: _DealSituation) -> None:
     if situation.vehicle_on_file or situation.closed:
         # The vehicle invoice is on file and does not give it: not claimed.
         row["current"] = None
+        # Under the statement policy a benefit the booking offered, or the
+        # scheme gives, that the NDC does not list is shown so, never dropped
+        # silently (2026-11-02, Deal defect 3).
+        offered = any((_dec(row[c]) or Decimal(0)) > 0 for c in ("booking", "entitled"))
+        if situation.statement_policy and offered:
+            row["flags"] = [*row["flags"], "NOT_ON_STATEMENT"]
         return
     row["current"] = row["booking"]
     row["currentSource"] = "booking" if row["booking"] is not None else None
