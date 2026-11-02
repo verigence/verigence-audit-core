@@ -1049,13 +1049,13 @@ def _record_tally_lines(
     connection: Connection, *, tenant_id: str, journey_id: UUID,
     tallies: list[tuple[dict[str, Any], list[dict[str, Any]]]],
 ) -> int:
+    """One row per line, under no document id (the ledger's pages are read
+    together), tied to the newest page's evidence: a re-read overwrites it,
+    and it stops counting once that page is no longer on file
+    (ACTIVE_SOURCE_CONDITION). Never deleted: the service role may not delete
+    source rows (live 2026-11-02: a DELETE here failed every statement sync)."""
     from audit_core.uc03_deal_source_history import record_source_value
 
-    connection.execute(
-        text("DELETE FROM auditcore.commercial_line_source_values "
-             "WHERE tenant_id=:t AND journey_id=:j AND source_document_type=:type"),
-        {"t": tenant_id, "j": journey_id, "type": TALLY_LEDGER_TYPE},
-    )
     if not tallies:
         return 0
     origin = _latest(tallies)
@@ -1066,7 +1066,7 @@ def _record_tally_lines(
             record_source_value(
                 connection, tenant_id=tenant_id, journey_id=journey_id, line_kind=kind, component_key=key,
                 source_document_type=TALLY_LEDGER_TYPE, amount=amount, evidence_id=origin["evidenceId"],
-                document_id=origin["documentId"],
+                document_id=None,
             )
             written += 1
     return written
