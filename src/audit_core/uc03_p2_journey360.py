@@ -534,12 +534,18 @@ def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[s
     duplicates = _duplicate_receipts(rows)
     loan_ids = _loan_receipt_ids(connection, tenant_id=tenant_id, journey_id=journey_id, duplicate_of=duplicates)
     counted = [r for r in rows if r["payment_id"] not in duplicates]
+    # Money the customer ledger records with no receipt on file (2026-11-02).
+    from audit_core.uc03_ledger_receipts import ledger_receipts
+
+    from_ledger = [p["amount"] for p in ledger_receipts(connection, tenant_id=tenant_id, journey_id=journey_id)]
     receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids), Decimal(0))
+    receipts += sum(from_ledger, Decimal(0))
     loan_receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] in loan_ids), Decimal(0))
     loan = loan_receipts + _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
+    customer = [Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids] + from_ledger
     return {"receipts": receipts, "loan": loan, "total": receipts + loan,
-            "customerAmounts": [Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids],
-            "countedAmounts": [Decimal(r["amount"]) for r in counted]}
+            "customerAmounts": customer,
+            "countedAmounts": [Decimal(r["amount"]) for r in counted] + from_ledger}
 
 
 def _loan_counted(connection: Connection, *, tenant_id: str, journey_id: UUID, paid: dict[str, Any]) -> dict[str, Any]:
@@ -2893,6 +2899,21 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         item["bankMatch"] = status
     for item in items:
         item.pop("bank_", None)
+    # Money the customer ledger records with no receipt on file: counted, its
+    # document the ledger page (product owner 2026-11-02: the customer ledger
+    # is used for the payment verification).
+    from audit_core.uc03_ledger_receipts import ledger_receipts
+
+    for posting in ledger_receipts(connection, tenant_id=tenant_id, journey_id=journey_id):
+        items.append({
+            "paymentId": f"ledger:{posting['number'] or posting['date']}:{posting['amount']}",
+            "amount": _money(posting["amount"]), "receiptNumber": posting["number"],
+            "receiptDate": posting["date"], "mode": posting["mode"], "stage": None, "bank": None,
+            "reference": posting["particulars"], "documentId": posting["documentId"],
+            "document": "Customer ledger (no receipt on file)", "counted": True, "isLoanReceipt": False,
+            "notCountedReason": None, "duplicateOf": None, "bankMatch": None, "bankStatement": None,
+            "fromLedger": True,
+        })
 
     # One split of the money received (2026-11-02): the customer's receipts,
     # and the loan -- its linked receipt plus a disbursement on the finance
