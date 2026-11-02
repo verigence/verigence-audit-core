@@ -202,3 +202,15 @@ def test_checkout_check_leaves_satellite_outlets_out(setup):
         connection.execute(text("UPDATE auditcore.dealer_outlets SET outlet_classification='SATELLITE' "
                                 "WHERE outlet_id=:o"), {"o": s.journey.outlet_id})
     assert s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/my-work/checkout-check").json()["pending"] == []
+
+
+def test_a_satellite_has_no_gate_register_day_before_3_november(setup):
+    s = setup
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.dealer_outlets SET outlet_classification='SATELLITE' "
+                                "WHERE outlet_id=:o"), {"o": s.journey.outlet_id})
+        outlets = my_work._my_outlets(connection, s.journey.tenant_id, s.journey.actor_id, "PC")
+        from datetime import date
+        days = my_work.gate_register(connection, s.journey.tenant_id, outlets, date(2026, 10, 30), date(2026, 11, 4))
+    assert [d["date"] for d in days[str(s.journey.outlet_id)]] == ["2026-11-03", "2026-11-04"]

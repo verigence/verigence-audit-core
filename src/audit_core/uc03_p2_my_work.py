@@ -100,6 +100,11 @@ def _my_outlets(connection: Connection, tenant_id: str, actor_id: str, role: str
             if role in {str(r).upper() for r in (o.get("roles") or [])}]
 
 
+# Satellite outlets have a gate register from this day on (product owner 2026-11-02; the daily
+# task reaches them from the next morning's run). Their earlier days were never asked for.
+SATELLITE_REGISTER_FROM = date(2026, 11, 3)
+
+
 def gate_register_days(start: date, end: date) -> list[date]:
     """The gate register days in the period: every day but Sunday (Monday's covers it)."""
     return [start + timedelta(days=i) for i in range((end - start).days + 1)
@@ -128,8 +133,11 @@ def gate_register(connection: Connection, tenant_id: str, outlets: list[dict[str
               AND business_date BETWEEN :a AND :b
         """), {"t": tenant_id, "ids": ids, "a": start, "b": end}).mappings().all()}
     uploaded = vehicle_gate_pass_deliveries(connection, tenant_id, ids, days[0], days[-1])
+    satellites = {str(o["outlet_id"]) for o in outlets if o.get("outlet_classification") == "SATELLITE"}
     for oid in ids:
         for d in days:
+            if oid in satellites and d < SATELLITE_REGISTER_FROM:
+                continue
             gp = passes.get((d, oid))
             files = uploaded.get((d, oid), 0)
             entry: dict[str, Any] = {
