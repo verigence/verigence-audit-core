@@ -107,6 +107,10 @@ def test_pc_home_counts_uploads_gate_register_and_tasks(setup):
     _delivery_file(s, journeys=2)                                   # two deliveries of today's gate pass
     gp = _upload(s).json()["gatePassId"]
     _register(s, gp, 5, 3)                                          # 2 uploaded, 1 pending, 2 not intimated
+    with s.journey.engine.begin() as connection:                    # the PC opened the booking (every live one has its creator)
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.journeys SET created_by_actor_id=:a WHERE tenant_id=:t AND journey_id=:j"),
+                           {"a": s.journey.actor_id, "t": s.journey.tenant_id, "j": str(s.journey.journey_id)})
     _journey_task(s, role="PC")
     today = ist_day().date()
     body = _work(s, **{"from": today.isoformat(), "to": today.isoformat()})
