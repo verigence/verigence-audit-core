@@ -1363,6 +1363,8 @@ _P2_ONLY_REQUIREMENTS = (
     # OPTIONAL row, so a Form 21 is filed there (uc03_form_21) and, once DI
     # has the type, DI links it there itself.
     ("p2_form_21", "form_21"),
+    # The vehicle delivery receipt (no amount) is not a money receipt (2026-11-02).
+    ("p2_delivery_receipt", "delivery_receipt"),
 )
 
 

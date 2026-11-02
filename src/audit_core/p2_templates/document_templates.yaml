@@ -1409,9 +1409,9 @@ document_types:
     - TRADE_IN
   form_21:
     # The RTO sale certificate (product owner, 2026-11-02): kept and listed,
-    # never an invoice and never a money source. Until DI has the type, an
-    # invoice-typed reading whose heading says Form 21 / Sale Certificate is
-    # filed here (uc03_form_21.filed_document_type).
+    # never an invoice and never a money source. DI reads it as form_21 (DI
+    # migration 0059); a reading DI still types as an invoice whose heading says
+    # Form 21 / Sale Certificate is filed here too (uc03_form_21.filed_document_type).
     display_name: Form 21 (Sale Certificate)
     di_types:
     - form_21
@@ -1422,8 +1422,8 @@ document_types:
     pages:
       shape: SINGLE
     extraction:
-      di_schema: FALLBACK
-      di_schema_version: null
+      di_schema: DEDICATED
+      di_schema_version: '1.0'
       key_fields: []
       review_threshold: 90
     persistence:
@@ -1432,6 +1432,34 @@ document_types:
     processors: []
     controls: []
     control_notes: Registration evidence only; no money facts.
+    task_effects:
+    - Low-confidence review
+    journey_360:
+    - DOCUMENTS
+  delivery_receipt:
+    # The New Vehicle Delivery Receipt (2026-11-02): the customer acknowledges
+    # taking the vehicle; it has no amount by nature. Kept and listed, never a
+    # money receipt (it was read as one, with no amount).
+    display_name: Vehicle Delivery Receipt
+    di_types:
+    - delivery_receipt
+    stage: DELIVERY
+    requirement: OPTIONAL
+    condition: null
+    accepted_early: true
+    pages:
+      shape: SINGLE
+    extraction:
+      di_schema: DEDICATED
+      di_schema_version: '1.0'
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical: []
+    processors: []
+    controls: []
+    control_notes: Delivery evidence only; no money facts.
     task_effects:
     - Low-confidence review
     journey_360:

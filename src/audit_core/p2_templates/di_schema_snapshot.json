@@ -2418,6 +2418,54 @@
    ],
    "schema_version": "1.1"
   },
+  "delivery_receipt": {
+   "display_name": "Vehicle Delivery Receipt",
+   "fields": [
+    {
+     "description": "The delivery receipt / delivery note's own number exactly as printed.",
+     "key": "receipt_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Date the customer took delivery of the vehicle, as printed.",
+     "key": "delivery_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Customer taking delivery of the vehicle, exactly as printed.",
+     "key": "customer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model exactly as printed.",
+     "key": "vehicle_model",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis number / VIN exactly as printed; never correct or complete characters.",
+     "key": "vin_number",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Engine number exactly as printed; never correct or complete characters.",
+     "key": "engine_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Financier / hypothecation printed on the receipt, exactly as printed.",
+     "key": "financed_by",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.0"
+  },
   "ew_invoice": {
    "display_name": "Extended Warranty Invoice",
    "fields": [
@@ -2705,6 +2753,90 @@
     }
    ],
    "schema_version": "1.1"
+  },
+  "form_21": {
+   "display_name": "Form 21 (Sale Certificate)",
+   "fields": [
+    {
+     "description": "The certificate's own serial number exactly as printed, only when it prints one; never the invoice number.",
+     "key": "certificate_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Invoice number printed on the certificate (Invoice No. / Bill No.), exactly as printed.",
+     "key": "invoice_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Date of sale: the date the certificate says the vehicle was delivered to the buyer (\"has been delivered by me to ... on <date>\", Date of Sale / Delivery).",
+     "key": "sale_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "Name of the buyer exactly as printed; not the son/wife/daughter of name.",
+     "key": "buyer_name",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Buyer's address exactly as printed (the permanent address when both are printed).",
+     "key": "buyer_address",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Dealer issuing the certificate (letterhead or signatory), exactly as printed.",
+     "key": "dealer_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Chassis number / VIN (Chassis No.) exactly as printed; never correct or complete characters.",
+     "key": "vin_number",
+     "required": true,
+     "type": "string"
+    },
+    {
+     "description": "Engine number (or motor number) exactly as printed; never correct or complete characters.",
+     "key": "engine_number",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Maker's name exactly as printed.",
+     "key": "vehicle_make",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Vehicle model / brand name exactly as printed (after \"Certified that\" or against Model).",
+     "key": "vehicle_model",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Colour of the body exactly as printed.",
+     "key": "vehicle_color",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Month and year of manufacture exactly as printed, e.g. 09/2026.",
+     "key": "vehicle_manufacture_month_year",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Financier the vehicle is held under hire-purchase / lease / hypothecation with, exactly as printed.",
+     "key": "financed_by",
+     "required": false,
+     "type": "string"
+    }
+   ],
+   "schema_version": "1.0"
   },
   "gate_pass": {
    "display_name": "Gate Pass",
