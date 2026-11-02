@@ -1289,6 +1289,10 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     awaiting_delta = _awaiting_delta(counted_rows, standard_discounts)
 
     paid = _paid(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # The old vehicle the NDC takes against the price ("Exchanged vehicle",
+    # or its "Trade in value" row) is paid in kind (2026-11-02, Deal defect 4).
+    old_vehicle = _old_vehicle_in_kind(declared) if statement_policy else None
+    paid_total = paid["total"] + (old_vehicle or Decimal(0))
     # What the customer owes is the current net; with none worked out it is
     # unknown, never the price master's standard (2026-11-02, Deal defect 12).
     payable = net_cur
@@ -1352,9 +1356,11 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             # Lines with no standard on record, taken in the standard at what
             # is charged for them.
             "standardTakenAsCharged": [r["key"] for r in taken_as_charged] if net_std is not None else [],
-            "paid": {"receipts": str(paid["receipts"]), "loan": str(paid["loan"]), "total": str(paid["total"])},
+            "paid": {"receipts": str(paid["receipts"]), "loan": str(paid["loan"]),
+                     "oldVehicle": str(old_vehicle) if old_vehicle is not None else None,
+                     "total": str(paid_total)},
             "payable": payable,
-            "balanceDue": _minus(payable, paid["total"]),
+            "balanceDue": _minus(payable, paid_total),
         },
         "flagged": sum(1 for r in counted_rows + discount_rows if r["flags"]),
     }
@@ -2182,6 +2188,17 @@ def _matched(
     charges = sum((Decimal(a) - Decimal(b) for a, b in pairs), Decimal(0))
     discounts_delta = sum((Decimal(a) - Decimal(b) for a, b in d_pairs), Decimal(0))
     return str(charges - discounts_delta)
+
+
+def _old_vehicle_in_kind(declared: dict[str, list[Any]]) -> Decimal | None:
+    """The old vehicle's value the dealer's statement takes against the price
+    (its declared old_vehicle_value), else None: only the statement says the
+    old vehicle was taken in part payment; a valuation or trade-in record
+    alone does not."""
+    values = [_dec(s["amount"]) for s in declared.get("old_vehicle_value", [])
+              if _norm_type(s["source_document_type"]) in _STATEMENT_NORM]
+    present = [v for v in values if v is not None and v > 0]
+    return present[0] if present else None
 
 
 def _awaiting_delta(counted_rows: list[dict[str, Any]], standard_discounts: list[dict[str, Any]]) -> Decimal:
