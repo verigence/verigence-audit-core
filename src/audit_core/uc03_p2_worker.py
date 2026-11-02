@@ -4673,6 +4673,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # (2026-11-01): see uc03_file_move.run_file_move_resend.
         from audit_core.uc03_file_move import run_file_move_resend
         return run_file_move_resend, (engine, tag, reports)
+    if kind == "OUR_SIDE_REUPLOAD":
+        # Files that failed on our side are uploaded again from the stored
+        # file (2026-11-02): see uc03_p2_our_side_reupload. A dry run lists them.
+        from audit_core.uc03_p2_our_side_reupload import run_our_side_reupload
+        return run_our_side_reupload, (engine, tag, reports)
     if kind == "UNREAD_REREAD":
         # Documents whose read never finished are read again from their
         # stored pages (2026-11-01): see uc03_p2_unread_reread. A dry run lists them.
@@ -4736,6 +4741,7 @@ _ONE_SHOT_VARIABLES = {
     "SKU_RUN": "AUDIT_CORE_SKU_RUN_TAG",
 }
 _JOB_POLL_SECONDS = 60
+_JOB_DETAIL_MAX = 200_000
 
 
 def _run_job(engine: Engine, job: dict[str, Any]) -> None:
@@ -4744,7 +4750,11 @@ def _run_job(engine: Engine, job: dict[str, Any]) -> None:
     try:
         target, args = _one_shot_target(job["job_kind"], engine, job["tag"], list(job["reports"] or []))
         logger.info("p2_worker_job_started", job_id=job_id, kind=job["job_kind"], tag=job["tag"])
-        target(*args)
+        result = target(*args)
+        # What a job returns is kept on its row (2026-11-02), so a dry run can
+        # be read without the worker's logs.
+        if result is not None:
+            detail = json.dumps(result, default=str)[:_JOB_DETAIL_MAX]
     except Exception as exc:  # recorded on the job row
         status, detail = "FAILED", f"{type(exc).__name__}: {exc}"[:1000]
         logger.warning("p2_worker_job_failed", job_id=job_id, kind=job["job_kind"], exc_info=True)
