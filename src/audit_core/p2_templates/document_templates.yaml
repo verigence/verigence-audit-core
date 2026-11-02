@@ -1402,6 +1402,35 @@ document_types:
     journey_360:
     - DOCUMENTS
     - TRADE_IN
+  form_21:
+    # The RTO sale certificate (product owner, 2026-11-02): kept and listed,
+    # never an invoice and never a money source. Until DI has the type, an
+    # invoice-typed reading whose heading says Form 21 / Sale Certificate is
+    # filed here (uc03_form_21.filed_document_type).
+    display_name: Form 21 (Sale Certificate)
+    di_types:
+    - form_21
+    stage: DELIVERY
+    requirement: OPTIONAL
+    condition: null
+    accepted_early: true
+    pages:
+      shape: SINGLE
+    extraction:
+      di_schema: FALLBACK
+      di_schema_version: null
+      key_fields: []
+      review_threshold: 90
+    persistence:
+      typed: generic reviewed field store
+      canonical: []
+    processors: []
+    controls: []
+    control_notes: Registration evidence only; no money facts.
+    task_effects:
+    - Low-confidence review
+    journey_360:
+    - DOCUMENTS
   supporting_document:
     display_name: Supporting Document
     di_types: []

@@ -58,6 +58,7 @@ from audit_core.uc03_booking_receipt_capture import (
 )
 from audit_core.uc03_document_assessments import _effective_applicability
 from audit_core.uc03_document_registry import is_receipt_document_type
+from audit_core.uc03_form_21 import decided_by_reading
 
 logger = structlog.get_logger(__name__)
 
@@ -613,6 +614,13 @@ def acknowledge_booking_document_link(
                     "requirement_ref": payload.requirementRef,
                 },
             ).scalar_one_or_none()
+            if prior_evidence_id is not None and decided_by_reading(requirement["document_type_key"]):
+                # An invoice-typed copy is told apart only once it is read: a
+                # Form 21 comes back from DI typed as an invoice and must never
+                # replace one (product owner, 2026-11-02). Linked ACTIVE beside
+                # the copy on file; which copy stays is decided when it is
+                # read (uc03_form_21.file_reading / settle_slot).
+                prior_evidence_id = None
             if prior_evidence_id is not None:
                 # Decision 2026-10-01 (replaces the September rule that voided
                 # the newer copy and asked the PC to delete the first): a new
