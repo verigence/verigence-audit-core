@@ -2176,6 +2176,14 @@ _GRID_MODEL_ALIASES: dict[str, str] = {
 }
 
 
+# Models a grid line covers besides the one it names (grid only; see
+# ``_grid_targets``): the identity named -> the identities it also covers.
+_GRID_ALSO_COVERS: dict[str, tuple[str, ...]] = {
+    "BE6": ("BE6SPORTEQ",),
+    "BOLERONEO": ("BOLERONEOPLUS",),
+}
+
+
 def _next_grid_start(connection: Connection, *, tenant_id: str, after: date) -> date | None:
     """The day the next grid version starts (it takes over from then), or None."""
     return connection.execute(
@@ -2198,12 +2206,41 @@ def _grid_targets(
     to is one target."""
     targets: list[_Target] = []
     seen: set[tuple[UUID, str | None]] = set()
+    read: list[set[str]] = []
     for in_book in books or [None]:  # type: ignore[list-item]
         found, _, _, _ = _model_targets(models, alias_map, alias, extra_aliases=_GRID_MODEL_ALIASES, in_book=in_book)
+        read.append({price_list_model_key(t.model_name) for t in found})
         for target in found:
             if (target.model_id, target.group) not in seen:
                 seen.add((target.model_id, target.group))
                 targets.append(target)
+    # A grid is for its month's book (2026-11-02): where an earlier book in
+    # its window reads the words as a model the latest book has replaced
+    # with its successor (the October grid's "SCORPIO-N", dated 1 Oct, read
+    # against the September book of 1-2 Oct as the OLD Scorpio N), the line
+    # is the successor's only. The old series then takes the previous
+    # month's line (``grid_row_for_model``): September's "SCORPIO N Old".
+    if len(read) > 1:
+        named = {price_list_model_key(t.model_name) for t in targets}
+        replaced = {old for old, new in _SUCCESSOR_IDENTITY.items()
+                    if old in named and new in read[-1] and old not in read[-1]}
+        targets = [t for t in targets if price_list_model_key(t.model_name) not in replaced]
+    # A line also covers the models the OEM sells as a variant line of the
+    # one it names (product owner, 2026-11-02; review of #468): the "BE6"
+    # line covers the BE 6 SPORTEQ, the "BOLERO NEO" line the Bolero Neo
+    # Plus (September's "THE BOSS- BOLERO+NEO" is all three, and the grid's
+    # "BOLERO & BOLERO NEO" line covered it). Grid only: a scheme's wording
+    # never reaches another model (2026-10-20 rules).
+    by_identity: dict[str, list[tuple[str, UUID, list[tuple[str, UUID]]]]] = {}
+    for entry in models:
+        by_identity.setdefault(price_list_model_key(entry[0]), []).append(entry)
+    for target in list(targets):
+        for extra in _GRID_ALSO_COVERS.get(price_list_model_key(target.model_name), ()):
+            for name, model_id, variants in by_identity.get(extra, []):
+                if (model_id, None) not in seen:
+                    seen.add((model_id, None))
+                    targets.append(_Target(model_id=model_id, model_name=name, variants=variants, group=None,
+                                           qualifiers=target.qualifiers))
     return targets
 
 
@@ -2234,11 +2271,21 @@ def grid_lines_unbound_to_books(
     names = {model_id: name for name, model_id, _ in models}
     books = _books_in_use(connection, tenant_id=tenant_id, start=version[1],
                           end=_next_grid_start(connection, tenant_id=tenant_id, after=version[1]))
+    # What a book reads the words as, less a model the latest book replaced
+    # with its successor (``_grid_targets``: the October grid's "SCORPIO-N"
+    # is never the old Scorpio N the book of 1-2 Oct still prices).
+    replaced: dict[str, set[str]] = {}
+    for alias in stored:
+        read = [{price_list_model_key(t.model_name) for t in _model_targets(
+            models, alias_map, alias, extra_aliases=_GRID_MODEL_ALIASES, in_book=in_book)[0]} for in_book in books]
+        named = set().union(*read) if read else set()
+        replaced[alias] = {old for old, new in _SUCCESSOR_IDENTITY.items()
+                           if len(read) > 1 and old in named and new in read[-1] and old not in read[-1]}
     gaps: list[str] = []
     for in_book in books:
         for alias, bound in stored.items():
             found, _, _, _ = _model_targets(models, alias_map, alias, extra_aliases=_GRID_MODEL_ALIASES, in_book=in_book)
-            wanted = {t.model_id for t in found} & in_book
+            wanted = {t.model_id for t in found if price_list_model_key(t.model_name) not in replaced[alias]} & in_book
             if wanted and not bound & in_book:
                 gaps.append(
                     f"grid v{version[0]} line '{alias}' names {sorted(names[m] for m in wanted)} in a book in force "
@@ -2356,9 +2403,9 @@ def grid_row_for_model(
 ) -> dict[str, Any] | None:
     """The grid line for a model from the grid version standing on a date.
 
-    2026-10-20 product owner rules (R5): only the grid in force on the date
-    answers -- a model the October grid leaves out has no October line, it
-    does not fall back to September's. Where a model has several lines
+    The grid in force on the date answers; a model it does not cover takes
+    the previous month's line (product owner, 2026-11-02, replacing R5 of
+    2026-10-20, under which it had none). Where a model has several lines
     (Camper and Pick-Up, MAXX HD and MAXX HD 2.0) the line whose variant
     group holds the deal's variant wins over the model's general line, and
     a line for another group never answers (a Pick-Up never takes the
@@ -2369,6 +2416,31 @@ def grid_row_for_model(
     version = grid_version_for_date(connection, tenant_id=tenant_id, effective_on=effective_on)
     if version is None:
         return None
+    found = _grid_line_in_version(connection, tenant_id=tenant_id, version=version, model_id=model_id,
+                                  variant_name=variant_name)
+    if found is not None:
+        return found
+    # Product owner, 2026-11-02 (replaces R5's "no fallback"): what a month's
+    # grid does not cover is taken from the previous month's grid -- the
+    # October grid has no XUV400 line (September's "XUV400 EV" answers),
+    # and the old Scorpio N, sold in October from the September series, takes
+    # September's "SCORPIO N Old" line. One month back only.
+    previous = grid_version_for_date(connection, tenant_id=tenant_id,
+                                     effective_on=version["effective_from"] - timedelta(days=1))
+    if previous is None or previous["grid_version_id"] == version["grid_version_id"]:
+        return None
+    carried = _grid_line_in_version(connection, tenant_id=tenant_id, version=previous, model_id=model_id,
+                                    variant_name=variant_name)
+    if carried is None:
+        return None
+    return {**carried, "carriedFromPreviousGrid": True, "gridInForceVersionNo": version["version_no"],
+            "gridInForceEffectiveFrom": str(version["effective_from"])}
+
+
+def _grid_line_in_version(
+    connection: Connection, *, tenant_id: str, version: dict[str, Any], model_id: UUID, variant_name: str | None,
+) -> dict[str, Any] | None:
+    """The grid line for a model in one grid version (``grid_row_for_model``)."""
     model_name = connection.execute(
         text("SELECT model_name FROM auditcore.product_models WHERE model_id = :m"), {"m": model_id},
     ).scalar_one_or_none()

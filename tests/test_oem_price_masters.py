@@ -834,7 +834,7 @@ def test_variant_match_ignores_the_registration_suffix() -> None:
     assert len(matches[1][1]) == 1
 
 
-def test_the_october_grid_keeps_tiers_and_variant_groups_and_never_falls_back(connection) -> None:
+def test_the_october_grid_keeps_tiers_and_variant_groups_and_falls_back_a_month(connection) -> None:
     from audit_core.oem_master_parsers import GridRow
     from audit_core.oem_price_masters import grid_row_for_model, ingest_discount_grid
 
@@ -876,9 +876,12 @@ def test_the_october_grid_keeps_tiers_and_variant_groups_and_never_falls_back(co
                                     variant_name="BOL PIK UP FB 1.3T - BS6.2 - PS")
         assert camper["model_alias"] == "Camper" and Decimal(camper["agreed_buffer_amount"]) == 0
         assert pickup["model_alias"] == "PICKUP" and pickup["raw"]["tiers"]["WITH_INSURANCE"] == "7000"
-        # Thar Roxx is in the August grid only: October has no line for it.
+        # Thar Roxx is in the August grid only: in October it takes the
+        # previous month's line (product owner, 2026-11-02; R5 had none).
         assert grid_row_for_model(connection, tenant_id=tenant_id, model_id=thar, effective_on=date(2026, 9, 9))
-        assert grid_row_for_model(connection, tenant_id=tenant_id, model_id=thar, effective_on=date(2026, 10, 9)) is None
+        carried = grid_row_for_model(connection, tenant_id=tenant_id, model_id=thar, effective_on=date(2026, 10, 9))
+        assert carried["model_alias"] == "Thar Roxx" and carried["carriedFromPreviousGrid"]
+        assert carried["effective_from"] == date(2026, 9, 1)
     finally:
         connection.execute(text("DELETE FROM auditcore.dealer_discount_grid_rows WHERE tenant_id=:t"), {"t": tenant_id})
         connection.execute(text("DELETE FROM auditcore.dealer_discount_grid_versions WHERE tenant_id=:t"),
@@ -1583,16 +1586,19 @@ def test_a_grid_dated_before_its_book_reads_its_models_against_the_book_it_is_us
 
     assert buffer_for("NEW SCORPIO N", date(2026, 10, 15)) == Decimal(12000)
     assert buffer_for("XUV3XO", date(2026, 10, 15)) == Decimal(7000)
-    # The book of 1 - 2 Oct still prices the old Scorpio N: a deal then has its line too.
-    assert buffer_for("SCORPIO N", date(2026, 10, 2)) == Decimal(12000)
+    # The book of 1 - 2 Oct still prices the old Scorpio N, but the October
+    # grid's "SCORPIO-N" is the new one only: the old series takes the
+    # previous month's line (product owner, 2026-11-02), none in this test.
+    assert buffer_for("SCORPIO N", date(2026, 10, 2)) is None
     version = c.execute(text("SELECT grid_version_id FROM auditcore.dealer_discount_grid_versions "
                              "WHERE tenant_id = :t"), {"t": c.tenant_id}).scalar_one()
     assert grid_lines_unbound_to_books(c, tenant_id=c.tenant_id, oem_id=c.oem_id, oem_code=oem_code,
                                        grid_version_id=version) == []
 
     # A line bound only to the retired model (how it was stored) is reported.
-    c.execute(text("DELETE FROM auditcore.dealer_discount_grid_rows WHERE grid_version_id = :v AND model_alias = 'SCORPIO-N' "
-                   "AND model_id = :m"), {"v": version, "m": models["NEW SCORPIO N"]})
+    c.execute(text("UPDATE auditcore.dealer_discount_grid_rows SET model_id = :old WHERE grid_version_id = :v "
+                   "AND model_alias = 'SCORPIO-N' AND model_id = :m"),
+              {"v": version, "m": models["NEW SCORPIO N"], "old": models["SCORPIO N"]})
     gaps = grid_lines_unbound_to_books(c, tenant_id=c.tenant_id, oem_id=c.oem_id, oem_code=oem_code,
                                        grid_version_id=version)
     assert len(gaps) == 1 and "'SCORPIO-N'" in gaps[0] and "NEW SCORPIO N" in gaps[0] and "SCORPIO N'" in gaps[0]

@@ -491,6 +491,19 @@ GRID_SPOT_CHECKS: tuple[tuple[date, str, str | None, str, bool, Any, Decimal | N
      {"BASE": "0.00", "WITH_INSURANCE": "0.00", "WITH_EW_INSURANCE": "5000.00"}, Decimal("5000.00")),
     (date(2026, 10, 15), "VEERO", None, "Veero", True,
      {"BASE": "7000.00", "WITH_INSURANCE": "10000.00", "WITH_EW_INSURANCE": "10000.00"}, Decimal("5000.00")),
+    # 2026-11-02, product owner: what the October grid does not cover is
+    # September's -- XUV400 (no October line), the old Scorpio N (sold in
+    # October from the September series) -- and a line covers the OEM's
+    # variant lines of its model: "BE6" the BE 6 SPORTEQ, "BOLERO NEO" the
+    # Bolero Neo Plus.
+    (date(2026, 10, 15), "XUV400", None, "XUV400 EV", True, Decimal("5000.00"), Decimal("3000.00")),
+    (date(2026, 10, 15), "SCORPIO N", None, "SCORPIO N Old", False, None, None),
+    (date(2026, 9, 15), "BE6 SPORTEQ", None, "BE6", True, Decimal("5000.00"), Decimal("3000.00")),
+    (date(2026, 10, 15), "BE6 SPORTEQ", None, "BE6", True,
+     {"BASE": "0.00", "WITH_INSURANCE": "0.00", "WITH_EW_INSURANCE": "5000.00"}, Decimal("5000.00")),
+    (date(2026, 9, 15), "BOLERO NEO PLUS", "P10 BS6.2", "BOLERO NEO", True, Decimal("5000.00"), Decimal("3000.00")),
+    (date(2026, 10, 15), "BOLERO NEO PLUS", "P10 BS6.2", "BOLERO NEO", True,
+     {"BASE": "5000.00", "WITH_INSURANCE": "5000.00", "WITH_EW_INSURANCE": "7000.00"}, Decimal("5000.00")),
 )
 
 
@@ -522,6 +535,7 @@ def grid_by_model(connection: Connection, tenant_id: str, on: date) -> list[dict
             "tiers": raw.get("tiers"),
             "outOfTerritory": str(row["out_of_territory_amount"]) if row and row.get("out_of_territory_amount") is not None else None,
             "bookingProtectionDays": (row or {}).get("booking_protection_days"),
+            "fromPreviousGrid": bool((row or {}).get("carriedFromPreviousGrid")),
         })
     return out
 
@@ -613,6 +627,10 @@ def reload_grids_tenant(connection: Connection, *, tenant_id: str, tag: str, sto
             names = sorted({m for a, m in bound if a == alias})
             if on < date(2026, 10, 1):
                 check(f"grid of {on}: '{alias}' is the September book's {model}", names == [model], [model], names)
+        if on >= date(2026, 10, 1):
+            names = sorted({m for a, m in bound if a == "SCORPIO-N"})
+            check(f"grid of {on}: 'SCORPIO-N' is the new Scorpio N only", names == ["NEW SCORPIO N"],
+                  ["NEW SCORPIO N"], names)
 
     by_month = {str(on): grid_by_model(connection, tenant_id, on) for on in GRID_CHECK_DATES}
     for on in GRID_CHECK_DATES:

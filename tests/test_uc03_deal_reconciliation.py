@@ -1407,12 +1407,14 @@ def test_b1_no_grid_line_and_out_of_scope_are_not_over_grants(journey) -> None:
         assert row["standard_eligible_amount"] == Decimal(7000)  # never the Camper line
         assert _details(c, "ADDITIONAL_DISCOUNT")["grid"]["modelAlias"] == "Pick-Up"
 
-        # A newer grid with no line for the model: not known, and one task.
+        # A newer grid with no line for the model: the previous grid's line
+        # answers (product owner, 2026-11-02: what a month's grid does not
+        # cover is taken from the previous month's).
         _grid(c, model_id=None, effective_from=date(2026, 9, 5), rows=[{"alias": "XUV 7XO", "buffer": "5000"}])
         dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
         row = _discount(c, "ADDITIONAL_DISCOUNT")
-        assert row["eligibility_result"] == "MASTER_UNMATCHED" and row["standard_eligible_amount"] is None
-        assert [t["dedupe_key"].startswith("grid-line-missing:") for t in _p2_tasks(c, "SCHEME_MASTER_UNMATCHED")] == [True]
+        assert row["standard_eligible_amount"] == Decimal(7000)
+        assert _details(c, "ADDITIONAL_DISCOUNT")["grid"]["modelAlias"] == "Pick-Up"
 
         # "Out of scope" of the discount control program is not "no discount".
         c.execute(text("UPDATE auditcore.dealer_discount_grid_rows SET in_scope = false WHERE tenant_id=:t"),
@@ -1421,6 +1423,14 @@ def test_b1_no_grid_line_and_out_of_scope_are_not_over_grants(journey) -> None:
                        "WHERE tenant_id=:t AND effective_from = '2026-09-05'"), {"t": c.tenant_id})
         dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
         assert _discount(c, "ADDITIONAL_DISCOUNT")["eligibility_result"] == "OUT_OF_GRID_SCOPE"
+
+        # No line in the grid in force nor in the one before: not known, and one task.
+        c.execute(text("DELETE FROM auditcore.dealer_discount_grid_rows WHERE tenant_id=:t "
+                       "AND model_alias IN ('Camper', 'Pick-Up')"), {"t": c.tenant_id})
+        dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+        row = _discount(c, "ADDITIONAL_DISCOUNT")
+        assert row["eligibility_result"] == "MASTER_UNMATCHED" and row["standard_eligible_amount"] is None
+        assert [t["dedupe_key"].startswith("grid-line-missing:") for t in _p2_tasks(c, "SCHEME_MASTER_UNMATCHED")] == [True]
     finally:
         c.execute(text("DELETE FROM auditcore.dealer_discount_grid_rows WHERE tenant_id=:t"), {"t": c.tenant_id})
         c.execute(text("DELETE FROM auditcore.dealer_discount_grid_versions WHERE tenant_id=:t"), {"t": c.tenant_id})
