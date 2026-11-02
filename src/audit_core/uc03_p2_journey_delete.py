@@ -17,6 +17,9 @@ What is removed
 What stays
     One row in ``p2_journey_deletions``: the journey's basic details as they
     stood, who deleted it, when and why, and how many documents and files went.
+    A copy the system deletes as the same file uploaded again also keeps its
+    PAN, mobile, Aadhaar (masked to the last four digits), booking reference
+    number, model and the copy kept (``record_details``, 2026-11-02).
 
 Order
     The record is written first and committed, so an attempt that fails half
@@ -169,6 +172,14 @@ def storage_prefixes(tenant_id: str, journey_id: UUID) -> tuple[str, str]:
     )
 
 
+# What a same-file deletion keeps beyond the journey's basic details
+# (migration 0187). The Aadhaar only ever masked.
+_DETAIL_COLUMNS = (
+    "deletion_kind", "customer_pan", "customer_aadhaar_masked", "customer_mobile",
+    "booking_reference", "model_name", "kept_journey_id", "kept_journey_reference",
+)
+
+
 def _check_and_record(
     connection: Connection,
     *,
@@ -179,11 +190,13 @@ def _check_and_record(
     actor_id: str,
     role: str,
     skip_guards: bool = False,
+    details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Check the journey may be deleted, collect what to remove and write the
     record, on a connection whose tenant context is set. The same guards for a
     Team Lead and for the system (2026-10-31): never a reviewed or closed journey.
-    ``skip_guards`` only to finish a system deletion already under way."""
+    ``skip_guards`` only to finish a system deletion already under way.
+    ``details``: the columns of a same-file deletion (``_DETAIL_COLUMNS``)."""
     row = connection.execute(
         text(_SNAPSHOT_SQL), {"tenant_id": tenant_id, "journey_id": journey_id}
     ).mappings().first()
@@ -230,12 +243,16 @@ def _check_and_record(
                 tenant_id, journey_id, journey_reference, customer_name,
                 dealer_id, dealer_name, outlet_id, outlet_name, outlet_code,
                 pc_actor_id, pc_name, vehicle, current_stage, journey_created_at_utc,
-                document_count, reason, deleted_by_actor_id, deleted_by_role, correlation_id
+                document_count, reason, deleted_by_actor_id, deleted_by_role, correlation_id,
+                deletion_kind, customer_pan, customer_aadhaar_masked, customer_mobile,
+                booking_reference, model_name, kept_journey_id, kept_journey_reference
             ) VALUES (
                 :tenant_id, :journey_id, :journey_reference, :customer_name,
                 :dealer_id, :dealer_name, :outlet_id, :outlet_name, :outlet_code,
                 :pc_actor_id, :pc_name, :vehicle, :current_stage, :created_at,
-                :document_count, :reason, :actor_id, :role, :correlation_id
+                :document_count, :reason, :actor_id, :role, :correlation_id,
+                :deletion_kind, :customer_pan, :customer_aadhaar_masked, :customer_mobile,
+                :booking_reference, :model_name, :kept_journey_id, :kept_journey_reference
             ) RETURNING deletion_id
             """
         ),
@@ -259,6 +276,7 @@ def _check_and_record(
             "actor_id": actor_id,
             "role": role,
             "correlation_id": correlation_id,
+            **{column: (details or {}).get(column) for column in _DETAIL_COLUMNS},
         },
     ).scalar_one()
     return {
@@ -609,13 +627,16 @@ def system_delete_journey(
     storage: P2DocumentStorage,
     on_deleted: Callable[[Connection], None] | None = None,
     before_record: Callable[[Connection, bool], None] | None = None,
+    record_details: Callable[[Connection], dict[str, Any]] | None = None,
 ) -> DeleteJourneyResult:
     """Delete a journey with no human principal. Must not be called inside an
     open transaction: Document Intelligence and R2 are called between the
     record (committed first) and the database delete (its own transaction).
     ``before_record(connection, continuing)`` runs in the record's transaction
     first (the worker checks it still holds its work item, and re-checks the
-    match, there); it may raise to stop. Raises NotFoundError, ConflictError
+    match, there); it may raise to stop. ``record_details(connection)`` then
+    gives the extra columns the record keeps (``_DETAIL_COLUMNS``), read
+    while the journey's facts still exist. Raises NotFoundError, ConflictError
     (reviewed / closed) or DependencyUnavailableError.
 
     An earlier system attempt on this journey that did not finish (STARTED,
@@ -646,6 +667,7 @@ def system_delete_journey(
         started = _check_and_record(
             connection, tenant_id=tenant_id, journey_id=journey_id, reason=reason[:2000],
             correlation_id=correlation_id, actor_id=SYSTEM_ACTOR, role=SYSTEM_ROLE, skip_guards=continuing,
+            details=record_details(connection) if record_details is not None else None,
         )
     di_done, object_count = _remove(
         engine, tenant_id=tenant_id, journey_id=journey_id, started=started,

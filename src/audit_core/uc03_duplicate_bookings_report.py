@@ -3,6 +3,14 @@ view of every DUPLICATE_BOOKING pairing: which two journeys, at which
 dealer/outlet, for which vehicle, and which one actually holds the booking.
 
   GET /v1/tenants/{tenant_id}/uc03/duplicate-bookings
+  GET /v1/tenants/{tenant_id}/uc03/duplicate-bookings/deleted
+
+The second lists the bookings the system deleted as the same file uploaded
+again (uc03_p2_same_file, product owner 2026-11-02): PC, outlet, model, PAN
+and mobile in full, the Aadhaar masked to its last four digits, the booking
+reference number, the customer, when, and the copy kept -- from the deletion
+record (auditcore.p2_journey_deletions), newest first, scoped the same way
+by the deleted booking's dealership / outlet.
 
 The finding itself (raised on the journey that does NOT hold the booking --
 see uc03_duplicate_booking_detection.py) already surfaces in the ordinary
@@ -232,6 +240,61 @@ def _side(row: dict[str, Any], prefix: str) -> DuplicateBookingSide:
     )
 
 
+class DeletedDuplicate(BaseModel):
+    """A booking deleted as the same file uploaded again. Records from
+    before 2026-11-02 carry the PAN and mobile masked, as their alert kept
+    them, and no Aadhaar or booking reference number."""
+    deletionId: UUID
+    deletedAtUtc: datetime
+    status: str
+    journeyId: UUID
+    journeyReference: str | None = None
+    keptJourneyId: UUID | None = None
+    keptJourneyReference: str | None = None
+    customerName: str | None = None
+    pcName: str | None = None
+    dealerName: str | None = None
+    outletName: str | None = None
+    model: str | None = None
+    pan: str | None = None
+    aadhaarMasked: str | None = None
+    mobile: str | None = None
+    bookingReference: str | None = None
+
+
+class DeletedDuplicatesResponse(BaseModel):
+    generatedAtUtc: datetime
+    items: list[DeletedDuplicate]
+
+
+_DELETED_LIMIT = 500
+
+_DELETED_SQL = f"""
+    SELECT d.deletion_id, COALESCE(d.completed_at_utc, d.requested_at_utc) AS deleted_at_utc,
+           d.deletion_status, d.journey_id, d.journey_reference, d.kept_journey_id, d.kept_journey_reference,
+           d.customer_name, d.pc_name, d.dealer_name, d.outlet_name, COALESCE(d.model_name, d.vehicle) AS model,
+           d.customer_pan, d.customer_aadhaar_masked, d.customer_mobile, d.booking_reference
+    FROM auditcore.p2_journey_deletions d
+    WHERE d.tenant_id = :tenant_id
+      AND d.deletion_kind = 'SAME_FILE' AND d.deletion_status = 'COMPLETED'
+      AND EXISTS (
+            SELECT 1 FROM auditcore.business_assignments ba
+            WHERE ba.tenant_id = d.tenant_id
+              AND ba.security_actor_id = :actor_id
+              AND ba.assignment_status = 'ACTIVE'
+              AND ba.effective_from <= now()
+              AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+              AND (
+                    ba.dealer_id IS NULL
+                    OR (ba.dealer_id = d.dealer_id
+                        AND (ba.outlet_id IS NULL OR ba.outlet_id = d.outlet_id))
+              )
+      )
+    ORDER BY COALESCE(d.completed_at_utc, d.requested_at_utc) DESC, d.deletion_id
+    LIMIT {_DELETED_LIMIT}
+"""
+
+
 def _actor_roles(connection: Connection, *, tenant_id: str, actor_id: str) -> list[str]:
     rows = connection.execute(
         text(
@@ -288,6 +351,44 @@ def get_duplicate_bookings(
         for row in rows
     ]
     return DuplicateBookingsResponse(roles=roles, generatedAtUtc=datetime.now(UTC), pairs=pairs)
+
+
+@router.get("/duplicate-bookings/deleted", response_model=DeletedDuplicatesResponse)
+def get_deleted_duplicate_bookings(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)] = None,
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ] = None,
+    connection: Annotated[Connection, Depends(get_connection)] = None,
+) -> DeletedDuplicatesResponse:
+    _authorize(authorization_client, human_principal=human_principal, tenant_id=tenant_id)
+    set_tenant_context(connection, tenant_id)
+    rows = connection.execute(
+        text(_DELETED_SQL), {"tenant_id": tenant_id, "actor_id": human_principal.subject},
+    ).mappings().all()
+    items = [
+        DeletedDuplicate(
+            deletionId=row["deletion_id"],
+            deletedAtUtc=row["deleted_at_utc"],
+            status=row["deletion_status"],
+            journeyId=row["journey_id"],
+            journeyReference=row["journey_reference"],
+            keptJourneyId=row["kept_journey_id"],
+            keptJourneyReference=row["kept_journey_reference"],
+            customerName=row["customer_name"],
+            pcName=row["pc_name"],
+            dealerName=row["dealer_name"],
+            outletName=row["outlet_name"],
+            model=row["model"],
+            pan=row["customer_pan"],
+            aadhaarMasked=row["customer_aadhaar_masked"],
+            mobile=row["customer_mobile"],
+            bookingReference=row["booking_reference"],
+        )
+        for row in rows
+    ]
+    return DeletedDuplicatesResponse(generatedAtUtc=datetime.now(UTC), items=items)
 
 
 __all__ = ["router"]
