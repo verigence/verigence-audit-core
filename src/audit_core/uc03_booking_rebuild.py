@@ -25,7 +25,8 @@ any document change. The job never writes a booking's values itself, and a
 booking whose build would change nothing is not touched.
 
 Started as worker job ``BOOKING_REBUILD``, over every booking or only the
-journey references the job lists in ``reports``. A DRY RUN unless the tag ends
+journey references the job lists in ``reports``, of every Project or only the
+one a ``<tenant_id>:<label>`` tag names. A DRY RUN unless the tag ends
 with "-commit". Idempotent: once the recomputes have run, a second run finds
 nothing to change.
 """
@@ -259,7 +260,7 @@ def rebuild_tenant(engine: Engine, *, tenant_id: str, tag: str, commit: bool,
                               "paymentsAdded": 0, "paymentsAddedAmount": Decimal("0.00"), "paymentsRemoved": 0,
                               "paymentsRemovedAmount": Decimal("0.00"), "paymentsChanged": 0, "vehicleChanged": 0,
                               "tasksRaised": 0, "tasksClosed": 0, "raisedByCode": Counter(),
-                              "closedByCode": Counter(),
+                              "closedByCode": Counter(), "closedByTask": Counter(),
                               "recomputeRequested": 0, "failed": 0}
     for journey in journeys:
         journey_id = UUID(str(journey["journey_id"]))
@@ -297,24 +298,50 @@ def rebuild_tenant(engine: Engine, *, tenant_id: str, tag: str, commit: bool,
         totals["tasksClosed"] += len(tasks.get("closed", []))
         totals["raisedByCode"].update(t.split(":", 1)[0] for t in tasks.get("raised", []))
         totals["closedByCode"].update(t.split(":", 1)[0] for t in tasks.get("closed", []))
+        totals["closedByTask"].update(tasks.get("closed", []))
         logger.info("booking_rebuild_item", tag=tag, tenant_id=tenant_id, commit=commit, journey_id=str(journey_id),
                     reference=journey["journey_reference"], changes=changes)
     totals["byTable"] = dict(totals["byTable"])
     totals["raisedByCode"] = dict(totals["raisedByCode"])
     totals["closedByCode"] = dict(totals["closedByCode"])
+    totals["closedByTask"] = dict(totals["closedByTask"])
     totals["paymentsAddedAmount"] = str(totals["paymentsAddedAmount"])
     totals["paymentsRemovedAmount"] = str(totals["paymentsRemovedAmount"])
     return totals
 
 
-def run_booking_rebuild(engine: Engine, tag: str, tenant_ids: list[str], references: list[str] | None = None) -> None:
+def _named_tenant(tag: str, tenant_ids: list[str]) -> list[str]:
+    """The Project a ``<tenant_id>:<label>`` tag names, or every Project for a
+    tag without one. A tag naming no active Project runs nothing."""
+    tenant_id, sep, _ = (tag or "").partition(":")
+    if not sep:
+        return tenant_ids
+    if tenant_id.strip() not in tenant_ids:
+        raise ValueError(f"{JOB}: no active Project {tenant_id.strip()!r} (tag '<tenant_id>:<label>')")
+    return [tenant_id.strip()]
+
+
+def run_booking_rebuild(engine: Engine, tag: str, tenant_ids: list[str],
+                        references: list[str] | None = None) -> dict[str, Any]:
     """``references``: journey references to limit the run to (a job's
-    ``reports``); none means every booking."""
+    ``reports``); none means every booking. Returns the totals of every
+    Project that had a booking to check, kept on the job row (a dry run can
+    be read without the worker's logs).
+
+    A tag ``<tenant_id>:<label>`` limits the run to that Project (2026-11-02:
+    the open RSA / EW invoice tasks of Mahindra Orissa); a tag without a colon
+    runs over every Project, as before."""
     commit = tag.endswith("-commit")
+    tenant_ids = _named_tenant(tag, tenant_ids)
+    results: dict[str, Any] = {}
     for tenant_id in tenant_ids:
         try:
             totals = rebuild_tenant(engine, tenant_id=tenant_id, tag=tag, commit=commit, references=references)
         except Exception:
             logger.warning("booking_rebuild_tenant_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
+            results[tenant_id] = {"failed": True}
             continue
         logger.info("booking_rebuild_finished", tag=tag, tenant_id=tenant_id, commit=commit, **totals)
+        if totals["journeys"]:
+            results[tenant_id] = totals
+    return {"commit": commit, "projects": results}

@@ -30,6 +30,11 @@ from sqlalchemy import Connection, text
 
 from audit_core.uc03_booking_confirmation_rules import _minimum_booking_amount
 from audit_core.uc03_customer_ledger import LEDGER_DI_TYPE, PAYMENT_LEDGER_NAME
+from audit_core.uc03_deal_source_policy import (
+    ACCOUNT_STATEMENT_TYPE,
+    INVOICE_SOURCE_TYPES,
+    normalise_type,
+)
 from audit_core.uc03_delivery_start import delivery_has_started
 from audit_core.uc03_duplicate_receipt_detection import (
     ReceiptRecord,
@@ -701,6 +706,30 @@ _AMOUNT_EVIDENCE = {
                         "non_genuine_accessories_amount", "accessories_amount"),
     "scrappageClaimed": ("scrappage_discount_amount", "SCRAPPAGE_BONUS_DEALER", "SCRAPPAGE_BONUS_COD"),
 }
+# RSA and extended warranty are sold only when the customer was charged for
+# them (product owner 2026-11-02: "The booking form shouldn't form the basis;
+# it should be the customer ledger, then it should be asked"). The booking
+# form is the offer: 86 of 124 open "Upload the RSA Invoice" tasks on Mahindra
+# Orissa were raised by it alone. So rsaSold / ewSold come only from a
+# document that charges the customer: the NDC / account statement and the
+# customer ledger (DI type customer_ledger, also the source type the statement
+# reader records its lines under), the ERP settlement printout read from it
+# (erp_settlement), the cost sheet that stands in for the NDC (cost_sheet), and
+# an invoice that bills the customer (the dealer's DMS / Tally invoices, the
+# RSA / EW / accessory invoices, a debit note) -- never the OEM's wholesale
+# invoice nor a credit note. The other conditions keep every source.
+CHARGED_ONLY_CONDITIONS = frozenset({"rsaSold", "ewSold"})
+CHARGED_SOURCE_TYPES = frozenset(
+    {ACCOUNT_STATEMENT_TYPE, "erp_settlement", "cost_sheet"}
+    | (INVOICE_SOURCE_TYPES - {"wholesale_invoice", "credit_note"})
+)
+
+
+def counts_as_evidence(condition: str, document_type: str | None) -> bool:
+    """Whether an amount on this document type can make ``condition`` true."""
+    return condition not in CHARGED_ONLY_CONDITIONS or normalise_type(document_type) in CHARGED_SOURCE_TYPES
+
+
 _TEXT_EVIDENCE = {
     # evidence key -> field keys whose non-empty value is the evidence
     "corporateCustomer": ("buyer_gstin", "customer_gstin", "gstin_of_buyer"),
@@ -802,7 +831,7 @@ def condition_reasons(connection: Connection, *, tenant_id: str, journey_id: UUI
     for row in fields:
         key, value, document_type = str(row["field_key"]), row["value"], row["document_type_key"]
         for condition, keys in _AMOUNT_EVIDENCE.items():
-            if key in keys:
+            if key in keys and counts_as_evidence(condition, document_type):
                 amount = _as_amount(value)
                 if amount is not None and amount > 0:
                     found(condition, f"The {where(document_type)} shows {key.replace('_', ' ').lower()} of ₹{amount:,.0f}.")
