@@ -58,7 +58,7 @@ from sqlalchemy import Connection, Engine, text
 from audit_core.authorization import AuthorizationError
 from audit_core.db import set_tenant_context
 from audit_core.errors import AuditCoreError
-from audit_core.uc03_p2_object_keys import original_key
+from audit_core.uc03_p2_object_keys import original_key, upload_labels
 from audit_core.uc03_p2_runtime import enqueue_work, record_activity
 from audit_core.uc03_p2_storage import P2DocumentStorageError, get_p2_document_storage
 
@@ -264,23 +264,12 @@ def _copy_file(engine: Engine, tenant_id: str, move: Move, journey_id: UUID, pay
             text("SELECT batch_id FROM auditcore.p2_upload_batches WHERE tenant_id=:t AND batch_id=:b"),
             {"t": tenant_id, "b": batch_id},
         ).scalar_one_or_none()
-        labels = connection.execute(
-            text(
-                """
-                SELECT o.outlet_name, j.created_by_display_name
-                FROM auditcore.journeys j
-                LEFT JOIN auditcore.dealer_outlets o
-                  ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
-                WHERE j.tenant_id=:t AND j.journey_id=:j
-                """
-            ),
-            {"t": tenant_id, "j": journey_id},
-        ).one()
+        labels = upload_labels(connection, tenant_id=tenant_id, journey_id=journey_id)
     if existing is not None:
         return batch_id
     storage = get_p2_document_storage()
     key = original_key(tenant_id, journey_id, batch_id, filename=move.file_name,
-                       outlet_name=labels[0], pc_name=labels[1])
+                       outlet_name=labels[0], pc_name=labels[1], customer_name=labels[2])
     # Object storage outside any transaction; a retry writes the same key.
     storage.put_object(key, payload, content_type=move.content_type or "application/pdf")
     correlation = f"p2-file-move:{move.move_id}"

@@ -412,9 +412,11 @@ def test_a_technical_intent_failure_still_retries():
     assert worker._is_retryable(refused) is False
 
 
-def test_a_pc_upload_is_stored_under_its_ist_date_with_outlet_and_pc_in_the_name(pipeline):
-    """The original, its pages and its merged documents all sit in one dated
-    batch folder; the original's name carries the outlet and the PC."""
+def test_a_pc_upload_is_stored_per_outlet_and_ist_day_under_the_customer_s_name(pipeline):
+    """Product owner 2026-11-02: the original, its pages and its merged
+    documents all sit in one batch folder under the booking's outlet and the
+    IST day; the original's name is the file's own with the customer's name
+    (and the PC's) appended. It is split and read only once it is stored."""
     import re
 
     journey, storage, di = pipeline
@@ -438,10 +440,11 @@ def test_a_pc_upload_is_stored_under_its_ist_date_with_outlet_and_pc_in_the_name
     assert client.post(f"{base}/uploads/{upload['batchId']}:finalize").status_code == 202
     _drain(journey)
 
-    folder = (rf"p2-documents/{re.escape(journey.tenant_id)}/\d{{4}}-W\d{{2}}/\d{{4}}-\d{{2}}-\d{{2}}/"
-              rf"{journey.journey_id}/{upload['batchId']}")
-    assert re.fullmatch(rf"{folder}/original/[A-Za-z0-9.-]+__Ravi-Kumar__booking_packet\.pdf", original), original
-    assert outlet.split()[0] in original
+    from audit_core.uc03_p2_object_keys import day_folder, safe_part
+
+    folder = (rf"p2-documents/{re.escape(journey.tenant_id)}/{re.escape(safe_part(outlet, fallback='outlet', limit=60))}/"
+              rf"{day_folder()}/{journey.journey_id}/{upload['batchId']}")
+    assert re.fullmatch(rf"{folder}/original/booking_packet__P2-Customer__Ravi-Kumar\.pdf", original), original
     stored = [k for k in storage.objects if k != original]
     assert stored, "the worker stored no pages"
     assert all(re.fullmatch(rf"{folder}/(pages|groups)/.+", k) for k in stored), stored

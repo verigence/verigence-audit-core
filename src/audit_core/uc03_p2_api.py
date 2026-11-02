@@ -134,22 +134,15 @@ def _safe_filename(value: str) -> str:
     return name[:180] or "document"
 
 
-def _upload_labels(connection: Connection, *, tenant_id: str, journey_id: UUID) -> tuple[str | None, str | None]:
-    """The outlet name and the PC's name the Journey belongs to, for the name
-    of the stored file (uc03_p2_object_keys)."""
-    row = connection.execute(
-        text(
-            """
-            SELECT o.outlet_name, j.created_by_display_name
-            FROM auditcore.journeys j
-            LEFT JOIN auditcore.dealer_outlets o
-              ON o.tenant_id = j.tenant_id AND o.dealer_id = j.dealer_id AND o.outlet_id = j.outlet_id
-            WHERE j.tenant_id = :t AND j.journey_id = :j
-            """
-        ),
-        {"t": tenant_id, "j": journey_id},
-    ).one_or_none()
-    return (row[0], row[1]) if row else (None, None)
+def _upload_labels(
+    connection: Connection, *, tenant_id: str, journey_id: UUID,
+) -> tuple[str | None, str | None, str | None]:
+    """The outlet name, the PC's name and the customer's name (as the PC
+    entered it on the booking) of the Journey, for where and under what name
+    the file is stored (uc03_p2_object_keys)."""
+    from audit_core.uc03_p2_object_keys import upload_labels
+
+    return upload_labels(connection, tenant_id=tenant_id, journey_id=journey_id)
 
 
 def _activity(
@@ -1155,7 +1148,7 @@ def init_uploads(
         candidate_batch_id = uuid4()
         candidate_object_key = original_key(
             tenant_id, journey_id, candidate_batch_id, filename=item.filename,
-            outlet_name=labels[0], pc_name=labels[1],
+            outlet_name=labels[0], pc_name=labels[1], customer_name=labels[2],
         )
         inserted = connection.execute(
             text(
@@ -1346,10 +1339,10 @@ def replace_document(
         ) from exc
 
     candidate_batch_id = uuid4()
-    outlet_name, pc_name = _upload_labels(connection, tenant_id=tenant_id, journey_id=journey_id)
+    outlet_name, pc_name, customer_name = _upload_labels(connection, tenant_id=tenant_id, journey_id=journey_id)
     candidate_key = original_key(
         tenant_id, journey_id, candidate_batch_id, filename=command.filename,
-        outlet_name=outlet_name, pc_name=pc_name,
+        outlet_name=outlet_name, pc_name=pc_name, customer_name=customer_name,
     )
     connection.execute(
         text(
