@@ -219,10 +219,12 @@ def test_a_conditional_document_without_the_flag_still_raises_its_task(journey):
 
 
 def test_a_delivery_document_is_not_asked_for_while_the_journey_is_at_booking(journey):
-    """2026-10-28: the booking docket says RSA was sold, but no RSA invoice can
-    exist before delivery; PCs could only comment "it is in booking stage" on
-    the task. It is raised once a delivery document is on file."""
-    add_ready_document(journey, "booking_docket", customer_name="A", booking_date="2026-09-01", rsa_amount="1500")
+    """2026-10-28: the RSA is charged, but no RSA invoice can exist before
+    delivery; PCs could only comment "it is in booking stage" on the task. It
+    is raised once a delivery document is on file. (Since 2026-11-02 the
+    booking docket's RSA alone no longer makes it sold: the ledger's charge does.)"""
+    add_ready_document(journey, "booking_docket", customer_name="A", booking_date="2026-09-01")
+    add_ready_document(journey, "customer_ledger", rsa_amount="1500")
     _settle(journey)
     reasons, items = _delivery_requirements(journey)
     assert "rsaSold" in reasons and items["rsa_invoice"]["required"] is True

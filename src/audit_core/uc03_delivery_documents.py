@@ -303,15 +303,22 @@ def _resolve_condition(
         return _commercial_amount_taken(
             connection, tenant_id=tenant_id, journey_id=journey_id, component_key="accessories_cost"
         )
-    if key == "extendedwarrantytaken":
-        return _commercial_amount_taken(
-            connection, tenant_id=tenant_id, journey_id=journey_id,
-            component_key="additional_warranty_amount",
+    if key in ("extendedwarrantytaken", "rsataken"):
+        # One rule for "RSA / EW sold" (product owner 2026-11-02): only an
+        # amount the customer was charged -- the NDC / customer ledger, cost
+        # sheet or a customer invoice, never the booking form -- see
+        # uc03_p2_stage.CHARGED_SOURCE_TYPES. Not charged but the line known
+        # (a booking-form offer, or a zero) is "No"; nothing yet is unknown.
+        from audit_core.uc03_p2_stage import condition_reasons
+
+        condition, component_key = (("ewSold", "additional_warranty_amount") if key == "extendedwarrantytaken"
+                                    else ("rsaSold", "rsa_amount"))
+        if condition in condition_reasons(connection, tenant_id=tenant_id, journey_id=journey_id):
+            return True
+        known = _commercial_amount_taken(
+            connection, tenant_id=tenant_id, journey_id=journey_id, component_key=component_key
         )
-    if key == "rsataken":
-        return _commercial_amount_taken(
-            connection, tenant_id=tenant_id, journey_id=journey_id, component_key="rsa_amount"
-        )
+        return None if known is None else False
     if key == "registrationbydealer":
         return _registration_by_dealer(connection, tenant_id=tenant_id, journey_id=journey_id)
     if key == "corporatecustomer":
