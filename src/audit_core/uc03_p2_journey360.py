@@ -1146,6 +1146,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     booking_date = plausible_from(connection, tenant_id=tenant_id, journey_id=journey_id)
     fallback_vehicle: dict[str, Any] | None = None
     if statement_policy:
+        sources = _standing_copies(connection, tenant_id=tenant_id, journey_id=journey_id, sources=sources)
         policy_documents, sources = _statement_policy_sources(documents, sources)
         sources, fallback_vehicle = _invoice_where_statement_silent(documents, sources, booking_date=booking_date)
         documents = policy_documents
@@ -1458,6 +1459,38 @@ def _deal_sku_block(sku: Any, price_plan: dict[str, Any] | None) -> dict[str, An
 
 # ---------------------------------------------------------------------------
 # deal(), stage 2: which document stands in which column.
+
+
+def _standing_copies(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Several copies of the NDC or of the cost sheet on file (2026-11-02, Deal
+    defect 15): each figure stands from the copy the statement sync took it
+    from (uc03_account_statement.combine_statements); another copy's row of
+    that figure leaves the Deal -- the copies-differ task lists it. With one
+    copy per figure nothing is read and nothing changes."""
+    documents: dict[tuple[str, str, str], set[str]] = {}
+    for s in sources:
+        kind = _norm_type(s["source_document_type"])
+        if kind in _LEDGER_NORM or kind in _QUOTE_NORM:
+            documents.setdefault((kind, str(s["line_kind"]), str(s["component_key"])), set()).add(
+                str(s["source_document_id"]))
+    if all(len(ids) <= 1 for ids in documents.values()):
+        return sources
+    from audit_core.uc03_account_statement import COST_SHEET_TYPE, chosen_copies
+    from audit_core.uc03_deal_source_policy import ACCOUNT_STATEMENT_TYPE
+
+    chosen = chosen_copies(connection, tenant_id=tenant_id, journey_id=journey_id)
+    kept = []
+    for s in sources:
+        kind = _norm_type(s["source_document_type"])
+        key = (kind, str(s["line_kind"]), str(s["component_key"]))
+        if len(documents.get(key, ())) > 1:
+            table = chosen[COST_SHEET_TYPE if kind in _QUOTE_NORM else ACCOUNT_STATEMENT_TYPE]
+            if table.get((str(s["line_kind"]), str(s["component_key"]))) != str(s["source_document_id"]):
+                continue
+        kept.append(s)
+    return kept
 
 
 def _statement_policy_sources(

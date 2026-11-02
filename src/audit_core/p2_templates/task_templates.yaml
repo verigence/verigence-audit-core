@@ -21,7 +21,7 @@ actions:
 - CONFIRM_BREACH
 - MARK_FALSE_POSITIVE
 # The PC closes a task by hand, with a comment (PC_PAGE_QUALITY_REJECTED,
-# PC_LARGE_UPLOAD_REVIEW and COST_SHEET_NDC_DIFFERENCE only).
+# PC_LARGE_UPLOAD_REVIEW, COST_SHEET_NDC_DIFFERENCE and NDC_COPIES_DIFFERENCE only).
 - CLOSE_TASK
 exception_roles:
 - TL
@@ -474,6 +474,19 @@ task_types:
   # on a line both print (product owner 2026-10-28): HIGH, for information
   # only; the PC closes it with a comment. Closes itself once they agree.
   COST_SHEET_NDC_DIFFERENCE:
+    category: CROSS_DOCUMENT_REVIEW
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - CLOSE_TASK
+    - ADD_COMMENT
+  # Two copies of the NDC, or of the cost sheet, give a figure differently by
+  # more than Rs 100, or the latest copy no longer prints one an older copy
+  # did (2026-11-02): HIGH, for information; the PC closes it with a comment.
+  NDC_COPIES_DIFFERENCE:
     category: CROSS_DOCUMENT_REVIEW
     owner: PC
     origin: SYSTEM

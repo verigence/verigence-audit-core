@@ -44,7 +44,9 @@ CLOSE_TASK = "CLOSE_TASK"
 # The tasks a PC closes by hand, with a comment.
 # The cost sheet / NDC difference is information only: the PC closes it with a comment (2026-10-28).
 COST_SHEET_DIFFERENCE_TASK = "COST_SHEET_NDC_DIFFERENCE"
-CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK, COST_SHEET_DIFFERENCE_TASK})
+# Copies of the NDC or cost sheet that differ: information too (2026-11-02).
+COPIES_DIFFERENCE_TASK = "NDC_COPIES_DIFFERENCE"
+CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK, COST_SHEET_DIFFERENCE_TASK, COPIES_DIFFERENCE_TASK})
 
 
 class TaskStateError(ValueError):
@@ -430,7 +432,7 @@ def submit_action(
 
     if action == CLOSE_TASK:
         if task["task_type"] not in CLOSE_TASK_TYPES:
-            raise ValueError(f"Action {action} is only for the image-quality, large-upload and cost-sheet tasks")
+            raise ValueError(f"Action {action} is only for the image-quality, large-upload, cost-sheet and copies tasks")
         # Checked here, on the server, before anything is written: the web
         # page asks for the comment too, but is not what enforces it.
         comment = (comment or "").strip()

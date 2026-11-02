@@ -490,20 +490,20 @@ def statement_loan(connection: Connection, *, tenant_id: str, journey_id: UUID) 
     financier, and the refunds it records: the handwritten statement form's
     financer line, else the ERP settlement's finance DO posting. None when
     neither is on file."""
-    for document in load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id):
-        rows = line_rows(document["fields"].get("line_items"))
-        kind = statement_kind(rows)
-        if kind == KIND_FORM:
-            read = read_statement(rows)
-            label = "NDC (account statement)"
-        elif kind == KIND_ERP:
-            read = read_erp_settlement(rows)
-            label = "Settlement (ERP printout)"
-        else:
+    documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+    parsed = [(d, rows, statement_kind(rows)) for d in documents for rows in [line_rows(d["fields"].get("line_items"))]]
+    statement, copies = combine_statements([(d, rows) for d, rows, kind in parsed if kind == KIND_FORM])
+    if statement is not None and (statement.financer is not None or statement.refunds):
+        origin = copies.origin.get(("STATEMENT", "financer"), copies.primary)
+        return {"loan": statement.financer, "refunds": statement.refunds, "source": "NDC (account statement)",
+                "documentId": str(origin["documentId"]) if origin else None}
+    for document, rows, kind in parsed:
+        if kind != KIND_ERP:
             continue
+        read = read_erp_settlement(rows)
         if read.financer is None and not read.refunds:
             continue
-        return {"loan": read.financer, "refunds": read.refunds, "source": label,
+        return {"loan": read.financer, "refunds": read.refunds, "source": "Settlement (ERP printout)",
                 "documentId": str(document["documentId"])}
     return None
 
@@ -639,6 +639,221 @@ def _difference_text(rows: list[dict[str, Any]]) -> str:
     def rupees(value: Decimal) -> str:
         return f"Rs {value:,.0f}"
     return "; ".join(f"{r['label']}: NDC {rupees(r['ndc'])}, cost sheet {rupees(r['costSheet'])}" for r in rows)
+
+
+# ── several copies of one document (2026-11-02, Deal defect 15) ──────────────
+# The NDC and the cost sheet may be on file more than once: an offer letter and
+# the final statement, two pages of one statement, a corrected copy. Every copy
+# is read; copies are never added together. The latest dated copy that prints
+# the vehicle line is the statement and gives every figure it prints; a copy
+# without the vehicle line (another page) adds only the figures that one does
+# not print; an older full copy is only compared. A figure two copies give
+# differently by more than Rs 100, or one the latest full copy no longer
+# prints, raises an information task for the PC (COPIES_DIFFERENCE_TASK).
+COPIES_DIFFERENCE_TASK = "NDC_COPIES_DIFFERENCE"
+_STATEMENT_DATE_FIELDS = ("invoice_date", "delivery_date", "period_to")
+_COST_SHEET_DATE_FIELDS = ("cost_sheet_date",)
+_FIGURE_LABELS = {
+    ("STATEMENT", "financer"): "Finance D/O",
+    ("STATEMENT", "old_vehicle_value"): "Exchanged vehicle",
+    ("STATEMENT", "printed_total"): "Net value",
+    ("SHEET", "discount_total"): "Total discount",
+    ("SHEET", "total"): "On-road total",
+}
+
+
+@dataclass
+class Copy:
+    """One copy on file: its document, its date as printed, and its figures
+    keyed (kind, key)."""
+    document: dict[str, Any]
+    day: Any
+    figures: dict[tuple[str, str], Decimal]
+    full: bool
+
+
+@dataclass
+class Combined:
+    """What the copies give together: each figure with the copy it came from,
+    the copy standing as the document, and where copies differ."""
+    figures: dict[tuple[str, str], Decimal] = field(default_factory=dict)
+    origin: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    primary: dict[str, Any] | None = None
+    used: list[dict[str, Any]] = field(default_factory=list)
+    differences: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _copy_day(fields: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    from audit_core.uc03_p2_dates import parse_extracted_date
+
+    days = []
+    for key in keys:
+        value = fields.get(key)
+        if isinstance(value, str):
+            value = value.strip().strip('"')
+        day = parse_extracted_date(value)
+        if day is not None:
+            days.append(day)
+    return max(days) if days else None
+
+
+def _newest_first(copies: list[Copy]) -> list[Copy]:
+    def order(copy: Copy) -> tuple[bool, str, float]:
+        linked = copy.document.get("linkedAtUtc")
+        stamp = linked.timestamp() if hasattr(linked, "timestamp") else 0.0
+        return (copy.day is not None, copy.day.isoformat() if copy.day is not None else "", stamp)
+
+    return sorted(copies, key=order, reverse=True)
+
+
+def combine_copies(copies: list[Copy]) -> Combined:
+    """Each figure from the copy that gives it (see the section comment)."""
+    out = Combined()
+    if not copies:
+        return out
+    ordered = _newest_first(copies)
+    primary = next((c for c in ordered if c.full), ordered[0])
+    out.primary = primary.document
+    other_full = [c for c in ordered if c.full and c is not primary]
+    pages = [c for c in ordered if not c.full and c is not primary]
+    keys = list(dict.fromkeys(k for c in ordered for k in c.figures))
+    used = {id(primary.document): primary.document}
+    for key in keys:
+        if key in primary.figures:
+            chosen: Copy | None = primary
+        elif any(key in c.figures for c in other_full):
+            chosen = None  # the latest full copy no longer prints it
+        else:
+            chosen = next(c for c in pages if key in c.figures)
+        taken = chosen.figures[key] if chosen is not None else None
+        if chosen is not None and taken is not None:
+            out.figures[key] = taken
+            out.origin[key] = chosen.document
+            used.setdefault(id(chosen.document), chosen.document)
+        for copy in ordered:
+            if copy is chosen or key not in copy.figures:
+                continue
+            if taken is None or abs(copy.figures[key] - taken) > TOLERANCE:
+                out.differences.append({
+                    "kind": key[0], "key": key[1], "label": _FIGURE_LABELS.get(key, key[1]),
+                    "taken": taken, "takenFrom": str(chosen.document["documentId"]) if chosen else None,
+                    "other": copy.figures[key], "otherFrom": str(copy.document["documentId"]),
+                })
+    out.used = list(used.values())
+    return out
+
+
+def _statement_figures(read: StatementRead) -> dict[tuple[str, str], Decimal]:
+    figures = {("COMMERCIAL", k): v for k, v in read.components.items()}
+    figures.update({("DISCOUNT", k): v for k, v in read.discounts.items()})
+    for name in ("financer", "old_vehicle_value", "printed_total"):
+        value = getattr(read, name)
+        if value is not None:
+            figures[("STATEMENT", name)] = value
+    return figures
+
+
+def combine_statements(
+    forms: list[tuple[dict[str, Any], list[dict[str, Any]]]],
+) -> tuple[StatementRead | None, Combined]:
+    """The statement the Deal reads, from every statement form on file. With
+    one copy this is exactly read_statement of it."""
+    reads = {id(document): read_statement(rows) for document, rows in forms}
+    copies = [
+        Copy(document=document, day=_copy_day(document["fields"], _STATEMENT_DATE_FIELDS),
+             figures=_statement_figures(reads[id(document)]),
+             full="ex_showroom_price" in reads[id(document)].components)
+        for document, _ in forms
+    ]
+    combined = combine_copies(copies)
+    if combined.primary is None:
+        return None, combined
+    out = StatementRead(kind=KIND_FORM)
+    for (kind, key), value in combined.figures.items():
+        if kind == "COMMERCIAL":
+            out.components[key] = value
+        elif kind == "DISCOUNT":
+            out.discounts[key] = value
+        else:
+            setattr(out, key, value)
+    # The money received is the statement's own, never added across copies:
+    # the standing copy's, else the newest other page's that prints any.
+    in_use = [reads[id(d)] for d in combined.used]
+    primary = reads[id(combined.primary)]
+    out.receipts = primary.receipts or next((r.receipts for r in in_use if r.receipts), Decimal(0))
+    out.refunds = primary.refunds or next((r.refunds for r in in_use if r.refunds), Decimal(0))
+    for read in in_use:
+        out.unmapped.extend(read.unmapped)
+        out.conflicts.extend(read.conflicts)
+    return out, combined
+
+
+def combine_cost_sheets(sheets: list[dict[str, Any]]) -> tuple[CostSheetRead | None, Combined]:
+    """The cost sheet the Deal reads, from every cost sheet on file, by the
+    same rule as the statement's copies; a copy that reads nothing is not one."""
+    copies = []
+    for document in sheets:
+        read = read_cost_sheet(document["fields"])
+        figures = {("COMMERCIAL", k): v for k, v in read.components.items()}
+        if read.discount_total is not None:
+            figures[("SHEET", "discount_total")] = read.discount_total
+        if read.total is not None:
+            figures[("SHEET", "total")] = read.total
+        if figures:
+            copies.append(Copy(document=document, day=_copy_day(document["fields"], _COST_SHEET_DATE_FIELDS),
+                               figures=figures, full="ex_showroom_price" in read.components))
+    combined = combine_copies(copies)
+    if combined.primary is None:
+        return None, combined
+    out = CostSheetRead()
+    for (kind, key), value in combined.figures.items():
+        if kind == "COMMERCIAL":
+            out.components[key] = value
+        elif key == "discount_total":
+            out.discount_total = value
+        else:
+            out.total = value
+    return out, combined
+
+
+def combined_tally_rows(tallies: list[tuple[dict[str, Any], list[dict[str, Any]]]]) -> list[dict[str, Any]]:
+    """Every voucher row of the Tally ledger pages on file, each once (a page
+    on file twice is one page), newest copy first."""
+    seen: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    ordered = sorted(tallies, key=lambda t: (
+        t[0].get("linkedAtUtc").timestamp() if hasattr(t[0].get("linkedAtUtc"), "timestamp") else 0.0),
+        reverse=True)
+    for _, lines in ordered:
+        for row in lines:
+            key = json.dumps(row, sort_keys=True, default=str)
+            if key not in seen:
+                seen.add(key)
+                rows.append(row)
+    return rows
+
+
+def _copies_text(differences: list[dict[str, Any]]) -> str:
+    def rupees(value: Decimal | None) -> str:
+        return "not printed" if value is None else f"Rs {value:,.0f}"
+
+    return "; ".join(f"{d['label']}: {rupees(d['taken'])} taken, another copy {rupees(d['other'])}"
+                     for d in differences)
+
+
+def chosen_copies(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, dict[tuple[str, str], str]]:
+    """For the Deal: which document each statement and cost-sheet figure is
+    taken from, as (line kind, key) -> document id (the sync's own choice)."""
+    documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+    forms = [(d, rows) for d in documents for rows in [line_rows(d["fields"].get("line_items"))]
+             if statement_kind(rows) == KIND_FORM]
+    _, statement = combine_statements(forms)
+    _, sheet = combine_cost_sheets(load_ledger_documents(
+        connection, tenant_id=tenant_id, journey_id=journey_id, document_type=COST_SHEET_TYPE))
+    return {
+        ACCOUNT_STATEMENT_TYPE: {k: str(d["documentId"]) for k, d in statement.origin.items()},
+        COST_SHEET_TYPE: {k: str(d["documentId"]) for k, d in sheet.origin.items()},
+    }
 
 
 # ── the journey ──────────────────────────────────────────────────────────────
@@ -864,32 +1079,36 @@ def sync_account_statement(
     tallies = [(d, rows) for d, rows, kind in parsed if kind == KIND_TALLY]
 
     cleared = _withdraw_invoice_actuals(connection, tenant_id=tenant_id, journey_id=journey_id)
-    statement = read_statement(forms[0][1]) if forms else None
-    document = forms[0][0] if forms else None
+    # Every statement copy on file is read; each figure comes from the copy
+    # that gives it (combine_statements), recorded under that copy.
+    statement, copies = combine_statements(forms)
+    document = copies.primary
     keep_components = set(statement.components) if statement else set()
     keep_discounts = set(statement.discounts) if statement else set()
     lines_written = discounts_written = 0
     if statement and document:
         for key, amount in sorted(statement.components.items()):
+            origin = copies.origin.get(("COMMERCIAL", key), document)
             record_source_value(
                 connection, tenant_id=tenant_id, journey_id=journey_id, line_kind="COMMERCIAL", component_key=key,
-                source_document_type=ACCOUNT_STATEMENT_TYPE, amount=amount, evidence_id=document["evidenceId"],
-                document_id=document["documentId"],
+                source_document_type=ACCOUNT_STATEMENT_TYPE, amount=amount, evidence_id=origin["evidenceId"],
+                document_id=origin["documentId"],
             )
             if upsert_commercial_actual(
                 connection, tenant_id=tenant_id, journey_id=journey_id, component_key=key, amount=amount,
-                document_type=ACCOUNT_STATEMENT_TYPE, document_id=document["documentId"],
-                evidence_id=document["evidenceId"], record=False,
+                document_type=ACCOUNT_STATEMENT_TYPE, document_id=origin["documentId"],
+                evidence_id=origin["evidenceId"], record=False,
             ):
                 lines_written += 1
         for key, amount in sorted(statement.discounts.items()):
+            origin = copies.origin.get(("DISCOUNT", key), document)
             record_source_value(
                 connection, tenant_id=tenant_id, journey_id=journey_id, line_kind="DISCOUNT", component_key=key,
-                source_document_type=ACCOUNT_STATEMENT_TYPE, amount=amount, evidence_id=document["evidenceId"],
-                document_id=document["documentId"],
+                source_document_type=ACCOUNT_STATEMENT_TYPE, amount=amount, evidence_id=origin["evidenceId"],
+                document_id=origin["documentId"],
             )
             _write_discount(connection, tenant_id=tenant_id, journey_id=journey_id, key=key, amount=amount,
-                            document_id=document["documentId"], evidence_id=document["evidenceId"])
+                            document_id=origin["documentId"], evidence_id=origin["evidenceId"])
             discounts_written += 1
     _stale_statement_rows(connection, tenant_id=tenant_id, journey_id=journey_id,
                           keep_components=keep_components, keep_discounts=keep_discounts)
@@ -915,13 +1134,14 @@ def sync_account_statement(
     # uc03_p2_journey360), and compared with the NDC when both are in.
     sheets = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
                                    document_type=COST_SHEET_TYPE)
-    sheet = read_cost_sheet(sheets[0]["fields"]) if sheets else None
+    sheet, sheet_copies = combine_cost_sheets(sheets)
     if sheet is not None:
         for key, amount in sorted(sheet.components.items()):
+            origin = sheet_copies.origin[("COMMERCIAL", key)]
             record_source_value(
                 connection, tenant_id=tenant_id, journey_id=journey_id, line_kind="COMMERCIAL", component_key=key,
-                source_document_type=COST_SHEET_TYPE, amount=amount, evidence_id=sheets[0]["evidenceId"],
-                document_id=sheets[0]["documentId"],
+                source_document_type=COST_SHEET_TYPE, amount=amount, evidence_id=origin["evidenceId"],
+                document_id=origin["documentId"],
             )
     differences = (cost_sheet_differences(statement, document["fields"], sheet)
                    if statement is not None and document is not None and sheet is not None else [])
@@ -936,12 +1156,34 @@ def sync_account_statement(
             ),
             reference=_json_amounts({"differences": differences,
                                      "ndcDocumentId": str(document["documentId"]) if document else None,
-                                     "costSheetDocumentId": str(sheets[0]["documentId"]) if sheets else None}),
+                                     "costSheetDocumentId": (str(sheet_copies.primary["documentId"])
+                                                             if sheet_copies.primary else None)}),
             severity="HIGH",
         )
     else:
         _resolve_task(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=COST_SHEET_DIFFERENCE_TASK,
                       evidence={"ndcOnFile": statement is not None, "costSheetOnFile": sheet is not None})
+
+    # Copies of the NDC, or of the cost sheet, that give a figure differently:
+    # for information, the PC closes it with a comment.
+    copy_differences = [{**d, "document": "NDC"} for d in copies.differences] + [
+        {**d, "document": "Cost sheet"} for d in sheet_copies.differences]
+    if copy_differences:
+        _raise_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id, task_type=COPIES_DIFFERENCE_TASK,
+            title="Copies of the NDC or cost sheet differ",
+            description=(
+                "More than one copy of the NDC or of the cost sheet is on file and they differ by more than "
+                "Rs 100 on: " + "; ".join(f"{d['document']} {_copies_text([d])}" for d in copy_differences)
+                + ". For information: the latest dated copy that prints the vehicle line gives the Deal's "
+                "figures. Check which is right and close this task with a comment."
+            ),
+            reference=_json_amounts({"differences": copy_differences}),
+            severity="HIGH",
+        )
+    else:
+        _resolve_task(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=COPIES_DIFFERENCE_TASK,
+                      evidence={"statementCopies": len(forms), "costSheetCopies": len(sheets)})
 
     # A statement is on file but its vehicle line was not read: CRITICAL, and it
     # says which lines were read (the Deal has no ex-showroom for this Journey).
@@ -964,7 +1206,7 @@ def sync_account_statement(
     # The Tally ledger validates the statement.
     deviations: list[dict[str, Any]] = []
     if statement is not None and tallies:
-        deviations = tally_deviations(statement, tally_postings(tallies[0][1]))
+        deviations = tally_deviations(statement, tally_postings(combined_tally_rows(tallies)))
     if deviations:
         _raise_task(
             connection, tenant_id=tenant_id, journey_id=journey_id, task_type=TALLY_DEVIATION_TASK,
@@ -987,6 +1229,7 @@ def sync_account_statement(
         old_vehicle_value=str(statement.old_vehicle_value) if statement and statement.old_vehicle_value else None,
         invoice_actuals_cleared=cleared, tally_deviations=len(deviations),
         cost_sheets=len(sheets), cost_sheet_differences=len(differences), settlement_lines=settlement_lines,
+        copy_differences=len(copy_differences),
     )
     # commercialLines / discountApplications are the keys the invoice path
     # returns, which its callers read.
@@ -1010,6 +1253,7 @@ def sync_if_source_of_truth(
 
 
 __all__ = [
+    "COPIES_DIFFERENCE_TASK",
     "COST_SHEET_DIFFERENCE_TASK",
     "COST_SHEET_TYPE",
     "FREE_ACCESSORIES_KEY",
@@ -1025,6 +1269,11 @@ __all__ = [
     "TALLY_DEVIATION_TASK",
     "CostSheetRead",
     "StatementRead",
+    "chosen_copies",
+    "combine_copies",
+    "combine_cost_sheets",
+    "combine_statements",
+    "combined_tally_rows",
     "cost_sheet_differences",
     "line_rows",
     "load_ledger_documents",
