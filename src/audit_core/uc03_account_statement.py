@@ -1038,6 +1038,13 @@ def _withdraw_invoice_actuals(connection: Connection, *, tenant_id: str, journey
     return int(lines or 0) + int(discounts or 0)
 
 
+def _latest(tallies: list[tuple[dict[str, Any], list[dict[str, Any]]]]) -> dict[str, Any]:
+    """The newest Tally ledger page on file: the document its figures are
+    recorded under."""
+    return max((d for d, _ in tallies), key=lambda d: (
+        d.get("linkedAtUtc").timestamp() if hasattr(d.get("linkedAtUtc"), "timestamp") else 0.0))
+
+
 def _record_tally_lines(
     connection: Connection, *, tenant_id: str, journey_id: UUID,
     tallies: list[tuple[dict[str, Any], list[dict[str, Any]]]],
@@ -1051,8 +1058,7 @@ def _record_tally_lines(
     )
     if not tallies:
         return 0
-    origin = max((d for d, _ in tallies), key=lambda d: (
-        d.get("linkedAtUtc").timestamp() if hasattr(d.get("linkedAtUtc"), "timestamp") else 0.0))
+    origin = _latest(tallies)
     read = read_tally_lines(combined_tally_rows(tallies))
     written = 0
     for kind, figures in (("COMMERCIAL", read.components), ("DISCOUNT", read.discounts)):

@@ -534,12 +534,18 @@ def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[s
     duplicates = _duplicate_receipts(rows)
     loan_ids = _loan_receipt_ids(connection, tenant_id=tenant_id, journey_id=journey_id, duplicate_of=duplicates)
     counted = [r for r in rows if r["payment_id"] not in duplicates]
+    # Money the customer ledger records with no receipt on file (2026-11-02).
+    from audit_core.uc03_ledger_receipts import ledger_receipts
+
+    from_ledger = [p["amount"] for p in ledger_receipts(connection, tenant_id=tenant_id, journey_id=journey_id)]
     receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids), Decimal(0))
+    receipts += sum(from_ledger, Decimal(0))
     loan_receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] in loan_ids), Decimal(0))
     loan = loan_receipts + _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
+    customer = [Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids] + from_ledger
     return {"receipts": receipts, "loan": loan, "total": receipts + loan,
-            "customerAmounts": [Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids],
-            "countedAmounts": [Decimal(r["amount"]) for r in counted]}
+            "customerAmounts": customer,
+            "countedAmounts": [Decimal(r["amount"]) for r in counted] + from_ledger}
 
 
 def _loan_counted(connection: Connection, *, tenant_id: str, journey_id: UUID, paid: dict[str, Any]) -> dict[str, Any]:
@@ -1605,7 +1611,7 @@ def _deal_sku(connection: Connection, params: dict[str, Any]) -> Any:
             SELECT pl.price_list_name, plv.version_no, plv.effective_from,
                    jp.model_name_snapshot AS model, jp.variant_name_snapshot AS variant,
                    jp.colour_name_snapshot AS colour, jp.selection_status, jp.selection_method,
-                   jp.vehicle_category, sku.sku_code
+                   jp.vehicle_category, sku.sku_code, pm.model_name AS sku_model, pv.variant_name AS sku_variant
             FROM auditcore.journeys j
             LEFT JOIN auditcore.price_list_versions plv
               ON plv.tenant_id=j.tenant_id AND plv.price_list_version_id=j.price_list_version_id
@@ -1614,6 +1620,8 @@ def _deal_sku(connection: Connection, params: dict[str, Any]) -> Any:
             LEFT JOIN auditcore.journey_products jp
               ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
             LEFT JOIN auditcore.product_skus sku ON sku.product_sku_id=jp.product_sku_id
+            LEFT JOIN auditcore.product_models pm ON pm.model_id=sku.model_id
+            LEFT JOIN auditcore.product_variants pv ON pv.variant_id=sku.variant_id
             WHERE j.tenant_id=:t AND j.journey_id=:j
             """
         ),
@@ -1655,8 +1663,14 @@ def _deal_sku_block(sku: Any, price_plan: dict[str, Any] | None) -> dict[str, An
     return {
         **_sku_header(sku, price_plan),
         "skuCode": sku["sku_code"] if sku else None,
-        "model": sku["model"] if sku else None,
-        "variant": sku["variant"] if sku else None,
+        # The matched SKU's own model and variant (the price master's names);
+        # the documents' wording beside them. Live 2026-11-02 (Balabhadra
+        # Dash): the header showed "XUV 3XO AX5", a misreading of the
+        # dealer's sheet, while the deal was priced as the XEV 9S it is.
+        "model": (sku.get("sku_model") or sku["model"]) if sku else None,
+        "variant": (sku.get("sku_variant") or sku["variant"]) if sku else None,
+        "documentModel": sku["model"] if sku else None,
+        "documentVariant": sku["variant"] if sku else None,
         "colour": sku["colour"] if sku else None,
         "category": sku["vehicle_category"] if sku else None,
         "resolution": sku["selection_status"] if sku else None,
@@ -2893,6 +2907,21 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         item["bankMatch"] = status
     for item in items:
         item.pop("bank_", None)
+    # Money the customer ledger records with no receipt on file: counted, its
+    # document the ledger page (product owner 2026-11-02: the customer ledger
+    # is used for the payment verification).
+    from audit_core.uc03_ledger_receipts import ledger_receipts
+
+    for posting in ledger_receipts(connection, tenant_id=tenant_id, journey_id=journey_id):
+        items.append({
+            "paymentId": f"ledger:{posting['number'] or posting['date']}:{posting['amount']}",
+            "amount": _money(posting["amount"]), "receiptNumber": posting["number"],
+            "receiptDate": posting["date"], "mode": posting["mode"], "stage": None, "bank": None,
+            "reference": posting["particulars"], "documentId": posting["documentId"],
+            "document": "Customer ledger (no receipt on file)", "counted": True, "isLoanReceipt": False,
+            "notCountedReason": None, "duplicateOf": None, "bankMatch": None, "bankStatement": None,
+            "fromLedger": True,
+        })
 
     # One split of the money received (2026-11-02): the customer's receipts,
     # and the loan -- its linked receipt plus a disbursement on the finance
