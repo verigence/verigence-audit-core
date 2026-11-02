@@ -387,7 +387,9 @@ def test_conditional_documents_have_a_requirement_row_so_di_reads_them(journey):
         ).all()
         _, delivery = _merged_candidate_requirements(connection, tenant_id=journey.tenant_id,
                                                      journey_id=journey.journey_id)
-    assert sorted(r[0] for r in rows) == ["bank_approval_letter", "debit_note", "purchase_order", "valuation_report"]
+    # form_21: the Form 21's own row (2026-11-02, uc03_form_21).
+    assert sorted(r[0] for r in rows) == ["bank_approval_letter", "debit_note", "form_21", "purchase_order",
+                                          "valuation_report"]
     assert {(r[1], r[2]) for r in rows} == {("OPTIONAL", "DELIVERY")}
     refs = _requirement_refs_by_document_type_key(delivery)
-    assert {"bank_approval_letter", "debit_note", "purchase_order", "valuation_report"} <= set(refs)
+    assert {"bank_approval_letter", "debit_note", "form_21", "purchase_order", "valuation_report"} <= set(refs)

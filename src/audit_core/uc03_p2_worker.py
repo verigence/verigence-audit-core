@@ -1359,6 +1359,10 @@ _P2_ONLY_REQUIREMENTS = (
     ("p2_purchase_order", "purchase_order"),
     ("p2_debit_note", "debit_note"),
     ("p2_valuation_report", "valuation_report"),
+    # The Form 21 (sale certificate) is never an invoice (2026-11-02): its own
+    # OPTIONAL row, so a Form 21 is filed there (uc03_form_21) and, once DI
+    # has the type, DI links it there itself.
+    ("p2_form_21", "form_21"),
 )
 
 
@@ -4885,6 +4889,9 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         "DISCOUNT_VARIANCE_RECOMPUTE": ("audit_core.uc03_discount_variance_recompute",
                                         "run_discount_variance_recompute"),
         "ACCESSORY_INVOICE_REPAIR": ("audit_core.uc03_accessory_invoice_repair", "run_accessory_invoice_repair"),
+        # Form 21s read as invoices filed as Form 21s, and the documents they
+        # set aside given back (2026-11-02): see uc03_form_21.
+        "FORM_21_REFILE": ("audit_core.uc03_form_21", "run_form_21_refile"),
     }
     if kind not in per_tenant:
         raise ValueError(f"unknown worker job kind {kind!r}")

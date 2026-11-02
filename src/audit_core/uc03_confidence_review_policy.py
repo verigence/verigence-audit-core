@@ -820,6 +820,21 @@ def _sync_booking_document(
         if document.document_type_key
         else str(link["document_type_key"] or "").strip().lower() or None
     )
+    # Where DI's reading becomes a document on the booking (2026-11-02): an
+    # invoice-typed reading of a Form 21 is filed as a Form 21 -- its facts,
+    # evidence and page -- and the single-slot copy a read copy replaces is
+    # decided here, never before it is read. See uc03_form_21.
+    from audit_core.uc03_form_21 import file_reading
+
+    document_type_key = file_reading(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        evidence_id=link["evidence_id"],
+        di_type=document_type_key,
+        facts=facts,
+        actor_id=service_id,
+    )
     changed = False
     for fact in facts:
         changed = _machine_upsert_fact(
