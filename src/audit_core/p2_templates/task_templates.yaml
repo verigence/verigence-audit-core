@@ -21,7 +21,8 @@ actions:
 - CONFIRM_BREACH
 - MARK_FALSE_POSITIVE
 # The PC closes a task by hand, with a comment (PC_PAGE_QUALITY_REJECTED,
-# PC_LARGE_UPLOAD_REVIEW, COST_SHEET_NDC_DIFFERENCE and NDC_COPIES_DIFFERENCE only).
+# PC_LARGE_UPLOAD_REVIEW, COST_SHEET_NDC_DIFFERENCE and NDC_COPIES_DIFFERENCE,
+# and DOCUMENT_MISSING raised as DOCUMENT_MISSING / BOOKING_FORM_MISSING only).
 - CLOSE_TASK
 exception_roles:
 - TL
@@ -679,6 +680,14 @@ task_types:
     - ACCEPT
     - REJECT
     - ADD_COMMENT
+  # "Upload the ..." (source DOCUMENT_MISSING or BOOKING_FORM_MISSING) is also
+  # closed by the PC by hand (product owner 2026-11-02): CLOSE_TASK with a
+  # mandatory comment, "Document uploaded" or "Document not required to be
+  # uploaded". A single page uploaded for it is often refused for scan quality
+  # and never read, so the machine check alone never closed it. CLOSE_TASK is
+  # not listed here because the wrong customer / dealer name tasks share this
+  # type and are not closed by hand: uc03_p2_tasks.submit_action accepts it
+  # for those two sources whatever the row lists (no backfill of open rows).
   DOCUMENT_MISSING:
     category: DOCUMENT_REUPLOAD
     owner: PC

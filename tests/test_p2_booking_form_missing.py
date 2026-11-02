@@ -115,3 +115,91 @@ def test_a_cancelled_or_duplicate_booking_is_never_asked_and_its_open_task_close
                   "ON CONFLICT (tenant_id, journey_id, stage_code) DO UPDATE SET business_status='BOOKING_CANCELLED'")
     assert _sync(journey) == "VERIFIED"
     assert _task(journey)["task_status"] == "VERIFIED_COMPLETE"
+
+
+# ── The PC closes a missing-document task by hand (product owner 2026-11-02) ──
+# A single page uploaded for it is often refused for scan quality and never
+# read, so the machine check never closes it. The PC closes it as the
+# image-quality task: "Document uploaded" or "Document not required to be
+# uploaded", with the comment; the producer does not bring it back.
+
+def _close(journey, task_id, comment, choice=None, role="PC"):
+    from audit_core.uc03_p2_tasks import submit_action
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return submit_action(connection, tenant_id=journey.tenant_id, task_id=task_id, action="CLOSE_TASK",
+                             actor_id=journey.actor_id, actor_role_code=role, comment=comment,
+                             details={"choice": choice} if choice else {})
+
+
+def _row(journey, key):
+    return _sql(journey, "SELECT task_id, task_status, allowed_actions, completion_result, round_number "
+                         "FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k", k=key)[0]
+
+
+def _raise_missing(journey, key, source_code="DOCUMENT_MISSING", title="Upload the RSA Invoice"):
+    """What sync_document_missing_tasks (and, for the docket, sync_booking_form_missing_task) raise."""
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_task_producer import raise_or_refresh
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return raise_or_refresh(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, dedupe_key=key,
+            task_type="DOCUMENT_MISSING", source_type="DOCUMENT", source_code=source_code, title=title,
+            description="The booking docket says RSA was sold. Upload it; this task closes itself once it is read.",
+            reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": source_code,
+                       "requirementKey": "rsa_invoice", "templateKeys": ["rsa_invoice"],
+                       "conditions": ["RSA_SOLD"], "stage": "DELIVERY"},
+            severity="HIGH", registry=get_registry(),
+        )[1]
+
+
+def test_the_pc_closes_a_missing_document_task_as_uploaded_and_the_producer_does_not_reopen_it(journey):
+    key = f"document-missing:{journey.journey_id}:rsa_invoice"
+    assert _raise_missing(journey, key) == "RAISED"
+    row = _row(journey, key)
+    # Rows raised before (and after) this change do not list CLOSE_TASK: it is accepted all the same.
+    assert "CLOSE_TASK" not in row["allowed_actions"]
+    with pytest.raises(ValueError, match="comment"):
+        _close(journey, row["task_id"], "  ", choice="Document uploaded")
+    assert _row(journey, key)["task_status"] == "READY"
+    assert _close(journey, row["task_id"], "Document uploaded", choice="Document uploaded") == {
+        "taskId": str(row["task_id"]), "status": "VERIFIED_COMPLETE", "outcome": "CLOSED_BY_PC"}
+    closed = _row(journey, key)
+    result = closed["completion_result"]
+    assert closed["task_status"] == "VERIFIED_COMPLETE"
+    assert (result["outcome"], result["reason"], result["choice"], result["closedRole"]) == (
+        "CLOSED_BY_PC", "Document uploaded", "Document uploaded", "PC")
+    [event] = _sql(journey, "SELECT event_type, comment FROM auditcore.p2_task_events WHERE tenant_id=:t "
+                            "AND task_id=:id AND event_type='CLOSE_TASK'", id=row["task_id"])
+    assert event["comment"] == "Document uploaded"
+    # The document is still not read: the next producer run finds it missing again and leaves the task closed.
+    assert _raise_missing(journey, key) == "ACCEPTED_EXCEPTION"
+    after = _row(journey, key)
+    assert (after["task_status"], after["round_number"]) == ("VERIFIED_COMPLETE", 1)
+    assert _sql(journey, "SELECT count(*) AS n FROM auditcore.p2_task_events WHERE tenant_id=:t AND task_id=:id "
+                         "AND event_type='REOPENED'", id=row["task_id"])[0]["n"] == 0
+
+
+def test_the_pc_closes_the_booking_docket_task_as_not_required_and_the_sync_leaves_it_closed(journey):
+    _requirement(journey)
+    assert _sync(journey) == "RAISED"
+    key = f"booking-form-missing:{journey.journey_id}"
+    choice = "Document not required to be uploaded"
+    _close(journey, _row(journey, key)["task_id"], f"{choice}: booking form is with the TL", choice=choice)
+    result = _row(journey, key)["completion_result"]
+    assert (result["outcome"], result["choice"]) == ("CLOSED_BY_PC", choice)
+    assert result["reason"] == f"{choice}: booking form is with the TL"
+    assert _sync(journey) == "ACCEPTED_EXCEPTION"  # still no booking form read: not raised again
+    assert _row(journey, key)["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_a_wrong_name_task_still_cannot_be_closed_by_hand(journey):
+    key = f"customer-name:{journey.journey_id}:invoice"
+    assert _raise_missing(journey, key, source_code="WRONG_CUSTOMER_NAME",
+                          title="Re-upload the invoice with the customer's name") == "RAISED"
+    with pytest.raises(ValueError, match="not allowed"):
+        _close(journey, _row(journey, key)["task_id"], "Document uploaded", choice="Document uploaded")
+    assert _row(journey, key)["task_status"] == "READY"
