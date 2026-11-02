@@ -7,8 +7,9 @@ by outlet, day by day, and a file told apart by whose it is:
     p2-documents/<tenant>/<outlet>/<yyyy-mm-dd>/<journey>/<batch>/original/<file>__<customer>__<pc>.<ext>
 
 The day is the upload day in IST (Asia/Kolkata). The outlet is the booking's
-outlet, the customer the booking's customer as the PC entered them, the PC the
-one who made the booking (2026-10-26: outlet and PC in the name). The page
+outlet; the customer is the booking's customer, by the KYC name once one is on
+file, else as the PC entered them (``upload_labels``); the PC is the one who
+made the booking (2026-10-26: outlet and PC in the name). The page
 files and merged files of a batch sit beside the original, under the same
 ``<batch>`` folder, so a batch is found from its original's key alone. Nothing
 is read before the file is in storage: the upload is accepted only once the
@@ -105,15 +106,23 @@ def upload_labels(
     connection: Connection, *, tenant_id: str, journey_id: UUID | str,
 ) -> tuple[str | None, str | None, str | None]:
     """The outlet name, the PC's name and the customer's name of a Journey,
-    for where and under what name its uploads are stored. The customer is the
-    one the PC entered on the booking (customers.display_name): the name the
-    booking is known by when the file comes in, before anything is read."""
+    for where and under what name its uploads are stored. The customer's name
+    is the KYC name once one is on file (legal_name: the customer's name rule),
+    else the name the PC entered on the booking. A booking started from an
+    upload has no name yet (its entered name is only a placeholder, the
+    journey's id): its file is stored under "customer" until a name is read."""
     from sqlalchemy import text
 
     row = connection.execute(
         text(
             """
-            SELECT o.outlet_name, j.created_by_display_name, c.display_name
+            SELECT o.outlet_name, j.created_by_display_name,
+                   CASE
+                     WHEN NULLIF(btrim(c.legal_name), '') IS NOT NULL THEN c.legal_name
+                     WHEN c.display_name = CAST(j.journey_id AS text)
+                       OR c.display_name ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN NULL
+                     ELSE c.display_name
+                   END
             FROM auditcore.journeys j
             LEFT JOIN auditcore.dealer_outlets o
               ON o.tenant_id = j.tenant_id AND o.dealer_id = j.dealer_id AND o.outlet_id = j.outlet_id
