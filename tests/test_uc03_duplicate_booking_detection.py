@@ -869,7 +869,7 @@ def _number_on(c, journey_id, document_type_key: str, field_key: str, value: str
 
 
 def test_different_bookings_needs_differing_numbers_and_nothing_shared() -> None:
-    empty = {"B": set(), "R": set(), "C": set()}
+    empty = {"B": set(), "R": set(), "C": set(), "M": set()}
     a = {"B": {"OTF12145"}, "R": set(), "C": {"KT1H73515"[-8:]}}
     b = {"B": {"INV27P000339"}, "R": {"BRMM262704196"}, "C": {"KT5H16927"[-8:]}}
     assert dbd.different_bookings(a, b)  # Hrushikesh Mahanty's two pick-ups
@@ -877,6 +877,17 @@ def test_different_bookings_needs_differing_numbers_and_nothing_shared() -> None
     assert not dbd.different_bookings({**a, "R": {"X12345"}}, {**b, "R": {"X12345"}})  # one receipt in common
     assert not dbd.different_bookings(empty, b)  # nothing to compare: the pair stays
     assert not dbd.different_bookings({**empty, "R": {"R11111"}}, {**empty, "R": {"R22222"}})  # receipts alone
+    # 2026-11-02: different models and nothing in common are different vehicles
+    # (Saroj Kumar Panigrahi: an XEV 9S and an XUV 700) ...
+    assert dbd.different_bookings({**empty, "R": {"KH3S2627"}, "M": {"XEV9S"}},
+                                  {**empty, "B": {"B1334764"}, "M": {"XUV700"}})
+    # ... but a shared number keeps a misread model in the pair (Monika Sahu)
+    assert not dbd.different_bookings({**empty, "R": {"BRMM262709541"}, "M": {"XEV9S"}},
+                                      {**empty, "R": {"BRMM262709541"}, "M": {"XUV700"}})
+    # ... and the same model with nothing to compare stays
+    assert not dbd.different_bookings({**empty, "M": {"XEV9S"}}, {**empty, "M": {"XEV9S"}})
+    # ... and for a relative's name or a surname match (not the same customer) the model never decides
+    assert not dbd.different_bookings({**empty, "M": {"XEV9S"}}, {**empty, "M": {"XUV700"}}, by_model=False)
 
 
 def test_the_same_customers_other_booking_is_not_a_duplicate(two_journeys) -> None:
@@ -898,3 +909,10 @@ def test_the_same_customers_other_booking_is_not_a_duplicate(two_journeys) -> No
     _number_on(c, c.journey_b, "dealer_receipt", "receipt_number", "BRMM/2627/04196")
     _sync_both(c)
     assert _open_findings(c, c.journey_a) or _open_findings(c, c.journey_b)
+    # 2026-11-02: the team cancels one copy -- it is dealt with, never paired.
+    c.execute(text(
+        "INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code, business_status) "
+        "VALUES (:t, :j, 'BOOKING', 'BOOKING_CANCELLED') ON CONFLICT (tenant_id, journey_id, stage_code) "
+        "DO UPDATE SET business_status = 'BOOKING_CANCELLED'"), {"t": c.tenant_id, "j": c.journey_b})
+    _sync_both(c)
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
