@@ -530,7 +530,7 @@ def test_delivery_not_completed_in_time_lists_everything_pending_for_the_tl(jour
     waiting = _run(journey, "DELIVERY")["DELIVERY_NOT_COMPLETED_IN_TIME"]
     assert waiting.outcome == "SKIPPED"
     assert f"Delivery due by {(TODAY + timedelta(days=4)).strftime('%d %b %Y')}" in waiting.reason  # from the cover note
-    assert "insurance cover dated" in waiting.reason and "NDC (Account Statement)" in waiting.reason
+    assert "insurance cover dated" in waiting.reason and "Dealer statement (NDC / cost sheet)" in waiting.reason
 
     # An earlier-dated gate pass moves the clock: 8 days ago, so the window has closed.
     add_ready_document(journey, "gate_pass", delivery_date=(TODAY - timedelta(days=8)).isoformat())

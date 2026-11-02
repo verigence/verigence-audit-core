@@ -785,6 +785,10 @@ document_types:
     stage: DELIVERY
     requirement: REQUIRED
     condition: null
+    # The NDC and the cost sheet are one requirement, "Dealer statement (NDC /
+    # cost sheet)": either one on file meets it (product owner 2026-10-28 and
+    # 2026-11-02), and every copy of each is kept.
+    group: DEALER_STATEMENT
     accepted_early: true
     pages:
       shape: MULTI_PAGE
@@ -854,6 +858,7 @@ document_types:
     stage: DELIVERY
     requirement: REQUIRED
     condition: null
+    group: DEALER_STATEMENT
     accepted_early: true
     pages: *id001
     extraction:
