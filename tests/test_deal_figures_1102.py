@@ -186,3 +186,15 @@ def test_nothing_is_payable_until_the_deal_has_a_figure(journey) -> None:
                   {"t": journey.tenant_id, "j": journey.journey_id})
     summary = _deal(journey)["summary"]
     assert summary["payable"] is None and summary["balanceDue"] is None
+
+
+# ── 6. insurance ─────────────────────────────────────────────────────────────
+def test_an_insurance_premium_on_the_statement_makes_the_insurance_in_house(journey) -> None:
+    from audit_core.uc03_insurance_source import resolve
+
+    _statement(journey, UTKAL)  # Insurance amount 38,201
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        decided = resolve(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert decided["source"] == "INHOUSE" and decided["decidedBy"] == "DOCUMENT"
+    assert "statement charges the insurance premium" in decided["basis"]
