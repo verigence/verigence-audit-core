@@ -207,7 +207,9 @@ def test_a_receipt_naming_the_financier_is_the_loan_even_unlinked(journey) -> No
     add_receipt_payment(journey, amount="641500", receipt_number="R-2", receipt_date="2026-10-12")
     with journey.engine.begin() as c:
         set_tenant_context(c, journey.tenant_id)
-        c.execute(text("UPDATE auditcore.payments SET receipt_bank_name='HDFC BANK LTD', payment_mode_code='RTGS' "
+        # In the financier's name (the receipt's payer); its bank name is the dealer's account.
+        c.execute(text("UPDATE auditcore.payments SET receipt_customer_name='HDFC Bank (Financer)', "
+                       "receipt_bank_name='Axis Bank', payment_mode_code='RTGS' "
                        "WHERE tenant_id=:t AND journey_id=:j AND receipt_number='R-2'"),
                   {"t": journey.tenant_id, "j": journey.journey_id})
     _letter(journey)

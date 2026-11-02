@@ -190,6 +190,29 @@ def test_the_section_is_built_on_demand_from_the_other_tabs(journey):
     assert body["verdict"]["amountAtRisk"]["customerOvercharged"] == "5000.00"
 
 
+def test_the_loan_receipt_shows_under_loan_received_not_receipts_and_is_counted_once(journey):
+    # 2026-11-02: the loan paid against a receipt was under receipts, the loan 0.
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
+    add_receipt_payment(journey, amount="50000", receipt_number="R1", receipt_date="2026-09-01")
+    add_receipt_payment(journey, amount="650000", receipt_number="R2", receipt_date="2026-09-12")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.finance_records (tenant_id, journey_id, finance_type_code, provider_name, "
+                 "financed_amount, source_kind, loan_disbursement_payment_id, loan_disbursement_amount, "
+                 "loan_disbursement_confidence) SELECT tenant_id, journey_id, 'LOAN', 'HDFC BANK LTD', 1500, 'EVIDENCE', "
+                 "payment_id, amount, 'HIGH' FROM auditcore.payments WHERE tenant_id=:t AND journey_id=:j "
+                 "AND receipt_number='R2'"),
+            {"t": journey.tenant_id, "j": journey.journey_id})
+        result = summary.audit_summary(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    funding = result["funding"]
+    assert funding["receipts"] == "50000.00" and funding["loanDisbursed"] == "650000.00"
+    assert funding["loanSource"] == "Loan disbursement on the finance record"
+    assert funding["received"] == "700000.00" and result["settlement"]["received"] == "700000.00"
+    # Every counted receipt, the loan's too, is checked against the bank statement.
+    assert funding["bankCheck"]["noStatement"] == "700000.00"
+
+
 def test_road_tax_and_registration_are_one_line_per_document() -> None:
     # ADI-PB-261022-001: the challan splits it (130,492 + 1,640), the cost
     # sheet prints the whole 1,32,132 on its registration line.
@@ -231,6 +254,7 @@ def test_a_statement_loan_already_among_the_receipts_is_not_counted_twice() -> N
     loan = summary.loan_received(matched=None, disbursement_known=False, financed=True, stated=stated,
                                  receipt_amounts=[Decimal(900005)])
     assert loan["amount"] == Decimal(0) and "not counted twice" in loan["note"]
+    assert "not yet linked as the loan receipt" in loan["note"]
 
 
 def test_a_disbursement_on_the_finance_record_wins_over_the_statement() -> None:

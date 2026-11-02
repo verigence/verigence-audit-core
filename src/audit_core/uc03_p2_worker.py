@@ -4882,6 +4882,12 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # What changed between two snapshot tags (reports: before, after).
         from audit_core.uc03_journey_snapshot import run_journey_snapshot_diff
         return run_journey_snapshot_diff, (engine, tag, reports)
+    if kind == "LOAN_RECEIPT_RESOLVE":
+        # The loan receipt of every financed booking re-resolved by the
+        # no-guessing rules (2026-11-02), or only the references in
+        # ``reports``: see uc03_loan_receipt_resolve. A dry run returns the report.
+        from audit_core.uc03_loan_receipt_resolve import run_loan_receipt_resolve
+        return run_loan_receipt_resolve, (engine, tag, _active_tenants(engine), reports)
     per_tenant = {
         "PAGE_RESEND": ("audit_core.uc03_p2_page_resend", "run_page_resend"),
         "INVOICE_RESCAN": ("audit_core.uc03_invoice_rescan", "run_invoice_rescan"),

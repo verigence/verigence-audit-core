@@ -22,7 +22,7 @@ from audit_core.dependencies import get_human_principal
 from audit_core.main import app
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import get_security_authorization_client
-from audit_core.uc03_p2_journey360 import component_category, deal
+from audit_core.uc03_p2_journey360 import component_category, deal, payments
 
 
 @pytest.fixture
@@ -475,6 +475,78 @@ def test_duplicate_receipts_count_once_and_receipts_meet_the_bank_statement(jour
     assert bank["matched"] == 1 and bank["unmatchedCredits"] == 1 and bank["receiptsWithoutCredit"] == 1
     matched = next(line for line in bank["lines"] if line["matchedPaymentId"])
     assert matched["matchedReceipt"] == "AMP-B/04824/26-27" and matched["date"] == "2026-09-12"
+
+
+def _finance_record(journey, *, linked_receipt: str | None = None, amount: str | None = None) -> None:
+    """A financed deal; its loan disbursement linked to the receipt with this
+    number, or entered with no receipt (``amount``)."""
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        payment_id = connection.execute(
+            text("SELECT payment_id FROM auditcore.payments WHERE tenant_id=:t AND journey_id=:j "
+                 "AND receipt_number=:n ORDER BY created_at_utc LIMIT 1"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "n": linked_receipt},
+        ).scalar_one_or_none() if linked_receipt else None
+        connection.execute(
+            text("INSERT INTO auditcore.finance_records (tenant_id, journey_id, finance_type_code, provider_name, "
+                 "financed_amount, source_kind, loan_disbursement_payment_id, loan_disbursement_amount, "
+                 "loan_disbursement_confidence) VALUES (:t, :j, 'LOAN', 'HDFC BANK LTD', 1500, 'EVIDENCE', :p, "
+                 "COALESCE(CAST(:a AS numeric), (SELECT amount FROM auditcore.payments WHERE payment_id=:p)), 'HIGH')"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "p": payment_id, "a": amount},
+        )
+
+
+def test_the_loan_receipt_is_the_loan_received_not_a_customer_receipt(journey):
+    # 2026-11-02: a loan paid against a receipt showed under the customer's
+    # receipts, and "Loan received" was 0 (141 bookings on live).
+    _seed_deal(journey)
+    add_receipt_payment(journey, amount="50000", receipt_number="R-1", receipt_date="2026-10-01")
+    add_receipt_payment(journey, amount="650000", receipt_number="R-2", receipt_date="2026-10-12")
+    _finance_record(journey, linked_receipt="R-2")
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/360"
+    view = client.get(f"{base}/payments").json()
+    flags = {i["receiptNumber"]: i["isLoanReceipt"] for i in view["items"]}
+    assert flags == {"R-1": False, "R-2": True}
+    assert Decimal(view["receiptsTotal"]) == 50000
+    assert Decimal(view["loanDisbursed"]) == 650000 and Decimal(view["loanReceiptsTotal"]) == 650000
+    assert Decimal(view["paidTotal"]) == 700000  # the same total as before the split
+    assert view["loanWithoutReceipt"] is None
+    paid = client.get(base).json()["money"]["paid"]  # the Deal's summary agrees
+    assert (Decimal(paid["receipts"]), Decimal(paid["loan"]), Decimal(paid["total"])) == (50000, 650000, 700000)
+
+
+def test_a_link_to_a_second_copy_stands_for_the_copy_counted(journey):
+    add_receipt_payment(journey, amount="650000", receipt_number="R-2", receipt_date="2026-10-12")
+    add_receipt_payment(journey, amount="650000", receipt_number="R-2", receipt_date="2026-10-12")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        second = connection.execute(
+            text("SELECT payment_id FROM auditcore.payments WHERE tenant_id=:t AND journey_id=:j "
+                 "ORDER BY created_at_utc DESC LIMIT 1"), {"t": journey.tenant_id, "j": journey.journey_id},
+        ).scalar_one()
+        connection.execute(
+            text("INSERT INTO auditcore.finance_records (tenant_id, journey_id, finance_type_code, provider_name, "
+                 "source_kind, loan_disbursement_payment_id, loan_disbursement_amount, loan_disbursement_confidence) "
+                 "VALUES (:t, :j, 'LOAN', 'HDFC BANK LTD', 'EVIDENCE', :p, 650000, 'PC_CONFIRMED')"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "p": second},
+        )
+        view = payments(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    counted = [i for i in view["items"] if i["counted"]]
+    assert [i["isLoanReceipt"] for i in counted] == [True]
+    assert Decimal(view["receiptsTotal"]) == 0 and Decimal(view["loanDisbursed"]) == 650000
+    assert Decimal(view["paidTotal"]) == 650000
+
+
+def test_a_disbursement_with_no_receipt_is_the_loan_and_every_receipt_the_customers(journey):
+    add_receipt_payment(journey, amount="50000", receipt_number="R-1", receipt_date="2026-10-01")
+    _finance_record(journey, amount="600000")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        view = payments(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert [i["isLoanReceipt"] for i in view["items"]] == [False]
+    assert Decimal(view["receiptsTotal"]) == 50000 and Decimal(view["loanDisbursed"]) == 600000
+    assert Decimal(view["paidTotal"]) == 650000
 
 
 def test_one_certificate_however_many_times_it_was_read(journey):
