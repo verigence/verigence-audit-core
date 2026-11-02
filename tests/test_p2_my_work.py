@@ -1,0 +1,200 @@
+"""PC Home and Tracker (my-work), the check-out check, and a Reviewer closing the Team
+Lead's Journey tasks (product owner 2026-11-02; real Postgres)."""
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+
+import pytest
+import test_uc03_p2_gate_pass as gate_pass_tests
+from sqlalchemy import text
+
+from audit_core import uc03_p2_my_work as my_work
+from audit_core.db import set_tenant_context
+from audit_core.task_closure_roles import (
+    can_close_as,
+    has_team_lead_authority,
+    roles_closable_by,
+)
+from audit_core.task_manager import gate_pass_day_label, previous_gate_pass_day
+from audit_core.uc03_p2_object_keys import ist_day
+from audit_core.uc03_p2_tasks import TaskPermissionError, submit_action
+
+_delivery_file, _register, _upload = (gate_pass_tests._delivery_file, gate_pass_tests._register,
+                                     gate_pass_tests._upload)
+setup = gate_pass_tests.setup  # the Daily Gate Pass fixture: a PC, an outlet, a Journey, storage doubled
+
+
+def _work(s, **params):
+    base = f"/p2/v1/tenants/{s.journey.tenant_id}/my-work"
+    return s.client.get(base, params=params)
+
+
+def _add_role(s, actor: str, role: str, *, dealer=True, outlet=False):
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, "
+                 "dealer_id, outlet_id) VALUES (:t, :a, :r, :d, :o)"),
+            {"t": s.journey.tenant_id, "a": actor, "r": role,
+             "d": s.journey.dealer_id if dealer else None, "o": s.journey.outlet_id if outlet else None})
+
+
+def _journey_task(s, *, role: str, task_type: str = "FINDING_REVIEW") -> str:
+    task_id = str(uuid4())
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(
+            text("""
+                INSERT INTO auditcore.p2_tasks (tenant_id, task_id, root_task_id, journey_id, task_type, category,
+                  origin_kind, source_type, dedupe_key, title, description, assigned_role_code, allowed_actions,
+                  completion_protocol)
+                VALUES (:t, :id, :id, :j, :type, 'FINDING_REMEDIATION', 'SYSTEM', 'RULE', :dk, 'Finding',
+                  'Check the finding', :role, CAST(:allowed AS jsonb), 'MACHINE_VERIFIED')
+            """),
+            {"t": s.journey.tenant_id, "id": task_id, "j": str(s.journey.journey_id), "type": task_type,
+             "dk": f"test:{task_id}", "role": role,
+             "allowed": json.dumps(["ACCEPT_EXCEPTION", "ADD_COMMENT", "CONFIRM_BREACH", "MARK_FALSE_POSITIVE"])})
+    return task_id
+
+
+# --------------------------------------------------------------------------- the rule itself
+
+def test_the_closure_rule():
+    assert can_close_as("TL", "TL") and can_close_as("TL", "REVIEWER")
+    assert not can_close_as("PC", "REVIEWER") and not can_close_as("TL", "PC") and not can_close_as("REVIEWER", "TL")
+    assert roles_closable_by("REVIEWER") == ["REVIEWER", "TL"] and roles_closable_by("PC") == ["PC"]
+    assert has_team_lead_authority("REVIEWER", "TL") and not has_team_lead_authority("REVIEWER", "PC")
+    assert has_team_lead_authority("PM", "PC")
+
+
+def test_a_reviewer_closes_a_team_lead_journey_task_but_not_a_pcs(setup):
+    s = setup
+    tl_task = _journey_task(s, role="TL")
+    pc_task = _journey_task(s, role="PC")
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        with pytest.raises(TaskPermissionError):
+            submit_action(connection, tenant_id=s.journey.tenant_id, task_id=tl_task, action="ACCEPT_EXCEPTION",
+                          actor_id="a-pc", actor_role_code="PC", comment="ok")
+        with pytest.raises(TaskPermissionError):
+            submit_action(connection, tenant_id=s.journey.tenant_id, task_id=pc_task, action="ACCEPT_EXCEPTION",
+                          actor_id="a-reviewer", actor_role_code="REVIEWER", comment="ok")
+        done = submit_action(connection, tenant_id=s.journey.tenant_id, task_id=tl_task, action="ACCEPT_EXCEPTION",
+                             actor_id="a-reviewer", actor_role_code="REVIEWER", comment="Scheme letter on file")
+    assert done["status"] == "VERIFIED_COMPLETE" and done["outcome"] == "EXCEPTION_ACCEPTED"
+
+
+def test_the_reviewers_task_queue_carries_the_team_leads_tasks(setup):
+    s = setup
+    tl_task = _journey_task(s, role="TL")
+    pc_task = _journey_task(s, role="PC")
+    queue = s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/tasks",
+                         params={"role": "REVIEWER", "includeLegacy": "false"})
+    assert queue.status_code == 200, queue.text
+    ids = {str(t.get("task_id") or t.get("taskId")) for t in queue.json()["items"]}
+    assert tl_task in ids and pc_task not in ids
+    tl_queue = s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/tasks",
+                            params={"role": "TL", "includeLegacy": "false"}).json()
+    assert tl_task in {str(t.get("task_id") or t.get("taskId")) for t in tl_queue["items"]}
+
+
+# --------------------------------------------------------------------------- PC Home / Tracker
+
+def test_pc_home_counts_uploads_gate_register_and_tasks(setup):
+    s = setup
+    _delivery_file(s, journeys=2)                                   # two deliveries of today's gate pass
+    gp = _upload(s).json()["gatePassId"]
+    _register(s, gp, 5, 3)                                          # 2 uploaded, 1 pending, 2 not intimated
+    _journey_task(s, role="PC")
+    today = ist_day().date()
+    body = _work(s, **{"from": today.isoformat(), "to": today.isoformat()})
+    assert body.status_code == 200, body.text
+    data = body.json()
+    assert data["role"] == "PC"
+    [line] = data["outlets"]
+    assert line["outletId"] == str(s.journey.outlet_id)
+    assert line["deliveriesUpdated"] + line["bookingsUploaded"] == line["journeysUploaded"] >= 1
+    assert line["journeysTotal"] >= 1
+    assert line["tasksPending"] == 1
+    if today.isoweekday() != 7:
+        [day] = line["gateRegister"]
+        assert (day["status"], day["total"], day["intimated"], day["uploadedInTool"], day["pendingWithPc"],
+                day["notIntimated"]) == ("DONE", 5, 3, 2, 1, 2)
+        assert line["pendingDeliveryFiles"] == 1 and line["gateRegisterUploaded"] == 1
+    assert data["totals"]["tasksPending"] == 1
+
+
+def test_a_week_is_allowed_and_more_than_a_month_is_not(setup):
+    s = setup
+    today = ist_day().date()
+    week = _work(s, **{"from": (today - timedelta(days=6)).isoformat(), "to": today.isoformat()}).json()
+    assert len(week["outlets"][0]["gateRegister"]) == sum(
+        1 for i in range(7) if (today - timedelta(days=i)).isoweekday() != 7)
+    assert _work(s, **{"from": (today - timedelta(days=40)).isoformat(), "to": today.isoformat()}).status_code == 422
+
+
+def test_a_gate_register_past_its_due_time_is_missed(setup):
+    s = setup
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        outlets = my_work._my_outlets(connection, s.journey.tenant_id, s.journey.actor_id, "PC")
+        today = ist_day().date()
+        days = my_work.gate_register(connection, s.journey.tenant_id, outlets, today - timedelta(days=6), today,
+                                     now=datetime.now(UTC) + timedelta(days=10))
+    statuses = {d["status"] for d in days[str(s.journey.outlet_id)]}
+    assert statuses == {"MISSED"}
+
+
+def test_the_reviewer_tracker(setup):
+    s = setup
+    reviewer = f"rv-{uuid4().hex[:6]}"
+    _add_role(s, reviewer, "REVIEWER")
+    tl_task = _journey_task(s, role="TL")
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.p2_stage_document_reviews (tenant_id, journey_id, stage_code, "
+                 "reviewed_by_actor_id, reviewed_by_role_code, document_count, dealer_id, outlet_id) "
+                 "VALUES (:t, :j, 'BOOKING', :a, 'REVIEWER', 3, :d, :o)"),
+            {"t": s.journey.tenant_id, "j": str(s.journey.journey_id), "a": reviewer,
+             "d": s.journey.dealer_id, "o": s.journey.outlet_id})
+        submit_action(connection, tenant_id=s.journey.tenant_id, task_id=tl_task, action="ACCEPT_EXCEPTION",
+                      actor_id=reviewer, actor_role_code="REVIEWER", comment="Documented")
+    _journey_task(s, role="TL")                                     # still open: pending for the Reviewer
+    s.acting["subject"] = reviewer
+    data = _work(s).json()
+    assert data["role"] == "REVIEWER"
+    [line] = data["outlets"]
+    assert (line["journeysWorked"], line["reviewsClosed"], line["tasksClosed"], line["tasksPending"]) == (1, 1, 1, 1)
+
+
+# --------------------------------------------------------------------------- check-out
+
+def test_checkout_check_names_the_unfinished_n_minus_1_registers_of_onsite_outlets(setup):
+    s = setup
+    day = previous_gate_pass_day(ist_day().date())
+    check = s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/my-work/checkout-check").json()
+    assert check["day"] == day.isoformat() and check["label"] == gate_pass_day_label(day)
+    assert [p["outletId"] for p in check["pending"]] == [str(s.journey.outlet_id)]
+    # Finished for that day: nothing to warn about.
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.p2_gate_passes (tenant_id, gate_pass_id, dealer_id, outlet_id, outlet_name, "
+                 "pc_actor_id, pc_name, business_date, object_key, content_type, size_bytes, width_px, height_px, "
+                 "sharpness, completed_at_utc, counts_submitted_at_utc, new_deliveries) "
+                 "VALUES (:t, :id, :d, :o, 'X', :a, 'PC', :day, 'k', 'image/jpeg', 1, 1, 1, 1, now(), now(), 0)"),
+            {"t": s.journey.tenant_id, "id": str(uuid4()), "d": s.journey.dealer_id, "o": s.journey.outlet_id,
+             "a": s.journey.actor_id, "day": day})
+    assert s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/my-work/checkout-check").json()["pending"] == []
+
+
+def test_checkout_check_leaves_satellite_outlets_out(setup):
+    s = setup
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.dealer_outlets SET outlet_classification='SATELLITE' "
+                                "WHERE outlet_id=:o"), {"o": s.journey.outlet_id})
+    assert s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/my-work/checkout-check").json()["pending"] == []

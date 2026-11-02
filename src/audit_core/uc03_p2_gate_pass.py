@@ -11,11 +11,23 @@ dated that day, has been uploaded (product owner 2026-10-27):
                                 raises a high-priority Daily Task for the TL
 
     1. POST  /gate-passes            multipart photo, quality-checked, stored in R2
-    2. POST  /gate-passes/{id}/counts the three counts (and any other)
-    3. POST  /gate-passes/{id}/answer the PC's answer when the counts differ
+    2. POST  /gate-passes/{id}/counts total deliveries on the register and how many were
+                                      intimated to the PC (product owner 2026-11-02); older
+                                      clients still send the new-delivery count alone
+    3. POST  /gate-passes/{id}/answer the PC's answer when the counts differ (older clients)
     4. GET   /gate-passes/calendar    declared / uploaded / missing per day
     5. GET   /gate-passes/{id}/image-url  the photo, one outlet at a time
     6. GET   /daily-tasks, POST /daily-tasks/{id}/resolve   the TL's Daily Tasks
+
+Every outlet a PC is mapped to has a gate register, satellite outlets included
+(product owner 2026-11-02; until then onsite outlets only).
+
+With the two counts the day settles at once (2026-11-02):
+
+    uploaded            delivery Journeys of the day (the rule below)
+    pending with PC     intimated - uploaded
+    not intimated       total - intimated (kept as not_notified_count, so every
+                        figure built on it -- calendar, consolidated view -- holds)
 
 A delivery counts only when its Journey carries the vehicle's gate pass document
 and the delivery date on it matches the day (see vehicle_gate_pass_deliveries):
@@ -219,6 +231,8 @@ def _public_gate_pass(row: dict[str, Any]) -> dict[str, Any]:
         "deliveryFiles": row["delivery_files"], "divergence": row["divergence"],
         "pastDeliveryNote": row["past_delivery_note"], "filesHeld": row["files_held"],
         "notNotifiedToPc": row.get("not_notified_count"),
+        "intimatedToPc": (max(int(row["new_deliveries"] or 0) - int(row.get("not_notified_count") or 0), 0)
+                          if row.get("not_notified_count") is not None else None),
         "notUploadedByPc": (max(int(row["new_deliveries"] or 0) - int(row["delivery_files"] or 0)
                                 - int(row.get("not_notified_count") or 0), 0)
                             if row.get("not_notified_count") is not None else None),
@@ -250,14 +264,14 @@ def gate_pass_outlets(
     client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    """The outlets the caller may upload for, the mapped ONSITE outlet first and marked as the default,
-    and the days a gate pass can be uploaded for. ``previousOpenOutletIds``: outlets whose gate pass of
-    the previous day is not finished yet, so the screen asks which day the photo is for."""
+    """The outlets the caller may upload for -- every mapped outlet, satellites included (2026-11-02) --
+    the first ONSITE outlet marked as the default, and the days a gate pass can be uploaded for.
+    ``previousOpenOutletIds``: outlets whose gate pass of the previous day is not finished yet, so the
+    screen asks which day the photo is for."""
     _authorize(connection, tenant_id, principal, client, _UPDATE)
-    scoped = scope_outlets(connection, tenant_id, principal.subject)
-    # The daily gate pass is for onsite outlets only, never a satellite (product owner 2026-10-27).
-    outlets = onsite = [o for o in scoped if o["outlet_classification"] == "ONSITE"]
-    default = (onsite or [None])[0]
+    outlets = scope_outlets(connection, tenant_id, principal.subject)
+    onsite = [o for o in outlets if o["outlet_classification"] == "ONSITE"]
+    default = (onsite or outlets or [None])[0]
     default_id = str(default["outlet_id"]) if default else None
     days = gate_pass_days()
     previous_open: list[str] = []
@@ -275,7 +289,8 @@ def gate_pass_outlets(
         "previousOpenOutletIds": previous_open,
         "outlets": [_public_outlet(o, default_id=default_id) for o in outlets],
         "defaultOutletId": default_id,
-        "satelliteOnly": bool(scoped) and not outlets,
+        # Kept for older clients: a satellite outlet has a gate register too now.
+        "satelliteOnly": False,
     }
 
 
@@ -297,8 +312,6 @@ def upload_gate_pass(
     Monday) says the PC photographed the two days apart (product owner 2026-10-27)."""
     _authorize(connection, tenant_id, principal, client, _UPDATE)
     outlet = _outlet_in_scope(scope_outlets(connection, tenant_id, principal.subject), outletId)
-    if outlet["outlet_classification"] != "ONSITE":
-        raise HTTPException(status_code=422, detail="The daily gate pass is for onsite outlets only, not a satellite outlet.")
     days = gate_pass_days()
     allowed = [d for d in (days["current"], days["previous"]) if d is not None]
     business_date = businessDate or (days["current"] or days["previous"])
@@ -389,14 +402,20 @@ def upload_gate_pass(
 class DayCounts(BaseModel):
     date: date
     newDeliveries: int = Field(ge=0, le=500)
-    stockTransfers: int = Field(ge=0, le=500)
-    testDrives: int = Field(ge=0, le=500)
+    # How many of the day's deliveries the dealership intimated to the PC (2026-11-02).
+    intimatedToPc: int | None = Field(default=None, ge=0, le=500)
+    stockTransfers: int = Field(default=0, ge=0, le=500)
+    testDrives: int = Field(default=0, ge=0, le=500)
     otherCount: int = Field(default=0, ge=0, le=500)
     otherNote: str | None = Field(default=None, max_length=500)
 
 
 class CountsCommand(BaseModel):
+    # Total deliveries on the gate register.
     newDeliveries: int = Field(default=0, ge=0, le=1000)
+    # How many of them the dealership intimated to the PC (product owner 2026-11-02). Sent by the
+    # current screen; an older client leaves it out and answers the difference afterwards.
+    intimatedToPc: int | None = Field(default=None, ge=0, le=1000)
     stockTransfers: int = Field(default=0, ge=0, le=1000)
     testDrives: int = Field(default=0, ge=0, le=1000)
     otherCount: int = Field(default=0, ge=0, le=1000)
@@ -431,9 +450,16 @@ def submit_counts(
         for d in command.days:
             if d.otherCount > 0 and not (d.otherNote or "").strip():
                 raise HTTPException(status_code=422, detail="Say what the other entries are.")
+        for d in command.days:
+            if d.intimatedToPc is not None and d.intimatedToPc > d.newDeliveries:
+                raise HTTPException(status_code=422, detail=f"{d.date:%a}: more deliveries intimated to you than "
+                                                            "the register lists.")
         day_counts = [{**d.model_dump(), "date": d.date.isoformat()} for d in command.days]
+        intimated_days = [d.intimatedToPc for d in command.days]
         command = CountsCommand(
             newDeliveries=sum(d.newDeliveries for d in command.days),
+            intimatedToPc=(sum(i for i in intimated_days if i is not None)
+                           if all(i is not None for i in intimated_days) else None),
             stockTransfers=sum(d.stockTransfers for d in command.days),
             testDrives=sum(d.testDrives for d in command.days),
             otherCount=sum(d.otherCount for d in command.days),
@@ -445,7 +471,17 @@ def submit_counts(
         raise HTTPException(status_code=422, detail="Say what the other entries are.")
     files = delivery_file_count(connection, tenant_id, row["outlet_id"], row["business_date"])
     declared = command.newDeliveries
+    intimated = command.intimatedToPc
+    if intimated is not None and intimated > declared:
+        raise HTTPException(status_code=422, detail="More deliveries intimated to you than the register lists.")
     divergence = "NONE" if declared == files else ("EXTRA_FILES" if files > declared else "MISSING_FILES")
+    # With the intimated count the day settles now (2026-11-02): not intimated = total - intimated, and
+    # what the PC still has to upload is intimated - uploaded. Only more uploads than the register lists
+    # still asks the PC which belong to other days. An older client (no intimated count) answers the
+    # difference in the next step, as before.
+    not_notified = declared - intimated if intimated is not None else None
+    settled = divergence == "NONE" or (intimated is not None and divergence == "MISSING_FILES")
+    pending = max(intimated - files, 0) if intimated is not None else None
     connection.execute(
         text(
             """
@@ -453,21 +489,32 @@ def submit_counts(
             SET new_deliveries = :nd, stock_transfers = :st, test_drives = :td, other_count = :oc,
                 other_note = :on, delivery_files = :files, divergence = CAST(:div AS varchar),
                 day_counts = CAST(:dc AS jsonb), counts_submitted_at_utc = now(),
-                completed_at_utc = CASE WHEN CAST(:div AS varchar) = 'NONE' THEN now() END
+                not_notified_count = :nn, files_held = :held,
+                completed_at_utc = CASE WHEN :settled THEN now() END
             WHERE tenant_id = :t AND gate_pass_id = :i
             """
         ),
         {"nd": declared, "st": command.stockTransfers, "td": command.testDrives, "oc": command.otherCount,
          "on": note or None, "files": files, "div": divergence, "t": tenant_id, "i": str(gate_pass_id),
-         "dc": json.dumps(day_counts) if day_counts else None},
+         "dc": json.dumps(day_counts) if day_counts else None, "nn": not_notified,
+         "held": (pending > 0) if pending is not None else None, "settled": settled},
     )
-    if divergence == "NONE":
+    if settled:
         close_gate_pass_tasks(connection, tenant_id=tenant_id, outlet_id=row["outlet_id"],
                               business_date=row["business_date"])
+    task_raised = False
+    if not_notified:
+        fresh = _gate_pass_row(connection, tenant_id, gate_pass_id)
+        _raise_delivery_not_notified(connection, tenant_id, fresh, principal.subject, not_notified=not_notified,
+                                     not_uploaded=pending or 0)
+        task_raised = True
     return {
         "gatePass": _public_gate_pass(_gate_pass_row(connection, tenant_id, gate_pass_id)),
         "divergence": divergence, "declared": declared, "deliveryFiles": files,
-        "difference": abs(declared - files), "nextStep": _next_step(divergence),
+        "difference": abs(declared - files),
+        "nextStep": "DONE" if settled else _next_step(divergence),
+        "intimatedToPc": intimated, "notIntimatedToPc": not_notified, "pendingWithPc": pending,
+        "taskRaised": task_raised,
     }
 
 
@@ -484,14 +531,15 @@ def _raise_delivery_not_notified(connection: Connection, tenant_id: str, row: di
     missing = not_notified
     day = row["business_date"]
     title = f"Delivery not notified to the PC: {row['outlet_name']}, {gate_pass_day_label(day)}"
-    description = (f"The gate pass of {row['outlet_name']} for {gate_pass_day_label(day)} lists {row['new_deliveries']} new "
-                   f"deliveries, but only {row['delivery_files']} vehicle gate passes of that day were uploaded. "
+    description = (f"The gate register of {row['outlet_name']} for {gate_pass_day_label(day)} lists {row['new_deliveries']} "
+                   f"deliveries; {row['delivery_files']} of that day are uploaded in the tool. "
                    f"{row['pc_name']} says {not_notified} {'delivery was' if not_notified == 1 else 'deliveries were'} "
-                   f"not notified to them by the dealership"
+                   f"not intimated to them by the dealership"
                    + (f", and {not_uploaded} {'is' if not_uploaded == 1 else 'are'} still to be uploaded by them."
                       if not_uploaded else "."))
-    # A Task Manager task of the outlet for the Team Lead, closed by the TL with
-    # a note (product owner 2026-10-26: daily tasks live in the Task Manager).
+    # A Task Manager task of the outlet for the Team Lead, closed by the TL -- or the
+    # outlet's Reviewer (task_closure_roles, 2026-11-02) -- with a note (product owner
+    # 2026-10-26: daily tasks live in the Task Manager).
     task_id = insert_task_manager_task(connection, tenant_id=tenant_id, values={
         "scope": "OUTLET", "dealer_id": str(row["dealer_id"]), "outlet_id": str(row["outlet_id"]),
         "task_type": TASK_DELIVERY_NOT_NOTIFIED, "category": DAILY_TASK_CATEGORY, "origin": "SYSTEM",
@@ -587,9 +635,8 @@ def gate_pass_calendar(
     The photo (gatePassId) is only given when one outlet is chosen: a dealership
     or all-outlets view has figures only, nothing to open or download."""
     _authorize(connection, tenant_id, principal, client, _READ)
-    # Onsite outlets only: the daily gate pass is not taken at a satellite (2026-10-27).
-    outlets = [o for o in scope_outlets(connection, tenant_id, principal.subject)
-               if o["outlet_classification"] == "ONSITE"]
+    # Every outlet, satellites included (2026-11-02).
+    outlets = scope_outlets(connection, tenant_id, principal.subject)
     chosen = outlets
     scope = "ALL"
     if outletId is not None:
@@ -680,7 +727,7 @@ def gate_pass_summary(
     start: Annotated[date | None, Query(alias="from")] = None,
     end: Annotated[date | None, Query(alias="to")] = None,
 ) -> dict[str, Any]:
-    """Consolidated view of the daily gate pass across the caller's onsite outlets
+    """Consolidated view of the daily gate pass across the caller's outlets, satellites included
     (TL: the outlets under them; PM and Executive: all), per outlet and day
     (product owner 2026-10-27):
 
@@ -698,8 +745,7 @@ def gate_pass_summary(
     start = start or end
     if start > end or (end - start).days >= MAX_SUMMARY_DAYS:
         raise HTTPException(status_code=422, detail=f"Choose a range of 1 to {MAX_SUMMARY_DAYS} days.")
-    outlets = [o for o in scope_outlets(connection, tenant_id, principal.subject)
-               if o["outlet_classification"] == "ONSITE"]
+    outlets = scope_outlets(connection, tenant_id, principal.subject)
     days = [start + timedelta(days=i) for i in range((end - start).days + 1)
             if (start + timedelta(days=i)).isoweekday() != 7]
     ids = [str(o["outlet_id"]) for o in outlets]
@@ -774,7 +820,7 @@ def gate_pass_summary(
     return {
         "from": start.isoformat(), "to": end.isoformat(), "outlets": rows, "totals": totals,
         "notes": [
-            "Onsite outlets only: the daily gate pass is not taken at a satellite outlet.",
+            "Every outlet, satellite outlets included (from 2 Nov 2026).",
             ("As per gate-out register: new deliveries on the gate pass. Updated in tool: deliveries whose vehicle "
              "gate pass, dated that day, is uploaded to the Journey (Monday's covers Sunday); a gate pass uploaded "
              "later still counts on the day it is dated."),

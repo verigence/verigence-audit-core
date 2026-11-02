@@ -31,6 +31,7 @@ from uuid import UUID, uuid4
 import structlog
 from sqlalchemy import Connection, text
 
+from audit_core.task_closure_roles import can_close_as, roles_closable_by
 from audit_core.uc03_p2_object_keys import IST
 from audit_core.uc03_p2_runtime import claim_scheduled_run
 
@@ -283,7 +284,10 @@ def _iso(value: Any) -> str | None:
 def _is_assignee(task: dict[str, Any], caller: Caller, outlets: tuple[bool, list[str]] | None) -> bool:
     if task["assigned_actor_id"]:
         return str(task["assigned_actor_id"]) == caller.actor_id
-    if normalise_role(task["assigned_role_code"]) != caller.role:
+    assigned_role = normalise_role(task["assigned_role_code"])
+    # A Team Lead task of an outlet is also that outlet's Reviewers' to close
+    # (task_closure_roles); a task of no outlet stays with its own role.
+    if assigned_role != caller.role and (not can_close_as(assigned_role, caller.role) or task["outlet_id"] is None):
         return False
     if task["outlet_id"] is None or outlets is None:
         return True
@@ -552,11 +556,16 @@ def raise_tasks(
 
 def _visibility(caller: Caller, view: str) -> tuple[str, dict[str, Any]]:
     """SQL predicate for which Task Manager tasks the caller sees in a view."""
-    params: dict[str, Any] = {"me": caller.actor_id, "role": caller.role or "", "all_outlets": True, "outlets": []}
+    params: dict[str, Any] = {"me": caller.actor_id, "role": caller.role or "", "all_outlets": True, "outlets": [],
+                              "co_roles": roles_closable_by(caller.role)[1:] or [""]}
+    # A Team Lead task of an outlet is also on that outlet's Reviewers' list (task_closure_roles).
     mine = """(
         t.assigned_actor_id = :me
         OR (t.assigned_actor_id IS NULL AND upper(t.assigned_role_code) = :role
             AND (t.outlet_id IS NULL OR CAST(:all_outlets AS boolean) OR t.outlet_id::text = ANY(:outlets)))
+        OR (t.assigned_actor_id IS NULL AND upper(t.assigned_role_code) = ANY(CAST(:co_roles AS text[]))
+            AND t.outlet_id IS NOT NULL
+            AND (CAST(:all_outlets AS boolean) OR t.outlet_id::text = ANY(:outlets)))
     )"""
     review = """(
         t.completion_protocol = 'REQUESTER_CONFIRMED' AND t.task_status = 'AWAITING_REQUESTER_REVIEW'
@@ -1126,8 +1135,8 @@ def _occurrence_assignees(connection: Connection, *, tenant_id: str, schedule: d
                   and (outlet is None or p["projectWide"] or any(o["outletId"] == outlet for o in p["outlets"]))]
         return [{"key": p["actorId"], "actor": p["actorId"], "role": role, "name": p["displayName"], "outlet": None}
                 for p in chosen]
-    # The daily gate pass is for onsite outlets only, never a satellite (product owner 2026-10-27).
-    onsite_only = schedule.get("system_kind") == GATE_PASS_SYSTEM_KIND
+    # Every outlet with a PC gets the daily gate pass, satellites included
+    # (product owner 2026-11-02; until then onsite outlets only).
     rows = connection.execute(
         text(f"""
             SELECT DISTINCT o.dealer_id, o.outlet_id, o.outlet_name
@@ -1135,10 +1144,9 @@ def _occurrence_assignees(connection: Connection, *, tenant_id: str, schedule: d
             JOIN auditcore.dealer_outlets o ON o.tenant_id = ba.tenant_id AND o.outlet_id = ba.outlet_id
             WHERE ba.tenant_id = :t AND {_ACTIVE} AND upper(ba.business_role_code) = 'PC'
               AND (CAST(:outlet AS uuid) IS NULL OR o.outlet_id = CAST(:outlet AS uuid))
-              AND (NOT :onsite_only OR o.outlet_classification = 'ONSITE')
             ORDER BY o.outlet_name
         """),
-        {"t": tenant_id, "outlet": outlet, "onsite_only": onsite_only},
+        {"t": tenant_id, "outlet": outlet},
     ).mappings().all()
     return [{"key": str(r["outlet_id"]), "actor": None, "role": "PC", "name": None,
              "outlet": {"dealer_id": str(r["dealer_id"]), "outlet_id": str(r["outlet_id"]),
@@ -1266,29 +1274,6 @@ def close_gate_pass_tasks(connection: Connection, *, tenant_id: str, outlet_id: 
     return len(rows)
 
 
-def cancel_satellite_gate_pass_tasks(connection: Connection, *, tenant_id: str, now: datetime | None = None) -> int:
-    """Open gate pass tasks of an outlet that is not onsite are cancelled: the
-    task is for onsite outlets only (product owner 2026-10-27)."""
-    now = now or datetime.now(UTC)
-    rows = connection.execute(
-        text("""
-            UPDATE auditcore.p2_tasks t
-            SET task_status = 'CANCELLED', updated_at_utc = :now,
-                completion_result = t.completion_result || jsonb_build_object(
-                  'outcome', 'NOT_REQUIRED', 'reason', 'The daily gate pass is for onsite outlets only.')
-            FROM auditcore.dealer_outlets o
-            WHERE t.tenant_id = :t AND t.task_type = :type AND t.task_status IN ('READY','IN_PROGRESS')
-              AND o.tenant_id = t.tenant_id AND o.outlet_id = t.outlet_id AND o.outlet_classification <> 'ONSITE'
-            RETURNING t.task_id
-        """),
-        {"t": tenant_id, "type": GATE_PASS_TASK, "now": now},
-    ).scalars().all()
-    for task_id in rows:
-        _event(connection, tenant_id=tenant_id, task_id=task_id, event_type="CANCELLED", caller=None,
-               details={"reason": "The daily gate pass is for onsite outlets only.", "by": "SYSTEM"})
-    return len(rows)
-
-
 def fail_unfinished_gate_passes(connection: Connection, *, tenant_id: str, now: datetime | None = None) -> int:
     """A gate pass task not finished by 23:59 IST of the next day is incomplete."""
     now = now or datetime.now(UTC)
@@ -1334,8 +1319,6 @@ def run_tick(connection: Connection, *, tenant_id: str, now: datetime | None = N
         if now_ist >= schedule["run_time_ist"] and occurs_on(schedule, today):
             raised += generate_occurrence(connection, tenant_id=tenant_id, schedule=schedule, day=today, now=now,
                                           claimed_by=claimed_by)
-    not_required = cancel_satellite_gate_pass_tasks(connection, tenant_id=tenant_id, now=now)
     closed = close_gate_pass_tasks(connection, tenant_id=tenant_id)
     failed = fail_unfinished_gate_passes(connection, tenant_id=tenant_id, now=now)
-    return {"raised": raised, "gatePassClosed": closed, "gatePassIncomplete": failed,
-            "gatePassNotRequired": not_required}
+    return {"raised": raised, "gatePassClosed": closed, "gatePassIncomplete": failed}

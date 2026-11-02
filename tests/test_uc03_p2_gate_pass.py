@@ -364,17 +364,65 @@ def test_consolidated_view_register_tool_and_pending(setup):
     assert s.client.get(f"{s.base}/summary").json()["totals"]["pendingDueToClient"] == 2
 
 
-def test_satellite_outlets_have_no_gate_pass(setup):
+def test_satellite_outlets_have_a_gate_register_too(setup):
+    """Every outlet, satellites included (product owner 2026-11-02; until then onsite only)."""
     s = setup
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
         connection.execute(text("UPDATE auditcore.dealer_outlets SET outlet_classification='SATELLITE' "
                                 "WHERE outlet_id=:o"), {"o": s.journey.outlet_id})
     outlets = s.client.get(f"{s.base}/outlets").json()
-    assert outlets["outlets"] == [] and outlets["satelliteOnly"] is True
-    refused = _upload(s)
-    assert refused.status_code == 422 and "onsite" in refused.json()["detail"]
-    assert s.client.get(f"{s.base}/summary").json()["outlets"] == []
+    assert [o["outletId"] for o in outlets["outlets"]] == [str(s.journey.outlet_id)]
+    assert outlets["defaultOutletId"] == str(s.journey.outlet_id) and outlets["satelliteOnly"] is False
+    created = _upload(s)
+    assert created.status_code == 201, created.text
+    assert [o["outletId"] for o in s.client.get(f"{s.base}/summary").json()["outlets"]] == [str(s.journey.outlet_id)]
+
+
+def _register(s, gate_pass_id, total, intimated):
+    return s.client.post(f"{s.base}/{gate_pass_id}/counts", json={"newDeliveries": total, "intimatedToPc": intimated})
+
+
+def test_total_and_intimated_settle_the_day_at_once(setup):
+    """The PC enters the register's total and how many were intimated to them; the tool works out
+    uploaded, pending with the PC (intimated - uploaded) and not intimated (total - intimated)."""
+    s = setup
+    _delivery_file(s, journeys=2)
+    gp = _upload(s).json()["gatePassId"]
+    assert _register(s, gp, 5, 6).status_code == 422          # more intimated than the register lists
+    result = _register(s, gp, 5, 3).json()
+    assert result["nextStep"] == "DONE" and result["gatePass"]["completed"] is True
+    assert (result["deliveryFiles"], result["intimatedToPc"], result["pendingWithPc"],
+            result["notIntimatedToPc"]) == (2, 3, 1, 2)
+    assert result["gatePass"]["intimatedToPc"] == 3 and result["gatePass"]["notUploadedByPc"] == 1
+    assert result["taskRaised"] is True
+    # The figures every other view reads stay the same.
+    totals = s.client.get(f"{s.base}/summary").json()["totals"]
+    assert (totals["asPerRegister"], totals["updatedInTool"], totals["notNotifiedToPc"],
+            totals["pendingDueToPc"]) == (5, 2, 2, 1)
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        task = connection.execute(text("SELECT assigned_role_code, task_status, description FROM auditcore.p2_tasks "
+                                       "WHERE tenant_id=:t AND task_type='GATE_PASS_DELIVERY_NOT_NOTIFIED'"),
+                                  {"t": s.journey.tenant_id}).mappings().one()
+    assert task["assigned_role_code"] == "TL" and task["task_status"] == "READY"
+    assert "not intimated" in task["description"]
+
+
+def test_all_intimated_and_uploaded_raises_no_task(setup):
+    s = setup
+    _delivery_file(s, journeys=2)
+    gp = _upload(s).json()["gatePassId"]
+    result = _register(s, gp, 2, 2).json()
+    assert result["nextStep"] == "DONE" and result["pendingWithPc"] == 0 and result["taskRaised"] is False
+
+
+def test_more_uploaded_than_the_register_still_asks_which_belong_to_other_days(setup):
+    s = setup
+    _delivery_file(s, journeys=3)
+    gp = _upload(s).json()["gatePassId"]
+    result = _register(s, gp, 1, 1).json()
+    assert result["nextStep"] == "EXPLAIN_EXTRA_FILES" and result["gatePass"]["completed"] is False
 
 
 def test_up_to_four_pages_and_each_page_opens(setup):

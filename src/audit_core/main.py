@@ -126,6 +126,7 @@ from audit_core.uc03_p2_gate_pass import router as uc03_p2_gate_pass_router
 from audit_core.uc03_p2_journey360_api import router as uc03_p2_journey360_router
 from audit_core.uc03_p2_journey_delete import router as uc03_p2_journey_delete_router
 from audit_core.uc03_p2_live import router as uc03_p2_live_router
+from audit_core.uc03_p2_my_work import router as uc03_p2_my_work_router
 from audit_core.uc03_p2_resplit import router as uc03_p2_resplit_router
 from audit_core.uc03_p2_reviewer import router as uc03_p2_reviewer_router
 from audit_core.uc03_p2_tenant_alerts import router as uc03_p2_tenant_alerts_router
@@ -314,6 +315,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_sku_standard_router)
     application.include_router(uc03_masters_overview_router)
     application.include_router(uc03_p2_gate_pass_router)
+    application.include_router(uc03_p2_my_work_router)
     application.include_router(task_manager_router)
     application.include_router(task_manager_admin_router)
     application.include_router(uc03_p2_vehicle_photos_router)

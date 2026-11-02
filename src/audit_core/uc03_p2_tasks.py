@@ -14,6 +14,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.task_closure_roles import can_close_as, has_team_lead_authority
 from audit_core.uc03_document_field_corrections import _apply_field_value
 from audit_core.uc03_insurance_source import TASK_TYPE as INSURANCE_SOURCE_TASK
 from audit_core.uc03_insurance_source import answer_task as answer_insurance_source_task
@@ -334,7 +335,7 @@ def _enable_management_referral(
     from audit_core.uc03_p2_deal_actions import set_management_referral
 
     role = str(actor_role_code or "").upper()
-    if role not in {"TL", "PM"}:
+    if not has_team_lead_authority(role, task.get("assigned_role_code")):
         raise ValueError("Only a Team Lead can enable the Management Referral discount")
     reference = dict(task["reference"] or {})
     raw = details or {}
@@ -419,13 +420,14 @@ def submit_action(
     # in by whoever knows: the PC it is assigned to, or a TL / PM.
     observation = task["task_type"] == _OBSERVATION_TASK and actor_role_code in _EXCEPTION_ROLES
     if supervisory:
-        if actor_role_code not in _EXCEPTION_ROLES:
+        # A Reviewer closes a Team Lead task in the TL's place (product owner 2026-11-02).
+        if not has_team_lead_authority(actor_role_code, assigned_role_code):
             raise TaskPermissionError("Only a Team Lead or Project Manager can accept an exception")
     elif observation:
         pass
     elif assigned_actor_id is not None and str(assigned_actor_id) != actor_id:
         raise TaskPermissionError("This task is assigned to a different actor")
-    elif assigned_actor_id is None and assigned_role_code and assigned_role_code != actor_role_code:
+    elif assigned_actor_id is None and assigned_role_code and not can_close_as(assigned_role_code, actor_role_code):
         raise TaskPermissionError(
             f"This task is assigned to role {assigned_role_code}, not {actor_role_code}"
         )
@@ -880,7 +882,7 @@ def _apply_verdict(
     from audit_core.uc03_finding_routing import class_profile, classify_finding
     from audit_core.uc03_p2_task_producer import close_tasks_for_finding
 
-    if actor_role_code not in _EXCEPTION_ROLES:
+    if not has_team_lead_authority(actor_role_code, task.get("assigned_role_code")):
         raise ValueError("Only a Team Lead or Project Manager can give a verdict on a finding")
     reason = (comment or "").strip()
     if not reason:
