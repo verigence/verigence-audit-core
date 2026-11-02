@@ -178,7 +178,7 @@ def test_form_without_a_vehicle_line_gives_no_ex_showroom() -> None:
 # 2026-11-02): fixed when the page is read, never split here.
 MERGED_LABELS = [
     "SHIELD WARANTY TCS", "FASTAG CHARGESRSA", "HANDLING CHARGES TCS", "Fastag charges TCS", "Shield waranty RSA",
-    "Accessories TCS 1%", "W/s billing TCS", "W/s billing TCS(1%)", "W/s billing TU (1%)", "MMFSL Cheque TCS 1%",
+    "Accessories TCS 1%", "MMFSL Cheque TCS 1%",
     "LESS: EXCHANGED VEHICLE (Welcome Bonus)", "IF ANY OTHERS COD", "IF ANY OTHERS MOTO", "IF ANY OTHERS D141 LV",
     "IF ANY OTHERS Digilence", "Shield waranty Accessory", "FAST TAG Fancy NO",
 ]
@@ -316,7 +316,11 @@ def test_a_finance_charge_is_not_the_loan(label: str) -> None:
     ("VLTD", 9999, "other_charges"),
     ("VLTD COD", 22600, "other_charges"),
     ("V.L.T.D + Fitness = 14,000+1,000", 15000, "other_charges"),
-    ("W/s billing", 18827, "other_charges"),
+    ("W/s billing", 18827, "tcs_amount"),
+    ("W/s billing TCS", 11010, "tcs_amount"),
+    ("W/s billing TCS(1%)", 22397, "tcs_amount"),
+    ("W/s billing TCS 1%", 18723, "tcs_amount"),
+    ("W/s billing TU (1%)", 10250, "tcs_amount"),
     ("Workshop billing Amount COD", 22000, "other_charges"),
 ])
 def test_clear_spellings_are_read_onto_the_existing_lines(label: str, amount: int, key: str) -> None:

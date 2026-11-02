@@ -126,7 +126,7 @@ _VLTD = r"V\.?L\.?T\.?D\.?"
 # charge of its own, so two rows add up (a permit and a tracking device on one
 # statement, 2026-11-02); the same row given two amounts is a conflict. The
 # vehicle location tracking device ("VLTD", "VLTD COD") and the workshop billing
-# ("W/S BILLING", "WORKSHOP BILLING AMOUNT COD") have no line of their own
+# ("WORKSHOP BILLING AMOUNT COD") have no line of their own
 # (product owner 2026-11-02).
 _OTHER_CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (item, re.compile(pattern)) for item, pattern in (
@@ -134,13 +134,16 @@ _OTHER_CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("IF_ANY_OTHERS", r"IF ANY OTHERS?"),
         ("MISC", r"MISC( \(IF ANY\))?"),
         ("VLTD", rf"{_VLTD}( COD)?"),
-        ("WORKSHOP_BILLING", r"(W/S|WORKSHOP) BILLING( AMOUNT)?( COD)?"),
+        ("WORKSHOP_BILLING", r"WORKSHOP BILLING( AMOUNT)?( COD)?"),
     )
 )
 _CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (key, re.compile(pattern)) for key, pattern in (
         ("ex_showroom_price", r"EX[- ]?SHOW ?ROOM( PRICE( OF VEHICLE)?)?|VEHICLE COST"),
-        ("tcs_amount", r"TCS( ON INVOICE)?( \d+(\.\d+)?%)?"),
+        # The Utkal form prints its TCS row as "W/s billing TCS (1%)"; read also
+        # as "W/S BILLING", "W/S BILLING TCS(1%)" and "W/S BILLING TU (1%)", and
+        # every amount on it is 1% of the sale (five live statements, 2026-11-02).
+        ("tcs_amount", r"TCS( ON INVOICE)?( \d+(\.\d+)?%)?|W/S BILLING( TCS| TU)? ?(\( ?1 ?%\)|1 ?%)?"),
         ("insurance_amount", r"INSURANCE( AMOUNT| COST)?( \((NORMAL|NIL DEP)\))?"),
         ("registration_charges", r"REGISTRATION( COST| CHARGES)?( BH| \(BH\)| RTO)?|ONLINE RTO|RTO CHARGES.*"),
         ("other_charges", "|".join(f"(?:{p.pattern})" for _, p in _OTHER_CHARGES)),
