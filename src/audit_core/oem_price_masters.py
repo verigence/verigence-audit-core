@@ -1101,7 +1101,12 @@ def _carry_into_later_versions(
 # October's book has no old Scorpio N, and a document dated October that
 # says "SCORPIO N" means the Scorpio N on sale then. Tried after the model
 # the words name, never instead of it.
-_SUCCESSOR_IDENTITY: dict[str, str] = {"SCORPION": "NEWSCORPION"}
+# Product owner 2 Nov 2026: "XUV 700" on a booking form is the XUV 7XO -- no
+# book since September prints an XUV 700, only the XUV 7XO that replaced it.
+# The variant words still decide the SKU: "XUV 700 AX7L DSL AT" names an
+# XUV 7XO AX7L diesel AT, while "XUV 700 Pack 3 B79" (an electric pack) fits
+# no XUV 7XO and stays for the PC.
+_SUCCESSOR_IDENTITY: dict[str, str] = {"SCORPION": "NEWSCORPION", "XUV700": "XUV7XO"}
 
 
 def model_identity_keys(model_text: str | None, variant_text: str | None = None) -> list[str]:
