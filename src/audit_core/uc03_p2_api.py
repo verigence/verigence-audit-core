@@ -137,9 +137,8 @@ def _safe_filename(value: str) -> str:
 def _upload_labels(
     connection: Connection, *, tenant_id: str, journey_id: UUID,
 ) -> tuple[str | None, str | None, str | None]:
-    """The outlet name, the PC's name and the customer's name (as the PC
-    entered it on the booking) of the Journey, for where and under what name
-    the file is stored (uc03_p2_object_keys)."""
+    """The outlet name, the PC's name and the customer's name of the Journey,
+    for where and under what name the file is stored (uc03_p2_object_keys.upload_labels)."""
     from audit_core.uc03_p2_object_keys import upload_labels
 
     return upload_labels(connection, tenant_id=tenant_id, journey_id=journey_id)

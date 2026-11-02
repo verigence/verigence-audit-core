@@ -228,3 +228,27 @@ def test_the_job_row_keeps_what_the_job_returned(journey, monkeypatch):
         with journey.engine.begin() as connection:
             connection.execute(sw.text("SELECT set_config('app.platform_super_admin','true',true)"))
             connection.execute(sw.text("DELETE FROM auditcore.p2_worker_jobs WHERE job_id=:i"), {"i": job_row["job_id"]})
+
+
+def test_the_customer_s_name_in_the_key_is_the_kyc_name_else_the_entered_one_never_a_placeholder(journey):
+    from audit_core.uc03_p2_object_keys import upload_labels
+
+    def labels():
+        with journey.engine.begin() as connection:
+            sw.set_tenant_context(connection, journey.tenant_id)
+            return upload_labels(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+    customer = "SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"
+    assert labels()[2] == "P2 Customer"  # the name the PC entered
+    sw._sql(journey, f"UPDATE auditcore.customers SET legal_name='MALAYA KUMAR MAHANTA' WHERE tenant_id=:t "
+                     f"AND customer_id=({customer})")
+    assert labels()[2] == "MALAYA KUMAR MAHANTA"  # the KYC name once on file
+    # A booking started from an upload: its entered name is the journey's id, a placeholder.
+    # (The entered name never changes: a booking with that placeholder is made here.)
+    sw._sql(journey, "WITH placeholder AS (INSERT INTO auditcore.customers (tenant_id, dealer_id, outlet_id, "
+                     "customer_type_code, display_name) SELECT tenant_id, dealer_id, outlet_id, 'INDIVIDUAL', "
+                     "CAST(journey_id AS text) FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j "
+                     "RETURNING customer_id) "
+                     "UPDATE auditcore.journeys SET customer_id=(SELECT customer_id FROM placeholder) "
+                     "WHERE tenant_id=:t AND journey_id=:j")
+    assert labels()[2] is None
