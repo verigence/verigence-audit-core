@@ -378,11 +378,11 @@ def _duplicate_receipts(rows: list[Any]) -> dict[Any, Any]:
 
 
 def _loan_received(connection: Connection, *, tenant_id: str, journey_id: UUID) -> Decimal:
-    """Loan disbursements not already booked as a receipt (a disbursement
-    matched to a payment row is counted once, as that payment). A bank loan
-    is paid to the dealer against a dealer receipt, so an unlinked
-    disbursement with a receipt of the same amount (to the rupee) on an
-    active document is that receipt, not more money (2026-10-20)."""
+    """Loan disbursements not linked to a receipt (a disbursement linked to a
+    payment row is that receipt: _loan_receipt_ids). A bank loan is paid to
+    the dealer against a dealer receipt, so an unlinked disbursement with a
+    receipt of the same amount (to the rupee) on an active document is that
+    receipt, not more money (2026-10-20)."""
     value = connection.execute(
         text(
             """
@@ -402,6 +402,45 @@ def _loan_received(connection: Connection, *, tenant_id: str, journey_id: UUID) 
         {"t": tenant_id, "j": journey_id},
     ).scalar_one()
     return Decimal(value or 0)
+
+
+def _loan_receipt_ids(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, duplicate_of: dict[Any, Any],
+) -> set[Any]:
+    """The receipts that are the loan's own (product owner, 2026-11-02): the
+    payment linked as the loan disbursement (finance_records.loan_disbursement_
+    payment_id). Each is counted as the loan, never as a customer receipt. A
+    link to the second copy of a receipt uploaded twice stands for the copy
+    that is counted."""
+    linked = connection.execute(
+        text(
+            """
+            SELECT DISTINCT loan_disbursement_payment_id FROM auditcore.finance_records
+            WHERE tenant_id=:t AND journey_id=:j AND loan_disbursement_payment_id IS NOT NULL
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).scalars().all()
+    return {duplicate_of.get(payment_id, payment_id) for payment_id in linked}
+
+
+def bank_approval_sanction(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    """The newest Bank Approval Letter's sanctioned amount (a revised sanction
+    replaces the first), or None when no letter on file prints one. The
+    Delivery Order carries no amount."""
+    for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               di_types=("bank_approval_letter",)):
+        amount = _dec(doc["fields"].get("finance_sanctioned_amount"))
+        if amount is None or amount <= 0:
+            continue
+        # _document_facts lists the newest first.
+        return {
+            "amount": amount, "documentId": doc["documentId"], "document": _document_label("bank_approval_letter"),
+            "financier": doc["fields"].get("financier_name"),
+            "date": doc["fields"].get("finance_disbursement_date") or doc["fields"].get("finance_sanction_date"),
+            "letterNumber": doc["fields"].get("finance_sanction_letter_number"),
+        }
+    return None
 
 
 def loan_without_receipt(
@@ -430,32 +469,18 @@ def loan_without_receipt(
     ).scalar_one()
     if known:
         return None
-    letters = []
-    for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
-                               di_types=("bank_approval_letter",)):
-        amount = _dec(doc["fields"].get("finance_sanctioned_amount"))
-        if amount is None or amount <= 0:
-            continue
-        letters.append({
-            "amount": amount, "documentId": doc["documentId"], "document": _document_label("bank_approval_letter"),
-            "financier": doc["fields"].get("financier_name"),
-            "date": doc["fields"].get("finance_disbursement_date") or doc["fields"].get("finance_sanction_date"),
-            "letterNumber": doc["fields"].get("finance_sanction_letter_number"),
-        })
-    if not letters:
+    letter = bank_approval_sanction(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if letter is None:
         return None
-    # The newest letter on file (a revised sanction replaces the first);
-    # _document_facts lists the newest first.
-    letter = letters[0]
     if any(r is not None and abs(r - letter["amount"]) <= 1 for r in receipt_amounts or []):
         return None
-    # A receipt after the minimum booking amount that names the financier is
-    # the loan's receipt even before it is linked (the disbursed amount is
-    # usually the sanctioned one less fees), so the letter would count it twice.
+    # A receipt in the financier's name is the loan's receipt even before it
+    # is linked (the disbursed amount is usually the sanctioned one less
+    # fees), so the letter would count it twice.
     from audit_core.uc03_finance_disbursement_resolution import (
-        _name_matches,
-        _normalize_name,
         eligible_loan_disbursement_candidates,
+        journey_customer_names,
+        names_financier,
     )
 
     provider = connection.execute(
@@ -465,7 +490,8 @@ def loan_without_receipt(
     ).scalar_one_or_none()
     names = [n for n in (letter["financier"], provider) if n]
     candidates = eligible_loan_disbursement_candidates(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if any(_name_matches(c, _normalize_name(n)) for c in candidates for n in names):
+    customers = journey_customer_names(connection, tenant_id=tenant_id, journey_id=journey_id) if names else ()
+    if any(names_financier(c, n, customer_names=customers) for c in candidates for n in names):
         return None
     return {**letter, "amount": _money(letter["amount"]),
             "note": "No dealership receipt for the loan amount; taken from the Bank Approval Letter "
@@ -474,7 +500,9 @@ def loan_without_receipt(
 
 def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Decimal]:
     """Money actually received: evidenced receipts on ACTIVE documents, the
-    same receipt uploaded twice counted once, plus the loan received."""
+    same receipt uploaded twice counted once, split as payments() splits it:
+    the customer's receipts, and the loan (its linked receipt plus any
+    disbursement on the finance record not linked to a receipt)."""
     rows = connection.execute(
         text(
             """
@@ -490,8 +518,11 @@ def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[s
         {"t": tenant_id, "j": journey_id},
     ).mappings().all()
     duplicates = _duplicate_receipts(rows)
-    receipts = sum((Decimal(r["amount"]) for r in rows if r["payment_id"] not in duplicates), Decimal(0))
-    loan = _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
+    loan_ids = _loan_receipt_ids(connection, tenant_id=tenant_id, journey_id=journey_id, duplicate_of=duplicates)
+    counted = [r for r in rows if r["payment_id"] not in duplicates]
+    receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids), Decimal(0))
+    loan_receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] in loan_ids), Decimal(0))
+    loan = loan_receipts + _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
     return {"receipts": receipts, "loan": loan, "total": receipts + loan}
 
 
@@ -2365,7 +2396,9 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     uploaded twice (same number, amount and date) counts once, a receipt
     whose document was removed counts nothing, and each counted receipt is
     tied to the bank statement credit it stands for when a statement is on
-    file."""
+    file. The receipt linked as the loan disbursement is marked
+    ``isLoanReceipt`` and counted in ``loanDisbursed``, not in
+    ``receiptsTotal`` (the customer's receipts); ``paidTotal`` is both."""
     rows = connection.execute(
         text(
             """
@@ -2415,6 +2448,9 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     derived_stage = {
         entry["paymentId"]: stage for stage in ("BOOKING", "DELIVERY") for entry in split[stage]
     }
+    # The receipt linked as the loan disbursement is the loan's, not the
+    # customer's (product owner, 2026-11-02).
+    loan_ids = _loan_receipt_ids(connection, tenant_id=tenant_id, journey_id=journey_id, duplicate_of=duplicate_of)
     items = []
     by_stage: dict[str, Decimal] = {}
     for r in rows:
@@ -2446,6 +2482,8 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
             "documentId": str(r["source_di_document_id"]) if r["source_di_document_id"] else None,
             "document": _document_label(r["document_type_key"]) if r["document_type_key"] else None,
             "counted": counted,
+            # Counted as the loan received, not among the customer's receipts.
+            "isLoanReceipt": counted and r["payment_id"] in loan_ids,
             "notCountedReason": reason,
             "duplicateOf": str(original) if original is not None else None,
             "bankMatch": None,
@@ -2494,8 +2532,12 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     for item in items:
         item.pop("bank_", None)
 
-    receipts = sum((Decimal(i["amount"]) for i in items if i["counted"]), Decimal(0))
-    loan = _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # One split of the money received (2026-11-02): the customer's receipts,
+    # and the loan -- its linked receipt plus a disbursement on the finance
+    # record not linked to a receipt. The paid total is the same either way.
+    receipts = sum((Decimal(i["amount"]) for i in items if i["counted"] and not i["isLoanReceipt"]), Decimal(0))
+    loan_receipts = sum((Decimal(i["amount"]) for i in items if i["isLoanReceipt"]), Decimal(0))
+    loan = loan_receipts + _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
     # Shown, marked with an asterisk, and not in the receipts or paid totals:
     # it is the lender's figure, not money a receipt shows (2026-10-31).
     letter_loan = loan_without_receipt(
@@ -2505,8 +2547,11 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     matched_credit = [_dec(line["credit"]) for line in lines if line["matchedPaymentId"] and _dec(line["credit"]) is not None]
     return {
         "items": items,
+        # The customer's receipts (the loan's own receipt is not among them).
         "receiptsTotal": str(receipts),
+        # The loan received: its linked receipt plus any unlinked disbursement.
         "loanDisbursed": str(loan),
+        "loanReceiptsTotal": str(loan_receipts),
         "loanWithoutReceipt": letter_loan,
         "paidTotal": str(receipts + loan),
         "byStage": {k: str(v) for k, v in by_stage.items()},
