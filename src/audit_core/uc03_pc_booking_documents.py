@@ -92,6 +92,18 @@ _REPEATABLE_REQUIREMENT_KEYS = {
 }
 
 
+# Requirement keys whose every copy is kept (product owner 2026-11-02: "no
+# document get lost or hidden"; Deal defect 15). The NDC and the cost sheet can
+# be on file more than once -- an offer letter and the final statement, two
+# pages of one statement, the NDC beside the Tally customer ledger (both read
+# as DI customer_ledger) -- and the statement sync reads every copy
+# (uc03_account_statement.combine_statements). A new reading replaces only a
+# reading of the same page: the same upload's same page, or the same page
+# image uploaded again. Before this, each new page replaced the last, and 161
+# Mahindra Orissa bookings had an NDC page hidden that way.
+_COPY_REQUIREMENT_KEYS = frozenset({"customer_ledger", "cost_sheet"})
+
+
 class BookingUploadRequirement(BaseModel):
     requirementRef: UUID
     requirementKey: str
@@ -176,6 +188,42 @@ def _capture_eligible_field_keys(document_type_key: str) -> list[str]:
         return sorted(_RECEIPT_CAPTURE_MAP)
     supported = _SUPPORTED_PROPOSAL_FIELDS.get(normalized, set())
     return sorted(field for field in supported if field in _PROPOSAL_CAPTURE_MAP)
+
+
+def _same_page_copy(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, requirement_ref: UUID, document_id: UUID,
+) -> UUID | None:
+    """The copy on file (ACTIVE, same requirement) that is a reading of the
+    same page as the new document: the same upload's page, or the same page
+    image. None when the new document is another page or another upload, or
+    when no page is known for it -- every copy is then kept."""
+    return connection.execute(
+        text(
+            """
+            SELECT e.evidence_id
+            FROM auditcore.evidence e
+            WHERE e.tenant_id=:tenant_id AND e.journey_id=:journey_id
+              AND e.journey_document_requirement_id=:requirement_ref
+              AND e.association_status='ACTIVE' AND e.di_document_id <> :document_id
+              AND EXISTS (
+                SELECT 1
+                FROM auditcore.p2_document_queue old_q
+                JOIN auditcore.p2_document_queue new_q
+                  ON new_q.tenant_id=old_q.tenant_id AND new_q.di_document_id=:document_id
+                WHERE old_q.tenant_id=e.tenant_id AND old_q.di_document_id=e.di_document_id
+                  AND ((old_q.batch_id=new_q.batch_id
+                        AND COALESCE(old_q.page_numbers, ARRAY[old_q.page_number])
+                            && COALESCE(new_q.page_numbers, ARRAY[new_q.page_number]))
+                       OR (old_q.page_sha256 IS NOT NULL AND old_q.page_sha256=new_q.page_sha256))
+              )
+            ORDER BY e.linked_at_utc DESC, e.evidence_id DESC
+            LIMIT 1
+            FOR UPDATE OF e
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "requirement_ref": requirement_ref,
+         "document_id": document_id},
+    ).scalar_one_or_none()
 
 
 def _is_repeatable_requirement(requirement_key: str | None) -> bool:
@@ -318,7 +366,8 @@ def prepare_booking_document_upload_context(
                 applicabilityReason=applicability_reason,
                 currentDocumentId=item["current_di_document_id"],
                 activeDocumentIds=list(item["active_di_document_ids"] or []),
-                repeatable=_is_repeatable_requirement(item["requirement_key"]),
+                repeatable=_is_repeatable_requirement(item["requirement_key"])
+                or str(item["requirement_key"] or "").lower() in _COPY_REQUIREMENT_KEYS,
                 captureEligibleFieldKeys=_capture_eligible_field_keys(item["document_type_key"]),
             )
         )
@@ -592,7 +641,12 @@ def acknowledge_booking_document_link(
             )
     else:
         prior_evidence_id = None
-        if not repeatable:
+        if not repeatable and str(requirement["requirement_key"]).lower() in _COPY_REQUIREMENT_KEYS:
+            prior_evidence_id = _same_page_copy(
+                connection, tenant_id=tenant_id, journey_id=journey_id,
+                requirement_ref=payload.requirementRef, document_id=payload.documentId,
+            )
+        elif not repeatable:
             prior_evidence_id = connection.execute(
                 text(
                     """

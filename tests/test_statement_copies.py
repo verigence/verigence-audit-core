@@ -164,3 +164,87 @@ def test_a_second_cost_sheet_is_compared_too(journey) -> None:
     _sync(journey)
     task = _task(journey, module.COPIES_DIFFERENCE_TASK)
     assert task is not None and "Cost sheet" in task["description"]
+
+
+# ── a new reading replaces only a reading of the same page ───────────────────
+def _requirement(journey, key: str):
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        return c.execute(
+            text("INSERT INTO auditcore.journey_document_requirements (tenant_id, journey_id, requirement_key, "
+                 "document_type_key, process_area, requirement_level) VALUES (:t, :j, :k, :k, 'DELIVERY', "
+                 "'REQUIRED') RETURNING journey_document_requirement_id"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "k": key}).scalar_one()
+
+
+def _copy_on_file(journey, requirement, *, batch, page: int, sha: str):
+    document_id = uuid4()
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id, "
+                       "di_document_id, journey_document_requirement_id, document_type_key, evidence_purpose, "
+                       "process_area, association_status) VALUES (:t, :j, :c, :s, :d, :r, 'customer_ledger', "
+                       "'DELIVERY_DOCUMENT', 'DELIVERY', 'ACTIVE')"),
+                  {"t": journey.tenant_id, "j": journey.journey_id, "c": journey.customer_id, "s": uuid4(),
+                   "d": document_id, "r": requirement})
+        _queue(c, journey, batch=batch, page=page, sha=sha, document_id=document_id)
+    return document_id
+
+
+def _queue(c, journey, *, batch, page: int, sha: str, document_id, group: bool = False) -> None:
+    # A page read again is a unit of its own over the same page (unit_kind GROUP).
+    c.execute(text("INSERT INTO auditcore.p2_document_queue (tenant_id, batch_id, journey_id, page_number, "
+                   "page_numbers, unit_kind, page_sha256, page_object_key, client_upload_id, di_document_id, "
+                   "queue_status) VALUES (:t, :b, :j, :p, :ps, :u, :sha, :k, :cu, :d, 'READY')"),
+              {"t": journey.tenant_id, "b": batch, "j": journey.journey_id, "p": page, "ps": [page],
+               "u": "GROUP" if group else "PAGE", "sha": sha, "k": f"p2/{batch}/{page}",
+               "cu": f"p2-{uuid4().hex}", "d": document_id})
+
+
+def _batch(journey):
+    from p2_support import add_page
+
+    batch, _, _ = add_page(journey, page_number=99)
+    return batch
+
+
+def test_only_a_reading_of_the_same_page_is_replaced(journey) -> None:
+    from audit_core.uc03_pc_booking_documents import _same_page_copy
+
+    requirement = _requirement(journey, "customer_ledger")
+    batch = _batch(journey)
+    page_one = _copy_on_file(journey, requirement, batch=batch, page=1, sha="a" * 64)
+    _copy_on_file(journey, requirement, batch=batch, page=2, sha="b" * 64)
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        reread, other_page, same_image = uuid4(), uuid4(), uuid4()
+        _queue(c, journey, batch=batch, page=1, sha="c" * 64, document_id=reread, group=True)
+        _queue(c, journey, batch=batch, page=3, sha="d" * 64, document_id=other_page)
+        _queue(c, journey, batch=_batch(journey), page=1, sha="a" * 64, document_id=same_image)
+
+        def replaced(document_id):
+            evidence = _same_page_copy(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                                       requirement_ref=requirement, document_id=document_id)
+            if evidence is None:
+                return None
+            return c.execute(text("SELECT di_document_id FROM auditcore.evidence WHERE tenant_id=:t "
+                                  "AND evidence_id=:e"), {"t": journey.tenant_id, "e": evidence}).scalar_one()
+
+        # page 1 read again replaces page 1; page 3 is another page, kept beside;
+        # the same page image uploaded again replaces it too; an unknown page is kept
+        assert replaced(reread) == page_one
+        assert replaced(other_page) is None
+        assert replaced(same_image) == page_one
+        assert replaced(uuid4()) is None
+
+
+def test_the_ndc_and_cost_sheet_keep_every_copy() -> None:
+    from audit_core.uc03_pc_booking_documents import (
+        _COPY_REQUIREMENT_KEYS,
+        _is_repeatable_requirement,
+    )
+
+    assert {"customer_ledger", "cost_sheet"} <= _COPY_REQUIREMENT_KEYS
+    # not repeatable: a late callback for a replaced reading of the same page
+    # never brings it back
+    assert not _is_repeatable_requirement("customer_ledger")
