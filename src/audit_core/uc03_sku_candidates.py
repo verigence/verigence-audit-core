@@ -259,7 +259,7 @@ def sync_sku_in_price_master_task(
     plan, on = found["plan"], found["onDate"]
     listed = connection.execute(
         text(
-            "SELECT bool_or(metadata ? 'carriedForwardFrom') FROM auditcore.price_list_items WHERE tenant_id=:t "
+            "SELECT bool_or(metadata ? 'carriedReason') FROM auditcore.price_list_items WHERE tenant_id=:t "
             "AND price_list_version_id=:v AND product_sku_id=:s"
         ),
         {"t": tenant_id, "v": plan["price_list_version_id"], "s": sku["product_sku_id"]},

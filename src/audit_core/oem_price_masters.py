@@ -1151,7 +1151,7 @@ def find_book_sku(
             SELECT s.product_sku_id, s.sku_code, pm.model_name, pv.variant_name,
                    pv.attributes ->> 'category' AS category, pv.fuel_powertrain,
                    max(i.standard_amount) FILTER (WHERE i.component_key = 'EX_SHOWROOM') AS ex_showroom,
-                   bool_or(i.metadata ? 'carriedForwardFrom') AS carried
+                   bool_or(i.metadata ? 'carriedReason') AS carried
             FROM auditcore.price_list_items i
             JOIN auditcore.product_skus s ON s.product_sku_id = i.product_sku_id
             JOIN auditcore.product_models pm ON pm.model_id = s.model_id
@@ -1414,7 +1414,8 @@ def _model_targets(
 
 def _models_in_book(connection: Connection, *, tenant_id: str, effective_on: date) -> set[UUID] | None:
     """The models the price master in force on a date sells (None: no book).
-    A variant carried at the previous month's price (``carriedForwardFrom``,
+    A variant carried at the previous month's price (``carriedReason``; a
+    dealer sheet's ``carriedForwardFrom`` rows are the book itself, on sale,
     2026-11-01) is priced, not on sale: it never makes its model one a
     month's scheme or grid wording names (the October "SCORPIO-N" stays the
     new Scorpio N with the old series carried)."""
@@ -1430,7 +1431,7 @@ def _models_in_book(connection: Connection, *, tenant_id: str, effective_on: dat
                 SELECT DISTINCT s.model_id FROM auditcore.price_list_items i
                 JOIN auditcore.product_skus s ON s.product_sku_id = i.product_sku_id
                 WHERE i.tenant_id = :t AND i.price_list_version_id = :v
-                  AND NOT (i.metadata ? 'carriedForwardFrom')
+                  AND NOT (i.metadata ? 'carriedReason')
                 """
             ),
             {"t": tenant_id, "v": plan["price_list_version_id"]},
