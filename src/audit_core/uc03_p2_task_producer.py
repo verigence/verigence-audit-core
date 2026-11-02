@@ -1562,6 +1562,95 @@ def sync_document_missing_tasks(
     return counts
 
 
+BOOKING_FORM_MISSING_CODE = "BOOKING_FORM_MISSING"
+# Tasks that already ask the PC for a file of the booking: while one is open,
+# the booking form is not asked for a second time (one ask at a time).
+_FILE_ASKS = ("DOCUMENT_RESUBMIT", "PC_PAGE_QUALITY_REJECTED", "PC_VERIFY_UNRECOGNIZED_DOCUMENT",
+              "DOCUMENT_REMEDIATION", "TL_DOCUMENT_STUCK", "PC_UPLOAD_STATUS")
+_BOOKING_FORM_TYPES = ("booking_docket", "booking_form")
+_BOOKING_FORM_GRACE = timedelta(hours=1)
+
+
+def sync_booking_form_missing_task(
+    connection: Connection,
+    *,
+    tenant_id: str,
+    journey_id: UUID,
+    registry: Registry | None = None,
+    evaluation_started_at: datetime | None = None,
+    now: datetime | None = None,
+) -> str:
+    """One PC task while the booking has no booking form on file and nothing
+    else asks for it (product owner 2026-11-02).
+
+    The booking form is a required document, so it only ever showed on the
+    stage checklist: a booking whose form was never read -- nothing uploaded,
+    or its page refused for scan quality and that task closed with "uploaded
+    document" while the new photo was refused too -- had no task at all
+    (27 live bookings on 2 Nov, 15 of them at Keonjhar). Without the form the
+    deal is not priced and the vehicle and booking date are never set.
+
+    Raised once the booking is an hour old, no upload of it is still being
+    read, and no other document task of the booking already asks the PC for a
+    file (a resubmit, a refused page, an unrecognised page...). Not raised on a
+    cancelled, duplicate or closed-without-delivery booking. Closes itself
+    once a booking form is read. Returns what happened to the task."""
+    registry = registry or get_registry()
+    now = now or datetime.now(UTC)
+    key = f"booking-form-missing:{journey_id}"
+    row = connection.execute(
+        text(
+            """
+            SELECT j.created_at_utc,
+                   j.review_completed_at_utc IS NULL AND NOT EXISTS (
+                     SELECT 1 FROM auditcore.journey_stage_states s
+                     WHERE s.tenant_id=j.tenant_id AND s.journey_id=j.journey_id AND s.stage_code='BOOKING'
+                       AND (s.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
+                            OR s.closure_disposition='NO_DELIVERY')) AS open_booking,
+                   EXISTS (SELECT 1 FROM auditcore.evidence e
+                           WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id
+                             AND e.association_status='ACTIVE' AND e.document_type_key = ANY(:types)) AS has_form,
+                   EXISTS (SELECT 1 FROM auditcore.p2_upload_batches b
+                           WHERE b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
+                             AND b.batch_status IN ('AWAITING_UPLOAD','UPLOADED','SPLITTING','PROCESSING')) AS reading,
+                   EXISTS (SELECT 1 FROM auditcore.p2_tasks t
+                           WHERE t.tenant_id=j.tenant_id AND t.journey_id=j.journey_id
+                             AND t.task_type = ANY(:asks) AND t.task_status = ANY(:open)) AS asked
+            FROM auditcore.journeys j
+            WHERE j.tenant_id=:t AND j.journey_id=:j
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "types": list(_BOOKING_FORM_TYPES), "asks": list(_FILE_ASKS),
+         "open": list(_OPEN)},
+    ).mappings().one_or_none()
+    if row is None:
+        return "UNCHANGED"
+    if row["has_form"] or not row["open_booking"]:
+        closed = resolve_if_open(
+            connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+            evidence={"reason": "A booking form is on file" if row["has_form"]
+                      else "The booking is cancelled, a duplicate or closed without delivery",
+                      "verifiedAt": now.isoformat()},
+        )
+        return "VERIFIED" if closed else "UNCHANGED"
+    if row["reading"] or row["asked"] or (row["created_at_utc"] and now - row["created_at_utc"] < _BOOKING_FORM_GRACE):
+        # Something is being read, or the PC is already asked for a file: an
+        # open task stays as it is (it closes once the form is read).
+        return "UNCHANGED"
+    _, outcome = raise_or_refresh(
+        connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+        task_type="DOCUMENT_MISSING", source_type="DOCUMENT", source_code=BOOKING_FORM_MISSING_CODE,
+        title="Upload the Booking Docket",
+        description=("No booking form has been read on this booking. Without it the deal is not priced, and "
+                     "the vehicle (SKU) and the booking date cannot be set. Upload a clear, flat scan of the "
+                     "booking form from Upload / Edit Documents. This task closes itself once it is read."),
+        reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": BOOKING_FORM_MISSING_CODE,
+                   "requirementKey": "booking_docket", "templateKeys": ["booking_docket"], "stage": "BOOKING"},
+        severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
+    )
+    return outcome
+
+
 def _adopt_member_tasks(connection: Connection, *, tenant_id: str, journey_id: UUID, key: str,
                         templates: list[str]) -> None:
     """When templates are grouped into one requirement after their own tasks

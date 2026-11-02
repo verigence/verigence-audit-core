@@ -118,6 +118,7 @@ from audit_core.uc03_p2_task_producer import (
     apply_control_transitions,
     raise_or_refresh,
     sync_booking_date_task,
+    sync_booking_form_missing_task,
     sync_dead_work_tasks,
     sync_delivery_review_task,
     sync_document_missing_tasks,
@@ -3237,6 +3238,10 @@ def _sync_rule_tasks(connection, *, tenant_id: str, journey_id: UUID, started_at
         "large_upload": sync_large_upload_tasks(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
         "unclassified_page": sync_unclassified_page_tasks(
+            connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
+        # After the file tasks above: the booking form is asked for only when
+        # nothing else asks the PC for a file (2026-11-02).
+        "booking_form_missing": sync_booking_form_missing_task(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
         "vehicle_photo": sync_vehicle_photo_task(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
