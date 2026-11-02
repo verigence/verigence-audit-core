@@ -619,6 +619,8 @@ def summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
             LEFT JOIN auditcore.journey_products jp
               ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
             LEFT JOIN auditcore.product_skus sku ON sku.product_sku_id=jp.product_sku_id
+            LEFT JOIN auditcore.product_models pm ON pm.model_id=sku.model_id
+            LEFT JOIN auditcore.product_variants pv ON pv.variant_id=sku.variant_id
             WHERE j.tenant_id=:t AND j.journey_id=:j
             """
         ),
@@ -1611,7 +1613,7 @@ def _deal_sku(connection: Connection, params: dict[str, Any]) -> Any:
             SELECT pl.price_list_name, plv.version_no, plv.effective_from,
                    jp.model_name_snapshot AS model, jp.variant_name_snapshot AS variant,
                    jp.colour_name_snapshot AS colour, jp.selection_status, jp.selection_method,
-                   jp.vehicle_category, sku.sku_code
+                   jp.vehicle_category, sku.sku_code, pm.model_name AS sku_model, pv.variant_name AS sku_variant
             FROM auditcore.journeys j
             LEFT JOIN auditcore.price_list_versions plv
               ON plv.tenant_id=j.tenant_id AND plv.price_list_version_id=j.price_list_version_id
@@ -1661,8 +1663,14 @@ def _deal_sku_block(sku: Any, price_plan: dict[str, Any] | None) -> dict[str, An
     return {
         **_sku_header(sku, price_plan),
         "skuCode": sku["sku_code"] if sku else None,
-        "model": sku["model"] if sku else None,
-        "variant": sku["variant"] if sku else None,
+        # The matched SKU's own model and variant (the price master's names);
+        # the documents' wording beside them. Live 2026-11-02 (Balabhadra
+        # Dash): the header showed "XUV 3XO AX5", a misreading of the
+        # dealer's sheet, while the deal was priced as the XEV 9S it is.
+        "model": (sku.get("sku_model") or sku["model"]) if sku else None,
+        "variant": (sku.get("sku_variant") or sku["variant"]) if sku else None,
+        "documentModel": sku["model"] if sku else None,
+        "documentVariant": sku["variant"] if sku else None,
         "colour": sku["colour"] if sku else None,
         "category": sku["vehicle_category"] if sku else None,
         "resolution": sku["selection_status"] if sku else None,
