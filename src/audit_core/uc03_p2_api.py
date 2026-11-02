@@ -86,6 +86,7 @@ from audit_core.uc03_p2_tasks import (
     submit_action,
     task_queue_tab,
 )
+from audit_core.uc03_p2_upload_accept import accept_upload
 from audit_core.uc03_p2_upload_pause import refuse_upload_if_paused
 from audit_core.uc03_requirement_satisfaction import (
     linked_documents_for_journey,
@@ -1523,70 +1524,22 @@ def finalize_upload(
         )
 
     correlation_id = get_correlation_id(request)
+    # The acceptance itself is shared with the worker, which accepts a file
+    # stored whole that the browser never confirmed (uc03_p2_upload_accept).
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
-        accepted = connection.execute(
-            text(
-                """
-                UPDATE auditcore.p2_upload_batches
-                SET batch_status='UPLOADED', updated_at_utc=now()
-                WHERE tenant_id=:tenant_id AND batch_id=:batch_id
-                  AND batch_status='AWAITING_UPLOAD'
-                RETURNING batch_id
-                """
-            ),
-            {"tenant_id": tenant_id, "batch_id": batch_id},
-        ).scalar_one_or_none()
-        if accepted is None:
-            current = connection.execute(
-                text(
-                    "SELECT batch_status FROM auditcore.p2_upload_batches "
-                    "WHERE tenant_id=:tenant_id AND batch_id=:batch_id"
-                ),
-                {"tenant_id": tenant_id, "batch_id": batch_id},
-            ).scalar_one()
-            return {"batchId": str(batch_id), "status": str(current)}
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.p2_work_queue (
-                    tenant_id, journey_id, work_type, work_key,
-                    payload, work_status, correlation_id, requested_version
-                ) VALUES (
-                    :tenant_id, :journey_id, 'SPLIT_BATCH', :work_key,
-                    CAST(:payload AS jsonb), 'PENDING', :correlation_id, 1
-                )
-                ON CONFLICT (tenant_id, work_type, work_key) DO NOTHING
-                """
-            ),
-            {
-                "tenant_id": tenant_id,
-                "journey_id": journey_id,
-                "work_key": str(batch_id),
-                "payload": json.dumps(
-                    {
-                        "batchId": str(batch_id),
-                        "uploadedBy": str(batch["uploaded_by_actor_id"]),
-                        "uploadedByRole": access.operating_role or access.functional_role or "USER",
-                    }
-                ),
-                "correlation_id": correlation_id,
-            },
-        )
-        _activity(
+        _accepted, status = accept_upload(
             connection,
             tenant_id=tenant_id,
             journey_id=journey_id,
-            event_type="UPLOAD_ACCEPTED",
-            subject_type="UPLOAD_BATCH",
-            subject_id=str(batch_id),
-            details={
-                "filename": str(batch["original_filename"]),
-                "sizeBytes": actual_size,
-            },
+            batch_id=batch_id,
+            filename=str(batch["original_filename"]),
+            size_bytes=actual_size,
+            uploaded_by=str(batch["uploaded_by_actor_id"]),
+            uploaded_by_role=access.operating_role or access.functional_role or "USER",
             correlation_id=correlation_id,
         )
-    return {"batchId": str(batch_id), "status": "UPLOADED"}
+    return {"batchId": str(batch_id), "status": status}
 
 
 

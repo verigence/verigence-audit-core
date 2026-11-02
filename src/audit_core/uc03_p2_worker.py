@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import os
 import random
 import signal
@@ -109,7 +110,7 @@ from audit_core.uc03_p2_runtime import (
     swept_pending_sql,
 )
 from audit_core.uc03_p2_stage import recompute_journey_stage
-from audit_core.uc03_p2_storage import get_p2_document_storage
+from audit_core.uc03_p2_storage import P2DocumentStorageError, get_p2_document_storage
 from audit_core.uc03_p2_task_producer import (
     FILE_NOT_SPLIT_IN_TIME_REASON,
     FILE_NOT_UPLOADED_IN_TIME_REASON,
@@ -129,6 +130,7 @@ from audit_core.uc03_p2_task_producer import (
     sync_unclassified_page_tasks,
     sync_vehicle_photo_task,
 )
+from audit_core.uc03_p2_upload_accept import accept_upload
 from audit_core.uc03_p2_workflow import mark_delivery_reviewed
 from audit_core.uc03_unified_document_capture import (
     _merged_candidate_requirements,
@@ -3867,7 +3869,10 @@ def fail_unsettled_pages(connection, *, tenant_id: str, now: datetime | None = N
       from the upload (GROUPING_CEILING is READ_CEILING).
     - Every file not uploaded or split into pages within 30 minutes is
       FAILED; grouping not done within 30 minutes fails the pages that
-      waited for it (_fail_grouping).
+      waited for it (_fail_grouping). (In the worker's pass a file still
+      waiting for its upload was looked up in storage just before,
+      accept_stored_uploads: one stored whole was accepted, so "did not
+      finish uploading" is said only of a file not in storage whole.)
     - Their pending send / read-again / split / grouping work is cancelled,
       and the DI document of every page failed here is withdrawn (deleted at
       DI: it stops reading it, nothing is read twice).
@@ -3959,6 +3964,136 @@ def fail_unsettled_pages(connection, *, tenant_id: str, now: datetime | None = N
     for journey_id in journeys:
         sync_processing_failure_tasks(connection, tenant_id=tenant_id, journey_id=journey_id)
     return len(pages) + len(files) + len(grouping_pages)
+
+
+# A file the browser stored but never confirmed (live, 2 Nov 2026: 3 of the 13
+# files failed as "did not finish uploading within 30 minutes" were in R2 at
+# their full size -- the browser finished the PUT and never called :finalize).
+# Product owner: a file saved in R2 must start the usual process. A file still
+# waiting for its upload this many minutes after uploads:init prepared it is
+# looked up in storage; found whole, it is accepted as :finalize accepts it.
+def _stored_check_minutes(value: str, default: float = 3.0) -> float:
+    try:
+        minutes = float(value)
+    except ValueError:
+        minutes = float("nan")
+    if not math.isfinite(minutes):
+        logger.warning("p2_upload_stored_check_minutes_invalid", value=value, using=default)
+        return default
+    return max(1.0, minutes)
+
+
+_STORED_CHECK_MINUTES = _stored_check_minutes(os.environ.get("AUDIT_CORE_UPLOAD_STORED_CHECK_MINUTES", "3"))
+# At most this many files are looked up per Project per pass, the oldest first;
+# once the pass has spent this long on storage, the rest wait for the next
+# pass (the pass runs in the worker's claim loop: slow storage must not hold it).
+_STORED_CHECK_PER_PASS = 20
+_STORED_CHECK_BUDGET_SECONDS = 10.0
+# One worker looks a waiting file up at most once in this long (the pass runs
+# with the 60-second watchdog, so about once a minute); the last look before
+# the 30-minute ceiling fails it is always made.
+_STORED_RECHECK_SECONDS = 55.0
+_stored_checked_at: dict[tuple[str, str], float] = {}
+STORED_FILE_FOUND = "STORED_FILE_FOUND"
+
+
+def accept_stored_uploads(engine: Engine, tenant_id: str, *, now: datetime | None = None) -> int:
+    """Accept the files of ``tenant_id`` stored whole that the browser never
+    confirmed (``:finalize`` never called).
+
+    Every batch still AWAITING_UPLOAD _STORED_CHECK_MINUTES after it was
+    prepared (oldest first, at most _STORED_CHECK_PER_PASS) is looked up in
+    storage, as :finalize does: a short read, the HEAD with no transaction
+    open, then one small conditional transaction (uc03_p2_upload_accept).
+
+    - Found at the size announced at uploads:init: accepted (UPLOADED,
+      SPLIT_BATCH queued, UPLOAD_ACCEPTED recorded by Verigence, how
+      STORED_FILE_FOUND). The uploader stays the PC who prepared it.
+    - Not found, or not at that size: not uploaded yet, left alone; the
+      30-minute ceiling (fail_unsettled_pages) still fails it.
+    - Accepted by :finalize or by another worker meanwhile: nothing is
+      written (the acceptance is conditional on AWAITING_UPLOAD).
+    Uploads paused for maintenance change nothing here, as for :finalize:
+    the file of an upload already prepared is finished. Returns the number
+    of files accepted."""
+    now = now or datetime.now(UTC)
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        waiting = connection.execute(
+            text(
+                """
+                SELECT batch_id, journey_id, original_filename, size_bytes, original_object_key,
+                       uploaded_by_actor_id, correlation_id, created_at_utc
+                FROM auditcore.p2_upload_batches
+                WHERE tenant_id=:t AND batch_status='AWAITING_UPLOAD' AND created_at_utc < :since
+                ORDER BY created_at_utc, batch_id
+                LIMIT :limit
+                """
+            ),
+            {"t": tenant_id, "since": now - timedelta(minutes=_STORED_CHECK_MINUTES),
+             "limit": _STORED_CHECK_PER_PASS},
+        ).mappings().all()
+    looked_at = time.monotonic()
+    still_waiting = {str(row["batch_id"]) for row in waiting}
+    for key in [k for k in _stored_checked_at if k[0] == tenant_id and k[1] not in still_waiting]:
+        del _stored_checked_at[key]
+    due = [
+        row for row in waiting
+        if row["created_at_utc"] < now - READ_CEILING
+        or looked_at - _stored_checked_at.get((tenant_id, str(row["batch_id"])), float("-inf"))
+        >= _STORED_RECHECK_SECONDS
+    ]
+    if not due:
+        return 0
+    storage = get_p2_document_storage()
+    accepted = 0
+    for number, row in enumerate(due):
+        if number and time.monotonic() - looked_at >= _STORED_CHECK_BUDGET_SECONDS:
+            logger.info("p2_upload_stored_check_deferred", tenant_id=tenant_id, files=len(due) - number)
+            break
+        batch_id = UUID(str(row["batch_id"]))
+        journey_id = UUID(str(row["journey_id"]))
+        _stored_checked_at[(tenant_id, str(batch_id))] = looked_at
+        try:
+            try:
+                metadata = storage.head_object(str(row["original_object_key"]))
+            except (RuntimeError, P2DocumentStorageError):
+                continue  # not stored (yet)
+            stored_size = int(metadata["contentLength"])
+            if stored_size != int(row["size_bytes"]):
+                continue  # not stored whole (yet)
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                won, status = accept_upload(
+                    connection,
+                    tenant_id=tenant_id,
+                    journey_id=journey_id,
+                    batch_id=batch_id,
+                    filename=str(row["original_filename"]),
+                    size_bytes=stored_size,
+                    uploaded_by=str(row["uploaded_by_actor_id"]),
+                    uploaded_by_role="PC",
+                    correlation_id=row["correlation_id"] or f"p2-upload-stored-check:{batch_id}",
+                    details={
+                        "by": "Verigence",
+                        "how": STORED_FILE_FOUND,
+                        "why": "The file was found stored whole; the browser never confirmed the upload.",
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001 - one file never stops the others or the ceiling
+            logger.warning("p2_upload_stored_check_failed", tenant_id=tenant_id, batch_id=str(batch_id),
+                           **exception_summary(exc))
+            continue
+        _stored_checked_at.pop((tenant_id, str(batch_id)), None)
+        if won:
+            accepted += 1
+            logger.info("p2_upload_stored_file_accepted", tenant_id=tenant_id, journey_id=str(journey_id),
+                        batch_id=str(batch_id), size_bytes=stored_size,
+                        minutes_waiting=round((now - row["created_at_utc"]).total_seconds() / 60, 1))
+        else:
+            logger.info("p2_upload_stored_file_already_accepted", tenant_id=tenant_id, batch_id=str(batch_id),
+                        status=status)
+    return accepted
 
 
 def _nightly_review_due(tenant_id: str, now: datetime | None = None) -> str | None:
@@ -4070,6 +4205,16 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
             logger.warning("p2_retry_policy_rollout_failed", tenant_id=tenant_id, exc_info=True)
     if now - _last_watchdog_at.get(tenant_id, 0.0) >= _WATCHDOG_SECONDS:
         _last_watchdog_at[tenant_id] = now
+        # First the files stored whole that the browser never confirmed
+        # (2026-11-02): accepted, they start processing; and a file the
+        # ceiling below would fail as "did not finish uploading" is looked up
+        # once more just before. Storage is never called inside a transaction.
+        try:
+            accepted = accept_stored_uploads(engine, tenant_id)
+            if accepted:
+                logger.info("p2_upload_stored_files_accepted", tenant_id=tenant_id, files=accepted)
+        except Exception:
+            logger.warning("p2_upload_stored_check_pass_failed", tenant_id=tenant_id, exc_info=True)
         try:
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
