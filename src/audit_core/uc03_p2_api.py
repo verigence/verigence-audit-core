@@ -31,6 +31,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.task_closure_roles import roles_closable_by
 from audit_core.uc03_p2_access import (
     P2AccessContext,
     authorize_p2,
@@ -3347,7 +3348,7 @@ def list_tasks(
             LEFT JOIN auditcore.journey_products jp ON jp.tenant_id=t.tenant_id AND jp.journey_id=t.journey_id
             WHERE t.tenant_id=:tenant_id
               AND (CAST(:journey_id AS uuid) IS NULL OR t.journey_id=CAST(:journey_id AS uuid))
-              AND (CAST(:role AS varchar) IS NULL OR t.assigned_role_code=CAST(:role AS varchar)
+              AND (CAST(:role AS varchar) IS NULL OR t.assigned_role_code=ANY(CAST(:roles AS varchar[]))
                    OR (t.origin_kind='HUMAN' AND t.raised_by_actor_id=:actor_id))
               AND (
                 (CAST(:status AS varchar) IS NOT NULL AND t.task_status=CAST(:status AS varchar))
@@ -3387,6 +3388,8 @@ def list_tasks(
             "actor_id": human_principal.subject,
             "view": view if view in {"open", "done", "all"} else "open",
             "role": role,
+            # A Reviewer's queue carries the Team Lead's tasks too (task_closure_roles).
+            "roles": roles_closable_by(role),
         },
     ).mappings().all()
 
@@ -3436,7 +3439,7 @@ def list_tasks(
             WHERE wt.tenant_id=:tenant_id
               AND wt.journey_id IS NOT NULL
               AND wt.assigned_role_code IN ('PC','TL','PM','EXECUTIVE')
-              AND (CAST(:role AS varchar) IS NULL OR wt.assigned_role_code=CAST(:role AS varchar))
+              AND (CAST(:role AS varchar) IS NULL OR wt.assigned_role_code=ANY(CAST(:roles AS varchar[])))
               AND (CAST(:journey_id AS uuid) IS NULL OR wt.journey_id=CAST(:journey_id AS uuid))
               AND (
                 CAST(:legacy_mode AS varchar)='all'
@@ -3482,6 +3485,8 @@ def list_tasks(
             "legacy_mode": legacy_mode,
             "view": view_mode,
             "role": role,
+            # A Reviewer's queue carries the Team Lead's tasks too (task_closure_roles).
+            "roles": roles_closable_by(role),
         },
     ).mappings().all()
 

@@ -52,6 +52,8 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.task_closure_roles import has_team_lead_authority
+
 CLOSEST_TASK = "SKU_CLOSEST_MATCH_CONFIRM"
 OTHER_MONTH_TASK = "SKU_OTHER_MONTH_PRICE_LIST"
 MODEL_CHANGED_TASK = "MODEL_CHANGED_BY_INVOICE"
@@ -778,7 +780,7 @@ def handle_sku_task_action(
                       role=role, comment=comment, extra={"next": "PICK_SKU"})
 
     if task_type == OTHER_MONTH_TASK and action in {"ACCEPT", "REJECT"}:
-        if role not in {"TL", "PM"}:
+        if not has_team_lead_authority(role, task.get("assigned_role_code")):
             from audit_core.uc03_p2_tasks import TaskPermissionError
 
             raise TaskPermissionError("Only a Team Lead can approve pricing on another month's price list")
@@ -838,7 +840,7 @@ def handle_sku_task_action(
                       role=role, comment=comment)
 
     if task_type == INVOICE_REVIEW_TASK and action in {"ACCEPT", "REJECT"}:
-        if role not in {"TL", "PM"}:
+        if not has_team_lead_authority(role, task.get("assigned_role_code")):
             from audit_core.uc03_p2_tasks import TaskPermissionError
 
             raise TaskPermissionError("Only a Team Lead can change a confirmed SKU")

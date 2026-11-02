@@ -441,15 +441,70 @@ def test_monday_gate_pass_task_names_both_days(project):
     assert task["reference"]["coversDates"] == ["2026-11-01", "2026-11-02"]
 
 
-def test_gate_pass_task_is_for_onsite_outlets_only(project):
+def test_gate_pass_task_is_raised_for_satellite_outlets_too(project):
+    """Every outlet with a PC has a gate register, satellites included (product owner 2026-11-02)."""
     p = project
     with _db(p) as c:
+        c.execute(text("UPDATE auditcore.dealer_outlets SET outlet_classification='SATELLITE' "
+                       "WHERE tenant_id=:t AND outlet_id=:o"), {"t": p.tenant, "o": p.journey.outlet_id})
         tm.ensure_system_schedules(c, tenant_id=p.tenant, now=_at(MONDAY, 7, 0))
         c.execute(text("UPDATE auditcore.p2_task_schedules SET starts_on = :d WHERE tenant_id = :t"),
                   {"d": MONDAY, "t": p.tenant})
-        assert tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY, 7, 5))["raised"] == 1
-        c.execute(text("UPDATE auditcore.dealer_outlets SET outlet_classification='SATELLITE' "
-                       "WHERE tenant_id=:t AND outlet_id=:o"), {"t": p.tenant, "o": p.journey.outlet_id})
-        tick = tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY, 8))
-        assert tick["gatePassNotRequired"] == 1  # the open one is cancelled
-        assert tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY + timedelta(days=1), 7, 5))["raised"] == 0
+        tick = tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY, 7, 5))
+        assert tick["raised"] == 1 and "gatePassNotRequired" not in tick
+        # ... and stays open: nothing cancels a satellite's task any more.
+        tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY, 8))
+        [task] = tm.list_tasks(c, tenant_id=p.tenant, caller=_caller(p, "PC2"), view="mine")["items"]
+    assert task["status"] == "READY" and task["kind"] == "GATE_PASS"
+
+
+def _tl_outlet_task(p, *, outlet: bool = True) -> str:
+    """A system task for the Team Lead role (no person), as the gate pass raises one."""
+    with _db(p) as c:
+        task_id = tm._insert_task(c, tenant_id=p.tenant, values={
+            "scope": "OUTLET" if outlet else "PROJECT",
+            "dealer_id": str(p.journey.dealer_id) if outlet else None,
+            "outlet_id": str(p.journey.outlet_id) if outlet else None,
+            "task_type": "GATE_PASS_DELIVERY_NOT_NOTIFIED", "category": "DAILY_TASK", "origin": "SYSTEM",
+            "dedupe_key": f"test:{uuid4()}", "title": "Delivery not notified", "description": "Two not intimated.",
+            "priority": "HIGH", "assigned_role": "TL", "protocol": "SELF_CLOSING",
+        })
+    return str(task_id)
+
+
+def test_a_team_lead_task_of_an_outlet_is_the_reviewers_to_close_too(project):
+    """One task, on the TL's and the outlet's Reviewer's lists; whoever closes it closes it for both
+    (product owner 2026-11-02)."""
+    p = project
+    task_id = _tl_outlet_task(p)
+    with _db(p) as c:
+        for role in ("TL", "REVIEWER"):
+            mine = tm.list_tasks(c, tenant_id=p.tenant, caller=_caller(p, role), view="mine")
+            assert [t["taskId"] for t in mine["items"]] == [task_id], role
+            assert "COMPLETE_ACTION" in mine["items"][0]["myActions"]
+            assert mine["counts"]["ACTION"] == 1
+        # Not a PC's or a CRM's.
+        assert tm.list_tasks(c, tenant_id=p.tenant, caller=_caller(p, "PC"), view="mine")["items"] == []
+    closed = _act(p, "REVIEWER", task_id, "COMPLETE_ACTION", comment="Spoke to the dealership")
+    assert closed["status"] == "VERIFIED_COMPLETE" and closed["completedByActorId"] == p.people["REVIEWER"]
+    with _db(p) as c:
+        assert tm.list_tasks(c, tenant_id=p.tenant, caller=_caller(p, "TL"), view="mine")["items"] == []
+
+
+def test_a_reviewer_does_not_get_team_lead_tasks_outside_their_outlets(project):
+    p = project
+    project_task = _tl_outlet_task(p, outlet=False)   # a Team Lead task of no outlet stays the TL's
+    outlet_task = _tl_outlet_task(p)
+    with _db(p) as c:
+        # The Reviewer is mapped to another dealership only.
+        other = c.execute(text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
+                               "VALUES (:t, :c, 'Other') RETURNING dealer_id"),
+                          {"t": p.tenant, "c": f"OTH-{uuid4().hex[:6]}"}).scalar_one()
+        c.execute(text("UPDATE auditcore.business_assignments SET dealer_id = :d "
+                       "WHERE tenant_id = :t AND security_actor_id = :a"),
+                  {"d": other, "t": p.tenant, "a": p.people["REVIEWER"]})
+        assert tm.list_tasks(c, tenant_id=p.tenant, caller=_caller(p, "REVIEWER"), view="mine")["items"] == []
+        assert {t["taskId"] for t in tm.list_tasks(c, tenant_id=p.tenant, caller=_caller(p, "TL"),
+                                                   view="mine")["items"]} == {project_task, outlet_task}
+    with pytest.raises(tm.TaskManagerNotFound):
+        _act(p, "REVIEWER", outlet_task, "COMPLETE_ACTION")
