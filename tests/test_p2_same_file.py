@@ -1,8 +1,10 @@
-"""The same file uploaded again (product owner, 2026-10-31).
+"""The same file uploaded again (product owner, 2026-10-31; rule of 2026-11-02).
 
-PAN, mobile, customer name and model all those of an earlier journey: an
-alert for the whole Project, and the new journey deleted when the PAN is an
-individual's. Real Postgres; Document Intelligence, Security and R2 are doubles.
+PAN and/or Aadhaar, mobile, model, customer name and booking reference number
+all those of an earlier journey of the same dealership: an alert for the whole
+Project, and the new journey deleted when the PAN is an individual's. No
+booking reference read on a copy: alert only. Real Postgres; Document
+Intelligence, Security and R2 are doubles.
 """
 from __future__ import annotations
 
@@ -43,6 +45,8 @@ from audit_core.uc03_p2_tenant_alerts import list_tenant_alerts
 
 INDIVIDUAL_PAN = "ABCPE1234F"
 COMPANY_PAN = "ABCCE1234F"
+AADHAAR = "2345 6789 1234"
+BOOKING_REF = "BK/0012"
 
 
 # ── doubles ───────────────────────────────────────────────────────────────────
@@ -104,7 +108,8 @@ def _journey(base: P2Journey, *, ref: str, created: datetime, pc: str = "Rakesh 
 
 
 def _file(journey: P2Journey, *, pan: str | None = INDIVIDUAL_PAN, mobile: str | None = "+91 98765 43210",
-          name: str | None = "Amit Kumar Sahoo", model: str | None = "THAR", sku: UUID | None = None) -> None:
+          name: str | None = "Amit Kumar Sahoo", model: str | None = "THAR", sku: UUID | None = None,
+          booking_ref: str | None = BOOKING_REF, aadhaar: str | None = None) -> None:
     doc = uuid4()
     if pan or mobile:
         add_evidence(journey, di_document_id=doc, document_type_key="pan_card")
@@ -112,6 +117,17 @@ def _file(journey: P2Journey, *, pan: str | None = INDIVIDUAL_PAN, mobile: str |
         add_extracted_field(journey, di_document_id=doc, field_key="pan_number", value=pan, document_type="pan_card")
     if mobile:
         add_extracted_field(journey, di_document_id=doc, field_key="customer_phone", value=mobile)
+    if aadhaar:
+        kyc = uuid4()
+        add_evidence(journey, di_document_id=kyc, document_type_key="aadhaar")
+        add_extracted_field(journey, di_document_id=kyc, field_key="aadhaar_number", value=aadhaar,
+                            document_type="aadhaar")
+    # The booking form, with its booking reference number, on every copy
+    # (both copies hold one, so neither holds a document the other lacks).
+    form = uuid4()
+    add_evidence(journey, di_document_id=form, document_type_key="booking_form")
+    if booking_ref:
+        add_extracted_field(journey, di_document_id=form, field_key="booking_reference_number", value=booking_ref)
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         if name:
@@ -195,12 +211,12 @@ def _identity(**overrides) -> FileIdentity:
     values = {"journey_id": uuid4(), "created_at": datetime.now(UTC), "reference": "R", "pc_name": "PC",
               "dealer_name": "D", "outlet_name": "O", "pan": INDIVIDUAL_PAN, "mobile": "9876543210",
               "name": "Amit Kumar Sahoo", "model_id": None, "model_name": "THAR", "variant_name": None,
-              "closed": False}
+              "closed": False, "booking_refs": frozenset({"BK-12"}), "booking_ref_display": "BK/0012"}
     values.update(overrides)
     return FileIdentity(**values)
 
 
-def test_all_four_must_match():
+def test_all_must_match():
     base = _identity()
     assert matched_fields(_identity(), base) is not None
     assert matched_fields(_identity(pan="ABCPE9999F"), base) is None
@@ -269,8 +285,9 @@ def test_same_file_with_an_individual_pan_is_deleted_and_alerted(tenant):
     assert alert["expires_at_utc"] > alert["published_at_utc"]
     assert "was deleted" in alert["body"] and "New PC" in alert["body"]
     fields = {f["field"]: f for f in alert["payload"]["matchedFields"]}
-    assert set(fields) == {"pan", "mobile", "name", "model"}
+    assert set(fields) == {"pan", "mobile", "name", "model", "bookingReference"}
     assert fields["pan"]["newValue"] == "XXXXXX234F"
+    assert fields["bookingReference"]["exact"] and fields["bookingReference"]["newValue"] == BOOKING_REF
     # The PC who entered the new file is named by id, so their own screen beeps (2026-10-31).
     with new.engine.begin() as connection:
         set_tenant_context(connection, new.tenant_id)
@@ -287,13 +304,19 @@ def test_same_file_with_an_individual_pan_is_deleted_and_alerted(tenant):
     assert record["deleted_by_actor_id"] == "SYSTEM" and record["deleted_by_role"] == "SYSTEM"
     assert record["deletion_status"] == "COMPLETED"
     assert record["reason"].startswith("Same file uploaded again: matches OLD-")
+    # What the Deleted tab shows (2026-11-02): PAN and mobile in full, the booking number, the copy kept.
+    assert record["deletion_kind"] == "SAME_FILE"
+    assert record["customer_pan"] == INDIVIDUAL_PAN and record["customer_mobile"] == "9876543210"
+    assert record["booking_reference"] == BOOKING_REF and record["model_name"] == "THAR"
+    assert record["kept_journey_id"] == old.journey_id and record["kept_journey_reference"].startswith("OLD-")
+    assert record["customer_aadhaar_masked"] is None  # no Aadhaar read
 
 
 @pytest.mark.parametrize("differs", [
     {"pan": "ABCPE9999F"}, {"mobile": "9000000001"}, {"name": "Sunil Kumar Mallick"}, {"model": "SCORPIO N"},
-    {"model": None},
+    {"model": None}, {"booking_ref": "BK/0013"},
 ])
-def test_three_of_four_is_not_the_same_file(tenant, differs):
+def test_one_value_different_is_not_the_same_file(tenant, differs):
     _, new = _pair(tenant, **differs)
     assert _detect(new).get("raised", 0) == 0
     assert _alerts(new) == [] and _queued(new) == []
@@ -790,47 +813,7 @@ def _ref(journey: P2Journey) -> str:
                                        "AND journey_id=:j"), {"t": journey.tenant_id, "j": journey.journey_id}).scalar_one()
 
 
-# ── the same receipt on both, and a sole proprietor's GSTIN (2026-11-01) ──────
-def _receipt(journey: P2Journey, number: str) -> None:
-    doc = uuid4()
-    add_evidence(journey, di_document_id=doc, document_type_key="dealer_receipt")
-    add_extracted_field(journey, di_document_id=doc, field_key="receipt_number", value=number,
-                        document_type="dealer_receipt")
-
-
-def test_the_same_receipt_on_both_is_the_same_file_without_the_mobile_or_one_model():
-    """13 pairs on 2026-11-01: the mobile read on one copy only, or the model not
-    identified on one (UTK-RM-261024-008), but the same receipt on both."""
-    base = _identity(receipts=frozenset({"BRKM/2627/03259"}))
-    assert matched_fields(_identity(mobile=None, receipts=frozenset({"BRKM/2627/03259"})), base) is not None
-    fields = matched_fields(_identity(model_name=None, mobile=None, receipts=frozenset({"BRKM/2627/03259"})), base)
-    assert [f["field"] for f in fields] == ["pan", "name", "receipt", "model"]
-    assert fields[2]["newValue"] == "BRKM/2627/03259"
-    # Not without the same receipt, nor when the model differs, nor for another person.
-    assert matched_fields(_identity(mobile=None, receipts=frozenset({"BRKM/2627/09999"})), base) is None
-    assert matched_fields(_identity(mobile=None, model_name="SCORPIO N",
-                                    receipts=frozenset({"BRKM/2627/03259"})), base) is None
-    assert matched_fields(_identity(mobile=None, name="Sunil Kumar Mallick",
-                                    receipts=frozenset({"BRKM/2627/03259"})), base) is None
-
-
-def test_a_receipt_number_must_look_like_one():
-    from audit_core.uc03_p2_same_file import normalize_receipt
-
-    assert normalize_receipt(" brkm/2627/ 03259 ") == "BRKM/2627/03259"
-    assert normalize_receipt("NA") is None and normalize_receipt("CASH") is None and normalize_receipt("12") is None
-
-
-def test_a_booking_entered_twice_with_the_same_receipt_is_deleted(tenant):
-    old, new = _pair(tenant, mobile=None)  # the mobile read on the old copy only
-    _receipt(old, "AMC-B/30640/26-27")
-    _receipt(new, "AMC-B/30640/26-27")
-    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
-    payload = _alerts(new)[0]["payload"]
-    assert [f["field"] for f in payload["matchedFields"]] == ["pan", "name", "receipt", "model"]
-    assert "on PAN, customer name, receipt number and model." in _alerts(new)[0]["body"]
-
-
+# ── a sole proprietor's GSTIN (2026-11-01) ────────────────────────────────────
 def test_a_sole_proprietors_gstin_on_their_own_pan_is_not_a_company(tenant):
     """Prahallad Behera (ADI-RD-261031-003, 2026-11-01): his GSTIN 21BYXPB9740G1Z8
     is built on his own PAN; the copy was kept as if a company's."""
@@ -860,3 +843,189 @@ def test_a_new_copy_holding_a_document_the_earlier_one_lacks_is_kept(tenant):
         set_tenant_context(connection, tenant.tenant_id)
         assert documents_only_on(connection, tenant_id=tenant.tenant_id, new_journey_id=new.journey_id,
                                  existing_journey_id=old.journey_id) == ["tax_invoice_tally"]
+
+
+# ── the booking reference number and the Aadhaar (product owner 2026-11-02) ──
+def test_booking_reference_normalisation():
+    from audit_core.uc03_p2_same_file import normalize_booking_reference as norm
+
+    assert norm("bk/0012") == norm("BK-12") == norm(" BK 12 ") == norm("BK12") == "BK-12"
+    assert norm("0000123") == norm("123") == "123"
+    assert norm("BK/12/3") != norm("BK/1/23")
+    for nothing in (None, "", "NA", "-", "0000", "N/A", "BK", "12"):
+        assert norm(nothing) is None, nothing
+
+
+def test_the_booking_reference_decides():
+    base = _identity()
+    # Read on both and different: two bookings.
+    assert matched_fields(_identity(booking_refs=frozenset({"BK-13"})), base) is None
+    # Not read on one: still a match, the booking row not exact (kept with an alert).
+    fields = matched_fields(_identity(booking_refs=frozenset(), booking_ref_display=None), base)
+    assert fields is not None and fields[-1] == {
+        "field": "bookingReference", "label": "Booking reference number", "newValue": None,
+        "existingValue": "BK/0012", "exact": False}
+    # Each dealership numbers its own bookings.
+    assert matched_fields(_identity(dealer_id=uuid4()), _identity(dealer_id=uuid4())) is None
+
+
+def test_pan_or_aadhaar_is_enough_but_a_different_one_is_another_person():
+    base = _identity(pan=None, aadhaar="234567891234")
+    fields = matched_fields(_identity(pan=None, aadhaar="234567891234"), base)
+    assert fields is not None and fields[0]["field"] == "aadhaar" and fields[0]["newValue"] == "XXXX XXXX 1234"
+    # PAN on one copy only, the Aadhaar on both: the Aadhaar decides.
+    assert matched_fields(_identity(aadhaar="234567891234"), base) is not None
+    # The same PAN but different Aadhaar numbers: two people.
+    assert matched_fields(_identity(aadhaar="234567899999"), _identity(aadhaar="234567891234")) is None
+    # Neither identity: nothing.
+    assert matched_fields(_identity(pan=None), _identity(pan=None)) is None
+
+
+def test_mask_aadhaar_keeps_the_last_four_digits_only():
+    from audit_core.uc03_p2_same_file import mask_aadhaar
+
+    assert mask_aadhaar("2345 6789 1234") == "XXXX XXXX 1234"
+    assert mask_aadhaar(None) is None
+
+
+def test_same_booking_reference_differently_written_is_deleted(tenant):
+    old, new = _pair(tenant, booking_ref="bk-12")  # the old copy reads "BK/0012"
+    _quiet(new)
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    assert _delete(new) == "DELETED"
+    assert not _exists(new) and _exists(old)
+
+
+def test_a_different_booking_reference_is_not_a_duplicate(tenant):
+    _, new = _pair(tenant, booking_ref="BK/0099")
+    assert _detect(new).get("raised", 0) == 0
+    assert _alerts(new) == [] and _queued(new) == []
+
+
+def test_no_booking_reference_on_one_copy_is_alerted_and_kept(tenant):
+    old, new = _pair(tenant, booking_ref=None)
+    assert _detect(new)["outcomes"] == ["KEPT_NO_BOOKING_REFERENCE"]
+    [alert] = _alerts(new)
+    assert alert["alert_status"] == "PUBLISHED" and alert["outcome"] == "KEPT_NO_BOOKING_REFERENCE"
+    assert "kept for review: the booking reference number was not read on the new file" in alert["body"]
+    assert "booking reference number" not in alert["body"].split(" on ")[-1]  # not listed as matched
+    assert _queued(new) == [] and _exists(new)
+    # Read later and the same: the copy is deleted after all, under the same alert.
+    form = uuid4()
+    add_evidence(new, di_document_id=form, document_type_key="booking_docket")
+    add_extracted_field(new, di_document_id=form, field_key="booking_reference_number", value="BK 12",
+                        document_type="booking_docket")
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    [alert] = _alerts(new)
+    assert alert["alert_status"] == "PENDING" and len(_queued(new)) == 1
+    _quiet(new)
+    assert _delete(new) == "DELETED" and _exists(old)
+
+
+def test_no_booking_reference_at_delete_time_keeps_the_copy(tenant):
+    _, new = _ready_to_delete(tenant)
+    with new.engine.begin() as connection:  # the booking form removed since
+        set_tenant_context(connection, new.tenant_id)
+        connection.execute(text("UPDATE auditcore.evidence SET association_status='VOIDED' WHERE tenant_id=:t "
+                                "AND journey_id=:j AND document_type_key='booking_form'"),
+                           {"t": new.tenant_id, "j": new.journey_id})
+    _quiet(new)
+    assert _delete(new) == "KEPT_CHANGED" and _exists(new)
+    assert "booking reference number was not read" in _alerts(new)[0]["body"]
+
+
+def test_another_dealership_is_never_the_same_file(tenant):
+    now = datetime.now(UTC)
+    old = _journey(tenant, ref="DLR-OLD", created=now - timedelta(days=1))
+    with tenant.engine.begin() as connection:  # another dealership of the same Project
+        set_tenant_context(connection, tenant.tenant_id)
+        dealer = connection.execute(
+            text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
+                 "VALUES (:t, :c, 'D2') RETURNING dealer_id"), {"t": tenant.tenant_id, "c": uuid4().hex[:8]},
+        ).scalar_one()
+        outlet = connection.execute(
+            text("INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_code, outlet_name) "
+                 "VALUES (:t, :d, :c, 'O2') RETURNING outlet_id"),
+            {"t": tenant.tenant_id, "d": dealer, "c": uuid4().hex[:8]},
+        ).scalar_one()
+    elsewhere = P2Journey(engine=tenant.engine, tenant_id=tenant.tenant_id, journey_id=tenant.journey_id,
+                          actor_id=tenant.actor_id, dealer_id=UUID(str(dealer)), outlet_id=UUID(str(outlet)),
+                          customer_id=tenant.customer_id)
+    new = _journey(elsewhere, ref="DLR-NEW", created=now)
+    _file(old)
+    _file(new)
+    assert _detect(new).get("raised", 0) == 0 and _alerts(new) == []
+
+
+def test_an_aadhaar_only_match_is_deleted_and_recorded_masked(tenant):
+    now = datetime.now(UTC)
+    old = _journey(tenant, ref="AAD-OLD", created=now - timedelta(days=1))
+    new = _journey(tenant, ref="AAD-NEW", created=now - timedelta(minutes=5))
+    _file(old, pan=None, aadhaar=AADHAAR)
+    _file(new, pan=None, aadhaar="234567891234")
+    _quiet(new)
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    payload = _alerts(new)[0]["payload"]
+    assert payload["matchedFields"][0] == {"field": "aadhaar", "label": "Aadhaar", "newValue": "XXXX XXXX 1234",
+                                           "existingValue": "XXXX XXXX 1234", "exact": True}
+    assert _delete(new) == "DELETED"
+    with new.engine.begin() as connection:
+        set_tenant_context(connection, new.tenant_id)
+        record = connection.execute(
+            text("SELECT * FROM auditcore.p2_journey_deletions WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": new.tenant_id, "j": new.journey_id},
+        ).mappings().one()
+        stored = " ".join(str(v) for v in record.values())
+    assert record["customer_aadhaar_masked"] == "XXXX XXXX 1234"
+    assert "234567891234" not in stored and "2345 6789 1234" not in stored  # never the full number
+    assert record["customer_pan"] is None and record["customer_mobile"] == "9876543210"
+    assert record["booking_reference"] == BOOKING_REF and record["kept_journey_reference"] == "AAD-OLD"
+
+
+def test_the_deleted_tab_lists_deleted_copies_within_the_callers_scope(tenant):
+    from audit_core.uc03_duplicate_bookings_report import get_deleted_duplicate_bookings
+
+    now = datetime.now(UTC)
+    old = _journey(tenant, ref=f"OLD-{uuid4().hex[:6]}", created=now - timedelta(days=1), pc="Old PC")
+    new = _journey(tenant, ref=f"NEW-{uuid4().hex[:6]}", created=now - timedelta(minutes=5), pc="New PC")
+    _file(old, aadhaar=AADHAAR)
+    _file(new, aadhaar=AADHAAR)
+    _quiet(new)
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    assert _delete(new) == "DELETED"
+    with tenant.engine.begin() as connection:
+        set_tenant_context(connection, tenant.tenant_id)
+        other_outlet = connection.execute(
+            text("INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_code, outlet_name) "
+                 "VALUES (:t, :d, :c, 'Other outlet') RETURNING outlet_id"),
+            {"t": tenant.tenant_id, "d": tenant.dealer_id, "c": uuid4().hex[:8]},
+        ).scalar_one()
+        for actor, dealer, outlet in (("dup-tl", None, None), ("dup-pc-own", tenant.dealer_id, tenant.outlet_id),
+                                      ("dup-pc-other", tenant.dealer_id, other_outlet)):
+            connection.execute(
+                text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, "
+                     "dealer_id, outlet_id) VALUES (:t, :a, :r, :d, :o)"),
+                {"t": tenant.tenant_id, "a": actor, "r": "TL" if dealer is None else "PC", "d": dealer, "o": outlet},
+            )
+        # A Team Lead's own delete is not listed.
+        connection.execute(
+            text("INSERT INTO auditcore.p2_journey_deletions (tenant_id, journey_id, dealer_id, outlet_id, reason, "
+                 "deleted_by_actor_id, deleted_by_role, deletion_status) VALUES (:t, :j, :d, :o, "
+                 "'A team lead removed it', 'tl', 'TL', 'COMPLETED')"),
+            {"t": tenant.tenant_id, "j": uuid4(), "d": tenant.dealer_id, "o": tenant.outlet_id},
+        )
+
+        def listed(actor: str):
+            return get_deleted_duplicate_bookings(
+                tenant_id=tenant.tenant_id, human_principal=SimpleNamespace(subject=actor),
+                authorization_client=AllowAllAuthorization(role_key="TL"), connection=connection).items
+
+        [item] = listed("dup-tl")
+        assert item.journeyId == new.journey_id and item.keptJourneyId == old.journey_id
+        assert item.journeyReference.startswith("NEW-") and item.keptJourneyReference.startswith("OLD-")
+        assert item.pan == INDIVIDUAL_PAN and item.mobile == "9876543210"
+        assert item.aadhaarMasked == "XXXX XXXX 1234" and item.bookingReference == BOOKING_REF
+        assert item.pcName == "New PC" and item.model == "THAR" and item.customerName == "Amit Kumar Sahoo"
+        assert item.outletName and item.status == "COMPLETED"
+        assert [i.journeyId for i in listed("dup-pc-own")] == [new.journey_id]
+        assert listed("dup-pc-other") == [] and listed("nobody") == []
