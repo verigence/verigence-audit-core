@@ -32,9 +32,11 @@ from audit_core.uc03_duplicate_journey_purge import (
 )
 from audit_core.uc03_p2_same_file import (
     ALERT_KIND,
+    CROSS_OUTLET_KIND,
     DELETE_WORK_TYPE,
     FileIdentity,
     alert_body,
+    cross_outlet_fields,
     is_individual_pan,
     matched_fields,
     run_same_file_delete,
@@ -954,7 +956,9 @@ def test_another_dealership_is_never_the_same_file(tenant):
     new = _journey(elsewhere, ref="DLR-NEW", created=now)
     _file(old)
     _file(new)
-    assert _detect(new).get("raised", 0) == 0 and _alerts(new) == []
+    # Never the same file (nothing deleted); since 2026-11-03 a duplicate booking across outlets.
+    assert _detect(new).get("raised", 0) == 0 and _queued(new) == []
+    assert [a["alert_kind"] for a in _alerts(new)] == [CROSS_OUTLET_KIND]
 
 
 def test_an_aadhaar_only_match_is_deleted_and_recorded_masked(tenant):
@@ -1029,3 +1033,106 @@ def test_the_deleted_tab_lists_deleted_copies_within_the_callers_scope(tenant):
         assert item.outletName and item.status == "COMPLETED"
         assert [i.journeyId for i in listed("dup-pc-own")] == [new.journey_id]
         assert listed("dup-pc-other") == [] and listed("nobody") == []
+
+
+# ── 2026-11-03: a duplicate booking across outlets ────────────────────────────
+def _other_outlet(base: P2Journey, *, other_dealer: bool = False) -> P2Journey:
+    """A journey of ``base``'s tenant at another outlet (of the same dealership, or of another)."""
+    with base.engine.begin() as connection:
+        set_tenant_context(connection, base.tenant_id)
+        dealer_id = base.dealer_id
+        if other_dealer:
+            dealer_id = connection.execute(
+                text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
+                     "VALUES (:t, :c, 'Other Dealer') RETURNING dealer_id"),
+                {"t": base.tenant_id, "c": f"OD-{uuid4().hex[:6]}"}).scalar_one()
+        outlet_id = connection.execute(
+            text("INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_code, outlet_name) "
+                 "VALUES (:t, :d, :c, 'Other Outlet') RETURNING outlet_id"),
+            {"t": base.tenant_id, "d": dealer_id, "c": f"OO-{uuid4().hex[:6]}"}).scalar_one()
+    return P2Journey(engine=base.engine, tenant_id=base.tenant_id, journey_id=base.journey_id, actor_id=base.actor_id,
+                     dealer_id=UUID(str(dealer_id)), outlet_id=UUID(str(outlet_id)), customer_id=base.customer_id)
+
+
+def _cross_pair(tenant: P2Journey, *, other_dealer: bool = False, **new_overrides):
+    now = datetime.now(UTC)
+    old = _journey(tenant, ref=f"OLD-{uuid4().hex[:6]}", created=now - timedelta(days=2), pc="Old PC")
+    elsewhere = _other_outlet(tenant, other_dealer=other_dealer)
+    new = _journey(elsewhere, ref=f"NEW-{uuid4().hex[:6]}", created=now - timedelta(minutes=5), pc="New PC")
+    _file(old)
+    _file(new, **new_overrides)
+    return old, new
+
+
+def test_cross_outlet_rule_without_a_database():
+    a, b = uuid4(), uuid4()
+    base = _identity(outlet_id=a)
+    # Another outlet: the customer, mobile and model are enough -- no booking number, no name.
+    assert cross_outlet_fields(_identity(outlet_id=b, booking_refs=frozenset({"BK-99"}), name=None), base)
+    assert cross_outlet_fields(_identity(outlet_id=b, pan=None, aadhaar="234567891234"), _identity(
+        outlet_id=a, pan=None, aadhaar="234567891234"))
+    assert cross_outlet_fields(_identity(outlet_id=b, mobile="9876500000"), base) is None
+    assert cross_outlet_fields(_identity(outlet_id=b, model_name="SCORPIO N"), base) is None
+    assert cross_outlet_fields(_identity(outlet_id=b, pan="ABCPE9999F"), base) is None
+    # The same outlet is never "across outlets"; and another outlet is never "the same file".
+    assert cross_outlet_fields(_identity(outlet_id=a), base) is None
+    assert matched_fields(_identity(outlet_id=b), base) is None
+    assert matched_fields(_identity(outlet_id=a), base) is not None
+
+
+@pytest.mark.parametrize("other_dealer", [False, True])
+def test_a_duplicate_booking_across_outlets_is_alerted_and_nothing_deleted(tenant, other_dealer):
+    old, new = _cross_pair(tenant, other_dealer=other_dealer, booking_ref="OTHER/77", name="A K Sahoo")
+    result = _detect(new)
+    assert result["acrossOutlets"] == 1 and result["raised"] == 0
+    [alert] = [a for a in _alerts(new) if a["alert_kind"] == CROSS_OUTLET_KIND]
+    assert alert["alert_status"] == "PUBLISHED" and alert["subject_journey_id"] == new.journey_id
+    assert alert["related_journey_id"] == old.journey_id
+    assert sorted(alert["payload"]["audienceOutletIds"]) == sorted([str(old.outlet_id), str(new.outlet_id)])
+    assert alert["title"] == "Duplicate booking across outlets" and "Nothing was deleted." in alert["body"]
+    assert _queued(new) == [] and _exists(new) and _exists(old)
+    # Once per journey: the older journey's own run does not raise it again.
+    assert _detect(old)["acrossOutlets"] == 0
+    assert len([a for a in _alerts(new) if a["alert_kind"] == CROSS_OUTLET_KIND]) == 1
+
+
+def test_the_same_outlet_is_still_the_same_file(tenant):
+    _old, new = _pair(tenant)
+    result = _detect(new)
+    assert result["acrossOutlets"] == 0 and result["raised"] == 1
+    assert [a["alert_kind"] for a in _alerts(new)] == [ALERT_KIND]
+
+
+def _assign(journey: P2Journey, actor: str, role: str, *, outlet_id: UUID | None) -> None:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, "
+                 "dealer_id, outlet_id) VALUES (:t, :a, :r, :d, :o)"),
+            {"t": journey.tenant_id, "a": actor, "r": role, "d": None if outlet_id is None else journey.dealer_id,
+             "o": outlet_id})
+
+
+def test_the_cross_outlet_alert_is_for_both_outlets_pcs_reviewers_and_team_leads(tenant):
+    old, new = _cross_pair(tenant)
+    _detect(new)
+    _assign(old, "pc-old", "PC", outlet_id=old.outlet_id)
+    _assign(new, "pc-new", "PC", outlet_id=new.outlet_id)
+    _assign(old, "tl-all", "TL", outlet_id=None)                      # Project-wide
+    _assign(old, "rv-old", "REVIEWER", outlet_id=old.outlet_id)
+    elsewhere = _other_outlet(tenant)
+    _assign(elsewhere, "pc-elsewhere", "PC", outlet_id=elsewhere.outlet_id)
+    _assign(old, "pm-old", "PM", outlet_id=old.outlet_id)
+
+    def kinds(actor: str) -> list[str]:
+        with tenant.engine.begin() as connection:
+            set_tenant_context(connection, tenant.tenant_id)
+            response = list_tenant_alerts(tenant_id=tenant.tenant_id, human_principal=SimpleNamespace(subject=actor),
+                                          authorization_client=AllowAllAuthorization(role_key="PC"),
+                                          connection=connection)
+            return [a.kind for a in response.items]
+
+    for actor in ("pc-old", "pc-new", "tl-all", "rv-old"):
+        assert kinds(actor) == [CROSS_OUTLET_KIND], actor
+    for actor in ("pc-elsewhere", "pm-old", "nobody"):
+        assert kinds(actor) == [], actor
