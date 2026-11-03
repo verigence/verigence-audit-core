@@ -209,7 +209,8 @@ def test_equal_counts_finish_the_task_and_bookings_are_not_counted(setup):
     result = _counts(s, gp, 2, transfers=1, drives=3).json()
     assert result["divergence"] == "NONE" and result["deliveryFiles"] == 2 and result["nextStep"] == "DONE"
     assert result["gatePass"]["completed"] is True
-    assert _counts(s, gp, 2).status_code == 409   # finished
+    # Finished -- but its PC may still correct the counts on the day it was uploaded (2026-11-03).
+    assert _counts(s, gp, 2).status_code == 200
 
 
 def test_more_files_than_declared_asks_which_belong_to_other_days(setup):
@@ -572,3 +573,48 @@ def test_all_notified_means_the_whole_gap_is_the_pcs_and_no_tl_task(setup):
     from audit_core.uc03_p2_object_keys import ist_day
     [day] = s.client.get(f"{s.base}/calendar", params={"month": f"{ist_day():%Y-%m}"}).json()["days"]
     assert (day["notNotified"], day["toUpload"]) == (0, 2)
+
+
+# ── the PC corrects the counts on the day of the upload (product owner 2026-11-03) ──
+def _not_notified_task(s, gp):
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        return connection.execute(
+            text("SELECT task_status, description, reference FROM auditcore.p2_tasks WHERE tenant_id=:t "
+                 "AND dedupe_key=:k"), {"t": s.journey.tenant_id, "k": f"gatepass:{gp}:GATE_PASS_DELIVERY_NOT_NOTIFIED"},
+        ).mappings().one_or_none()
+
+
+def test_the_pc_corrects_the_counts_on_the_day_and_the_team_leads_task_follows(setup):
+    s = setup
+    _delivery_file(s, journeys=2)
+    gp = _upload(s).json()["gatePassId"]
+    first = _register(s, gp, 5, 3).json()
+    assert first["gatePass"]["countsEditable"] is True and first["taskRaised"] is True
+    assert _not_notified_task(s, gp)["task_status"] not in ("CANCELLED", "VERIFIED_COMPLETE")
+    # Every delivery was intimated after all: the task goes.
+    fixed = _register(s, gp, 5, 5)
+    assert fixed.status_code == 200, fixed.text
+    body = fixed.json()
+    assert body["intimatedToPc"] == 5 and body["notIntimatedToPc"] == 0 and body["pendingWithPc"] == 3
+    assert body["gatePass"]["countsEditCount"] == 1
+    [before] = body["gatePass"]["countsHistory"]
+    assert before["newDeliveries"] == 5 and before["notNotifiedToPc"] == 2
+    assert _not_notified_task(s, gp)["task_status"] == "CANCELLED"
+    # And back: 4 of 6 intimated -- the same task, open again, with the new numbers.
+    again = _register(s, gp, 6, 4).json()
+    assert again["taskRaised"] is True and again["gatePass"]["countsEditCount"] == 2
+    task = _not_notified_task(s, gp)
+    assert task["task_status"] == "READY" and task["reference"]["missing"] == 2 and "corrected" in task["description"]
+
+
+def test_counts_are_not_corrected_after_the_day_of_the_upload(setup):
+    s = setup
+    gp = _upload(s).json()["gatePassId"]
+    assert _register(s, gp, 2, 2).status_code == 200
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_gate_passes SET created_at_utc = now() - interval '1 day' "
+                                "WHERE tenant_id=:t AND gate_pass_id=:g"), {"t": s.journey.tenant_id, "g": gp})
+    late = _register(s, gp, 3, 3)
+    assert late.status_code == 409 and "day the gate register was uploaded" in late.text
