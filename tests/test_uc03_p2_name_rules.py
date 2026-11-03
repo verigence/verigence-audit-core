@@ -423,6 +423,36 @@ def test_a_full_name_fits_a_masked_reference():
     assert not masked_matches("SXXXXXXXXXXN BXXXD", "Soumya Rajesh Barad")  # last shown letter differs
 
 
+def test_a_masked_name_resembles_the_verified_kyc_name_whatever_length_the_mask_prints():
+    """Live 2026-11-03: five bookings kept the PAN's masked name as their
+    entered name while their KYC read the full name: the mask did not keep
+    the words' lengths."""
+    from audit_core.uc03_p2_names import masked_resembles
+
+    assert masked_resembles("PXXXXXXXXXA DXS", "PRIYADARSA DAS")  # one X too many
+    assert masked_resembles("AXXXXH NXXXK", "Abinash Nayak")
+    assert masked_resembles("RXXXXU CX", "RAGHUU CHATRI")  # the surname cut short
+    assert not masked_resembles("PXXXXXXXXXA DXS", "PRIYADARSI DAS")  # the last letter shown differs
+    assert not masked_resembles("RXXXXU CX", "RAGHUU")  # a word left over
+    assert not masked_resembles("PRIYADARSA DAS", "PRIYADARSA DAS")  # nothing masked
+
+
+def test_a_masked_entered_name_follows_the_verified_kyc_name(journey):
+    from audit_core.uc03_p2_customer import follow_entered_name
+
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        # The entered name is guarded; set as the first masked PAN name was.
+        c.execute(text("SELECT set_config('auditcore.entered_name_follows_customer', 'on', true)"))
+        c.execute(text("UPDATE auditcore.customers SET display_name='PXXXXXXXXXA DXS', "
+                       "legal_name='PRIYADARSA DAS', legal_name_status='VERIFIED' "
+                       "WHERE tenant_id=:t AND customer_id=:c"),
+                  {"t": journey.tenant_id, "c": journey.customer_id})
+        c.execute(text("SELECT set_config('auditcore.entered_name_follows_customer', 'off', true)"))
+        assert follow_entered_name(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id) == "PRIYADARSA DAS"
+        assert follow_entered_name(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id) is None
+
+
 def test_a_proprietors_kyc_in_the_gst_legal_name_is_the_customers(journey, strict):
     """2026-10-28: a proprietorship's GST certificate prints the proprietor as
     the legal name ("BISWAJIT DAS", trade name "M/S DAS CONSTRUCTION"). His
