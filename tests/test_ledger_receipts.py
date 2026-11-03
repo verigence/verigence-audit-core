@@ -138,3 +138,5 @@ def test_a_disbursement_net_of_the_lenders_charges_is_the_loan(journey) -> None:
     view = _payments(journey)
     assert [(i["receiptNumber"], D(i["amount"])) for i in view["items"] if i.get("fromLedger")] == [
         ("PB/26-27/0401", D(582229))]
+    # The loan received is the ledger's credit, not the sanction.
+    assert D(view["loanWithoutReceipt"]["amount"]) == D(1250000)
