@@ -57,6 +57,7 @@ RULES = {
     "AS-07": "Loan disbursed against the loan sanctioned",
     "AS-08": "Customer payments verified against a bank statement",
     "AS-09": "Money received against the net payable",
+    "AS-10": "The deal's balance against the customer ledger's balance",
 }
 
 # The document that proves a charge, by Deal line (third party: issued by the
@@ -404,6 +405,35 @@ def settlement(
                 "Received less than the net payable." if status == "SHORT" else "Received more than the net payable.")}
 
 
+# The ledger posts round-off and paise the deal does not carry: the product
+# owner's price tolerance.
+_LEDGER_TOLERANCE = Decimal(100)
+
+
+def ledger_check(ledger: dict[str, Any] | None, settle: dict[str, Any]) -> dict[str, Any] | None:
+    """The deal's balance (net payable less money received) set against the
+    Tally customer ledger's (its debits less its credits): the ledger is the
+    dealer's own record of every charge, benefit and payment, so the two agree
+    within the tolerance or the difference is shown. None with no ledger."""
+    if ledger is None:
+        return None
+    book = dec(ledger["balance"])
+    shown = (f"Rs {abs(book):,.2f} {'due (Dr)' if book > 0 else 'paid over (Cr)' if book < 0 else 'nil'}")
+    out = {"label": "Deal balance against the customer ledger", "rule": "AS-10", "impact": None,
+           "ledgerBalance": money(book), "dealBalance": settle.get("balance"),
+           "documentId": ledger.get("documentId")}
+    deal_balance = dec(settle.get("balance"))
+    if deal_balance is None:
+        return {**out, "conclusion": CANNOT, "difference": None,
+                "reason": f"The customer ledger shows {shown}; the deal's balance cannot be worked out yet."}
+    difference = deal_balance - book
+    if abs(difference) <= _LEDGER_TOLERANCE:
+        return {**out, "conclusion": OK, "difference": money(difference), "reason": None}
+    return {**out, "conclusion": EXCEPTION, "difference": money(difference),
+            "reason": f"The customer ledger shows {shown}; the deal's balance is Rs {deal_balance:,.2f} "
+                      f"({'due' if deal_balance > 0 else 'paid over'}): they differ by Rs {abs(difference):,.2f}."}
+
+
 def verdict(rows: list[dict[str, Any]], *, delivery_started: bool, missing: list[str]) -> dict[str, Any]:
     counts = {c: sum(1 for r in rows if r.get("conclusion") == c) for c in (OK, EXCEPTION, UNSUPPORTED, DISPUTED, CANNOT)}
     customer = sum((abs(dec(r.get("difference")) or Decimal(0)) for r in rows
@@ -586,12 +616,17 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                         loan_unknown=loan_on_file["unknown"],
                         awaiting=[a.get("label") or a.get("key") for a in summary.get("awaiting") or []])
 
+    from audit_core.uc03_ledger_receipts import customer_ledger_balance
+
+    ledger = ledger_check(customer_ledger_balance(connection, tenant_id=tenant_id, journey_id=journey_id), settle)
+    funding["customerLedger"] = ledger
     rows = charges + benefits + products + [dict(bank_check, label="Payments verified with bank statement",
                                                   difference=None, impact=None),
                                             *[dict(entry, label=f"Loan ({entry['lender'] or 'lender not named'})",
                                                    impact=None) for entry in loans],
                                             dict(settle, label="Money received against net payable",
-                                                 difference=settle.get("balance"))]
+                                                 difference=settle.get("balance")),
+                                            *([ledger] if ledger else [])]
     missing = []
     if not on_file & {"customer_invoice_dms", "tax_invoice_tally", "customer_ledger", "cost_sheet"}:
         missing.append("No invoice, account statement or cost sheet on file.")

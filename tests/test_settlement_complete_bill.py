@@ -140,3 +140,29 @@ def test_the_loans_own_receipt_net_of_charges_is_not_counted_again_from_the_lett
     assert "among the receipts" in loan["note"]
     assert view["loanWithoutReceipt"] is None
     assert D(view["receiptsTotal"]) == D(722366)
+
+
+# ── the customer ledger checks the balance ───────────────────────────────────
+def test_the_deal_balance_is_checked_against_the_customer_ledger() -> None:
+    """Product owner 2026-11-03: the ledger rows are not shown on screen; they
+    are used to verify in the Audit Summary."""
+    from audit_core.uc03_ledger_receipts import ledger_balance
+    from audit_core.uc03_p2_audit_summary import ledger_check
+
+    rows = [
+        {"particulars_raw": "ICICI BANK", "voucher_type": "Receipt", "credit_amount": 11000},
+        {"particulars_raw": "Vehicle Sale 40%", "voucher_type": "Vehicle Sale", "debit_amount": 2520960},
+        {"particulars_raw": "MMFSL MAHINDRA FINANCE TA (52879)", "voucher_type": "Journal_NonGST",
+         "credit_amount": 2275000},
+        {"particulars_raw": "SCRAPPAGE BONUS@40%", "voucher_type": "Credit Note_MM", "credit_amount": 20000},
+        {"particulars_raw": "ROUND OFF", "voucher_type": "Journal_NonGST", "credit_amount": 33},
+        {"particulars_raw": "Closing Balance", "credit_amount": 214927},
+    ]
+    assert ledger_balance(rows) == D(214927)
+    ledger = {"balance": D(214927), "documentId": "d"}
+    agrees = ledger_check(ledger, {"balance": "214960.00"})
+    assert agrees["conclusion"] == "OK" and agrees["rule"] == "AS-10"
+    differs = ledger_check(ledger, {"balance": "-20000.00"})
+    assert differs["conclusion"] == "EXCEPTION" and "due (Dr)" in differs["reason"]
+    assert ledger_check(ledger, {"balance": None})["conclusion"] == "CANNOT_DETERMINE"
+    assert ledger_check(None, {"balance": "1"}) is None
