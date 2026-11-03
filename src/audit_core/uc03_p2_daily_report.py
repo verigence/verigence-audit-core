@@ -569,6 +569,50 @@ def build_daily_processing_report(
     }
 
 
+def exact_duplicate_batches(connection: Connection, *, tenant_id: str, batch_ids: list[Any]) -> set[str]:
+    """The uploaded files that added nothing (product owner 2026-11-03: "how many exact
+    duplicate files each PC uploaded, on a daily basis -- all pages the same, no new
+    addition"): the same file uploaded again to a booking (cancelled on arrival, DUPLICATE),
+    or a file every page of which has the fingerprint (page_sha256) of a page uploaded
+    earlier anywhere in the Project. A file whose pages are not split yet is not judged."""
+    if not batch_ids:
+        return set()
+    rows = connection.execute(
+        text(
+            """
+            WITH mine AS (
+                SELECT b.batch_id, b.created_at_utc, b.batch_status, b.page_count, b.sha256
+                FROM auditcore.p2_upload_batches b
+                WHERE b.tenant_id = :t AND b.batch_id = ANY(:ids)
+            ),
+            pages AS (
+                SELECT m.batch_id, q.page_sha256,
+                       EXISTS (
+                           SELECT 1 FROM auditcore.p2_document_queue q2
+                           JOIN auditcore.p2_upload_batches b2 ON b2.tenant_id = q2.tenant_id AND b2.batch_id = q2.batch_id
+                           WHERE q2.tenant_id = :t AND q2.unit_kind = 'PAGE' AND q2.page_sha256 = q.page_sha256
+                             AND q2.batch_id <> m.batch_id AND b2.created_at_utc < m.created_at_utc
+                       ) AS seen_before
+                FROM mine m
+                JOIN auditcore.p2_document_queue q
+                  ON q.tenant_id = :t AND q.batch_id = m.batch_id AND q.unit_kind = 'PAGE'
+                 AND q.queue_status <> 'CANCELLED'
+            )
+            SELECT m.batch_id
+            FROM mine m
+            WHERE (m.batch_status = 'CANCELLED' AND m.page_count = 0 AND m.sha256 IS NOT NULL)
+               OR EXISTS (
+                   SELECT 1 FROM pages p WHERE p.batch_id = m.batch_id
+                   GROUP BY p.batch_id
+                   HAVING bool_and(p.page_sha256 IS NOT NULL AND p.seen_before)
+               )
+            """
+        ),
+        {"t": tenant_id, "ids": list(batch_ids)},
+    ).scalars().all()
+    return {str(r) for r in rows}
+
+
 def _file_state(row: Any, units: list[dict[str, Any]]) -> str:
     """Where one uploaded file stands, in one word."""
     from audit_core.uc03_p2_task_producer import FILE_NOT_UPLOADED_IN_TIME_REASON
@@ -649,6 +693,7 @@ def _uploaded_files(
             extra[unit["batch_id"]].append(dict(unit))
         units_by_batch.update(extra)
 
+    exact = exact_duplicate_batches(connection, tenant_id=tenant_id, batch_ids=[r["batch_id"] for r in rows])
     files: list[dict[str, Any]] = []
     for row in rows:
         units = units_by_batch.get(row["batch_id"], [])
@@ -677,6 +722,8 @@ def _uploaded_files(
             "failureReason": row["failure_reason"] if state in ("NOT_UPLOADED", "NOT_SPLIT") else None,
             "uploadedAtUtc": row["created_at_utc"].isoformat() if row["created_at_utc"] else None,
             "documents": docs,
+            # Every page already uploaded before, or the same file again: nothing new added.
+            "exactDuplicate": str(row["batch_id"]) in exact,
             "large": large,
             "review": ({"status": "OPEN" if str(row["review_status"]) not in ("VERIFIED_COMPLETE", "CANCELLED")
                         else "CLOSED", "comment": row["review_comment"]}
@@ -698,7 +745,7 @@ def _document_status(
     def empty() -> dict[str, Any]:
         return {
             "filesUploaded": 0, "filesNotUploaded": 0, "filesUploadPending": 0, "filesNotSplit": 0,
-            "duplicateFiles": 0, "largeUploads": 0,
+            "duplicateFiles": 0, "exactDuplicateFiles": 0, "largeUploads": 0,
             "documents": 0, "read": 0, "rejected": 0, "failedOther": 0, "waiting": 0,
             "retriedAutomatically": 0, "retriedByPc": 0, "retriesExhausted": 0,
         }
@@ -726,6 +773,8 @@ def _document_status(
             entry["filesUploaded"] += 1
         if file["large"]:
             entry["largeUploads"] += 1
+        if file.get("exactDuplicate"):
+            entry["exactDuplicateFiles"] += 1
     for pc, summary in pcs.items():
         entry = slot(pc)
         docs = summary["documents"]
