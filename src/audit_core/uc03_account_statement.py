@@ -130,22 +130,31 @@ _VLTD = r"V\.?L\.?T\.?D\.?"
 # (product owner 2026-11-02).
 _OTHER_CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (item, re.compile(pattern)) for item, pattern in (
-        ("PERMIT", r"PERMIT( CHARGES)?"),
+        # the Offer Letter's permit row carries handwritten words ("PERMIT Add Basic")
+        ("PERMIT", r"PERMIT( CHARGES)?( .*)?"),
         ("IF_ANY_OTHERS", r"IF ANY OTHERS?"),
         ("MISC", r"MISC( \(IF ANY\))?"),
         ("VLTD", rf"{_VLTD}( COD)?"),
         ("WORKSHOP_BILLING", r"WORKSHOP BILLING( AMOUNT)?( COD)?"),
+        # The Offer Letter / Payment Details form (2026-11-03): rows of their
+        # own beside RTO, a fancy number and a coating.
+        ("TEMP_REGISTRATION", r"TEMPORARY REGISTRATION"),
+        ("RTO_CHOICE", r"RTO CHOICE( NO\.?)?"),
+        ("3M", r"3M"),
+        ("OTHERS", r"OTHERS( .*)?"),
     )
 )
 _CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (key, re.compile(pattern)) for key, pattern in (
-        ("ex_showroom_price", r"EX[- ]?SHOW ?ROOM( PRICE( OF VEHICLE)?)?|VEHICLE COST"),
+        # "EX SHOWROOM (1-2)": the Offer Letter / Payment Details form prints
+        # the vehicle price less its scheme on this row (2026-11-03).
+        ("ex_showroom_price", r"EX[- ]?SHOW ?ROOM( PRICE( OF VEHICLE)?| ?\( ?1 ?- ?2 ?\))?|VEHICLE COST"),
         # The Utkal form prints its TCS row as "W/s billing TCS (1%)"; read also
         # as "W/S BILLING", "W/S BILLING TCS(1%)" and "W/S BILLING TU (1%)", and
         # every amount on it is 1% of the sale (five live statements, 2026-11-02).
         ("tcs_amount", r"TCS( ON INVOICE)?( \d+(\.\d+)?%)?|W/S BILLING( TCS| TU)? ?(\( ?1 ?%\)|1 ?%)?"),
         ("insurance_amount", r"INSURANCE( AMOUNT| COST)?( \((NORMAL|NIL DEP)\))?"),
-        ("registration_charges", r"REGISTRATION( COST| CHARGES)?( BH| \(BH\)| RTO)?|ONLINE RTO|RTO CHARGES.*"),
+        ("registration_charges", r"REGISTRATION( COST| CHARGES)?( BH| \(BH\)| RTO)?|ONLINE RTO|RTO CHARGES.*|RTO"),
         ("other_charges", "|".join(f"(?:{p.pattern})" for _, p in _OTHER_CHARGES)),
         ("accessories_cost", r"ACCESSORIES|SALE OF ACCESSORIES"),
         ("fastag_amount", r"FAST ?T?AG( CHARGES)?"),
@@ -156,13 +165,14 @@ _CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("additional_warranty_amount",
          r"(SHIELD|EXTENDED|EXT\.?) WARR?ANT(Y|IES)?( \(\d(ST|ND|RD|TH)( ?[-+&] ?\d(ST|ND|RD|TH))? ?(YR|YEAR)S?\))?"),
         ("service_package_amount", r"SERVICE PACK(AGE)?"),
-        ("handling_charges", r"HANDLING CHARGES"),
+        ("handling_charges", r"HANDLING CHARGES?"),
     )
 )
 # The canonical keys of the benefits the statement gives as a line of their
 # own (uc03_masters_alignment): free accessories, and the scrappage bonus of
 # the dealer or of the certificate of deposit.
 FREE_ACCESSORIES_KEY = "ACCESSORIES_KIT"
+_ACCESSORIES_FREE = re.compile(r"ACCESSORIES ?\(?FREE\)?")
 SCRAPPAGE_DEALER_KEY = "SCRAPPAGE_BONUS_DEALER"
 SCRAPPAGE_COD_KEY = "SCRAPPAGE_BONUS_COD"
 # Discounts, to the canonical discount keys the Deal already uses
@@ -176,27 +186,32 @@ _DISCOUNTS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         # "EXCHANGE CLAIM" is the exchange bonus (product owner 2026-10-29, the
         # Aditya form; written "EXCHANNGE CLAIM" on it, and read "EXCHANNG
         # CLAIM"); "EXCHANGE LOYALITY" is the loyalty bonus misspelt.
-        ("EXCHANGE_BONUS", r"EXCHAN+GE? (LOYALI?TY|BONUS|CLAIM)( .*)?"),
-        ("ADDITIONAL_DISCOUNT", r"(OTHER DISCOUNT( \(IF ANY\))?|CASH DISCOUNT)( .*)?"),
+        ("EXCHANGE_BONUS", r"EXCHAN+GE? ?[ /] ?(LOYALI?TY|BONUS|CLAIM)( .*)?"),
+        ("ADDITIONAL_DISCOUNT", r"(OTHER DISCOUNT( \(IF ANY\))?|CASH DISCOUNT|ADDITIONAL DISCOUNT)( .*)?"),
     )
 )
 # The total the statement prints for what the customer owes (product owner,
 # 2026-10-26: every dealer's statement has one): "Net Value" (Aditya, Shivnath),
 # "NET RECEIVABLE (A+B)" (Utkal) -- and "Final price", which he also named.
-_PRINTED_TOTAL = re.compile(r"(NET VALUE|FINAL PRICE|NET RECEIVABLE( \(A ?\+ ?B\))?)( .*)?")
+_PRINTED_TOTAL = re.compile(r"(NET VALUE|FINAL PRICE|NET RECEIVABLE( \(A ?\+ ?B\))?|ON ?ROAD PRICE)( .*)?")
 # The form's own summary rows: figures the dealer wrote from the rows above
 # them, never a charge or a receipt, so they are not "unmapped" and are not
 # read as one. (The net value is read separately, above.)
 _SUMMARY = re.compile(
     r"GROSS VALUE|DISCOUNT|TOTAL( COST| RECEIPTS?| \(A\))?|NET AMOUNT RECEIVED( \(E\))?|"
-    r"SHORT ?/ ?EXCESS|BALANCE ?(EXCESS ?/ ?SHORTAGE)?( \(C-E\))?|DUE"
+    r"SHORT ?/ ?EXCESS|BALANCE ?(EXCESS ?/ ?SHORTAGE)?( \(C-E\))?|DUE|"
+    # The Offer Letter / Payment Details form's working rows (2026-11-03): the
+    # vehicle price and its scheme (the Ex Showroom (1-2) row is their
+    # difference), its sub-totals, the finance plan, the final payment.
+    r"VEHICLE PRICE|SCHEME|BALANCE PAYMENT|SUB ?TOTAL.*|DOWN ?PAYMENT.*|1ST EMI|FINANCE FEES|"
+    r"MISC PAYMENT|FINAL PAYMENT"
 )
 # The old vehicle's value (product owner 2026-10-29): Aditya's form deducts
 # "LESS: EXCHANGED VEHICLE" in section A, before the net receivable. It is the
 # customer paying with the old vehicle -- not a discount and not the exchange
 # bonus (that is "EXCHANGE CLAIM") -- and, being already netted off the net
 # receivable, not one of the statement's received lines either.
-_OLD_VEHICLE = re.compile(r"EXCHANGED VEHICLE( VALUE)?")
+_OLD_VEHICLE = re.compile(r"EXCHANGED? VEHICLE( VALUE| AMT| AMOUNT)?")
 _TRADE_IN = re.compile(r"TRADE IN VALUE( .*)?")
 # Scrappage is a Deal line of its own (product owner 2026-11-02): the row that
 # names the scrappage bonus is the benefit -- the certificate of deposit's
@@ -213,17 +228,17 @@ _COD = re.compile(r".*(\bCOD\b|\bC\.O\.D\b|CERTIFICATE OF DEPOSIT).*")
 # D/O-1963"), as "FINANCE D/P", as the bank's money receipt ("FINANCE HDFC MR
 # NO. PLSM/1066") or as "FINANCE" alone (product owner 2026-11-02).
 _FINANCER = re.compile(
-    r"FINANCER AMOUNT( .*)?|BANK DO( .*)?|"
+    r"FINANCER? AMOUNT( .*)?|BANK DO( .*)?|"
     r"FINANCE( D/?O( .*)?| D/O\S.*| D/P( .*)?| [A-Z][A-Z&.]*( [A-Z][A-Z&.]*)* MR NO\.?.*)?"
 )
 _RECEIPT = re.compile(
     r"(BOOKING AMOUNT|DEPOSITED INTO BANK|CASH|CHEQUE|ONLINE TRANSFER|TRADE IN VALUE|CASH SHORTAGE|"
-    r"MR NO\.?.*|PAYMENT A/C DETAILS|REFUND)( .*)?"
+    r"MR NO\.?.*|PAYMENT A/C DETAILS|REFUND|RECEIPT)( .*)?"
 )
 _FORM_MARKERS = tuple(re.compile(p) for p in (
     r"(EX[- ]?SHOW ?ROOM|VEHICLE COST)", r"FINANCER AMOUNT", r"DEPOSITED INTO BANK", r"BOOKING AMOUNT",
     r"FINANCE D/?O", r"MR NO", r"PAYMENT A/C", r"SCHEME DISCOUNT", r"OTHER DISCOUNT", r"CORPORATE DISCOUNT",
-    r"BANK DO", r"TRADE IN VALUE", r"ONLINE TRANSFER",
+    r"BANK DO", r"TRADE IN VALUE", r"ONLINE TRANSFER", r"OFFER LETTER", r"ON ?ROAD PRICE", r"FINANCE AMOUNT",
 ))
 _ERP_TOTALS = re.compile(r"(TOTAL|NET) VEHICLE COST")
 
@@ -363,6 +378,12 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
                     "names the scrappage but no bonus: it may be the certificate of deposit bought for it")})
                 continue
             give("DISCOUNT", SCRAPPAGE_COD_KEY if _COD.fullmatch(label) else SCRAPPAGE_DEALER_KEY, amount)
+            continue
+        if _ACCESSORIES_FREE.fullmatch(label):
+            # Accessories given free: billed at their value, the same value the
+            # free-accessories benefit (the Offer Letter's "ACCESSORIES Free").
+            give("COMMERCIAL", "accessories_cost", amount)
+            give("DISCOUNT", FREE_ACCESSORIES_KEY, amount)
             continue
         charge = next((k for k, pattern in _CHARGES if pattern.fullmatch(label)), None)
         if charge is not None:
