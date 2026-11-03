@@ -120,3 +120,29 @@ def test_the_current_type_picks_the_page_when_two_uploads_share_its_number(journ
     assert named["wouldSend"][0]["from"] == "booking_form"
     assert _unit(journey, letter["queue_id"])["queue_status"] == "READY"
     assert _unit(journey, ledger["queue_id"])["queue_status"] == "READY"
+
+
+def test_a_document_never_read_is_split_with_each_page_read_as_named(journey):
+    """Live 2026-11-03 (SHI-SS-261027-007): a delivery-file cover sheet and the
+    Offer Letter were joined into one document that was never read
+    (CANCELLED). Each page is read alone: the Offer Letter as the NDC, the
+    cover as the type the same job names for it."""
+    batch_id, pages = add_batch_pages(journey, [("booking_form", "MERGED"), ("booking_form", "MERGED")],
+                                      grouping_status="NOT_NEEDED")
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        group = c.execute(text(
+            "INSERT INTO auditcore.p2_document_queue (tenant_id, batch_id, journey_id, page_number, page_numbers, "
+            "page_sha256, page_object_key, client_upload_id, queue_status, unit_kind, group_source, "
+            "classified_document_type, template_key, business_stage) VALUES (:t, :b, :j, 1, ARRAY[1,2], 'g2', "
+            "'p2/g2.pdf', 'p2-group-y', 'CANCELLED', 'GROUP', 'SYSTEM', 'booking_form', 'booking_docket', "
+            "'BOOKING') RETURNING queue_id"), {"t": journey.tenant_id, "b": batch_id, "j": journey.journey_id}).scalar_one()
+        c.execute(text("UPDATE auditcore.p2_document_queue SET merged_into_queue_id=:g WHERE queue_id = ANY(:q)"),
+                  {"g": group, "q": [p["queue_id"] for p in pages]})
+    reference = _reference(journey)
+    done = retype.run_page_retype(journey.engine, f"{journey.tenant_id}:split-commit",
+                                  [f"{reference}:2:customer_ledger", f"{reference}:1:supporting_document"])
+    assert [s["page"] for s in done["sent"]] == [2] and done["skipped"] == []
+    sent = {p["page"]: p["to"] for p in done["sent"][0]["pages"]}
+    assert sent == {2: "customer_ledger", 1: "supporting_document"}
+    assert _unit(journey, group)["queue_status"] == "MERGED"

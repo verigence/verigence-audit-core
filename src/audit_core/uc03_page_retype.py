@@ -103,9 +103,10 @@ def _own_page_unit(connection: Any, *, tenant_id: str, journey_id: UUID, batch_i
 
 
 def _split(connection: Any, *, tenant_id: str, journey_id: UUID, group: dict[str, Any], page: int, template: Any,
-           tag: str, registry: Any) -> list[dict[str, Any]] | str:
-    """The group's pages read alone: ``page`` as ``template``, the others as
-    the group's own type. Returns what was sent, or why nothing was."""
+           tag: str, registry: Any, named: dict[int, Any] | None = None) -> list[dict[str, Any]] | str:
+    """The group's pages read alone: ``page`` as ``template``, each other page
+    as the type the same job names for it (``named``), else as the group's own
+    type. Returns what was sent, or why nothing was."""
     from audit_core.uc03_p2_api import _page_unit, _send_page_again
 
     own_type = registry.documents.get(group["template_key"] or "")
@@ -119,8 +120,25 @@ def _split(connection: Any, *, tenant_id: str, journey_id: UUID, group: dict[str
         return "no stored page of its own for page " + ", ".join(map(str, missing))
     sent = []
     for each in [page] + [p for p in pages if p != page]:
-        kind = template if each == page else own_type
+        kind = template if each == page else (named or {}).get(each) or own_type
         unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=units[each])
+        if not kind.di_types:
+            # A type that is never read (a supporting page, a cover sheet): the
+            # page stays on file on its own, as such, and is not sent.
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.p2_document_queue
+                    SET queue_status = 'SUPPORTING', merged_into_queue_id = NULL, template_key = :k,
+                        status_reason = :why, updated_at_utc = now()
+                    WHERE tenant_id = :t AND queue_id = :q
+                    """
+                ),
+                {"t": tenant_id, "q": units[each], "k": kind.key,
+                 "why": f"Kept on file, not read: split from pages {pages} by job {tag}."},
+            )
+            sent.append({"page": each, "to": kind.key, "newQueueId": str(units[each]), "kept": True})
+            continue
         new_id = _send_page_again(
             connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit, template=kind,
             di_type=kind.di_types[0], actor_id=_ACTOR, role="SYSTEM", swept=False, event_type="PAGE_TYPE_SET",
@@ -136,7 +154,7 @@ def _split(connection: Any, *, tenant_id: str, journey_id: UUID, group: dict[str
             WHERE tenant_id = :t AND queue_id = :q
             """
         ),
-        {"t": tenant_id, "q": group["queue_id"], "into": sent[0]["newQueueId"],
+        {"t": tenant_id, "q": group["queue_id"], "into": next(x["newQueueId"] for x in sent if not x.get("kept")),
          "why": "Split into its pages, each read alone: " + ", ".join(f"page {s['page']} as {s['to']}" for s in sent)},
     )
     return sent
@@ -155,7 +173,11 @@ def run_page_retype(engine: Engine, tag: str, reports: list[str]) -> dict[str, A
     tenant_id, commit, items = parse_request(tag, reports)
     registry = get_registry()
     out: dict[str, Any] = {"commit": commit, "sent": [], "wouldSend": [], "skipped": []}
+    asked = {(reference, page): registry.documents.get(key) for reference, page, key, _ in items}
+    split_done: set[tuple[str, int]] = set()
     for reference, page, template_key, current in items:
+        if (reference, page) in split_done:
+            continue  # read alone already, as asked, when its group was split
         template = registry.documents.get(template_key)
         if template is None or not template.di_types:
             out["skipped"].append({"journey": reference, "page": page, "why": f"unknown template {template_key}"})
@@ -171,7 +193,12 @@ def run_page_retype(engine: Engine, tag: str, reports: list[str]) -> dict[str, A
                               queue_id=UUID(str(found["queue_id"])))
             swept = unit["queue_status"] == "CANCELLED" and _is_swept(
                 connection, tenant_id=tenant_id, queue_id=UUID(str(unit["queue_id"])))
-            if unit["queue_status"] not in _RETYPEABLE_PAGE_STATES and not swept:
+            grouped = len(unit["page_numbers"] or []) > 1
+            # A document made from several pages that was never read (live
+            # 2026-11-03, SHI-SS-261027-007: a cover sheet and the Offer
+            # Letter, CANCELLED) is split as well: each page is read alone.
+            never_read = grouped and unit["queue_status"] in ("CANCELLED", "DEAD_LETTER")
+            if unit["queue_status"] not in _RETYPEABLE_PAGE_STATES and not swept and not never_read:
                 out["skipped"].append({"journey": reference, "page": page,
                                        "why": f"page is {unit['queue_status']} (still being read)"})
                 continue
@@ -183,18 +210,19 @@ def run_page_retype(engine: Engine, tag: str, reports: list[str]) -> dict[str, A
                 continue
             entry = {"journey": reference, "page": page, "from": unit["template_key"] or unit["classified_document_type"],
                      "to": template_key}
-            grouped = len(unit["page_numbers"] or []) > 1
             if grouped:
                 entry["splitFrom"] = [int(p) for p in unit["page_numbers"]]
             if not commit:
                 out["wouldSend"].append(entry)
                 continue
             if grouped:
+                named = {p: kind for (ref, p), kind in asked.items() if ref == reference and kind is not None}
                 split = _split(connection, tenant_id=tenant_id, journey_id=journey_id, group=unit, page=page,
-                               template=template, tag=tag, registry=registry)
+                               template=template, tag=tag, registry=registry, named=named)
                 if isinstance(split, str):
                     out["skipped"].append({"journey": reference, "page": page, "why": split})
                     continue
+                split_done.update((reference, int(p)) for p in unit["page_numbers"])
                 out["sent"].append({**entry, "newQueueId": split[0]["newQueueId"], "pages": split})
                 logger.info("page_retype_split", tag=tag, journey=reference, page=page, to=template_key)
                 continue
