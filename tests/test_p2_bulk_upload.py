@@ -42,7 +42,7 @@ class BucketDouble:
     def head_object(self, key: str) -> dict:
         if key not in self.objects:
             raise KeyError(key)
-        return {"ContentLength": len(self.objects[key])}
+        return {"contentLength": len(self.objects[key]), "contentType": "application/pdf", "etag": "e"}
 
     def get_object(self, key: str) -> bytes:
         if key not in self.objects and key.startswith("p2/"):  # a test page (p2_support.add_page)

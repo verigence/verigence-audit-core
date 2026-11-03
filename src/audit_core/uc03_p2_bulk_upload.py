@@ -291,7 +291,7 @@ def complete_bulk_file(
         head = get_p2_document_storage().head_object(str(row["object_key"]))
     except Exception as exc:  # not there (yet)
         raise HTTPException(status_code=409, detail="The file has not reached storage yet.") from exc
-    size = int(head.get("ContentLength") or head.get("content_length") or row["size_bytes"] or 0)
+    size = int(head.get("contentLength") or row["size_bytes"] or 0)
     updated = connection.execute(
         text("UPDATE auditcore.p2_bulk_files SET upload_status='UPLOADED', size_bytes=:s, updated_at_utc=now() "
              "WHERE tenant_id=:t AND file_id=:f RETURNING *"),
