@@ -311,6 +311,9 @@ _STATEMENT_NORM = frozenset(_norm_type(t) for t in (_STATEMENT_COLUMN_TYPE, _COS
 # which stand before any invoice (product owner 2026-11-02: NDC, cost sheet,
 # customer ledger, then the invoice).
 _DEALER_BOOKS_NORM = _STATEMENT_NORM | {_norm_type(TALLY_LEDGER_TYPE)}
+# The deal's offer as the dealer wrote it: the NDC (statement form) or, with
+# none, the cost sheet standing in for it -- not the ERP settlement printout.
+_OFFER_NORM = frozenset(_norm_type(t) for t in (_STATEMENT_COLUMN_TYPE, _COST_SHEET_STANDIN_TYPE))
 _QUOTE_NORM = frozenset(_norm_type(t) for t in _QUOTE_SOURCES)
 
 
@@ -1181,7 +1184,7 @@ def _invoice_discounts_inside_the_price(all_rows: list[dict[str, Any]], discount
         row["flags"] = [f for f in row["flags"] if f not in _STANDARD_FLAGS]
 
 
-def _one_benefit_per_figure(discount_rows: list[dict[str, Any]]) -> None:
+def _one_benefit_per_figure(discount_rows: list[dict[str, Any]], *, offer_on_file: bool = False) -> None:
     """One benefit printed by two billing documents counts once (product owner
     2026-11-02).
 
@@ -1194,9 +1197,15 @@ def _one_benefit_per_figure(discount_rows: list[dict[str, Any]]) -> None:
       show stays out of the totals and is flagged as a disagreement -- never
       added beside the statement's own (one discount split differently on
       the two documents would otherwise count twice).
-    * With no benefit on the statement, the invoice's discounts are the
-      deal's (live 2026-11-02: the Tally invoice's "OEM Discount" of Rs 30,000
-      on Biswadeep Jena, the NDC filed as a booking docket)."""
+    * With the NDC or the cost sheet on file (``offer_on_file``) it is the
+      deal's offer even when it prints no benefit, whenever it was uploaded:
+      an invoice discount it does not show is not added (product owner
+      2026-11-03: "NDC/Cost sheet ... should get the priority and no way the
+      initial offering has to be changed"); it stays beside the deal, marked
+      as not on the NDC.
+    * With neither, the invoice's discounts are the deal's (live 2026-11-02:
+      the Tally invoice's "OEM Discount" of Rs 30,000 on SHI-SS-261031-004,
+      the NDC filed as a booking docket)."""
     def from_books(row: dict[str, Any], norm: frozenset[str]) -> bool:
         return row["current"] is not None and any(
             _norm_type(s.get("documentType")) in norm and _near(s.get("amount"), Decimal(row["current"]),
@@ -1216,6 +1225,9 @@ def _one_benefit_per_figure(discount_rows: list[dict[str, Any]]) -> None:
         elif statement_gives:
             row["current"], row["currentSource"], row["variance"] = None, None, None
             row["flags"] = [*(f for f in row["flags"] if f not in _STANDARD_FLAGS), "INVOICES_DISAGREE"]
+        elif offer_on_file:
+            row["current"], row["currentSource"], row["variance"] = None, None, None
+            row["flags"] = [*(f for f in row["flags"] if f not in _STANDARD_FLAGS), "NOT_ON_STATEMENT"]
 
 
 def _benefit_row_for(discount_rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
@@ -1509,7 +1521,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         _settle_discount(row, situation, mr_key=mr_key)
 
     _invoice_discounts_inside_the_price(all_rows, discount_rows)
-    _one_benefit_per_figure(discount_rows)
+    _one_benefit_per_figure(discount_rows, offer_on_file=statement_policy and any(
+        _norm_type(s["source_document_type"]) in _OFFER_NORM for s in sources))
     _link_credit_notes(credit_notes, discount_rows)
     insurance["invoiceOnFile"] = _insurance_accounted(documents, sources, selection)
     insurance["vehicleInvoiced"] = vehicle_on_file
