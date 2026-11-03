@@ -608,6 +608,9 @@ def test_the_pc_corrects_the_counts_on_the_day_and_the_team_leads_task_follows(s
     assert task["task_status"] == "READY" and task["reference"]["missing"] == 2 and "corrected" in task["description"]
     loaded = s.client.get(f"{s.base}/{gp}")
     assert loaded.status_code == 200 and loaded.json()["gatePass"]["newDeliveries"] == 6
+    # The Daily gate pass screen lists it, so the PC can correct it right there.
+    [listed] = s.client.get(f"{s.base}/outlets").json()["editableToday"]
+    assert listed["gatePassId"] == gp and listed["newDeliveries"] == 6
 
 
 def test_counts_are_not_corrected_after_the_day_of_the_upload(setup):
@@ -620,3 +623,4 @@ def test_counts_are_not_corrected_after_the_day_of_the_upload(setup):
                                 "WHERE tenant_id=:t AND gate_pass_id=:g"), {"t": s.journey.tenant_id, "g": gp})
     late = _register(s, gp, 3, 3)
     assert late.status_code == 409 and "day the gate register was uploaded" in late.text
+    assert s.client.get(f"{s.base}/outlets").json()["editableToday"] == []
