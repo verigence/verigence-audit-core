@@ -157,13 +157,76 @@ def test_the_offer_letter_without_its_ex_showroom_row_reads_the_vehicle_price() 
             {"particulars_raw": "FINANCE AMOUNT", "credit_amount": 1500000}]
     read = read_statement([{"particulars_raw": "VEHICLE PRICE", "debit_amount": 1928561}, *base])
     assert read.components["ex_showroom_price"] == D(1928561) and read.unmapped == []
+    # A scheme is a benefit on the vehicle price (2026-11-03), never taken off the price.
     with_scheme = read_statement([{"particulars_raw": "VEHICLE PRICE", "debit_amount": 1928561},
                                   {"particulars_raw": "SCHEME", "debit_amount": 28561}, *base])
-    assert with_scheme.components["ex_showroom_price"] == D(1900000)
-    # The Ex Showroom row, when written, is what counts.
+    assert with_scheme.components["ex_showroom_price"] == D(1928561)
+    assert with_scheme.discounts == {"CASH_DISCOUNT": D(28561)}
+    # An Ex Showroom row that is not the vehicle price less the scheme is read as written.
     printed = read_statement([{"particulars_raw": "VEHICLE PRICE", "debit_amount": 1928561},
                               {"particulars_raw": "EX SHOWROOM (1-2)", "debit_amount": 1900000}, *base])
-    assert printed.components["ex_showroom_price"] == D(1900000)
+    assert printed.components["ex_showroom_price"] == D(1900000) and printed.discounts == {}
+
+
+def test_the_offer_letters_scheme_is_a_benefit_of_the_type_the_letter_names() -> None:
+    """Live 2026-11-03 (SHI-SS-261027-007): Vehicle price Rs 9,99,901, Scheme
+    Rs 30,000, Ex Showroom (1-2) Rs 9,69,901 and, on the right, "Corporate
+    discount" Rs 30,000. The customer paid the Ex Showroom price plus the
+    charges: the corporate discount is the scheme, named (product owner: "30k
+    is a corporate discount"). Read before as a price Rs 30,000 under the
+    price master, with the Rs 30,000 given again."""
+    from decimal import Decimal as D
+
+    from audit_core.uc03_account_statement import read_statement
+
+    rows = [{"particulars_raw": "VEHICLE PRICE", "debit_amount": 999901},
+            {"particulars_raw": "SCHEME", "debit_amount": 30000},
+            {"particulars_raw": "EX SHOWROOM (1-2)", "debit_amount": 969901},
+            {"particulars_raw": "INSURANCE AMOUNT", "debit_amount": 39381},
+            {"particulars_raw": "ONROAD PRICE", "debit_amount": 1028352},
+            {"particulars_raw": "CORPORATE DISCOUNT", "credit_amount": 30000},
+            {"particulars_raw": "FINANCE AMOUNT", "credit_amount": 984872}]
+    read = read_statement(rows)
+    assert read.components["ex_showroom_price"] == D(999901)
+    assert read.discounts == {"CORPORATE_PRIVILEGE": D(30000)}
+    assert read.unmapped == [] and read.conflicts == []
+
+    # No benefit on the letter has the scheme's amount: it is the scheme discount,
+    # beside the others (SHI-SS-261027-025: Scheme Rs 25,000, Corporate Rs 5,000).
+    rows = [{"particulars_raw": "VEHICLE PRICE", "debit_amount": 1327501},
+            {"particulars_raw": "SCHEME", "debit_amount": 25000},
+            {"particulars_raw": "EX SHOWROOM (1-2)", "debit_amount": 1302501},
+            {"particulars_raw": "CORPORATE DISCOUNT", "credit_amount": 5000}]
+    read = read_statement(rows)
+    assert read.components["ex_showroom_price"] == D(1327501)
+    assert read.discounts == {"CORPORATE_PRIVILEGE": D(5000), "CASH_DISCOUNT": D(25000)}
+
+    # Two benefits with the scheme's amount: which one it is cannot be told, so
+    # the scheme stands as its own (SHI-SS-261101-001: Scheme, Corporate and
+    # Additional discount, Rs 5,000 each).
+    rows = [{"particulars_raw": "VEHICLE PRICE", "debit_amount": 999901},
+            {"particulars_raw": "SCHEME", "credit_amount": 5000},
+            {"particulars_raw": "EX SHOWROOM (1-2)", "debit_amount": 994901},
+            {"particulars_raw": "CORPORATE DISCOUNT", "credit_amount": 5000},
+            {"particulars_raw": "ADDITIONAL DISCOUNT", "credit_amount": 5000}]
+    read = read_statement(rows)
+    assert read.discounts == {"CORPORATE_PRIVILEGE": D(5000), "ADDITIONAL_DISCOUNT": D(5000),
+                              "CASH_DISCOUNT": D(5000)}
+
+    # "Scheme of Month" (another branch's form) is the same row.
+    read = read_statement([{"particulars_raw": "Vehicle Price", "debit_amount": 3050000},
+                           {"particulars_raw": "Scheme of Month", "debit_amount": -100000},
+                           {"particulars_raw": "Ex-Showroom Price (1-2)", "debit_amount": 2950000},
+                           {"particulars_raw": "Additional Discount Entry", "credit_amount": 15000}])
+    assert read.components["ex_showroom_price"] == D(3050000)
+    assert read.discounts == {"ADDITIONAL_DISCOUNT": D(15000), "CASH_DISCOUNT": D(100000)}
+
+    # The three rows do not add up (a figure misread): the Ex Showroom row stands, no scheme.
+    read = read_statement([{"particulars_raw": "VEHICLE PRICE", "debit_amount": 1310902},
+                           {"particulars_raw": "SCHEME", "debit_amount": 50000},
+                           {"particulars_raw": "EX SHOWROOM (1-2)", "debit_amount": 1340902}])
+    assert read.components["ex_showroom_price"] == D(1340902) and read.discounts == {}
+    assert [u["label"] for u in read.unmapped] == ["SCHEME"]
 
 
 def test_a_kit_written_into_another_row_of_the_offer_letter_is_accessories() -> None:

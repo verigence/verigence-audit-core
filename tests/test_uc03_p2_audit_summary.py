@@ -104,6 +104,30 @@ def test_benefits_against_entitlement_and_proof() -> None:
     assert (not_given["conclusion"], not_given["reason"]) == (summary.INFO, "Entitled, not given.")
 
 
+def test_a_benefit_the_deal_does_not_count_is_never_shown_as_given() -> None:
+    """Live 2026-11-03 (SHI-SS-261027-024): the NDC's "Exchange / loyalty
+    bonus" Rs 10,000 is the ledger's scrappage credit note. The Deal counted it
+    once; this page showed both as given and asked for an exchange vehicle RC."""
+    unknown = ENTITLEMENT_UNKNOWN_RESULTS
+    exchange = summary.conclude_benefit(
+        {"key": "EXCHANGE_BONUS", "label": "Exchange bonus", "entitled": "0", "eligibility": "ELIGIBLE",
+         "billed": None, "current": None, "sameAs": {"key": "SCRAPPAGE_BONUS_DEALER", "label": "Scrappage bonus (dealer)"},
+         "proof": {"documentType": "vehicle_rc", "document": "Vehicle RC", "onFile": False},
+         "sources": [_src("account_statement", "10000")]}, unknown_results=unknown)
+    assert (exchange["conclusion"], exchange["billed"], exchange["proof"]) == (summary.INFO, None, None)
+    assert "same benefit as Scrappage bonus (dealer)" in exchange["reason"]
+    in_price = summary.conclude_benefit(
+        {"key": "CASH_DISCOUNT", "label": "Consumer / cash discount", "billed": "49999.60", "current": None,
+         "inPrice": True, "sources": [_src("customer_invoice_dms", "49999.60")]}, unknown_results=unknown)
+    assert (in_price["conclusion"], in_price["billed"]) == (summary.INFO, None)
+    invoice_only = summary.conclude_benefit(
+        {"key": "CASH_DISCOUNT", "label": "Consumer / cash discount", "billed": "5000", "current": None,
+         "flags": ["NOT_ON_STATEMENT"], "entitled": "5000", "eligibility": "ELIGIBLE",
+         "sources": [_src("customer_invoice_dms", "5000")]}, unknown_results=unknown)
+    assert (invoice_only["conclusion"], invoice_only["billed"]) == (summary.DISPUTED, None)
+    assert invoice_only["documents"][0]["amount"] == "5000.00"
+
+
 def test_a_product_charged_without_its_document_is_unsupported() -> None:
     charge = summary.conclude_charge({"key": "additional_warranty_amount", "label": "Extended warranty",
                                       "standard": "17999", "billed": "17999",

@@ -89,6 +89,9 @@ _DELIVERY_COMPLETION_DAYS = int(os.environ.get("P2_DELIVERY_COMPLETION_DAYS", "7
 _CASH_RECEIPT_LIMIT = Decimal(os.environ.get("P2_CASH_RECEIPT_LIMIT", "200000"))
 _TCS_THRESHOLD = Decimal(os.environ.get("P2_TCS_THRESHOLD", "1000000"))
 _TCS_RATE_PERCENT = Decimal(os.environ.get("P2_TCS_RATE_PERCENT", "1"))
+# The free-accessories benefit (uc03_account_statement.FREE_ACCESSORIES_KEY):
+# it pays for the accessories charged, not for the vehicle.
+_FREE_ACCESSORIES_KEY = "ACCESSORIES_KIT"
 
 _YES = {"value": "YES", "label": "Yes"}
 _NO = {"value": "NO", "label": "No", "requiresComment": True}
@@ -664,15 +667,26 @@ def tcs_short(facts: _Facts) -> RuleOutcome:
     price = _charged(rows.get("ex_showroom_price"))
     if price is None:
         return RuleOutcome(code, "SKIPPED", "The ex-showroom price has not been read yet.")
-    if price <= _TCS_THRESHOLD:
-        return RuleOutcome(code, "PASS", f"Ex-showroom price {_rupees(price)} is within the TCS threshold of "
+    # TCS is due on what the vehicle is sold for: the ex-showroom price less
+    # the benefits given on it (2026-11-03). The benefits are the Deal's own,
+    # apart from the free accessories, which pay for the accessories charged.
+    # Live: SHI-SS-261027-006, ex-showroom Rs 30,59,000 less a scheme of Rs
+    # 1,00,000, TCS Rs 29,590; and 74 more deals whose TCS is 1% of the price
+    # after their discount were held "short".
+    benefits = sum((_dec(d.get("current")) or Decimal(0) for d in facts.sheet.get("discounts") or []
+                    if d.get("key") != _FREE_ACCESSORIES_KEY), Decimal(0))
+    sale = price - benefits
+    on = (f"the ex-showroom price {_rupees(price)}" if benefits == 0 else
+          f"the ex-showroom price {_rupees(price)} less benefits of {_rupees(benefits)}, {_rupees(sale)}")
+    if sale <= _TCS_THRESHOLD:
+        return RuleOutcome(code, "PASS", f"The sale value, {on}, is within the TCS threshold of "
                                          f"{_rupees(_TCS_THRESHOLD)}.")
-    expected = (price * _TCS_RATE_PERCENT / 100).quantize(Decimal("0.01"))
+    expected = (sale * _TCS_RATE_PERCENT / 100).quantize(Decimal("0.01"))
     charged = _charged(rows.get("tcs_amount")) or Decimal(0)
     if expected - charged > _LINE_TOLERANCE:
         return RuleOutcome(code, "FAIL", (
-            f"TCS {_rupees(charged)} charged against {_rupees(expected)} due ({_TCS_RATE_PERCENT}% of the "
-            f"ex-showroom price {_rupees(price)}; {_rupees(expected - charged)} short)."
+            f"TCS {_rupees(charged)} charged against {_rupees(expected)} due ({_TCS_RATE_PERCENT}% of "
+            f"{on}; {_rupees(expected - charged)} short)."
         ), {"findingTitle": "TCS undercharged", "expected": str(expected), "observed": str(charged)})
     return RuleOutcome(code, "PASS", f"TCS {_rupees(charged)} charged against {_rupees(expected)} due.")
 
