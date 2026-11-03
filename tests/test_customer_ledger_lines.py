@@ -211,3 +211,7 @@ def test_one_benefit_the_ndc_and_the_ledger_name_differently_counts_once(journey
     assert D(view["summary"]["discounts"]["current"]) == D("55000.01")
     # The kit: Rs 30,000 free plus Rs 18,398 written into the PERMIT row.
     assert D(_row(view, "accessories_cost")["current"]) == D(48398)
+    # The letter leaves the EW and RSA rows blank and no bill charges them:
+    # not taken, never awaited (the settlement was "awaiting the EW and RSA bills").
+    awaited = {a["key"] for a in view["summary"]["awaiting"]}
+    assert not awaited & {"additional_warranty_amount", "extended_warranty_amount", "rsa_amount"}
