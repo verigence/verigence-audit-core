@@ -846,6 +846,12 @@ def _document_own_prices(kind: str, fields: dict[str, Any]) -> dict[str, Decimal
     return {}
 
 
+# A figure within Rs 10 of its standard is the standard (2026-11-03: a price
+# of Rs 9,99,901 against the master's Rs 9,99,901.32 was flagged "below
+# standard"); the Audit Summary takes Rs 10 either way as no difference.
+_STANDARD_TOLERANCE = Decimal(10)
+
+
 def _flags(kind: str, standard: Any, booking: Any, billed: Any, ledger: Any) -> list[str]:
     """A row's flags, on billed figures only. The booking docket is never
     measured: nothing it says is confirmed (product owner 2026-11-02: only a
@@ -858,7 +864,7 @@ def _flags(kind: str, standard: Any, booking: Any, billed: Any, ledger: Any) -> 
     if bl is not None and lg is not None and bl != lg:
         flags.append("BILLED_VS_LEDGER")
     reference = bl
-    if std is not None and reference is not None and reference != std:
+    if std is not None and reference is not None and abs(reference - std) > _STANDARD_TOLERANCE:
         if kind == "COMMERCIAL":
             flags.append("ABOVE_STANDARD" if reference > std else "BELOW_STANDARD")
         else:
@@ -875,7 +881,7 @@ def _measured_flags(kind: str, flags: list[str], current: Any, standard: Any) ->
     booking-only figure no longer raises an entitlement flag)."""
     kept = [f for f in flags if f not in _STANDARD_FLAGS]
     cur, std = _dec(current), _dec(standard)
-    if cur is not None and std is not None and cur != std:
+    if cur is not None and std is not None and abs(cur - std) > _STANDARD_TOLERANCE:
         if kind == "COMMERCIAL":
             kept.append("ABOVE_STANDARD" if cur > std else "BELOW_STANDARD")
         else:

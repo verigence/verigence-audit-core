@@ -513,7 +513,7 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
             if gap > _LINE_TOLERANCE:
                 short.append({"key": row["key"], "label": row["label"], "standard": str(standard),
                               "charged": str(charged), "short": str(gap),
-                              "source": ("invoice" if row["billed"] is not None
+                              "source": (_billed_on(row, charged) if row["billed"] is not None
                                          else "nothing billed" if row.get("currentSource") == "not_invoiced"
                                          else "booking form")})
     net = facts.sheet["summary"]["net"]
@@ -659,6 +659,19 @@ def booking_date_unusable(facts: _Facts) -> RuleOutcome:
         "price, no SKU check and no commercial finding -- until the booking date is corrected.",
         {"readAs": str(raw) if raw is not None else None, "reason": why},
     )
+
+
+def _billed_on(row: dict[str, Any], amount: Decimal) -> str:
+    """The billing document a line's figure is on, as the Deal names it (the
+    NDC, the cost sheet, the ledger, the invoice) -- not "the invoice" for
+    every line (2026-11-03: the NDC's RTO figure was reported as the
+    invoice's)."""
+    for source in row.get("sources") or []:
+        figure = _dec(source.get("amount"))
+        if (figure is not None and abs(figure - amount) <= 1 and source.get("document")
+                and "booking" not in str(source.get("documentType") or "")):
+            return str(source["document"])
+    return "bill"
 
 
 def tcs_short(facts: _Facts) -> RuleOutcome:
