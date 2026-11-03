@@ -1187,6 +1187,46 @@ def _invoice_discounts_inside_the_price(all_rows: list[dict[str, Any]], discount
         row["flags"] = [f for f in row["flags"] if f not in _STANDARD_FLAGS]
 
 
+# The small lines one bill may print under another's name (the Offer Letter's
+# "RSA" row struck out and "Fastag" written over it): never the vehicle, its
+# taxes, the insurance or the RTO.
+_SMALL_CHARGES = frozenset({
+    "rsa_amount", "fastag_amount", "other_charges", "handling_charges", "service_package_amount",
+    "additional_warranty_amount", "extended_warranty_amount",
+})
+
+
+def _one_charge_per_figure(rows: list[dict[str, Any]]) -> None:
+    """One charge the NDC and the dealer's ledger print under two names counts
+    once (2026-11-03), as a benefit does: the ledger's posting names it, the
+    NDC's row checks it. Live, SHI-SS-261027-010: the Offer Letter's "RSA" row,
+    struck out with "Fastag 600" written over it, read as an RSA of Rs 600
+    beside the ledger's "FAST TAG (SALES)" Rs 600 -- the Rs 600 counted twice.
+    Only a row neither bill gives for the other's line pairs; each ledger line
+    stands for one NDC row."""
+    statement, tally = _STATEMENT_NORM, frozenset({_norm_type(TALLY_LEDGER_TYPE)})
+
+    def gives(row: dict[str, Any], norm: frozenset[str]) -> bool:
+        return row["current"] is not None and any(
+            _norm_type(s.get("documentType")) in norm and _near(s.get("amount"), Decimal(row["current"]),
+                                                                _SAME_BENEFIT_TOLERANCE)
+            for s in row["sources"])
+
+    small = [r for r in rows if r["key"] in _SMALL_CHARGES and (_dec(r.get("current")) or Decimal(0)) > 0]
+    by_ledger = [r for r in small if gives(r, tally) and not gives(r, statement)]
+    paired: set[int] = set()
+    for row in small:
+        if not gives(row, statement) or gives(row, tally):
+            continue
+        amount = Decimal(row["current"])
+        same = next((r for r in by_ledger if id(r) not in paired and r["key"] != row["key"]
+                     and _near(r["current"], amount, _SAME_BENEFIT_TOLERANCE)), None)
+        if same is not None:
+            paired.add(id(same))
+            same["sources"] = [*same["sources"], *[{**e, "checks": True} for e in row["sources"]]]
+            _take_back(row, same_as=same)
+
+
 def _one_benefit_per_figure(discount_rows: list[dict[str, Any]], *, offer_on_file: bool = False) -> None:
     """One benefit printed by two billing documents counts once (product owner
     2026-11-02).
@@ -1540,6 +1580,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             # own policy kept out of the deal).
             row["variance"] = None
             row["flags"] = [f for f in row["flags"] if f not in _STANDARD_FLAGS]
+    _one_charge_per_figure(all_rows)
     for row in discount_rows:
         _settle_discount(row, situation, mr_key=mr_key)
 

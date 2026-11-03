@@ -215,3 +215,32 @@ def test_one_benefit_the_ndc_and_the_ledger_name_differently_counts_once(journey
     # not taken, never awaited (the settlement was "awaiting the EW and RSA bills").
     awaited = {a["key"] for a in view["summary"]["awaiting"]}
     assert not awaited & {"additional_warranty_amount", "extended_warranty_amount", "rsa_amount"}
+
+
+def test_offer_letter_rows_for_a_bh_number_and_a_fastag_written_on_others() -> None:
+    """Live 2026-11-03: "RTO BH" (SHI-SS-261027-025), "RTO (BH Series)"
+    (SHI-SS-261027-007) and "OTHERS FT" / "OTHERS Fastag" (the FASTag written
+    on the Others row) were left unmapped or read as other charges."""
+    from audit_core.uc03_account_statement import read_statement
+
+    for rto in ("RTO BH", "RTO (BH Series)", "RTO"):
+        assert read_statement([{"particulars_raw": rto, "debit_amount": 21000}]).components == {
+            "registration_charges": D(21000)}
+    for fastag in ("OTHERS FT", "OTHERS Fastag", "FASTAG"):
+        read = read_statement([{"particulars_raw": fastag, "debit_amount": 600}])
+        assert read.components == {"fastag_amount": D(600)} and read.unmapped == []
+
+
+def test_one_charge_the_ndc_and_the_ledger_name_differently_counts_once(journey) -> None:
+    """Live 2026-11-03 (SHI-SS-261027-010): the Offer Letter's "RSA" row, struck
+    out with "Fastag 600" written over it, read as an RSA of Rs 600 beside the
+    ledger's FASTag Rs 600: the Rs 600 counted twice."""
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _ledger(journey, BAPU)  # its FASTag posting: Rs 600
+    _ledger(journey, [line if line["particulars_raw"] != "PERMIT Add cash kit" else
+                      {"particulars_raw": "RSA", "debit_amount": 600} for line in OFFER_LETTER])
+    _sync(journey)
+    view = _deal(journey)
+    rsa, fastag = _row(view, "rsa_amount"), _row(view, "fastag_amount")
+    assert rsa["current"] is None and rsa["sameAs"]["key"] == "fastag_amount"
+    assert D(fastag["current"]) == D(600)

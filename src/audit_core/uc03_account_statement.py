@@ -154,10 +154,14 @@ _CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         # every amount on it is 1% of the sale (five live statements, 2026-11-02).
         ("tcs_amount", r"TCS( ON INVOICE)?( \d+(\.\d+)?%)?|W/S BILLING( TCS| TU)? ?(\( ?1 ?%\)|1 ?%)?"),
         ("insurance_amount", r"INSURANCE( AMOUNT| COST)?( \((NORMAL|NIL DEP)\))?"),
-        ("registration_charges", r"REGISTRATION( COST| CHARGES)?( BH| \(BH\)| RTO)?|ONLINE RTO|RTO CHARGES.*|RTO"),
+        # "RTO BH" / "RTO (BH Series)": the Offer Letter's RTO row for a BH-series number (2026-11-03).
+        ("registration_charges",
+         r"REGISTRATION( COST| CHARGES)?( BH| \(BH\)| RTO)?|ONLINE RTO|RTO CHARGES.*|RTO( \(?BH( SERIES)?\)?)?"),
+        # The Offer Letter's "Others" row with "FT" / "Fastag" written on it is
+        # the FASTag (2026-11-03), so it is matched before the other charges.
+        ("fastag_amount", r"(OTHERS )?(FAST ?T?AG( CHARGES)?|FT)"),
         ("other_charges", "|".join(f"(?:{p.pattern})" for _, p in _OTHER_CHARGES)),
         ("accessories_cost", r"ACCESSORIES|SALE OF ACCESSORIES"),
-        ("fastag_amount", r"FAST ?T?AG( CHARGES)?"),
         # Not "RSA COD" / "RSA COP": their amounts are the certificate of
         # deposit bought for a scrappage (Rs 20,700 / 24,143 against an RSA of
         # Rs 2,021 on live statements, 2026-11-02), written in the RSA row.
