@@ -10,7 +10,8 @@ amount of 23-09; Chinmay Kumar Gajendra's Rs 5,82,229 and Rs 12,50,000 of
 Each credit posting of the ledger that is money in -- a Receipt voucher, or a
 journal transfer from another ledger (a relative's account) -- is a payment of
 the booking, the ledger its document, unless a receipt on file already stands
-for it: the same receipt number, or the same amount within three days. It is
+for it: the same receipt number, else the same amount (each receipt standing
+for one posting, the nearest date first). It is
 read from the ledger each time (payments are one row per document, and the
 ledger is one document with many postings), never stored. Credit notes
 (benefits), the vehicle sale and round-off are not money received. A posting
@@ -29,7 +30,8 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
-_DAYS = 3
+# A disbursement is the sanction less the lender's charges: within 2%.
+_LOAN_NET_SHARE = Decimal("0.98")
 _RECEIPT_VOUCHER = re.compile(r".*RECEIPT.*")
 _JOURNAL_VOUCHER = re.compile(r".*JOURNAL.*")
 _NOT_MONEY = re.compile(r".*(ROUND ?OFF|CREDIT ?NOTE|DISCOUNT|BONUS|SCHEME|OFFER).*")
@@ -96,21 +98,43 @@ def _on_file(connection: Connection, *, tenant_id: str, journey_id: UUID) -> lis
     ).mappings().all()]
 
 
-def _stands_for(posting: dict[str, Any], receipts: list[dict[str, Any]]) -> bool:
-    """A receipt on file already stands for this posting: the same receipt
-    number (the receipt's own reading may drop a leading letter, "B/26-27/0672"
-    for "PB/26-27/0672"), or the same amount within three days."""
-    number = re.sub(r"[^A-Z0-9]", "", (posting["number"] or "").upper())
-    for receipt in receipts:
-        same_amount = abs(Decimal(receipt["amount"]) - posting["amount"]) <= 1
-        theirs = re.sub(r"[^A-Z0-9]", "", str(receipt["receipt_number"] or "").upper())
-        if number and len(theirs) >= 4 and (number == theirs or (number.endswith(theirs) and same_amount)):
-            return True
-        if same_amount:
-            day = _day(receipt["receipt_date"])
-            if day is None or posting["date"] is None or abs((day - posting["date"]).days) <= _DAYS:
-                return True
-    return False
+def _number(value: Any) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _match(postings: list[dict[str, Any]], receipts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The postings no receipt on file stands for. Each receipt stands for one
+    posting at most: first by its number (the receipt's own reading may drop
+    a leading letter, "B/26-27/0672" for "PB/26-27/0672"), then by its amount,
+    the nearest date first -- whatever the gap: the dealer posts a transfer
+    from another ledger days or weeks after the receipt (live 2026-11-02: a
+    Rs 70,000 cash booking amount of 03-10 posted as "SABITA RANI DASH" on
+    24-10; a Rs 21,000 receipt posted as "BARADA PRASAN NAYAK")."""
+    free = list(range(len(receipts)))
+    left: list[dict[str, Any]] = []
+    unmatched: list[dict[str, Any]] = []
+    for posting in postings:
+        number = _number(posting["number"])
+        hit = next((i for i in free if number and len(_number(receipts[i]["receipt_number"])) >= 4 and (
+            number == _number(receipts[i]["receipt_number"])
+            or (number.endswith(_number(receipts[i]["receipt_number"]))
+                and abs(Decimal(receipts[i]["amount"]) - posting["amount"]) <= 1))), None)
+        if hit is not None:
+            free.remove(hit)
+        else:
+            unmatched.append(posting)
+    for posting in unmatched:
+        same = [i for i in free if abs(Decimal(receipts[i]["amount"]) - posting["amount"]) <= 1]
+        if not same:
+            left.append(posting)
+            continue
+
+        def gap(i: int, posting: dict[str, Any] = posting) -> int:
+            day = _day(receipts[i]["receipt_date"])
+            return abs((day - posting["date"]).days) if day and posting["date"] else 0
+
+        free.remove(min(same, key=gap))
+    return left
 
 
 def _loan_amounts(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[Decimal]:
@@ -150,13 +174,14 @@ def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID)
     receipts = _on_file(connection, tenant_id=tenant_id, journey_id=journey_id)
     loans: list[Decimal] | None = None
     out = []
-    for posting in money_in(combined_tally_rows(tallies)):
-        if _stands_for(posting, receipts):
-            continue
+    for posting in _match(money_in(combined_tally_rows(tallies)), receipts):
         if _JOURNAL_VOUCHER.fullmatch(posting["voucherType"]) and _FINANCIER.fullmatch(_label(posting["particulars"])):
             continue
         loans = loans if loans is not None else _loan_amounts(connection, tenant_id=tenant_id, journey_id=journey_id)
-        if any(abs(loan - posting["amount"]) <= 1 for loan in loans):
+        # The loan: the amount known, or the disbursement net of the lender's
+        # charges, a little under it (live: Rs 12,50,000 credited against a
+        # sanction of Rs 12,57,000).
+        if any(loan * _LOAN_NET_SHARE <= posting["amount"] <= loan + 1 for loan in loans):
             continue
         out.append({**posting, "documentId": str(origin["documentId"])})
     return out
