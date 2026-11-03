@@ -31,7 +31,7 @@ from p2_support import (
     database_engine,
 )
 from sqlalchemy import text
-from test_uc03_account_statement import UTKAL, _ledger, _set_policy, _sync
+from test_uc03_account_statement import UTKAL, _cost_sheet, _ledger, _set_policy, _sync
 
 from audit_core.db import set_tenant_context
 from audit_core.uc03_deal_source_policy import POLICY_ACCOUNT_STATEMENT
@@ -224,11 +224,8 @@ def test_an_invoice_discount_already_in_the_statement_price_is_not_given_twice(j
     """Live 2026-11-02 (Chinmay Kumar Gajendra): the cost sheet prices the
     vehicle at the invoice's price less the invoice's discount."""
     _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
-    _source(journey, "ex_showroom_price", "cost_sheet", "847000")
-    _source(journey, "accessories_cost", "cost_sheet", "10000")
-    from test_uc03_account_statement import _sync as sync
-
-    sync(journey)
+    _cost_sheet(journey, {"ex_showroom_price": "847000", "accessories_amount": "10000"})
+    _sync(journey)
     add_ready_document(journey, "customer_invoice_dms", process_area="DELIVERY", **OEM_DISCOUNT_INVOICE)
     view = _deal(journey)
     oem = _benefit(view, "CASH_DISCOUNT")

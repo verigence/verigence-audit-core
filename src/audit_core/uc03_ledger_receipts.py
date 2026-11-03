@@ -41,6 +41,12 @@ _BANK = re.compile(r".*\b(BANK|NEFT|RTGS|IMPS|UPI|POS)\b.*")
 _FINANCIER = re.compile(r".*\b(FINANCE|FINANCIAL|FIN\.? ?SERV\w*|MMFSL|CAPITAL|LEASING)\b.*")
 
 
+def is_loan_net_of_charges(amount: Decimal, loan: Decimal) -> bool:
+    """The amount is the loan, or its disbursement net of the lender's
+    charges: between 98% of the loan and the loan (a rupee over allowed)."""
+    return Decimal(loan) * _LOAN_NET_SHARE <= Decimal(amount) <= Decimal(loan) + 1
+
+
 def _label(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").upper()).strip()
 
@@ -134,7 +140,38 @@ def _match(postings: list[dict[str, Any]], receipts: list[dict[str, Any]]) -> li
             return abs((day - posting["date"]).days) if day and posting["date"] else 0
 
         free.remove(min(same, key=gap))
+    return _combined(left, [receipts[i] for i in free])
+
+
+# The most receipts one posting is matched against.
+_MAX_COMBINED = 4
+
+
+def _combined(postings: list[dict[str, Any]], receipts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Of the postings left, those no set of the receipts left adds up to:
+    the dealer may post several receipts as one transfer (live 2026-11-03:
+    three receipts of Rs 5,000, 11,000 and 70,000 posted as one Rs 86,000
+    journal from the customer's ledger). Each receipt stands once."""
+    receipts = list(receipts)
+    left = list(postings)
+    for posting in sorted(postings, key=lambda p: -p["amount"]):
+        hit = _subset(posting["amount"], [Decimal(r["amount"]) for r in receipts])
+        if hit is not None:
+            receipts = [r for i, r in enumerate(receipts) if i not in hit]
+            left = [p for p in left if p is not posting]
     return left
+
+
+def _subset(total: Decimal, amounts: list[Decimal]) -> set[int] | None:
+    """The indexes of the fewest amounts (two to _MAX_COMBINED) that add up to
+    ``total`` within a rupee; None when none do."""
+    from itertools import combinations
+
+    for size in range(2, min(_MAX_COMBINED, len(amounts)) + 1):
+        for picked in combinations(range(len(amounts)), size):
+            if abs(sum((amounts[i] for i in picked), Decimal(0)) - total) <= 1:
+                return set(picked)
+    return None
 
 
 def _loan_amounts(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[Decimal]:
@@ -181,7 +218,7 @@ def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID)
         # The loan: the amount known, or the disbursement net of the lender's
         # charges, a little under it (live: Rs 12,50,000 credited against a
         # sanction of Rs 12,57,000).
-        if any(loan * _LOAN_NET_SHARE <= posting["amount"] <= loan + 1 for loan in loans):
+        if any(is_loan_net_of_charges(posting["amount"], loan) for loan in loans):
             continue
         out.append({**posting, "documentId": str(origin["documentId"])})
     return out
@@ -213,8 +250,8 @@ def ledger_loan_credit(connection: Connection, *, tenant_id: str, journey_id: UU
     if not tallies:
         return None
     amounts = [p["amount"] for p in money_in(combined_tally_rows(tallies))
-               if Decimal(loan) * _LOAN_NET_SHARE <= p["amount"] <= Decimal(loan) + 1]
+               if is_loan_net_of_charges(p["amount"], loan)]
     return max(amounts) if amounts else None
 
 
-__all__ = ["ledger_financier_credit", "ledger_loan_credit", "ledger_receipts", "money_in"]
+__all__ = ["is_loan_net_of_charges", "ledger_financier_credit", "ledger_loan_credit", "ledger_receipts", "money_in"]

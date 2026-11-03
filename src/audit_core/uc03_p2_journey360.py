@@ -457,6 +457,23 @@ def bank_approval_sanction(connection: Connection, *, tenant_id: str, journey_id
     return None
 
 
+def letter_loan_among_receipts(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, receipt_amounts: list[Decimal | None],
+) -> Decimal | None:
+    """The customer receipt that is the Bank Approval Letter's loan, not yet
+    linked as the loan receipt: the sanction, or the disbursement net of the
+    lender's charges (within 2% under it). None when there is no letter or no
+    such receipt (live 2026-11-03: a Rs 7,01,366 "DISB:" receipt against a
+    sanction of Rs 7,10,000)."""
+    from audit_core.uc03_ledger_receipts import is_loan_net_of_charges
+
+    letter = bank_approval_sanction(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if letter is None:
+        return None
+    return next((Decimal(r) for r in receipt_amounts
+                 if r is not None and is_loan_net_of_charges(Decimal(r), letter["amount"])), None)
+
+
 def loan_without_receipt(
     connection: Connection, *, tenant_id: str, journey_id: UUID, receipt_amounts: list[Decimal] | None = None,
 ) -> dict[str, Any] | None:
@@ -486,7 +503,13 @@ def loan_without_receipt(
     letter = bank_approval_sanction(connection, tenant_id=tenant_id, journey_id=journey_id)
     if letter is None:
         return None
-    if any(r is not None and abs(r - letter["amount"]) <= 1 for r in receipt_amounts or []):
+    # A counted receipt of the loan amount, or of the disbursement net of the
+    # lender's charges (within 2% under the sanction), is the loan's receipt
+    # (live 2026-11-03: a Rs 7,01,366 "DISB:" receipt against a sanction of
+    # Rs 7,10,000; the letter counted the loan a second time).
+    from audit_core.uc03_ledger_receipts import is_loan_net_of_charges
+
+    if any(r is not None and is_loan_net_of_charges(r, letter["amount"]) for r in receipt_amounts or []):
         return None
     # A receipt in the financier's name is the loan's receipt even before it
     # is linked (the disbursed amount is usually the sanctioned one less
@@ -579,6 +602,8 @@ def _loan_counted(connection: Connection, *, tenant_id: str, journey_id: UUID, p
         receipt_amounts=paid["customerAmounts"],
         letter=loan_without_receipt(connection, tenant_id=tenant_id, journey_id=journey_id,
                                     receipt_amounts=paid["countedAmounts"]),
+        loan_among_receipts=letter_loan_among_receipts(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                                       receipt_amounts=paid["customerAmounts"]),
     )
 
 
@@ -1526,7 +1551,12 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     paid_total = paid["receipts"] + loan + (old_vehicle or Decimal(0)) - refunds
     # What the customer owes is the current net; with none worked out it is
     # unknown, never the price master's standard (2026-11-02, Deal defect 12).
-    payable = net_cur
+    # While the vehicle's own price awaits its bill (no NDC, cost sheet or
+    # vehicle invoice gives it), what the other bills add up to is no payable
+    # (live 2026-11-03: an RTO challan's Rs 10,000 stood as the payable of an
+    # Rs 18.6 lakh deal, so the loan and the receipts read as an excess).
+    price_awaited = any(r["key"] == "ex_showroom_price" and r["awaiting"] for r in all_rows)
+    payable = None if price_awaited else net_cur
     invoiced = sum(1 for r in counted_rows if r["billed"] is not None)
     return {
         "sku": _deal_sku_block(sku, price_plan),
@@ -1724,30 +1754,29 @@ def _deal_sku_block(sku: Any, price_plan: dict[str, Any] | None) -> dict[str, An
 def _standing_copies(
     connection: Connection, *, tenant_id: str, journey_id: UUID, sources: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Several copies of the NDC or of the cost sheet on file (2026-11-02, Deal
-    defect 15): each figure stands from the copy the statement sync took it
-    from (uc03_account_statement.combine_statements); another copy's row of
-    that figure leaves the Deal -- the copies-differ task lists it. With one
-    copy per figure nothing is read and nothing changes."""
-    documents: dict[tuple[str, str, str], set[str]] = {}
-    for s in sources:
-        kind = _norm_type(s["source_document_type"])
-        if kind in _LEDGER_NORM or kind in _QUOTE_NORM:
-            documents.setdefault((kind, str(s["line_kind"]), str(s["component_key"])), set()).add(
-                str(s["source_document_id"]))
-    if all(len(ids) <= 1 for ids in documents.values()):
+    """The dealer's books' figures as they stand now (uc03_account_statement.
+    standing_figures): each NDC, cost-sheet, settlement or Tally-ledger figure
+    stands from the copy the statement sync takes it from today (several
+    copies on file: 2026-11-02, Deal defect 15 -- the copies-differ task lists
+    the others), and a figure an earlier reading recorded that today's
+    reading no longer gives leaves the Deal (2026-11-03: source rows are
+    never deleted, so a re-read left its first reading's figures behind)."""
+    books = {_norm_type(t) for t in (*_LEDGER_SOURCES, *_QUOTE_SOURCES, _SETTLEMENT_TYPE, TALLY_LEDGER_TYPE)}
+    if not any(_norm_type(s["source_document_type"]) in books for s in sources):
         return sources
-    from audit_core.uc03_account_statement import COST_SHEET_TYPE, chosen_copies
-    from audit_core.uc03_deal_source_policy import ACCOUNT_STATEMENT_TYPE
+    from audit_core.uc03_account_statement import COST_SHEET_KEYS, standing_figures
 
-    chosen = chosen_copies(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # Benefit keys are recorded in lower case (the statement reads them in
+    # upper case): compared without case.
+    standing = {_norm_type(t): {(k.upper(), c.lower()): d for (k, c), d in figures.items()}
+                for t, figures in standing_figures(connection, tenant_id=tenant_id, journey_id=journey_id).items()}
     kept = []
     for s in sources:
         kind = _norm_type(s["source_document_type"])
-        key = (kind, str(s["line_kind"]), str(s["component_key"]))
-        if len(documents.get(key, ())) > 1:
-            table = chosen[COST_SHEET_TYPE if kind in _QUOTE_NORM else ACCOUNT_STATEMENT_TYPE]
-            if table.get((str(s["line_kind"]), str(s["component_key"]))) != str(s["source_document_id"]):
+        if kind in standing and not (kind in _QUOTE_NORM and str(s["component_key"]).lower() not in COST_SHEET_KEYS):
+            key = (str(s["line_kind"]).upper(), str(s["component_key"]).lower())
+            document_id = str(s["source_document_id"]).lower() if s.get("source_document_id") else None
+            if key not in standing[kind] or (standing[kind][key] or "").lower() != (document_id or ""):
                 continue
         kept.append(s)
     return kept

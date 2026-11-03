@@ -643,6 +643,9 @@ _COST_SHEET_COMPONENTS: tuple[tuple[str, str], ...] = (
     ("insurance_amount", "insurance_amount"),
     ("accessories_amount", "accessories_cost"),
 )
+# The lines the cost sheet's reader gives (another writer records its other
+# boxes, such as the declared discount total, under the same type).
+COST_SHEET_KEYS = frozenset(component for _, component in _COST_SHEET_COMPONENTS)
 _LINE_LABELS = {
     "ex_showroom_price": "Ex-showroom price",
     "registration_charges": "Registration / RTO",
@@ -924,6 +927,50 @@ def chosen_copies(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         ACCOUNT_STATEMENT_TYPE: {k: str(d["documentId"]) for k, d in statement.origin.items()},
         COST_SHEET_TYPE: {k: str(d["documentId"]) for k, d in sheet.origin.items()},
     }
+
+
+def standing_figures(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, dict[tuple[str, str], str | None]]:
+    """For the Deal: every figure the dealer's books give now, as (line kind,
+    key) -> the document it stands from, by source type -- exactly what
+    sync_account_statement records: the NDC's lines, benefits and printed
+    totals; the ERP settlement's charges (no NDC); the Tally ledger's postings
+    (recorded under no document); the cost sheet's lines.
+
+    A recorded figure of these types that is not here was set by an earlier
+    reading and no longer stands: the service role may not delete source rows,
+    so a re-read leaves the first reading's rows behind (live 2026-11-03: an
+    NDC whose reading was cleared still showed its first reading's
+    Rs 21,75,000 corporate discount and Rs 1,51,000 registration)."""
+    documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+    parsed = [(d, rows, statement_kind(rows)) for d in documents for rows in [line_rows(d["fields"].get("line_items"))]]
+    statement, copies = combine_statements([(d, rows) for d, rows, kind in parsed if kind == KIND_FORM])
+    ledger: dict[tuple[str, str], str | None] = {}
+    if statement is not None and copies.primary is not None:
+        for kind, figures in (("COMMERCIAL", statement.components), ("DISCOUNT", statement.discounts)):
+            for key in figures:
+                ledger[(kind, key)] = str(copies.origin.get((kind, key), copies.primary)["documentId"])
+        for key, _amount, origin in _declared_figures(statement, copies):
+            ledger[("COMMERCIAL", key)] = str(origin["documentId"])
+    settlement: dict[tuple[str, str], str | None] = {}
+    settlements = [(d, rows) for d, rows, kind in parsed if kind == KIND_ERP]
+    if statement is None and settlements:
+        erp_document, erp_rows = settlements[0]
+        settlement = {("COMMERCIAL", key): str(erp_document["documentId"])
+                      for key in read_erp_settlement(erp_rows).components}
+    tallies = [(d, rows) for d, rows, kind in parsed if kind == KIND_TALLY]
+    tally: dict[tuple[str, str], str | None] = {}
+    if tallies:
+        read = read_tally_lines(combined_tally_rows(tallies))
+        tally = {(kind, key): None for kind, figures in (("COMMERCIAL", read.components), ("DISCOUNT", read.discounts))
+                 for key in figures}
+    sheet, sheet_copies = combine_cost_sheets(load_ledger_documents(
+        connection, tenant_id=tenant_id, journey_id=journey_id, document_type=COST_SHEET_TYPE))
+    cost: dict[tuple[str, str], str | None] = {}
+    if sheet is not None:
+        cost = {("COMMERCIAL", key): str(sheet_copies.origin[("COMMERCIAL", key)]["documentId"])
+                for key in sheet.components}
+    return {ACCOUNT_STATEMENT_TYPE: ledger, SETTLEMENT_SOURCE_TYPE: settlement, TALLY_LEDGER_TYPE: tally,
+            COST_SHEET_TYPE: cost}
 
 
 # ── the journey ──────────────────────────────────────────────────────────────
@@ -1406,6 +1453,7 @@ def sync_if_source_of_truth(
 __all__ = [
     "COPIES_DIFFERENCE_TASK",
     "COST_SHEET_DIFFERENCE_TASK",
+    "COST_SHEET_KEYS",
     "COST_SHEET_TYPE",
     "DECLARED_BALANCE",
     "DECLARED_NET",
@@ -1438,6 +1486,7 @@ __all__ = [
     "read_statement",
     "read_tally_lines",
     "read_working",
+    "standing_figures",
     "statement_kind",
     "statement_loan",
     "sync_account_statement",

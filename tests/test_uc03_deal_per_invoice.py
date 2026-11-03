@@ -342,7 +342,9 @@ def test_an_accessory_invoice_alone_zeroes_neither_the_vehicle_nor_the_insurance
     assert Decimal(rows["accessories_cost"]["current"]) == Decimal("7457.01")
     summary = view["summary"]
     assert Decimal(summary["net"]["current"]) == Decimal("7457.01")
-    assert Decimal(summary["payable"]) == Decimal("7457.01")
+    # The vehicle's own price awaits its bill: the accessory invoice alone is
+    # no payable, and there is no balance yet (2026-11-03).
+    assert summary["payable"] is None and summary["balanceDue"] is None
     assert not any("NOT_INVOICED" in r["flags"] for r in rows.values())
 
 
