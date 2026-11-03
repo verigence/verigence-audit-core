@@ -1,4 +1,15 @@
-"""The same file uploaded again (product owner, 2026-10-31).
+"""The same file uploaded again, and a duplicate booking across outlets.
+
+Product owner 2026-11-03: the "same file" is a PC's mistake only within ONE
+OUTLET. The same customer (PAN and/or Aadhaar), mobile and model on open
+journeys of two DIFFERENT outlets -- of one dealership or of two; each
+dealership numbers its own bookings, so no booking reference number is
+compared -- is a DUPLICATE BOOKING ACROSS OUTLETS: nothing is deleted and a
+large deep-red alert (DUPLICATE_ACROSS_OUTLETS) goes to the PCs of both
+outlets, their Reviewers and Team Leads (uc03_p2_tenant_alerts), once per
+newer journey, for a journey created within the same window as below.
+
+The same file uploaded again (product owner, 2026-10-31).
 
     "When ever a PC enters a Journey which has existing PAN, Mobile No,
     Customer Name, Model same, Pls raise an Alert across all PC telling Same
@@ -121,6 +132,8 @@ from audit_core.uc03_sku_words import generation_key
 logger = structlog.get_logger(__name__)
 
 ALERT_KIND = "SAME_FILE_UPLOADED"
+CROSS_OUTLET_KIND = "DUPLICATE_ACROSS_OUTLETS"
+CROSS_OUTLET_TITLE = "Duplicate booking across outlets"
 DELETE_WORK_TYPE = "SAME_FILE_DELETE"
 ALERT_HOURS = 24
 ALERT_TITLE = "Same file being uploaded"
@@ -204,7 +217,7 @@ _IDENTITY_SQL = f"""
     )
     SELECT j.journey_id, j.created_at_utc, j.journey_reference,
            j.created_by_display_name AS pc_name, j.created_by_actor_id AS pc_actor_id,
-           j.dealer_id, d.dealer_name, o.outlet_name,
+           j.dealer_id, d.dealer_name, j.outlet_id, o.outlet_name,
            (SELECT r.value FROM ranked r
              WHERE r.journey_id = j.journey_id AND r.field_key = 'pan_number' AND r.row_rank = 1) AS pan,
            (SELECT r.value FROM ranked r
@@ -234,14 +247,14 @@ _IDENTITY_SQL = f"""
     WHERE j.tenant_id = :tenant_id AND j.journey_id = ANY(:journey_ids)
 """
 
-# Journeys of the same dealership whose extracted PAN or Aadhaar, on any
-# document, is this one's: a narrowing only -- each is then compared on its
-# own highest-confidence values.
+# Journeys of the Project whose extracted PAN or Aadhaar, on any document, is
+# this one's (any outlet, any dealership: 2026-11-03, a duplicate booking across
+# outlets): a narrowing only -- each is then compared on its own
+# highest-confidence values.
 _SAME_CUSTOMER_SQL = f"""
     SELECT DISTINCT f.journey_id
     FROM auditcore.journey_document_extracted_fields f
-    JOIN auditcore.journeys oj ON oj.tenant_id = f.tenant_id AND oj.journey_id = f.journey_id
-    WHERE f.tenant_id = :tenant_id AND f.journey_id <> :journey_id AND oj.dealer_id = :dealer_id
+    WHERE f.tenant_id = :tenant_id AND f.journey_id <> :journey_id
       AND ((f.field_key = 'pan_number' AND CAST(:pan AS text) IS NOT NULL
             AND upper(regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^A-Za-z0-9]', '', 'g')) = :pan)
         OR (f.field_key = 'aadhaar_number' AND CAST(:aadhaar AS text) IS NOT NULL
@@ -286,6 +299,8 @@ class FileIdentity:
     dealer_id: UUID | None = None
     booking_refs: frozenset[str] = frozenset()
     booking_ref_display: str | None = None
+    # 2026-11-03: the same file is a mistake within one outlet only.
+    outlet_id: UUID | None = None
 
     @property
     def model_key(self) -> str:
@@ -332,6 +347,7 @@ def _identities(connection: Connection, *, tenant_id: str, journey_ids: Iterable
             pan=_valid_pan(row["pan"]),
             aadhaar=_valid_aadhaar(row["aadhaar"]),
             dealer_id=UUID(str(row["dealer_id"])) if row["dealer_id"] else None,
+            outlet_id=UUID(str(row["outlet_id"])) if row["outlet_id"] else None,
             mobile=_normalize_mobile(row["phone"]),
             name=name,
             model_id=UUID(str(row["model_id"])) if row["model_id"] else None,
@@ -406,6 +422,54 @@ def booking_reference_shared(left: FileIdentity, right: FileIdentity) -> bool:
     return bool(left.booking_refs & right.booking_refs)
 
 
+def same_outlet(left: FileIdentity, right: FileIdentity) -> bool:
+    return not (left.outlet_id and right.outlet_id and left.outlet_id != right.outlet_id)
+
+
+def same_customer(new: FileIdentity, existing: FileIdentity) -> tuple[bool, bool] | None:
+    """(same PAN, same Aadhaar) when the two are one customer: either one equal, and
+    neither read on both and different; None otherwise."""
+    same_pan = bool(new.pan and new.pan == existing.pan)
+    same_aadhaar = bool(new.aadhaar and new.aadhaar == existing.aadhaar)
+    if not (same_pan or same_aadhaar):
+        return None
+    if (new.pan and existing.pan and not same_pan) or (new.aadhaar and existing.aadhaar and not same_aadhaar):
+        return None
+    return same_pan, same_aadhaar
+
+
+def cross_outlet_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
+    """The fields when the two journeys are one customer's booking of one model at two
+    different outlets (product owner 2026-11-03): the same PAN and/or Aadhaar, the same
+    mobile and the same model -- no booking reference number (each dealership numbers its
+    own) and no name (the PAN or Aadhaar is the person). None otherwise."""
+    if same_outlet(new, existing):
+        return None
+    customer = same_customer(new, existing)
+    if customer is None:
+        return None
+    if not (new.mobile and new.mobile == existing.mobile and (new.model_id or new.model_key)
+            and same_model(new, existing)):
+        return None
+    same_pan, same_aadhaar = customer
+    fields: list[dict[str, Any]] = []
+    if same_pan:
+        fields.append({"field": "pan", "label": "PAN", "newValue": _masked(new.pan),
+                       "existingValue": _masked(existing.pan), "exact": True})
+    if same_aadhaar:
+        fields.append({"field": "aadhaar", "label": "Aadhaar", "newValue": mask_aadhaar(new.aadhaar),
+                       "existingValue": mask_aadhaar(existing.aadhaar), "exact": True})
+    fields += [
+        {"field": "mobile", "label": "Mobile", "newValue": _masked(new.mobile),
+         "existingValue": _masked(existing.mobile), "exact": True},
+        {"field": "model", "label": "Model", "newValue": new.model_name, "existingValue": existing.model_name,
+         "exact": bool(new.model_id and new.model_id == existing.model_id) or new.model_name == existing.model_name},
+        {"field": "outlet", "label": "Outlet", "newValue": _place(new.dealer_name, new.outlet_name),
+         "existingValue": _place(existing.dealer_name, existing.outlet_name), "exact": False},
+    ]
+    return fields
+
+
 def matched_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
     """The fields, as a reviewer should see them, when the new file may be a
     copy of the existing one; None when they are two bookings.
@@ -420,6 +484,8 @@ def matched_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, 
     reference row not exact: the caller then alerts and keeps the copy
     (KEPT_NO_BOOKING_REFERENCE), never deletes it."""
     if new.dealer_id and existing.dealer_id and new.dealer_id != existing.dealer_id:
+        return None
+    if not same_outlet(new, existing):  # 2026-11-03: another outlet is a duplicate across outlets
         return None
     same_pan = bool(new.pan and new.pan == existing.pan)
     same_aadhaar = bool(new.aadhaar and new.aadhaar == existing.aadhaar)
@@ -742,26 +808,95 @@ def _raise(
     return outcome
 
 
+def cross_outlet_body(payload: dict[str, Any]) -> str:
+    new = payload.get("newJourney") or {}
+    existing = payload.get("existingJourney") or {}
+    who = f"{payload.get('customerName') or 'Unknown customer'}, {payload.get('model') or 'unknown model'}"
+    labels = [str(f.get("label") or "") for f in payload.get("matchedFields") or [] if f.get("field") != "outlet"]
+    on = labels[0] if len(labels) == 1 else f"{', '.join(labels[:-1])} and {labels[-1]}"
+    return (f"{CROSS_OUTLET_TITLE} — {who}. {new.get('reference') or 'A new journey'} "
+            f"(PC {new.get('pcName') or 'unknown'}, {_place(new.get('dealerName'), new.get('outletName'))}) "
+            f"and {existing.get('reference') or 'an earlier journey'} "
+            f"(PC {existing.get('pcName') or 'unknown'}, {_place(existing.get('dealerName'), existing.get('outletName'))}) "
+            f"are the same customer on {on}. Nothing was deleted.")
+
+
+def _raise_cross_outlet(connection: Connection, *, tenant_id: str, new: FileIdentity, existing: FileIdentity,
+                        fields: list[dict[str, Any]]) -> bool:
+    """The deep-red alert for a duplicate booking across outlets (2026-11-03), once per newer
+    journey; for the PCs of both outlets, their Reviewers and Team Leads (``audienceOutletIds``)."""
+    payload = {
+        "customerName": new.name or existing.name,
+        "model": new.model_name or existing.model_name,
+        "variant": new.variant_name,
+        "newJourney": {**_journey_view(new), "outletId": str(new.outlet_id) if new.outlet_id else None},
+        "existingJourney": {**_journey_view(existing),
+                            "outletId": str(existing.outlet_id) if existing.outlet_id else None},
+        "matchedFields": fields,
+        "audienceOutletIds": sorted({str(o) for o in (new.outlet_id, existing.outlet_id) if o}),
+        "audienceRoles": ["PC", "REVIEWER", "TL"],
+        "severity": "CRITICAL",
+    }
+    alert_id = connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.p2_tenant_alerts (
+                tenant_id, alert_kind, subject_journey_id, subject_journey_reference, related_journey_id,
+                alert_status, outcome, title, body, payload, published_at_utc, expires_at_utc
+            ) VALUES (
+                :t, :k, :j, :ref, :related, 'PUBLISHED', 'FLAGGED', :title, :body, CAST(:payload AS jsonb),
+                now(), now() + (:hours * interval '1 hour')
+            )
+            ON CONFLICT (tenant_id, alert_kind, subject_journey_id) DO NOTHING
+            RETURNING alert_id
+            """
+        ),
+        {"t": tenant_id, "k": CROSS_OUTLET_KIND, "j": new.journey_id, "ref": new.reference,
+         "related": existing.journey_id, "title": CROSS_OUTLET_TITLE, "body": cross_outlet_body(payload),
+         "payload": json.dumps(payload, default=str), "hours": ALERT_HOURS},
+    ).scalar_one_or_none()
+    if alert_id is not None:
+        logger.info("p2_duplicate_across_outlets", tenant_id=tenant_id, journey_id=str(new.journey_id),
+                    journey_reference=new.reference, existing_journey_id=str(existing.journey_id),
+                    existing_reference=existing.reference)
+    return alert_id is not None
+
+
 def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str) -> dict[str, Any]:
     me = _identities(connection, tenant_id=tenant_id, journey_ids=[journey_id]).get(journey_id)
-    if me is None or me.closed or not me.comparable:
+    # The customer, mobile and model are enough to look (a duplicate across outlets needs no
+    # name); the same file still needs everything (matched_fields).
+    if me is None or me.closed or not ((me.pan or me.aadhaar) and me.mobile and (me.model_id or me.model_key)):
         return {"examined": 0, "raised": 0}
     candidate_ids = [
         UUID(str(v)) for v in connection.execute(
             text(_SAME_CUSTOMER_SQL),
-            {"tenant_id": tenant_id, "journey_id": journey_id, "dealer_id": me.dealer_id, "pan": me.pan,
-             "aadhaar": me.aadhaar},
+            {"tenant_id": tenant_id, "journey_id": journey_id, "pan": me.pan, "aadhaar": me.aadhaar},
         ).scalars().all()
     ]
     others = _identities(connection, tenant_id=tenant_id, journey_ids=candidate_ids)
-    matches = [o for o in others.values() if not o.closed and matched_fields(me, o) is not None]
-    if not matches:
-        return {"examined": len(others), "raised": 0}
-    group = [me, *matches]
-    original = min(group, key=lambda identity: identity.order_key)
     cutoff = connection.execute(
         text("SELECT now() - (:hours * interval '1 hour')"), {"hours": SAME_FILE_WINDOW_HOURS},
     ).scalar_one()
+    # Another outlet: a duplicate booking across outlets, alert only (2026-11-03). The newer
+    # journey is named against the earliest booking at another outlet.
+    across = [o for o in others.values() if not o.closed and cross_outlet_fields(me, o) is not None]
+    flagged = 0
+    if across:
+        pair = sorted([me, *across], key=lambda identity: identity.order_key)
+        earliest = pair[0]
+        for newer in pair[1:]:
+            if newer.created_at < cutoff or same_outlet(newer, earliest):
+                continue
+            fields = cross_outlet_fields(newer, earliest)
+            if fields and _raise_cross_outlet(connection, tenant_id=tenant_id, new=newer, existing=earliest,
+                                              fields=fields):
+                flagged += 1
+    matches = [o for o in others.values() if not o.closed and matched_fields(me, o) is not None]
+    if not matches:
+        return {"examined": len(others), "raised": 0, "acrossOutlets": flagged}
+    group = [me, *matches]
+    original = min(group, key=lambda identity: identity.order_key)
     outcomes: list[str] = []
     for new in sorted(group, key=lambda identity: identity.order_key):
         if new is original:
@@ -776,7 +911,7 @@ def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correla
                          correlation_id=correlation_id)
         if outcome is not None:
             outcomes.append(outcome)
-    return {"examined": len(others), "raised": len(outcomes), "outcomes": outcomes}
+    return {"examined": len(others), "raised": len(outcomes), "outcomes": outcomes, "acrossOutlets": flagged}
 
 
 def sync_same_file_detection(

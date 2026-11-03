@@ -11,6 +11,12 @@ scoped to a dealership, since the same file may be uploaded at another one.
 Only PUBLISHED alerts that have not expired (24 hours) are returned, newest
 first; ``since`` narrows to those published after it. The first kind is
 SAME_FILE_UPLOADED (uc03_p2_same_file).
+
+DUPLICATE_ACROSS_OUTLETS (2026-11-03) is not for everyone: "to be seen by the
+PC of both the affected outlets, Reviewer, TL". Its payload names the outlets
+(``audienceOutletIds``) and roles (``audienceRoles``); it is returned to a
+person who holds one of those roles at one of those outlets -- a dealer-wide
+or Project-wide assignment covers the outlet (uc03_p2_gate_pass.scope_outlets).
 """
 from __future__ import annotations
 
@@ -54,7 +60,26 @@ class TenantAlertsResponse(BaseModel):
     serverTimeUtc: datetime
 
 
-def active_alerts(connection: Connection, *, tenant_id: str, since: datetime | None = None) -> list[TenantAlert]:
+def _for_audience(payload: dict[str, Any], held: dict[str, set[str]] | None) -> bool:
+    """An alert with an audience is for those who hold one of its roles at one of its outlets."""
+    outlets = payload.get("audienceOutletIds")
+    if not outlets:
+        return True
+    if held is None:
+        return False
+    roles = {str(r).upper() for r in payload.get("audienceRoles") or []}
+    return any(roles & held.get(str(o), set()) for o in outlets)
+
+
+def roles_by_outlet(connection: Connection, *, tenant_id: str, actor_id: str) -> dict[str, set[str]]:
+    from audit_core.uc03_p2_gate_pass import scope_outlets
+
+    return {str(o["outlet_id"]): {str(r).upper() for r in (o.get("roles") or [])}
+            for o in scope_outlets(connection, tenant_id, actor_id)}
+
+
+def active_alerts(connection: Connection, *, tenant_id: str, since: datetime | None = None,
+                  held: dict[str, set[str]] | None = None) -> list[TenantAlert]:
     rows = connection.execute(
         text(
             """
@@ -83,6 +108,7 @@ def active_alerts(connection: Connection, *, tenant_id: str, since: datetime | N
             expiresAtUtc=row["expires_at_utc"],
         )
         for row in rows
+        if _for_audience(dict(row["payload"] or {}), held)
     ]
 
 
@@ -100,4 +126,6 @@ def list_tenant_alerts(
     )
     set_tenant_context(connection, tenant_id)
     now = connection.execute(text("SELECT now()")).scalar_one()
-    return TenantAlertsResponse(items=active_alerts(connection, tenant_id=tenant_id, since=since), serverTimeUtc=now)
+    held = roles_by_outlet(connection, tenant_id=tenant_id, actor_id=human_principal.subject)
+    return TenantAlertsResponse(items=active_alerts(connection, tenant_id=tenant_id, since=since, held=held),
+                                serverTimeUtc=now)
