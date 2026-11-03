@@ -4914,6 +4914,10 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # Form 21s read as invoices filed as Form 21s, and the documents they
         # set aside given back (2026-11-02): see uc03_form_21.
         "FORM_21_REFILE": ("audit_core.uc03_form_21", "run_form_21_refile"),
+        # A PC's bulk upload (2026-11-03): its files placed on submit, then each journey
+        # read for it joined to the customer's booking or kept: see uc03_p2_bulk_upload.
+        "BULK_UPLOAD": ("audit_core.uc03_p2_bulk_upload", "run_bulk_upload"),
+        "BULK_SETTLE": ("audit_core.uc03_p2_bulk_upload", "run_bulk_settle"),
     }
     if kind not in per_tenant:
         raise ValueError(f"unknown worker job kind {kind!r}")

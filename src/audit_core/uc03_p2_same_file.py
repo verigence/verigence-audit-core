@@ -1004,6 +1004,14 @@ def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correla
         ).scalars().all()
     ]
     others = _identities(connection, tenant_id=tenant_id, journey_ids=candidate_ids)
+    # A journey being read for a PC's bulk upload is left to BULK_SETTLE (2026-11-03): it
+    # joins the customer's booking quietly instead of alerting the Project.
+    from audit_core.uc03_p2_bulk_upload import reading_for_bulk
+
+    bulk = reading_for_bulk(connection, tenant_id=tenant_id, journey_ids=[journey_id, *others])
+    if journey_id in bulk:
+        return {"examined": len(others), "raised": 0, "acrossOutlets": 0, "bulk": True}
+    others = {k: v for k, v in others.items() if k not in bulk}
     cutoff = connection.execute(
         text("SELECT now() - (:hours * interval '1 hour')"), {"hours": SAME_FILE_WINDOW_HOURS},
     ).scalar_one()
