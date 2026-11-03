@@ -332,3 +332,49 @@ def test_a_closed_delivery_file_counts_under_the_journeys_own_pc(journey):
     assert by_pc[journey.actor_id]["deliveryFilesClosed"] == 1
     assert by_pc[journey.actor_id]["journeysUploaded"] == 0
     assert by_pc[other]["deliveryFilesClosed"] == 0 and by_pc[other]["journeysUploaded"] == 1
+
+
+# Exact duplicate files (product owner 2026-11-03): every page uploaded before, nothing new.
+def _file_with_pages(journey, shas: list[str], *, minutes_ago: float) -> str:
+    """One uploaded file whose pages carry these fingerprints, uploaded ``minutes_ago``."""
+    batch = None
+    for n, sha in enumerate(shas, start=1):
+        b, queue, _ = add_page(journey, page_number=n, status="READY")
+        with journey.engine.begin() as c:
+            set_tenant_context(c, journey.tenant_id)
+            if batch is None:
+                batch = b
+            else:  # the same file: every page in the first upload
+                c.execute(text("UPDATE auditcore.p2_document_queue SET batch_id=:b WHERE tenant_id=:t AND queue_id=:q"),
+                          {"b": batch, "t": journey.tenant_id, "q": queue})
+                c.execute(text("DELETE FROM auditcore.p2_upload_batches WHERE tenant_id=:t AND batch_id=:b"),
+                          {"t": journey.tenant_id, "b": b})
+            c.execute(text("UPDATE auditcore.p2_document_queue SET page_sha256=:s, unit_kind='PAGE' "
+                           "WHERE tenant_id=:t AND queue_id=:q"), {"s": sha, "t": journey.tenant_id, "q": queue})
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("UPDATE auditcore.p2_upload_batches SET created_at_utc = now() - (:m * interval '1 minute'), "
+                       "page_count=:n WHERE tenant_id=:t AND batch_id=:b"),
+                  {"m": minutes_ago, "n": len(shas), "t": journey.tenant_id, "b": batch})
+    return str(batch)
+
+
+def test_exact_duplicate_files_are_counted_per_pc(journey):
+    tl = _tl(journey)
+    a, b, c = (uuid4().hex for _ in range(3))
+    first = _file_with_pages(journey, [a, b], minutes_ago=30)          # new
+    again = _file_with_pages(journey, [b, a], minutes_ago=20)          # all pages seen before
+    more = _file_with_pages(journey, [a, c], minutes_ago=10)           # one new page: not a duplicate
+    with journey.engine.begin() as conn:                                # the same file uploaded again, cancelled
+        set_tenant_context(conn, journey.tenant_id)
+        conn.execute(
+            text("INSERT INTO auditcore.p2_upload_batches (tenant_id, batch_id, journey_id, original_filename, "
+                 "content_type, size_bytes, page_count, original_object_key, batch_status, uploaded_by_actor_id, "
+                 "sha256) VALUES (:t, :id, :j, 'scan.pdf', 'application/pdf', 100, 0, 'k', 'CANCELLED', :a, :sha)"),
+            {"t": journey.tenant_id, "id": uuid4(), "j": journey.journey_id, "a": journey.actor_id,
+             "sha": uuid4().hex})
+    report = _report(journey, tl)
+    flags = {f["batchId"]: f["exactDuplicate"] for f in report["files"]}
+    assert (flags[first], flags[again], flags[more]) == (False, True, False)
+    [pc] = report["documentStatus"]["byPc"]
+    assert pc["exactDuplicateFiles"] == 2 and report["documentStatus"]["total"]["exactDuplicateFiles"] == 2
