@@ -510,6 +510,16 @@ def statement_loan(connection: Connection, *, tenant_id: str, journey_id: UUID) 
             continue
         return {"loan": read.financer, "refunds": read.refunds, "source": "Settlement (ERP printout)",
                 "documentId": str(document["documentId"])}
+    # The customer ledger's journal from the financier: the loan credited to
+    # the customer (live 2026-11-02, a Shivnath booking: "MMFSL MAHINDRA FINANCE
+    # TA (52879)" Rs 14,86,991, no sanction letter on file).
+    from audit_core.uc03_ledger_receipts import ledger_financier_credit
+
+    tallies = [(d, rows) for d, rows, kind in parsed if kind == KIND_TALLY]
+    credited = ledger_financier_credit(combined_tally_rows(tallies)) if tallies else None
+    if credited is not None:
+        return {"loan": credited, "refunds": Decimal(0), "source": "Customer ledger (financier's posting)",
+                "documentId": str(tallies[0][0]["documentId"])}
     return None
 
 
