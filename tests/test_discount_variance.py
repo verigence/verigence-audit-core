@@ -173,18 +173,20 @@ def _statement_deal_with_excess(journey):
     _sql(journey, "UPDATE auditcore.projects SET deal_source_policy='ACCOUNT_STATEMENT' WHERE tenant_id=:t")
     _sql(journey, "INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, standard_amount, "
                   "actual_amount) VALUES (:t, :j, 'ex_showroom_price', 1000000, 1000000)")
-    for kind, key, document_type, amount in (
-        ("COMMERCIAL", "ex_showroom_price", "customer_ledger", "1000000"),
-        ("DISCOUNT", "CASH_DISCOUNT", "customer_ledger", "30000"),
-        ("DISCOUNT", "CORPORATE_DISCOUNT", "customer_ledger", "13000"),
-        ("DISCOUNT", "CASH_DISCOUNT", "tax_invoice_tally", "25000"),
-    ):
-        _sql(journey, "INSERT INTO auditcore.commercial_line_source_values (tenant_id, journey_id, line_kind, "
-                      "component_key, source_document_type, amount, source_document_id) "
-                      "VALUES (:t, :j, :k, :c, :d, :a, :doc)", k=kind, c=key, d=document_type, a=amount, doc=uuid4())
     _sql(journey, "INSERT INTO auditcore.discount_applications (tenant_id, journey_id, discount_key, "
                   "standard_eligible_amount, actual_discount_amount, eligibility_result, actual_source_kind) "
-                  "VALUES (:t, :j, 'CASH_DISCOUNT', 25000, 30000, 'ELIGIBLE', 'EVIDENCE')")
+                  "VALUES (:t, :j, 'ADDITIONAL_DISCOUNT', 25000, NULL, 'ELIGIBLE', 'EVIDENCE')")
+    # The NDC itself, read by the statement sync: a figure stands on the Deal
+    # only as a document on file gives it (2026-11-03).
+    from test_uc03_account_statement import _ledger, _sync
+
+    _ledger(journey, [{"particulars_raw": "Ex-Showroom", "debit_amount": 1000000},
+                      {"particulars_raw": "Cash Discount", "credit_amount": 30000},
+                      {"particulars_raw": "Corporate Discount", "credit_amount": 13000}])
+    _sync(journey)
+    _sql(journey, "INSERT INTO auditcore.commercial_line_source_values (tenant_id, journey_id, line_kind, "
+                  "component_key, source_document_type, amount, source_document_id) "
+                  "VALUES (:t, :j, 'DISCOUNT', 'ADDITIONAL_DISCOUNT', 'tax_invoice_tally', 25000, :doc)", doc=uuid4())
     _sql(journey, "INSERT INTO auditcore.p2_journey_runtime (tenant_id, journey_id, current_stage) "
                   "VALUES (:t, :j, 'BOOKING_VERIFY_DOCUMENTS') ON CONFLICT (tenant_id, journey_id) DO NOTHING")
 
@@ -207,8 +209,8 @@ def test_an_account_statement_deal_shows_every_discount_the_rule_flags(journey):
     assert outcome.outcome == "FAIL"
     flagged = {d["key"]: Decimal(d["extra"]) for d in outcome.details["discounts"]}
     shown = {i["discountKey"]: Decimal(i["variance"]) for i in report["items"] if i["status"] == OVER}
-    assert flagged == shown and shown["CASH_DISCOUNT"] == 5000
-    cash = next(i for i in report["items"] if i["discountKey"] == "CASH_DISCOUNT")
+    assert flagged == shown and shown["ADDITIONAL_DISCOUNT"] == 5000
+    cash = next(i for i in report["items"] if i["discountKey"] == "ADDITIONAL_DISCOUNT")
     assert cash["invoice"] == "30000.00" and cash["givenDocument"] == "NDC (Account Statement)"
 
 
@@ -239,7 +241,7 @@ def test_the_recompute_job_rebuilds_old_rows_only_on_commit(journey):
     )
 
     _statement_deal_with_excess(journey)
-    stale = [{"key": "CASH_DISCOUNT", "label": "Cash", "status": UNDER, "entitled": "25000", "invoice": "0",
+    stale = [{"key": "ADDITIONAL_DISCOUNT", "label": "Additional", "status": UNDER, "entitled": "25000", "invoice": "0",
               "variance": "-25000"}]
     _sql(journey, "UPDATE auditcore.p2_journey_runtime SET discount_variance=CAST(:d AS jsonb), "
                   "price_variance_fact_version=fact_version WHERE tenant_id=:t AND journey_id=:j", d=json.dumps(stale))
@@ -251,4 +253,4 @@ def test_the_recompute_job_rebuilds_old_rows_only_on_commit(journey):
     run_discount_variance_recompute(journey.engine, "xd-1", [journey.tenant_id])
     assert cached() == stale
     run_discount_variance_recompute(journey.engine, "xd-1-commit", [journey.tenant_id])
-    assert {r["key"]: r["status"] for r in cached()} == {"CASH_DISCOUNT": OVER, "CORPORATE_DISCOUNT": OVER}
+    assert {r["key"]: r["status"] for r in cached()} == {"ADDITIONAL_DISCOUNT": OVER, "CORPORATE_PRIVILEGE": OVER}
