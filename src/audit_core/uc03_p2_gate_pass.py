@@ -937,6 +937,19 @@ def _team_leads(connection: Connection, tenant_id: str, outlets: list[dict[str, 
     return out
 
 
+@router.get("/gate-passes/{gate_pass_id}")
+def get_own_gate_pass(
+    tenant_id: str,
+    gate_pass_id: UUID,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """The PC's own gate register, to correct its counts on the day it was uploaded (2026-11-03)."""
+    _authorize(connection, tenant_id, principal, client, _READ)
+    return {"gatePass": _public_gate_pass(_own_gate_pass(connection, tenant_id, gate_pass_id, principal.subject))}
+
+
 @router.get("/gate-passes/{gate_pass_id}/image-url")
 def gate_pass_image_url(
     tenant_id: str,

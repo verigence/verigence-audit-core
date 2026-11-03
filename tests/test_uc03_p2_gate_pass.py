@@ -606,6 +606,8 @@ def test_the_pc_corrects_the_counts_on_the_day_and_the_team_leads_task_follows(s
     assert again["taskRaised"] is True and again["gatePass"]["countsEditCount"] == 2
     task = _not_notified_task(s, gp)
     assert task["task_status"] == "READY" and task["reference"]["missing"] == 2 and "corrected" in task["description"]
+    loaded = s.client.get(f"{s.base}/{gp}")
+    assert loaded.status_code == 200 and loaded.json()["gatePass"]["newDeliveries"] == 6
 
 
 def test_counts_are_not_corrected_after_the_day_of_the_upload(setup):
