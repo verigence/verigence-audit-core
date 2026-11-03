@@ -356,6 +356,11 @@ class StatementRead:
     conflicts: list[dict[str, Any]] = field(default_factory=list)
 
 
+# A label ending in a whole number of three digits or more, on a row whose
+# amount column is empty or zero: the number is the row's amount.
+_AMOUNT_IN_LABEL = re.compile(r"(?P<label>.*[A-Z%].*?) (?P<amount>[1-9]\d?(?:,\d{2})*,\d{3}|[1-9]\d{2,})")
+
+
 def _side_amount(row: dict[str, Any]) -> tuple[str, Decimal] | None:
     debit, credit = _amount(row.get("debit_amount")), _amount(row.get("credit_amount"))
     if debit not in (None, Decimal(0)):
@@ -378,6 +383,13 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
     for row in lines:
         label = _label(row.get("particulars_raw"))
         side = _side_amount(row)
+        if side is None and (written := _AMOUNT_IN_LABEL.fullmatch(label)) is not None \
+                and any(pattern.fullmatch(written["label"]) for _, pattern in _CHARGES):
+            # A charge's amount written into its label, the amount column
+            # empty (2026-11-03, SHI-SS-261027-024: "OTHERS Fastag 600" with
+            # 0): the figure is the charge's. Never a receipt's or a voucher's
+            # number, which only a charge row's label is not.
+            label, side = written["label"], ("DR", Decimal(written["amount"].replace(",", "")))
         if not label or side is None:
             continue  # a zero or empty line is not a figure
         _, amount = side

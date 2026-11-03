@@ -30,8 +30,17 @@ def _view(discounts, *, invoice=True, price="1000000", policy="INVOICE", standar
 
 
 def _d(key, entitled, billed, billed_from="invoice", booking=None, effective=None, eligibility=None, sources=None):
+    # The Deal counts a billed figure (``current``) unless it set it aside.
     return {"key": key, "label": key.title(), "entitled": entitled, "billed": billed, "billedFrom": billed_from,
-            "booking": booking, "effective": effective, "eligibility": eligibility, "sources": sources or []}
+            "booking": booking, "effective": effective, "eligibility": eligibility, "sources": sources or [],
+            "current": billed}
+
+
+def test_a_billed_discount_the_deal_set_aside_is_no_discount_given():
+    """2026-11-03 (SHI-SS-261031-004): an invoice discount the NDC does not
+    give is set aside by the Deal (``current`` empty); it is no over-grant."""
+    aside = {**_d("CASH_DISCOUNT", "0", "30000.60"), "current": None, "flags": ["NOT_ON_STATEMENT"]}
+    assert discount_variance_rows(_view([aside])) == []
 
 
 def test_a_discount_given_above_its_entitlement_is_over():

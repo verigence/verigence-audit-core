@@ -307,3 +307,39 @@ def test_one_charge_the_ndc_and_the_ledger_name_differently_counts_once(journey)
     rsa, fastag = _row(view, "rsa_amount"), _row(view, "fastag_amount")
     assert rsa["current"] is None and rsa["sameAs"]["key"] == "fastag_amount"
     assert D(fastag["current"]) == D(600)
+
+
+def test_a_charge_written_into_its_label_with_no_amount_is_read() -> None:
+    """Live 2026-11-03 (SHI-SS-261027-024): "OTHERS Fastag 600" read with the
+    600 in the label and 0 as the amount: the FASTag was lost. A receipt's
+    number in its label is never an amount."""
+    from audit_core.uc03_account_statement import read_statement
+
+    read = read_statement([{"particulars_raw": "OTHERS Fastag 600", "debit_amount": 0},
+                           {"particulars_raw": "RECEIPT 0573", "credit_amount": 0},
+                           {"particulars_raw": "RECEIPT MR 1573", "credit_amount": None}])
+    assert read.components == {"fastag_amount": D(600)}
+    assert read.receipts == 0 and read.unmapped == []
+
+
+def test_the_checks_count_only_the_discounts_the_deal_counts() -> None:
+    """Live 2026-11-03 (SHI-SS-261031-004): the invoice's Rs 30,000.60 the NDC
+    does not give, set aside by the Deal, was raised as an excess discount."""
+    from audit_core import uc03_discount_given as dg
+
+    invoice_only = {"key": "CASH_DISCOUNT", "billed": "30000.60", "current": None, "flags": ["NOT_ON_STATEMENT"]}
+    same_as = {"key": "EXCHANGE_BONUS", "billed": None, "current": None, "sameAs": {"key": "SCRAPPAGE_BONUS_DEALER"}}
+    in_price = {"key": "CASH_DISCOUNT", "billed": "49999.60", "current": None, "inPrice": True}
+    counted = {"key": "CORPORATE_PRIVILEGE", "billed": "30000", "current": "30000"}
+    assert [dg.has_figure(r) for r in (invoice_only, same_as, in_price, counted)] == [False, False, False, True]
+    assert dg.given(invoice_only) == (None, None) and dg.given(counted) == (D(30000), "billed")
+
+
+def test_a_figure_within_ten_rupees_of_its_standard_is_not_flagged() -> None:
+    """Live 2026-11-03 (SHI-SS-261027-007): Rs 9,99,901 against the price
+    master's Rs 9,99,901.32 was flagged "below standard"."""
+    from audit_core.uc03_p2_journey360 import _flags, _measured_flags
+
+    assert _flags("COMMERCIAL", "999901.32", None, "999901", None) == []
+    assert _flags("COMMERCIAL", "999901.32", None, "999881", None) == ["BELOW_STANDARD"]
+    assert _measured_flags("COMMERCIAL", [], "999901", "999901.32") == []

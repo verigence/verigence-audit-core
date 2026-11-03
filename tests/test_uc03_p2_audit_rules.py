@@ -160,7 +160,7 @@ def test_deal_undercharged_and_excess_discount_name_each_line(journey):
     result = _run(journey, "BOOKING")
     under = result["DEAL_UNDERCHARGED"]
     assert under.outcome == "FAIL"
-    assert "Ex-showroom price: ₹9,90,000 on the invoice against the standard ₹10,00,000 (₹10,000 short)" in under.reason
+    assert "Ex-showroom price: ₹9,90,000 on the Tax Invoice (Tally) against the standard ₹10,00,000 (₹10,000 short)" in under.reason
     assert "TCS" not in under.reason
     assert "Net deal ₹9,60,000 against the standard ₹9,85,000 (₹25,000 short)" in under.reason
     assert [c["key"] for c in under.details["components"]] == ["ex_showroom_price"]

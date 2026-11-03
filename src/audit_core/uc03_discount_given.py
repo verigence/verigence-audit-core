@@ -32,11 +32,22 @@ LINE_TOLERANCE = Decimal(100)
 GIVEN_COLUMNS = ("billed",)
 
 
+def counted(row: dict[str, Any]) -> bool:
+    """The Deal counts the line (2026-11-03). A billed figure the Deal set
+    aside is no discount given: the same benefit as another line
+    (``sameAs``), a discount already inside the statement's price
+    (``inPrice``), or an invoice discount the NDC / cost sheet does not give
+    (``NOT_ON_STATEMENT``, ``INVOICES_DISAGREE``) -- the Deal's ``current`` is
+    then empty. Live, SHI-SS-261031-004: the invoice's Rs 30,000.60 the NDC
+    does not give, counted out of the Deal, was raised as an excess discount."""
+    return row.get("current") is not None and not row.get("sameAs") and not row.get("inPrice")
+
+
 def has_figure(row: dict[str, Any]) -> bool:
-    """A line some document gives a figure on. The Management Referral line is
-    always on the sheet, opted out by default: with no figure it is no
-    discount yet."""
-    return any(row.get(c) is not None for c in GIVEN_COLUMNS)
+    """A line the Deal counts with a figure a billing document gives. The
+    Management Referral line is always on the sheet, opted out by default:
+    with no figure it is no discount yet."""
+    return counted(row) and any(row.get(c) is not None for c in GIVEN_COLUMNS)
 
 
 def entitlement_unknown(row: dict[str, Any]) -> bool:
@@ -48,6 +59,8 @@ def entitlement_unknown(row: dict[str, Any]) -> bool:
 
 def given(row: dict[str, Any]) -> tuple[Decimal | None, str | None]:
     """The amount given on this line and the Deal column it was read from."""
+    if not counted(row):
+        return None, None
     for column in GIVEN_COLUMNS:
         if row.get(column) is not None:
             return _dec(row[column]), column
