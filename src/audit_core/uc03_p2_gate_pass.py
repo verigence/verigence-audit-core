@@ -242,10 +242,22 @@ def _public_gate_pass(row: dict[str, Any]) -> dict[str, Any]:
         "photoQuality": row.get("quality_flag") or "GOOD",
         "photoMode": row.get("photo_mode") or "COMBINED",
         "dayCounts": row.get("day_counts"),
+        # Correctable by its PC until the end of the day it was uploaded (2026-11-03).
+        "countsEditable": row["counts_submitted_at_utc"] is not None and counts_editable(row),
+        "countsEditCount": int(row.get("counts_edit_count") or 0),
+        "countsEditedAtUtc": row["counts_edited_at_utc"].isoformat() if row.get("counts_edited_at_utc") else None,
+        "countsHistory": row.get("counts_history") or [],
         "pages": [{"pageNo": p["page_no"], "date": p["page_date"].isoformat(),
                    "photoQuality": p["quality_flag"] or "GOOD"} for p in row.get("pages", [])],
         "photoQualityNote": _QUALITY_NOTES.get(row.get("quality_flag") or "GOOD"),
     }
+
+
+def counts_editable(row: dict[str, Any], now: datetime | None = None) -> bool:
+    """The PC may correct a gate register's counts until the end of the IST day it was
+    uploaded (product owner 2026-11-03: PCs make mistakes reporting the numbers)."""
+    created = row.get("created_at_utc")
+    return bool(created) and ist_day(created).date() == ist_day(now).date()
 
 
 def _own_gate_pass(connection: Connection, tenant_id: str, gate_pass_id: UUID, actor_id: str) -> dict[str, Any]:
@@ -439,8 +451,11 @@ def submit_counts(
 ) -> dict[str, Any]:
     _authorize(connection, tenant_id, principal, client, _UPDATE)
     row = _own_gate_pass(connection, tenant_id, gate_pass_id, principal.subject)
-    if row["completed_at_utc"] is not None:
-        raise HTTPException(status_code=409, detail="This gate pass is already finished.")
+    # Counts already entered are corrected only on the day the register was uploaded (2026-11-03).
+    editing = row["counts_submitted_at_utc"] is not None
+    if editing and not counts_editable(row):
+        raise HTTPException(status_code=409, detail="The counts can be corrected only on the day the gate "
+                                                    "register was uploaded.")
     day_counts = None
     if command.days:
         covers = gate_pass_covers(row["business_date"])
@@ -482,6 +497,17 @@ def submit_counts(
     not_notified = declared - intimated if intimated is not None else None
     settled = divergence == "NONE" or (intimated is not None and divergence == "MISSING_FILES")
     pending = max(intimated - files, 0) if intimated is not None else None
+    if editing:
+        before = {"newDeliveries": row["new_deliveries"], "notNotifiedToPc": row.get("not_notified_count"),
+                  "stockTransfers": row["stock_transfers"], "testDrives": row["test_drives"],
+                  "otherCount": row["other_count"], "otherNote": row["other_note"], "dayCounts": row.get("day_counts"),
+                  "replacedAtUtc": datetime.now(UTC).isoformat(), "replacedBy": principal.subject}
+        connection.execute(
+            text("UPDATE auditcore.p2_gate_passes SET counts_history = counts_history || CAST(:h AS jsonb), "
+                 "counts_edit_count = counts_edit_count + 1, counts_edited_at_utc = now() "
+                 "WHERE tenant_id = :t AND gate_pass_id = :i"),
+            {"h": json.dumps([before], default=str), "t": tenant_id, "i": str(gate_pass_id)},
+        )
     connection.execute(
         text(
             """
@@ -503,7 +529,12 @@ def submit_counts(
         close_gate_pass_tasks(connection, tenant_id=tenant_id, outlet_id=row["outlet_id"],
                               business_date=row["business_date"])
     task_raised = False
-    if not_notified:
+    if editing:
+        # The Team Lead's task follows the corrected numbers.
+        fresh = _gate_pass_row(connection, tenant_id, gate_pass_id)
+        task_raised = _sync_not_notified_task(connection, tenant_id, fresh, principal.subject,
+                                              not_notified=not_notified or 0, not_uploaded=pending or 0)
+    elif not_notified:
         fresh = _gate_pass_row(connection, tenant_id, gate_pass_id)
         _raise_delivery_not_notified(connection, tenant_id, fresh, principal.subject, not_notified=not_notified,
                                      not_uploaded=pending or 0)
@@ -559,6 +590,61 @@ def _raise_delivery_not_notified(connection: Connection, tenant_id: str, row: di
                  "actor_role_code, details) VALUES (:t, :id, NULL, 'RAISED', :a, 'PC', CAST(:d AS jsonb))"),
             {"t": tenant_id, "id": str(task_id), "a": actor_id, "d": json.dumps({"gatePassId": str(row["gate_pass_id"])})},
         )
+
+
+def _sync_not_notified_task(connection: Connection, tenant_id: str, row: dict[str, Any], actor_id: str, *,
+                            not_notified: int, not_uploaded: int) -> bool:
+    """After the PC corrects the counts (2026-11-03): the "delivery not notified" task of the
+    gate register says the corrected numbers -- raised if there was none, opened again if the
+    Team Lead had closed it, cancelled when nothing is left not intimated. True when a task
+    is open for the Team Lead afterwards."""
+    key = f"gatepass:{row['gate_pass_id']}:{TASK_DELIVERY_NOT_NOTIFIED}"
+    task = connection.execute(
+        text("SELECT task_id, task_status FROM auditcore.p2_tasks WHERE tenant_id = :t AND dedupe_key = :k"),
+        {"t": tenant_id, "k": key},
+    ).mappings().one_or_none()
+    if task is None:
+        if not_notified:
+            _raise_delivery_not_notified(connection, tenant_id, row, actor_id, not_notified=not_notified,
+                                         not_uploaded=not_uploaded)
+            return True
+        return False
+    open_ = task["task_status"] not in ("VERIFIED_COMPLETE", "CANCELLED", "FAILED", "DEAD_LETTER")
+    if not not_notified:
+        if open_:
+            connection.execute(
+                text("UPDATE auditcore.p2_tasks SET task_status = 'CANCELLED', updated_at_utc = now(), "
+                     "completion_result = CAST(:r AS jsonb) WHERE tenant_id = :t AND task_id = :id"),
+                {"r": json.dumps({"note": "The PC corrected the gate register: every delivery was intimated."}),
+                 "t": tenant_id, "id": task["task_id"]},
+            )
+        return False
+    day = row["business_date"]
+    description = (f"The gate register of {row['outlet_name']} for {gate_pass_day_label(day)} lists "
+                   f"{row['new_deliveries']} deliveries; {row['delivery_files']} of that day are uploaded in the tool. "
+                   f"{row['pc_name']} says {not_notified} {'delivery was' if not_notified == 1 else 'deliveries were'} "
+                   f"not intimated to them by the dealership"
+                   + (f", and {not_uploaded} {'is' if not_uploaded == 1 else 'are'} still to be uploaded by them."
+                      if not_uploaded else ".")
+                   + f" (Counts corrected by the PC, {int(row.get('counts_edit_count') or 0)}x.)")
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_tasks
+            SET description = :d, updated_at_utc = now(),
+                reference = reference || CAST(:ref AS jsonb),
+                verified_at_utc = CASE WHEN task_status IN ('VERIFIED_COMPLETE','CANCELLED') THEN NULL
+                                       ELSE verified_at_utc END,
+                task_status = CASE WHEN task_status IN ('VERIFIED_COMPLETE','CANCELLED') THEN 'READY'
+                                   ELSE task_status END
+            WHERE tenant_id = :t AND task_id = :id
+            """
+        ),
+        {"d": description, "t": tenant_id, "id": task["task_id"],
+         "ref": json.dumps({"declared": row["new_deliveries"], "deliveryFiles": row["delivery_files"],
+                            "missing": not_notified, "notUploadedByPc": not_uploaded, "countsCorrected": True})},
+    )
+    return True
 
 
 @router.post("/gate-passes/{gate_pass_id}/answer")
@@ -849,6 +935,19 @@ def _team_leads(connection: Connection, tenant_id: str, outlets: list[dict[str, 
                         and (r["outlet_id"] is None or str(r["outlet_id"]) == oid)})
         out[oid] = found
     return out
+
+
+@router.get("/gate-passes/{gate_pass_id}")
+def get_own_gate_pass(
+    tenant_id: str,
+    gate_pass_id: UUID,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """The PC's own gate register, to correct its counts on the day it was uploaded (2026-11-03)."""
+    _authorize(connection, tenant_id, principal, client, _READ)
+    return {"gatePass": _public_gate_pass(_own_gate_pass(connection, tenant_id, gate_pass_id, principal.subject))}
 
 
 @router.get("/gate-passes/{gate_pass_id}/image-url")
