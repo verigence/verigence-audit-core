@@ -507,6 +507,16 @@ def loan_without_receipt(
     customers = journey_customer_names(connection, tenant_id=tenant_id, journey_id=journey_id) if names else ()
     if any(names_financier(c, n, customer_names=customers) for c in candidates for n in names):
         return None
+    # The customer ledger records the loan credit (the sanction less the
+    # lender's charges): that is the money received (live 2026-11-02:
+    # Rs 12,50,000 credited against a sanction of Rs 12,57,000).
+    from audit_core.uc03_ledger_receipts import ledger_loan_credit
+
+    credited = ledger_loan_credit(connection, tenant_id=tenant_id, journey_id=journey_id, loan=letter["amount"])
+    if credited is not None:
+        return {**letter, "amount": _money(credited),
+                "note": "No dealership receipt for the loan amount; the loan credit the customer ledger records "
+                        f"against the Bank Approval Letter's sanction of Rs {letter['amount']:,.0f}."}
     return {**letter, "amount": _money(letter["amount"]),
             "note": "No dealership receipt for the loan amount; taken from the Bank Approval Letter "
                     "(sanctioned amount)."}
@@ -1108,6 +1118,34 @@ def _near(value: Any, amount: Decimal, tolerance: Decimal) -> bool:
     return figure is not None and abs(figure - amount) <= tolerance
 
 
+# The dealer's statement and the invoice agree on the vehicle's net price
+# within the NDC / cost sheet tolerance (product owner 2026-10-28: Rs 100).
+_PRICE_TOLERANCE = Decimal(100)
+
+
+def _invoice_discounts_inside_the_price(all_rows: list[dict[str, Any]], discount_rows: list[dict[str, Any]]) -> None:
+    """The dealer's statement prices the vehicle net of the invoice's discount:
+    the cost sheet's ex-showroom equals the invoice's less its discounts (live
+    2026-11-02, Chinmay Kumar Gajendra: cost sheet Rs 16,89,901 = invoice
+    Rs 17,39,900 less Rs 49,999.60). The discount is already in the price the
+    statement charges: it is not given a second time, and the two prices
+    agree."""
+    vehicle = next((r for r in all_rows if r["key"] == "ex_showroom_price"), None)
+    if vehicle is None or vehicle.get("billedFrom") != "document" or vehicle.get("invoiced") is None:
+        return
+    on_invoice = [r for r in discount_rows if r["currentSource"] == "invoice" and r["current"] is not None]
+    if not on_invoice:
+        return
+    net = _dec(vehicle["invoiced"]) - sum((Decimal(r["current"]) for r in on_invoice), Decimal(0))
+    if abs(net - _dec(vehicle["billed"])) > _PRICE_TOLERANCE:
+        return
+    vehicle["flags"] = [f for f in vehicle["flags"] if f != "INVOICES_DISAGREE"]
+    for row in on_invoice:
+        row["current"], row["currentSource"], row["variance"] = None, None, None
+        row["inPrice"] = True
+        row["flags"] = [f for f in row["flags"] if f not in _STANDARD_FLAGS]
+
+
 def _one_benefit_per_figure(discount_rows: list[dict[str, Any]]) -> None:
     """One benefit printed by two billing documents counts once (product owner
     2026-11-02).
@@ -1428,6 +1466,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     for row in discount_rows:
         _settle_discount(row, situation, mr_key=mr_key)
 
+    _invoice_discounts_inside_the_price(all_rows, discount_rows)
     _one_benefit_per_figure(discount_rows)
     _link_credit_notes(credit_notes, discount_rows)
     insurance["invoiceOnFile"] = _insurance_accounted(documents, sources, selection)

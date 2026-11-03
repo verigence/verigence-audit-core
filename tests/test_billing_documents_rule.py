@@ -218,3 +218,20 @@ def test_an_invoice_discount_the_ndc_does_not_show_is_a_check_not_an_addition(jo
     oem = _benefit(view, "CASH_DISCOUNT")
     assert oem["current"] is None and "INVOICES_DISAGREE" in oem["flags"]
     assert D(view["summary"]["discounts"]["current"]) == D(before["summary"]["discounts"]["current"])
+
+
+def test_an_invoice_discount_already_in_the_statement_price_is_not_given_twice(journey) -> None:
+    """Live 2026-11-02 (Chinmay Kumar Gajendra): the cost sheet prices the
+    vehicle at the invoice's price less the invoice's discount."""
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _source(journey, "ex_showroom_price", "cost_sheet", "847000")
+    _source(journey, "accessories_cost", "cost_sheet", "10000")
+    from test_uc03_account_statement import _sync as sync
+
+    sync(journey)
+    add_ready_document(journey, "customer_invoice_dms", process_area="DELIVERY", **OEM_DISCOUNT_INVOICE)
+    view = _deal(journey)
+    oem = _benefit(view, "CASH_DISCOUNT")
+    assert oem["current"] is None and oem["inPrice"] is True
+    vehicle = _row(view, "ex_showroom_price")
+    assert D(vehicle["billed"]) == D(847000) and "INVOICES_DISAGREE" not in vehicle["flags"]

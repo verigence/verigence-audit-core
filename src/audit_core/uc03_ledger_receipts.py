@@ -187,4 +187,26 @@ def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID)
     return out
 
 
-__all__ = ["ledger_receipts", "money_in"]
+def ledger_loan_credit(connection: Connection, *, tenant_id: str, journey_id: UUID, loan: Decimal) -> Decimal | None:
+    """The money-in posting of the customer ledger that is the loan: the
+    largest one between the loan amount less the lender's charges (2%) and
+    the loan amount. None when the ledger shows none."""
+    from audit_core.uc03_account_statement import (
+        KIND_TALLY,
+        combined_tally_rows,
+        line_rows,
+        load_ledger_documents,
+        statement_kind,
+    )
+
+    documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+    tallies = [(d, rows) for d in documents for rows in [line_rows(d["fields"].get("line_items"))]
+               if statement_kind(rows) == KIND_TALLY]
+    if not tallies:
+        return None
+    amounts = [p["amount"] for p in money_in(combined_tally_rows(tallies))
+               if Decimal(loan) * _LOAN_NET_SHARE <= p["amount"] <= Decimal(loan) + 1]
+    return max(amounts) if amounts else None
+
+
+__all__ = ["ledger_loan_credit", "ledger_receipts", "money_in"]
