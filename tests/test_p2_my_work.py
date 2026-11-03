@@ -172,6 +172,8 @@ def test_the_reviewer_tracker(setup):
     assert data["role"] == "REVIEWER"
     [line] = data["outlets"]
     assert (line["journeysWorked"], line["reviewsClosed"], line["tasksClosed"], line["tasksPending"]) == (1, 1, 1, 1)
+    [today] = data["days"]                                          # the same work, on today's row
+    assert (today["totals"]["journeysWorked"], today["totals"]["reviewsClosed"], today["totals"]["tasksClosed"]) == (1, 1, 1)
 
 
 # --------------------------------------------------------------------------- check-out
@@ -214,3 +216,59 @@ def test_a_satellite_has_no_gate_register_day_before_3_november(setup):
         from datetime import date
         days = my_work.gate_register(connection, s.journey.tenant_id, outlets, date(2026, 10, 30), date(2026, 11, 4))
     assert [d["date"] for d in days[str(s.journey.outlet_id)]] == ["2026-11-03", "2026-11-04"]
+
+
+# --------------------------------------------------------------------------- the Tracker, day by day (2026-11-03)
+
+def test_the_tracker_is_day_by_day_and_counts_journeys_completed(setup):
+    """Each day of the period has its own row per outlet, newest first; a delivery file closed
+    today (every mandatory document in, no PC document task open) is a journey completed today."""
+    s = setup
+    _delivery_file(s)                                               # a delivery page uploaded today
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.journeys SET created_by_actor_id=:a WHERE tenant_id=:t AND journey_id=:j"),
+                           {"a": s.journey.actor_id, "t": s.journey.tenant_id, "j": str(s.journey.journey_id)})
+        connection.execute(
+            text("INSERT INTO auditcore.p2_stage_gate_state (tenant_id, journey_id, stage_code, gate_key, "
+                 "gate_status, details) VALUES (:t, :j, 'DELIVERY', 'REQUIRED_DOCUMENTS', 'PASS', '{\"missing\": []}')"),
+            {"t": s.journey.tenant_id, "j": str(s.journey.journey_id)})
+    today = ist_day().date()
+    data = _work(s, **{"from": (today - timedelta(days=6)).isoformat(), "to": today.isoformat()}).json()
+    assert [d["date"] for d in data["days"]] == [(today - timedelta(days=i)).isoformat() for i in range(7)]
+    first = data["days"][0]
+    [line] = first["outlets"]
+    assert line["outletId"] == str(s.journey.outlet_id)
+    assert line["deliveriesUpdated"] == 1 and line["journeysCompleted"] == 1
+    assert first["totals"]["journeysCompleted"] == 1
+    assert all(d["totals"]["journeysUploaded"] == 0 for d in data["days"][1:])
+    assert data["outlets"][0]["journeysCompleted"] == 1 and data["totals"]["journeysCompleted"] == 1
+    # A Sunday has no gate register day; any other day carries the outlet's entry.
+    for d in data["days"]:
+        entry = d["outlets"][0]["gateRegister"]
+        assert (entry is None) == (datetime.fromisoformat(d["date"]).isoweekday() == 7)
+
+
+def test_a_journey_with_a_document_task_open_is_not_completed(setup):
+    s = setup
+    _delivery_file(s)
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.journeys SET created_by_actor_id=:a WHERE tenant_id=:t AND journey_id=:j"),
+                           {"a": s.journey.actor_id, "t": s.journey.tenant_id, "j": str(s.journey.journey_id)})
+        connection.execute(
+            text("INSERT INTO auditcore.p2_stage_gate_state (tenant_id, journey_id, stage_code, gate_key, "
+                 "gate_status, details) VALUES (:t, :j, 'DELIVERY', 'REQUIRED_DOCUMENTS', 'PASS', '{\"missing\": []}')"),
+            {"t": s.journey.tenant_id, "j": str(s.journey.journey_id)})
+    _journey_task(s, role="PC", task_type="DOCUMENT_MISSING")
+    today = ist_day().date()
+    data = _work(s, **{"from": today.isoformat(), "to": today.isoformat()}).json()
+    assert data["totals"]["journeysCompleted"] == 0 and data["days"][0]["totals"]["journeysCompleted"] == 0
+
+
+def test_a_month_is_allowed(setup):
+    s = setup
+    today = ist_day().date()
+    month = _work(s, **{"from": (today - timedelta(days=30)).isoformat(), "to": today.isoformat()})
+    assert month.status_code == 200, month.text
+    assert len(month.json()["days"]) == 31

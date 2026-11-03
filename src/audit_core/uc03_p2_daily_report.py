@@ -876,7 +876,7 @@ def delivery_files_closed(
             )
             SELECT j.journey_id, j.journey_reference, j.created_by_actor_id AS pc_actor_id,
                    COALESCE(c.legal_name, c.display_name) AS customer_name,
-                   d.dealer_name, o.outlet_name, o.outlet_code,
+                   d.dealer_name, j.outlet_id, o.outlet_name, o.outlet_code,
                    GREATEST(dv.last_upload, dt.last_closed) AS closed_at
             FROM delivery dv
             JOIN auditcore.journeys j ON j.tenant_id=:t AND j.journey_id=dv.journey_id
@@ -916,6 +916,7 @@ def delivery_files_closed(
         file = {
             "journeyId": str(row["journey_id"]), "journeyReference": row["journey_reference"],
             "customerName": row["customer_name"], "dealerName": row["dealer_name"],
+            "outletId": str(row["outlet_id"]) if row["outlet_id"] else None,
             "outletName": row["outlet_name"], "outletCode": row["outlet_code"],
             "pcActorId": pc or None, "pcName": names.get(pc),
             "closedAtUtc": row["closed_at"].isoformat() if row["closed_at"] else None,
