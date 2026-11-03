@@ -173,6 +173,7 @@ _CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 # the dealer or of the certificate of deposit.
 FREE_ACCESSORIES_KEY = "ACCESSORIES_KIT"
 _ACCESSORIES_FREE = re.compile(r"ACCESSORIES ?\(?FREE\)?")
+_ADDED_KIT = re.compile(r"\bKIT\b|ACCESSOR")
 SCRAPPAGE_DEALER_KEY = "SCRAPPAGE_BONUS_DEALER"
 SCRAPPAGE_COD_KEY = "SCRAPPAGE_BONUS_COD"
 # Discounts, to the canonical discount keys the Deal already uses
@@ -392,6 +393,13 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             give("DISCOUNT", FREE_ACCESSORIES_KEY, amount)
             continue
         charge = next((k for k, pattern in _CHARGES if pattern.fullmatch(label)), None)
+        if charge == "other_charges" and _ADDED_KIT.search(label):
+            # A kit written into another row of the Offer Letter ("PERMIT Add
+            # Boss kit 18,398" beside "ACCESSORIES Free 30,000": the kit costs
+            # Rs 48,398, the ledger's and the accessory invoice's figure) is
+            # more accessories, not an other charge (2026-11-03).
+            give("COMMERCIAL", "accessories_cost", amount, "ADDED_KIT")
+            continue
         if charge is not None:
             give("COMMERCIAL", charge, amount, _other_charge_row(label) if charge == "other_charges" else "")
             continue

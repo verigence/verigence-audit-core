@@ -164,3 +164,50 @@ def test_the_offer_letter_without_its_ex_showroom_row_reads_the_vehicle_price() 
     printed = read_statement([{"particulars_raw": "VEHICLE PRICE", "debit_amount": 1928561},
                               {"particulars_raw": "EX SHOWROOM (1-2)", "debit_amount": 1900000}, *base])
     assert printed.components["ex_showroom_price"] == D(1900000)
+
+
+def test_a_kit_written_into_another_row_of_the_offer_letter_is_accessories() -> None:
+    """Live 2026-11-03 (SHI-SS-261031-008): "ACCESSORIES Free 30,000" and, in
+    the PERMIT row, "Add Boss kit 18,398": the kit costs Rs 48,398 (the
+    ledger's and the accessory invoice's figure), Rs 30,000 of it free."""
+    from decimal import Decimal as D
+
+    from audit_core.uc03_account_statement import read_statement
+
+    read = read_statement([{"particulars_raw": "EX SHOWROOM (1-2)", "debit_amount": 1748401},
+                           {"particulars_raw": "ACCESSORIES Free", "debit_amount": 30000},
+                           {"particulars_raw": "PERMIT Add cash kit", "debit_amount": 18398},
+                           {"particulars_raw": "PERMIT", "debit_amount": 2500}])
+    assert read.components["accessories_cost"] == D(48398) and read.components["other_charges"] == D(2500)
+    assert read.discounts == {"ACCESSORIES_KIT": D(30000)} and read.conflicts == []
+
+
+OFFER_LETTER = [  # SHI-SS-261031-008, the Offer Letter read as its NDC
+    {"particulars_raw": "VEHICLE PRICE", "debit_amount": 1748401},
+    {"particulars_raw": "EX SHOWROOM (1-2)", "debit_amount": 1748401},
+    {"particulars_raw": "TCS", "debit_amount": 17484}, {"particulars_raw": "INSURANCE AMOUNT", "debit_amount": 72391},
+    {"particulars_raw": "RTO", "debit_amount": 133185}, {"particulars_raw": "ACCESSORIES Free", "debit_amount": 30000},
+    {"particulars_raw": "PERMIT Add cash kit", "debit_amount": 18398},
+    {"particulars_raw": "EXCHANGE/LOYALTY BONUS", "credit_amount": 20000},
+    {"particulars_raw": "BOOKING AMOUNT", "credit_amount": 21000},
+    {"particulars_raw": "FINANCE AMOUNT", "credit_amount": 950000},
+]
+
+
+def test_one_benefit_the_ndc_and_the_ledger_name_differently_counts_once(journey) -> None:
+    """Live 2026-11-03 (SHI-SS-261031-008): the Offer Letter's "Exchange /
+    loyalty bonus" Rs 20,000 and the ledger's credit note "SCRAPPAGE BONUS"
+    Rs 20,000 were both counted, the payable Rs 20,000 short. The ledger's
+    credit note names the benefit; the NDC's row checks it."""
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _ledger(journey, BAPU)
+    _ledger(journey, OFFER_LETTER)
+    _sync(journey)
+    view = _deal(journey)
+    exchange, scrappage = _benefit(view, "EXCHANGE_BONUS"), _benefit(view, "SCRAPPAGE_BONUS_DEALER")
+    assert exchange["current"] is None and exchange["sameAs"]["key"] == "SCRAPPAGE_BONUS_DEALER"
+    assert D(scrappage["current"]) == D(20000)
+    assert D(_benefit(view, "ACCESSORIES_KIT")["current"]) == D(30000)
+    assert D(view["summary"]["discounts"]["current"]) == D("55000.01")
+    # The kit: Rs 30,000 free plus Rs 18,398 written into the PERMIT row.
+    assert D(_row(view, "accessories_cost")["current"]) == D(48398)

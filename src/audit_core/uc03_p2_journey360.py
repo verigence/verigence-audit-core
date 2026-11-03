@@ -1228,6 +1228,25 @@ def _one_benefit_per_figure(discount_rows: list[dict[str, Any]], *, offer_on_fil
         elif offer_on_file:
             row["current"], row["currentSource"], row["variance"] = None, None, None
             row["flags"] = [*(f for f in row["flags"] if f not in _STANDARD_FLAGS), "NOT_ON_STATEMENT"]
+    # The NDC and the dealer's ledger give one benefit under two names (live
+    # 2026-11-03, SHI-SS-261031-008: the Offer Letter's "Exchange / loyalty
+    # bonus" Rs 20,000 and the ledger's credit note "SCRAPPAGE BONUS" Rs 20,000,
+    # both counted, the payable Rs 20,000 short). The ledger's credit note names
+    # it (product owner 2026-11-02: the ledger / credit-note name decides); the
+    # NDC's row checks it. Each ledger benefit stands for one NDC row only.
+    tally = _norm_type(TALLY_LEDGER_TYPE)
+    by_ledger = [r for r in discount_rows if from_books(r, frozenset({tally})) and not from_books(r, _STATEMENT_NORM)]
+    paired: set[int] = set()
+    for row in discount_rows:
+        if row["current"] is None or not from_books(row, _STATEMENT_NORM) or from_books(row, frozenset({tally})):
+            continue
+        amount = Decimal(row["current"])
+        same = next((r for r in by_ledger if id(r) not in paired and r["key"] != row["key"]
+                     and _near(r["current"], amount, _SAME_BENEFIT_TOLERANCE)), None)
+        if same is not None:
+            paired.add(id(same))
+            same["sources"] = [*same["sources"], *[{**e, "checks": True} for e in row["sources"]]]
+            _take_back(row, same_as=same)
 
 
 def _benefit_row_for(discount_rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
