@@ -343,3 +343,30 @@ def test_a_figure_within_ten_rupees_of_its_standard_is_not_flagged() -> None:
     assert _flags("COMMERCIAL", "999901.32", None, "999901", None) == []
     assert _flags("COMMERCIAL", "999901.32", None, "999881", None) == ["BELOW_STANDARD"]
     assert _measured_flags("COMMERCIAL", [], "999901", "999901.32") == []
+
+
+def test_a_bh_series_rto_is_not_compared_with_the_price_master(journey) -> None:
+    """Product owner 2026-11-03: "Don't compare BH RTO". The price master's
+    RTO figure is a state registration's; SHI-SS-261027-007's BH-series RTO
+    of Rs 18,500 was held Rs 62,232 "undercharged" against Rs 80,732. The RTO
+    challan's two-year road tax tells a BH registration."""
+    from audit_core.uc03_p2_journey360 import _bh_series, _rto_without_standard
+
+    def bh() -> bool:
+        with journey.engine.begin() as c:
+            set_tenant_context(c, journey.tenant_id)
+            return _bh_series(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+    add_ready_document(journey, "rto_challan", process_area="DELIVERY", line_items=[
+        {"description_raw": "MV Tax(14-Oct-2026 to One Time)", "amount": 130000}])
+    assert bh() is False
+    add_ready_document(journey, "rto_challan", process_area="DELIVERY", line_items=[
+        {"description_raw": "MV Tax(14-Oct-2026 to 13-Oct-2028)", "amount": 11299}])
+    assert bh() is True
+
+    rows = [{"key": "road_tax_registration", "standard": "80732.11", "variance": "-62232.11",
+             "flags": ["BELOW_STANDARD", "INVOICES_DISAGREE"]},
+            {"key": "insurance_amount", "standard": "41415", "variance": "-2034", "flags": ["BELOW_STANDARD"]}]
+    _rto_without_standard(rows)
+    assert (rows[0]["standard"], rows[0]["variance"], rows[0]["flags"]) == (None, None, ["INVOICES_DISAGREE"])
+    assert rows[1]["standard"] == "41415"
