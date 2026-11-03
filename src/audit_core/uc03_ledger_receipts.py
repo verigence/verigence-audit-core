@@ -187,6 +187,14 @@ def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID)
     return out
 
 
+def ledger_financier_credit(rows: list[dict[str, Any]]) -> Decimal | None:
+    """The financier's journal posting credited to the customer (its D/O), the
+    largest when several; None when the ledger shows none."""
+    amounts = [p["amount"] for p in money_in(rows)
+               if _JOURNAL_VOUCHER.fullmatch(p["voucherType"]) and _FINANCIER.fullmatch(_label(p["particulars"]))]
+    return max(amounts) if amounts else None
+
+
 def ledger_loan_credit(connection: Connection, *, tenant_id: str, journey_id: UUID, loan: Decimal) -> Decimal | None:
     """The money-in posting of the customer ledger that is the loan: the
     largest one between the loan amount less the lender's charges (2%) and
@@ -209,4 +217,4 @@ def ledger_loan_credit(connection: Connection, *, tenant_id: str, journey_id: UU
     return max(amounts) if amounts else None
 
 
-__all__ = ["ledger_loan_credit", "ledger_receipts", "money_in"]
+__all__ = ["ledger_financier_credit", "ledger_loan_credit", "ledger_receipts", "money_in"]

@@ -140,3 +140,32 @@ def test_a_disbursement_net_of_the_lenders_charges_is_the_loan(journey) -> None:
         ("PB/26-27/0401", D(582229))]
     # The loan received is the ledger's credit, not the sanction.
     assert D(view["loanWithoutReceipt"]["amount"]) == D(1250000)
+
+
+def test_the_financiers_posting_on_the_ledger_is_the_loan_when_no_statement_gives_one(journey) -> None:
+    """Live 2026-11-02 (a Shivnath booking): no NDC financer
+    line, no settlement, no bank letter; the customer ledger credits
+    "MMFSL MAHINDRA FINANCE TA (52879)" Rs 14,86,991 -- the loan received,
+    counted once and never a customer payment."""
+    from audit_core.uc03_account_statement import statement_loan
+    from audit_core.uc03_p2_journey360 import _loan_counted, _paid
+
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _ledger(journey, [
+        {"entry_date": "2026-09-20", "particulars_raw": "ICICI BANK (788005000453)", "voucher_type": "Receipt",
+         "voucher_number": "PB/26-27/0300", "credit_amount": 21000, "running_balance": "21,000.00 Cr"},
+        {"entry_date": "2026-10-18", "particulars_raw": "MMFSL MAHINDRA FINANCE TA (52879)",
+         "voucher_type": "Journal_NonGST", "voucher_number": "MT26100502299781", "credit_amount": 1486991,
+         "running_balance": "15,07,991.00 Cr"},
+    ])
+    _sync(journey)
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        stated = statement_loan(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        loan = _loan_counted(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                             paid=_paid(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id))
+    assert (D(stated["loan"]), stated["source"]) == (D(1486991), "Customer ledger (financier's posting)")
+    assert D(loan["amount"]) == D(1486991)
+    view = _payments(journey)
+    assert [(i["receiptNumber"], D(i["amount"])) for i in view["items"] if i.get("fromLedger")] == [
+        ("PB/26-27/0300", D(21000))]
