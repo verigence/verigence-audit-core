@@ -100,3 +100,46 @@ def test_the_ledger_prices_the_lines_no_ndc_gives_and_confirms_the_insurance(jou
     assert [c["number"] for c in scrappage["paidByCreditNotes"]] == ["UOV27C000046"]
     assert D(_benefit(view, "ADDITIONAL_DISCOUNT")["current"]) == D("5000.01")
     assert D(view["summary"]["discounts"]["current"]) == D("25000.01")
+
+
+def test_the_offer_letter_payment_details_form_is_an_ndc() -> None:
+    """Live 2026-11-03: a dealer's "OFFER LETTER / PAYMENT DETAILS" form is its
+    NDC; the rows as the document reader returns them (made-up figures)."""
+    from decimal import Decimal as D
+
+    from audit_core.uc03_account_statement import (
+        KIND_FORM,
+        read_statement,
+        statement_kind,
+    )
+
+    rows = [
+        {"particulars_raw": "VEHICLE PRICE", "debit_amount": 1500000},
+        {"particulars_raw": "EX SHOWROOM (1-2)", "debit_amount": 1500000},
+        {"particulars_raw": "TCS", "debit_amount": 15000},
+        {"particulars_raw": "INSURANCE AMOUNT", "debit_amount": 60000},
+        {"particulars_raw": "TEMPORARY REGISTRATION", "debit_amount": 500},
+        {"particulars_raw": "RTO", "debit_amount": 120000},
+        {"particulars_raw": "ACCESSORIES Free", "debit_amount": 25000},
+        {"particulars_raw": "PERMIT Add Basic", "debit_amount": 10000},
+        {"particulars_raw": "ONROAD PRICE", "debit_amount": 1705500},
+        {"particulars_raw": "BALANCE PAYMENT", "debit_amount": 500},
+        {"particulars_raw": "EXCHANGE VEHICLE AMT", "credit_amount": 300000},
+        {"particulars_raw": "EXCHANGE/LOYALTY BONUS", "credit_amount": 20000},
+        {"particulars_raw": "ADDITIONAL DISCOUNT", "credit_amount": 5000},
+        {"particulars_raw": "BOOKING AMOUNT", "credit_amount": 21000},
+        {"particulars_raw": "FINANCE AMOUNT", "credit_amount": 900000},
+        {"particulars_raw": "SUB TOTAL(17+18+19+20+21+22)", "credit_amount": 1246000},
+        {"particulars_raw": "FINAL PAYMENT", "credit_amount": 1705000},
+        {"entry_date": "2026-10-15", "particulars_raw": "RECEIPT PB/26-27/0759", "voucher_number": "PB/26-27/0759",
+         "credit_amount": 21000, "voucher_type": "RTGS"},
+    ]
+    assert statement_kind(rows) == KIND_FORM
+    read = read_statement(rows)
+    assert read.components == {"ex_showroom_price": D(1500000), "tcs_amount": D(15000), "insurance_amount": D(60000),
+                               "registration_charges": D(120000), "accessories_cost": D(25000),
+                               "other_charges": D(10500)}
+    assert read.discounts == {"ACCESSORIES_KIT": D(25000), "EXCHANGE_BONUS": D(20000),
+                              "ADDITIONAL_DISCOUNT": D(5000)}
+    assert (read.financer, read.printed_total, read.old_vehicle_value) == (D(900000), D(1705500), D(300000))
+    assert read.unmapped == [] and read.conflicts == []
