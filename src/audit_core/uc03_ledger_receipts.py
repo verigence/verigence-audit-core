@@ -34,7 +34,7 @@ from sqlalchemy import Connection, text
 _LOAN_NET_SHARE = Decimal("0.98")
 _RECEIPT_VOUCHER = re.compile(r".*RECEIPT.*")
 _JOURNAL_VOUCHER = re.compile(r".*JOURNAL.*")
-_NOT_MONEY = re.compile(r".*(ROUND ?OFF|CREDIT ?NOTE|DISCOUNT|BONUS|SCHEME|OFFER).*")
+_NOT_MONEY = re.compile(r".*(ROUND(ING|ED)? ?OFF|CREDIT ?NOTE|DISCOUNT|BONUS|SCHEME|OFFER).*")
 _CASH = re.compile(r".*\bCASH\b.*")
 _BANK = re.compile(r".*\b(BANK|NEFT|RTGS|IMPS|UPI|POS)\b.*")
 # A journal from the financier (MMFSL, "... FINANCE ...", "... FIN SERV ...").

@@ -313,7 +313,8 @@ def conclude_product(charge: dict[str, Any], *, on_file: set[str], taken: bool |
 def loan_received(
     *, matched: Decimal | None, disbursement_known: bool, financed: bool, stated: dict[str, Any] | None,
     receipt_amounts: list[Decimal | None], letter: dict[str, Any] | None = None,
-    loan_among_receipts: Decimal | None = None,
+    loan_among_receipts: Decimal | None = None, payable: Decimal | None = None,
+    paid_without_loan: Decimal | None = None,
 ) -> dict[str, Any]:
     """The loan money to count as received, and from where (2026-10-30).
 
@@ -356,6 +357,19 @@ def loan_received(
         return out
     letter_amount = dec((letter or {}).get("amount"))
     if letter_amount is not None:
+        # The letter is the lender's approval, not money received. When the
+        # money on file already pays all but less than half of it, the loan
+        # is among the receipts (a disbursement whose reference does not name
+        # the lender, or net of more than 2% charges): live 2026-11-03, a
+        # Rs 23,20,189 "BOI" RTGS against a Rs 21,40,000 sanction, a Rs 6,84,200
+        # Kotak credit against Rs 7,00,000 -- counted twice, read as excesses.
+        if payable is not None and paid_without_loan is not None \
+                and payable - paid_without_loan < letter_amount / 2:
+            out.update(amount=Decimal(0), source="Bank Approval Letter (sanctioned amount)",
+                       note=f"The money on file already pays the net payable but Rs {max(payable - paid_without_loan, Decimal(0)):,.2f}: "
+                            f"the Bank Approval Letter's loan of Rs {letter_amount:,.2f} is taken to be among the receipts, "
+                            "not counted again.")
+            return out
         out.update(amount=letter_amount, source="Bank Approval Letter (sanctioned amount)", withoutReceipt=True,
                    note="No dealership receipt for the loan amount; taken from the Bank Approval Letter.")
         return out
@@ -550,6 +564,8 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         loan_among_receipts=j360.letter_loan_among_receipts(
             connection, tenant_id=tenant_id, journey_id=journey_id,
             receipt_amounts=[dec(i.get("amount")) for i in counted if not i.get("isLoanReceipt")]),
+        payable=dec(summary.get("payable")),
+        paid_without_loan=receipts + (dec((summary.get("paid") or {}).get("oldVehicle")) or Decimal(0)),
     )
     loan = loan_on_file["amount"] or Decimal(0)
     refunds = loan_on_file["refunds"]

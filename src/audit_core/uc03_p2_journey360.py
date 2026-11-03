@@ -581,7 +581,8 @@ def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[s
             "countedAmounts": [Decimal(r["amount"]) for r in counted] + from_ledger}
 
 
-def _loan_counted(connection: Connection, *, tenant_id: str, journey_id: UUID, paid: dict[str, Any]) -> dict[str, Any]:
+def _loan_counted(connection: Connection, *, tenant_id: str, journey_id: UUID, paid: dict[str, Any],
+                  payable: Decimal | None = None, paid_without_loan: Decimal | None = None) -> dict[str, Any]:
     """The loan counted as received, by the Audit Summary's own rule
     (uc03_p2_audit_summary.loan_received): the disbursement on the finance
     record, else the dealer's statement financier row, else the bank letter's
@@ -604,6 +605,7 @@ def _loan_counted(connection: Connection, *, tenant_id: str, journey_id: UUID, p
                                     receipt_amounts=paid["countedAmounts"]),
         loan_among_receipts=letter_loan_among_receipts(connection, tenant_id=tenant_id, journey_id=journey_id,
                                                        receipt_amounts=paid["customerAmounts"]),
+        payable=payable, paid_without_loan=paid_without_loan,
     )
 
 
@@ -1540,23 +1542,26 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # discount set (2026-10-20, D-28).
     current_vs_standard = _minus(net_cur, net_std) if net_cur is not None and net_std is not None else None
 
+    # What the customer owes is the current net; with none worked out it is
+    # unknown, never the price master's standard (2026-11-02, Deal defect 12).
+    # Until a billing document charges the vehicle's own price (the NDC, the
+    # cost sheet or the vehicle invoice), what the other bills add up to is
+    # no payable (live 2026-11-03: an RTO challan's Rs 10,000 stood as the
+    # payable of an Rs 18.6 lakh deal; on a closed file with no vehicle bill
+    # the price read "not invoiced", 0, and the payable was Rs 2,161).
+    price_billed = any(r["key"] == "ex_showroom_price" and (_dec(r["current"]) or Decimal(0)) > 0
+                       for r in all_rows if not r.get("excluded"))
+    payable = net_cur if price_billed else None
     paid = _paid(connection, tenant_id=tenant_id, journey_id=journey_id)
-    # The loan as the Audit Summary counts it, so both give one balance.
-    loan_view = _loan_counted(connection, tenant_id=tenant_id, journey_id=journey_id, paid=paid)
-    loan = loan_view["amount"] or Decimal(0)
-    refunds = loan_view["refunds"] or Decimal(0)
     # The old vehicle the NDC takes against the price ("Exchanged vehicle",
     # or its "Trade in value" row) is paid in kind (2026-11-02, Deal defect 4).
     old_vehicle = _old_vehicle_in_kind(declared) if statement_policy else None
+    # The loan as the Audit Summary counts it, so both give one balance.
+    loan_view = _loan_counted(connection, tenant_id=tenant_id, journey_id=journey_id, paid=paid,
+                              payable=_dec(payable), paid_without_loan=paid["receipts"] + (old_vehicle or Decimal(0)))
+    loan = loan_view["amount"] or Decimal(0)
+    refunds = loan_view["refunds"] or Decimal(0)
     paid_total = paid["receipts"] + loan + (old_vehicle or Decimal(0)) - refunds
-    # What the customer owes is the current net; with none worked out it is
-    # unknown, never the price master's standard (2026-11-02, Deal defect 12).
-    # While the vehicle's own price awaits its bill (no NDC, cost sheet or
-    # vehicle invoice gives it), what the other bills add up to is no payable
-    # (live 2026-11-03: an RTO challan's Rs 10,000 stood as the payable of an
-    # Rs 18.6 lakh deal, so the loan and the receipts read as an excess).
-    price_awaited = any(r["key"] == "ex_showroom_price" and r["awaiting"] for r in all_rows)
-    payable = None if price_awaited else net_cur
     invoiced = sum(1 for r in counted_rows if r["billed"] is not None)
     return {
         "sku": _deal_sku_block(sku, price_plan),

@@ -166,3 +166,26 @@ def test_the_deal_balance_is_checked_against_the_customer_ledger() -> None:
     assert differs["conclusion"] == "EXCEPTION" and "due (Dr)" in differs["reason"]
     assert ledger_check(ledger, {"balance": None})["conclusion"] == "CANNOT_DETERMINE"
     assert ledger_check(None, {"balance": "1"}) is None
+
+
+def test_the_bank_letters_loan_is_not_counted_again_when_the_receipts_already_pay_the_deal() -> None:
+    """Live 2026-11-03: a Rs 23,20,189 "BOI" RTGS against a Rs 21,40,000
+    sanction; the letter's loan was added on top and read as an excess."""
+    from audit_core.uc03_p2_audit_summary import loan_received
+
+    letter = {"amount": "2140000"}
+    on_top = loan_received(matched=None, disbursement_known=False, financed=True, stated=None,
+                           receipt_amounts=[D(2320189)], letter=letter,
+                           payable=D(2393619), paid_without_loan=D(2320190))
+    assert on_top["amount"] == D(0) and not on_top["withoutReceipt"] and "among the receipts" in on_top["note"]
+    # The receipts leave the loan unpaid: the letter's loan counts, marked.
+    owed = loan_received(matched=None, disbursement_known=False, financed=True, stated=None,
+                         receipt_amounts=[D(253619)], letter=letter,
+                         payable=D(2393619), paid_without_loan=D(253619))
+    assert owed["amount"] == D(2140000) and owed["withoutReceipt"]
+
+
+def test_rounding_off_is_not_money_received() -> None:
+    from audit_core.uc03_ledger_receipts import money_in
+
+    assert money_in([{"particulars_raw": "ROUNDING OFF", "voucher_type": "Journal", "credit_amount": 1}]) == []
