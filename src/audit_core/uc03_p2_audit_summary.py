@@ -263,6 +263,24 @@ def conclude_benefit(row: dict[str, Any], *, unknown_results: frozenset[str]) ->
                booked=money(dec(row.get("booking"))), billed=money(given), billedFrom=given_from,
                documents=disagreement(row), eligibility=eligibility,
                proof={"documents": [proof.get("documentType")], "onFile": bool(proof.get("onFile"))} if proof else None)
+    # A figure the Deal does not count is never shown as given (2026-11-03,
+    # SHI-SS-261027-024: the NDC's "Exchange / loyalty bonus" Rs 10,000 is the
+    # ledger's scrappage credit note; the Deal counted it once, this page
+    # listed it twice and asked for an exchange vehicle's RC).
+    same_as = row.get("sameAs")
+    if same_as:
+        out.update(billed=None, billedFrom=None, documents=[], proof=None, conclusion=INFO, reason=(
+            f"The same benefit as {same_as.get('label') or same_as.get('key')}: counted once, on that line."))
+        return out
+    if row.get("inPrice"):
+        out.update(billed=None, billedFrom=None, documents=[], proof=None, conclusion=INFO, reason=(
+            "Already in the vehicle price the dealer's statement charges: not given a second time."))
+        return out
+    if given and row.get("current") is None and {"NOT_ON_STATEMENT", "INVOICES_DISAGREE"} & set(row.get("flags") or []):
+        out.update(billed=None, billedFrom=None, conclusion=DISPUTED, rule="AS-03",
+                   documents=[{"document": given_from, "amount": money(given)}], reason=(
+                       "Printed on the invoice only: the NDC / cost sheet does not give it, so it is not counted."))
+        return out
     if not given:
         if entitled and eligibility == "ELIGIBLE":
             out.update(conclusion=INFO, rule="AS-04", reason="Entitled, not given.")

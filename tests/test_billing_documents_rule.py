@@ -236,3 +236,34 @@ def test_an_invoice_discount_already_in_the_statement_price_is_not_given_twice(j
     assert oem["current"] is None and oem["inPrice"] is True
     vehicle = _row(view, "ex_showroom_price")
     assert D(vehicle["billed"]) == D(847000) and "INVOICES_DISAGREE" not in vehicle["flags"]
+
+
+def test_the_offer_letters_scheme_named_on_it_is_the_invoices_discount_counted_once(journey) -> None:
+    """Live 2026-11-03 (SHI-SS-261027-007; figures scaled to the invoice
+    above): the Offer Letter prices the vehicle at Rs 8,52,000 less a scheme of
+    Rs 5,000 and names the scheme "Corporate discount" on the right; the
+    invoice bills Rs 8,52,000 less a discount whose type it does not print.
+    The deal showed the price Rs 5,000 under, the corporate discount given on
+    top, and the invoice's discount as an "Invoice discount (type not printed)".
+    Product owner: "30k is a corporate discount ... its not invoice discount"."""
+    _statement(journey, [
+        {"particulars_raw": "VEHICLE PRICE", "debit_amount": 852000},
+        {"particulars_raw": "SCHEME", "debit_amount": 5000},
+        {"particulars_raw": "EX SHOWROOM (1-2)", "debit_amount": 847000},
+        {"particulars_raw": "ONROAD PRICE", "debit_amount": 847000},
+        {"particulars_raw": "CORPORATE DISCOUNT", "credit_amount": 5000},
+        {"particulars_raw": "FINANCE AMOUNT", "credit_amount": 800000},
+    ])
+    untyped = {**OEM_DISCOUNT_INVOICE, "line_items": [
+        OEM_DISCOUNT_INVOICE["line_items"][0],
+        {"line_category": "DISCOUNT_LINE", "description_raw": "Discount", "taxable_amount": 4237.29}]}
+    add_ready_document(journey, "customer_invoice_dms", process_area="DELIVERY", **untyped)
+    view = _deal(journey)
+    assert D(_row(view, "ex_showroom_price")["current"]) == D(852000)
+    corporate = _benefit(view, "CORPORATE_PRIVILEGE")
+    assert D(corporate["current"]) == D(5000)
+    invoice_discount = _benefit(view, "UNCLASSIFIED_DISCOUNT")
+    assert invoice_discount["current"] is None and invoice_discount["billed"] is None
+    assert invoice_discount["sameAs"]["key"] == "CORPORATE_PRIVILEGE"
+    assert D(view["summary"]["discounts"]["current"]) == D(5000)
+    assert D(view["summary"]["net"]["current"]) == D(847000)

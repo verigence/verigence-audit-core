@@ -154,10 +154,14 @@ _CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         # every amount on it is 1% of the sale (five live statements, 2026-11-02).
         ("tcs_amount", r"TCS( ON INVOICE)?( \d+(\.\d+)?%)?|W/S BILLING( TCS| TU)? ?(\( ?1 ?%\)|1 ?%)?"),
         ("insurance_amount", r"INSURANCE( AMOUNT| COST)?( \((NORMAL|NIL DEP)\))?"),
-        ("registration_charges", r"REGISTRATION( COST| CHARGES)?( BH| \(BH\)| RTO)?|ONLINE RTO|RTO CHARGES.*|RTO"),
+        # "RTO BH" / "RTO (BH Series)": the Offer Letter's RTO row for a BH-series number (2026-11-03).
+        ("registration_charges",
+         r"REGISTRATION( COST| CHARGES)?( BH| \(BH\)| RTO)?|ONLINE RTO|RTO CHARGES.*|RTO( \(?BH( SERIES)?\)?)?"),
+        # The Offer Letter's "Others" row with "FT" / "Fastag" written on it is
+        # the FASTag (2026-11-03), so it is matched before the other charges.
+        ("fastag_amount", r"(OTHERS )?(FAST ?T?AG( CHARGES)?|FT)"),
         ("other_charges", "|".join(f"(?:{p.pattern})" for _, p in _OTHER_CHARGES)),
         ("accessories_cost", r"ACCESSORIES|SALE OF ACCESSORIES"),
-        ("fastag_amount", r"FAST ?T?AG( CHARGES)?"),
         # Not "RSA COD" / "RSA COP": their amounts are the certificate of
         # deposit bought for a scrappage (Rs 20,700 / 24,143 against an RSA of
         # Rs 2,021 on live statements, 2026-11-02), written in the RSA row.
@@ -198,12 +202,13 @@ _PRINTED_TOTAL = re.compile(r"(NET VALUE|FINAL PRICE|NET RECEIVABLE( \(A ?\+ ?B\
 # The form's own summary rows: figures the dealer wrote from the rows above
 # them, never a charge or a receipt, so they are not "unmapped" and are not
 # read as one. (The net value is read separately, above.)
-# The Offer Letter's "VEHICLE PRICE" and "SCHEME" rows: the Ex Showroom (1-2)
-# row is their difference. When the dealer left that row blank and wrote only
-# the vehicle price (SHI-SS-261027-024, 2026-11-03: Rs 19,28,561, no scheme),
-# the ex-showroom is the vehicle price less the scheme -- the form's own sum.
+# The Offer Letter's "VEHICLE PRICE" and "SCHEME" rows ("Scheme of Month" on
+# another branch's form): the Ex Showroom (1-2) row is their difference. The
+# vehicle price is the ex-showroom price and the scheme a benefit on it
+# (_price_and_scheme), whether or not the dealer wrote the Ex Showroom row
+# (SHI-SS-261027-024, 2026-11-03: only the vehicle price, Rs 19,28,561).
 _VEHICLE_PRICE = re.compile(r"VEHICLE PRICE")
-_SCHEME_ROW = re.compile(r"SCHEME")
+_SCHEME_ROW = re.compile(r"SCHEME( OF (THE )?MONTH)?")
 _SUMMARY = re.compile(
     r"GROSS VALUE|DISCOUNT|TOTAL( COST| RECEIPTS?| \(A\))?|NET AMOUNT RECEIVED( \(E\))?|"
     r"SHORT ?/ ?EXCESS|BALANCE ?(EXCESS ?/ ?SHORTAGE)?( \(C-E\))?|DUE|"
@@ -460,12 +465,60 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             continue
         else:
             (out.components if kind == "COMMERCIAL" else out.discounts)[key] = value
-    vehicle_price = totals.get(("WORKING", "vehicle_price"))
-    if "ex_showroom_price" not in out.components and ("COMMERCIAL", "ex_showroom_price") not in in_conflict \
-            and vehicle_price is not None \
-            and ("WORKING", "vehicle_price") not in in_conflict and ("WORKING", "scheme") not in in_conflict:
-        out.components["ex_showroom_price"] = vehicle_price - totals.get(("WORKING", "scheme"), Decimal(0))
+    _price_and_scheme(out, totals, in_conflict)
     return out
+
+
+# The Offer Letter's right-hand benefits, one of which may be its scheme
+# written again under its name (not the free accessories, which pay for the
+# accessories charged, nor the scrappage bonus).
+_NAMED_BENEFITS = frozenset(key for key, _ in _DISCOUNTS)
+_SAME_SCHEME_TOLERANCE = Decimal(10)
+
+
+def _price_and_scheme(out: StatementRead, totals: dict[tuple[str, str], Decimal],
+                      in_conflict: set[tuple[str, str]]) -> None:
+    """The Offer Letter's "VEHICLE PRICE" is the vehicle's ex-showroom price;
+    its "SCHEME" is a benefit given on it; "EX SHOWROOM (1-2)" is the one less
+    the other (product owner 2026-11-03: the benefits are the ones the NDC
+    shows, of the type it shows; the price is checked against the price
+    master).
+
+    Live, SHI-SS-261027-007: Vehicle price Rs 9,99,901, Scheme Rs 30,000, Ex
+    Showroom (1-2) Rs 9,69,901, and on the right "Corporate discount" Rs
+    30,000. The customer paid the Ex Showroom price plus the charges: the
+    corporate discount is the scheme, named. Read as the Ex Showroom row, the
+    price was Rs 30,000 under the price master and the Rs 30,000 was given a
+    second time.
+
+    * The scheme, when one benefit on the letter has its amount, is that
+      benefit: nothing is added.
+    * Else it is the scheme discount ("Scheme Discount" on the other dealers'
+      forms).
+    * When the three rows do not add up (a figure misread), the Ex Showroom
+      row stands as written and no scheme is read."""
+    if ("WORKING", "vehicle_price") in in_conflict or ("WORKING", "scheme") in in_conflict \
+            or ("COMMERCIAL", "ex_showroom_price") in in_conflict:
+        return
+    vehicle_price = totals.get(("WORKING", "vehicle_price"))
+    if vehicle_price is None:
+        return
+    scheme = totals.get(("WORKING", "scheme"), Decimal(0))
+    printed = out.components.get("ex_showroom_price")
+    if printed is not None and abs(vehicle_price - scheme - printed) > TOLERANCE:
+        if scheme > 0:
+            out.unmapped.append({"label": "SCHEME", "amount": scheme, "why": (
+                "the vehicle price less the scheme is not the Ex Showroom (1-2) written: "
+                "the Ex Showroom row is read as written")})
+        return
+    out.components["ex_showroom_price"] = vehicle_price
+    if scheme <= 0:
+        return
+    named = [key for key, amount in out.discounts.items()
+             if key in _NAMED_BENEFITS and abs(amount - scheme) <= _SAME_SCHEME_TOLERANCE]
+    if len(named) == 1:
+        return  # the scheme, written again on the right under its name
+    out.discounts["CASH_DISCOUNT"] = out.discounts.get("CASH_DISCOUNT", Decimal(0)) + scheme
 
 
 def _other_charge_row(label: str) -> str:

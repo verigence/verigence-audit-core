@@ -477,6 +477,40 @@ def test_cash_limit_tcs_and_payment_before_booking(journey):
     assert "TCS ₹5,000 charged against ₹15,000 due (1% of the ex-showroom price ₹15,00,000; ₹10,000 short)" in result["TCS_SHORT"].reason
 
 
+def test_tcs_is_due_on_the_price_after_the_benefits_given_on_it(journey):
+    """2026-11-03: the dealers charge TCS on what the vehicle is sold for, the
+    ex-showroom price less its discount (SHI-SS-261027-006: Rs 30,59,000 less a
+    scheme of Rs 1,00,000, TCS Rs 29,590). 74 deals were held "short" on the
+    price before the discount. Free accessories pay for the accessories, not
+    the vehicle; a price under the threshold once the benefits are off owes none."""
+    from audit_core.uc03_account_statement import FREE_ACCESSORIES_KEY
+    from audit_core.uc03_p2_audit_rules import _FREE_ACCESSORIES_KEY
+
+    assert _FREE_ACCESSORIES_KEY == FREE_ACCESSORIES_KEY
+    _line(journey, "ex_showroom_price", "3059000", "3059000")
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "3059000")
+    _line(journey, "tcs_amount", "30590", "29590")
+    _source(journey, "COMMERCIAL", "tcs_amount", "tax_invoice_tally", "29590")
+    _discount(journey, "CASH_DISCOUNT", "100000", "100000")
+    _source(journey, "DISCOUNT", "CASH_DISCOUNT", "tax_invoice_tally", "100000")
+    _discount(journey, FREE_ACCESSORIES_KEY, "30000", "30000")
+    _source(journey, "DISCOUNT", FREE_ACCESSORIES_KEY, "tax_invoice_tally", "30000")
+    tcs = _run(journey, "BOOKING")["TCS_SHORT"]
+    assert tcs.outcome == "PASS" and "₹29,590 charged against ₹29,590 due" in tcs.reason
+
+    _sql(journey, "UPDATE auditcore.commercial_line_source_values SET amount=19000 WHERE tenant_id=:t "
+                  "AND component_key='tcs_amount'")
+    tcs = _run(journey, "BOOKING")["TCS_SHORT"]
+    assert tcs.outcome == "FAIL"
+    assert ("1% of the ex-showroom price ₹30,59,000 less benefits of ₹1,00,000, ₹29,59,000; ₹10,590 short"
+            in tcs.reason)
+
+    _sql(journey, "UPDATE auditcore.commercial_line_source_values SET amount=1050000 WHERE tenant_id=:t "
+                  "AND component_key='ex_showroom_price'")
+    tcs = _run(journey, "BOOKING")["TCS_SHORT"]
+    assert tcs.outcome == "PASS" and "within the TCS threshold" in tcs.reason
+
+
 # ---------------------------------------------------- the TL's verdict
 
 
