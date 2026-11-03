@@ -197,6 +197,11 @@ def _run_audit_core_rules_for_stage(
         sync_same_file_detection(
             connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id
         )
+        # A journey read for a PC's bulk upload asks for its drop to be settled (2026-11-03):
+        # joined to the customer's booking or kept, once every page is read. Never raises.
+        from audit_core.uc03_p2_bulk_upload import request_settle
+
+        request_settle(connection, tenant_id=tenant_id, journey_id=journey_id)
 
         # Direct user correction (2026-09-24): price/discount standards
         # (uc03_deal_reconciliation.sync_deal_reconciliation) previously had
