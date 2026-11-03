@@ -135,11 +135,13 @@ def gate_register(connection: Connection, tenant_id: str, outlets: list[dict[str
         return out
     passes = {(r["business_date"], str(r["outlet_id"])): dict(r) for r in connection.execute(
         text("""
-            SELECT business_date, outlet_id, gate_pass_id, new_deliveries, not_notified_count, files_held,
-                   counts_submitted_at_utc, completed_at_utc
-            FROM auditcore.p2_gate_passes
-            WHERE tenant_id = :t AND status = 'ACTIVE' AND outlet_id = ANY(CAST(:ids AS uuid[]))
-              AND business_date BETWEEN :a AND :b
+            SELECT gp.business_date, gp.outlet_id, gp.gate_pass_id, gp.new_deliveries, gp.not_notified_count,
+                   gp.files_held, gp.counts_submitted_at_utc, gp.completed_at_utc, gp.created_at_utc,
+                   (SELECT count(*) FROM auditcore.p2_gate_pass_pages pg
+                    WHERE pg.tenant_id = gp.tenant_id AND pg.gate_pass_id = gp.gate_pass_id) AS pages
+            FROM auditcore.p2_gate_passes gp
+            WHERE gp.tenant_id = :t AND gp.status = 'ACTIVE' AND gp.outlet_id = ANY(CAST(:ids AS uuid[]))
+              AND gp.business_date BETWEEN :a AND :b
         """), {"t": tenant_id, "ids": ids, "a": start, "b": end}).mappings().all()}
     uploaded = vehicle_gate_pass_deliveries(connection, tenant_id, ids, days[0], days[-1])
     satellites = {str(o["outlet_id"]) for o in outlets if o.get("outlet_classification") == "SATELLITE"}
@@ -152,12 +154,15 @@ def gate_register(connection: Connection, tenant_id: str, outlets: list[dict[str
             entry: dict[str, Any] = {
                 "date": d.isoformat(), "label": gate_pass_day_label(d), "dueAtUtc": gate_pass_due(d).isoformat(),
                 "uploadedInTool": files, "total": None, "intimated": None, "pendingWithPc": None,
-                "notIntimated": None, "gatePassId": None,
+                "notIntimated": None, "gatePassId": None, "pages": 0, "uploadedAtUtc": None,
             }
             if gp is None:
                 entry["status"] = "MISSED" if now > gate_pass_due(d) else "NOT_UPLOADED"
             else:
                 entry["gatePassId"] = str(gp["gate_pass_id"])
+                # The register's photo opens through GET .../gate-passes/{id}/image-url?page=n.
+                entry["pages"] = max(int(gp["pages"] or 0), 1)
+                entry["uploadedAtUtc"] = gp["created_at_utc"].isoformat() if gp["created_at_utc"] else None
                 if gp["counts_submitted_at_utc"] is None:
                     entry["status"] = "COUNTS_PENDING"
                 else:

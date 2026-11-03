@@ -127,6 +127,7 @@ def test_pc_home_counts_uploads_gate_register_and_tasks(setup):
         assert (day["status"], day["total"], day["intimated"], day["uploadedInTool"], day["pendingWithPc"],
                 day["notIntimated"]) == ("DONE", 5, 3, 2, 1, 2)
         assert line["pendingDeliveryFiles"] == 1 and line["gateRegisterUploaded"] == 1
+        assert day["gatePassId"] == gp and day["pages"] >= 1 and day["uploadedAtUtc"]
     assert data["totals"]["tasksPending"] == 1
 
 
