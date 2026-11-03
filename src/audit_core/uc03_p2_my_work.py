@@ -1,19 +1,25 @@
 """PC Home and the Tracker tab for PCs and Reviewers (product owner, 2026-11-02).
 
 ``GET /p2/v1/tenants/{t}/my-work?from=&to=`` answers, for the signed-in PC or
-Reviewer and a day or a week (up to 31 days), per outlet they are mapped to:
+Reviewer and a day, a week or a month (up to 31 days), per outlet they are mapped to,
+and day by day (``days``, newest first: each day's figures per outlet; product owner
+2026-11-03, "the tracker should be date wise"):
 
 PC
     journeysTotal       every Journey they ever opened at the outlet
     journeysUploaded    Journeys they uploaded a file to in the period
     bookingsUploaded    of those, Journeys uploaded to while still at booking
     deliveriesUpdated   of those, Journeys with a delivery page in those uploads
+    journeysCompleted   their Journeys whose delivery file closed in the period, by the
+                        Daily processing report's rule (all mandatory delivery documents
+                        in, every document task of the PC closed)
     gateRegister        per gate register day of the period: uploaded or not, total
                         on the register, intimated to the PC, uploaded in the tool,
                         pending with the PC and not intimated
     pendingDeliveryFiles  the period's "pending with PC" summed
     tasksWorked         tasks they acted on in the period (a task counts once)
-    tasksPending        tasks open for them now
+    tasksClosed         of those, the tasks they closed
+    tasksPending        tasks open for them now (no day: it is what is open now)
 
 Reviewer
     journeysWorked      Journeys they marked reviewed, corrected or worked a task on
@@ -169,7 +175,7 @@ def gate_register(connection: Connection, tenant_id: str, outlets: list[dict[str
 
 def _uploads(connection: Connection, *, tenant_id: str, actor_id: str, tz: str, start: date,
              end: date) -> list[dict[str, Any]]:
-    """Journeys the caller uploaded to in the period, per outlet, and whether any page of those
+    """Journeys the caller uploaded to in the period, per outlet and IST day, and whether any page of those
     uploads was a delivery page (p2_document_queue.business_stage = 'DELIVERY'). The page's own stage
     is used, not the Journey's stage trail: on live data most Journeys never recorded a stage change,
     which counted 1 delivery where the PC had uploaded 73 (checked 2026-11-02). A Journey uploaded to
@@ -181,7 +187,7 @@ def _uploads(connection: Connection, *, tenant_id: str, actor_id: str, tz: str, 
                 SELECT (CAST(:a AS date))::timestamp AT TIME ZONE :tz AS s,
                        (CAST(:b AS date) + 1)::timestamp AT TIME ZONE :tz AS e
             )
-            SELECT ub.journey_id, j.outlet_id,
+            SELECT ub.journey_id, j.outlet_id, CAST(ub.created_at_utc AT TIME ZONE :tz AS date) AS day,
                    COALESCE(bool_or(q.business_stage = 'DELIVERY'), false) AS delivery
             FROM auditcore.p2_upload_batches ub
             CROSS JOIN b
@@ -191,7 +197,7 @@ def _uploads(connection: Connection, *, tenant_id: str, actor_id: str, tz: str, 
               AND ub.created_at_utc >= b.s AND ub.created_at_utc < b.e
               AND ub.batch_status <> 'AWAITING_UPLOAD'
               AND NOT (ub.batch_status='CANCELLED' AND ub.page_count=0)
-            GROUP BY ub.journey_id, j.outlet_id
+            GROUP BY ub.journey_id, j.outlet_id, CAST(ub.created_at_utc AT TIME ZONE :tz AS date)
             """
         ),
         {"t": tenant_id, "me": actor_id, "tz": tz, "a": start, "b": end},
@@ -242,8 +248,8 @@ def _tasks_pending(connection: Connection, *, tenant_id: str, actor_id: str, rol
 
 def _task_events(connection: Connection, *, tenant_id: str, actor_id: str, tz: str, start: date,
                  end: date) -> list[dict[str, Any]]:
-    """Every task the caller worked in the period (one row per task), with its outlet and
-    whether the caller closed it in the period."""
+    """Every task the caller worked in the period, one row per task and IST day worked, with its
+    outlet and whether the caller closed it that day."""
     return [dict(r) for r in connection.execute(
         text(
             """
@@ -252,6 +258,7 @@ def _task_events(connection: Connection, *, tenant_id: str, actor_id: str, tz: s
                        (CAST(:b AS date) + 1)::timestamp AT TIME ZONE :tz AS e
             )
             SELECT t.task_id, t.journey_id, COALESCE(t.outlet_id, j.outlet_id) AS outlet_id,
+                   CAST(te.created_at_utc AT TIME ZONE :tz AS date) AS day,
                    bool_or(te.event_type = ANY(:closing) AND t.task_status = 'VERIFIED_COMPLETE') AS closed
             FROM auditcore.p2_task_events te
             CROSS JOIN b
@@ -259,9 +266,11 @@ def _task_events(connection: Connection, *, tenant_id: str, actor_id: str, tz: s
             LEFT JOIN auditcore.journeys j ON j.tenant_id = t.tenant_id AND j.journey_id = t.journey_id
             WHERE te.tenant_id = :t AND te.actor_id = :me AND te.event_type = ANY(:work)
               AND te.created_at_utc >= b.s AND te.created_at_utc < b.e
-            GROUP BY t.task_id, t.journey_id, COALESCE(t.outlet_id, j.outlet_id)
+            GROUP BY t.task_id, t.journey_id, COALESCE(t.outlet_id, j.outlet_id),
+                     CAST(te.created_at_utc AT TIME ZONE :tz AS date)
             UNION
-            SELECT t.task_id, t.journey_id, COALESCE(t.outlet_id, j.outlet_id), true
+            SELECT t.task_id, t.journey_id, COALESCE(t.outlet_id, j.outlet_id),
+                   CAST(COALESCE(t.action_completed_at_utc, t.verified_at_utc) AT TIME ZONE :tz AS date), true
             FROM auditcore.p2_tasks t
             CROSS JOIN b
             LEFT JOIN auditcore.journeys j ON j.tenant_id = t.tenant_id AND j.journey_id = t.journey_id
@@ -285,12 +294,14 @@ def _reviews(connection: Connection, *, tenant_id: str, actor_id: str, tz: str, 
                 SELECT (CAST(:a AS date))::timestamp AT TIME ZONE :tz AS s,
                        (CAST(:b AS date) + 1)::timestamp AT TIME ZONE :tz AS e
             )
-            SELECT r.journey_id, r.outlet_id, 'REVIEW' AS kind
+            SELECT r.journey_id, r.outlet_id, 'REVIEW' AS kind,
+                   CAST(r.reviewed_at_utc AT TIME ZONE :tz AS date) AS day
             FROM auditcore.p2_stage_document_reviews r CROSS JOIN b
             WHERE r.tenant_id = :t AND r.reviewed_by_actor_id = :me
               AND r.reviewed_at_utc >= b.s AND r.reviewed_at_utc < b.e
             UNION ALL
-            SELECT DISTINCT l.journey_id, j.outlet_id, 'CORRECTION'
+            SELECT DISTINCT l.journey_id, j.outlet_id, 'CORRECTION',
+                   CAST(l.changed_at_utc AT TIME ZONE :tz AS date)
             FROM auditcore.journey_field_change_log l CROSS JOIN b
             JOIN auditcore.journeys j ON j.tenant_id = l.tenant_id AND j.journey_id = l.journey_id
             WHERE l.tenant_id = :t AND l.actor_id = :me AND l.change_reason = 'CORRECTION'
@@ -301,15 +312,61 @@ def _reviews(connection: Connection, *, tenant_id: str, actor_id: str, tz: str, 
     ).mappings().all()]
 
 
+def _completed(connection: Connection, *, tenant_id: str, actor_id: str, tz: str, start: date,
+               end: date) -> list[dict[str, Any]]:
+    """The PC's Journeys whose delivery file closed in the period (product owner 2026-11-03:
+    "journeys completed"), by the Daily processing report's own rule (uc03_p2_daily_report.
+    delivery_files_closed: every mandatory delivery document in, and every document task the
+    PC owns closed), on the IST day it last closed. Only the Journeys the PC opened."""
+    from zoneinfo import ZoneInfo
+
+    from audit_core.uc03_p2_daily_report import delivery_files_closed
+
+    zone = ZoneInfo(tz)
+    first = datetime.combine(start, datetime.min.time(), zone)
+    after = datetime.combine(end + timedelta(days=1), datetime.min.time(), zone)
+    files = delivery_files_closed(connection, tenant_id=tenant_id, actor_id=actor_id,
+                                  start=first, end=after, names={})["files"]
+    out = []
+    for f in files:
+        if f["pcActorId"] != actor_id or not f["closedAtUtc"] or not f.get("outletId"):
+            continue
+        closed = datetime.fromisoformat(f["closedAtUtc"]).astimezone(zone).date()
+        out.append({"journey_id": f["journeyId"], "outlet_id": f["outletId"], "day": closed})
+    return out
+
+
 def _outlet_line(o: dict[str, Any]) -> dict[str, Any]:
     return {"outletId": str(o["outlet_id"]), "outletName": o["outlet_name"], "dealerId": str(o["dealer_id"]),
             "dealerName": o["dealer_name"], "classification": o["outlet_classification"]}
 
 
-_PC_KEYS = ("journeysTotal", "journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "gateRegisterDays",
-            "gateRegisterUploaded", "gateRegisterMissed", "registerTotal", "registerIntimated",
-            "uploadedInTool", "pendingDeliveryFiles", "notIntimated", "tasksWorked", "tasksPending")
+def _days(start: date, end: date) -> list[date]:
+    """Every day of the period, newest first."""
+    return [end - timedelta(days=i) for i in range((end - start).days + 1)]
+
+
+_PC_KEYS = ("journeysTotal", "journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "journeysCompleted",
+            "gateRegisterDays", "gateRegisterUploaded", "gateRegisterMissed", "registerTotal", "registerIntimated",
+            "uploadedInTool", "pendingDeliveryFiles", "notIntimated", "tasksWorked", "tasksClosed", "tasksPending")
+# The figures of one day of one outlet (the Tracker's day-by-day rows).
+_PC_DAY_KEYS = ("journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "journeysCompleted",
+                "uploadedInTool", "pendingDeliveryFiles", "tasksWorked", "tasksClosed")
 _REVIEWER_KEYS = ("journeysWorked", "reviewsClosed", "corrections", "tasksWorked", "tasksClosed", "tasksPending")
+_REVIEWER_DAY_KEYS = ("journeysWorked", "reviewsClosed", "corrections", "tasksWorked", "tasksClosed")
+
+
+def _uploaded(uploads: list[dict[str, Any]]) -> dict[str, int]:
+    """Journeys uploaded to, of them bookings (no delivery page) and deliveries (a delivery page)."""
+    journeys = {str(u["journey_id"]) for u in uploads}
+    delivered = {str(u["journey_id"]) for u in uploads if u["delivery"]}
+    return {"journeysUploaded": len(journeys), "bookingsUploaded": len(journeys - delivered),
+            "deliveriesUpdated": len(delivered)}
+
+
+def _tasks(worked: list[dict[str, Any]]) -> dict[str, int]:
+    return {"tasksWorked": len({w["task_id"] for w in worked}),
+            "tasksClosed": len({w["task_id"] for w in worked if w["closed"]})}
 
 
 def build_pc_work(connection: Connection, *, tenant_id: str, actor_id: str, start: date, end: date,
@@ -322,19 +379,18 @@ def build_pc_work(connection: Connection, *, tenant_id: str, actor_id: str, star
     register = gate_register(connection, tenant_id, outlets, start, end, now=now)
     pending = _tasks_pending(connection, tenant_id=tenant_id, actor_id=actor_id, role="PC", outlet_ids=ids)
     worked = _task_events(connection, tenant_id=tenant_id, actor_id=actor_id, tz=tz, start=start, end=end)
+    completed = _completed(connection, tenant_id=tenant_id, actor_id=actor_id, tz=tz, start=start, end=end)
     rows = []
     totals = dict.fromkeys(_PC_KEYS, 0)
     for o in outlets:
         oid = str(o["outlet_id"])
-        mine = [u for u in uploads if str(u["outlet_id"]) == oid]
         days = register.get(oid, [])
         done = [d for d in days if d["status"] != "NOT_UPLOADED" and d["status"] != "MISSED"]
         line = {
             **_outlet_line(o),
             "journeysTotal": totals_by_outlet.get(oid, 0),
-            "journeysUploaded": len({u["journey_id"] for u in mine}),
-            "bookingsUploaded": len({u["journey_id"] for u in mine if not u["delivery"]}),
-            "deliveriesUpdated": len({u["journey_id"] for u in mine if u["delivery"]}),
+            **_uploaded([u for u in uploads if str(u["outlet_id"]) == oid]),
+            "journeysCompleted": len({c["journey_id"] for c in completed if c["outlet_id"] == oid}),
             "gateRegisterDays": len(days),
             "gateRegisterUploaded": len(done),
             "gateRegisterMissed": sum(1 for d in days if d["status"] == "MISSED"),
@@ -343,7 +399,7 @@ def build_pc_work(connection: Connection, *, tenant_id: str, actor_id: str, star
             "uploadedInTool": sum(d["uploadedInTool"] for d in days),
             "pendingDeliveryFiles": sum(d["pendingWithPc"] or 0 for d in days),
             "notIntimated": sum(d["notIntimated"] or 0 for d in days),
-            "tasksWorked": len({w["task_id"] for w in worked if str(w["outlet_id"]) == oid}),
+            **_tasks([w for w in worked if str(w["outlet_id"]) == oid]),
             "tasksPending": pending.get(oid, 0),
             "gateRegister": days,
         }
@@ -352,8 +408,33 @@ def build_pc_work(connection: Connection, *, tenant_id: str, actor_id: str, star
         rows.append(line)
     # A journey uploaded to at two outlets is impossible, so per-outlet sums are exact;
     # tasks of no outlet (Project-wide) still count in the total.
-    totals["tasksWorked"] = len({w["task_id"] for w in worked})
-    return {"role": "PC", "outlets": rows, "totals": totals}
+    totals.update(_tasks(worked))
+
+    # Day by day (product owner 2026-11-03: "the tracker should be date wise"), newest first.
+    # Tasks pending is what is open now, so it has no day.
+    day_rows = []
+    for d in _days(start, end):
+        lines = []
+        day_totals = dict.fromkeys(_PC_DAY_KEYS, 0)
+        for o in outlets:
+            oid = str(o["outlet_id"])
+            entry = next((g for g in register.get(oid, []) if g["date"] == d.isoformat()), None)
+            line = {
+                "outletId": oid, "outletName": o["outlet_name"], "classification": o["outlet_classification"],
+                **_uploaded([u for u in uploads if str(u["outlet_id"]) == oid and u["day"] == d]),
+                "journeysCompleted": len({c["journey_id"] for c in completed if c["outlet_id"] == oid and c["day"] == d}),
+                "uploadedInTool": entry["uploadedInTool"] if entry else 0,
+                "pendingDeliveryFiles": (entry["pendingWithPc"] or 0) if entry else 0,
+                **_tasks([w for w in worked if str(w["outlet_id"]) == oid and w["day"] == d]),
+                "gateRegister": entry,
+            }
+            for k in _PC_DAY_KEYS:
+                day_totals[k] += line[k]
+            lines.append(line)
+        day_totals.update(_tasks([w for w in worked if w["day"] == d]))
+        day_rows.append({"date": d.isoformat(), "label": f"{d:%a} {d.day} {d:%b}", "outlets": lines,
+                         "totals": day_totals})
+    return {"role": "PC", "outlets": rows, "totals": totals, "days": day_rows}
 
 
 def build_reviewer_work(connection: Connection, *, tenant_id: str, actor_id: str, start: date,
@@ -364,29 +445,50 @@ def build_reviewer_work(connection: Connection, *, tenant_id: str, actor_id: str
     reviews = _reviews(connection, tenant_id=tenant_id, actor_id=actor_id, tz=tz, start=start, end=end)
     worked = _task_events(connection, tenant_id=tenant_id, actor_id=actor_id, tz=tz, start=start, end=end)
     pending = _tasks_pending(connection, tenant_id=tenant_id, actor_id=actor_id, role="REVIEWER", outlet_ids=ids)
+
+    def figures(marks: list[dict[str, Any]], tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        journeys = {str(r["journey_id"]) for r in marks} | {str(w["journey_id"]) for w in tasks if w["journey_id"]}
+        return {
+            "journeysWorked": len(journeys),
+            "reviewsClosed": sum(1 for r in marks if r["kind"] == "REVIEW"),
+            "corrections": len({str(r["journey_id"]) for r in marks if r["kind"] == "CORRECTION"}),
+            **_tasks(tasks),
+            "_journeys": journeys,
+        }
+
     rows = []
     totals = dict.fromkeys(_REVIEWER_KEYS, 0)
     all_journeys: set[str] = set()
     for o in outlets:
         oid = str(o["outlet_id"])
-        marks = [r for r in reviews if str(r["outlet_id"]) == oid]
-        tasks = [w for w in worked if str(w["outlet_id"]) == oid]
-        journeys = {str(r["journey_id"]) for r in marks} | {str(w["journey_id"]) for w in tasks if w["journey_id"]}
-        all_journeys |= journeys
-        line = {
-            **_outlet_line(o),
-            "journeysWorked": len(journeys),
-            "reviewsClosed": sum(1 for r in marks if r["kind"] == "REVIEW"),
-            "corrections": len({str(r["journey_id"]) for r in marks if r["kind"] == "CORRECTION"}),
-            "tasksWorked": len({w["task_id"] for w in tasks}),
-            "tasksClosed": len({w["task_id"] for w in tasks if w["closed"]}),
-            "tasksPending": pending.get(oid, 0),
-        }
+        line = figures([r for r in reviews if str(r["outlet_id"]) == oid],
+                       [w for w in worked if str(w["outlet_id"]) == oid])
+        all_journeys |= line.pop("_journeys")
+        line = {**_outlet_line(o), **line, "tasksPending": pending.get(oid, 0)}
         for k in _REVIEWER_KEYS:
             totals[k] += line[k]
         rows.append(line)
     totals["journeysWorked"] = len(all_journeys)
-    return {"role": "REVIEWER", "outlets": rows, "totals": totals}
+    totals.update(_tasks([w for w in worked if str(w["outlet_id"]) in set(ids)]))
+
+    day_rows = []
+    for d in _days(start, end):
+        lines = []
+        day_journeys: set[str] = set()
+        day_totals = dict.fromkeys(_REVIEWER_DAY_KEYS, 0)
+        for o in outlets:
+            oid = str(o["outlet_id"])
+            line = figures([r for r in reviews if str(r["outlet_id"]) == oid and r["day"] == d],
+                           [w for w in worked if str(w["outlet_id"]) == oid and w["day"] == d])
+            day_journeys |= line.pop("_journeys")
+            for k in _REVIEWER_DAY_KEYS:
+                day_totals[k] += line[k]
+            lines.append({"outletId": oid, "outletName": o["outlet_name"],
+                          "classification": o["outlet_classification"], **line})
+        day_totals["journeysWorked"] = len(day_journeys)
+        day_rows.append({"date": d.isoformat(), "label": f"{d:%a} {d.day} {d:%b}", "outlets": lines,
+                         "totals": day_totals})
+    return {"role": "REVIEWER", "outlets": rows, "totals": totals, "days": day_rows}
 
 
 @router.get("/my-work")
