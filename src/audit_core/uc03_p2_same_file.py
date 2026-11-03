@@ -9,6 +9,19 @@ large deep-red alert (DUPLICATE_ACROSS_OUTLETS) goes to the PCs of both
 outlets, their Reviewers and Team Leads (uc03_p2_tenant_alerts), once per
 newer journey, for a journey created within the same window as below.
 
+Documents only the copy holds (product owner 2026-11-03, for every upload,
+bulk or not; within one outlet): "before delete, check if the duplicate file
+has additional documents which match the given customer; if yes, upload those
+documents to the journey; if it is the same set of documents, the journey gets
+deleted" -- by page fingerprint ("avoid any loss of document"): a page of the
+copy with no page of the same SHA-256 on the earlier journey is new, and the
+document holding it is copied, byte for byte, to a new upload of the earlier
+journey (uc03_duplicate_merge._copy_unit: split and read there like any
+upload) before the copy is deleted (``carry_plan``). Only the customer's own
+files (file identity BELONGS) are carried; a new page of a file not settled as
+the customer's, or another customer's file on the copy, keeps the copy for
+review (KEPT_OWN_DOCUMENTS) -- nothing is deleted that could be lost.
+
 The same file uploaded again (product owner, 2026-10-31).
 
     "When ever a PC enters a Journey which has existing PAN, Mobile No,
@@ -614,7 +627,11 @@ def alert_body(payload: dict[str, Any], outcome: str) -> str:
                f"{_place(existing.get('dealerName'), existing.get('outletName'))}) "
                f"on {on}.")
     what = {
-        DELETED: f"The new file {ref} was deleted.",
+        DELETED: (f"The new file {ref} was deleted"
+                  + (f" after its {', '.join(payload['carriedDocuments']).replace('_', ' ')} "
+                     f"{'was' if len(payload['carriedDocuments']) == 1 else 'were'} added to "
+                     f"{existing.get('reference') or 'the earlier journey'}."
+                     if payload.get("carriedDocuments") else ".")),
         PENDING_DELETE: f"The new file {ref} is being deleted.",
         KEPT_NOT_INDIVIDUAL: (f"The new file {ref} was kept for review: {kept} "
                               "(a company or firm may book two identical vehicles)."),
@@ -708,13 +725,121 @@ def documents_only_on(connection: Connection, *, tenant_id: str, new_journey_id:
     return sorted(new_kinds - existing_kinds)
 
 
+# The customer's own files (file identity): only their documents are carried to the earlier journey.
+_CARRIED_IDENTITY = "BELONGS"
+_GONE_UNITS = ("CANCELLED", "MERGED")
+
+
+@dataclass(frozen=True)
+class CarryPlan:
+    """What the copy holds that the earlier journey does not, by page fingerprint: the
+    document units to copy, the kinds they are (for the alert), and a reason to keep the
+    copy instead when some of it is not settled as the customer's."""
+    kinds: tuple[str, ...]
+    units: tuple[dict[str, Any], ...]
+    unsure: str | None
+
+
+def _unit_pages(unit: dict[str, Any]) -> list[int]:
+    return [int(p) for p in (unit["page_numbers"] or [unit["page_number"]]) if p is not None]
+
+
+def carry_plan(connection: Connection, *, tenant_id: str, new: FileIdentity, existing: FileIdentity) -> CarryPlan:
+    """Product owner 2026-11-03: "if we are having fingerprint scan then it's better to use it
+    and make the system more reliable and avoid any loss of document". A page of the copy is
+    the earlier journey's already when a page with the same fingerprint (page_sha256, the
+    SHA-256 of the split page) was uploaded to it; every other page is new. Each document
+    unit of the copy holding a new page is carried whole (a multi-page document stays one).
+    Kept instead, never deleted, when a new page's file is not judged the customer's
+    (UNKNOWN, or not judged yet), when the copy holds another customer's file (FOREIGN),
+    or when a new page has no stored unit to copy yet."""
+    ref = existing.reference or "the earlier journey"
+    on_existing = {str(sha) for sha in connection.execute(
+        text("SELECT DISTINCT page_sha256 FROM auditcore.p2_document_queue WHERE tenant_id=:t AND journey_id=:j "
+             "AND unit_kind='PAGE' AND page_sha256 IS NOT NULL AND queue_status <> 'CANCELLED'"),
+        {"t": tenant_id, "j": existing.journey_id},
+    ).scalars().all()}
+    rows = [dict(r) for r in connection.execute(
+        text(
+            """
+            SELECT q.queue_id, q.batch_id, q.unit_kind, q.page_number, q.page_numbers, q.page_sha256,
+                   q.page_object_key, q.queue_status, q.classified_document_type, q.merged_into_queue_id,
+                   b.original_filename, b.content_type, b.identity_status, b.batch_status, b.uploaded_by_actor_id,
+                   (SELECT e.document_type_key FROM auditcore.evidence e
+                     WHERE e.tenant_id=q.tenant_id AND e.journey_id=q.journey_id AND e.di_document_id=q.di_document_id
+                     ORDER BY (e.association_status='ACTIVE') DESC LIMIT 1) AS document_type_key
+            FROM auditcore.p2_document_queue q
+            JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
+            WHERE q.tenant_id=:t AND q.journey_id=:j AND q.queue_status <> 'CANCELLED'
+              AND b.batch_status <> 'CANCELLED'
+            """
+        ),
+        {"t": tenant_id, "j": new.journey_id},
+    ).mappings().all()]
+    if any(r["identity_status"] == "FOREIGN" for r in rows):
+        return CarryPlan(kinds=(), units=(), unsure=f"it holds another customer's file, which {ref} must not get")
+    pages = [r for r in rows if r["unit_kind"] == "PAGE"]
+    fresh = [p for p in pages if not p["page_sha256"] or str(p["page_sha256"]) not in on_existing]
+    if not fresh:
+        return CarryPlan(kinds=(), units=(), unsure=None)  # the same set of documents
+    unsettled = [p for p in fresh if p["identity_status"] != _CARRIED_IDENTITY]
+    if unsettled:
+        return CarryPlan(kinds=(), units=(), unsure=(
+            f"{len(unsettled)} page(s) {ref} does not have, not yet settled as the customer's"))
+    # The unit that holds each new page: the document it was merged into, or the page itself.
+    units: dict[str, dict[str, Any]] = {}
+    by_id = {str(r["queue_id"]): r for r in rows}
+    for page in fresh:
+        unit = by_id.get(str(page["merged_into_queue_id"])) if page["merged_into_queue_id"] else page
+        if unit is None or unit["queue_status"] in _GONE_UNITS or not unit["page_object_key"]:
+            return CarryPlan(kinds=(), units=(), unsure=(
+                f"page {page['page_number']} of {page['original_filename'] or 'a file'}, which {ref} does not have, "
+                "has no stored document to copy yet"))
+        units[str(unit["queue_id"])] = {**unit, "document_type_key": unit["document_type_key"]
+                                        or unit["classified_document_type"] or "document"}
+    kinds = tuple(sorted({str(u["document_type_key"]) for u in units.values()}))
+    return CarryPlan(kinds=kinds, units=tuple(units.values()), unsure=None)
+
+
 def _own_documents_reason(connection: Connection, *, tenant_id: str, new: FileIdentity,
                           existing: FileIdentity) -> str | None:
-    only = documents_only_on(connection, tenant_id=tenant_id, new_journey_id=new.journey_id,
-                             existing_journey_id=existing.journey_id)
-    if not only:
-        return None
-    return f"a document {existing.reference or 'the earlier journey'} does not: {', '.join(only).replace('_', ' ')}"
+    """Why the copy must be kept for what it alone holds: only when some of it is not settled
+    as the customer's; what is the customer's is carried to the earlier journey (2026-11-03)."""
+    return carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing).unsure
+
+
+def carry_documents(engine: Engine, *, tenant_id: str, new_journey_id: UUID, existing_journey_id: UUID) -> list[str]:
+    """Copy the documents only the copy holds to the earlier journey, as new uploads there
+    (uc03_duplicate_merge._copy_unit; idempotent: one fixed upload per unit). Returns the
+    kinds carried; nothing when there is nothing to carry or it is not all the customer's."""
+    from datetime import UTC
+
+    from audit_core.db import set_tenant_context
+    from audit_core.uc03_duplicate_merge import _copy_unit
+
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        files = _identities(connection, tenant_id=tenant_id, journey_ids=[new_journey_id, existing_journey_id])
+        new, existing = files.get(new_journey_id), files.get(existing_journey_id)
+        if new is None or existing is None:
+            return []
+        plan = carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing)
+        keep = connection.execute(
+            text("SELECT journey_id, journey_reference, created_by_actor_id FROM auditcore.journeys "
+                 "WHERE tenant_id=:t AND journey_id=:j"), {"t": tenant_id, "j": existing_journey_id},
+        ).mappings().one()
+    if plan.unsure or not plan.units:
+        return []
+    copy = {"journey_id": new_journey_id, "journey_reference": new.reference}
+    now = datetime.now(UTC)
+    for unit in plan.units:
+        # Uploaded on the earlier journey by its PC; by whoever uploaded the page when it has none.
+        uploader = keep["created_by_actor_id"] or unit.get("uploaded_by_actor_id")
+        _copy_unit(engine, tenant_id, {**dict(keep), "created_by_actor_id": uploader}, copy, unit,
+                   tag=f"same-file:{new_journey_id}", now=now)
+    logger.info("p2_same_file_documents_carried", tenant_id=tenant_id, journey_id=str(new_journey_id),
+                existing_journey_id=str(existing_journey_id), kinds=list(plan.kinds), units=len(plan.units))
+    return list(plan.kinds)
 
 
 def _reviewed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
@@ -732,14 +857,15 @@ def _raise(
     """The alert for one new file, and its delete queued; None when this
     file was already handled (the marker)."""
     kept_reason = business_reason(connection, tenant_id=tenant_id, files=[new, existing])
+    plan = CarryPlan(kinds=(), units=(), unsure=None)
     if kept_reason:
         outcome = KEPT_NOT_INDIVIDUAL
     elif _reviewed(connection, tenant_id=tenant_id, journey_id=new.journey_id):
         outcome = KEPT_REVIEWED
     elif not booking_reference_shared(new, existing):
         outcome, kept_reason = KEPT_NO_BOOKING_REFERENCE, _no_booking_reference_reason(new, existing)
-    elif (own := _own_documents_reason(connection, tenant_id=tenant_id, new=new, existing=existing)):
-        outcome, kept_reason = KEPT_OWN_DOCUMENTS, own
+    elif (plan := carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing)).unsure:
+        outcome, kept_reason = KEPT_OWN_DOCUMENTS, plan.unsure
     else:
         outcome = PENDING_DELETE
     payload = {
@@ -751,6 +877,8 @@ def _raise(
         "matchedFields": fields,
         "outcome": outcome,
         **({"keptReason": kept_reason} if kept_reason else {}),
+        # The documents only the copy holds, carried to the earlier journey before the delete.
+        **({"carryDocuments": list(plan.kinds)} if outcome == PENDING_DELETE and plan.kinds else {}),
     }
     publish_now = outcome != PENDING_DELETE
     alert_id = connection.execute(
@@ -774,21 +902,22 @@ def _raise(
          "payload": json.dumps(payload, default=str), "publish": publish_now, "hours": ALERT_HOURS},
     ).scalar_one_or_none()
     if alert_id is None and outcome == PENDING_DELETE:
-        # Kept earlier only because a booking number was not yet read: now
-        # read and the same on both, the copy is deleted after all.
+        # Kept earlier only because a booking number was not yet read (now read and the
+        # same on both), or for documents it alone held (now carried): deleted after all.
         alert_id = connection.execute(
             text(
                 """
                 UPDATE auditcore.p2_tenant_alerts
                 SET alert_status='PENDING', outcome=:outcome, body=:body, payload=CAST(:payload AS jsonb),
                     related_journey_id=:related, published_at_utc=NULL, expires_at_utc=NULL, updated_at_utc=now()
-                WHERE tenant_id=:t AND alert_kind=:k AND subject_journey_id=:j AND outcome=:was
+                WHERE tenant_id=:t AND alert_kind=:k AND subject_journey_id=:j AND outcome = ANY(:was)
                 RETURNING alert_id
                 """
             ),
             {"t": tenant_id, "k": ALERT_KIND, "j": new.journey_id, "related": existing.journey_id,
              "outcome": outcome, "body": alert_body(payload, outcome), "payload": json.dumps(payload, default=str),
-             "was": KEPT_NO_BOOKING_REFERENCE},
+             # 2026-11-03: kept for what it alone held, now carried to the earlier journey.
+             "was": [KEPT_NO_BOOKING_REFERENCE, KEPT_OWN_DOCUMENTS]},
         ).scalar_one_or_none()
     if alert_id is None:
         return None
@@ -1076,6 +1205,8 @@ def run_same_file_delete(
         recheck_pairs_of(connection, tenant_id=tenant_id, deleted_journey_id=journey_id,
                          correlation_id=correlation_id)
 
+    carried: list[str] = []  # the kinds carried, for the alert
+
     def check(connection: Connection, continuing: bool) -> None:
         if before_record is not None:
             before_record(connection)
@@ -1087,6 +1218,24 @@ def run_same_file_delete(
 
     kept_reason: str | None = None
     try:
+        # 2026-11-03: what only the copy holds goes to the earlier journey first -- once the
+        # pair still holds without it (nothing is copied for a copy that will be kept).
+        if existing_id is not None:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                recheck_before_delete(connection, tenant_id=tenant_id, new_journey_id=journey_id,
+                                      existing_journey_id=existing_id, existing_reference=existing_ref)
+            carried = carry_documents(engine, tenant_id=tenant_id, new_journey_id=journey_id,
+                                      existing_journey_id=existing_id)
+            if carried:
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    connection.execute(
+                        text("UPDATE auditcore.p2_tenant_alerts SET payload = payload || CAST(:extra AS jsonb), "
+                             "updated_at_utc=now() WHERE tenant_id=:t AND alert_kind=:k AND subject_journey_id=:j"),
+                        {"extra": json.dumps({"carriedDocuments": carried}), "t": tenant_id, "k": ALERT_KIND,
+                         "j": journey_id},
+                    )
         system_delete_journey(
             engine, tenant_id=tenant_id, journey_id=journey_id, reason=reason, correlation_id=correlation_id,
             security_client=security_client, v2_client=v2_client, storage=storage,

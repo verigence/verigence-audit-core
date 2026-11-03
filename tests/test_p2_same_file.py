@@ -208,6 +208,30 @@ def _delete(journey: P2Journey) -> str:
     )
 
 
+def _page(journey: P2Journey, *, sha: str, kind: str = "pan_card", identity: str | None = "BELONGS",
+          status: str = "READY") -> tuple[UUID, UUID, UUID]:
+    """A page with this fingerprint, read as ``kind``, its file judged ``identity``."""
+    batch, queue, doc = add_page(journey, status=status)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_document_queue SET page_sha256=:s, unit_kind='PAGE' "
+                                "WHERE tenant_id=:t AND queue_id=:q"), {"s": sha, "t": journey.tenant_id, "q": queue})
+        connection.execute(text("UPDATE auditcore.p2_upload_batches SET identity_status=:i "
+                                "WHERE tenant_id=:t AND batch_id=:b"), {"i": identity, "t": journey.tenant_id, "b": batch})
+    add_evidence(journey, di_document_id=doc, document_type_key=kind)
+    return batch, queue, doc
+
+
+def _same_pages(old: P2Journey, new: P2Journey, n: int = 1) -> list[UUID]:
+    """The same file uploaded again: pages with the same fingerprints on both journeys."""
+    docs = []
+    for _ in range(n):
+        sha = uuid4().hex
+        _page(old, sha=sha)
+        docs.append(_page(new, sha=sha)[2])
+    return docs
+
+
 # ── matching, without a database ──────────────────────────────────────────────
 def _identity(**overrides) -> FileIdentity:
     values = {"journey_id": uuid4(), "created_at": datetime.now(UTC), "reference": "R", "pc_name": "PC",
@@ -263,7 +287,7 @@ def test_alert_text_names_customer_model_pc_and_dealership():
 # ── detection and delete, on the database ─────────────────────────────────────
 def test_same_file_with_an_individual_pan_is_deleted_and_alerted(tenant):
     old, new = _pair(tenant)
-    di_document = add_page(new)[2]
+    [di_document] = _same_pages(old, new)  # the same file, page for page
     _quiet(new)
 
     result = _detect(new)
@@ -710,7 +734,7 @@ def test_a_journey_still_receiving_pages_is_not_deleted_yet(tenant, monkeypatch)
     from audit_core.uc03_p2_same_file import UploadInProgress
 
     _, new = _ready_to_delete(tenant)
-    add_page(new)  # uploaded just now
+    _same_pages(_, new)  # the same pages again, uploaded just now
     with pytest.raises(UploadInProgress) as waiting:
         _delete(new)
     assert 0 < waiting.value.delay_seconds <= 10 * 60 + 30
@@ -827,15 +851,20 @@ def test_a_sole_proprietors_gstin_on_their_own_pan_is_not_a_company(tenant):
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
 
 
-def test_a_new_copy_holding_a_document_the_earlier_one_lacks_is_kept(tenant):
-    """Sarbeswar Pradhan (2026-11-01): the Tally invoice was only on his second
-    booking. Deleting it would lose the invoice; it is kept for review."""
+def test_a_page_the_earlier_one_lacks_but_not_settled_as_the_customers_keeps_the_copy(tenant):
+    """Nothing is deleted that could be lost (2026-11-03): a new page of a file whose person
+    is not settled keeps the copy for review."""
     old, new = _pair(tenant)
-    doc = uuid4()
-    add_evidence(new, di_document_id=doc, document_type_key="tax_invoice_tally")
+    _same_pages(old, new)
+    _page(new, sha=uuid4().hex, kind="tax_invoice_tally", identity="UNKNOWN")
     assert _detect(new)["outcomes"] == ["KEPT_OWN_DOCUMENTS"]
     [alert] = _alerts(new)
-    assert "it holds a document" in alert["body"] and "tax invoice tally" in alert["body"] and _queued(new) == []
+    assert "not yet settled as the customer's" in alert["body"] and _queued(new) == []
+
+
+def test_documents_only_on_reads_kinds(tenant):
+    old, new = _pair(tenant)
+    add_evidence(new, di_document_id=uuid4(), document_type_key="tax_invoice_tally")
     # A payment receipt on one and a dealer receipt on the other are one kind.
     from audit_core.uc03_p2_same_file import documents_only_on
 
@@ -1136,3 +1165,81 @@ def test_the_cross_outlet_alert_is_for_both_outlets_pcs_reviewers_and_team_leads
         assert kinds(actor) == [CROSS_OUTLET_KIND], actor
     for actor in ("pc-elsewhere", "pm-old", "nobody"):
         assert kinds(actor) == [], actor
+
+
+# ── 2026-11-03: carry what only the copy holds, by page fingerprint ──────────
+class CopyStorage:
+    """The stored files: what _copy_unit reads and writes."""
+    def __init__(self) -> None:
+        self.put: dict[str, bytes] = {}
+
+    def get_object(self, key: str) -> bytes:
+        return b"%PDF-1.4 page " + key.encode()
+
+    def put_object(self, key: str, payload: bytes, *, content_type: str) -> None:
+        self.put[key] = payload
+
+
+def _batches(journey: P2Journey) -> list[dict]:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return [dict(r) for r in connection.execute(
+            text("SELECT batch_id, client_upload_id, original_filename FROM auditcore.p2_upload_batches "
+                 "WHERE tenant_id=:t AND journey_id=:j"), {"t": journey.tenant_id, "j": journey.journey_id},
+        ).mappings().all()]
+
+
+def test_the_same_set_of_documents_is_deleted_without_copying(tenant, monkeypatch):
+    from audit_core import uc03_p2_storage
+
+    old, new = _pair(tenant)
+    _same_pages(old, new, n=3)
+    _quiet(new)
+    storage = CopyStorage()
+    monkeypatch.setattr(uc03_p2_storage, "get_p2_document_storage", lambda: storage)
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    assert "carryDocuments" not in _alerts(new)[0]["payload"]
+    before = len(_batches(old))
+    assert _delete(new) == "DELETED"
+    assert storage.put == {} and len(_batches(old)) == before
+
+
+@pytest.mark.parametrize("kind", ["tax_invoice_tally", "dealer_receipt"])
+def test_a_page_only_the_copy_holds_goes_to_the_earlier_journey_before_the_delete(tenant, monkeypatch, kind):
+    """A Tally invoice the earlier journey lacks -- or a second receipt, a kind it already
+    holds, which comparing kinds would have lost -- is copied to it, then the copy goes."""
+    from audit_core import uc03_p2_storage
+
+    old, new = _pair(tenant)
+    _same_pages(old, new, n=2)
+    if kind == "dealer_receipt":
+        _page(old, sha=uuid4().hex, kind="dealer_receipt")             # the earlier journey's own receipt
+    extra_queue = _page(new, sha=uuid4().hex, kind=kind)[1]
+    _quiet(new)
+    storage = CopyStorage()
+    monkeypatch.setattr(uc03_p2_storage, "get_p2_document_storage", lambda: storage)
+
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    assert _alerts(new)[0]["payload"]["carryDocuments"] == [kind]
+    assert _delete(new) == "DELETED"
+    assert not _exists(new) and _exists(old)
+    [copied] = [b for b in _batches(old) if b["client_upload_id"] == f"dup-merge-{extra_queue}"]
+    assert copied["original_filename"].startswith(f"{kind} from ")
+    assert len(storage.put) == 1
+    [alert] = _alerts(new)
+    assert alert["outcome"] == "DELETED" and f"after its {kind.replace('_', ' ')} was added to" in alert["body"]
+    # The copied upload is split and read on the earlier journey like any upload.
+    with old.engine.begin() as connection:
+        set_tenant_context(connection, old.tenant_id)
+        assert connection.execute(
+            text("SELECT count(*) FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
+                 "AND work_type='SPLIT_BATCH' AND work_key=:k"),
+            {"t": old.tenant_id, "j": old.journey_id, "k": str(copied["batch_id"])}).scalar_one() == 1
+
+
+def test_a_copy_holding_another_customers_file_is_kept(tenant):
+    old, new = _pair(tenant)
+    _same_pages(old, new)
+    _page(new, sha=uuid4().hex, kind="pan_card", identity="FOREIGN")
+    assert _detect(new)["outcomes"] == ["KEPT_OWN_DOCUMENTS"]
+    assert "another customer's file" in _alerts(new)[0]["body"]
