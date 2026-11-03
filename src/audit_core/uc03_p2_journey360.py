@@ -3038,6 +3038,34 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     }
 
 
+def payments_section(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """The Payments tab: every receipt (payments()), and the money received
+    exactly as the Deal and the Audit Summary count it (2026-11-03).
+
+    Live 2026-11-03, the first cross-screen check of every booking: on 141 of
+    926 the Payments tab's "Total received" was not the Deal's. The tab
+    counted the loan only from the finance record and the loan's own receipt,
+    so a loan that the NDC's financer line, the ERP settlement or the ledger's
+    financier posting gives read Rs 0 here; and the bank letter's sanction
+    stood as the loan on bookings whose deal counts the NDC's figure. One rule
+    decides the loan (_loan_counted, the Audit Summary's loan_received); this
+    tab shows its answer: the loan, where it comes from, the old vehicle paid
+    in kind, refunds, and the total. The bank letter's line shows only when
+    the letter is the loan counted."""
+    view = payments(connection, tenant_id=tenant_id, journey_id=journey_id)
+    paid = deal(connection, tenant_id=tenant_id, journey_id=journey_id)["summary"]["paid"]
+    view.update({
+        "loanDisbursed": paid["loan"],
+        "loanSource": paid["loanSource"],
+        "loanUnknown": paid["loanUnknown"],
+        "oldVehicle": paid["oldVehicle"],
+        "refunds": paid["refunds"],
+        "paidTotal": paid["total"],
+        "loanWithoutReceipt": view["loanWithoutReceipt"] if paid["loanWithoutReceipt"] else None,
+    })
+    return view
+
+
 # ── vehicle, registration, delivery ──────────────────────────────────────────
 def _document_facts(
     connection: Connection, *, tenant_id: str, journey_id: UUID, di_types: tuple[str, ...],
@@ -4202,7 +4230,7 @@ BUILDERS = {
     "invoices": invoices,
     "addons": addons,
     "documents": documents,
-    "payments": payments,
+    "payments": payments_section,
     "vehicle": vehicle,
     "tradein": tradein,
     "customer": customer,

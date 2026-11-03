@@ -185,6 +185,29 @@ def test_the_bank_letters_loan_is_not_counted_again_when_the_receipts_already_pa
     assert owed["amount"] == D(2140000) and owed["withoutReceipt"]
 
 
+def test_the_payments_tab_counts_the_loan_the_deal_counts(journey) -> None:
+    """Live 2026-11-03, cross-screen check: on 141 bookings the Payments tab's
+    total was not the Deal's; a loan the NDC's financer line gives read Rs 0
+    on Payments."""
+    from audit_core.uc03_p2_journey360 import BUILDERS, payments
+
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _ledger(journey, UTKAL)
+    _sync(journey)
+    add_receipt_payment(journey, amount="21000", receipt_number="R-1", receipt_date="2026-10-12")
+    paid = _deal(journey)["summary"]["paid"]
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        raw = payments(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        tab = BUILDERS["payments"](c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    loan = D(paid["loan"])
+    assert loan > 0 and "NDC" in paid["loanSource"]
+    assert D(raw["loanDisbursed"]) == D(0)  # the receipts alone: why the tab went its own way
+    assert D(tab["loanDisbursed"]) == D(paid["loan"]) and tab["loanSource"] == paid["loanSource"]
+    assert D(tab["paidTotal"]) == D(paid["total"]) == D(tab["receiptsTotal"]) + loan
+    assert tab["loanWithoutReceipt"] is None
+
+
 def test_rounding_off_is_not_money_received() -> None:
     from audit_core.uc03_ledger_receipts import money_in
 
