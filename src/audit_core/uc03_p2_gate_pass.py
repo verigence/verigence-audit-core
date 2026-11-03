@@ -269,6 +269,26 @@ def _own_gate_pass(connection: Connection, tenant_id: str, gate_pass_id: UUID, a
     return row
 
 
+def editable_today(connection: Connection, tenant_id: str, actor_id: str,
+                   now: datetime | None = None) -> list[dict[str, Any]]:
+    """The caller's gate registers whose counts can still be corrected -- submitted, uploaded
+    today (IST) -- so the Daily gate pass screen offers the correction right where the PC
+    uploads (product owner 2026-11-03)."""
+    start = ist_day(now).replace(hour=0, minute=0, second=0, microsecond=0)
+    ids = connection.execute(
+        text("SELECT gate_pass_id FROM auditcore.p2_gate_passes WHERE tenant_id = :t AND pc_actor_id = :a "
+             "AND status = 'ACTIVE' AND counts_submitted_at_utc IS NOT NULL AND created_at_utc >= :s "
+             "ORDER BY created_at_utc DESC"),
+        {"t": tenant_id, "a": actor_id, "s": start},
+    ).scalars().all()
+    out = []
+    for gate_pass_id in ids:
+        row = _gate_pass_row(connection, tenant_id, gate_pass_id)
+        if counts_editable(row, now):
+            out.append(_public_gate_pass(row))
+    return out
+
+
 @router.get("/gate-passes/outlets")
 def gate_pass_outlets(
     tenant_id: str,
@@ -301,6 +321,7 @@ def gate_pass_outlets(
         "previousOpenOutletIds": previous_open,
         "outlets": [_public_outlet(o, default_id=default_id) for o in outlets],
         "defaultOutletId": default_id,
+        "editableToday": editable_today(connection, tenant_id, principal.subject),
         # Kept for older clients: a satellite outlet has a gate register too now.
         "satelliteOnly": False,
     }
