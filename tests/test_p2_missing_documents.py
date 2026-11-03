@@ -179,7 +179,7 @@ def test_delivered_journeys_listed_by_day_with_names_and_counts(setup):
     # A narrower period leaves the older day out.
     narrow = s.client.get(s.url, params={"from": (today - timedelta(days=1)).isoformat()}).json()
     assert [d["date"] for d in narrow["days"]] == [(today - timedelta(days=1)).isoformat()]
-    assert s.client.get(s.url, params={"from": (today - timedelta(days=70)).isoformat()}).status_code == 422
+    assert s.client.get(s.url, params={"from": (today - timedelta(days=100)).isoformat()}).status_code == 422
 
 
 def test_pc_sees_own_outlet_and_tl_the_project(setup):
@@ -212,3 +212,47 @@ def test_pc_sees_own_outlet_and_tl_the_project(setup):
     # Someone with no assignment sees nothing.
     s.acting.update(subject=f"nobody-{uuid4().hex[:6]}", role="PC")
     assert s.client.get(s.url).json()["totals"] == {"journeys": 0, "documents": 0}
+
+
+def _other_task(s, jny, *, status="READY"):
+    """An open PC document task that is not a missing document (a page to upload again)."""
+    with s.journey.engine.begin() as c:
+        set_tenant_context(c, s.journey.tenant_id)
+        c.execute(
+            text("INSERT INTO auditcore.p2_tasks (tenant_id, journey_id, task_type, category, origin_kind, source_type, "
+                 "source_code, title, description, dedupe_key, assigned_role_code, task_status, completion_protocol) "
+                 "VALUES (:t, :j, 'PC_PAGE_QUALITY_REJECTED', 'DOCUMENT_REUPLOAD', 'SYSTEM', 'DOCUMENT', 'QUALITY', "
+                 "'Upload page 2 again', 'x', :k, 'PC', :st, 'MACHINE_VERIFIED')"),
+            {"t": s.journey.tenant_id, "j": jny.journey_id, "k": f"quality:{uuid4()}", "st": status})
+
+
+def test_close_to_completion_lists_files_held_up_by_missing_documents_alone(setup):
+    """Product owner 2026-11-03: the journeys on the verge of completion that do not complete
+    because of missing documents -- fewest missing first, then the longest waiting."""
+    s = setup
+    one_old = _journey(s, customer="Asha Das")
+    _pages(s, one_old, "DELIVERY", uploaded_days_ago=3)
+    _task(s, one_old, "Upload the RSA Invoice", "rsa_invoice")
+
+    one_new = _journey(s, customer="Bimal Sahu")
+    _pages(s, one_new, "DELIVERY", uploaded_days_ago=1)
+    _task(s, one_new, "Upload the RTO Challan", "rto_challan")
+
+    two = _journey(s, customer="Chitra Nayak")
+    _pages(s, two, "DELIVERY", uploaded_days_ago=5)
+    _task(s, two, "Upload the RSA Invoice", "rsa_invoice")
+    _task(s, two, "Upload the Insurance Policy", "insurance_policy")
+
+    other = _journey(s, customer="Deepak Rout")                    # one missing, but a page to upload again too
+    _pages(s, other, "DELIVERY", uploaded_days_ago=2)
+    _task(s, other, "Upload the RSA Invoice", "rsa_invoice")
+    _other_task(s, other)
+
+    body = s.client.get(s.url, params={"top": 2}).json()
+    close = body["closeToCompletion"]
+    assert [j["customer"] for j in close["journeys"]] == ["Asha Das", "Bimal Sahu"]
+    assert close["eligible"] == 3 and close["heldByOtherTasks"] == 1 and close["top"] == 2
+    assert close["journeys"][0]["documents"] == ["RSA Invoice"] and close["journeys"][0]["otherOpenTasks"] == 0
+    everyone = s.client.get(s.url).json()["closeToCompletion"]["journeys"]
+    assert [j["customer"] for j in everyone] == ["Asha Das", "Bimal Sahu", "Chitra Nayak"]
+    assert s.client.get(s.url, params={"top": 0}).status_code == 400
