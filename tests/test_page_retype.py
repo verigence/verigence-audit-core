@@ -39,7 +39,9 @@ def _unit(journey, queue_id) -> dict:
 
 def test_a_request_names_the_tenant_and_each_page_with_its_type():
     tenant, commit, items = retype.parse_request("t:try-commit", ["utk-sa-261027-002:17:supporting_document"])
-    assert tenant == "t" and commit and items == [("UTK-SA-261027-002", 17, "supporting_document")]
+    assert tenant == "t" and commit and items == [("UTK-SA-261027-002", 17, "supporting_document", None)]
+    _, _, [item] = retype.parse_request("t:x", ["A-1:1:customer_ledger:booking_docket"])
+    assert item == ("A-1", 1, "customer_ledger", "booking_docket")
     for tag, reports in (("no-label", ["A-1:1:x_y"]), ("t:x", []), ("t:x", ["A-1:1"]), ("t:x", ["A-1:0:abc"]),
                          ("t:x", ["A-1:1:Bad-Key"])):
         with pytest.raises(ValueError):
@@ -103,3 +105,18 @@ def test_a_page_read_with_others_is_split_and_each_page_read_alone(journey):
     retired = _unit(journey, group)
     assert retired["queue_status"] == "MERGED" and str(retired["merged_into_queue_id"]) == sent[1]["newQueueId"]
     assert _unit(journey, pages[1]["queue_id"])["queue_status"] == "READY"  # the page outside the group
+
+
+def test_the_current_type_picks_the_page_when_two_uploads_share_its_number(journey):
+    """Live 2026-11-03 (SHI-SS-261031-005): page 1 of the delivery file is the
+    Offer Letter, page 1 of a second upload is the Tally ledger."""
+    _, [letter] = add_batch_pages(journey, [("booking_form", "READY")], grouping_status="NOT_NEEDED")
+    _, [ledger] = add_batch_pages(journey, [("customer_ledger", "READY")], grouping_status="NOT_NEEDED")
+    reference = _reference(journey)
+    plain = retype.run_page_retype(journey.engine, f"{journey.tenant_id}:look", [f"{reference}:1:customer_ledger"])
+    assert plain["wouldSend"][0]["from"] == "customer_ledger"  # the newest upload's page 1
+    named = retype.run_page_retype(journey.engine, f"{journey.tenant_id}:look",
+                                   [f"{reference}:1:customer_ledger:booking_form"])
+    assert named["wouldSend"][0]["from"] == "booking_form"
+    assert _unit(journey, letter["queue_id"])["queue_status"] == "READY"
+    assert _unit(journey, ledger["queue_id"])["queue_status"] == "READY"

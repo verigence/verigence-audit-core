@@ -36,29 +36,35 @@ from audit_core.db import set_tenant_context
 logger = structlog.get_logger(__name__)
 
 MAX_PAGES = 60
-_ITEM = re.compile(r"^(?P<reference>[A-Z0-9][A-Z0-9-]{2,63}):(?P<page>[1-9][0-9]{0,3}):(?P<template>[a-z0-9_]{2,64})$")
+# An optional fourth part names the type the page is read as now, to pick the
+# unit when the booking has two uploads with a page of that number (2026-11-03,
+# SHI-SS-261031-005: page 1 of the delivery file and page 1 of the ledger file).
+_ITEM = re.compile(r"^(?P<reference>[A-Z0-9][A-Z0-9-]{2,63}):(?P<page>[1-9][0-9]{0,3}):(?P<template>[a-z0-9_]{2,64})"
+                   r"(:(?P<current>[a-z0-9_]{2,64}))?$")
 _ACTOR = "SYSTEM:PAGE_RETYPE"
 
 
-def parse_request(tag: str, reports: list[str]) -> tuple[str, bool, list[tuple[str, int, str]]]:
+def parse_request(tag: str, reports: list[str]) -> tuple[str, bool, list[tuple[str, int, str, str | None]]]:
     tenant_id, _, label = (tag or "").partition(":")
     if not tenant_id or not label:
         raise ValueError("the tag must be '<tenant_id>:<label>'")
-    items: list[tuple[str, int, str]] = []
+    items: list[tuple[str, int, str, str | None]] = []
     for raw in reports:
         text_ = str(raw).strip()
         reference, _, rest = text_.partition(":")
         match = _ITEM.match(f"{reference.upper()}:{rest}")
         if not match:
             raise ValueError(f"{raw!r} is not '<journey reference>:<page>:<template key>'")
-        items.append((match["reference"], int(match["page"]), match["template"]))
+        items.append((match["reference"], int(match["page"]), match["template"], match["current"]))
     if not items or len(items) > MAX_PAGES:
         raise ValueError(f"ask for 1 to {MAX_PAGES} pages")
     return tenant_id, label.endswith("-commit"), items
 
 
-def _current_unit(connection: Any, *, tenant_id: str, reference: str, page: int) -> dict[str, Any] | None:
-    """The booking and the live (not merged, not retired) unit holding the page."""
+def _current_unit(connection: Any, *, tenant_id: str, reference: str, page: int,
+                  current: str | None = None) -> dict[str, Any] | None:
+    """The booking and the live (not merged, not retired) unit holding the page
+    (read now as ``current``, when given)."""
     row = connection.execute(
         text(
             """
@@ -67,11 +73,12 @@ def _current_unit(connection: Any, *, tenant_id: str, reference: str, page: int)
             JOIN auditcore.p2_document_queue q ON q.tenant_id = j.tenant_id AND q.journey_id = j.journey_id
             WHERE j.tenant_id = :t AND upper(j.journey_reference) = :r AND :p = ANY(q.page_numbers)
               AND q.queue_status <> 'MERGED' AND q.retired_at_utc IS NULL
+              AND (CAST(:c AS text) IS NULL OR COALESCE(q.template_key, q.classified_document_type) = :c)
             ORDER BY q.created_at_utc DESC
             LIMIT 1
             """
         ),
-        {"t": tenant_id, "r": reference, "p": page},
+        {"t": tenant_id, "r": reference, "p": page, "c": current},
     ).mappings().first()
     return dict(row) if row else None
 
@@ -148,14 +155,14 @@ def run_page_retype(engine: Engine, tag: str, reports: list[str]) -> dict[str, A
     tenant_id, commit, items = parse_request(tag, reports)
     registry = get_registry()
     out: dict[str, Any] = {"commit": commit, "sent": [], "wouldSend": [], "skipped": []}
-    for reference, page, template_key in items:
+    for reference, page, template_key, current in items:
         template = registry.documents.get(template_key)
         if template is None or not template.di_types:
             out["skipped"].append({"journey": reference, "page": page, "why": f"unknown template {template_key}"})
             continue
         with engine.begin() as connection:
             set_tenant_context(connection, tenant_id)
-            found = _current_unit(connection, tenant_id=tenant_id, reference=reference, page=page)
+            found = _current_unit(connection, tenant_id=tenant_id, reference=reference, page=page, current=current)
             if found is None:
                 out["skipped"].append({"journey": reference, "page": page, "why": "no live page"})
                 continue
