@@ -173,6 +173,7 @@ _CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 # the dealer or of the certificate of deposit.
 FREE_ACCESSORIES_KEY = "ACCESSORIES_KIT"
 _ACCESSORIES_FREE = re.compile(r"ACCESSORIES ?\(?FREE\)?")
+_ADDED_KIT = re.compile(r"\bKIT\b|ACCESSOR")
 SCRAPPAGE_DEALER_KEY = "SCRAPPAGE_BONUS_DEALER"
 SCRAPPAGE_COD_KEY = "SCRAPPAGE_BONUS_COD"
 # Discounts, to the canonical discount keys the Deal already uses
@@ -197,6 +198,12 @@ _PRINTED_TOTAL = re.compile(r"(NET VALUE|FINAL PRICE|NET RECEIVABLE( \(A ?\+ ?B\
 # The form's own summary rows: figures the dealer wrote from the rows above
 # them, never a charge or a receipt, so they are not "unmapped" and are not
 # read as one. (The net value is read separately, above.)
+# The Offer Letter's "VEHICLE PRICE" and "SCHEME" rows: the Ex Showroom (1-2)
+# row is their difference. When the dealer left that row blank and wrote only
+# the vehicle price (SHI-SS-261027-024, 2026-11-03: Rs 19,28,561, no scheme),
+# the ex-showroom is the vehicle price less the scheme -- the form's own sum.
+_VEHICLE_PRICE = re.compile(r"VEHICLE PRICE")
+_SCHEME_ROW = re.compile(r"SCHEME")
 _SUMMARY = re.compile(
     r"GROSS VALUE|DISCOUNT|TOTAL( COST| RECEIPTS?| \(A\))?|NET AMOUNT RECEIVED( \(E\))?|"
     r"SHORT ?/ ?EXCESS|BALANCE ?(EXCESS ?/ ?SHORTAGE)?( \(C-E\))?|DUE|"
@@ -386,6 +393,13 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             give("DISCOUNT", FREE_ACCESSORIES_KEY, amount)
             continue
         charge = next((k for k, pattern in _CHARGES if pattern.fullmatch(label)), None)
+        if charge == "other_charges" and _ADDED_KIT.search(label):
+            # A kit written into another row of the Offer Letter ("PERMIT Add
+            # Boss kit 18,398" beside "ACCESSORIES Free 30,000": the kit costs
+            # Rs 48,398, the ledger's and the accessory invoice's figure) is
+            # more accessories, not an other charge (2026-11-03).
+            give("COMMERCIAL", "accessories_cost", amount, "ADDED_KIT")
+            continue
         if charge is not None:
             give("COMMERCIAL", charge, amount, _other_charge_row(label) if charge == "other_charges" else "")
             continue
@@ -395,6 +409,9 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             continue
         if _PRINTED_TOTAL.fullmatch(label):
             give("TOTAL", "printed_total", amount)
+            continue
+        if _VEHICLE_PRICE.fullmatch(label) or _SCHEME_ROW.fullmatch(label):
+            give("WORKING", "vehicle_price" if _VEHICLE_PRICE.fullmatch(label) else "scheme", amount)
             continue
         if _SUMMARY.fullmatch(label):
             continue
@@ -439,8 +456,15 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             out.printed_total = value
         elif kind == "OLD_VEHICLE":
             out.old_vehicle_value = value
+        elif kind == "WORKING":
+            continue
         else:
             (out.components if kind == "COMMERCIAL" else out.discounts)[key] = value
+    vehicle_price = totals.get(("WORKING", "vehicle_price"))
+    if "ex_showroom_price" not in out.components and ("COMMERCIAL", "ex_showroom_price") not in in_conflict \
+            and vehicle_price is not None \
+            and ("WORKING", "vehicle_price") not in in_conflict and ("WORKING", "scheme") not in in_conflict:
+        out.components["ex_showroom_price"] = vehicle_price - totals.get(("WORKING", "scheme"), Decimal(0))
     return out
 
 

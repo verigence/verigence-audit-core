@@ -311,6 +311,9 @@ _STATEMENT_NORM = frozenset(_norm_type(t) for t in (_STATEMENT_COLUMN_TYPE, _COS
 # which stand before any invoice (product owner 2026-11-02: NDC, cost sheet,
 # customer ledger, then the invoice).
 _DEALER_BOOKS_NORM = _STATEMENT_NORM | {_norm_type(TALLY_LEDGER_TYPE)}
+# The deal's offer as the dealer wrote it: the NDC (statement form) or, with
+# none, the cost sheet standing in for it -- not the ERP settlement printout.
+_OFFER_NORM = frozenset(_norm_type(t) for t in (_STATEMENT_COLUMN_TYPE, _COST_SHEET_STANDIN_TYPE))
 _QUOTE_NORM = frozenset(_norm_type(t) for t in _QUOTE_SOURCES)
 
 
@@ -1026,6 +1029,9 @@ _OPTED_COMPONENTS = frozenset({
     "accessories_cost", "essential_kit_amount", "genuine_accessories_amount", "non_genuine_accessories_amount",
     "additional_warranty_amount", "extended_warranty_amount",
 })
+# The products the customer may or may not take; with the NDC on file, one it
+# does not charge (nor any other bill) is not taken (2026-11-03).
+_OPTIONAL_PRODUCTS = _OPTED_COMPONENTS | {"rsa_amount"}
 # Every vehicle-sale invoice type (2026-10-20: not two hard-coded ones); an
 # invoice_generic counts as one when it prints a vehicle-sale purpose.
 _VEHICLE_INVOICE_TYPES = tuple(sorted(VEHICLE_SALE_TYPES))
@@ -1181,7 +1187,7 @@ def _invoice_discounts_inside_the_price(all_rows: list[dict[str, Any]], discount
         row["flags"] = [f for f in row["flags"] if f not in _STANDARD_FLAGS]
 
 
-def _one_benefit_per_figure(discount_rows: list[dict[str, Any]]) -> None:
+def _one_benefit_per_figure(discount_rows: list[dict[str, Any]], *, offer_on_file: bool = False) -> None:
     """One benefit printed by two billing documents counts once (product owner
     2026-11-02).
 
@@ -1194,9 +1200,15 @@ def _one_benefit_per_figure(discount_rows: list[dict[str, Any]]) -> None:
       show stays out of the totals and is flagged as a disagreement -- never
       added beside the statement's own (one discount split differently on
       the two documents would otherwise count twice).
-    * With no benefit on the statement, the invoice's discounts are the
-      deal's (live 2026-11-02: the Tally invoice's "OEM Discount" of Rs 30,000
-      on Biswadeep Jena, the NDC filed as a booking docket)."""
+    * With the NDC or the cost sheet on file (``offer_on_file``) it is the
+      deal's offer even when it prints no benefit, whenever it was uploaded:
+      an invoice discount it does not show is not added (product owner
+      2026-11-03: "NDC/Cost sheet ... should get the priority and no way the
+      initial offering has to be changed"); it stays beside the deal, marked
+      as not on the NDC.
+    * With neither, the invoice's discounts are the deal's (live 2026-11-02:
+      the Tally invoice's "OEM Discount" of Rs 30,000 on SHI-SS-261031-004,
+      the NDC filed as a booking docket)."""
     def from_books(row: dict[str, Any], norm: frozenset[str]) -> bool:
         return row["current"] is not None and any(
             _norm_type(s.get("documentType")) in norm and _near(s.get("amount"), Decimal(row["current"]),
@@ -1216,6 +1228,28 @@ def _one_benefit_per_figure(discount_rows: list[dict[str, Any]]) -> None:
         elif statement_gives:
             row["current"], row["currentSource"], row["variance"] = None, None, None
             row["flags"] = [*(f for f in row["flags"] if f not in _STANDARD_FLAGS), "INVOICES_DISAGREE"]
+        elif offer_on_file:
+            row["current"], row["currentSource"], row["variance"] = None, None, None
+            row["flags"] = [*(f for f in row["flags"] if f not in _STANDARD_FLAGS), "NOT_ON_STATEMENT"]
+    # The NDC and the dealer's ledger give one benefit under two names (live
+    # 2026-11-03, SHI-SS-261031-008: the Offer Letter's "Exchange / loyalty
+    # bonus" Rs 20,000 and the ledger's credit note "SCRAPPAGE BONUS" Rs 20,000,
+    # both counted, the payable Rs 20,000 short). The ledger's credit note names
+    # it (product owner 2026-11-02: the ledger / credit-note name decides); the
+    # NDC's row checks it. Each ledger benefit stands for one NDC row only.
+    tally = _norm_type(TALLY_LEDGER_TYPE)
+    by_ledger = [r for r in discount_rows if from_books(r, frozenset({tally})) and not from_books(r, _STATEMENT_NORM)]
+    paired: set[int] = set()
+    for row in discount_rows:
+        if row["current"] is None or not from_books(row, _STATEMENT_NORM) or from_books(row, frozenset({tally})):
+            continue
+        amount = Decimal(row["current"])
+        same = next((r for r in by_ledger if id(r) not in paired and r["key"] != row["key"]
+                     and _near(r["current"], amount, _SAME_BENEFIT_TOLERANCE)), None)
+        if same is not None:
+            paired.add(id(same))
+            same["sources"] = [*same["sources"], *[{**e, "checks": True} for e in row["sources"]]]
+            _take_back(row, same_as=same)
 
 
 def _benefit_row_for(discount_rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
@@ -1491,10 +1525,11 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         if row["key"] in _OPTED_COMPONENTS:
             own_document = row["billed"] is not None or document_on_file[_line_document(row["key"])]
             row["opted"] = _opted(row["billed"], row["booking"], invoiced=own_document)
+    offer_on_file = statement_policy and any(_norm_type(s["source_document_type"]) in _OFFER_NORM for s in sources)
     situation = _DealSituation(
         invoice_on_file=invoice_on_file, vehicle_on_file=vehicle_on_file, closed=closed,
         vehicle_reading=vehicle_reading, vehicle_taxes_read=vehicle_taxes_read, document_on_file=document_on_file,
-        statement_policy=statement_policy,
+        statement_policy=statement_policy, offer_on_file=offer_on_file,
     )
     for row in all_rows:
         _settle_component(row, situation)
@@ -1509,7 +1544,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         _settle_discount(row, situation, mr_key=mr_key)
 
     _invoice_discounts_inside_the_price(all_rows, discount_rows)
-    _one_benefit_per_figure(discount_rows)
+    _one_benefit_per_figure(discount_rows, offer_on_file=offer_on_file)
     _link_credit_notes(credit_notes, discount_rows)
     insurance["invoiceOnFile"] = _insurance_accounted(documents, sources, selection)
     insurance["vehicleInvoiced"] = vehicle_on_file
@@ -2281,6 +2316,7 @@ class _DealSituation:
         "closed",
         "document_on_file",
         "invoice_on_file",
+        "offer_on_file",
         "statement_policy",
         "vehicle_on_file",
         "vehicle_reading",
@@ -2289,8 +2325,12 @@ class _DealSituation:
 
     def __init__(self, *, invoice_on_file: bool, vehicle_on_file: bool, closed: bool,
                  vehicle_reading: dict[str, Any] | None, vehicle_taxes_read: bool,
-                 document_on_file: dict[str, bool], statement_policy: bool = False) -> None:
+                 document_on_file: dict[str, bool], statement_policy: bool = False,
+                 offer_on_file: bool = False) -> None:
         self.invoice_on_file = invoice_on_file
+        # The NDC (or the cost sheet standing in for it) is on file: the deal's
+        # offer as the dealer wrote it (product owner 2026-11-03).
+        self.offer_on_file = offer_on_file
         self.vehicle_on_file = vehicle_on_file
         self.closed = closed
         self.vehicle_reading = vehicle_reading
@@ -2336,6 +2376,15 @@ def _component_current(row: dict[str, Any], situation: _DealSituation) -> None:
     awaiting its document, with no amount, out of every total."""
     if row["billed"] is not None:
         row["current"], row["currentSource"] = row["billed"], row.get("billedFrom") or "document"
+        return
+    if situation.offer_on_file and row["key"] in _OPTIONAL_PRODUCTS:
+        # An optional product (accessories, extended warranty, RSA) the NDC /
+        # cost sheet does not charge, nor any other bill: not taken -- never
+        # awaited, never a shortfall (product owner 2026-11-03: the NDC sets
+        # the offer; 2026-11-02: RSA / EW are sold only when charged). Live,
+        # SHI-SS-261031-008: its Offer Letter leaves the EW and RSA rows blank,
+        # and the settlement could not be judged "awaiting the EW and RSA bills".
+        row["current"], row["currentSource"] = None, None
         return
     document = _line_document(row["key"])
     if not situation.invoice_on_file:

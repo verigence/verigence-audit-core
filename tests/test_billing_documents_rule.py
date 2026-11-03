@@ -155,16 +155,20 @@ def test_the_invoice_stands_where_the_ndc_is_silent_and_one_benefit_counts_once(
     assert D(_row(view, "ex_showroom_price")["billed"]) == D(1039000)
 
 
-def test_an_invoice_discount_the_ndc_does_not_give_counts(journey) -> None:
-    """Live 2026-11-02 (Biswadeep Jena, Bibhudatta Bhatta): the Tally invoice's
-    "OEM Discount" (30,000 / 24,999 with GST) was dropped under the NDC policy."""
-    _statement(journey, [line for line in UTKAL if line["particulars_raw"] != "Other Discount (if any)"])
-    before = _deal(journey)["summary"]["net"]["current"]
+def test_an_ndc_that_gives_no_benefit_still_sets_the_offer(journey) -> None:
+    """Product owner 2026-11-03: "NDC/Cost sheet ... should get the priority
+    and no way the initial offering has to be changed" -- an NDC that prints
+    no discount still keeps an invoice's discount out of the deal, whichever
+    was uploaded first; the invoice's figure shows beside it, marked as not on
+    the NDC. (On 2 Nov the invoice's discount was added: SHI-SS-261031-004 and
+    SHI-SS-261027-025, whose NDC -- the Offer Letter -- was then filed as a
+    booking docket, so the deal had no NDC at all.)"""
     add_ready_document(journey, "customer_invoice_dms", process_area="DELIVERY", **OEM_DISCOUNT_INVOICE)
+    _statement(journey, [line for line in UTKAL if line["particulars_raw"] != "Other Discount (if any)"])
     view = _deal(journey)
     oem = _benefit(view, "CASH_DISCOUNT")
-    assert D(oem["current"]) == D(5000) and oem["currentSource"] == "invoice"
-    assert D(view["summary"]["net"]["current"]) == D(before) - 5000
+    assert oem["current"] is None and "NOT_ON_STATEMENT" in oem["flags"] and D(oem["billed"]) == D(5000)
+    assert view["summary"]["discounts"]["current"] is None
 
 
 # ── 4. credit notes ──────────────────────────────────────────────────────────
