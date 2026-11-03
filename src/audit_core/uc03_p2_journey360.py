@@ -1202,6 +1202,57 @@ _SMALL_CHARGES = frozenset({
 })
 
 
+# A BH-series registration: its number ("26 BH 1234 A"), its type, or the RTO
+# challan's road tax for two years ("MV Tax(14-Oct-2026 to 13-Oct-2028)")
+# instead of the one-time or yearly tax of a state registration.
+_BH_NUMBER = r"^\s*\d{2}\s*-?\s*BH\s*-?\s*\d{4}"
+_TWO_YEAR_TAX = re.compile(r"MV TAX ?\((\d{2})-(\w{3})-(\d{4}) TO (\d{2})-(\w{3})-(\d{4})\)")
+
+
+def _bh_series(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """The vehicle is registered in the BH series (2026-11-03)."""
+    found = connection.execute(
+        text(
+            """
+            SELECT EXISTS (SELECT 1 FROM auditcore.registration_records r
+                           WHERE r.tenant_id=:t AND r.journey_id=:j
+                             AND (r.registration_number ~* :bh OR r.registration_type_code ~* '\\mBH\\M'))
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "bh": _BH_NUMBER},
+    ).scalar_one()
+    if found:
+        return True
+    challans = connection.execute(
+        text(
+            """
+            SELECT f.effective_value::text FROM auditcore.journey_document_extracted_fields f
+            JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id
+             AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
+             AND e.document_type_key IN ('rto_challan', 'rto_tax_receipt')
+            WHERE f.tenant_id=:t AND f.journey_id=:j AND f.field_key='line_items'
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).scalars().all()
+    for value in challans:
+        for m in _TWO_YEAR_TAX.finditer(str(value).upper()):
+            if int(m[6]) - int(m[3]) == 2:
+                return True
+    return False
+
+
+def _rto_without_standard(rows: list[dict[str, Any]]) -> None:
+    """A BH-series registration is not compared with the price master's RTO
+    figure, which is a state registration's (product owner 2026-11-03: "Don't
+    compare BH RTO"). The bills are still compared with each other."""
+    for row in rows:
+        if row["key"] in (_RTO_COMBINED, *_RTO_PARTS):
+            row["standard"], row["variance"] = None, None
+            row["flags"] = [f for f in row["flags"] if f not in _STANDARD_FLAGS]
+            row["standardNote"] = "BH series registration: the price master's RTO figure is not compared."
+
+
 def _one_charge_per_figure(rows: list[dict[str, Any]]) -> None:
     """One charge the NDC and the dealer's ledger print under two names counts
     once (2026-11-03), as a benefit does: the ledger's posting names it, the
@@ -1587,6 +1638,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             row["variance"] = None
             row["flags"] = [f for f in row["flags"] if f not in _STANDARD_FLAGS]
     _one_charge_per_figure(all_rows)
+    if _bh_series(connection, tenant_id=tenant_id, journey_id=journey_id):
+        _rto_without_standard(all_rows)
     for row in discount_rows:
         _settle_discount(row, situation, mr_key=mr_key)
 
