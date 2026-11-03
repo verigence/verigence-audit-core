@@ -312,6 +312,7 @@ def conclude_product(charge: dict[str, Any], *, on_file: set[str], taken: bool |
 def loan_received(
     *, matched: Decimal | None, disbursement_known: bool, financed: bool, stated: dict[str, Any] | None,
     receipt_amounts: list[Decimal | None], letter: dict[str, Any] | None = None,
+    loan_among_receipts: Decimal | None = None,
 ) -> dict[str, Any]:
     """The loan money to count as received, and from where (2026-10-30).
 
@@ -328,7 +329,11 @@ def loan_received(
     3. Else the Bank Approval Letter's sanctioned amount, when no dealership
        receipt stands for the loan (2026-10-31; ``letter``, from
        uc03_p2_journey360.loan_without_receipt): counted, and marked
-       ``withoutReceipt`` so the screen shows it with an asterisk.
+       ``withoutReceipt`` so the screen shows it with an asterisk. A customer
+       receipt of the sanction less the lender's charges
+       (``loan_among_receipts``, uc03_p2_journey360.letter_loan_among_receipts)
+       is the loan's receipt not yet linked: the loan is in the receipts, not
+       unknown and not counted twice (live 2026-11-03).
     4. Else, on a financed deal, the loan is NOT zero: it is unknown, and the
        settlement cannot be judged (REBARANI GANTHIA: the summary showed the
        whole loan as a shortfall).
@@ -353,16 +358,30 @@ def loan_received(
         out.update(amount=letter_amount, source="Bank Approval Letter (sanctioned amount)", withoutReceipt=True,
                    note="No dealership receipt for the loan amount; taken from the Bank Approval Letter.")
         return out
+    if loan_among_receipts is not None:
+        out.update(amount=Decimal(0), source="Bank Approval Letter (sanctioned amount)",
+                   note=f"The loan's receipt (Rs {loan_among_receipts:,.2f}, the sanction less the lender's charges) "
+                        "is among the receipts, not yet linked as the loan receipt; not counted twice.")
+        return out
     if financed:
         out.update(unknown=True, note="Financed deal: the loan amount is not on file (no disbursement on the "
                                       "finance record, no financer line on the NDC or settlement).")
     return out
 
 
-def settlement(payable: Decimal | None, received: Decimal, *, loan_unknown: bool = False) -> dict[str, Any]:
+def settlement(
+    payable: Decimal | None, received: Decimal, *, loan_unknown: bool = False, awaiting: list[str] | None = None,
+) -> dict[str, Any]:
+    """Money received against the net payable. ``awaiting``: the lines still
+    awaiting their billing document (product owner 2026-11-02: only billing
+    documents count), so the payable is what is billed so far: a shortfall
+    stands (the awaited bills can only add to it); an excess is not judged,
+    as it may be paying for them."""
     if payable is None:
         return {"payable": None, "received": money(received), "balance": None, "status": None,
-                "conclusion": CANNOT, "rule": "AS-09", "reason": "No net payable could be worked out."}
+                "conclusion": CANNOT, "rule": "AS-09",
+                "reason": "No net payable yet: the vehicle's price is not on a billing document "
+                          "(NDC, cost sheet or vehicle invoice)."}
     if loan_unknown:
         # The lender's money is part of what was received; without it the
         # balance would be the loan itself, not a shortfall.
@@ -371,6 +390,11 @@ def settlement(payable: Decimal | None, received: Decimal, *, loan_unknown: bool
                 "reason": "Financed deal: the loan amount is not on file, so the settlement cannot be judged."}
     balance = payable - received
     status = "SETTLED" if abs(balance) <= TOLERANCE else ("SHORT" if balance > 0 else "EXCESS")
+    if status == "EXCESS" and awaiting:
+        return {"payable": money(payable), "received": money(received), "balance": money(balance), "status": None,
+                "conclusion": CANNOT, "rule": "AS-09", "impact": None, "awaiting": list(awaiting),
+                "reason": "Received more than is billed so far; still awaiting the bill for "
+                          + ", ".join(awaiting) + ", which the difference may be paying for."}
     return {"payable": money(payable), "received": money(received), "balance": money(balance), "status": status,
             "conclusion": OK if status == "SETTLED" else EXCEPTION, "rule": "AS-09",
             # A balance is money still to come in (or to refund), not a price
@@ -493,6 +517,9 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         stated=statement_loan(connection, tenant_id=tenant_id, journey_id=journey_id),
         receipt_amounts=[dec(i.get("amount")) for i in counted if not i.get("isLoanReceipt")],
         letter=pays.get("loanWithoutReceipt"),
+        loan_among_receipts=j360.letter_loan_among_receipts(
+            connection, tenant_id=tenant_id, journey_id=journey_id,
+            receipt_amounts=[dec(i.get("amount")) for i in counted if not i.get("isLoanReceipt")]),
     )
     loan = loan_on_file["amount"] or Decimal(0)
     refunds = loan_on_file["refunds"]
@@ -556,7 +583,8 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                       "basis": (deal.get("insurance") or {}).get("basis")},
     }
     settle = settlement(dec(summary.get("payable")), receipts + loan + old_vehicle - refunds,
-                        loan_unknown=loan_on_file["unknown"])
+                        loan_unknown=loan_on_file["unknown"],
+                        awaiting=[a.get("label") or a.get("key") for a in summary.get("awaiting") or []])
 
     rows = charges + benefits + products + [dict(bank_check, label="Payments verified with bank statement",
                                                   difference=None, impact=None),
