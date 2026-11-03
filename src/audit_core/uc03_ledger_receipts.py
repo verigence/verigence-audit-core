@@ -34,7 +34,7 @@ from sqlalchemy import Connection, text
 _LOAN_NET_SHARE = Decimal("0.98")
 _RECEIPT_VOUCHER = re.compile(r".*RECEIPT.*")
 _JOURNAL_VOUCHER = re.compile(r".*JOURNAL.*")
-_NOT_MONEY = re.compile(r".*(ROUND ?OFF|CREDIT ?NOTE|DISCOUNT|BONUS|SCHEME|OFFER).*")
+_NOT_MONEY = re.compile(r".*(ROUND(ING|ED)? ?OFF|CREDIT ?NOTE|DISCOUNT|BONUS|SCHEME|OFFER).*")
 _CASH = re.compile(r".*\bCASH\b.*")
 _BANK = re.compile(r".*\b(BANK|NEFT|RTGS|IMPS|UPI|POS)\b.*")
 # A journal from the financier (MMFSL, "... FINANCE ...", "... FIN SERV ...").
@@ -224,6 +224,53 @@ def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID)
     return out
 
 
+# Rows of a ledger printout that repeat the postings above them.
+_CARRIED = re.compile(r"(CLOSING BALANCE|TOTAL|GRAND TOTAL|CARRIED OVER|BROUGHT FORWARD|C/F|B/F|C/O|B/O)\b.*")
+
+
+def ledger_balance(rows: list[dict[str, Any]]) -> Decimal | None:
+    """What the customer ledger says the customer owes: its debits less its
+    credits (a negative figure is money the customer paid over). The
+    closing-balance, total and carried-over rows repeat the postings and are
+    not added. None when the ledger has no posting."""
+    total, posted = Decimal(0), False
+    for row in rows:
+        if _CARRIED.fullmatch(_label(row.get("particulars_raw"))):
+            continue
+        debit, credit = _amount(row.get("debit_amount")), _amount(row.get("credit_amount"))
+        if debit:
+            total += abs(debit)
+            posted = True
+        if credit:
+            total -= abs(credit)
+            posted = True
+    return total if posted else None
+
+
+def customer_ledger_balance(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    """The Tally customer ledger's balance, for the Audit Summary's check of
+    the deal's balance (product owner 2026-11-03: the ledger rows are not shown
+    on screen; they are used to verify in the Audit Summary). None with no
+    Tally ledger on file."""
+    from audit_core.uc03_account_statement import (
+        KIND_TALLY,
+        combined_tally_rows,
+        line_rows,
+        load_ledger_documents,
+        statement_kind,
+    )
+
+    documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+    tallies = [(d, rows) for d in documents for rows in [line_rows(d["fields"].get("line_items"))]
+               if statement_kind(rows) == KIND_TALLY]
+    if not tallies:
+        return None
+    balance = ledger_balance(combined_tally_rows(tallies))
+    if balance is None:
+        return None
+    return {"balance": balance, "documentId": str(tallies[0][0]["documentId"])}
+
+
 def ledger_financier_credit(rows: list[dict[str, Any]]) -> Decimal | None:
     """The financier's journal posting credited to the customer (its D/O), the
     largest when several; None when the ledger shows none."""
@@ -254,4 +301,12 @@ def ledger_loan_credit(connection: Connection, *, tenant_id: str, journey_id: UU
     return max(amounts) if amounts else None
 
 
-__all__ = ["is_loan_net_of_charges", "ledger_financier_credit", "ledger_loan_credit", "ledger_receipts", "money_in"]
+__all__ = [
+    "customer_ledger_balance",
+    "is_loan_net_of_charges",
+    "ledger_balance",
+    "ledger_financier_credit",
+    "ledger_loan_credit",
+    "ledger_receipts",
+    "money_in",
+]

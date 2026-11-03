@@ -21,12 +21,18 @@ into it stays as it is: the document was not read as a whole). When the
 document is read later (the PC's Retry, or a new upload), it replaces the copy
 again the usual way, and nothing here brings the copy back while it stands.
 
-Never brought back: a copy whose replacement was read (the newer document,
-whatever became of it since), a copy the PC replaced and then removed
-(P2_DOCUMENT_VOIDED is the PC's own decision; the document card's Restore is
-one click away), and a copy replaced by another customer's file
-(uc03_p2_file_identity gives those back, and takes them away again should the
-file be found to belong).
+The same holds when the PC removes the copy that replaced it (product owner,
+2026-11-03: "When a PC voids a document, should the other read copy come
+back? yes"): a newer copy the PC voided (P2_DOCUMENT_VOIDED) no longer stands
+for the document, so the earlier copy, as it was read, is the booking's
+document again. A copy the PC removed itself is never brought back (it is
+VOIDED, not superseded): the PC removes the earlier copy too when neither is
+right.
+
+Never brought back: a copy whose replacement was read and still stands (the
+newer document, unless the PC removed it), and a copy replaced by another
+customer's file (uc03_p2_file_identity gives those back, and takes them away
+again should the file be found to belong).
 
 ``run_earlier_copy_back`` (p2_worker_jobs kind EARLIER_COPY_BACK) lists, per
 booking, every copy that comes back this way or through the file identity --
@@ -53,6 +59,20 @@ _REPLACED = ("REPLACED_BY_NEWER_UPLOAD", "REPLACED_BY_P2_REUPLOAD", "EARLIER_COP
 _NEVER_READ = ("CANCELLED", "DEAD_LETTER")
 _NAME_FIELDS = ("pan_name", "aadhaar_name", "customer_name", "buyer_name", "insured_name",
                 "organisation_legal_name", "finance_applicant_name")
+
+
+# The PC's own removal of a document (uc03_p2_documents.void_p2_document).
+PC_VOIDED = "P2_DOCUMENT_VOIDED"
+
+
+def _gone(replacement: dict[str, Any]) -> bool:
+    """The replacing copy no longer stands for the document: a page merged
+    into a document that was never read, or a copy the PC removed."""
+    if replacement["association_status"] != "VOIDED":
+        return False
+    if replacement["void_reason"] == PC_VOIDED:
+        return True
+    return replacement["void_reason"] == "P2_MERGED_INTO_DOCUMENT" and replacement["merged_into_status"] in _NEVER_READ
 
 
 def _repeatable(requirement_key: str | None) -> bool:
@@ -111,16 +131,15 @@ def copies_to_bring_back(connection: Connection, *, tenant_id: str, journey_id: 
             ),
             {"t": tenant_id, "e": row["evidence_id"]},
         ).mappings().all()
-        if not replacements or not all(
-            s["association_status"] == "VOIDED" and s["void_reason"] == "P2_MERGED_INTO_DOCUMENT"
-            and s["merged_into_status"] in _NEVER_READ for s in replacements
-        ):
+        if not replacements or not all(_gone(s) for s in replacements):
             continue
+        removed = any(s["void_reason"] == PC_VOIDED for s in replacements)
         picked.append({
             "evidence_id": row["evidence_id"], "di_document_id": row["di_document_id"],
             "document_type_key": row["document_type_key"], "process_area": row["process_area"],
             "replaced_by": [str(s["di_document_id"]) for s in replacements],
-            "reason": "The copy that replaced it was never read.",
+            "reason": ("The PC removed the copy that replaced it." if removed
+                       else "The copy that replaced it was never read."),
         })
     if picked:
         names: dict[str, str] = {}
@@ -210,12 +229,18 @@ def _journeys(connection: Connection, tenant_id: str) -> list[UUID]:
               AND s.association_status='VOIDED' AND s.void_reason='P2_MERGED_INTO_DOCUMENT'
               AND g.queue_status = ANY(:never)
             UNION
+            SELECT DISTINCT e.journey_id
+            FROM auditcore.evidence e
+            JOIN auditcore.evidence s ON s.tenant_id=e.tenant_id AND s.supersedes_evidence_id=e.evidence_id
+            WHERE e.tenant_id=:t AND e.association_status='SUPERSEDED'
+              AND s.association_status='VOIDED' AND s.void_reason=:pc_voided
+            UNION
             SELECT DISTINCT b.journey_id FROM auditcore.p2_upload_batches b
             WHERE b.tenant_id=:t AND b.identity_enforced_at_utc IS NOT NULL
             ORDER BY 1
             """
         ),
-        {"t": tenant_id, "never": list(_NEVER_READ)},
+        {"t": tenant_id, "never": list(_NEVER_READ), "pc_voided": PC_VOIDED},
     ).scalars().all()]
 
 

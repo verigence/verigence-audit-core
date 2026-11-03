@@ -42,6 +42,7 @@ from sqlalchemy import Connection, text
 from audit_core.uc03_p2_names import (
     is_masked,
     masked_matches,
+    masked_resembles,
     person_tokens,
     same_person,
 )
@@ -250,7 +251,12 @@ def follow_entered_name(connection: Connection, *, tenant_id: str, journey_id: U
     entered = str(row["display_name"])
     if not customer or is_masked(customer) or same_person(entered, customer):
         return None
-    masked_self = is_masked(entered) and masked_matches(entered, customer)
+    # The booking's own verified KYC name is the customer's name: a masked
+    # entered name follows it when the letters the mask shows agree, whatever
+    # length the mask prints (2026-11-03: five bookings kept the PAN's masked
+    # name while their KYC had verified the full one).
+    masked_self = is_masked(entered) and (
+        masked_matches(entered, customer) or (legal is not None and masked_resembles(entered, customer)))
     if not masked_self:
         people = [p for p in connection.execute(
             text(

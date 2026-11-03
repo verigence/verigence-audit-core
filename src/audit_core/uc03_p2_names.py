@@ -193,6 +193,29 @@ def masked_matches(masked: Any, full: Any) -> bool:
     return fits(right) or fits(person_tokens(full)) or fits_joined(right) or fits_joined(person_tokens(full))
 
 
+def masked_resembles(masked: Any, full: Any) -> bool:
+    """Whether a masked name is the full one when the mask does not keep the
+    words' lengths (live 2026-11-03, five bookings: a ten-letter first name
+    printed with nine Xs between its first and last letters, a six-letter
+    surname printed "CX"): the same number of words, and each word's letters that
+    show at its two ends are the full word's; a word with no mask is the same
+    word. Looser than masked_matches, so used only where the full name is the
+    booking's own verified KYC name."""
+    left = [t for t in re.sub(r"[^A-Za-z ]+", " ", str(masked or "")).upper().split() if t]
+    right = person_tokens(full) or [t for t in re.sub(r"[^A-Za-z ]+", " ", str(full or "")).upper().split() if t]
+    right = [str(t).upper() for t in right]
+    if not left or len(left) != len(right) or not any("X" in m for m in left):
+        return False
+    for m, f in zip(left, right, strict=True):
+        if "X" not in m:
+            if m != f:
+                return False
+            continue
+        if (m[0] != "X" and m[0] != f[0]) or (m[-1] != "X" and m[-1] != f[-1]):
+            return False
+    return True
+
+
 def same_organisation(left: Any, right: Any) -> bool:
     """Whether two printed names are the same dealership: the same words
     once the legal suffixes go, one a prefix of the other ("Sarthak Motors"

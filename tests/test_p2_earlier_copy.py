@@ -107,21 +107,41 @@ def test_a_page_of_the_unread_document_itself_stays_as_it_is(journey, monkeypatc
     assert fid._state(journey, pages["aadhaar:1"], pages["aadhaar:2"]) == ["SUPERSEDED", "VOIDED"]
 
 
-@pytest.mark.parametrize("replacement", ["removed by the PC", "read", "still being read"])
-def test_a_copy_stays_replaced_unless_the_replacement_was_never_read(journey, monkeypatch, replacement):
+def test_a_copy_comes_back_when_the_pc_removes_the_copy_that_replaced_it(journey, monkeypatch):
+    """Product owner 2026-11-03: "When a PC voids a document, should the other
+    read copy come back? yes"."""
     monkeypatch.delenv("P2_FILE_IDENTITY_ENFORCE", raising=False)
-    _, first, again, unread = _masked_pan_then_aadhaar(journey)
+    _, first, again, _ = _masked_pan_then_aadhaar(journey)
+    with journey.engine.begin() as connection:  # the newer copy was a document; the PC removed it
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.evidence SET void_reason='P2_DOCUMENT_VOIDED' "
+                                "WHERE tenant_id=:t AND evidence_id=:e"),
+                           {"t": journey.tenant_id, "e": again["aadhaar:1"]["evidence_id"]})
+    fid._settle(journey)
+    assert fid._state(journey, first["aadhaar:2"], again["aadhaar:1"]) == ["ACTIVE", "VOIDED"]
+    [(details,)] = _one(journey, "SELECT details FROM auditcore.p2_activity_events WHERE tenant_id=:t "
+                                 "AND event_type='EARLIER_COPY_BACK'")
+    assert details["reason"] == "The PC removed the copy that replaced it."
+    # The PC then removes the earlier copy too: it stays removed.
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        if replacement == "removed by the PC":  # the newer copy was a document, the PC removed it
-            connection.execute(text("UPDATE auditcore.evidence SET void_reason='P2_DOCUMENT_VOIDED' "
-                                    "WHERE tenant_id=:t AND evidence_id=:e"),
-                               {"t": journey.tenant_id, "e": again["aadhaar:1"]["evidence_id"]})
-        else:
-            connection.execute(text("UPDATE auditcore.p2_document_queue SET queue_status=:s WHERE tenant_id=:t "
-                                    "AND queue_id=:g"),
-                               {"t": journey.tenant_id, "g": unread["group_id"],
-                                "s": "SUPPORTING" if replacement == "read" else "EXTRACTING"})
+        connection.execute(text("UPDATE auditcore.evidence SET association_status='VOIDED', "
+                                "void_reason='P2_DOCUMENT_VOIDED' WHERE tenant_id=:t AND evidence_id=:e"),
+                           {"t": journey.tenant_id, "e": first["aadhaar:2"]["evidence_id"]})
+    fid._settle(journey)
+    assert fid._state(journey, first["aadhaar:2"], again["aadhaar:1"]) == ["VOIDED", "VOIDED"]
+
+
+@pytest.mark.parametrize("replacement", ["read", "still being read"])
+def test_a_copy_stays_replaced_while_its_replacement_stands(journey, monkeypatch, replacement):
+    monkeypatch.delenv("P2_FILE_IDENTITY_ENFORCE", raising=False)
+    _, first, _, unread = _masked_pan_then_aadhaar(journey)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_document_queue SET queue_status=:s WHERE tenant_id=:t "
+                                "AND queue_id=:g"),
+                           {"t": journey.tenant_id, "g": unread["group_id"],
+                            "s": "SUPPORTING" if replacement == "read" else "EXTRACTING"})
     fid._settle(journey)
     assert fid._state(journey, first["aadhaar:2"]) == ["SUPERSEDED"]
     assert fid._legal_name(journey) == "BXXXXH KXXXR MXXXXA"  # as it stands: the masked PAN only
