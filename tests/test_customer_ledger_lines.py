@@ -143,3 +143,24 @@ def test_the_offer_letter_payment_details_form_is_an_ndc() -> None:
                               "ADDITIONAL_DISCOUNT": D(5000)}
     assert (read.financer, read.printed_total, read.old_vehicle_value) == (D(900000), D(1705500), D(300000))
     assert read.unmapped == [] and read.conflicts == []
+
+
+def test_the_offer_letter_without_its_ex_showroom_row_reads_the_vehicle_price() -> None:
+    """Live 2026-11-03 (SHI-SS-261027-024): the dealer wrote only the vehicle
+    price; the Ex Showroom (1-2) row, vehicle price less scheme, was blank, so
+    the deal had no price and no payable."""
+    from decimal import Decimal as D
+
+    from audit_core.uc03_account_statement import read_statement
+
+    base = [{"particulars_raw": "TCS", "debit_amount": 19285},
+            {"particulars_raw": "FINANCE AMOUNT", "credit_amount": 1500000}]
+    read = read_statement([{"particulars_raw": "VEHICLE PRICE", "debit_amount": 1928561}, *base])
+    assert read.components["ex_showroom_price"] == D(1928561) and read.unmapped == []
+    with_scheme = read_statement([{"particulars_raw": "VEHICLE PRICE", "debit_amount": 1928561},
+                                  {"particulars_raw": "SCHEME", "debit_amount": 28561}, *base])
+    assert with_scheme.components["ex_showroom_price"] == D(1900000)
+    # The Ex Showroom row, when written, is what counts.
+    printed = read_statement([{"particulars_raw": "VEHICLE PRICE", "debit_amount": 1928561},
+                              {"particulars_raw": "EX SHOWROOM (1-2)", "debit_amount": 1900000}, *base])
+    assert printed.components["ex_showroom_price"] == D(1900000)
