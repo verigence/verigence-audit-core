@@ -1490,6 +1490,13 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     )
     for row in all_rows:
         _settle_component(row, situation)
+        if row.get("excluded"):
+            # Out of the deal (the customer's own insurance, or insurance not
+            # yet confirmed in-house): never a variance against the standard
+            # (live 2026-11-03: "Below standard" by Rs 36,912 on a customer's
+            # own policy kept out of the deal).
+            row["variance"] = None
+            row["flags"] = [f for f in row["flags"] if f not in _STANDARD_FLAGS]
     for row in discount_rows:
         _settle_discount(row, situation, mr_key=mr_key)
 
@@ -3270,11 +3277,12 @@ def _taken_addons(
             "tenureMonths": ew_fields.get("tenure_months"),
         },
     }
+    in_deal = (deal_view.get("insurance") or {}).get("inDeal")
+    decided = (deal_view.get("insurance") or {}).get("source")
     out: dict[str, dict[str, Any]] = {}
     for kind, components in _ADDON_COMPONENTS.items():
         rows = [by_key[c] for c in components if c in by_key]
         billed = [_dec(r["billed"]) for r in rows if r["billed"] is not None]
-        booking = [_dec(r["booking"]) for r in rows if r["booking"] is not None]
         proof = [d for d in invoices if d["documentType"] in _ADDON_DOCUMENTS[kind]]
         if kind == "insurance" and cover:
             proof = [cover]
@@ -3288,17 +3296,26 @@ def _taken_addons(
             amount, source = _dec(insurance_row.get("actual_premium_amount")), "billed"
         elif plan is not None and _dec(plan["actual_amount"]) is not None:
             amount, source = _dec(plan["actual_amount"]), "record"
-        elif booking and sum(booking, Decimal(0)) > 0:
-            amount, source = sum(booking, Decimal(0)), "booking"
         else:
+            # The booking docket's figure is never what was taken (product
+            # owner 2026-11-02: only billing documents count).
             amount, source = None, None
         provider = (plan or {}).get("provider_name")
         if kind == "insurance":
             provider = provider or details["insurance"]["insurerName"]
         if kind == "warranty":
             provider = provider or details["warranty"]["providerName"]
+        taken = bool(proof or items or (amount is not None and amount > 0) or (kind == "insurance" and insurer))
+        if kind == "insurance" and taken and in_deal is False:
+            # A policy on file is not insurance taken with the car until it
+            # is confirmed in-house (the Deal's insurance.inDeal): the
+            # customer's own, or not yet confirmed (2026-11-03).
+            details["insurance"]["notInDeal"] = (
+                "The customer's own policy" if decided == "SELF"
+                else "Not confirmed in-house: kept out of the deal until the PC confirms")
+            taken = False
         out[kind] = {
-            "taken": bool(proof or items or (amount is not None and amount > 0) or (kind == "insurance" and insurer)),
+            "taken": taken,
             "amount": str(amount) if amount is not None else None,
             "amountSource": source,
             "provider": provider,
