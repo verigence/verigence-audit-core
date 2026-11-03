@@ -246,61 +246,11 @@ def test_booking_form_discount_evidence_and_intimation_date(request: pytest.Fixt
         ).mappings().all()
 
     assert str(state["intimation_date"]) == "2026-08-15"
-    rule_keys = {row["rule_key"] for row in findings}
-    assert "BK_DISCOUNT_EVIDENCE_MISSING:corporate_discount" in rule_keys
-    assert "BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus" in rule_keys
-    assert "BK_DISCOUNT_EVIDENCE_MISSING:scrappage_discount" in rule_keys
-    for row in findings:
-        assert row["severity"] == "HIGH"
-        assert row["finding_status"] == "OPEN"
-
-    # Corporate ID and a Scrappage Certificate of Deposit now arrive: both
-    # self-heal; exchange (no vehicle_rc ever linked) stays open.
-    corporate_id_doc = _link_evidence(
-        engine, tenant_id=tenant_id, journey_id=journey_id, customer_id=customer_id,
-        document_type_key="corporate_id",
-    )
-    di_client.add(_confirmed_document(corporate_id_doc, "corporate_id"), [])
-    scrappage_certificate_doc = _link_evidence(
-        engine, tenant_id=tenant_id, journey_id=journey_id, customer_id=customer_id,
-        document_type_key="scrappage_certificate_of_deposit",
-    )
-    di_client.add(_confirmed_document(scrappage_certificate_doc, "scrappage_certificate_of_deposit"), [])
-    with engine.begin() as connection:
-        confidence_policy._sync_booking_document(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            document_id=corporate_id_doc,
-            service_id="di-service",
-            security_client=_FakeSecurityClient(),
-            di_client=di_client,
-            bump_version=True,
-        )
-        from audit_core.uc03_booking_confirmation_rules import (
-            record_booking_form_intimation_and_discount_evidence,
-        )
-
-        record_booking_form_intimation_and_discount_evidence(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            document_id=booking_form_id,
-            correlation_id="test",
-        )
-
-    with engine.begin() as connection:
-        findings = connection.execute(
-            text(
-                "SELECT rule_key, finding_status FROM auditcore.audit_findings "
-                "WHERE tenant_id=:t AND journey_id=:j"
-            ),
-            {"t": tenant_id, "j": journey_id},
-        ).mappings().all()
-    status_by_key = {row["rule_key"]: row["finding_status"] for row in findings}
-    assert status_by_key["BK_DISCOUNT_EVIDENCE_MISSING:corporate_discount"] == "RESOLVED"
-    assert status_by_key["BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus"] == "OPEN"
-    assert status_by_key["BK_DISCOUNT_EVIDENCE_MISSING:scrappage_discount"] == "RESOLVED"
+    # The booking docket is information only (product owner 2026-11-02): the
+    # discounts it offers raise no "evidence is missing" finding (2026-11-03).
+    # A benefit a billing document gives without its proof is raised by the
+    # deal reconciliation (test_uc03_deal_reconciliation).
+    assert not [r for r in findings if str(r["rule_key"]).startswith("BK_DISCOUNT_EVIDENCE_MISSING")]
 
     engine.dispose()
 
@@ -362,12 +312,11 @@ def test_corporate_and_exchange_discount_evidence_not_raised_before_delivery_sta
             {"t": tenant_id, "j": journey_id},
         ).mappings().all()
     rule_keys = {row["rule_key"] for row in findings}
-    assert "BK_DISCOUNT_EVIDENCE_MISSING:corporate_discount" not in rule_keys
-    assert "BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus" not in rule_keys
-    assert "BK_DISCOUNT_EVIDENCE_MISSING:scrappage_discount" in rule_keys
+    # 2026-11-03: the booking docket raises no evidence finding at all, before
+    # delivery or after it (product owner 2026-11-02: information only).
+    assert not [k for k in rule_keys if str(k).startswith("BK_DISCOUNT_EVIDENCE_MISSING")]
 
-    # Delivery starts; re-confirming the same Booking Form now raises the
-    # two previously-gated findings (scrappage's stays open, unaffected).
+    # Delivery starts; re-confirming the same Booking Form still raises none.
     _start_delivery(engine, tenant_id=tenant_id, journey_id=journey_id)
     with engine.begin() as connection:
         from audit_core.uc03_booking_confirmation_rules import (
@@ -391,8 +340,7 @@ def test_corporate_and_exchange_discount_evidence_not_raised_before_delivery_sta
             {"t": tenant_id, "j": journey_id},
         ).mappings().all()
     rule_keys = {row["rule_key"] for row in findings}
-    assert "BK_DISCOUNT_EVIDENCE_MISSING:corporate_discount" in rule_keys
-    assert "BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus" in rule_keys
+    assert not [k for k in rule_keys if str(k).startswith("BK_DISCOUNT_EVIDENCE_MISSING")]
 
     engine.dispose()
 

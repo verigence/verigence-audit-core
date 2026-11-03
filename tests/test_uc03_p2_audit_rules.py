@@ -363,8 +363,12 @@ def test_financier_windows(journey):
     _sql(journey, "INSERT INTO auditcore.finance_records (tenant_id, journey_id, provider_name, financed_amount) "
                   "VALUES (:t, :j, 'HDFC Bank', 500000)")
     result = _run(journey, "DELIVERY")
-    # The sanction counts as committed at delivery: not a short payment.
-    assert result["DELIVERED_ON_SHORT_PAYMENT"].outcome == "PASS"
+    # The payment rules count the loan the Deal counts (2026-11-03): a
+    # financed deal whose loan no disbursement, NDC, settlement, ledger or
+    # bank letter gives has an unknown loan, so what was owed at delivery
+    # cannot be told -- never the whole loan read as the customer's shortfall.
+    assert result["DELIVERED_ON_SHORT_PAYMENT"].outcome == "SKIPPED"
+    assert "loan amount is not on file" in result["DELIVERED_ON_SHORT_PAYMENT"].reason
     assert result["DO_PAYMENT_NOT_RECEIVED"].outcome == "FAIL"
     assert "No loan disbursement from HDFC Bank recorded 20 days after delivery" in result["DO_PAYMENT_NOT_RECEIVED"].reason
     assert result["DO_SHORT_PAYMENT"].outcome == "SKIPPED"
@@ -374,6 +378,39 @@ def test_financier_windows(journey):
     assert result["DO_PAYMENT_NOT_RECEIVED"].outcome == "PASS"
     assert result["DO_SHORT_PAYMENT"].outcome == "FAIL"
     assert "₹4,50,000 against a sanction of ₹5,00,000 (₹50,000 short)" in result["DO_SHORT_PAYMENT"].reason
+    # Rs 5,00,000 received and the Rs 4,50,000 disbursed, by the Deal's count.
+    assert result["DELIVERED_ON_SHORT_PAYMENT"].outcome == "FAIL"
+    assert "plus the loan of ₹4,50,000" in result["DELIVERED_ON_SHORT_PAYMENT"].reason
+
+
+def test_the_payment_rules_count_the_loan_the_ndc_gives(journey):
+    """Live 2026-11-03: a loan the NDC's financer line gives (no dealer
+    receipt for it) read as the customer's money short at delivery, and as
+    "No loan disbursement" 13 days after delivery."""
+    from test_uc03_account_statement import UTKAL, _ledger, _set_policy, _sync
+
+    from audit_core.uc03_deal_source_policy import POLICY_ACCOUNT_STATEMENT
+    from audit_core.uc03_p2_journey360 import deal
+
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _ledger(journey, UTKAL)
+    _sync(journey)
+    _sql(journey, "INSERT INTO auditcore.finance_records (tenant_id, journey_id, provider_name, finance_type_code, "
+                  "source_kind, details) VALUES (:t, :j, 'IndusInd', 'LOAN', 'EVIDENCE', '{}'::jsonb)")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        summary = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["summary"]
+    from decimal import Decimal
+
+    loan = Decimal(summary["paid"]["loan"])
+    assert loan > 0 and "NDC" in summary["paid"]["loanSource"]
+    _deliver(journey, TODAY - timedelta(days=20))
+    _receipt(journey, str(Decimal(summary["payable"]) - loan), TODAY - timedelta(days=22), "R-1")
+    result = _run(journey, "DELIVERY")
+    assert result["DELIVERED_ON_SHORT_PAYMENT"].outcome == "PASS", result["DELIVERED_ON_SHORT_PAYMENT"].reason
+    assert result["PAYMENT_AFTER_DELIVERY_BEYOND_GRACE"].outcome == "PASS"
+    assert result["DO_PAYMENT_NOT_RECEIVED"].outcome == "PASS"
+    assert "NDC" in result["DO_PAYMENT_NOT_RECEIVED"].reason
 
 
 # ------------------------------------------------------------- trade-in

@@ -253,10 +253,9 @@ def conclude_benefit(row: dict[str, Any], *, unknown_results: frozenset[str]) ->
     """One benefit (discount / offer): given against its entitlement, and its
     proof document when the benefit needs one."""
     key = str(row["key"])
+    # Only what a billing document gives is given (product owner 2026-11-02):
+    # the reconciled amount, written from the booking docket, is not.
     given, given_from = billed_figure(row)
-    if given is None:
-        given = dec(row.get("effective"))
-        given_from = "Deal" if given is not None else None
     entitled = dec(row.get("entitled"))
     eligibility = row.get("eligibility")
     proof = row.get("proof")
@@ -341,7 +340,10 @@ def loan_received(
        whole loan as a shortfall).
     Refunds the settlement printout records are money paid back out."""
     refunds = (stated or {}).get("refunds") or Decimal(0)
+    # ``inReceipts``: the loan is among the customer's receipts, not yet
+    # linked as the loan's own (counted there, not again here).
     out: dict[str, Any] = {"amount": None, "source": None, "note": None, "unknown": False, "withoutReceipt": False,
+                           "inReceipts": False,
                            "refunds": refunds, "refundsSource": (stated or {}).get("source") if refunds else None}
     if disbursement_known:
         out.update(amount=matched or Decimal(0), source="Loan disbursement on the finance record")
@@ -349,7 +351,7 @@ def loan_received(
     loan = (stated or {}).get("loan")
     if loan is not None:
         if any(r is not None and abs(r - loan) <= TOLERANCE for r in receipt_amounts):
-            out.update(amount=Decimal(0), source=stated["source"],
+            out.update(amount=Decimal(0), source=stated["source"], inReceipts=True,
                        note="The loan on the statement is already among the receipts (not yet linked as the loan "
                                  "receipt); not counted twice.")
         else:
@@ -365,7 +367,7 @@ def loan_received(
         # Kotak credit against Rs 7,00,000 -- counted twice, read as excesses.
         if payable is not None and paid_without_loan is not None \
                 and payable - paid_without_loan < letter_amount / 2:
-            out.update(amount=Decimal(0), source="Bank Approval Letter (sanctioned amount)",
+            out.update(amount=Decimal(0), source="Bank Approval Letter (sanctioned amount)", inReceipts=True,
                        note=f"The money on file already pays the net payable but Rs {max(payable - paid_without_loan, Decimal(0)):,.2f}: "
                             f"the Bank Approval Letter's loan of Rs {letter_amount:,.2f} is taken to be among the receipts, "
                             "not counted again.")
@@ -374,7 +376,7 @@ def loan_received(
                    note="No dealership receipt for the loan amount; taken from the Bank Approval Letter.")
         return out
     if loan_among_receipts is not None:
-        out.update(amount=Decimal(0), source="Bank Approval Letter (sanctioned amount)",
+        out.update(amount=Decimal(0), source="Bank Approval Letter (sanctioned amount)", inReceipts=True,
                    note=f"The loan's receipt (Rs {loan_among_receipts:,.2f}, the sanction less the lender's charges) "
                         "is among the receipts, not yet linked as the loan receipt; not counted twice.")
         return out
@@ -630,7 +632,9 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     }
     settle = settlement(dec(summary.get("payable")), receipts + loan + old_vehicle - refunds,
                         loan_unknown=loan_on_file["unknown"],
-                        awaiting=[a.get("label") or a.get("key") for a in summary.get("awaiting") or []])
+                        # Each awaited bill named once (two warranty lines are one warranty bill).
+                        awaiting=list(dict.fromkeys(a.get("label") or a.get("key")
+                                                    for a in summary.get("awaiting") or [])))
 
     from audit_core.uc03_ledger_receipts import customer_ledger_balance
 

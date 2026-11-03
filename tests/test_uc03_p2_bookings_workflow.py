@@ -117,12 +117,17 @@ def test_claimed_corporate_discount_requires_the_corporate_id(journey):
         set_tenant_context(connection, journey.tenant_id)
         assert "corporateDiscount" not in condition_reasons(
             connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
-        connection.execute(
-            text("""INSERT INTO auditcore.commercial_line_source_values (tenant_id, journey_id, line_kind,
+        # The booking docket's offer asks for nothing (2026-11-03: information
+        # only); the NDC giving the discount does.
+        insert = text("""INSERT INTO auditcore.commercial_line_source_values (tenant_id, journey_id, line_kind,
                     component_key, source_document_type, amount, source_document_id)
-                    VALUES (:t, :j, 'DISCOUNT', 'CORPORATE_PRIVILEGE', 'booking_form', 5000, :d)"""),
-            {"t": journey.tenant_id, "j": journey.journey_id, "d": uuid4()},
-        )
+                    VALUES (:t, :j, 'DISCOUNT', 'CORPORATE_PRIVILEGE', :s, 5000, :d)""")
+        connection.execute(insert, {"t": journey.tenant_id, "j": journey.journey_id, "s": "booking_form",
+                                    "d": uuid4()})
+        assert "corporateDiscount" not in condition_reasons(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        connection.execute(insert, {"t": journey.tenant_id, "j": journey.journey_id, "s": "customer_ledger",
+                                    "d": uuid4()})
         reasons = condition_reasons(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     assert "corporate privilege of ₹5,000" in reasons["corporateDiscount"]
     checklist = _client().get(

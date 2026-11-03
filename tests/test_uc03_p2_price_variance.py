@@ -110,13 +110,15 @@ def test_the_worker_stores_the_deals_own_variance_and_the_list_shows_it(journey)
     assert Decimal(_listed(journey)) == expected
 
 
-def test_the_list_reads_the_stored_value_and_falls_back_while_it_is_not_computed(journey):
+def test_the_list_reads_the_stored_value_and_shows_none_while_it_is_not_computed(journey):
+    """2026-11-03: the list no longer works out a figure of its own (its
+    fallback read the booking form's prices); only billing documents count."""
     _seed_deal(journey)
     _runtime_row(journey)
     _set(journey, Decimal("123.00"))
     assert Decimal(_listed(journey)) == 123
-    _set(journey, None)  # not computed yet: the list's previous calculation
-    assert Decimal(_listed(journey)) == 5000
+    _set(journey, None)  # not computed yet: no figure, never a guess
+    assert _listed(journey) is None
 
 
 def test_the_list_never_shows_a_cached_variance_older_than_the_facts(journey):
@@ -127,7 +129,7 @@ def test_the_list_never_shows_a_cached_variance_older_than_the_facts(journey):
     _seed_deal(journey)
     _runtime_row(journey)
     _set(journey, Decimal("271181.00"), fresh=False)
-    assert Decimal(_listed(journey)) == 5000, "a stale copy must not reach the list"
+    assert _listed(journey) is None, "a stale copy must not reach the list"
 
     # and the sweep restores the Deal's own figure, stamped at these facts
     assert price_variance.backfill_price_variance(journey.engine, tenant_id=journey.tenant_id) == 1
@@ -215,6 +217,7 @@ def test_the_list_shows_no_variance_until_delivery_has_started(journey):
     """Product owner 2026-10-28: "Variance should be shown only for the journey
     for which Delivery has started"."""
     _seed_deal(journey)
+    _runtime_row(journey)  # the list shows the Deal's stored figure only (2026-11-03)
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         price_variance.refresh_price_variance(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)

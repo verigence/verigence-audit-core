@@ -720,14 +720,25 @@ _AMOUNT_EVIDENCE = {
 # invoice nor a credit note. The other conditions keep every source.
 CHARGED_ONLY_CONDITIONS = frozenset({"rsaSold", "ewSold"})
 CHARGED_SOURCE_TYPES = frozenset(
-    {ACCOUNT_STATEMENT_TYPE, "erp_settlement", "cost_sheet"}
+    {ACCOUNT_STATEMENT_TYPE, "customer_ledger_tally", "erp_settlement", "cost_sheet"}
     | (INVOICE_SOURCE_TYPES - {"wholesale_invoice", "credit_note"})
 )
+# Every other condition (2026-11-03): only billing documents count, the booking
+# docket is information only (product owner 2026-11-02). An amount, or a
+# "by dealer" / "exchange applicable" / GSTIN entry, makes a condition true only
+# when a billing document carries it: the charging documents above, or a
+# credit note that pays a benefit. Live 2026-11-03: of 6,314 recorded source
+# figures on Mahindra Orissa the booking form gave 6,314 -- a docket's offered
+# accessories, corporate or exchange figure asked for the accessory invoice,
+# the corporate proof or the RC with nothing billed. The discount
+# applications' reconciled amount ('deal') is written from the docket too.
+BILLING_SOURCE_TYPES = CHARGED_SOURCE_TYPES | frozenset({"credit_note"})
 
 
 def counts_as_evidence(condition: str, document_type: str | None) -> bool:
     """Whether an amount on this document type can make ``condition`` true."""
-    return condition not in CHARGED_ONLY_CONDITIONS or normalise_type(document_type) in CHARGED_SOURCE_TYPES
+    kind = normalise_type(document_type)
+    return kind in (CHARGED_SOURCE_TYPES if condition in CHARGED_ONLY_CONDITIONS else BILLING_SOURCE_TYPES)
 
 
 _TEXT_EVIDENCE = {
@@ -835,6 +846,8 @@ def condition_reasons(connection: Connection, *, tenant_id: str, journey_id: UUI
                 amount = _as_amount(value)
                 if amount is not None and amount > 0:
                     found(condition, f"The {where(document_type)} shows {key.replace('_', ' ').lower()} of ₹{amount:,.0f}.")
+        if normalise_type(document_type) not in BILLING_SOURCE_TYPES:
+            continue
         for condition, keys in _TEXT_EVIDENCE.items():
             if key in keys and _as_text(value):
                 found(condition, f"The {where(document_type)} shows {key.replace('_', ' ')} {_as_text(value)}.")

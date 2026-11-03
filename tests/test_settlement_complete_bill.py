@@ -225,8 +225,16 @@ def test_a_policy_not_confirmed_in_house_is_not_taken_and_has_no_variance(journe
         set_tenant_context(c, journey.tenant_id)
         c.execute(text("INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, standard_amount) "
                        "VALUES (:t, :j, 'insurance_amount', 103555)"), {"t": journey.tenant_id, "j": journey.journey_id})
+        c.execute(text("INSERT INTO auditcore.insurance_records (tenant_id, journey_id, insurer_name, source_kind, "
+                       "insurance_by, standard_premium_amount, actual_premium_amount) VALUES (:t, :j, 'United India', "
+                       "'EVIDENCE', 'Dealer', 103555, 66643)"), {"t": journey.tenant_id, "j": journey.journey_id})
         view = addons(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     taken = view["taken"]["insurance"]
     assert taken["taken"] is False and "Not confirmed in-house" in taken["details"]["notInDeal"]
     row = view["insurance"]["charges"]["components"][0]
     assert row["excluded"] is True and row["variance"] is None and "BELOW_STANDARD" not in row["flags"]
+    assert view["insurance"]["records"] and all(r["premium_variance"] is None for r in view["insurance"]["records"])
+    # Who arranged it is the Deal's decision on every tab, never one reading's
+    # field (live 2026-11-03: "Insurance by: Self" beside an in-house deal).
+    assert all(r["insurance_by"].startswith("Not confirmed") for r in view["insurance"]["records"])
+    assert taken["details"]["insuranceBy"].startswith("Not confirmed")

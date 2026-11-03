@@ -247,32 +247,13 @@ def record_booking_form_intimation_and_discount_evidence(
                 correlation_id=correlation_id,
             )
             continue
-        if field_key in _RAISE_GATED_UNTIL_DELIVERY_STARTS and not _delivery_started(
-            connection, tenant_id=tenant_id, journey_id=journey_id,
-        ):
-            continue
-        _machine_flag(
-            connection,
-            tenant_id=tenant_id,
-            journey_id=journey_id,
-            stage_code="BOOKING",
-            rule_key=rule_key,
-            finding_type=_FINDING_TYPE_DOCUMENT_EXCEPTION,
-            severity="HIGH",
-            title=f"{discount_label.replace('_', ' ').title()} evidence is missing",
-            description=(
-                f"The Booking Form shows a {discount_label.replace('_', ' ')} of "
-                f"₹{amount:,.2f}, but no supporting document is on file for this Booking."
-            ),
-            correlation_id=correlation_id,
-            safe_payload={
-                "trigger": "BOOKING_FORM_CONFIRMED",
-                "discountField": field_key,
-                "amount": str(amount),
-                "requiredDocumentType": required_document_type,
-            },
-            blocking_completion=False,
-        )
+        # The booking docket is information only (product owner 2026-11-02):
+        # what it offers raises nothing (2026-11-03; live, 21 open "Corporate
+        # discount evidence is missing" findings rested on the docket alone).
+        # A benefit a billing document gives without its proof is raised by
+        # the deal reconciliation (uc03_deal_reconciliation.
+        # _sync_conditional_discount_evidence), under the same rule key.
+        continue
 
     # scrappage_discount_amount is now handled by the loop above like any
     # other discount evidence. Resolve the retired unconditional-raise finding
