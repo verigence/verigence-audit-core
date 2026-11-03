@@ -11,6 +11,12 @@ Executive) the whole Project, with the count of each missing document type.
     The day                   the delivery date on the vehicle's gate pass, when it
                               is a valid date 60 days before to 1 day after the first
                               delivery upload; otherwise the IST day of that upload
+    Close to completion       (product owner 2026-11-03: "journeys on the verge of
+                              completion and not getting completed due to the missing
+                              documents") the delivery files of the period whose only
+                              open PC document tasks are missing documents, fewest
+                              missing first, then the longest waiting; the top ``top``
+                              (the web asks 20 for a day, 30 for longer)
 
 Read-only.
 """
@@ -38,7 +44,9 @@ router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-missi
 _READ = "audit.journey.read"
 _ADMIN_ROLES = ("SUPER_ADMIN", "TENANT_ADMIN")
 DEFAULT_DAYS = 31
-MAX_DAYS = 62
+MAX_DAYS = 92
+TOP_DEFAULT = 20
+TOP_MAX = 50
 # A gate pass date further from the first delivery upload than this is a misreading.
 GATE_PASS_DAYS_BEFORE = 60
 GATE_PASS_DAYS_AFTER = 1
@@ -188,8 +196,48 @@ def _gate_pass_dates(connection: Connection, tenant_id: str, journey_ids: list[s
     ).mappings().all()}
 
 
+def _other_open_tasks(connection: Connection, tenant_id: str, journey_ids: list[str]) -> dict[str, int]:
+    """Open PC document tasks other than a missing document, per Journey: what else keeps the
+    delivery file from closing (the Daily processing report's document-task rule,
+    uc03_p2_daily_report.delivery_files_closed)."""
+    from audit_core.uc03_p2_tasks import (
+        _DOCUMENT_CATEGORIES,
+        _DOCUMENT_TASKS,
+        _MANUAL_VERIFICATION_TASKS,
+    )
+
+    return {str(r["journey_id"]): int(r["n"]) for r in connection.execute(
+        text(
+            """
+            SELECT t.journey_id, count(*) AS n
+            FROM auditcore.p2_tasks t
+            JOIN auditcore.journeys j ON j.tenant_id = t.tenant_id AND j.journey_id = t.journey_id
+            WHERE t.tenant_id = :t AND t.journey_id = ANY(CAST(:ids AS uuid[]))
+              AND t.task_status <> ALL(:closed) AND t.task_type <> 'DOCUMENT_MISSING'
+              AND (t.task_type = ANY(:doc_types) OR t.category = ANY(:doc_categories))
+              AND t.task_type <> ALL(:mv_types) AND t.category <> 'CORRECTION_APPROVAL'
+              AND (upper(t.assigned_role_code) = 'PC' OR t.assigned_actor_id = j.created_by_actor_id)
+            GROUP BY t.journey_id
+            """
+        ),
+        {"t": tenant_id, "ids": journey_ids, "closed": list(_CLOSED), "doc_types": sorted(_DOCUMENT_TASKS),
+         "doc_categories": sorted(_DOCUMENT_CATEGORIES), "mv_types": sorted(_MANUAL_VERIFICATION_TASKS)},
+    ).mappings().all()}
+
+
+def close_to_completion(days: list[dict[str, Any]], top: int) -> dict[str, Any]:
+    """The delivery files held up by missing documents alone, nearest to closing first:
+    fewest documents missing, then the oldest delivery day, then the customer."""
+    files = [{**j, "deliveryDate": d["date"], "deliveryLabel": d["label"]}
+             for d in days for j in d["journeys"]]
+    only_missing = [f for f in files if f["otherOpenTasks"] == 0]
+    only_missing.sort(key=lambda f: (len(f["documents"]), f["deliveryDate"], str(f["customer"]).lower()))
+    return {"top": top, "journeys": only_missing[:top], "eligible": len(only_missing),
+            "heldByOtherTasks": len(files) - len(only_missing)}
+
+
 def build_missing_documents(connection: Connection, *, tenant_id: str, outlets: list[dict[str, Any]],
-                            first: date, last: date) -> dict[str, Any]:
+                            first: date, last: date, top: int = TOP_DEFAULT) -> dict[str, Any]:
     ids = [str(o["outlet_id"]) for o in outlets]
     journeys = _delivered_journeys(
         connection, tenant_id, ids,
@@ -198,6 +246,7 @@ def build_missing_documents(connection: Connection, *, tenant_id: str, outlets: 
     journey_ids = [str(j["journey_id"]) for j in journeys]
     missing = _missing_by_journey(connection, tenant_id, journey_ids) if journey_ids else {}
     gate_passes = _gate_pass_dates(connection, tenant_id, journey_ids) if journey_ids else {}
+    other_tasks = _other_open_tasks(connection, tenant_id, journey_ids) if journey_ids else {}
 
     days: dict[date, list[dict[str, Any]]] = {}
     by_document: dict[str, dict[str, Any]] = {}
@@ -219,6 +268,7 @@ def build_missing_documents(connection: Connection, *, tenant_id: str, outlets: 
             "pcName": j["pc_name"], "basis": basis, "uploadDay": j["upload_day"].isoformat(),
             "documents": [d["name"] for d in documents],
             "requirementKeys": [d["requirementKey"] for d in documents],
+            "otherOpenTasks": other_tasks.get(jid, 0),
         })
         for d in documents:
             entry = by_document.setdefault(d["requirementKey"], {"name": d["name"], "requirementKey": d["requirementKey"],
@@ -251,6 +301,7 @@ def build_missing_documents(connection: Connection, *, tenant_id: str, outlets: 
         "byOutlet": sorted(by_outlet.values(), key=lambda e: (str(e["dealerName"] or "").lower(),
                                                                -e["documents"], str(e["outletName"] or "").lower())),
         "days": day_rows,
+        "closeToCompletion": close_to_completion(day_rows, top),
     }
 
 
@@ -264,6 +315,7 @@ def missing_documents(
     end: Annotated[date | None, Query(alias="to")] = None,
     outletId: UUID | None = None,
     dealerId: UUID | None = None,
+    top: Annotated[int, Query(ge=1, le=TOP_MAX)] = TOP_DEFAULT,
 ) -> dict[str, Any]:
     """Missing documents of the Journeys with deliveries, by delivery day (newest first),
     in the caller's scope: a PC their mapped outlets, a TL, PM or Executive with a
@@ -292,7 +344,7 @@ def missing_documents(
         chosen = [o for o in outlets if str(o["dealer_id"]) == str(dealerId)]
         if not chosen:
             raise HTTPException(status_code=404, detail="Dealership not found in your current Project scope.")
-    report = build_missing_documents(connection, tenant_id=tenant_id, outlets=chosen, first=start, last=end)
+    report = build_missing_documents(connection, tenant_id=tenant_id, outlets=chosen, first=start, last=end, top=top)
     return {
         **report,
         "scope": "OUTLET" if outletId is not None else "DEALER" if dealerId is not None else "ALL",

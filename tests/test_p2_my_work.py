@@ -130,13 +130,14 @@ def test_pc_home_counts_uploads_gate_register_and_tasks(setup):
     assert data["totals"]["tasksPending"] == 1
 
 
-def test_a_week_is_allowed_and_more_than_a_month_is_not(setup):
+def test_a_range_of_up_to_92_days_is_allowed(setup):
     s = setup
     today = ist_day().date()
     week = _work(s, **{"from": (today - timedelta(days=6)).isoformat(), "to": today.isoformat()}).json()
     assert len(week["outlets"][0]["gateRegister"]) == sum(
         1 for i in range(7) if (today - timedelta(days=i)).isoweekday() != 7)
-    assert _work(s, **{"from": (today - timedelta(days=40)).isoformat(), "to": today.isoformat()}).status_code == 422
+    assert _work(s, **{"from": (today - timedelta(days=40)).isoformat(), "to": today.isoformat()}).status_code == 200
+    assert _work(s, **{"from": (today - timedelta(days=100)).isoformat(), "to": today.isoformat()}).status_code == 422
 
 
 def test_a_gate_register_past_its_due_time_is_missed(setup):
@@ -172,7 +173,7 @@ def test_the_reviewer_tracker(setup):
     assert data["role"] == "REVIEWER"
     [line] = data["outlets"]
     assert (line["journeysWorked"], line["reviewsClosed"], line["tasksClosed"], line["tasksPending"]) == (1, 1, 1, 1)
-    [today] = data["days"]                                          # the same work, on today's row
+    [today] = data["periods"]                                          # the same work, on today's row
     assert (today["totals"]["journeysWorked"], today["totals"]["reviewsClosed"], today["totals"]["tasksClosed"]) == (1, 1, 1)
 
 
@@ -235,16 +236,16 @@ def test_the_tracker_is_day_by_day_and_counts_journeys_completed(setup):
             {"t": s.journey.tenant_id, "j": str(s.journey.journey_id)})
     today = ist_day().date()
     data = _work(s, **{"from": (today - timedelta(days=6)).isoformat(), "to": today.isoformat()}).json()
-    assert [d["date"] for d in data["days"]] == [(today - timedelta(days=i)).isoformat() for i in range(7)]
-    first = data["days"][0]
+    assert [d["date"] for d in data["periods"]] == [(today - timedelta(days=i)).isoformat() for i in range(7)]
+    first = data["periods"][0]
     [line] = first["outlets"]
     assert line["outletId"] == str(s.journey.outlet_id)
     assert line["deliveriesUpdated"] == 1 and line["journeysCompleted"] == 1
     assert first["totals"]["journeysCompleted"] == 1
-    assert all(d["totals"]["journeysUploaded"] == 0 for d in data["days"][1:])
+    assert all(d["totals"]["journeysUploaded"] == 0 for d in data["periods"][1:])
     assert data["outlets"][0]["journeysCompleted"] == 1 and data["totals"]["journeysCompleted"] == 1
     # A Sunday has no gate register day; any other day carries the outlet's entry.
-    for d in data["days"]:
+    for d in data["periods"]:
         entry = d["outlets"][0]["gateRegister"]
         assert (entry is None) == (datetime.fromisoformat(d["date"]).isoweekday() == 7)
 
@@ -263,7 +264,7 @@ def test_a_journey_with_a_document_task_open_is_not_completed(setup):
     _journey_task(s, role="PC", task_type="DOCUMENT_MISSING")
     today = ist_day().date()
     data = _work(s, **{"from": today.isoformat(), "to": today.isoformat()}).json()
-    assert data["totals"]["journeysCompleted"] == 0 and data["days"][0]["totals"]["journeysCompleted"] == 0
+    assert data["totals"]["journeysCompleted"] == 0 and data["periods"][0]["totals"]["journeysCompleted"] == 0
 
 
 def test_a_month_is_allowed(setup):
@@ -271,4 +272,33 @@ def test_a_month_is_allowed(setup):
     today = ist_day().date()
     month = _work(s, **{"from": (today - timedelta(days=30)).isoformat(), "to": today.isoformat()})
     assert month.status_code == 200, month.text
-    assert len(month.json()["days"]) == 31
+    assert len(month.json()["periods"]) == 31
+
+
+def test_rows_by_week_and_by_month():
+    """Weeks run Monday to Sunday and months are calendar months, cut to the range, newest first."""
+    from datetime import date
+    weeks = my_work.buckets(date(2026, 10, 14), date(2026, 11, 3), "week")
+    assert [(a.isoformat(), b.isoformat()) for a, b, _ in weeks] == [
+        ("2026-11-02", "2026-11-03"), ("2026-10-26", "2026-11-01"), ("2026-10-19", "2026-10-25"),
+        ("2026-10-14", "2026-10-18")]
+    months = my_work.buckets(date(2026, 9, 1), date(2026, 11, 3), "month")
+    assert [(a.isoformat(), b.isoformat(), label) for a, b, label in months] == [
+        ("2026-11-01", "2026-11-03", "1 Nov – 3 Nov 2026"), ("2026-10-01", "2026-10-31", "October 2026"),
+        ("2026-09-01", "2026-09-30", "September 2026")]
+    assert len(my_work.buckets(date(2026, 10, 1), date(2026, 10, 31), "day")) == 31
+
+
+def test_the_tracker_by_week_sums_the_days(setup):
+    s = setup
+    _delivery_file(s)
+    today = ist_day().date()
+    by_day = _work(s, **{"from": (today - timedelta(days=13)).isoformat(), "to": today.isoformat()}).json()
+    by_week = _work(s, **{"from": (today - timedelta(days=13)).isoformat(), "to": today.isoformat(),
+                          "by": "week"}).json()
+    assert by_week["by"] == "week" and 2 <= len(by_week["periods"]) <= 3
+    assert sum(p["totals"]["journeysUploaded"] for p in by_week["periods"]) == \
+        sum(p["totals"]["journeysUploaded"] for p in by_day["periods"]) == 1
+    days_with_register = sum(p["totals"]["gateRegisterDays"] for p in by_day["periods"])
+    assert sum(p["totals"]["gateRegisterDays"] for p in by_week["periods"]) == days_with_register
+    assert _work(s, by="year").status_code == 400

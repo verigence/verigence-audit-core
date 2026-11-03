@@ -1,9 +1,10 @@
 """PC Home and the Tracker tab for PCs and Reviewers (product owner, 2026-11-02).
 
 ``GET /p2/v1/tenants/{t}/my-work?from=&to=`` answers, for the signed-in PC or
-Reviewer and a day, a week or a month (up to 31 days), per outlet they are mapped to,
-and day by day (``days``, newest first: each day's figures per outlet; product owner
-2026-11-03, "the tracker should be date wise"):
+Reviewer and any range of up to 92 days, per outlet they are mapped to, and date wise
+(``periods``, newest first: each day, week or calendar month of the range, ``by=day|week|
+month``, with its figures per outlet; product owner 2026-11-03, "date wise capture across
+all the assigned outlets and then weekly / monthly view, with a range of dates"):
 
 PC
     journeysTotal       every Journey they ever opened at the outlet
@@ -67,7 +68,9 @@ router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-my-wo
 
 _READ_PERMISSION = "audit.journey.read"
 _FALLBACK_TIMEZONE = "Asia/Kolkata"
-MAX_DAYS = 31
+MAX_DAYS = 92
+# How the Tracker groups its rows (product owner 2026-11-03: daily, weekly or monthly, over a range).
+GROUPINGS = ("day", "week", "month")
 
 # What a person does on a task (as the Daily Processing report counts work).
 _WORK_EVENTS = (
@@ -341,19 +344,39 @@ def _outlet_line(o: dict[str, Any]) -> dict[str, Any]:
             "dealerName": o["dealer_name"], "classification": o["outlet_classification"]}
 
 
-def _days(start: date, end: date) -> list[date]:
-    """Every day of the period, newest first."""
-    return [end - timedelta(days=i) for i in range((end - start).days + 1)]
+def buckets(start: date, end: date, by: str = "day") -> list[tuple[date, date, str]]:
+    """The rows of the Tracker, newest first: each day, each week (Monday to Sunday) or each
+    calendar month of the period, cut to the period. (first, last, label)."""
+    out: list[tuple[date, date, str]] = []
+    cursor = end
+    while cursor >= start:
+        if by == "week":
+            first = max(cursor - timedelta(days=cursor.weekday()), start)
+        elif by == "month":
+            first = max(cursor.replace(day=1), start)
+        else:
+            first = cursor
+        if by == "day":
+            label = f"{cursor:%a} {cursor.day} {cursor:%b}"
+        elif by == "week":
+            label = f"{first.day} {first:%b} – {cursor.day} {cursor:%b}"
+        else:
+            whole = first.day == 1 and (cursor + timedelta(days=1)).month != cursor.month
+            label = f"{cursor:%B %Y}" if whole else f"{first.day} {first:%b} – {cursor.day} {cursor:%b} {cursor:%Y}"
+        out.append((first, cursor, label))
+        cursor = first - timedelta(days=1)
+    return out
 
 
 _PC_KEYS = ("journeysTotal", "journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "journeysCompleted",
             "gateRegisterDays", "gateRegisterUploaded", "gateRegisterMissed", "registerTotal", "registerIntimated",
             "uploadedInTool", "pendingDeliveryFiles", "notIntimated", "tasksWorked", "tasksClosed", "tasksPending")
-# The figures of one day of one outlet (the Tracker's day-by-day rows).
-_PC_DAY_KEYS = ("journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "journeysCompleted",
+# The figures of one row (a day, week or month) of one outlet.
+_PC_ROW_KEYS = ("journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "journeysCompleted",
+                "gateRegisterDays", "gateRegisterUploaded", "registerTotal", "registerIntimated",
                 "uploadedInTool", "pendingDeliveryFiles", "tasksWorked", "tasksClosed")
 _REVIEWER_KEYS = ("journeysWorked", "reviewsClosed", "corrections", "tasksWorked", "tasksClosed", "tasksPending")
-_REVIEWER_DAY_KEYS = ("journeysWorked", "reviewsClosed", "corrections", "tasksWorked", "tasksClosed")
+_REVIEWER_ROW_KEYS = ("journeysWorked", "reviewsClosed", "corrections", "tasksWorked", "tasksClosed")
 
 
 def _uploaded(uploads: list[dict[str, Any]]) -> dict[str, int]:
@@ -370,7 +393,7 @@ def _tasks(worked: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def build_pc_work(connection: Connection, *, tenant_id: str, actor_id: str, start: date, end: date,
-                  now: datetime | None = None) -> dict[str, Any]:
+                  now: datetime | None = None, by: str = "day") -> dict[str, Any]:
     tz = _timezone(connection, tenant_id)
     outlets = _my_outlets(connection, tenant_id, actor_id, "PC")
     ids = [str(o["outlet_id"]) for o in outlets]
@@ -410,35 +433,43 @@ def build_pc_work(connection: Connection, *, tenant_id: str, actor_id: str, star
     # tasks of no outlet (Project-wide) still count in the total.
     totals.update(_tasks(worked))
 
-    # Day by day (product owner 2026-11-03: "the tracker should be date wise"), newest first.
-    # Tasks pending is what is open now, so it has no day.
-    day_rows = []
-    for d in _days(start, end):
+    # Date wise (product owner 2026-11-03), by day, week or month, newest first. Tasks pending
+    # is what is open now, so it has no row.
+    period_rows = []
+    for first, last, label in buckets(start, end, by):
+        def inside(day: date, first: date = first, last: date = last) -> bool:
+            return first <= day <= last
         lines = []
-        day_totals = dict.fromkeys(_PC_DAY_KEYS, 0)
+        row_totals = dict.fromkeys(_PC_ROW_KEYS, 0)
         for o in outlets:
             oid = str(o["outlet_id"])
-            entry = next((g for g in register.get(oid, []) if g["date"] == d.isoformat()), None)
+            entries = [g for g in register.get(oid, []) if inside(date.fromisoformat(g["date"]))]
             line = {
                 "outletId": oid, "outletName": o["outlet_name"], "classification": o["outlet_classification"],
-                **_uploaded([u for u in uploads if str(u["outlet_id"]) == oid and u["day"] == d]),
-                "journeysCompleted": len({c["journey_id"] for c in completed if c["outlet_id"] == oid and c["day"] == d}),
-                "uploadedInTool": entry["uploadedInTool"] if entry else 0,
-                "pendingDeliveryFiles": (entry["pendingWithPc"] or 0) if entry else 0,
-                **_tasks([w for w in worked if str(w["outlet_id"]) == oid and w["day"] == d]),
-                "gateRegister": entry,
+                **_uploaded([u for u in uploads if str(u["outlet_id"]) == oid and inside(u["day"])]),
+                "journeysCompleted": len({c["journey_id"] for c in completed
+                                          if c["outlet_id"] == oid and inside(c["day"])}),
+                "gateRegisterDays": len(entries),
+                "gateRegisterUploaded": sum(1 for g in entries if g["status"] not in ("NOT_UPLOADED", "MISSED")),
+                "registerTotal": sum(g["total"] or 0 for g in entries),
+                "registerIntimated": sum(g["intimated"] or 0 for g in entries),
+                "uploadedInTool": sum(g["uploadedInTool"] for g in entries),
+                "pendingDeliveryFiles": sum(g["pendingWithPc"] or 0 for g in entries),
+                **_tasks([w for w in worked if str(w["outlet_id"]) == oid and inside(w["day"])]),
+                # One day: that day's register entry (status and figures); a week or month sums them.
+                "gateRegister": entries[0] if by == "day" and entries else None,
             }
-            for k in _PC_DAY_KEYS:
-                day_totals[k] += line[k]
+            for k in _PC_ROW_KEYS:
+                row_totals[k] += line[k]
             lines.append(line)
-        day_totals.update(_tasks([w for w in worked if w["day"] == d]))
-        day_rows.append({"date": d.isoformat(), "label": f"{d:%a} {d.day} {d:%b}", "outlets": lines,
-                         "totals": day_totals})
-    return {"role": "PC", "outlets": rows, "totals": totals, "days": day_rows}
+        row_totals.update(_tasks([w for w in worked if inside(w["day"])]))
+        period_rows.append({"from": first.isoformat(), "to": last.isoformat(), "date": first.isoformat(),
+                            "label": label, "outlets": lines, "totals": row_totals})
+    return {"role": "PC", "outlets": rows, "totals": totals, "by": by, "periods": period_rows}
 
 
 def build_reviewer_work(connection: Connection, *, tenant_id: str, actor_id: str, start: date,
-                        end: date) -> dict[str, Any]:
+                        end: date, by: str = "day") -> dict[str, Any]:
     tz = _timezone(connection, tenant_id)
     outlets = _my_outlets(connection, tenant_id, actor_id, "REVIEWER")
     ids = [str(o["outlet_id"]) for o in outlets]
@@ -471,24 +502,26 @@ def build_reviewer_work(connection: Connection, *, tenant_id: str, actor_id: str
     totals["journeysWorked"] = len(all_journeys)
     totals.update(_tasks([w for w in worked if str(w["outlet_id"]) in set(ids)]))
 
-    day_rows = []
-    for d in _days(start, end):
+    period_rows = []
+    for first, last, label in buckets(start, end, by):
+        def inside(day: date, first: date = first, last: date = last) -> bool:
+            return first <= day <= last
         lines = []
-        day_journeys: set[str] = set()
-        day_totals = dict.fromkeys(_REVIEWER_DAY_KEYS, 0)
+        row_journeys: set[str] = set()
+        row_totals = dict.fromkeys(_REVIEWER_ROW_KEYS, 0)
         for o in outlets:
             oid = str(o["outlet_id"])
-            line = figures([r for r in reviews if str(r["outlet_id"]) == oid and r["day"] == d],
-                           [w for w in worked if str(w["outlet_id"]) == oid and w["day"] == d])
-            day_journeys |= line.pop("_journeys")
-            for k in _REVIEWER_DAY_KEYS:
-                day_totals[k] += line[k]
+            line = figures([r for r in reviews if str(r["outlet_id"]) == oid and inside(r["day"])],
+                           [w for w in worked if str(w["outlet_id"]) == oid and inside(w["day"])])
+            row_journeys |= line.pop("_journeys")
+            for k in _REVIEWER_ROW_KEYS:
+                row_totals[k] += line[k]
             lines.append({"outletId": oid, "outletName": o["outlet_name"],
                           "classification": o["outlet_classification"], **line})
-        day_totals["journeysWorked"] = len(day_journeys)
-        day_rows.append({"date": d.isoformat(), "label": f"{d:%a} {d.day} {d:%b}", "outlets": lines,
-                         "totals": day_totals})
-    return {"role": "REVIEWER", "outlets": rows, "totals": totals, "days": day_rows}
+        row_totals["journeysWorked"] = len(row_journeys)
+        period_rows.append({"from": first.isoformat(), "to": last.isoformat(), "date": first.isoformat(),
+                            "label": label, "outlets": lines, "totals": row_totals})
+    return {"role": "REVIEWER", "outlets": rows, "totals": totals, "by": by, "periods": period_rows}
 
 
 @router.get("/my-work")
@@ -499,15 +532,18 @@ def my_work(
     connection: Annotated[Connection, Depends(get_connection)],
     start: Annotated[date | None, Query(alias="from")] = None,
     end: Annotated[date | None, Query(alias="to")] = None,
+    by: Annotated[str, Query(pattern="^(day|week|month)$")] = "day",
 ) -> dict[str, Any]:
     authorize_p2(connection, tenant_id=tenant_id, journey_id=None, human_principal=principal,
                  authorization_client=client, permission_key=_READ_PERMISSION)
     start, end = _period(start, end)
     role = caller_role(connection, tenant_id=tenant_id, actor_id=principal.subject)
     if role == "PC":
-        body = build_pc_work(connection, tenant_id=tenant_id, actor_id=principal.subject, start=start, end=end)
+        body = build_pc_work(connection, tenant_id=tenant_id, actor_id=principal.subject, start=start, end=end,
+                             by=by)
     elif role == "REVIEWER":
-        body = build_reviewer_work(connection, tenant_id=tenant_id, actor_id=principal.subject, start=start, end=end)
+        body = build_reviewer_work(connection, tenant_id=tenant_id, actor_id=principal.subject, start=start, end=end,
+                                   by=by)
     else:
         raise HTTPException(status_code=404, detail="My work is for a PC or a Reviewer.")
     return {"from": start.isoformat(), "to": end.isoformat(), **body}
