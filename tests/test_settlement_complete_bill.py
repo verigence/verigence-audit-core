@@ -22,7 +22,12 @@ from decimal import Decimal as D
 
 import pytest
 from conftest import delete_tenant_data
-from p2_support import add_ready_document, add_receipt_payment, create_p2_journey, database_engine
+from p2_support import (
+    add_ready_document,
+    add_receipt_payment,
+    create_p2_journey,
+    database_engine,
+)
 from sqlalchemy import text
 from test_uc03_account_statement import UTKAL, _ledger, _set_policy, _sync
 
