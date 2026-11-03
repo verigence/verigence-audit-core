@@ -597,13 +597,16 @@ def list_p2_journeys(
                    -- The Deal tab's own number, but only while the cached copy
                    -- was computed at the Journey's current fact version
                    -- (migration 0159). Stale -- a SKU re-pinned, a pricing date
-                   -- moved -- and the row falls back to the pv recomputation
-                   -- below, which is already computed for every row on this
-                   -- page and so costs nothing extra; the worker's sweep
-                   -- restores the Deal's own figure within a cycle.
-                   CASE WHEN pr.price_variance IS NOT NULL
-                              AND pr.price_variance_fact_version = pr.fact_version
-                        THEN pr.price_variance ELSE pv.price_variance END AS price_variance,
+                   -- moved -- and no figure is shown until the worker's sweep
+                   -- restores the Deal's own figure (within a cycle). The list
+                   -- no longer works out a figure of its own: its fallback read
+                   -- the booking form's prices and the discounts written from
+                   -- it, and only billing documents count (product owner
+                   -- 2026-11-02; 2026-11-03).
+                   CASE WHEN pr.price_variance_fact_version = pr.fact_version
+                        THEN pr.price_variance END AS price_variance,
+                   (pr.journey_id IS NULL OR pr.price_variance_fact_version IS NOT DISTINCT FROM pr.fact_version)
+                     AS price_variance_fresh,
                    gt.kyc_status, gt.docs_required, gt.docs_received,
                    gp.gate_pass_date, op.opened_at, op.last_upload_at,
                    up.processing_now, up.upload_started_at, up.upload_finished_at,
@@ -741,65 +744,6 @@ def list_p2_journeys(
                 AND finding_status IN ('OPEN','ACKNOWLEDGED')
             ) fd ON true
             LEFT JOIN LATERAL (
-              -- Fallback while the Journey's stored Deal variance (price_variance,
-              -- the Deal tab's own number) is missing or stale: for every
-              -- priced line the figure a document still on file carries (a
-              -- billing document, else the booking form, else the line's own
-              -- actual before any invoice) against the price list, less the
-              -- same difference on the discounts. 2026-10-20 (review S8):
-              -- voided documents and the wholesale invoice never count, and a
-              -- line awaiting its own document with no booking figure is left
-              -- out instead of counting at nil.
-              SELECT COALESCE((
-                SELECT SUM(cur.current - cl.standard_amount)
-                FROM auditcore.commercial_lines cl
-                CROSS JOIN LATERAL (
-                  SELECT EXISTS (
-                    SELECT 1 FROM auditcore.commercial_line_source_values s
-                    WHERE s.tenant_id=p.tenant_id AND s.journey_id=p.journey_id
-                      AND s.source_document_type IN ('customer_invoice_dms','tax_invoice_tally','tax_invoice_dms',
-                        'tax_invoice','customer_invoice_dms_v2','accessory_invoice_dms','accessory_invoice_tally',
-                        'ew_invoice','rsa_invoice','invoice_generic','credit_note','debit_note')
-                      AND NOT EXISTS (SELECT 1 FROM auditcore.evidence e
-                                     WHERE e.tenant_id=s.tenant_id AND e.journey_id=s.journey_id
-                                       AND (e.di_document_id=s.source_document_id OR e.evidence_id=s.source_evidence_id)
-                                       AND e.association_status <> 'ACTIVE')
-                  ) AS invoiced
-                ) vi
-                LEFT JOIN LATERAL (
-                  SELECT COALESCE(
-                    (SELECT s.amount FROM auditcore.commercial_line_source_values s
-                      WHERE s.tenant_id=cl.tenant_id AND s.journey_id=cl.journey_id
-                        AND s.line_kind='COMMERCIAL' AND s.component_key=cl.component_key
-                        AND s.source_document_type NOT IN ('booking_form','booking_docket','order_taking_form',
-                                                           'customer_ledger','cost_sheet','wholesale_invoice')
-                        AND NOT EXISTS (SELECT 1 FROM auditcore.evidence e
-                                     WHERE e.tenant_id=s.tenant_id AND e.journey_id=s.journey_id
-                                       AND (e.di_document_id=s.source_document_id OR e.evidence_id=s.source_evidence_id)
-                                       AND e.association_status <> 'ACTIVE')
-                      ORDER BY s.source_document_type, s.source_document_id LIMIT 1),
-                    (SELECT s.amount FROM auditcore.commercial_line_source_values s
-                      WHERE s.tenant_id=cl.tenant_id AND s.journey_id=cl.journey_id
-                        AND s.line_kind='COMMERCIAL' AND s.component_key=cl.component_key
-                        AND s.source_document_type IN ('booking_form','booking_docket','order_taking_form')
-                        AND NOT EXISTS (SELECT 1 FROM auditcore.evidence e
-                                     WHERE e.tenant_id=s.tenant_id AND e.journey_id=s.journey_id
-                                       AND (e.di_document_id=s.source_document_id OR e.evidence_id=s.source_evidence_id)
-                                       AND e.association_status <> 'ACTIVE')
-                      ORDER BY s.source_document_type, s.source_document_id LIMIT 1),
-                    CASE WHEN NOT vi.invoiced THEN cl.actual_amount END) AS current
-                ) cur ON true
-                WHERE cl.tenant_id=p.tenant_id AND cl.journey_id=p.journey_id
-                  AND cl.standard_amount IS NOT NULL AND cur.current IS NOT NULL
-              ), 0)
-              - COALESCE((
-                SELECT SUM(da.actual_discount_amount - da.standard_eligible_amount)
-                FROM auditcore.discount_applications da
-                WHERE da.tenant_id=p.tenant_id AND da.journey_id=p.journey_id
-                  AND da.actual_discount_amount IS NOT NULL AND da.standard_eligible_amount IS NOT NULL
-              ), 0) AS price_variance
-            ) pv ON true
-            LEFT JOIN LATERAL (
               -- The journey opens for the PC with the first document uploaded
               -- (a Phase 1 journey: the first evidence linked).
               SELECT COALESCE(
@@ -891,7 +835,10 @@ def list_p2_journeys(
         for key in ("booking_receipt_total", "booking_minimum_amount", "price_variance"):
             if item.get(key) is not None:
                 item[key] = str(item[key])
-        item["price_variance"] = item.get("price_variance") or "0"
+        # The Deal's own figure, or none while it is being worked out (never
+        # a guess, never a figure of the list's own; 2026-11-03).
+        if not item.pop("price_variance_fresh", True):
+            item["price_variance"] = None
         item["delivery_started"] = item["journey_id"] in delivery_started
         if not item["delivery_started"]:
             item["price_variance"] = None

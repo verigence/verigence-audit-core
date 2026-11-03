@@ -1536,12 +1536,24 @@ def _sync_conditional_discount_evidence(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).mappings().all()
+    # What a billing document gives on each benefit, as the Deal shows it
+    # (2026-11-03): only billing documents count, the booking docket is
+    # information only (product owner 2026-11-02). The application's
+    # actual_discount_amount is written from the docket too, so a benefit only
+    # the docket offers asked for its proof with nothing given.
+    from audit_core.uc03_p2_journey360 import deal as deal_sheet
+
+    given = {
+        str(d.get("key") or "").upper(): _to_decimal(d.get("billed"))
+        for d in deal_sheet(connection, tenant_id=tenant_id, journey_id=journey_id).get("discounts") or []
+    }
 
     updated = 0
     for row in rows:
         discount_key = row["discount_key"]
         required_document = CONDITIONAL_DISCOUNT_EVIDENCE_DOCUMENT.get(discount_key)
-        claimed = row["actual_discount_amount"]
+        billed = given.get(str(discount_key or "").upper())
+        claimed = billed if billed is not None and billed > 0 else None
 
         if required_document is None:
             status = "NOT_REQUIRED"
@@ -1616,7 +1628,8 @@ def _sync_conditional_discount_evidence(
                     finding_id=finding_id,
                     actor_id=None,
                     correlation_id=correlation_id,
-                    note="Supporting document is now on file.",
+                    note="Supporting document is now on file." if status == "VERIFIED" else
+                    "No billing document gives this benefit; the booking docket's offer is information only.",
                 )
     return updated
 

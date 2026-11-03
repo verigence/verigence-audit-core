@@ -102,11 +102,17 @@ def test_the_oem_wholesale_invoice_and_a_credit_note_do_not_sell_it(journey, con
     assert condition not in reasons
 
 
-def test_other_conditions_still_read_the_booking_form(journey):
+def test_no_condition_reads_the_booking_docket(journey):
+    """2026-11-03: the booking docket is information only (product owner
+    2026-11-02); every condition, not only RSA and EW, is made true by a
+    billing document's figure."""
     add_ready_document(journey, "booking_docket", customer_name="A", booking_date="2026-09-01",
                        accessories_cost="12500", rsa_amount="1500")
     reasons, _ = _reasons_and_items(journey)
-    assert "accessoriesSold" in reasons and "rsaSold" not in reasons
+    assert "accessoriesSold" not in reasons and "rsaSold" not in reasons
+    _source_value(journey, "accessories_cost", "customer_ledger", "12500")
+    reasons, _ = _reasons_and_items(journey)
+    assert "accessoriesSold" in reasons
 
 
 def test_the_legacy_requirement_resolver_follows_the_same_rule(journey):

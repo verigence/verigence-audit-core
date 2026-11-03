@@ -58,19 +58,20 @@ def test_within_rupees_100_is_not_a_variance():
     assert discount_variance_rows(_view([_d("CORPORATE", "20000", "20100.01")]))[0]["status"] == OVER
 
 
-def test_the_given_figure_is_the_rules_billed_then_booking_then_reconciled():
+def test_the_given_figure_is_the_billed_one_only():
     # 2026-10-31: the tab and the EXCESS_DISCOUNT rule read one resolution.
+    # 2026-11-03: only what a billing document gives is given (product owner
+    # 2026-11-02): the booking docket's offer and the reconciled amount
+    # written from it raise no over-grant.
     statement = [{"document": "NDC (Account Statement)", "documentType": "account_statement", "amount": "30000"},
                  {"document": "Booking docket", "documentType": "booking_docket", "amount": "20000"}]
     row = discount_variance_rows(_view([_d("CASH_DISCOUNT", "25000", "30000", billed_from="document",
                                            booking="20000", sources=statement)]))[0]
     assert (row["status"], row["invoice"], row["givenFrom"]) == (OVER, "30000", "billed")
     assert row["givenDocument"] == "NDC (Account Statement)"
-    row = discount_variance_rows(_view([_d("CASH_DISCOUNT", "0", None, billed_from=None, booking="20000",
-                                           sources=statement[1:])]))[0]
-    assert (row["status"], row["givenFrom"], row["givenDocument"]) == (OVER, "booking", "Booking docket")
-    row = discount_variance_rows(_view([_d("CASH_DISCOUNT", "0", None, billed_from=None, effective="5000")]))[0]
-    assert (row["givenFrom"], row["givenDocument"]) == ("effective", "Discount reconciliation")
+    assert discount_variance_rows(_view([_d("CASH_DISCOUNT", "0", None, billed_from=None, booking="20000",
+                                            sources=statement[1:])])) == []
+    assert discount_variance_rows(_view([_d("CASH_DISCOUNT", "0", None, billed_from=None, effective="5000")])) == []
 
 
 def test_no_entitlement_on_record_is_an_entitlement_of_zero():
@@ -127,7 +128,9 @@ def test_the_tab_lists_exactly_the_discounts_the_rule_flags():
     assert outcome.outcome == "FAIL"
     flagged = {d["key"]: d["extra"] for d in outcome.details["discounts"]}
     over = {r["key"]: r["variance"] for r in discount_variance_rows(view) if r["status"] == OVER}
-    assert flagged == over == {"CASH_DISCOUNT": "5000", "CORPORATE": "13000"}
+    # The corporate discount only the booking docket offers is not given
+    # (2026-11-03): neither the rule nor the tab raises it.
+    assert flagged == over == {"CASH_DISCOUNT": "5000"}
 
 
 @pytest.fixture

@@ -654,11 +654,12 @@ def test_vehicle_section_carries_what_the_header_strip_used_to(journey):
     assert view["journey"]["registrationNumber"] is None and view["journey"]["insurer"] is None
 
 
-def test_opted_lines_read_the_invoice_once_one_exists_else_the_booking_form(journey):
+def test_opted_lines_read_the_billing_documents_never_the_booking_form(journey):
     """Decision 2026-09-30: the Deal tab shows what the customer opted for
-    on the discounts, accessories and extended warranty. Until an invoice
-    is read the booking form says; once one is, the invoice says and a
-    line it does not carry is opted out."""
+    on the discounts, accessories and extended warranty; once an invoice is
+    read, the invoice says and a line it does not carry is opted out.
+    2026-11-03: the booking docket is information only (product owner
+    2026-11-02), so until a billing document bills a line it is not taken."""
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         _source(connection, journey, "COMMERCIAL", "essential_kit_amount", "booking_form", "15000")
@@ -666,9 +667,9 @@ def test_opted_lines_read_the_invoice_once_one_exists_else_the_booking_form(jour
         _source(connection, journey, "DISCOUNT", "CASH_DISCOUNT", "booking_form", "20000")
         view = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     rows = {r["key"]: r for g in view["categories"] for r in g["components"]}
-    assert rows["essential_kit_amount"]["opted"] == {"taken": True, "source": "booking"}
-    assert rows["additional_warranty_amount"]["opted"] == {"taken": False, "source": "booking"}
-    assert view["discounts"][0]["opted"] == {"taken": True, "source": "booking"}
+    assert rows["essential_kit_amount"]["opted"] == {"taken": False, "source": None}
+    assert rows["additional_warranty_amount"]["opted"] == {"taken": False, "source": None}
+    assert view["discounts"][0]["opted"] == {"taken": False, "source": None}
     # Not confirmed in-house: shown, kept out of the deal (2026-11-02).
     assert view["insurance"] == {"source": "INHOUSE", "decidedBy": "DEFAULT", "decidedAt": None, "actorId": None,
                                  "basis": None, "invoiceOnFile": False, "vehicleInvoiced": False, "inDeal": False}
@@ -681,9 +682,9 @@ def test_opted_lines_read_the_invoice_once_one_exists_else_the_booking_form(jour
     rows = {r["key"]: r for g in view["categories"] for r in g["components"]}
     assert rows["ex_showroom_price"].get("opted") is None  # the vehicle price is never opted out
     # 2026-10-20 (R2): the accessories are billed by the accessory invoice;
-    # the vehicle invoice says nothing about them, so the booking form still
-    # says until the accessory invoice is on file.
-    assert rows["essential_kit_amount"]["opted"] == {"taken": True, "source": "booking"}
+    # the vehicle invoice says nothing about them, so they are not taken
+    # until the accessory invoice is on file.
+    assert rows["essential_kit_amount"]["opted"] == {"taken": False, "source": None}
     assert rows["additional_warranty_amount"]["opted"] == {"taken": True, "source": "invoice"}
     assert view["discounts"][0]["opted"] == {"taken": False, "source": "invoice"}
 

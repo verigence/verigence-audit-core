@@ -201,6 +201,22 @@ class _Facts:
         return [p for p in self.payments if p["amount"] < 0 or p["mode"] == "REFUND"]
 
     @cached_property
+    def money(self) -> dict[str, Any]:
+        """Money received exactly as the Deal counts it (2026-11-03): the
+        Deal's own paid block -- the customer's receipts (the ledger's
+        receipts with no receipt on file among them), the loan by the one loan
+        rule, the old vehicle taken in kind, refunds, the total -- and the
+        customer's receipts dated, the same receipts (uc03_p2_journey360._paid).
+        Live 2026-11-03: the payment rules counted only the receipts on file
+        and a person-entered sanction, so a loan the NDC, the ERP settlement or
+        the ledger gives and the exchanged vehicle read as money short."""
+        from audit_core.uc03_p2_journey360 import _paid
+
+        paid = dict(self.sheet["summary"]["paid"])
+        dated = _paid(self.connection, tenant_id=self.tenant_id, journey_id=self.journey_id)["customerReceipts"]
+        return {**paid, "dated": [{**r, "date": _day(r["date"])} for r in dated]}
+
+    @cached_property
     def loan_received(self) -> Decimal:
         from audit_core.uc03_p2_journey360 import _loan_received
 
@@ -280,10 +296,13 @@ class _Facts:
                 "resale": _day(row["resale_at_utc"]),
                 "resaleValue": _dec(resale_value),
             }
+        # An exchange is on the deal when a valuation report is on file or a
+        # billing document takes the old vehicle in kind (the Deal's
+        # oldVehicle); the booking docket's "exchange applicable" is
+        # information only (product owner 2026-11-02).
         valuation = self.documents("valuation_report")
-        booking = self.documents("booking_form", "booking_docket")
-        exchange = str((booking[0]["fields"] if booking else {}).get("exchange_applicable") or "").strip().upper()
-        if valuation or exchange in {"YES", "Y", "TRUE", "APPLICABLE"}:
+        in_kind = _dec(((self.sheet.get("summary") or {}).get("paid") or {}).get("oldVehicle"))
+        if valuation or (in_kind is not None and in_kind > 0):
             fields = valuation[0]["fields"] if valuation else {}
             return {
                 "registration": fields.get("registration_number") or "the exchange vehicle",
@@ -665,25 +684,34 @@ _NO_DELIVERY_DATE = "The delivery date is not known yet (no gate pass or deliver
 
 
 def _at_delivery(facts: _Facts) -> dict[str, Any] | RuleOutcome:
-    """What was payable and what was covered when the vehicle left."""
+    """What was payable and what was covered when the vehicle left, on the
+    Deal's own figures (2026-11-03): its payable, the loan it counts (the
+    financier's money), the old vehicle it takes in kind, less refunds, and
+    the customer's receipts dated on or before the delivery day."""
     delivered = facts.delivery_date
     if delivered is None:
         return RuleOutcome("", "SKIPPED", _NO_DELIVERY_DATE)
     payable = _dec(facts.sheet["summary"]["payable"])
     if payable is None:
-        return RuleOutcome("", "SKIPPED", "The amount payable is not known yet (no booking form or invoice read).")
-    received = sum((r["amount"] for r in facts.receipts if r["date"] is None or r["date"] <= delivered), Decimal(0))
-    sanction = facts.finance["sanction"] if facts.finance else Decimal(0)
-    committed = max(sanction, facts.loan_received)
-    covered = received + committed
-    return {"delivered": delivered, "payable": payable, "received": received, "committed": committed,
+        return RuleOutcome("", "SKIPPED", "No net payable yet: the vehicle's price is not on a billing document "
+                                          "(NDC, cost sheet or vehicle invoice).")
+    money = facts.money
+    if money.get("loanUnknown"):
+        return RuleOutcome("", "SKIPPED", "Financed deal: the loan amount is not on file, so what was owed at "
+                                          "delivery cannot be told.")
+    received = sum((r["amount"] for r in money["dated"] if r["date"] is None or r["date"] <= delivered), Decimal(0))
+    loan = _dec(money.get("loan")) or Decimal(0)
+    old_vehicle = _dec(money.get("oldVehicle")) or Decimal(0)
+    refunds = _dec(money.get("refunds")) or Decimal(0)
+    covered = received + loan + old_vehicle - refunds
+    return {"delivered": delivered, "payable": payable, "received": received, "committed": loan,
+            "loanSource": money.get("loanSource"), "oldVehicle": old_vehicle, "refunds": refunds,
             "covered": covered, "short": payable - covered}
 
 
 def _received_in_all(facts: _Facts) -> Decimal:
-    return sum((r["amount"] for r in facts.receipts), Decimal(0)) + (
-        max(facts.finance["sanction"], facts.loan_received) if facts.finance else facts.loan_received
-    )
+    """All money received, as the Deal counts it (its paid total)."""
+    return _dec(facts.money.get("total")) or Decimal(0)
 
 
 def delivered_on_short_payment(facts: _Facts) -> RuleOutcome:
@@ -692,13 +720,17 @@ def delivered_on_short_payment(facts: _Facts) -> RuleOutcome:
     if isinstance(state, RuleOutcome):
         return RuleOutcome(code, state.outcome, state.reason)
     if state["short"] > _TOLERANCE:
-        committed = f" plus {_rupees(state['committed'])} committed by the financier" if state["committed"] else ""
+        committed = (f" plus the loan of {_rupees(state['committed'])}"
+                     + (f" ({state['loanSource']})" if state["loanSource"] else "")) if state["committed"] else ""
+        old_vehicle = f" and the old vehicle at {_rupees(state['oldVehicle'])}" if state["oldVehicle"] else ""
+        refunds = f", less {_rupees(state['refunds'])} refunded" if state["refunds"] else ""
         return RuleOutcome(code, "FAIL", (
-            f"Delivered on {_when(state['delivered'])} with {_rupees(state['received'])} received{committed} "
-            f"against {_rupees(state['payable'])} payable ({_rupees(state['short'])} short)."
+            f"Delivered on {_when(state['delivered'])} with {_rupees(state['received'])} received{committed}"
+            f"{old_vehicle}{refunds} against {_rupees(state['payable'])} payable ({_rupees(state['short'])} short)."
         ), {"findingTitle": "Vehicle delivered on short payment",
             "deliveredOn": state["delivered"].isoformat(), "payable": str(state["payable"]),
             "receivedByDelivery": str(state["received"]), "financed": str(state["committed"]),
+            "oldVehicle": str(state["oldVehicle"]), "refunds": str(state["refunds"]),
             "short": str(state["short"])})
     return RuleOutcome(code, "PASS", f"Paid by delivery: {_rupees(state['covered'])} against "
                                      f"{_rupees(state['payable'])} payable.")
@@ -840,22 +872,34 @@ def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
             f"Receipts are compared with the account statement once the settlement window closes on "
             f"{_when(settles)} ({_SETTLEMENT_DAYS} days after delivery on {_when(delivered)})."
         ))
-    received = sum((r["amount"] for r in facts.receipts), Decimal(0))
-    refunded = sum((abs(r["amount"]) for r in facts.refunds), Decimal(0))
+    # The money received as the Deal counts it (2026-11-03): the customer's
+    # receipts (the ledger's among them), the loan by the one loan rule and
+    # the old vehicle taken in kind, less refunds. Live: the receipts alone
+    # were compared, so every loan the financier paid with no dealer receipt
+    # read as the customer's shortfall.
+    money = facts.money
+    if money.get("loanUnknown"):
+        return RuleOutcome(code, "SKIPPED", "Financed deal: the loan amount is not on file, so the money received "
+                                            "cannot be compared with the account statement yet.")
+    received = _received_in_all(facts) + (_dec(money.get("refunds")) or Decimal(0))
+    refunded = _dec(money.get("refunds")) or Decimal(0)
     net = received - refunded
     gap = net - billed
     refund_text = f" less {_rupees(refunded)} refunded" if refunded else ""
     how = "the net value printed on the account statement"
     details = {"statementTotal": str(billed), "statementReceivedLines": str(read.receipts),
                "received": str(received), "refunded": str(refunded), "difference": str(gap),
+               "receipts": str(money.get("receipts")), "loan": str(money.get("loan")),
+               "loanSource": money.get("loanSource"), "oldVehicle": money.get("oldVehicle"),
                "documentId": str(document["documentId"])}
     if abs(gap) <= _INVOICE_TOLERANCE:
         return RuleOutcome(code, "PASS", (
-            f"Receipts {_rupees(received)}{refund_text} match {how}, {_rupees(billed)}."
+            f"Money received {_rupees(received)}{refund_text} matches {how}, {_rupees(billed)}."
         ), details)
     direction = "short of" if gap < 0 else "more than"
     return RuleOutcome(code, "FAIL", (
-        f"Receipts {_rupees(received)}{refund_text} are {_rupees(abs(gap))} {direction} {how}, {_rupees(billed)}."
+        f"Money received {_rupees(received)}{refund_text} (receipts, loan and old vehicle as the Deal counts them) "
+        f"is {_rupees(abs(gap))} {direction} {how}, {_rupees(billed)}."
     ), {**details, "findingTitle": "Receipts do not equal the account statement"})
 
 
@@ -901,7 +945,8 @@ def receipts_equal_invoices(facts: _Facts) -> RuleOutcome:
 
 
 def _late_receipts(facts: _Facts, start: date, end: date | None) -> list[dict[str, Any]]:
-    return [r for r in facts.receipts if r["date"] and r["date"] > start and (end is None or r["date"] <= end)]
+    """The customer's receipts (as the Deal counts them) dated after ``start``."""
+    return [r for r in facts.money["dated"] if r["date"] and r["date"] > start and (end is None or r["date"] <= end)]
 
 
 def _receipt_lines(rows: list[dict[str, Any]], delivered: date) -> str:
@@ -926,7 +971,7 @@ def payment_after_delivery_within_grace(facts: _Facts) -> RuleOutcome:
         f"{_rupees(state['short'])} was outstanding at delivery on {_when(state['delivered'])}; received afterwards: "
         f"{_receipt_lines(late, state['delivered'])}."
     ), {"findingTitle": f"Payment received within {_SETTLEMENT_DAYS} days after delivery",
-        "paymentIds": [r["paymentId"] for r in late], "shortAtDelivery": str(state["short"])})
+        "paymentIds": [r["paymentId"] for r in late if r["paymentId"]], "shortAtDelivery": str(state["short"])})
 
 
 def payment_after_delivery_beyond_grace(facts: _Facts) -> RuleOutcome:
@@ -943,7 +988,7 @@ def payment_after_delivery_beyond_grace(facts: _Facts) -> RuleOutcome:
         return RuleOutcome(code, "FAIL", (
             f"{_rupees(state['short'])} was outstanding at delivery on {_when(state['delivered'])}; received "
             f"{_receipt_lines(late, state['delivered'])}."
-        ), {"findingTitle": title, "paymentIds": [r["paymentId"] for r in late],
+        ), {"findingTitle": title, "paymentIds": [r["paymentId"] for r in late if r["paymentId"]],
             "shortAtDelivery": str(state["short"])})
     outstanding = state["payable"] - _received_in_all(facts)
     if outstanding <= _TOLERANCE:
@@ -965,6 +1010,17 @@ def do_payment_not_received(facts: _Facts) -> RuleOutcome:
         return RuleOutcome(code, "PASS", "The deal is not financed.")
     if finance["disbursed"] > 0:
         return RuleOutcome(code, "PASS", f"Loan of {_rupees(finance['disbursed'])} received from {finance['provider']}.")
+    # The loan as the Deal counts it (2026-11-03): the NDC's financer line,
+    # the ERP settlement's DO posting or the ledger's financier posting is the
+    # financier's money on the dealer's own books; a loan already among the
+    # customer's receipts is received. The bank letter alone is an approval,
+    # not money received, so it does not pass this check.
+    money = facts.money
+    loan = _dec(money.get("loan")) or Decimal(0)
+    if money.get("loanInReceipts"):
+        return RuleOutcome(code, "PASS", f"The loan is among the receipts ({money.get('loanSource')}).")
+    if loan > 0 and not money.get("loanWithoutReceipt"):
+        return RuleOutcome(code, "PASS", f"Loan of {_rupees(loan)} received ({money.get('loanSource')}).")
     delivered = facts.delivery_date
     if delivered is None:
         return RuleOutcome(code, "SKIPPED", _NO_DELIVERY_DATE)

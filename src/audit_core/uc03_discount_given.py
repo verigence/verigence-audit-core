@@ -24,11 +24,12 @@ from audit_core.uc03_p2_journey360 import _column_for, _dec
 # Per discount line: a gap at or below this is rounding, not an over-grant.
 LINE_TOLERANCE = Decimal(100)
 
-# The Deal columns the given figure is read from, in order: what the billing
-# document gave (the invoice, or for an ACCOUNT_STATEMENT Project the NDC or the
-# cost sheet standing in for it), else what the booking form offered, else the
-# reconciled amount of the discount application.
-GIVEN_COLUMNS = ("billed", "booking", "effective")
+# The Deal column the given figure is read from: what the billing document
+# gave (the invoice, or for an ACCOUNT_STATEMENT Project the NDC or the cost
+# sheet standing in for it). Only billing documents count (product owner
+# 2026-11-02): what the booking docket offered, and the discount application's
+# reconciled amount written from it, are never a discount given (2026-11-03).
+GIVEN_COLUMNS = ("billed",)
 
 
 def has_figure(row: dict[str, Any]) -> bool:

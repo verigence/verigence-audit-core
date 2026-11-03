@@ -570,14 +570,21 @@ def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[s
     # Money the customer ledger records with no receipt on file (2026-11-02).
     from audit_core.uc03_ledger_receipts import ledger_receipts
 
-    from_ledger = [p["amount"] for p in ledger_receipts(connection, tenant_id=tenant_id, journey_id=journey_id)]
+    postings = ledger_receipts(connection, tenant_id=tenant_id, journey_id=journey_id)
+    from_ledger = [p["amount"] for p in postings]
     receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids), Decimal(0))
     receipts += sum(from_ledger, Decimal(0))
     loan_receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] in loan_ids), Decimal(0))
     loan = loan_receipts + _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
     customer = [Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids] + from_ledger
+    # The same customer money, dated as printed, for the rules that ask what
+    # was paid by a day (delivery): the receipts that make up ``receipts``.
+    dated = [{"paymentId": str(r["payment_id"]), "amount": Decimal(r["amount"]), "date": r["receipt_date"],
+              "receiptNumber": r["receipt_number"]} for r in counted if r["payment_id"] not in loan_ids]
+    dated += [{"paymentId": None, "amount": Decimal(p["amount"]), "date": p["date"],
+               "receiptNumber": p["number"]} for p in postings]
     return {"receipts": receipts, "loan": loan, "total": receipts + loan,
-            "customerAmounts": customer,
+            "customerAmounts": customer, "customerReceipts": dated,
             "countedAmounts": [Decimal(r["amount"]) for r in counted] + from_ledger}
 
 
@@ -1069,15 +1076,16 @@ _SETTLEMENT_DAYS = int(os.environ.get("P2_SETTLEMENT_GRACE_DAYS", "7"))
 
 def _opted(billed: Any, booking: Any, *, invoiced: bool) -> dict[str, Any]:
     """Whether the customer took this line, read from the invoice once the
-    deal has one (a line the invoice does not carry is opted out), else
-    from the booking form."""
+    deal has one (a line the invoice does not carry is opted out), else from
+    the billing document that bills it. The booking docket is information
+    only (product owner 2026-11-02): what it offers never makes a line taken
+    (``booking`` is kept in the signature for the callers; 2026-11-03)."""
+    value = _dec(billed)
     if invoiced:
-        value = _dec(billed)
         return {"taken": value is not None and value > 0, "source": "invoice"}
-    value = _dec(booking)
     if value is None:
         return {"taken": False, "source": None}
-    return {"taken": value > 0, "source": "booking"}
+    return {"taken": value > 0, "source": "billed"}
 
 
 def resolve_insurance_source(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
@@ -1634,7 +1642,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             "standardTakenAsCharged": [r["key"] for r in taken_as_charged] if net_std is not None else [],
             "paid": {"receipts": str(paid["receipts"]), "loan": str(loan),
                      "loanSource": loan_view["source"], "loanWithoutReceipt": loan_view["withoutReceipt"],
-                     "loanUnknown": loan_view["unknown"],
+                     "loanUnknown": loan_view["unknown"], "loanInReceipts": loan_view["inReceipts"],
                      "refunds": str(refunds) if refunds else None,
                      "oldVehicle": str(old_vehicle) if old_vehicle is not None else None,
                      "total": str(paid_total)},
@@ -2578,6 +2586,22 @@ def _rows(connection: Connection, sql: str, params: dict[str, Any]) -> list[dict
     return [_plain(r) for r in connection.execute(text(sql), params).mappings().all()]
 
 
+def insurance_by_label(decision: dict[str, Any]) -> str | None:
+    """Who arranged the insurance, as the Deal decided it (insurance.source,
+    inDeal, basis): one answer for every tab."""
+    source = decision.get("source")
+    if source == "SELF":
+        label = "Self (the customer's own policy)"
+    elif source == "INHOUSE" and decision.get("inDeal"):
+        label = "Dealer (in-house)"
+    elif source == "INHOUSE":
+        label = "Not confirmed: kept out of the deal until the PC confirms"
+    else:
+        return None
+    basis = decision.get("basis")
+    return f"{label}. {basis}" if basis else label
+
+
 def addons(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     params = {"t": tenant_id, "j": journey_id}
     insurance = _rows(connection, """
@@ -2586,8 +2610,6 @@ def addons(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[
                standard_premium_amount, actual_premium_amount, add_ons, actual_status_code
         FROM auditcore.insurance_records WHERE tenant_id=:t AND journey_id=:j
         ORDER BY updated_at_utc DESC""", params)
-    for item in insurance:
-        item["premium_variance"] = _minus(item["actual_premium_amount"], item["standard_premium_amount"])
     finance = _rows(connection, """
         SELECT f.finance_type_code, f.provider_name,
                -- From documents this is the RTO challan's hypothecation charges, not the loan (2026-10-27).
@@ -2622,6 +2644,20 @@ def addons(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[
     # Accessory, insurance and protection charges live on the deal lines too;
     # surface them here so the add-on view is complete on its own.
     deal_view = as_shown(deal(connection, tenant_id=tenant_id, journey_id=journey_id))
+    # The premium is measured against the standard only for a policy the deal
+    # counts: confirmed in-house (the Deal's insurance.inDeal). The customer's
+    # own policy, or one not yet confirmed, has no variance (2026-11-03).
+    in_deal = bool((deal_view.get("insurance") or {}).get("inDeal"))
+    insurance_by = insurance_by_label(deal_view.get("insurance") or {})
+    for item in insurance:
+        item["premium_variance"] = (
+            _minus(item["actual_premium_amount"], item["standard_premium_amount"]) if in_deal else None)
+        # Who arranged the policy is the Deal's decision (2026-11-03), never
+        # the field one reading stored: live, SHI-SS-261031-008 showed
+        # "Insurance by: Self" from an earlier reading while the Deal counts
+        # the dealer's policy (the dealer's MISP code, the NDC's premium).
+        item["insurance_by"] = insurance_by
+        item["self_insurance_flag"] = None
     lines = {g["code"]: g for g in deal_view["categories"]}
     discounts = {d["key"]: d for d in deal_view["discounts"]}
     is_accessory = lambda p: "ACCESS" in str(p["addon_type_code"]).upper()
@@ -3038,6 +3074,34 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     }
 
 
+def payments_section(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """The Payments tab: every receipt (payments()), and the money received
+    exactly as the Deal and the Audit Summary count it (2026-11-03).
+
+    Live 2026-11-03, the first cross-screen check of every booking: on 141 of
+    926 the Payments tab's "Total received" was not the Deal's. The tab
+    counted the loan only from the finance record and the loan's own receipt,
+    so a loan that the NDC's financer line, the ERP settlement or the ledger's
+    financier posting gives read Rs 0 here; and the bank letter's sanction
+    stood as the loan on bookings whose deal counts the NDC's figure. One rule
+    decides the loan (_loan_counted, the Audit Summary's loan_received); this
+    tab shows its answer: the loan, where it comes from, the old vehicle paid
+    in kind, refunds, and the total. The bank letter's line shows only when
+    the letter is the loan counted."""
+    view = payments(connection, tenant_id=tenant_id, journey_id=journey_id)
+    paid = deal(connection, tenant_id=tenant_id, journey_id=journey_id)["summary"]["paid"]
+    view.update({
+        "loanDisbursed": paid["loan"],
+        "loanSource": paid["loanSource"],
+        "loanUnknown": paid["loanUnknown"],
+        "oldVehicle": paid["oldVehicle"],
+        "refunds": paid["refunds"],
+        "paidTotal": paid["total"],
+        "loanWithoutReceipt": view["loanWithoutReceipt"] if paid["loanWithoutReceipt"] else None,
+    })
+    return view
+
+
 # ── vehicle, registration, delivery ──────────────────────────────────────────
 def _document_facts(
     connection: Connection, *, tenant_id: str, journey_id: UUID, di_types: tuple[str, ...],
@@ -3255,7 +3319,8 @@ def _taken_addons(
             "policyNumber": insurance_row.get("policy_reference") or cover_fields.get("policy_number"),
             "policyType": cover_fields.get("policy_type"),
             "coverNoteReference": insurance_row.get("cover_note_reference"),
-            "insuranceBy": insurance_row.get("insurance_by"),
+            # The Deal's decision, not one reading's field (2026-11-03).
+            "insuranceBy": insurance_by_label(deal_view.get("insurance") or {}),
             "policyStartDate": cover_fields.get("policy_start_date"),
             "policyEndDate": cover_fields.get("policy_end_date"),
             "issueDate": cover_fields.get("issue_date"),
@@ -4202,7 +4267,7 @@ BUILDERS = {
     "invoices": invoices,
     "addons": addons,
     "documents": documents,
-    "payments": payments,
+    "payments": payments_section,
     "vehicle": vehicle,
     "tradein": tradein,
     "customer": customer,

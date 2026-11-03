@@ -12,6 +12,15 @@ with ``-commit``. ``reports`` lists the pages as
 ``<journey reference>:<page number>:<template key>``, at most 60 per job.
 A page that is still being read, or whose stage a person marked reviewed, is
 left alone and listed with why.
+
+A page read as one document with other pages (a GROUP unit) is split
+(2026-11-03): live, Shivnath's Offer Letter / Payment Details sheet (its NDC)
+was read together with the Mahindra booking form as one booking docket
+(SHI-SS-261031-008, pages 1 and 3), so the booking form's booking amount was
+taken as a corporate discount and the letter's lines never reached the Deal.
+The page asked for is read alone as the type asked for; every other page of
+the group is read alone as the group's own type, each from its own stored
+page; the group is retired (MERGED into the page asked for).
 """
 from __future__ import annotations
 
@@ -67,6 +76,65 @@ def _current_unit(connection: Any, *, tenant_id: str, reference: str, page: int)
     return dict(row) if row else None
 
 
+def _own_page_unit(connection: Any, *, tenant_id: str, journey_id: UUID, batch_id: Any,
+                   page: int) -> UUID | None:
+    """The unit of one page as it was uploaded (unit_kind PAGE), which holds
+    that page's own stored file."""
+    found = connection.execute(
+        text(
+            """
+            SELECT queue_id FROM auditcore.p2_document_queue
+            WHERE tenant_id = :t AND journey_id = :j AND batch_id = :b AND unit_kind = 'PAGE'
+              AND page_numbers = ARRAY[:p]::int[]
+            ORDER BY created_at_utc DESC
+            LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "b": batch_id, "p": page},
+    ).scalar_one_or_none()
+    return UUID(str(found)) if found is not None else None
+
+
+def _split(connection: Any, *, tenant_id: str, journey_id: UUID, group: dict[str, Any], page: int, template: Any,
+           tag: str, registry: Any) -> list[dict[str, Any]] | str:
+    """The group's pages read alone: ``page`` as ``template``, the others as
+    the group's own type. Returns what was sent, or why nothing was."""
+    from audit_core.uc03_p2_api import _page_unit, _send_page_again
+
+    own_type = registry.documents.get(group["template_key"] or "")
+    if own_type is None or not own_type.di_types:
+        return f"the group's own type {group['template_key']!r} is not a known template"
+    pages = [int(p) for p in (group["page_numbers"] or [group["page_number"]])]
+    units = {p: _own_page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, batch_id=group["batch_id"],
+                               page=p) for p in pages}
+    missing = [p for p, unit in units.items() if unit is None]
+    if missing:
+        return "no stored page of its own for page " + ", ".join(map(str, missing))
+    sent = []
+    for each in [page] + [p for p in pages if p != page]:
+        kind = template if each == page else own_type
+        unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id, queue_id=units[each])
+        new_id = _send_page_again(
+            connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit, template=kind,
+            di_type=kind.di_types[0], actor_id=_ACTOR, role="SYSTEM", swept=False, event_type="PAGE_TYPE_SET",
+            override_reason=f"Split from pages {pages} by job {tag}", correlation_id=tag,
+        )
+        sent.append({"page": each, "to": kind.key, "newQueueId": str(new_id)})
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status = 'MERGED', merged_into_queue_id = :into, updated_at_utc = now(),
+                status_reason = :why
+            WHERE tenant_id = :t AND queue_id = :q
+            """
+        ),
+        {"t": tenant_id, "q": group["queue_id"], "into": sent[0]["newQueueId"],
+         "why": "Split into its pages, each read alone: " + ", ".join(f"page {s['page']} as {s['to']}" for s in sent)},
+    )
+    return sent
+
+
 def run_page_retype(engine: Engine, tag: str, reports: list[str]) -> dict[str, Any]:
     from audit_core.uc03_p2_api import (
         _RETYPEABLE_PAGE_STATES,
@@ -108,8 +176,20 @@ def run_page_retype(engine: Engine, tag: str, reports: list[str]) -> dict[str, A
                 continue
             entry = {"journey": reference, "page": page, "from": unit["template_key"] or unit["classified_document_type"],
                      "to": template_key}
+            grouped = len(unit["page_numbers"] or []) > 1
+            if grouped:
+                entry["splitFrom"] = [int(p) for p in unit["page_numbers"]]
             if not commit:
                 out["wouldSend"].append(entry)
+                continue
+            if grouped:
+                split = _split(connection, tenant_id=tenant_id, journey_id=journey_id, group=unit, page=page,
+                               template=template, tag=tag, registry=registry)
+                if isinstance(split, str):
+                    out["skipped"].append({"journey": reference, "page": page, "why": split})
+                    continue
+                out["sent"].append({**entry, "newQueueId": split[0]["newQueueId"], "pages": split})
+                logger.info("page_retype_split", tag=tag, journey=reference, page=page, to=template_key)
                 continue
             new_id = _send_page_again(
                 connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit, template=template,

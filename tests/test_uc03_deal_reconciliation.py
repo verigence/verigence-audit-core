@@ -565,8 +565,25 @@ def test_raise_findings_false_skips_evidence_and_variance_checks(journey) -> Non
     assert _open_finding(c, "BK_DISCOUNT_EVIDENCE_MISSING:corporate_discount") is None
 
 
-def test_conditional_discount_without_evidence_is_missing_and_flagged(journey) -> None:
+def _billed_on_deal(monkeypatch, **given: str) -> None:
+    """The Deal shows these benefits billed. 2026-11-03: the evidence check
+    reads what a billing document gives (the Deal's billed figure), never the
+    booking docket's offer (product owner 2026-11-02)."""
+    import audit_core.uc03_p2_journey360 as j360
+
+    real = j360.deal
+
+    def billed(connection, *, tenant_id, journey_id):
+        view = real(connection, tenant_id=tenant_id, journey_id=journey_id)
+        view["discounts"] = [*(view.get("discounts") or []), *({"key": k, "billed": v} for k, v in given.items())]
+        return view
+
+    monkeypatch.setattr(j360, "deal", billed)
+
+
+def test_conditional_discount_without_evidence_is_missing_and_flagged(journey, monkeypatch) -> None:
     c = journey
+    _billed_on_deal(monkeypatch, CORPORATE_PRIVILEGE="40000")
     seeded = _seed_pinned_sku(c, model="XUV700", variant="AX7L", components={"EX_SHOWROOM": "2000000"})
     _seed_scheme(c, category="CORPORATE", benefit_key="CORPORATE_PRIVILEGE", amount="40000",
                  model_id=seeded["model_id"], customer_type_code="CORPORATE")
@@ -593,8 +610,9 @@ def test_conditional_discount_without_evidence_is_missing_and_flagged(journey) -
     assert task["assigned_role_code"] == "PC"
 
 
-def test_conditional_discount_with_evidence_is_verified(journey) -> None:
+def test_conditional_discount_with_evidence_is_verified(journey, monkeypatch) -> None:
     c = journey
+    _billed_on_deal(monkeypatch, EXCHANGE_BONUS="25000")
     seeded = _seed_pinned_sku(c, model="THAR", variant="LX", components={"EX_SHOWROOM": "1500000"})
     _seed_scheme(c, category="EXCHANGE", benefit_key="EXCHANGE_BONUS", amount="25000",
                  model_id=seeded["model_id"])
@@ -607,8 +625,9 @@ def test_conditional_discount_with_evidence_is_verified(journey) -> None:
     assert _open_finding(c, "BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus") is None
 
 
-def test_evidence_finding_resolves_once_document_appears(journey) -> None:
+def test_evidence_finding_resolves_once_document_appears(journey, monkeypatch) -> None:
     c = journey
+    _billed_on_deal(monkeypatch, EXCHANGE_BONUS="25000")
     seeded = _seed_pinned_sku(c, model="BOLERO", variant="B4", components={"EX_SHOWROOM": "1000000"})
     _seed_scheme(c, category="EXCHANGE", benefit_key="EXCHANGE_BONUS", amount="25000",
                  model_id=seeded["model_id"])
@@ -623,6 +642,21 @@ def test_evidence_finding_resolves_once_document_appears(journey) -> None:
 
     assert _evidence_status(c, "EXCHANGE_BONUS") == "VERIFIED"
     assert _open_finding(c, "BK_DISCOUNT_EVIDENCE_MISSING:exchange_bonus") is None
+
+
+def test_a_benefit_only_the_booking_docket_offers_asks_for_no_proof(journey) -> None:
+    """Live 2026-11-03: 21 open "Corporate discount evidence is missing"
+    findings rested on the booking docket alone; nothing billed it."""
+    c = journey
+    seeded = _seed_pinned_sku(c, model="XUV700", variant="AX7L", components={"EX_SHOWROOM": "2000000"})
+    _seed_scheme(c, category="CORPORATE", benefit_key="CORPORATE_PRIVILEGE", amount="40000",
+                 model_id=seeded["model_id"], customer_type_code="CORPORATE")
+    _seed_reviewed_booking(c, corporate_discount_amount="40000")
+
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+
+    assert _evidence_status(c, "CORPORATE_PRIVILEGE") == "PENDING"
+    assert _open_finding(c, "BK_DISCOUNT_EVIDENCE_MISSING:corporate_discount") is None
 
 
 def test_unclaimed_conditional_discount_is_pending_not_missing(journey) -> None:
@@ -650,10 +684,11 @@ def test_cash_discount_is_not_required(journey) -> None:
     assert _evidence_status(c, "CASH_DISCOUNT") == "NOT_REQUIRED"
 
 
-def test_scrappage_amount_now_flows_to_actual_discount(journey) -> None:
+def test_scrappage_amount_now_flows_to_actual_discount(journey, monkeypatch) -> None:
     """Regression: scrappage_discount_amount was never mapped at all, so a
     scrappage amount on the Booking Form never reached actual_discount_amount."""
     c = journey
+    _billed_on_deal(monkeypatch, SCRAPPAGE_BONUS_DEALER="20000")
     seeded = _seed_pinned_sku(c, model="XUV400", variant="EL", components={"EX_SHOWROOM": "1700000"})
     _seed_scheme(c, category="SCRAPPAGE", benefit_key="SCRAPPAGE_BONUS_DEALER", amount="20000",
                  model_id=seeded["model_id"])
