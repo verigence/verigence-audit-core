@@ -168,8 +168,9 @@ def test_submit_queues_the_job_and_files_are_placed(s):
             text("SELECT original_filename, sha256 FROM auditcore.p2_upload_batches WHERE tenant_id=:t "
                  "AND client_upload_id LIKE 'bulk-%' ORDER BY original_filename"), {"t": s.journey.tenant_id},
         ).all()
-    assert [b[0] for b in batches] == ["Asha Das KYC.pdf", "Asha Das invoice.pdf", "IMG_0042.pdf"]
-    assert batches[0][1] == hashlib.sha256(b"%PDF asha kyc").hexdigest()
+    by_name = dict(batches)  # independent of the database's sort order (collation)
+    assert sorted(by_name) == sorted(["Asha Das KYC.pdf", "Asha Das invoice.pdf", "IMG_0042.pdf"])
+    assert by_name["Asha Das KYC.pdf"] == hashlib.sha256(b"%PDF asha kyc").hexdigest()
     # Run again: nothing done twice.
     assert _run_upload(s, bulk_id)["files"] == 0
 
