@@ -420,6 +420,22 @@ def test_discount_without_entitlement_is_an_over_grant(journey):
     assert "OVER_ENTITLEMENT" in row["flags"]
 
 
+def _confirm_inhouse(journey) -> None:
+    """The PC's confirmation that the insurance was taken through the dealer."""
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        updated = connection.execute(
+            text("UPDATE auditcore.insurance_records SET insurance_source='INHOUSE', insurance_source_set_at_utc=now() "
+                 "WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": journey.tenant_id, "j": journey.journey_id}).rowcount
+        if not updated:
+            connection.execute(
+                text("INSERT INTO auditcore.insurance_records (tenant_id, journey_id, insurer_name, source_kind, "
+                     "insurance_source, insurance_source_set_at_utc) VALUES (:t, :j, 'Zurich Kotak', 'EVIDENCE', "
+                     "'INHOUSE', now())"),
+                {"t": journey.tenant_id, "j": journey.journey_id})
+
+
 def test_insurance_taken_reads_the_cover_note_not_the_bookings_zero(journey):
     """The booking form prices insurance at 0 (customer to arrange), then a
     cover note arrives: the policy exists, the premium is what the cover
@@ -439,6 +455,9 @@ def test_insurance_taken_reads_the_cover_note_not_the_bookings_zero(journey):
         )
     cover = add_ready_document(journey, "insurance_cover", insurer_name="Zurich Kotak", policy_number="MKG/P30598174",
                                premium_amount="62,029", add_ons=["CONSUMABLES COVER", "ENGINE PROTECT"])
+    # The PC confirms it in-house: a policy alone is not insurance taken with
+    # the car (product owner 2026-11-02).
+    _confirm_inhouse(journey)
     # delivery has started: the Deal screen shows the variance only from then on (2026-10-28)
     add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
     client = TestClient(app, raise_server_exceptions=False)
@@ -815,6 +834,9 @@ def test_the_deal_screen_shows_no_variance_until_delivery_has_started(journey):
                  "actual_amount, actual_source_kind, source_reference) VALUES (:t, :j, 'insurance_amount', 71809, "
                  "62029, 'EVIDENCE', 'insurance_cover:x')"),
             {"t": journey.tenant_id, "j": journey.journey_id})
+    _confirm_inhouse(journey)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
         computed = deal(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     client = TestClient(app, raise_server_exceptions=False)
     base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/360"

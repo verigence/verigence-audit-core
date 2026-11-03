@@ -189,3 +189,21 @@ def test_rounding_off_is_not_money_received() -> None:
     from audit_core.uc03_ledger_receipts import money_in
 
     assert money_in([{"particulars_raw": "ROUNDING OFF", "voucher_type": "Journal", "credit_amount": 1}]) == []
+
+
+def test_a_policy_not_confirmed_in_house_is_not_taken_and_has_no_variance(journey) -> None:
+    """Live 2026-11-03: the customer's own policy (not confirmed in-house)
+    showed "Taken" on Add-ons and "Below standard" by Rs 36,912."""
+    from audit_core.uc03_p2_journey360 import addons
+
+    add_ready_document(journey, "insurance_cover", insurer_name="United India", policy_number="P-1",
+                       premium_amount="66643")
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, standard_amount) "
+                       "VALUES (:t, :j, 'insurance_amount', 103555)"), {"t": journey.tenant_id, "j": journey.journey_id})
+        view = addons(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    taken = view["taken"]["insurance"]
+    assert taken["taken"] is False and "Not confirmed in-house" in taken["details"]["notInDeal"]
+    row = view["insurance"]["charges"]["components"][0]
+    assert row["excluded"] is True and row["variance"] is None and "BELOW_STANDARD" not in row["flags"]
