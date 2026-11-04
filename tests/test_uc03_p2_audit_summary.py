@@ -63,6 +63,33 @@ def test_documents_that_print_different_figures_are_disputed() -> None:
     assert {d["amount"] for d in out["documents"]} == {"132132.00", "142132.00"}
 
 
+def test_a_price_net_of_a_counted_discount_is_the_same_price_not_a_dispute() -> None:
+    # independent check 2026-11-04: the NDC prints the price net of the dealer's
+    # Rs 7,500 discount, the invoice the gross price (4 journeys disputed)
+    row = {"key": "ex_showroom_price", "label": "Ex-showroom price", "standard": "1044500", "billed": "1037000",
+           "sources": [_src("customer_ledger", "1037000"), _src("customer_invoice_dms", "1044500")]}
+    assert summary.conclude_charge(row, on_file=set(), discounts=(Decimal(7500),))["conclusion"] != summary.DISPUTED
+    # apart by the deal's discounts together, too
+    assert summary.disagreement(row, allowances=(Decimal(5000), Decimal(2500), Decimal(7500))) == []
+    # apart by an amount no discount explains: disputed as before
+    assert summary.conclude_charge(row, on_file=set(), discounts=(Decimal(5000),))["conclusion"] == summary.DISPUTED
+    # never for another line
+    rto = {**row, "key": "road_tax_registration"}
+    assert summary.conclude_charge(rto, on_file=set(), discounts=(Decimal(7500),))["conclusion"] == summary.DISPUTED
+
+
+def test_an_invoice_discount_printed_before_gst_is_the_ndcs_amount() -> None:
+    # the NDC's consumer offer Rs 25,000 is the invoice's Rs 21,186 (25,000 / 1.18)
+    row = {"key": "CASH_DISCOUNT", "label": "Consumer offer", "billed": "25000", "current": "25000",
+           "entitled": "25000", "eligibility": "ELIGIBLE",
+           "sources": [_src("customer_ledger", "25000"), _src("customer_invoice_dms", "21186")]}
+    out = summary.conclude_benefit(row, unknown_results=frozenset())
+    assert out["documents"] == [] and out["conclusion"] == summary.OK
+    # two statements apart by 18% are still two figures: only an invoice prints before GST
+    other = {**row, "sources": [_src("customer_ledger", "25000"), _src("cost_sheet", "21186")]}
+    assert summary.conclude_benefit(other, unknown_results=frozenset())["conclusion"] == summary.DISPUTED
+
+
 def test_a_statutory_line_is_measured_against_its_proof_document() -> None:
     row = {"key": "insurance_amount", "label": "Insurance premium", "standard": "84180", "billed": "74827",
            "sources": [_src("cost_sheet", "74827"), _src("insurance_cover", "74827")]}
