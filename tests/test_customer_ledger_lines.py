@@ -228,6 +228,11 @@ def test_the_offer_letters_scheme_is_a_benefit_of_the_type_the_letter_names() ->
     assert read.components["ex_showroom_price"] == D(1340902) and read.discounts == {}
     assert [u["label"] for u in read.unmapped] == ["SCHEME"]
 
+    # The Ex Showroom row off by more than half is the row misread (SHI-SS-261027-021).
+    read = read_statement([{"particulars_raw": "VEHICLE PRICE", "debit_amount": 1928501},
+                           {"particulars_raw": "EX SHOWROOM (1-2)", "debit_amount": 19285}])
+    assert read.components["ex_showroom_price"] == D(1928501) and read.discounts == {}
+
 
 def test_a_kit_written_into_another_row_of_the_offer_letter_is_accessories() -> None:
     """Live 2026-11-03 (SHI-SS-261031-008): "ACCESSORIES Free 30,000" and, in
@@ -370,3 +375,18 @@ def test_a_bh_series_rto_is_not_compared_with_the_price_master(journey) -> None:
     _rto_without_standard(rows)
     assert (rows[0]["standard"], rows[0]["variance"], rows[0]["flags"]) == (None, None, ["INVOICES_DISAGREE"])
     assert rows[1]["standard"] == "41415"
+
+
+def test_a_tcs_in_lakhs_on_the_booking_docket_is_a_misread_and_not_shown() -> None:
+    """Live 2026-11-04 (SHI-SS-261027-007): the booking form's vehicle price,
+    Rs 9,99,901, was read as its TCS and shown. TCS is 1% of the ex-showroom."""
+    from audit_core.uc03_p2_journey360 import _tcs_read_wrongly
+
+    rows = [{"key": "ex_showroom_price", "current": "999901", "billed": "999901", "booking": None,
+             "standard": "999901.32", "flags": []},
+            {"key": "tcs_amount", "current": "0", "billed": None, "booking": "999901", "standard": "0", "flags": []}]
+    _tcs_read_wrongly(rows)
+    assert rows[1]["booking"] is None and "READ_ERROR" in rows[1]["flags"]
+    rows[1]["booking"], rows[1]["flags"] = "9999", []
+    _tcs_read_wrongly(rows)
+    assert rows[1]["booking"] == "9999" and rows[1]["flags"] == []

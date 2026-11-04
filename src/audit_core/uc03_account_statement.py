@@ -508,7 +508,10 @@ def _price_and_scheme(out: StatementRead, totals: dict[tuple[str, str], Decimal]
     * Else it is the scheme discount ("Scheme Discount" on the other dealers'
       forms).
     * When the three rows do not add up (a figure misread), the Ex Showroom
-      row stands as written and no scheme is read."""
+      row stands as written and no scheme is read -- unless the Ex Showroom
+      row is off by more than half, which is the row misread, not the price
+      (SHI-SS-261027-021, 2026-11-04: Vehicle price Rs 19,28,501, Ex Showroom
+      read as Rs 19,285)."""
     if ("WORKING", "vehicle_price") in in_conflict or ("WORKING", "scheme") in in_conflict \
             or ("COMMERCIAL", "ex_showroom_price") in in_conflict:
         return
@@ -517,7 +520,9 @@ def _price_and_scheme(out: StatementRead, totals: dict[tuple[str, str], Decimal]
         return
     scheme = totals.get(("WORKING", "scheme"), Decimal(0))
     printed = out.components.get("ex_showroom_price")
-    if printed is not None and abs(vehicle_price - scheme - printed) > TOLERANCE:
+    expected = vehicle_price - scheme
+    if printed is not None and abs(expected - printed) > TOLERANCE and not (
+            printed < expected / 2 or printed > expected * 2):
         if scheme > 0:
             out.unmapped.append({"label": "SCHEME", "amount": scheme, "why": (
                 "the vehicle price less the scheme is not the Ex Showroom (1-2) written: "

@@ -162,7 +162,8 @@ def test_deal_undercharged_and_excess_discount_name_each_line(journey):
     assert under.outcome == "FAIL"
     assert "Ex-showroom price: ₹9,90,000 on the Tax Invoice (Tally) against the standard ₹10,00,000 (₹10,000 short)" in under.reason
     assert "TCS" not in under.reason
-    assert "Net deal ₹9,60,000 against the standard ₹9,85,000 (₹25,000 short)" in under.reason
+    # no TCS is due on a car of Rs 9,99,999 or less (2026-11-04): the standard net carries none
+    assert "Net deal ₹9,60,000 against the standard ₹9,75,000 (₹15,000 short)" in under.reason
     assert [c["key"] for c in under.details["components"]] == ["ex_showroom_price"]
     excess = result["EXCESS_DISCOUNT"]
     assert excess.outcome == "FAIL"
@@ -474,66 +475,64 @@ def test_cash_limit_tcs_and_payment_before_booking(journey):
     assert result["PAYMENT_BEFORE_BOOKING"].outcome == "FAIL"
     assert "₹10,000 on 01 Sep 2026 (receipt R-0): dated before the booking on 10 Sep 2026" in result["PAYMENT_BEFORE_BOOKING"].reason
     assert result["TCS_SHORT"].outcome == "FAIL"
-    assert "TCS ₹5,000 charged against ₹15,000 due (1% of the ex-showroom price ₹15,00,000; ₹10,000 short)" in result["TCS_SHORT"].reason
+    assert "less than 1% of the ex-showroom price ₹15,00,000 (₹15,000): ₹10,000 short" in result["TCS_SHORT"].reason
 
 
-def test_tcs_is_checked_on_the_ndc_then_the_cost_sheet_then_the_invoice() -> None:
-    """Product owner 2026-11-04: "TCS is to be checked from NDC, Cost Sheet and
-    then may be invoice and not the other way". With no NDC or cost sheet the
-    vehicle invoice's sale value is the base (its Rs 17,48,400 less its Rs
-    30,001 accessory discount: TCS Rs 17,183.99 on Rs 17,18,399)."""
+def test_a_figure_that_cannot_be_right_for_a_car_raises_a_task() -> None:
+    """Product owner 2026-11-04: "check you are reading the correct values in
+    NDC and Cost sheet". Live 3 Nov: an ex-showroom read as Rs 19,285 (the
+    TCS), a premium of Rs 2,51,540 on a Rs 6,30,500 car, a premium of Re 1."""
     from types import SimpleNamespace
 
-    from audit_core.uc03_p2_audit_rules import tcs_short
+    from audit_core.uc03_p2_audit_rules import figure_implausible
 
-    sheet = {"categories": [{"components": [
-        {"key": "ex_showroom_price", "current": "1748401", "billed": "1748401", "sources": []},
-        {"key": "tcs_amount", "current": "17183.99", "billed": "17183.99", "sources": []}]}],
-        "discounts": [{"key": "SCRAPPAGE_BONUS_DEALER", "current": "20000"}],
-        "summary": {"saleValue": "1718399.00"}}
-    out = tcs_short(SimpleNamespace(sheet=sheet))
-    assert out.outcome == "PASS", out.reason
-    sheet["summary"]["saleValue"] = None
-    assert tcs_short(SimpleNamespace(sheet=sheet)).outcome == "FAIL"
-    # The NDC prices the vehicle: its figures decide, never the invoice's.
-    sheet["summary"]["saleValue"] = "1718399.00"
-    sheet["categories"][0]["components"][0]["sources"] = [{"documentType": "account_statement", "amount": "1748401"}]
-    out = tcs_short(SimpleNamespace(sheet=sheet))
-    assert out.outcome == "FAIL" and "less benefits of ₹20,000" in out.reason
+    ndc = [{"document": "NDC (Account Statement)", "documentType": "account_statement"}]
+
+    def facts(price: str, standard: str, insurance: str, rto: str = "60000") -> SimpleNamespace:
+        def row(key, label, amount, std=None):
+            return {"key": key, "label": label, "current": amount, "billed": amount, "standard": std,
+                    "sources": [{**ndc[0], "amount": amount}]}
+        return SimpleNamespace(sheet={"categories": [{"components": [
+            row("ex_showroom_price", "Ex-showroom price", price, standard),
+            row("insurance_amount", "Insurance premium", insurance),
+            row("road_tax_registration", "Road tax + registration", rto)]}], "discounts": [], "summary": {}})
+
+    assert figure_implausible(facts("630500", "630500", "35000")).outcome == "PASS"
+    misread = figure_implausible(facts("19285", "1928500", "77220", "146280"))
+    assert misread.outcome == "FAIL"
+    assert "Ex-showroom price ₹19,285 on the NDC (Account Statement): against the price master's ₹19,28,500" in misread.reason
+    assert "Insurance premium ₹2,51,540" in figure_implausible(facts("630500", "630500", "251540")).reason
+    assert "Insurance premium ₹1 on the NDC" in figure_implausible(facts("2236000", "2236000", "1")).reason
 
 
-def test_tcs_is_due_on_the_price_after_the_benefits_given_on_it(journey):
-    """2026-11-03: the dealers charge TCS on what the vehicle is sold for, the
-    ex-showroom price less its discount (SHI-SS-261027-006: Rs 30,59,000 less a
-    scheme of Rs 1,00,000, TCS Rs 29,590). 74 deals were held "short" on the
-    price before the discount. Free accessories pay for the accessories, not
-    the vehicle; a price under the threshold once the benefits are off owes none."""
-    from audit_core.uc03_account_statement import FREE_ACCESSORIES_KEY
-    from audit_core.uc03_p2_audit_rules import _FREE_ACCESSORIES_KEY
+def test_tcs_is_one_percent_of_the_ex_showroom_both_ways_above_rs_999999() -> None:
+    """Product owner 2026-11-04: "TCS is always 1% of exshowroom", checked "for
+    both more than 1% and less than 1% of ex showroom price and it is for the
+    cars with ex showroom price more than Rs 999999", in one place."""
+    from types import SimpleNamespace
 
-    assert _FREE_ACCESSORIES_KEY == FREE_ACCESSORIES_KEY
-    _line(journey, "ex_showroom_price", "3059000", "3059000")
-    _source(journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "3059000")
-    _line(journey, "tcs_amount", "30590", "29590")
-    _source(journey, "COMMERCIAL", "tcs_amount", "tax_invoice_tally", "29590")
-    _discount(journey, "CASH_DISCOUNT", "100000", "100000")
-    _source(journey, "DISCOUNT", "CASH_DISCOUNT", "tax_invoice_tally", "100000")
-    _discount(journey, FREE_ACCESSORIES_KEY, "30000", "30000")
-    _source(journey, "DISCOUNT", FREE_ACCESSORIES_KEY, "tax_invoice_tally", "30000")
-    tcs = _run(journey, "BOOKING")["TCS_SHORT"]
-    assert tcs.outcome == "PASS" and "₹29,590 charged against ₹29,590 due" in tcs.reason
+    from audit_core.uc03_p2_audit_rules import tcs_excess, tcs_short
 
-    _sql(journey, "UPDATE auditcore.commercial_line_source_values SET amount=19000 WHERE tenant_id=:t "
-                  "AND component_key='tcs_amount'")
-    tcs = _run(journey, "BOOKING")["TCS_SHORT"]
-    assert tcs.outcome == "FAIL"
-    assert ("1% of the ex-showroom price ₹30,59,000 less benefits of ₹1,00,000, ₹29,59,000; ₹10,590 short"
-            in tcs.reason)
+    def facts(price: str, tcs: str | None) -> SimpleNamespace:
+        rows = [{"key": "ex_showroom_price", "current": price, "billed": price, "sources": []}]
+        if tcs is not None:
+            rows.append({"key": "tcs_amount", "current": tcs, "billed": tcs, "sources": [
+                {"document": "NDC (Account Statement)", "documentType": "account_statement", "amount": tcs}]})
+        return SimpleNamespace(sheet={"categories": [{"components": rows}], "discounts": [], "summary": {}})
 
-    _sql(journey, "UPDATE auditcore.commercial_line_source_values SET amount=1050000 WHERE tenant_id=:t "
-                  "AND component_key='ex_showroom_price'")
-    tcs = _run(journey, "BOOKING")["TCS_SHORT"]
-    assert tcs.outcome == "PASS" and "within the TCS threshold" in tcs.reason
+    right = facts("2284999", "22850")
+    assert tcs_short(right).outcome == "PASS" and tcs_excess(right).outcome == "PASS"
+    above = facts("2284999", "27850")
+    assert tcs_short(above).outcome == "PASS" and tcs_excess(above).outcome == "FAIL"
+    assert "TCS ₹27,850 on the NDC (Account Statement) is more than 1% of the ex-showroom price ₹22,84,999" in \
+        tcs_excess(above).reason
+    below = facts("3059000", "29590")
+    assert tcs_short(below).outcome == "FAIL" and tcs_excess(below).outcome == "PASS"
+    assert tcs_short(facts("3059000", None)).outcome == "FAIL"
+    for price in ("999999", "999901"):
+        assert tcs_short(facts(price, None)).outcome == "PASS"
+        assert tcs_excess(facts(price, "9999")).outcome == "PASS"
+    assert tcs_short(facts("1000000", "10000")).outcome == "PASS"
 
 
 # ---------------------------------------------------- the TL's verdict

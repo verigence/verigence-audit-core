@@ -6,6 +6,7 @@ and answer the questions a manual deal audit asks:
 
   Deal undercharged        DEAL_UNDERCHARGED           per price component + net
                            TCS_SHORT                   statutory rate above the threshold
+                           TCS_EXCESS                  TCS above 1% of the ex-showroom price
   Excess discount          EXCESS_DISCOUNT             per discount + total
   Short payment            DELIVERED_ON_SHORT_PAYMENT, PAYMENT_AFTER_DELIVERY_WITHIN_GRACE,
                            PAYMENT_AFTER_DELIVERY_BEYOND_GRACE
@@ -87,13 +88,10 @@ _DELIVERY_COMPLETION_DAYS = int(os.environ.get("P2_DELIVERY_COMPLETION_DAYS", "7
 # Statutory limits, set per deployment: a single cash receipt above the
 # limit (Income-tax Act s.269ST), TCS on a vehicle priced above the threshold.
 _CASH_RECEIPT_LIMIT = Decimal(os.environ.get("P2_CASH_RECEIPT_LIMIT", "200000"))
-_TCS_THRESHOLD = Decimal(os.environ.get("P2_TCS_THRESHOLD", "1000000"))
+# No TCS on a car of Rs 9,99,999 or less (product owner 2026-11-04: "it is for
+# the cars ... with ex showroom price more than Rs 999999").
+_TCS_FREE_UP_TO = Decimal(os.environ.get("P2_TCS_FREE_UP_TO", "999999"))
 _TCS_RATE_PERCENT = Decimal(os.environ.get("P2_TCS_RATE_PERCENT", "1"))
-# The free-accessories benefit (uc03_account_statement.FREE_ACCESSORIES_KEY):
-# it pays for the accessories charged, not for the vehicle.
-_FREE_ACCESSORIES_KEY = "ACCESSORIES_KIT"
-# The dealer's own offer: the NDC (statement) or the cost sheet standing in for it.
-_OFFER_DOCUMENTS = frozenset({"account_statement", "cost_sheet_in_place_of_ndc", "cost_sheet"})
 
 _YES = {"value": "YES", "label": "Yes"}
 _NO = {"value": "NO", "label": "No", "requiresComment": True}
@@ -676,45 +674,98 @@ def _billed_on(row: dict[str, Any], amount: Decimal) -> str:
     return "bill"
 
 
-def tcs_short(facts: _Facts) -> RuleOutcome:
-    code = "TCS_SHORT"
+def _tcs_at_one_percent(facts: _Facts, code: str) -> RuleOutcome | tuple[Decimal, Decimal, Decimal, str]:
+    """The one TCS reckoning both checks share (product owner 2026-11-04):
+    "TCS is always 1% of exshowroom", checked "for both more than 1% and less
+    than 1% of ex showroom price", "for the cars with ex showroom price more
+    than Rs 999999", in one place with no branch by document. The ex-showroom
+    and the TCS are the Deal's own figures, whichever bill they came from."""
     rows = {c["key"]: c for g in facts.sheet["categories"] for c in g["components"]}
     price = _charged(rows.get("ex_showroom_price"))
     if price is None:
         return RuleOutcome(code, "SKIPPED", "The ex-showroom price has not been read yet.")
-    # TCS is due on what the vehicle is sold for: the ex-showroom price less
-    # the benefits given on it (2026-11-03). The benefits are the Deal's own,
-    # apart from the free accessories, which pay for the accessories charged.
-    # Live: SHI-SS-261027-006, ex-showroom Rs 30,59,000 less a scheme of Rs
-    # 1,00,000, TCS Rs 29,590; and 74 more deals whose TCS is 1% of the price
-    # after their discount were held "short".
-    benefits = sum((_dec(d.get("current")) or Decimal(0) for d in facts.sheet.get("discounts") or []
-                    if d.get("key") != _FREE_ACCESSORIES_KEY), Decimal(0))
-    sale = price - benefits
-    on = (f"the ex-showroom price {_rupees(price)}" if benefits == 0 else
-          f"the ex-showroom price {_rupees(price)} less benefits of {_rupees(benefits)}, {_rupees(sale)}")
-    # The order of the documents (product owner 2026-11-04: "TCS is to be
-    # checked from NDC, Cost Sheet and then may be invoice and not the other
-    # way"): with the price on the NDC or the cost sheet, the sale value is
-    # theirs, above. Only when neither prices the vehicle is the vehicle
-    # invoice's own sale value -- its ex-showroom less the discounts it
-    # prints -- the one TCS is due on.
-    vehicle = rows.get("ex_showroom_price") or {}
-    from_offer = any(str(s.get("documentType") or "") in _OFFER_DOCUMENTS for s in vehicle.get("sources") or [])
-    invoiced = _dec((facts.sheet.get("summary") or {}).get("saleValue"))
-    if not from_offer and invoiced is not None and Decimal(0) < invoiced < sale:
-        sale, on = invoiced, f"the vehicle invoice's sale value {_rupees(invoiced)}"
-    if sale <= _TCS_THRESHOLD:
-        return RuleOutcome(code, "PASS", f"The sale value, {on}, is within the TCS threshold of "
-                                         f"{_rupees(_TCS_THRESHOLD)}.")
-    expected = (sale * _TCS_RATE_PERCENT / 100).quantize(Decimal("0.01"))
+    if price <= _TCS_FREE_UP_TO:
+        return RuleOutcome(code, "PASS", f"Ex-showroom price {_rupees(price)}: no TCS on a car of "
+                                                   f"{_rupees(_TCS_FREE_UP_TO)} or less.")
+    due = (price * _TCS_RATE_PERCENT / 100).quantize(Decimal("0.01"))
     charged = _charged(rows.get("tcs_amount")) or Decimal(0)
-    if expected - charged > _LINE_TOLERANCE:
+    where = _billed_on(rows["tcs_amount"], charged) if rows.get("tcs_amount") and charged else "bills"
+    return price, due, charged, where
+
+
+def tcs_short(facts: _Facts) -> RuleOutcome:
+    """TCS less than 1% of the ex-showroom price."""
+    code = "TCS_SHORT"
+    found = _tcs_at_one_percent(facts, code)
+    if isinstance(found, RuleOutcome):
+        return found
+    price, due, charged, where = found
+    if due - charged > _LINE_TOLERANCE:
         return RuleOutcome(code, "FAIL", (
-            f"TCS {_rupees(charged)} charged against {_rupees(expected)} due ({_TCS_RATE_PERCENT}% of "
-            f"{on}; {_rupees(expected - charged)} short)."
-        ), {"findingTitle": "TCS undercharged", "expected": str(expected), "observed": str(charged)})
-    return RuleOutcome(code, "PASS", f"TCS {_rupees(charged)} charged against {_rupees(expected)} due.")
+            f"TCS {_rupees(charged)} on the {where} is less than {_TCS_RATE_PERCENT}% of the ex-showroom price "
+            f"{_rupees(price)} ({_rupees(due)}): {_rupees(due - charged)} short."
+        ), {"findingTitle": "TCS below 1% of the ex-showroom price", "expected": str(due), "observed": str(charged)})
+    return RuleOutcome(code, "PASS", f"TCS {_rupees(charged)} against {_rupees(due)} ({_TCS_RATE_PERCENT}% of the "
+                                     f"ex-showroom price {_rupees(price)}).")
+
+
+def tcs_excess(facts: _Facts) -> RuleOutcome:
+    """TCS more than 1% of the ex-showroom price: overcharged, or a figure
+    read wrongly -- either way a person looks at it."""
+    code = "TCS_EXCESS"
+    found = _tcs_at_one_percent(facts, code)
+    if isinstance(found, RuleOutcome):
+        return found
+    price, due, charged, where = found
+    if charged - due > _LINE_TOLERANCE:
+        return RuleOutcome(code, "FAIL", (
+            f"TCS {_rupees(charged)} on the {where} is more than {_TCS_RATE_PERCENT}% of the ex-showroom price "
+            f"{_rupees(price)} ({_rupees(due)}): {_rupees(charged - due)} above. Check the figure on the {where} "
+            f"-- overcharged, or read wrongly."
+        ), {"findingTitle": "TCS above 1% of the ex-showroom price", "expected": str(due), "observed": str(charged)})
+    return RuleOutcome(code, "PASS", f"TCS {_rupees(charged)} against {_rupees(due)} ({_TCS_RATE_PERCENT}% of the "
+                                     f"ex-showroom price {_rupees(price)}).")
+
+
+def figure_implausible(facts: _Facts) -> RuleOutcome:
+    """A figure the Deal took from a document that cannot be right for a car
+    (product owner 2026-11-04: "pls do check you are reading the correct
+    values in NDC and Cost sheet.. it cant be possible to be so horribly
+    wrong"). Live on 3 Nov: an NDC's ex-showroom read as Rs 19,285 (its TCS),
+    an insurance premium of Rs 2,51,540 on a Rs 6,30,500 car, a premium of
+    Re 1. Each is named with the document it was read from, for a person to
+    check the reading or the bill."""
+    code = "FIGURE_IMPLAUSIBLE"
+    rows = {c["key"]: c for g in facts.sheet["categories"] for c in g["components"]}
+    vehicle = rows.get("ex_showroom_price")
+    price = _charged(vehicle)
+    if price is None or price <= 0:
+        return RuleOutcome(code, "SKIPPED", "The ex-showroom price has not been read yet.")
+    odd: list[str] = []
+
+    def note(row: dict[str, Any], amount: Decimal, why: str) -> None:
+        odd.append(f"{row.get('label') or row['key']} {_rupees(amount)} on the {_billed_on(row, amount)}: {why}")
+
+    standard = _dec(vehicle.get("standard"))
+    if standard and (price < standard / 2 or price > standard * Decimal("1.5")):
+        note(vehicle, price, f"against the price master's {_rupees(standard)}")
+    for key, row in rows.items():
+        if key == "ex_showroom_price" or row.get("partOf") or row.get("excluded"):
+            continue
+        amount = _charged(row)
+        if amount is None or amount <= 0:
+            continue
+        if amount > price:
+            note(row, amount, f"more than the ex-showroom price {_rupees(price)}")
+        elif key == "insurance_amount" and not (price * Decimal("0.005") <= amount <= price * Decimal("0.12")):
+            note(row, amount, f"not a premium for a car of {_rupees(price)} (0.5% to 12% of its price)")
+        elif key == "road_tax_registration" and amount > price * Decimal("0.2"):
+            note(row, amount, f"more than 20% of the ex-showroom price {_rupees(price)}")
+    if odd:
+        return RuleOutcome(code, "FAIL", "Figures that cannot be right -- check the reading or the bill: "
+                           + "; ".join(odd) + ".", {"findingTitle": "A figure read that cannot be right",
+                                                    "figures": odd})
+    return RuleOutcome(code, "PASS", "Every figure is within the range a car's deal can have.")
 
 
 # ----------------------------------------------- bucket 2: after delivery
@@ -1401,7 +1452,7 @@ def self_insurance_declared(facts: _Facts) -> RuleOutcome:
 # that need a delivery run with the Delivery unit.
 _BOOKING_RULES = (
     booking_date_unusable,
-    deal_undercharged, excess_discount, tcs_short,
+    deal_undercharged, excess_discount, tcs_short, tcs_excess, figure_implausible,
     third_party_payment_unconfirmed, third_party_payment_undeclared,
     # Cash transactions raise no tasks (product owner, 2026-10-31): no cash
     # intimation question, so neither it nor its finding runs.
@@ -1424,7 +1475,7 @@ RULE_CODES = {
 # The Findings catalogue entry each check raises under.
 _FINDING_TYPES = {
     "BOOKING_DATE_UNUSABLE": "PROCESS_NON_COMPLIANCE",
-    "DEAL_UNDERCHARGED": "PRICING_ANOMALY", "TCS_SHORT": "PRICING_ANOMALY", "EXCESS_DISCOUNT": "DISCOUNT_ANOMALY",
+    "DEAL_UNDERCHARGED": "PRICING_ANOMALY", "TCS_SHORT": "PRICING_ANOMALY", "TCS_EXCESS": "PRICING_ANOMALY", "FIGURE_IMPLAUSIBLE": "PRICING_ANOMALY", "EXCESS_DISCOUNT": "DISCOUNT_ANOMALY",
     "TRADE_IN_NOT_RESOLD": "COMMERCIAL_EXCEPTION", "TRADE_IN_SOLD_AT_LOSS": "COMMERCIAL_EXCEPTION",
     "DELIVERY_NOT_COMPLETED_IN_TIME": "DELIVERY_EXCEPTION",
     "ACCESSORY_FITTED_UNBILLED": "PROCESS_NON_COMPLIANCE",
