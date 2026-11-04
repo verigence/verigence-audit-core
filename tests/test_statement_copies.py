@@ -107,6 +107,24 @@ def test_cost_sheet_copies_follow_the_same_rule() -> None:
     assert [(d["key"], d["other"]) for d in copies.differences] == [("insurance_amount", D(40000))]
 
 
+def test_of_a_quotation_and_the_final_cost_sheet_the_one_the_invoice_agrees_with_stands() -> None:
+    """16 journeys, 2026-11-04 (UTK-JP-261101-009): two cost sheets pricing
+    the car at Rs 17,95,276 (dated "2024-09-27", a misread) and Rs 17,77,500
+    (undated); the invoice bills Rs 17,77,500. With no invoice agreeing, the
+    newest copy stands as before."""
+    quotation = {"documentId": uuid4(), "evidenceId": uuid4(), "linkedAtUtc": NOW,
+                 "fields": {"cost_sheet_date": "2024-09-27", "ex_showroom_price": "1795276", "rto_amount": "180000"}}
+    final = {"documentId": uuid4(), "evidenceId": uuid4(), "linkedAtUtc": NOW,
+             "fields": {"ex_showroom_price": "1777500", "insurance_amount": "60000"}}
+    sheet, copies = module.combine_cost_sheets([quotation, final], billed_ex_showroom=(D("1777500.00"),))
+    assert copies.primary is final and sheet.components["ex_showroom_price"] == D(1777500)
+    assert "registration_charges" not in sheet.components  # the quotation's figures are only compared
+    _, copies = module.combine_cost_sheets([quotation, final], billed_ex_showroom=(D(1500000),))
+    assert copies.primary is quotation
+    _, copies = module.combine_cost_sheets([quotation, final])
+    assert copies.primary is quotation
+
+
 # ── the sync and the Deal ────────────────────────────────────────────────────
 def _task(journey, task_type: str) -> dict | None:
     with journey.engine.begin() as c:

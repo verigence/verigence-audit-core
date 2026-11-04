@@ -115,7 +115,10 @@ _COMPONENT_LABELS = {
 }
 
 _DISCOUNT_LABELS = {
-    "CASH_DISCOUNT": "Consumer / cash discount",
+    # The OEM's consumer offer ("CONSUMER OFFER" / "SCHEME DISCOUNT" on the
+    # NDCs). Aditya's "CASH DISCOUNT" is the dealer's own, ADDITIONAL_DISCOUNT
+    # (independent check 2026-11-04: the old label named both "cash").
+    "CASH_DISCOUNT": "Consumer offer / scheme discount",
     "EXCHANGE_BONUS": "Exchange bonus",
     "SCRAPPAGE_BONUS_DEALER": "Scrappage bonus (dealer)",
     "SCRAPPAGE_BONUS_COD": "Scrappage bonus (certificate of deposit)",
@@ -126,11 +129,13 @@ _DISCOUNT_LABELS = {
     "EXT_WARRANTY_4TH_5TH_YR": "Free extended warranty (4th–5th year)",
     "INSURANCE": "Insurance discount",
     "OTHER_SCHEME": "Other scheme",
-    "ADDITIONAL_DISCOUNT": "Additional dealer discount",
+    "ADDITIONAL_DISCOUNT": "Dealer cash / additional discount",
     "MANAGEMENT_REFERRAL": "Management referral (MR)",
     # 2026-10-20: an invoice discount whose printed description names no
     # scheme stays its own line instead of being read as the consumer offer.
     UNCLASSIFIED_DISCOUNT: "Invoice discount (type not printed)",
+    # 2026-11-04: the cost sheet's discount total, beyond the benefits named on billing documents.
+    "COST_SHEET_DISCOUNT": "Discount on the cost sheet (type not printed)",
 }
 
 
@@ -375,9 +380,22 @@ def journey_etag(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
 
 
 # ── money helpers ────────────────────────────────────────────────────────────
+# A bank reference (UTR) names one payment: two receipts with the same
+# reference, amount and date are the one payment read twice, whatever their
+# receipt numbers (live 2026-11-04, UTK-SA-261103-008: one Rs 75,000 transfer
+# read as receipt "CDAM/2627/02127" and as "CDAM/2026/0212", counted twice).
+_MIN_REFERENCE = re.compile(r"(?=(.*\d){6})[A-Z0-9]{8,}")
+
+
+def _payment_reference(row: Any) -> str | None:
+    value = "".join(ch for ch in str(row.get("payment_reference") or "").upper() if ch.isalnum())
+    return value if _MIN_REFERENCE.fullmatch(value) else None
+
+
 def _duplicate_receipts(rows: list[Any]) -> dict[Any, Any]:
     """payment_id -> the earlier payment it repeats (same receipt number,
-    amount and date), by the stage engine's own rule."""
+    amount and date, by the stage engine's own rule; or the same bank
+    reference, amount and date)."""
     records = [
         ReceiptRecord(
             document_id=r["payment_id"], stage_code="BOOKING", document_type_key="receipt",
@@ -391,6 +409,16 @@ def _duplicate_receipts(rows: list[Any]) -> dict[Any, Any]:
         if group.dates_match:
             for later in group.documents[1:]:
                 out[later.document_id] = group.documents[0].document_id
+    first: dict[tuple[str, Decimal, Any], Any] = {}
+    for r in rows:
+        reference = _payment_reference(r)
+        if reference is None or r["payment_id"] in out:
+            continue
+        key = (reference, Decimal(str(r["amount"])), normalize_receipt_date(r["receipt_date"]))
+        if key in first:
+            out[r["payment_id"]] = first[key]
+        else:
+            first[key] = r["payment_id"]
     return out
 
 
@@ -556,7 +584,7 @@ def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[s
     rows = connection.execute(
         text(
             """
-            SELECT p.payment_id, p.amount, p.receipt_number, p.receipt_date
+            SELECT p.payment_id, p.amount, p.receipt_number, p.receipt_date, p.payment_reference
             FROM auditcore.payments p
             JOIN auditcore.evidence e
               ON e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id AND e.di_document_id=p.source_di_document_id
@@ -1372,6 +1400,48 @@ def _one_benefit_per_figure(discount_rows: list[dict[str, Any]], *, offer_on_fil
             _take_back(row, same_as=same)
 
 
+COST_SHEET_DISCOUNT_KEY = "COST_SHEET_DISCOUNT"
+
+
+def _cost_sheet_benefits(discount_rows: list[dict[str, Any]], total: Decimal, document_id: str) -> None:
+    """The cost sheet standing in for the NDC prints its benefits as one
+    total, their types not printed (2026-11-04). It is the deal's offer
+    (product owner 2026-11-03: the NDC / cost sheet "should get the priority
+    and no way the initial offering has to be changed"); it was never counted,
+    so the deal was priced with no benefit -- 94 of 118 such deals on 3 Nov,
+    e.g. ADI-RD-261102-015's Rs 4,000 (paid in full less it).
+
+    * The benefits billing documents name (the ledger, credit notes) are part
+      of the total.
+    * When the invoice's discounts, set aside as not on the statement, make
+      up the rest (within Rs 10), they name it and count.
+    * Else the rest is one line, "Discount on the cost sheet (type not
+      printed)", whose entitlement cannot be matched."""
+    counted = sum((Decimal(r["current"]) for r in discount_rows if r.get("current") is not None
+                   and not r.get("sameAs")), Decimal(0))
+    # A discount already inside the price the cost sheet charges is part of
+    # its total too: never given a second time.
+    counted += sum((Decimal(r["billed"]) for r in discount_rows if r.get("inPrice") and r.get("billed") is not None),
+                   Decimal(0))
+    rest = total - counted
+    if rest <= _SAME_BENEFIT_TOLERANCE:
+        return
+    source = {"document": _document_label(_COST_SHEET_STANDIN_TYPE), "documentType": _COST_SHEET_STANDIN_TYPE,
+              "amount": _money(total), "documentId": document_id}
+    aside = [r for r in discount_rows if r.get("current") is None and r.get("billed") is not None
+             and "NOT_ON_STATEMENT" in (r.get("flags") or []) and not r.get("sameAs")]
+    if aside and abs(sum((Decimal(r["billed"]) for r in aside), Decimal(0)) - rest) <= _SAME_BENEFIT_TOLERANCE:
+        for row in aside:
+            row["current"], row["currentSource"] = row["billed"], "invoice"
+            row["flags"] = [f for f in row["flags"] if f != "NOT_ON_STATEMENT"]
+            row["sources"] = [*row["sources"], {**source, "checks": True}]
+            row["variance"] = _minus(row["current"], row["entitled"]) if row.get("entitled") is not None else None
+        return
+    row = _benefit_row_for(discount_rows, COST_SHEET_DISCOUNT_KEY)
+    _give(row, rest, how="document", sources=[source])
+    row["eligibility"] = row["eligibility"] or "NOT_EVALUATED"
+
+
 def _benefit_row_for(discount_rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
     """The Deal's row for a benefit, added when no document or master has
     shown it yet (a credit note naming it, say)."""
@@ -1617,6 +1687,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     vehicle_reading = selection["vehicle"]["representative"] if selection["vehicle"] else None
     sale_value = (vehicle_reading.get("vehicle") or {}).get("saleValue") if vehicle_reading else None
     _tcs_at_one_percent(all_rows)
+    if _financed(connection, tenant_id=tenant_id, journey_id=journey_id):
+        _hypothecation_on_rto(all_rows)
 
     # "Current" is what the deal stands at now: the billed figure; before
     # any invoice, what the booking offered. Once an invoice is on file, a
@@ -1668,6 +1740,13 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     _invoice_discounts_inside_the_price(all_rows, discount_rows)
     _one_benefit_per_figure(discount_rows, offer_on_file=offer_on_file)
     _link_credit_notes(credit_notes, discount_rows)
+    if offer_on_file and not any(_norm_type(s["source_document_type"]) == _norm_type(_STATEMENT_COLUMN_TYPE)
+                                 for s in sources):
+        from audit_core.uc03_account_statement import cost_sheet_discount
+
+        printed = cost_sheet_discount(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if printed is not None:
+            _cost_sheet_benefits(discount_rows, *printed)
     insurance["invoiceOnFile"] = _insurance_accounted(documents, sources, selection)
     insurance["vehicleInvoiced"] = vehicle_on_file
 
@@ -2272,6 +2351,32 @@ def _mark_insurance(groups: list[dict[str, Any]], *, self_insured: bool) -> None
             # Insurance is optional too: Inhouse (opted in, the default)
             # or Self (opted out), as the PC confirms it.
             row["opted"] = {"taken": not self_insured, "source": "insurance"}
+
+
+# The RTO's hypothecation (HP) fee on a financed car, which the price
+# master's RTO figure leaves out (product owner 2026-11-04: 74 journeys were
+# Rs 1,500 above the standard, each a financed car).
+_HYPOTHECATION_FEE = Decimal(os.environ.get("P2_RTO_HYPOTHECATION_FEE", "1500"))
+
+
+def _financed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """The deal is financed: the finance rule (uc03_finance_rule) keeps a
+    finance record exactly while a current document proves the loan."""
+    return bool(connection.execute(
+        text("SELECT EXISTS (SELECT 1 FROM auditcore.finance_records WHERE tenant_id=:t AND journey_id=:j)"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one())
+
+
+def _hypothecation_on_rto(all_rows: list[dict[str, Any]]) -> None:
+    """A financed car's RTO standard is the price master's RTO plus the
+    hypothecation fee, on the one RTO row that carries the standard."""
+    rto = next((r for key in (_RTO_COMBINED, *_RTO_PARTS) for r in all_rows
+                if r["key"] == key and not r.get("partOf") and r.get("standard") is not None), None)
+    if rto is None:
+        return
+    rto["standard"] = _money(_dec(rto["standard"]) + _HYPOTHECATION_FEE)
+    rto["standardBasis"] = f"the price master's RTO plus the hypothecation fee of Rs {_HYPOTHECATION_FEE} (financed)"
 
 
 def _tcs_at_one_percent(all_rows: list[dict[str, Any]]) -> None:
@@ -3129,7 +3234,11 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         stage = derived_stage.get(payment_id) if counted else None
         if counted and stage is not None:
             by_stage[stage] = by_stage.get(stage, Decimal(0)) + Decimal(r["amount"])
-        if original is not None:
+        if original is not None and _normalize_ref(number_of.get(original)) != _normalize_ref(r["receipt_number"]) \
+                and _payment_reference(r) is not None:
+            reason = "Duplicate: the same bank reference, amount and date as " + (
+                f"receipt {number_of.get(original)}" if number_of.get(original) else "an earlier receipt")
+        elif original is not None:
             reason = "Duplicate: the same receipt number, amount and date as " + (
                 f"receipt {number_of.get(original)}" if number_of.get(original) else "an earlier receipt")
         elif not evidenced and r["association_status"] == "FOREIGN":
@@ -3210,7 +3319,7 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
             "amount": _money(posting["amount"]), "receiptNumber": posting["number"],
             "receiptDate": posting["date"], "mode": posting["mode"], "stage": None, "bank": None,
             "reference": posting["particulars"], "documentId": posting["documentId"],
-            "document": "Customer ledger (no receipt on file)", "counted": True, "isLoanReceipt": False,
+            "document": posting["documentLabel"], "counted": True, "isLoanReceipt": False,
             "notCountedReason": None, "duplicateOf": None, "bankMatch": None, "bankStatement": None,
             "fromLedger": True,
         })

@@ -143,6 +143,9 @@ def _match(postings: list[dict[str, Any]], receipts: list[dict[str, Any]]) -> li
     return _combined(left, [receipts[i] for i in free])
 
 
+# The rupees an NDC's received lines may run over its total (rounding).
+_NDC_TOLERANCE = Decimal(10)
+
 # The most receipts one posting is matched against.
 _MAX_COMBINED = 4
 
@@ -191,11 +194,13 @@ def _loan_amounts(connection: Connection, *, tenant_id: str, journey_id: UUID) -
 
 
 def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
-    """The customer ledger's money-in postings no receipt on file stands for
-    and that are not the loan, each with the ledger page as its document."""
+    """The customer ledger's money-in postings, and the NDC's received lines,
+    that no receipt on file stands for and that are not the loan, each with
+    its page as its document."""
     from audit_core.uc03_account_statement import (
         KIND_TALLY,
         combined_tally_rows,
+        journey_statement_received_lines,
         line_rows,
         load_ledger_documents,
         statement_kind,
@@ -204,23 +209,46 @@ def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID)
     documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
     tallies = [(d, rows) for d in documents for rows in [line_rows(d["fields"].get("line_items"))]
                if statement_kind(rows) == KIND_TALLY]
-    if not tallies:
+    ndc_lines, ndc_total, ndc_document = journey_statement_received_lines(
+        connection, tenant_id=tenant_id, journey_id=journey_id)
+    if not tallies and not ndc_lines:
         return []
-    origin = max((d for d, _ in tallies), key=lambda d: (
-        d.get("linkedAtUtc").timestamp() if hasattr(d.get("linkedAtUtc"), "timestamp") else 0.0))
     receipts = _on_file(connection, tenant_id=tenant_id, journey_id=journey_id)
     loans: list[Decimal] | None = None
-    out = []
-    for posting in _match(money_in(combined_tally_rows(tallies)), receipts):
-        if _JOURNAL_VOUCHER.fullmatch(posting["voucherType"]) and _FINANCIER.fullmatch(_label(posting["particulars"])):
-            continue
+    out: list[dict[str, Any]] = []
+
+    def not_the_loan(posting: dict[str, Any]) -> bool:
+        nonlocal loans
         loans = loans if loans is not None else _loan_amounts(connection, tenant_id=tenant_id, journey_id=journey_id)
         # The loan: the amount known, or the disbursement net of the lender's
         # charges, a little under it (live: Rs 12,50,000 credited against a
         # sanction of Rs 12,57,000).
-        if any(is_loan_net_of_charges(posting["amount"], loan) for loan in loans):
-            continue
-        out.append({**posting, "documentId": str(origin["documentId"])})
+        return not any(is_loan_net_of_charges(posting["amount"], loan) for loan in loans)
+
+    if tallies:
+        origin = max((d for d, _ in tallies), key=lambda d: (
+            d.get("linkedAtUtc").timestamp() if hasattr(d.get("linkedAtUtc"), "timestamp") else 0.0))
+        for posting in _match(money_in(combined_tally_rows(tallies)), receipts):
+            if _JOURNAL_VOUCHER.fullmatch(posting["voucherType"]) \
+                    and _FINANCIER.fullmatch(_label(posting["particulars"])):
+                continue
+            if not_the_loan(posting):
+                out.append({**posting, "documentId": str(origin["documentId"]),
+                            "documentLabel": "Customer ledger (no receipt on file)"})
+    if ndc_lines:
+        # The NDC's received lines no receipt on file and no ledger posting
+        # already counted stands for (product owner 2026-11-04): each money
+        # received once, whichever document shows it. Never more than the
+        # NDC's own received total leaves unexplained by the receipts on file
+        # and the ledger: when its lines and the receipts are split
+        # differently, the lines left are not more money.
+        taken = receipts + [{"receipt_number": p["number"], "receipt_date": p["date"], "amount": p["amount"]}
+                            for p in out]
+        left = [p for p in _match(ndc_lines, taken) if not_the_loan(p)]
+        on_file = sum((Decimal(r["amount"]) for r in receipts if not_the_loan({"amount": Decimal(r["amount"])})),
+                      Decimal(0)) + sum((p["amount"] for p in out), Decimal(0))
+        if sum((p["amount"] for p in left), Decimal(0)) <= ndc_total - on_file + _NDC_TOLERANCE:
+            out.extend({**p, "documentId": ndc_document, "documentLabel": "NDC (no receipt on file)"} for p in left)
     return out
 
 

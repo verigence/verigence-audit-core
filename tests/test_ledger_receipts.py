@@ -169,3 +169,28 @@ def test_the_financiers_posting_on_the_ledger_is_the_loan_when_no_statement_give
     view = _payments(journey)
     assert [(i["receiptNumber"], D(i["amount"])) for i in view["items"] if i.get("fromLedger")] == [
         ("PB/26-27/0300", D(21000))]
+
+
+def test_an_ndc_receipt_line_with_no_receipt_on_file_counts_as_paid_once(journey) -> None:
+    """Product owner 2026-11-04 (Utkal NDCs: "MR NO. CR-150349" Rs 84,000 with
+    no receipt in the file): an NDC's received line counts as paid like the
+    ledger's. The line a receipt on file stands for, the finance D/O (the
+    loan) and a refund are not added; nor is a line the Tally ledger already
+    counted."""
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    add_receipt_payment(journey, amount="11000", receipt_number="BRMM/2627/00416", receipt_date="2026-10-01")
+    _ledger(journey, [
+        {"particulars_raw": "VEHICLE COST", "debit_amount": 986500},
+        {"particulars_raw": "FINANCE D/O MMFSL", "credit_amount": 807491},
+        {"particulars_raw": "MR NO. BR-00416", "credit_amount": 11000},
+        {"particulars_raw": "MR NO. CR-150349", "credit_amount": 84000},
+        {"particulars_raw": "REFUND", "credit_amount": 500},
+    ])
+    _sync(journey)
+    view = _payments(journey)
+    ndc = [i for i in view["items"] if i.get("fromLedger")]
+    assert [(i["receiptNumber"], D(i["amount"]), i["document"]) for i in ndc] == [
+        ("CR-150349", D(84000), "NDC (no receipt on file)")]
+    assert D(view["receiptsTotal"]) == D(95000)
+    _sync(journey)
+    assert D(_payments(journey)["receiptsTotal"]) == D(95000)

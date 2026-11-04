@@ -235,15 +235,27 @@ def test_resync_is_refused_once_the_stage_is_reviewed_and_a_tl_needs_a_reason(jo
     _open(journey, document, reviewer)
     _mark(journey, reviewer)
 
+    # A PC is refused outright. A Reviewer, like a TL, may override with a
+    # reason (product owner 2026-11-04), so without one they are asked for it.
+    pc = _actor(journey, "PC")
     with journey.engine.begin() as connection, pytest.raises(HTTPException) as refused:
+        resync_page(
+            tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=queue_id,
+            request=_request(), human_principal=SimpleNamespace(subject=pc),
+            authorization_client=AllowAllAuthorization(role_key="PC"),
+            connection=connection, payload=None,
+        )
+    assert refused.value.status_code == 409
+    assert "marked reviewed" in refused.value.detail
+
+    with journey.engine.begin() as connection, pytest.raises(HTTPException) as reviewer_no_reason:
         resync_page(
             tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=queue_id,
             request=_request(), human_principal=SimpleNamespace(subject=reviewer),
             authorization_client=AllowAllAuthorization(role_key="REVIEWER"),
             connection=connection, payload=None,
         )
-    assert refused.value.status_code == 409
-    assert "marked reviewed" in refused.value.detail
+    assert reviewer_no_reason.value.status_code == 422
 
     with journey.engine.begin() as connection, pytest.raises(HTTPException) as no_reason:
         resync_page(
@@ -291,11 +303,12 @@ def test_reading_a_page_again_is_refused_once_the_stage_is_reviewed(journey):
     _open(journey, document, reviewer)
     _mark(journey, reviewer)
 
+    pc = _actor(journey, "PC")
     with journey.engine.begin() as connection, pytest.raises(HTTPException) as refused:
         reread_page(
             tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=queue_id,
-            request=_request(), human_principal=SimpleNamespace(subject=reviewer),
-            authorization_client=AllowAllAuthorization(role_key="REVIEWER"),
+            request=_request(), human_principal=SimpleNamespace(subject=pc),
+            authorization_client=AllowAllAuthorization(role_key="PC"),
             connection=connection, payload=None,
         )
     assert refused.value.status_code == 409
@@ -316,6 +329,23 @@ def test_reading_a_page_again_is_refused_once_the_stage_is_reviewed(journey):
             request=_request(), human_principal=SimpleNamespace(subject=team_lead),
             authorization_client=AllowAllAuthorization(role_key="TL"),
             connection=connection, payload=ReReadPageCommand(reason="Scan was upside down"),
+        )
+    assert overridden["status"] == "REREAD_REQUESTED"
+
+
+def test_a_reviewer_overrides_a_reviewed_stage_with_a_reason(journey):
+    """Product owner 2026-11-04: a Reviewer reads a page of a reviewed stage
+    again, with a reason, as a Team Lead does."""
+    reviewer = _actor(journey, "REVIEWER")
+    _, queue_id, document = add_page(journey, page_number=1, status="NEEDS_REVIEW")
+    _open(journey, document, reviewer)
+    _mark(journey, reviewer)
+    with journey.engine.begin() as connection:
+        overridden = reread_page(
+            tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=queue_id,
+            request=_request(), human_principal=SimpleNamespace(subject=reviewer),
+            authorization_client=AllowAllAuthorization(role_key="REVIEWER"),
+            connection=connection, payload=ReReadPageCommand(reason="Wrong page was read as invoice"),
         )
     assert overridden["status"] == "REREAD_REQUESTED"
 
@@ -409,3 +439,56 @@ def test_a_pc_correcting_a_confident_value_applies_it_too(journey):
     )
     assert result["applied"] is True
     assert result["taskId"] is None
+
+
+def _corrections_task(journey):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return connection.execute(
+            text("SELECT task_id, task_status, assigned_role_code, reference, title FROM auditcore.p2_tasks "
+                 "WHERE tenant_id=:t AND journey_id=:j AND task_type='REVIEWER_CORRECTIONS_INFO'"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).mappings().all()
+
+
+def test_a_reviewers_corrections_go_to_the_team_lead_as_one_information_task(journey):
+    """Product owner 2026-11-04: all the data the Reviewer corrected goes to
+    the TL as one information task, combined. The Reviewer does not close it;
+    the TL does, with a comment; a later correction opens it again."""
+    from audit_core.uc03_p2_tasks import TaskPermissionError, submit_action
+
+    reviewer = _actor(journey, "REVIEWER")
+    team_lead = _actor(journey, "TL")
+    _, _, document = add_page(journey, page_number=1, status="READY")
+    _confident_field(journey, document)
+
+    _correct(journey, document, reviewer, "REVIEWER", value="125000", remarks="Invoice total misread")
+    (task,) = _corrections_task(journey)
+    assert task["assigned_role_code"] == "TL" and task["task_status"] not in ("VERIFIED_COMPLETE",)
+    assert task["reference"]["correctionCount"] == 1
+    (item,) = task["reference"]["corrections"]
+    assert (item["fieldKey"], item["previousValue"], item["newValue"]) == ("amount", "100000", "125000")
+    assert item["remarks"] == "Invoice total misread" and item["reviewerActorId"] == reviewer
+
+    _correct(journey, document, reviewer, "REVIEWER", value="126000")
+    (task,) = _corrections_task(journey)          # still one task: combined
+    assert task["reference"]["correctionCount"] == 2
+
+    # A PC's correction is not on it.
+    _correct(journey, document, _actor(journey, "PC"), "PC", value="127000")
+    assert _corrections_task(journey)[0]["reference"]["correctionCount"] == 2
+
+    task_id = task["task_id"]
+    with journey.engine.begin() as connection, pytest.raises(TaskPermissionError):
+        set_tenant_context(connection, journey.tenant_id)
+        submit_action(connection, tenant_id=journey.tenant_id, task_id=task_id, action="CLOSE_TASK",
+                      actor_id=reviewer, actor_role_code="REVIEWER", comment="seen")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        submit_action(connection, tenant_id=journey.tenant_id, task_id=task_id, action="CLOSE_TASK",
+                      actor_id=team_lead, actor_role_code="TL", comment="Seen, both corrections agree with the invoice")
+    assert _corrections_task(journey)[0]["task_status"] == "VERIFIED_COMPLETE"
+
+    _correct(journey, document, reviewer, "REVIEWER", value="125500")
+    (task,) = _corrections_task(journey)
+    assert task["task_status"] != "VERIFIED_COMPLETE" and task["reference"]["correctionCount"] == 3
