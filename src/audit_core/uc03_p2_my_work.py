@@ -247,6 +247,7 @@ def _tasks_pending(connection: Connection, *, tenant_id: str, actor_id: str, rol
                        -- bookings at the same outlet are not theirs to clear.
                        AND (:role <> 'PC' OR t.journey_id IS NULL OR j.created_by_actor_id = :me)))
               AND COALESCE(t.outlet_id, j.outlet_id) = ANY(CAST(:ids AS uuid[]))
+              AND NOT (t.task_type = 'REVIEWER_CORRECTIONS_INFO' AND :role = 'REVIEWER')
             GROUP BY 1
             """
         ),

@@ -660,6 +660,19 @@ task_types:
     - PROVIDE_FEEDBACK
     - ACCEPT_EXCEPTION
     - ADD_COMMENT
+  # Every value a Reviewer corrected on a journey, as ONE task for the Team Lead
+  # (product owner 2026-11-04). For information: the corrections are already
+  # applied; the TL closes it with a comment and a later correction reopens it.
+  REVIEWER_CORRECTIONS_INFO:
+    category: CORRECTION_APPROVAL
+    owner: TL
+    origin: SYSTEM
+    source: DOCUMENT_FIELD
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - CLOSE_TASK
+    - ADD_COMMENT
   FIELD_CORRECTION_REVIEW_P2:
     category: CORRECTION_APPROVAL
     owner: TL
