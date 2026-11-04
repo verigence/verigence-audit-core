@@ -477,9 +477,11 @@ def test_cash_limit_tcs_and_payment_before_booking(journey):
     assert "TCS ₹5,000 charged against ₹15,000 due (1% of the ex-showroom price ₹15,00,000; ₹10,000 short)" in result["TCS_SHORT"].reason
 
 
-def test_tcs_is_due_on_the_vehicle_invoices_sale_value() -> None:
-    """2026-11-04 (SHI-SS-261031-008): the invoice prices Rs 17,48,400 less its
-    accessory discount of Rs 30,001; TCS Rs 17,183.99 is 1% of Rs 17,18,399."""
+def test_tcs_is_checked_on_the_ndc_then_the_cost_sheet_then_the_invoice() -> None:
+    """Product owner 2026-11-04: "TCS is to be checked from NDC, Cost Sheet and
+    then may be invoice and not the other way". With no NDC or cost sheet the
+    vehicle invoice's sale value is the base (its Rs 17,48,400 less its Rs
+    30,001 accessory discount: TCS Rs 17,183.99 on Rs 17,18,399)."""
     from types import SimpleNamespace
 
     from audit_core.uc03_p2_audit_rules import tcs_short
@@ -493,6 +495,11 @@ def test_tcs_is_due_on_the_vehicle_invoices_sale_value() -> None:
     assert out.outcome == "PASS", out.reason
     sheet["summary"]["saleValue"] = None
     assert tcs_short(SimpleNamespace(sheet=sheet)).outcome == "FAIL"
+    # The NDC prices the vehicle: its figures decide, never the invoice's.
+    sheet["summary"]["saleValue"] = "1718399.00"
+    sheet["categories"][0]["components"][0]["sources"] = [{"documentType": "account_statement", "amount": "1748401"}]
+    out = tcs_short(SimpleNamespace(sheet=sheet))
+    assert out.outcome == "FAIL" and "less benefits of ₹20,000" in out.reason
 
 
 def test_tcs_is_due_on_the_price_after_the_benefits_given_on_it(journey):
