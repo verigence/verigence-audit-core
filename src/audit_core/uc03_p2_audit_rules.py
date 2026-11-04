@@ -88,13 +88,10 @@ _DELIVERY_COMPLETION_DAYS = int(os.environ.get("P2_DELIVERY_COMPLETION_DAYS", "7
 # Statutory limits, set per deployment: a single cash receipt above the
 # limit (Income-tax Act s.269ST), TCS on a vehicle priced above the threshold.
 _CASH_RECEIPT_LIMIT = Decimal(os.environ.get("P2_CASH_RECEIPT_LIMIT", "200000"))
-_TCS_THRESHOLD = Decimal(os.environ.get("P2_TCS_THRESHOLD", "1000000"))
+# No TCS on a car of Rs 9,99,999 or less (product owner 2026-11-04: "it is for
+# the cars ... with ex showroom price more than Rs 999999").
+_TCS_FREE_UP_TO = Decimal(os.environ.get("P2_TCS_FREE_UP_TO", "999999"))
 _TCS_RATE_PERCENT = Decimal(os.environ.get("P2_TCS_RATE_PERCENT", "1"))
-# The free-accessories benefit (uc03_account_statement.FREE_ACCESSORIES_KEY):
-# it pays for the accessories charged, not for the vehicle.
-_FREE_ACCESSORIES_KEY = "ACCESSORIES_KIT"
-# The dealer's own offer: the NDC (statement) or the cost sheet standing in for it.
-_OFFER_DOCUMENTS = frozenset({"account_statement", "cost_sheet_in_place_of_ndc", "cost_sheet"})
 
 _YES = {"value": "YES", "label": "Yes"}
 _NO = {"value": "NO", "label": "No", "requiresComment": True}
@@ -677,68 +674,57 @@ def _billed_on(row: dict[str, Any], amount: Decimal) -> str:
     return "bill"
 
 
-def tcs_short(facts: _Facts) -> RuleOutcome:
-    code = "TCS_SHORT"
+def _tcs_at_one_percent(facts: _Facts, code: str) -> RuleOutcome | tuple[Decimal, Decimal, Decimal, str]:
+    """The one TCS reckoning both checks share (product owner 2026-11-04):
+    "TCS is always 1% of exshowroom", checked "for both more than 1% and less
+    than 1% of ex showroom price", "for the cars with ex showroom price more
+    than Rs 999999", in one place with no branch by document. The ex-showroom
+    and the TCS are the Deal's own figures, whichever bill they came from."""
     rows = {c["key"]: c for g in facts.sheet["categories"] for c in g["components"]}
     price = _charged(rows.get("ex_showroom_price"))
     if price is None:
         return RuleOutcome(code, "SKIPPED", "The ex-showroom price has not been read yet.")
-    # TCS is due on what the vehicle is sold for: the ex-showroom price less
-    # the benefits given on it (2026-11-03). The benefits are the Deal's own,
-    # apart from the free accessories, which pay for the accessories charged.
-    # Live: SHI-SS-261027-006, ex-showroom Rs 30,59,000 less a scheme of Rs
-    # 1,00,000, TCS Rs 29,590; and 74 more deals whose TCS is 1% of the price
-    # after their discount were held "short".
-    benefits = sum((_dec(d.get("current")) or Decimal(0) for d in facts.sheet.get("discounts") or []
-                    if d.get("key") != _FREE_ACCESSORIES_KEY), Decimal(0))
-    sale = price - benefits
-    on = (f"the ex-showroom price {_rupees(price)}" if benefits == 0 else
-          f"the ex-showroom price {_rupees(price)} less benefits of {_rupees(benefits)}, {_rupees(sale)}")
-    # The order of the documents (product owner 2026-11-04: "TCS is to be
-    # checked from NDC, Cost Sheet and then may be invoice and not the other
-    # way"): with the price on the NDC or the cost sheet, the sale value is
-    # theirs, above. Only when neither prices the vehicle is the vehicle
-    # invoice's own sale value -- its ex-showroom less the discounts it
-    # prints -- the one TCS is due on.
-    vehicle = rows.get("ex_showroom_price") or {}
-    from_offer = any(str(s.get("documentType") or "") in _OFFER_DOCUMENTS for s in vehicle.get("sources") or [])
-    invoiced = _dec((facts.sheet.get("summary") or {}).get("saleValue"))
-    if not from_offer and invoiced is not None and Decimal(0) < invoiced < sale:
-        sale, on = invoiced, f"the vehicle invoice's sale value {_rupees(invoiced)}"
-    if sale <= _TCS_THRESHOLD:
-        return RuleOutcome(code, "PASS", f"The sale value, {on}, is within the TCS threshold of "
-                                         f"{_rupees(_TCS_THRESHOLD)}.")
-    expected = (sale * _TCS_RATE_PERCENT / 100).quantize(Decimal("0.01"))
+    if price <= _TCS_FREE_UP_TO:
+        return RuleOutcome(code, "PASS", f"Ex-showroom price {_rupees(price)}: no TCS on a car of "
+                                                   f"{_rupees(_TCS_FREE_UP_TO)} or less.")
+    due = (price * _TCS_RATE_PERCENT / 100).quantize(Decimal("0.01"))
     charged = _charged(rows.get("tcs_amount")) or Decimal(0)
-    if expected - charged > _LINE_TOLERANCE:
+    where = _billed_on(rows["tcs_amount"], charged) if rows.get("tcs_amount") and charged else "bills"
+    return price, due, charged, where
+
+
+def tcs_short(facts: _Facts) -> RuleOutcome:
+    """TCS less than 1% of the ex-showroom price."""
+    code = "TCS_SHORT"
+    found = _tcs_at_one_percent(facts, code)
+    if isinstance(found, RuleOutcome):
+        return found
+    price, due, charged, where = found
+    if due - charged > _LINE_TOLERANCE:
         return RuleOutcome(code, "FAIL", (
-            f"TCS {_rupees(charged)} charged against {_rupees(expected)} due ({_TCS_RATE_PERCENT}% of "
-            f"{on}; {_rupees(expected - charged)} short)."
-        ), {"findingTitle": "TCS undercharged", "expected": str(expected), "observed": str(charged)})
-    return RuleOutcome(code, "PASS", f"TCS {_rupees(charged)} charged against {_rupees(expected)} due.")
+            f"TCS {_rupees(charged)} on the {where} is less than {_TCS_RATE_PERCENT}% of the ex-showroom price "
+            f"{_rupees(price)} ({_rupees(due)}): {_rupees(due - charged)} short."
+        ), {"findingTitle": "TCS below 1% of the ex-showroom price", "expected": str(due), "observed": str(charged)})
+    return RuleOutcome(code, "PASS", f"TCS {_rupees(charged)} against {_rupees(due)} ({_TCS_RATE_PERCENT}% of the "
+                                     f"ex-showroom price {_rupees(price)}).")
 
 
 def tcs_excess(facts: _Facts) -> RuleOutcome:
-    """TCS is 1% of the ex-showroom price (product owner 2026-11-04: "TCS is
-    always 1% of exshowroom ... if TCS is more than 1% of the ex showroom
-    price then pls raise the task"). A TCS above it is either overcharged or
-    a figure misread from the document -- either way a person looks at it."""
+    """TCS more than 1% of the ex-showroom price: overcharged, or a figure
+    read wrongly -- either way a person looks at it."""
     code = "TCS_EXCESS"
-    rows = {c["key"]: c for g in facts.sheet["categories"] for c in g["components"]}
-    price = _charged(rows.get("ex_showroom_price"))
-    charged = _charged(rows.get("tcs_amount"))
-    if price is None or charged is None:
-        return RuleOutcome(code, "SKIPPED", "The ex-showroom price or the TCS has not been read yet.")
-    ceiling = (price * _TCS_RATE_PERCENT / 100).quantize(Decimal("0.01"))
-    if charged - ceiling > _LINE_TOLERANCE:
-        where = _billed_on(rows["tcs_amount"], charged)
+    found = _tcs_at_one_percent(facts, code)
+    if isinstance(found, RuleOutcome):
+        return found
+    price, due, charged, where = found
+    if charged - due > _LINE_TOLERANCE:
         return RuleOutcome(code, "FAIL", (
             f"TCS {_rupees(charged)} on the {where} is more than {_TCS_RATE_PERCENT}% of the ex-showroom price "
-            f"{_rupees(price)} ({_rupees(ceiling)}): {_rupees(charged - ceiling)} above. Check the figure on the "
-            f"{where} -- overcharged, or read wrongly."
-        ), {"findingTitle": "TCS above 1% of the ex-showroom price", "expected": str(ceiling), "observed": str(charged)})
-    return RuleOutcome(code, "PASS", f"TCS {_rupees(charged)} is within {_TCS_RATE_PERCENT}% of the ex-showroom "
-                                     f"price {_rupees(price)}.")
+            f"{_rupees(price)} ({_rupees(due)}): {_rupees(charged - due)} above. Check the figure on the {where} "
+            f"-- overcharged, or read wrongly."
+        ), {"findingTitle": "TCS above 1% of the ex-showroom price", "expected": str(due), "observed": str(charged)})
+    return RuleOutcome(code, "PASS", f"TCS {_rupees(charged)} against {_rupees(due)} ({_TCS_RATE_PERCENT}% of the "
+                                     f"ex-showroom price {_rupees(price)}).")
 
 
 def figure_implausible(facts: _Facts) -> RuleOutcome:
