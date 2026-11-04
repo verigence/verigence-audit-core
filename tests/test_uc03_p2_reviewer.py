@@ -492,3 +492,29 @@ def test_a_reviewers_corrections_go_to_the_team_lead_as_one_information_task(jou
     _correct(journey, document, reviewer, "REVIEWER", value="125500")
     (task,) = _corrections_task(journey)
     assert task["task_status"] != "VERIFIED_COMPLETE" and task["reference"]["correctionCount"] == 3
+
+
+def test_the_backfill_raises_the_tl_task_for_corrections_made_before_it(journey):
+    """Product owner 2026-11-04: backfill the TL task for earlier corrections."""
+    from audit_core.uc03_reviewer_corrections_task import (
+        run_reviewer_corrections_backfill,
+    )
+
+    reviewer = _actor(journey, "REVIEWER")
+    _, _, document = add_page(journey, page_number=1, status="READY")
+    _confident_field(journey, document)
+    _correct(journey, document, reviewer, "REVIEWER", value="125000")
+    with journey.engine.begin() as connection:     # as if made before the task existed
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("DELETE FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+                                "AND task_type='REVIEWER_CORRECTIONS_INFO'"),
+                           {"t": journey.tenant_id, "j": journey.journey_id})
+    dry = run_reviewer_corrections_backfill(journey.engine, "rcb-dry", [journey.tenant_id])
+    assert dry["tenants"][journey.tenant_id] == {"journeys": 1, "raised": 0, "failed": 0}
+    assert _corrections_task(journey) == []
+    done = run_reviewer_corrections_backfill(journey.engine, "rcb-commit", [journey.tenant_id])
+    assert done["tenants"][journey.tenant_id]["raised"] == 1
+    (task,) = _corrections_task(journey)
+    assert task["reference"]["correctionCount"] == 1
+    run_reviewer_corrections_backfill(journey.engine, "rcb2-commit", [journey.tenant_id])
+    assert len(_corrections_task(journey)) == 1          # idempotent

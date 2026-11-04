@@ -132,3 +132,46 @@ def refresh_reviewer_corrections_task(connection: Connection, *, tenant_id: str,
         severity="MEDIUM", registry=get_registry(),
     )
     return task_id
+
+
+def run_reviewer_corrections_backfill(engine: Any, tag: str, tenant_ids: list[str]) -> dict[str, Any]:
+    """Raise the Team Lead's one information task for every journey whose
+    Reviewer corrections predate the task (product owner 2026-11-04: "yes" to
+    the backfill of the corrections made before it existed).
+
+    Worker job ``REVIEWER_CORRECTIONS_BACKFILL``. A DRY RUN -- counts only,
+    nothing written -- unless the tag ends with "-commit". Idempotent: a
+    journey's task is raised or refreshed by its stable key, so a second run
+    changes nothing."""
+    import structlog
+
+    from audit_core.db import set_tenant_context
+
+    logger = structlog.get_logger(__name__)
+    commit = tag.endswith("-commit")
+    report: dict[str, Any] = {"tag": tag, "commit": commit, "tenants": {}}
+    for tenant_id in tenant_ids:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            journeys = [r[0] for r in connection.execute(
+                text("SELECT DISTINCT journey_id FROM auditcore.journey_field_change_log WHERE tenant_id=:t "
+                     "AND upper(actor_role_code)='REVIEWER' AND change_reason='CORRECTION'"),
+                {"t": tenant_id},
+            ).all()]
+        totals = {"journeys": len(journeys), "raised": 0, "failed": 0}
+        if commit:
+            for journey_id in journeys:
+                try:
+                    with engine.begin() as connection:
+                        set_tenant_context(connection, tenant_id)
+                        if refresh_reviewer_corrections_task(connection, tenant_id=tenant_id,
+                                                             journey_id=UUID(str(journey_id))):
+                            totals["raised"] += 1
+                except Exception:
+                    totals["failed"] += 1
+                    logger.warning("reviewer_corrections_backfill_item_failed", tag=tag, tenant_id=tenant_id,
+                                   journey_id=str(journey_id), exc_info=True)
+        if journeys:
+            report["tenants"][tenant_id] = totals
+        logger.info("reviewer_corrections_backfill_finished", tag=tag, tenant_id=tenant_id, commit=commit, **totals)
+    return report
