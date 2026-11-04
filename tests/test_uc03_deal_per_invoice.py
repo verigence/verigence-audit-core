@@ -383,8 +383,8 @@ def test_utkal_like_totals_variance_is_current_net_less_standard_net(journey):
     rows, discounts, summary = _rows(view), _discounts(view), view["summary"]
 
     assert rows["ex_showroom_price"]["billed"] == "1029900.54" and Decimal(rows["ex_showroom_price"]["variance"]) == 0
-    # TCS is due on what the car sold for (under ₹10 lakh here), not on the list price.
-    assert Decimal(rows["tcs_amount"]["standard"]) == 0
+    # TCS is 1% of the ex-showroom price on a car over Rs 9,99,999 (product owner 2026-11-04).
+    assert Decimal(rows["tcs_amount"]["standard"]) == Decimal("10299.01")
     assert Decimal(rows["road_tax_registration"]["billed"]) == 103730
     assert rows["rsa_amount"]["awaiting"] == "RSA invoice" and rows["fastag_amount"]["awaiting"] == "FASTag invoice"
     assert discounts["CASH_DISCOUNT"]["billed"] == "30000.00" and Decimal(discounts["CASH_DISCOUNT"]["variance"]) == 0
@@ -394,10 +394,10 @@ def test_utkal_like_totals_variance_is_current_net_less_standard_net(journey):
     # The RSA and the FASTag are on the booking only, and the policy carries no
     # dealer code (insurance not confirmed in-house): none of them is billed,
     # so none is in either net (2026-11-02).
-    assert Decimal(summary["net"]["standard"]) == Decimal("1103630.54")
+    assert Decimal(summary["net"]["standard"]) == Decimal("1113929.55")
     assert Decimal(summary["net"]["current"]) == Decimal("1098630.53")
     assert Decimal(summary["variance"]["currentVsStandard"]) == (
-        Decimal(summary["net"]["current"]) - Decimal(summary["net"]["standard"])) == Decimal("-5000.01")
+        Decimal(summary["net"]["current"]) - Decimal(summary["net"]["standard"])) == Decimal("-15299.02")
 
 
 def test_the_booking_form_never_overwrites_an_invoice_actual(journey):
