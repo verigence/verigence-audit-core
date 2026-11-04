@@ -3286,7 +3286,7 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
             "amount": _money(posting["amount"]), "receiptNumber": posting["number"],
             "receiptDate": posting["date"], "mode": posting["mode"], "stage": None, "bank": None,
             "reference": posting["particulars"], "documentId": posting["documentId"],
-            "document": "Customer ledger (no receipt on file)", "counted": True, "isLoanReceipt": False,
+            "document": posting["documentLabel"], "counted": True, "isLoanReceipt": False,
             "notCountedReason": None, "duplicateOf": None, "bankMatch": None, "bankStatement": None,
             "fromLedger": True,
         })
