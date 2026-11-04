@@ -699,6 +699,65 @@ def test_no_statement_leaves_the_invoice_blank(journey) -> None:
     assert _open_tasks(journey) == {}  # nothing on file is not a reading failure
 
 
+def _unread_ndc(journey, **printed) -> None:
+    """An NDC of which only the printed totals were read, none of the rows (UTK-BP-261104-002)."""
+    document_id = uuid4()
+    add_evidence(journey, di_document_id=document_id, document_type_key="customer_ledger", process_area="DELIVERY")
+    add_extracted_field(journey, di_document_id=document_id, field_key="line_items", value=None,
+                        document_type="customer_ledger")
+    add_extracted_field(journey, di_document_id=document_id, field_key="statement_title",
+                        value="FINAL VEHICLE ACCOUNTS STATEMENT", document_type="customer_ledger")
+    for key, value in printed.items():
+        add_extracted_field(journey, di_document_id=document_id, field_key=key, value=value,
+                            document_type="customer_ledger")
+
+
+def test_an_ndc_read_without_its_rows_raises_a_critical_task(journey) -> None:
+    """2026-11-04: the totals were read, none of the rows; the Deal fell back to the
+    invoice without a word. Now: a CRITICAL task, and the Deal says so."""
+    from audit_core.uc03_p2_journey360 import deal
+
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _unread_ndc(journey, total_cost="3241050", total_receipts="3384740")
+    _sync(journey)
+    assert _open_tasks(journey) == {NO_EX_SHOWROOM_TASK: "CRITICAL"}
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        title, description = c.execute(
+            text("SELECT title, description FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+                 "AND task_type=:k"), {"t": journey.tenant_id, "j": journey.journey_id, "k": NO_EX_SHOWROOM_TASK}).one()
+        view = deal(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert title == "NDC on file but not read" and "total cost Rs 3241050" in description
+    [unread] = view["summary"]["statementNotRead"]
+    assert unread["title"] == "FINAL VEHICLE ACCOUNTS STATEMENT" and unread["printed"]["total_cost"] == "3241050"
+    # Read again with its rows: the task closes and the Deal no longer says so.
+    _ledger(journey, UTKAL)
+    _sync(journey)
+    assert _open_tasks(journey) == {}
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        assert deal(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["summary"]["statementNotRead"] == []
+
+
+def test_a_blank_ledger_page_is_not_an_unread_ndc(journey) -> None:
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _unread_ndc(journey)  # no totals printed either: nothing says it is an NDC
+    _sync(journey)
+    assert _open_tasks(journey) == {}
+
+
+def test_unread_statements_only_counts_pages_with_printed_totals() -> None:
+    from audit_core.uc03_account_statement import unread_statements
+
+    docs = [
+        {"documentId": "a", "fields": {"line_items": None, "total_cost": "3241050"}},
+        {"documentId": "b", "fields": {"line_items": "[]", "net_value": "0"}},
+        {"documentId": "c", "fields": {"line_items": [{"particulars_raw": "Vehicle cost", "debit_amount": 1}],
+                                       "total_cost": "1"}},
+    ]
+    assert [u["documentId"] for u in unread_statements(docs)] == ["a"]
+
+
 def test_statement_with_no_vehicle_line_raises_a_critical_task_and_clears_when_fixed(journey) -> None:
     _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
     _ledger(journey, ADITYA_NO_VEHICLE)

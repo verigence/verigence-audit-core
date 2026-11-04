@@ -1356,6 +1356,39 @@ def load_ledger_documents(
     return list(documents.values())
 
 
+# A statement's own printed figures: what shows that a page was an NDC / account
+# statement even when none of its rows was read.
+_PRINTED_TOTALS = ("total_cost", "total_receipts", "net_value", "gross_value", "balance_amount")
+
+
+def unread_statements(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The NDC copies on file of which Document Intelligence read the printed
+    totals but none of the rows (product owner 2026-11-04: "all these should
+    have been identified"). Live on 4 Nov: 57 copies on 46 bookings, Utkal's
+    "Final Vehicle Accounts Statement" among them, whose Deal then fell back to
+    the invoice without a word."""
+    out = []
+    for document in documents:
+        fields = document["fields"]
+        if line_rows(fields.get("line_items")):
+            continue
+        printed = {key: _amount(fields.get(key)) for key in _PRINTED_TOTALS}
+        printed = {key: amount for key, amount in printed.items() if amount is not None and amount > 0}
+        if printed:
+            out.append({"documentId": str(document["documentId"]), "evidenceId": str(document.get("evidenceId") or ""),
+                        "title": str(fields.get("statement_title") or "").strip('"') or None,
+                        "printed": {key: str(amount) for key, amount in printed.items()}})
+    return out
+
+
+def statement_reading(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """Whether the Journey's NDC was read: ``read`` when a copy's rows were
+    read as a statement form, and the copies with printed totals but no rows."""
+    documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+    read = any(statement_kind(line_rows(d["fields"].get("line_items"))) == KIND_FORM for d in documents)
+    return {"read": read, "unread": unread_statements(documents)}
+
+
 def _discount_detail_rows(fields: dict[str, Any]) -> list[dict[str, Any]]:
     """The statement's discounts read into ``discount_details`` (label and
     amount) rather than among its line items, as credit rows the reader takes
@@ -1765,9 +1798,31 @@ def sync_account_statement(
         _resolve_task(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=COPIES_DIFFERENCE_TASK,
                       evidence={"statementCopies": len(forms), "costSheetCopies": len(sheets)})
 
+    # An NDC is on file but none of its rows was read, only its printed totals
+    # (2026-11-04): CRITICAL. Without it the Deal has no NDC figure at all and
+    # every line shown is the invoice's (marked * on screen), so it is said
+    # plainly instead of the Deal falling back without a word.
+    unread = unread_statements(documents) if statement is None else []
+    if unread:
+        totals = "; ".join(", ".join(f"{k.replace('_', ' ')} Rs {v}" for k, v in u["printed"].items()) for u in unread)
+        _raise_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id, task_type=NO_EX_SHOWROOM_TASK,
+            title="NDC on file but not read",
+            description=(
+                "This Project takes the Deal from the dealer's NDC (account statement). "
+                f"{len(unread)} NDC cop{'y' if len(unread) == 1 else 'ies'} on file printed totals ({totals}) "
+                "but none of the rows (vehicle cost, TCS, insurance, receipts, discounts) was read, so the Deal "
+                "has no NDC figures: what it shows is from the invoice (marked *) and no discount counts. Have "
+                "the NDC read again or correct its reading."
+                + (" A cost sheet is on file and stands in for it meanwhile." if sheet is not None else "")
+            ),
+            reference=_json_amounts({"unread": unread}),
+            # The cost sheet stands in for the NDC (product owner 2026-10-28): HIGH, else CRITICAL.
+            severity="HIGH" if sheet is not None else "CRITICAL",
+        )
     # A statement is on file but its vehicle line was not read: CRITICAL, and it
     # says which lines were read (the Deal has no ex-showroom for this Journey).
-    if statement is not None and "ex_showroom_price" not in statement.components:
+    elif statement is not None and "ex_showroom_price" not in statement.components:
         _raise_task(
             connection, tenant_id=tenant_id, journey_id=journey_id, task_type=NO_EX_SHOWROOM_TASK,
             title="Account statement on file but its vehicle line was not read",
@@ -1873,8 +1928,10 @@ __all__ = [
     "standing_figures",
     "statement_kind",
     "statement_loan",
+    "statement_reading",
     "sync_account_statement",
     "sync_if_source_of_truth",
     "tally_deviations",
     "tally_postings",
+    "unread_statements",
 ]

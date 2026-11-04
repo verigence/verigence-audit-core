@@ -1904,6 +1904,10 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             # Where the billed figures come from: the invoices, or (Mahindra
             # Orissa) the NDC / account statement, else the cost sheet.
             "billedSource": "ACCOUNT_STATEMENT" if statement_policy else "INVOICE",
+            # The NDC copies on file of which none of the rows was read (2026-11-04):
+            # the screen says so instead of showing an invoice-built Deal as the NDC's.
+            "statementNotRead": _statement_not_read(connection, tenant_id=tenant_id, journey_id=journey_id)
+            if statement_policy else [],
             # Lines awaiting their own document with no figure yet: not in
             # Current net, Standard net or Balance due.
             "awaiting": [{"key": r["key"], "label": r["label"], "document": r["awaiting"],
@@ -3436,6 +3440,13 @@ def payments_section(connection: Connection, *, tenant_id: str, journey_id: UUID
 
 
 # ── vehicle, registration, delivery ──────────────────────────────────────────
+def _statement_not_read(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    from audit_core.uc03_account_statement import statement_reading
+
+    reading = statement_reading(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return [] if reading["read"] else reading["unread"]
+
+
 def _document_facts(
     connection: Connection, *, tenant_id: str, journey_id: UUID, di_types: tuple[str, ...],
 ) -> list[dict[str, Any]]:
