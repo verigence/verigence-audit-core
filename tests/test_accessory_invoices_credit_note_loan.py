@@ -155,10 +155,12 @@ def test_the_statement_deal_lists_the_credit_note(journey) -> None:
     view = _deal(journey)
     assert [(c["number"], D(c["amount"]), c["reason"]) for c in view["creditNotes"]] == \
         [("CN-7", D(25000), "Scrappage incentive")]
-    # A billing document (2026-11-02): its reason names the benefit, which the
-    # statement does not give, so the scrappage bonus is given by it, once.
+    # Its reason names the benefit; the statement does not give it, so since
+    # 2026-11-04 it is shown, never counted (discounts from the NDC / cost sheet only).
     assert view["creditNotes"][0]["benefit"]["key"] == "SCRAPPAGE_BONUS_DEALER"
-    assert D(view["summary"]["net"]["current"]) == D(before) - 25000
+    scrappage = next(d for d in view["discounts"] if d["key"] == "SCRAPPAGE_BONUS_DEALER")
+    assert scrappage["current"] is None and "NOT_ON_STATEMENT" in scrappage["flags"]
+    assert D(view["summary"]["net"]["current"]) == D(before)
 
 
 # ── 4. the loan without a receipt ────────────────────────────────────────────

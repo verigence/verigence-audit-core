@@ -1357,7 +1357,9 @@ def _one_benefit_per_figure(discount_rows: list[dict[str, Any]], *, offer_on_fil
       as not on the NDC.
     * With neither, the invoice's discounts are the deal's (live 2026-11-02:
       the Tally invoice's "OEM Discount" of Rs 30,000 on SHI-SS-261031-004,
-      the NDC filed as a booking docket)."""
+      the NDC filed as a booking docket) -- for a Project that reads its Deal
+      from invoices only; under the account-statement policy no invoice
+      discount counts (2026-11-04, ``_only_the_statement_gives``)."""
     def from_books(row: dict[str, Any], norm: frozenset[str]) -> bool:
         return row["current"] is not None and any(
             _norm_type(s.get("documentType")) in norm and _near(s.get("amount"), Decimal(row["current"]),
@@ -1434,12 +1436,14 @@ def _cost_sheet_benefits(discount_rows: list[dict[str, Any]], total: Decimal, do
     if aside and abs(sum((Decimal(r["billed"]) for r in aside), Decimal(0)) - rest) <= _SAME_BENEFIT_TOLERANCE:
         for row in aside:
             row["current"], row["currentSource"] = row["billed"], "invoice"
+            row["fromStatement"] = True  # the cost sheet's total, named by the invoice
             row["flags"] = [f for f in row["flags"] if f != "NOT_ON_STATEMENT"]
             row["sources"] = [*row["sources"], {**source, "checks": True}]
             row["variance"] = _minus(row["current"], row["entitled"]) if row.get("entitled") is not None else None
         return
     row = _benefit_row_for(discount_rows, COST_SHEET_DISCOUNT_KEY)
     _give(row, rest, how="document", sources=[source])
+    row["fromStatement"] = True
     row["eligibility"] = row["eligibility"] or "NOT_EVALUATED"
 
 
@@ -1479,6 +1483,34 @@ def _take_back(row: dict[str, Any], *, same_as: dict[str, Any]) -> None:
     row["flags"] = [f for f in row["flags"] if f not in _STANDARD_FLAGS]
 
 
+def _only_the_statement_gives(discount_rows: list[dict[str, Any]]) -> None:
+    """Mahindra Orissa (product owner 2026-11-04): "no discount to be read from
+    invoice ... discounts to be applicable from NDC, Cost Sheet"; a credit note
+    and the Tally customer ledger's discount journal are shown only, never
+    counted. A benefit counts when the dealer's statement (the NDC -- Shivnath's
+    offer / payment pages read as one --, the cost sheet standing in for it, or
+    the ERP settlement printout) gives its amount; another document may name
+    it (a credit note's reason, the invoice naming the cost sheet's total).
+    Every other benefit a document gives stays on the Deal, marked not on the
+    NDC, out of every total and never a variance."""
+    for row in discount_rows:
+        if row.get("current") is None or row.get("fromStatement"):
+            continue
+        amount = _dec(row["current"])
+        if amount is not None and any(
+            _norm_type(s.get("documentType")) in _STATEMENT_NORM and _near(s.get("amount"), amount, _SAME_BENEFIT_TOLERANCE)
+            for s in row.get("sources") or []
+        ):
+            continue
+        row["current"], row["currentSource"], row["variance"] = None, None, None
+        # A conditional benefit (exchange, scrappage, ...) is in the standard only when
+        # claimed or proven; a claim on a document that does not count is no claim.
+        row["inStandard"] = row.get("entitled") is not None and (
+            row["key"] not in _CONDITIONAL_BENEFITS or bool((row.get("proof") or {}).get("onFile")))
+        row["flags"] = [*(f for f in row["flags"] if f not in (*_STANDARD_FLAGS, "NOT_ON_STATEMENT")),
+                        "NOT_ON_STATEMENT"]
+
+
 def _link_credit_notes(credit_notes: list[dict[str, Any]], discount_rows: list[dict[str, Any]]) -> None:
     """Which benefit each credit note pays, and what it adds to the deal.
 
@@ -1496,6 +1528,10 @@ def _link_credit_notes(credit_notes: list[dict[str, Any]], discount_rows: list[d
       entitles, with its amount (most credit notes print no reason -- Aditya
       and Shivnath DMS credit notes, seen 2026-11-02 -- so the amount names it);
     * else it is a benefit of its own, "Credit note (benefit not named)".
+
+    Under the account-statement policy (product owner 2026-11-04) a credit
+    note only names a benefit the NDC / cost sheet gives; one the statement
+    does not give is shown, never counted (``_only_the_statement_gives``).
     """
     for note in credit_notes:
         note["benefit"] = None
@@ -1748,6 +1784,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         printed = cost_sheet_discount(connection, tenant_id=tenant_id, journey_id=journey_id)
         if printed is not None:
             _cost_sheet_benefits(discount_rows, *printed)
+    if statement_policy:
+        _only_the_statement_gives(discount_rows)
     insurance["invoiceOnFile"] = _insurance_accounted(documents, sources, selection)
     insurance["vehicleInvoiced"] = vehicle_on_file
 

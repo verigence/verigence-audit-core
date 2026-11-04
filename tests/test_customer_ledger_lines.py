@@ -93,7 +93,9 @@ def test_the_ledger_prices_the_lines_no_ndc_gives_and_confirms_the_insurance(jou
     """Bapu Dalabehera: no NDC read (it was filed as a booking docket), the
     Tally ledger on file. Its insurance, RTO, accessories and FASTag are the
     deal's; the insurance is in-house because the dealer charged it; the
-    scrappage credit note is the scrappage bonus, counted once."""
+    scrappage credit note is the scrappage bonus -- since 2026-11-04 shown,
+    never counted, like the ledger's own discount: discounts count from the
+    NDC / cost sheet only."""
     _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
     _ledger(journey, BAPU)
     _sync(journey)
@@ -109,10 +111,12 @@ def test_the_ledger_prices_the_lines_no_ndc_gives_and_confirms_the_insurance(jou
         assert row["sources"][0]["documentType"] == "customer_ledger_tally", key
     assert view["insurance"]["decidedBy"] == "DOCUMENT" and view["insurance"]["inDeal"] is True
     scrappage = _benefit(view, "SCRAPPAGE_BONUS_DEALER")
-    assert D(scrappage["current"]) == D(20000)
+    assert scrappage["current"] is None and D(scrappage["billed"]) == D(20000)
+    assert "NOT_ON_STATEMENT" in scrappage["flags"]
     assert [c["number"] for c in scrappage["paidByCreditNotes"]] == ["UOV27C000046"]
-    assert D(_benefit(view, "ADDITIONAL_DISCOUNT")["current"]) == D("5000.01")
-    assert D(view["summary"]["discounts"]["current"]) == D("25000.01")
+    ledger_discount = _benefit(view, "ADDITIONAL_DISCOUNT")
+    assert ledger_discount["current"] is None and "NOT_ON_STATEMENT" in ledger_discount["flags"]
+    assert view["summary"]["discounts"]["current"] is None
 
 
 def test_the_offer_letter_payment_details_form_is_an_ndc() -> None:
@@ -289,7 +293,10 @@ def test_one_benefit_the_ndc_and_the_ledger_name_differently_counts_once(journey
     assert exchange["current"] is None and exchange["sameAs"]["key"] == "SCRAPPAGE_BONUS_DEALER"
     assert D(scrappage["current"]) == D(20000)
     assert D(_benefit(view, "ACCESSORIES_KIT")["current"]) == D(30000)
-    assert D(view["summary"]["discounts"]["current"]) == D("55000.01")
+    # The ledger's own Rs 5,000.01 discount journal, which the NDC does not give: shown,
+    # never counted (2026-11-04).
+    assert _benefit(view, "ADDITIONAL_DISCOUNT")["current"] is None
+    assert D(view["summary"]["discounts"]["current"]) == D("50000.00")
     # The kit: Rs 30,000 free plus Rs 18,398 written into the PERMIT row.
     assert D(_row(view, "accessories_cost")["current"]) == D(48398)
     # The letter leaves the EW and RSA rows blank and no bill charges them:

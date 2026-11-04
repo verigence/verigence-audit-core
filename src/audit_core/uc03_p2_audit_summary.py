@@ -319,9 +319,13 @@ def conclude_benefit(row: dict[str, Any], *, unknown_results: frozenset[str]) ->
         # The Deal does not count it (2026-11-04: ADI-BA-261019-003, an
         # invoice discount the NDC does not give, set aside with no flag,
         # was listed as given): the document's figure is shown, never as given.
-        out.update(billed=None, billedFrom=None, conclusion=DISPUTED, rule="AS-03",
+        # Product owner 2026-11-04: discounts count from the NDC / cost sheet
+        # only, so one printed elsewhere (invoice, credit note, Tally ledger)
+        # is information, not a dispute.
+        out.update(billed=None, billedFrom=None, conclusion=INFO,
                    documents=[{"document": given_from, "amount": money(given)}], reason=(
-                       f"Printed on the {given_from or 'invoice'} only: the deal does not count it."))
+                       f"Printed on the {given_from or 'invoice'} only: discounts count from the NDC / "
+                       "cost sheet, so the deal does not count it."))
         return out
     if not given:
         if entitled and eligibility == "ELIGIBLE":

@@ -163,12 +163,15 @@ def test_a_benefit_the_deal_does_not_count_is_never_shown_as_given() -> None:
         {"key": "CASH_DISCOUNT", "label": "Consumer / cash discount", "billed": "5000", "current": None,
          "flags": ["NOT_ON_STATEMENT"], "entitled": "5000", "eligibility": "ELIGIBLE",
          "sources": [_src("customer_invoice_dms", "5000")]}, unknown_results=unknown)
-    assert (invoice_only["conclusion"], invoice_only["billed"]) == (summary.DISPUTED, None)
+    # Product owner 2026-11-04: discounts count from the NDC / cost sheet only; one
+    # printed on the invoice alone is information, not a dispute.
+    assert (invoice_only["conclusion"], invoice_only["billed"]) == (summary.INFO, None)
+    assert "discounts count from the NDC / cost sheet" in invoice_only["reason"]
     assert invoice_only["documents"][0]["amount"] == "5000.00"
     unflagged = summary.conclude_benefit(
         {"key": "UNCLASSIFIED_DISCOUNT", "label": "Invoice discount (type not printed)", "billed": None,
          "current": None, "flags": [], "sources": [_src("customer_invoice_dms", "9000")]}, unknown_results=unknown)
-    assert (unflagged["conclusion"], unflagged["billed"]) == (summary.DISPUTED, None)
+    assert (unflagged["conclusion"], unflagged["billed"]) == (summary.INFO, None)
 
 
 def test_a_product_charged_without_its_document_is_unsupported() -> None:
