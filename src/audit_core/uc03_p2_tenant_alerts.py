@@ -12,8 +12,10 @@ Only PUBLISHED alerts that have not expired (24 hours) are returned, newest
 first; ``since`` narrows to those published after it. The first kind is
 SAME_FILE_UPLOADED (uc03_p2_same_file).
 
-DUPLICATE_ACROSS_OUTLETS (2026-11-03) is not for everyone: "to be seen by the
-PC of both the affected outlets, Reviewer, TL". Its payload names the outlets
+DUPLICATE_ACROSS_OUTLETS: from 2026-11-04 (another dealership) for every
+screen of the Project. DUPLICATE_SAME_DEALERSHIP (2026-11-04) is "to be seen
+by the PC of both the affected outlets, Reviewer, TL", and stays up while both
+bookings are open. Its payload names the outlets
 (``audienceOutletIds``) and roles (``audienceRoles``); it is returned to a
 person who holds one of those roles at one of those outlets -- a dealer-wide
 or Project-wide assignment covers the outlet (uc03_p2_gate_pass.scope_outlets).
@@ -80,13 +82,23 @@ def roles_by_outlet(connection: Connection, *, tenant_id: str, actor_id: str) ->
 
 def active_alerts(connection: Connection, *, tenant_id: str, since: datetime | None = None,
                   held: dict[str, set[str]] | None = None) -> list[TenantAlert]:
+    from audit_core.uc03_p2_same_file import _CLOSED_SQL
+
     rows = connection.execute(
         text(
             """
             SELECT alert_id, alert_kind, outcome, title, body, subject_journey_id, subject_journey_reference,
                    payload, published_at_utc, expires_at_utc
             FROM auditcore.p2_tenant_alerts
-            WHERE tenant_id=:t AND alert_status='PUBLISHED' AND expires_at_utc > now()
+            WHERE tenant_id=:t AND alert_status='PUBLISHED'
+              AND (expires_at_utc > now()
+                   -- a duplicate booking at two outlets of one dealership stays up while both
+                   -- bookings are open: it is what pauses the PCs' uploads (2026-11-04)
+                   OR (alert_kind = 'DUPLICATE_SAME_DEALERSHIP'
+                       AND (SELECT count(*) FROM auditcore.journeys j
+                            WHERE j.tenant_id = p2_tenant_alerts.tenant_id
+                              AND j.journey_id IN (subject_journey_id, related_journey_id)
+                              AND NOT """ + _CLOSED_SQL + """) = 2))
               AND (CAST(:since AS timestamptz) IS NULL OR published_at_utc > CAST(:since AS timestamptz))
             ORDER BY published_at_utc DESC, alert_id
             LIMIT :limit

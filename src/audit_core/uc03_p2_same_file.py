@@ -1,13 +1,30 @@
 """The same file uploaded again, and a duplicate booking across outlets.
 
+Product owner 2026-11-04 (supersedes the name and booking-number rules below):
+    - PAN/Aadhaar + mobile + model + OUTLET the same: the journey with FEWER
+      documents is deleted ("keep deleting the files where we have less
+      number of documents uploaded in the journey"); the earlier one is kept
+      on a tie. Neither the customer name nor the booking reference number is
+      compared any more (``matched_fields``).
+    - The same at another outlet of the SAME DEALERSHIP: nothing is deleted;
+      the PCs of both bookings may not start an upload until a Reviewer
+      deletes the duplicate ("temporary block the upload for them ... they have
+      to contact the reviewer to get the file deleted, once duplicate file got
+      deleted, their access will be back"): DUPLICATE_SAME_DEALERSHIP, for the
+      PCs, Reviewers and Team Leads of both outlets, up while both bookings
+      are open (uc03_p2_upload_pause.duplicate_block).
+    - The same at ANOTHER DEALERSHIP: nothing is deleted; a big red alert on
+      every screen of the Project, with a sound for the PCs of both bookings
+      (DUPLICATE_ACROSS_OUTLETS, no audience).
+    - The same mobile only, at another dealership: a DUPLICATE_BOOKING finding
+      of less probability (uc03_duplicate_booking_detection,
+      MOBILE_OTHER_DEALERSHIP).
+
 Product owner 2026-11-03: the "same file" is a PC's mistake only within ONE
 OUTLET. The same customer (PAN and/or Aadhaar), mobile and model on open
-journeys of two DIFFERENT outlets -- of one dealership or of two; each
-dealership numbers its own bookings, so no booking reference number is
-compared -- is a DUPLICATE BOOKING ACROSS OUTLETS: nothing is deleted and a
-large deep-red alert (DUPLICATE_ACROSS_OUTLETS) goes to the PCs of both
-outlets, their Reviewers and Team Leads (uc03_p2_tenant_alerts), once per
-newer journey, for a journey created within the same window as below.
+journeys of two DIFFERENT outlets -- each dealership numbers its own bookings,
+so no booking reference number is compared -- is a DUPLICATE BOOKING ACROSS
+OUTLETS, raised once per newer journey created within the window below.
 
 Documents only the copy holds (product owner 2026-11-03, for every upload,
 bulk or not; within one outlet): "before delete, check if the duplicate file
@@ -30,7 +47,8 @@ The same file uploaded again (product owner, 2026-10-31).
     Dealership, and delete the journey completely. This alert should be seen
     by all team on their respective screens, if they are active."
 
-What is "the same file" (product owner, 2026-11-02)
+What was "the same file" (product owner, 2026-11-02; name and booking number
+dropped 2026-11-04, outlet added)
     Two open journeys of one dealership that agree on ALL of:
       - the customer: the same PAN and/or the same Aadhaar -- either one
         equal is enough (``pan_number`` in PAN shape by ``_valid_pan``;
@@ -62,9 +80,11 @@ What is "the same file" (product owner, 2026-11-02)
     basis is enough, a TL task) is unchanged; this is the stricter check on
     top of it.
 
-Which one is the new file
-    The later ``created_at_utc``, ``journey_id`` breaking a tie -- the same
-    order whichever journey's check runs, so exactly one side is ever "new".
+Which one is the copy (2026-11-04)
+    The journey with fewer documents on file; on a tie the later
+    ``created_at_utc``, ``journey_id`` breaking a tie -- the same order
+    whichever journey's check runs, so exactly one side is ever the copy.
+    Should the copy gain more documents before its delete, it is kept.
     The check runs in the NATIVE:BOOKING unit of either journey; when the
     older one is the last to have all its values, its own run flags the
     newer one.
@@ -80,10 +100,8 @@ What happens to it
       can genuinely book two identical vehicles (product owner 2026-10-31).
     - A journey whose documents a reviewer already marked reviewed is kept
       too (the delete guard), and the alert says so.
-    - A copy whose booking reference number was not read (on either side)
-      is kept and alerted (KEPT_NO_BOOKING_REFERENCE). Once the booking
-      numbers are read and agree, the check runs again and the copy is
-      deleted after all (the kept alert is turned into a pending delete).
+    - (Until 2026-11-04 a copy whose booking reference number was not read
+      was kept, KEPT_NO_BOOKING_REFERENCE; old alerts may still say so.)
     - Every copy deleted keeps, on its ``p2_journey_deletions`` row, the PAN,
       the mobile, the Aadhaar masked to its last four digits ("XXXX XXXX
       1234" -- the full number is never stored), the booking reference
@@ -146,7 +164,10 @@ logger = structlog.get_logger(__name__)
 
 ALERT_KIND = "SAME_FILE_UPLOADED"
 CROSS_OUTLET_KIND = "DUPLICATE_ACROSS_OUTLETS"
-CROSS_OUTLET_TITLE = "Duplicate booking across outlets"
+CROSS_OUTLET_TITLE = "Duplicate booking across dealerships"
+# 2026-11-04: another outlet of the same dealership -- uploads paused for both PCs.
+SAME_DEALERSHIP_KIND = "DUPLICATE_SAME_DEALERSHIP"
+SAME_DEALERSHIP_TITLE = "Duplicate booking at two outlets: uploads paused"
 DELETE_WORK_TYPE = "SAME_FILE_DELETE"
 ALERT_HOURS = 24
 ALERT_TITLE = "Same file being uploaded"
@@ -321,10 +342,9 @@ class FileIdentity:
 
     @property
     def complete(self) -> bool:
-        """A PAN or an Aadhaar, the mobile, the customer name and the model --
-        everything compared except the booking reference number, whose
-        absence keeps the copy with an alert instead."""
-        return bool((self.pan or self.aadhaar) and self.mobile and self.name and (self.model_id or self.model_key))
+        """A PAN or an Aadhaar, the mobile and the model: everything compared
+        (product owner 2026-11-04)."""
+        return bool((self.pan or self.aadhaar) and self.mobile and (self.model_id or self.model_key))
 
     @property
     def comparable(self) -> bool:
@@ -430,11 +450,6 @@ def mask_aadhaar(value: Any) -> str | None:
     return f"XXXX XXXX {digits[-4:]}" if len(digits) >= 4 else None
 
 
-def booking_reference_shared(left: FileIdentity, right: FileIdentity) -> bool:
-    """Both copies carry the same booking reference number."""
-    return bool(left.booking_refs & right.booking_refs)
-
-
 def same_outlet(left: FileIdentity, right: FileIdentity) -> bool:
     return not (left.outlet_id and right.outlet_id and left.outlet_id != right.outlet_id)
 
@@ -484,34 +499,24 @@ def cross_outlet_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[
 
 
 def matched_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
-    """The fields, as a reviewer should see them, when the new file may be a
-    copy of the existing one; None when they are two bookings.
+    """The fields, as a reviewer should see them, when the two journeys are one
+    booking entered twice at one outlet; None otherwise.
 
-    Product owner 2026-11-02: the same PAN and/or the same Aadhaar (either
-    one equal is enough; one read on both and different says two people),
-    the same mobile, the same model, the same customer name (kept from
-    2026-10-31) and the same booking reference number -- within one
-    dealership, as each numbers its own bookings. Booking numbers read on
-    both copies and none in common: two bookings, None. A booking number not
-    read on one copy (or either) still returns the fields, with the booking
-    reference row not exact: the caller then alerts and keeps the copy
-    (KEPT_NO_BOOKING_REFERENCE), never deletes it."""
+    Product owner 2026-11-04: the same PAN and/or the same Aadhaar (either one
+    equal is enough; one read on both and different says two people), the same
+    mobile, the same model and the same outlet. The customer name and the
+    booking reference number are no longer compared (2026-11-02 rule
+    replaced): both were read wrongly on real copies and kept them."""
+    if not same_outlet(new, existing):  # another outlet: a duplicate booking across outlets
+        return None
     if new.dealer_id and existing.dealer_id and new.dealer_id != existing.dealer_id:
         return None
-    if not same_outlet(new, existing):  # 2026-11-03: another outlet is a duplicate across outlets
+    customer = same_customer(new, existing)
+    if customer is None:
         return None
-    same_pan = bool(new.pan and new.pan == existing.pan)
-    same_aadhaar = bool(new.aadhaar and new.aadhaar == existing.aadhaar)
-    if not (same_pan or same_aadhaar):
+    if not (new.complete and existing.complete and new.mobile == existing.mobile and same_model(new, existing)):
         return None
-    if (new.pan and existing.pan and not same_pan) or (new.aadhaar and existing.aadhaar and not same_aadhaar):
-        return None
-    if not (new.complete and existing.complete and new.mobile == existing.mobile
-            and same_model(new, existing) and same_name(new.name, existing.name)):
-        return None
-    shared = sorted(new.booking_refs & existing.booking_refs)
-    if new.booking_refs and existing.booking_refs and not shared:
-        return None
+    same_pan, same_aadhaar = customer
     fields: list[dict[str, Any]] = []
     if same_pan:
         fields.append({"field": "pan", "label": "PAN", "newValue": _masked(new.pan),
@@ -522,25 +527,22 @@ def matched_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, 
     fields += [
         {"field": "mobile", "label": "Mobile", "newValue": _masked(new.mobile),
          "existingValue": _masked(existing.mobile), "exact": True},
-        {"field": "name", "label": "Customer name", "newValue": new.name, "existingValue": existing.name,
-         "exact": new.name == existing.name},
         {"field": "model", "label": "Model", "newValue": new.model_name, "existingValue": existing.model_name,
          "exact": bool(new.model_id and new.model_id == existing.model_id) or new.model_name == existing.model_name},
-        {"field": "bookingReference", "label": "Booking reference number",
-         "newValue": new.booking_ref_display, "existingValue": existing.booking_ref_display,
-         "exact": bool(shared)},
+        {"field": "outlet", "label": "Outlet", "newValue": _place(new.dealer_name, new.outlet_name),
+         "existingValue": _place(existing.dealer_name, existing.outlet_name), "exact": True},
     ]
     return fields
 
 
-def _no_booking_reference_reason(new: FileIdentity, existing: FileIdentity) -> str:
-    if not new.booking_refs and not existing.booking_refs:
-        where = "either copy"
-    elif not new.booking_refs:
-        where = f"the new file {new.reference or ''}".rstrip()
-    else:
-        where = existing.reference or "the earlier journey"
-    return f"the booking reference number was not read on {where}"
+def document_counts(connection: Connection, *, tenant_id: str, journey_ids: Iterable[UUID]) -> dict[UUID, int]:
+    """Documents on file (ACTIVE) per journey."""
+    ids = list(journey_ids)
+    return {UUID(str(j)): int(n) for j, n in connection.execute(
+        text("SELECT journey_id, count(*) FROM auditcore.evidence WHERE tenant_id=:t AND journey_id = ANY(:ids) "
+             "AND association_status='ACTIVE' GROUP BY journey_id"),
+        {"t": tenant_id, "ids": ids},
+    ).all()}
 
 
 def is_individual_pan(pan: str | None) -> bool:
@@ -862,8 +864,6 @@ def _raise(
         outcome = KEPT_NOT_INDIVIDUAL
     elif _reviewed(connection, tenant_id=tenant_id, journey_id=new.journey_id):
         outcome = KEPT_REVIEWED
-    elif not booking_reference_shared(new, existing):
-        outcome, kept_reason = KEPT_NO_BOOKING_REFERENCE, _no_booking_reference_reason(new, existing)
     elif (plan := carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing)).unsure:
         outcome, kept_reason = KEPT_OWN_DOCUMENTS, plan.unsure
     else:
@@ -937,23 +937,33 @@ def _raise(
     return outcome
 
 
-def cross_outlet_body(payload: dict[str, Any]) -> str:
+def cross_outlet_body(payload: dict[str, Any], *, title: str | None = None) -> str:
     new = payload.get("newJourney") or {}
     existing = payload.get("existingJourney") or {}
     who = f"{payload.get('customerName') or 'Unknown customer'}, {payload.get('model') or 'unknown model'}"
     labels = [str(f.get("label") or "") for f in payload.get("matchedFields") or [] if f.get("field") != "outlet"]
     on = labels[0] if len(labels) == 1 else f"{', '.join(labels[:-1])} and {labels[-1]}"
-    return (f"{CROSS_OUTLET_TITLE} — {who}. {new.get('reference') or 'A new journey'} "
+    blocked = (" Uploads by both PCs are paused until a Reviewer deletes the duplicate booking."
+               if payload.get("uploadsBlocked") else "")
+    return (f"{title or CROSS_OUTLET_TITLE} — {who}. {new.get('reference') or 'A new journey'} "
             f"(PC {new.get('pcName') or 'unknown'}, {_place(new.get('dealerName'), new.get('outletName'))}) "
             f"and {existing.get('reference') or 'an earlier journey'} "
             f"(PC {existing.get('pcName') or 'unknown'}, {_place(existing.get('dealerName'), existing.get('outletName'))}) "
-            f"are the same customer on {on}. Nothing was deleted.")
+            f"are the same customer on {on}. Nothing was deleted.{blocked}")
 
 
 def _raise_cross_outlet(connection: Connection, *, tenant_id: str, new: FileIdentity, existing: FileIdentity,
-                        fields: list[dict[str, Any]]) -> bool:
-    """The deep-red alert for a duplicate booking across outlets (2026-11-03), once per newer
-    journey; for the PCs of both outlets, their Reviewers and Team Leads (``audienceOutletIds``)."""
+                        fields: list[dict[str, Any]], same_dealership: bool = False) -> bool:
+    """The deep-red alert for a duplicate booking across outlets, once per newer journey.
+
+    Product owner 2026-11-04:
+    - another DEALERSHIP: a big red alert flashing on every screen of the Project, and a
+      sound for the PCs of both bookings (DUPLICATE_ACROSS_OUTLETS, no audience);
+    - another outlet of the SAME dealership: the PCs of both bookings may not upload until
+      a Reviewer deletes the duplicate (DUPLICATE_SAME_DEALERSHIP, uc03_p2_upload_pause);
+      the alert is for the PCs, Reviewers and Team Leads of both outlets."""
+    kind = SAME_DEALERSHIP_KIND if same_dealership else CROSS_OUTLET_KIND
+    title = SAME_DEALERSHIP_TITLE if same_dealership else CROSS_OUTLET_TITLE
     payload = {
         "customerName": new.name or existing.name,
         "model": new.model_name or existing.model_name,
@@ -962,9 +972,9 @@ def _raise_cross_outlet(connection: Connection, *, tenant_id: str, new: FileIden
         "existingJourney": {**_journey_view(existing),
                             "outletId": str(existing.outlet_id) if existing.outlet_id else None},
         "matchedFields": fields,
-        "audienceOutletIds": sorted({str(o) for o in (new.outlet_id, existing.outlet_id) if o}),
-        "audienceRoles": ["PC", "REVIEWER", "TL"],
         "severity": "CRITICAL",
+        **({"audienceOutletIds": sorted({str(o) for o in (new.outlet_id, existing.outlet_id) if o}),
+            "audienceRoles": ["PC", "REVIEWER", "TL"], "uploadsBlocked": True} if same_dealership else {}),
     }
     alert_id = connection.execute(
         text(
@@ -980,8 +990,8 @@ def _raise_cross_outlet(connection: Connection, *, tenant_id: str, new: FileIden
             RETURNING alert_id
             """
         ),
-        {"t": tenant_id, "k": CROSS_OUTLET_KIND, "j": new.journey_id, "ref": new.reference,
-         "related": existing.journey_id, "title": CROSS_OUTLET_TITLE, "body": cross_outlet_body(payload),
+        {"t": tenant_id, "k": kind, "j": new.journey_id, "ref": new.reference,
+         "related": existing.journey_id, "title": title, "body": cross_outlet_body(payload, title=title),
          "payload": json.dumps(payload, default=str), "hours": ALERT_HOURS},
     ).scalar_one_or_none()
     if alert_id is not None:
@@ -1026,20 +1036,29 @@ def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correla
             if newer.created_at < cutoff or same_outlet(newer, earliest):
                 continue
             fields = cross_outlet_fields(newer, earliest)
-            if fields and _raise_cross_outlet(connection, tenant_id=tenant_id, new=newer, existing=earliest,
-                                              fields=fields):
+            if not fields:
+                continue
+            # Product owner 2026-11-04: at another outlet of the same dealership the PCs of both
+            # stop uploading until a Reviewer deletes the duplicate; at another dealership a big
+            # red alert on every screen.
+            same_dealer = bool(newer.dealer_id and newer.dealer_id == earliest.dealer_id)
+            if _raise_cross_outlet(connection, tenant_id=tenant_id, new=newer, existing=earliest, fields=fields,
+                                   same_dealership=same_dealer):
                 flagged += 1
     matches = [o for o in others.values() if not o.closed and matched_fields(me, o) is not None]
     if not matches:
         return {"examined": len(others), "raised": 0, "acrossOutlets": flagged}
     group = [me, *matches]
-    original = min(group, key=lambda identity: identity.order_key)
+    # Product owner 2026-11-04: the journey with more documents is kept (the earlier on a tie);
+    # every other one is the copy, deleted once what only it holds is carried over.
+    counts = document_counts(connection, tenant_id=tenant_id, journey_ids=[g.journey_id for g in group])
+    original = min(group, key=lambda identity: (-counts.get(identity.journey_id, 0), identity.order_key))
     outcomes: list[str] = []
     for new in sorted(group, key=lambda identity: identity.order_key):
         if new is original:
             continue
-        if new.created_at < cutoff:
-            # Not a file just uploaded again: left to DUPLICATE_BOOKING.
+        if max(new.created_at, original.created_at) < cutoff:
+            # Neither just uploaded: left to DUPLICATE_BOOKING.
             continue
         fields = matched_fields(new, original)
         if fields is None:  # matched this journey, not the oldest one
@@ -1116,10 +1135,11 @@ def recheck_before_delete(
     if new.closed:
         raise SameFileNoLongerHolds("it is already closed")
     if matched_fields(new, existing) is None:
-        raise SameFileNoLongerHolds(
-            f"its PAN / Aadhaar, mobile, model, customer name or booking reference number no longer match {ref}")
-    if not booking_reference_shared(new, existing):
-        raise SameFileNoLongerHolds(_no_booking_reference_reason(new, existing))
+        raise SameFileNoLongerHolds(f"its PAN / Aadhaar, mobile, model or outlet no longer match {ref}")
+    counts = document_counts(connection, tenant_id=tenant_id, journey_ids=[new_journey_id, existing_journey_id])
+    if counts.get(new_journey_id, 0) > counts.get(existing_journey_id, 0):
+        # the copy now holds more documents (pages still arriving): the other one is the copy
+        raise SameFileNoLongerHolds(f"it now holds more documents than {ref}")
     reason = business_reason(connection, tenant_id=tenant_id, files=[new, existing]) or _own_documents_reason(
         connection, tenant_id=tenant_id, new=new, existing=existing)
     if reason:

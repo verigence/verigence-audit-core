@@ -370,7 +370,7 @@ def create_p2_journey(
     _authorize_security(authorization_client, human_principal=human_principal, tenant_id=tenant_id)
     set_tenant_context(connection, tenant_id)
     # A booking starts with its first upload: none while uploads are paused.
-    refuse_upload_if_paused(connection, tenant_id)
+    refuse_upload_if_paused(connection, tenant_id, human_principal.subject)
     return start_p2_journey(
         connection, tenant_id=tenant_id, actor_id=human_principal.subject, outlet_id=command.outletId,
         customer_name=command.customerName, created_by_name=command.createdByName,
@@ -1078,7 +1078,7 @@ def init_uploads(
         authorization_client=authorization_client,
         permission_key=_UPDATE_PERMISSION,
     )
-    refuse_upload_if_paused(connection, tenant_id)
+    refuse_upload_if_paused(connection, tenant_id, human_principal.subject)
     max_bytes = int(os.environ.get("P2_MAX_UPLOAD_BYTES", str(_DEFAULT_MAX_UPLOAD_BYTES)))
     correlation_id = get_correlation_id(request)
     try:
@@ -1251,7 +1251,7 @@ def replace_document(
         authorization_client=authorization_client,
         permission_key=_UPDATE_PERMISSION,
     )
-    refuse_upload_if_paused(connection, tenant_id)
+    refuse_upload_if_paused(connection, tenant_id, human_principal.subject)
     evidence = connection.execute(
         text(
             """

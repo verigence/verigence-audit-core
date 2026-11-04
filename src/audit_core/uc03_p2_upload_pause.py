@@ -22,6 +22,12 @@ that was prepared before the pause (its file is already in storage), so the
 worker finishes every file already received.
 
 No row, or a row with paused = false, changes nothing.
+
+A duplicate booking at two outlets of one dealership (product owner
+2026-11-04): the PCs of both bookings may not start an upload until a Reviewer
+deletes the duplicate (409 VAC-DUP-001). Nothing to clear by hand: once one of
+the two bookings is deleted or closed, their uploads are back. The same GET
+tells the signed-in PC (``duplicateBooking``).
 """
 from __future__ import annotations
 
@@ -119,11 +125,68 @@ def pause_detail(pause: dict[str, Any]) -> str:
     return f"{message} Uploads are back at {ist_text(until)}." if until else message
 
 
-def refuse_upload_if_paused(connection: Connection, tenant_id: str) -> None:
-    """Refuse a NEW document upload (503 VAC-MAINT-001) while uploads are paused."""
+DUPLICATE_BLOCK_ERROR_CODE = "VAC-DUP-001"
+DUPLICATE_BLOCK_TITLE = "Uploads paused: duplicate booking"
+
+
+class DuplicateBookingBlockError(AuditCoreError):
+    def __init__(self, *, detail: str) -> None:
+        super().__init__(DUPLICATE_BLOCK_ERROR_CODE, 409, DUPLICATE_BLOCK_TITLE, detail)
+
+
+def duplicate_block(connection: Connection, tenant_id: str, actor_id: str | None) -> dict[str, Any] | None:
+    """The duplicate booking at two outlets of one dealership that pauses this
+    person's uploads (they entered one of the two), while both bookings are
+    still open; None otherwise (uc03_p2_same_file.SAME_DEALERSHIP_KIND)."""
+    if not actor_id:
+        return None
+    from audit_core.uc03_p2_same_file import _CLOSED_SQL, SAME_DEALERSHIP_KIND
+
+    row = connection.execute(
+        text(
+            f"""
+            SELECT a.alert_id, a.payload
+            FROM auditcore.p2_tenant_alerts a
+            WHERE a.tenant_id = :t AND a.alert_kind = :kind
+              AND (a.payload #>> '{{newJourney,pcActorId}}' = :a OR a.payload #>> '{{existingJourney,pcActorId}}' = :a)
+              AND (SELECT count(*) FROM auditcore.journeys j
+                   WHERE j.tenant_id = a.tenant_id AND j.journey_id IN (a.subject_journey_id, a.related_journey_id)
+                     AND NOT {_CLOSED_SQL}) = 2
+            ORDER BY a.created_at_utc
+            LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "kind": SAME_DEALERSHIP_KIND, "a": actor_id},
+    ).mappings().first()
+    if row is None:
+        return None
+    payload = row["payload"] or {}
+    return {"alertId": str(row["alert_id"]), "newJourney": payload.get("newJourney"),
+            "existingJourney": payload.get("existingJourney"), "customerName": payload.get("customerName"),
+            "model": payload.get("model")}
+
+
+def duplicate_block_detail(block: dict[str, Any]) -> str:
+    def named(journey: dict[str, Any] | None) -> str:
+        journey = journey or {}
+        place = journey.get("outletName") or journey.get("dealerName") or "another outlet"
+        return f"{journey.get('reference') or 'a booking'} ({place})"
+
+    return (f"{named(block.get('newJourney'))} and {named(block.get('existingJourney'))} are the same customer "
+            f"({block.get('customerName') or 'unknown'}, {block.get('model') or 'unknown model'}) at two outlets. "
+            "Contact the Reviewer to delete the duplicate booking; your uploads come back once it is deleted.")
+
+
+def refuse_upload_if_paused(connection: Connection, tenant_id: str, actor_id: str | None = None) -> None:
+    """Refuse a NEW document upload (503 VAC-MAINT-001) while uploads are
+    paused, and (409 VAC-DUP-001) while a duplicate booking at two outlets
+    of one dealership waits for a Reviewer (2026-11-04)."""
     pause = upload_pause(connection, tenant_id)
     if pause is not None:
         raise UploadsPausedError(detail=pause_detail(pause))
+    block = duplicate_block(connection, tenant_id, actor_id)
+    if block is not None:
+        raise DuplicateBookingBlockError(detail=duplicate_block_detail(block))
 
 
 # ── the signed-in user's Project ──────────────────────────────────────────────
@@ -131,6 +194,8 @@ class UploadPauseStatus(BaseModel):
     paused: bool
     message: str | None
     untilUtc: datetime | None
+    # 2026-11-04: this person's uploads wait for a Reviewer to delete a duplicate booking
+    duplicateBooking: dict[str, Any] | None = None
 
 
 @router.get("/upload-pause", response_model=UploadPauseStatus)
@@ -148,9 +213,13 @@ def get_upload_pause(
     )
     set_tenant_context(connection, tenant_id)
     pause = upload_pause(connection, tenant_id)
-    if pause is None:
-        return UploadPauseStatus(paused=False, message=None, untilUtc=None)
-    return UploadPauseStatus(paused=True, message=pause["message"], untilUtc=pause["untilUtc"])
+    if pause is not None:
+        return UploadPauseStatus(paused=True, message=pause["message"], untilUtc=pause["untilUtc"])
+    block = duplicate_block(connection, tenant_id, human_principal.subject)
+    if block is not None:
+        return UploadPauseStatus(paused=True, message=duplicate_block_detail(block), untilUtc=None,
+                                 duplicateBooking=block)
+    return UploadPauseStatus(paused=False, message=None, untilUtc=None)
 
 
 # ── SuperAdmin ────────────────────────────────────────────────────────────────

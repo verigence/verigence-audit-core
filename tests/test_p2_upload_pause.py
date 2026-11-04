@@ -1,4 +1,6 @@
-"""Uploads paused for maintenance (product owner, 2026-10-31).
+"""Uploads paused for maintenance (product owner, 2026-10-31), and a PC's
+uploads paused by a duplicate booking at two outlets of one dealership
+(2026-11-04).
 
 While paused, every endpoint that starts a NEW document upload refuses with
 503 VAC-MAINT-001; reads, vehicle photos, task actions and the finalize of an
@@ -9,6 +11,7 @@ are doubles.
 """
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
@@ -37,10 +40,13 @@ from audit_core.main import app
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import get_security_authorization_client
 from audit_core.security_integration import SecurityAdminContext
+from audit_core.uc03_p2_same_file import SAME_DEALERSHIP_KIND
 from audit_core.uc03_p2_tasks import create_p2_task
 from audit_core.uc03_p2_upload_pause import (
+    DUPLICATE_BLOCK_ERROR_CODE,
     UPLOAD_PAUSED_ERROR_CODE,
     UPLOAD_PAUSED_TITLE,
+    duplicate_block,
     ist_text,
     pause_detail,
     upload_pause,
@@ -245,7 +251,7 @@ def test_unpaused_every_upload_endpoint_works_as_before(journey):
 
     status = client.get(f"/p2/v1/tenants/{j.tenant_id}/upload-pause")
     assert status.status_code == 200
-    assert status.json() == {"paused": False, "message": None, "untilUtc": None}
+    assert status.json() == {"paused": False, "message": None, "untilUtc": None, "duplicateBooking": None}
 
 
 def test_an_expired_pause_refuses_nothing(journey):
@@ -403,3 +409,82 @@ def test_the_change_is_logged(journey, monkeypatch):
         ("upload_pause_changed", "ALL", True, None, "sa-1"),
         ("upload_pause_changed", "ALL", False, True, "sa-1"),
     ]
+
+
+# ── 2026-11-04: a duplicate booking at two outlets of one dealership ──────────
+def _duplicate_at_another_outlet(j, *, pc_of_new: str | None = None, pc_of_existing: str | None = None):
+    """Another open journey of the same customer at another outlet, and the alert naming both PCs."""
+    with j.engine.begin() as connection:
+        set_tenant_context(connection, j.tenant_id)
+        outlet = connection.execute(
+            text("INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_code, outlet_name) "
+                 "VALUES (:t, :d, :c, 'Patia') RETURNING outlet_id"),
+            {"t": j.tenant_id, "d": j.dealer_id, "c": f"OO-{uuid4().hex[:6]}"}).scalar_one()
+        customer = connection.execute(
+            text("INSERT INTO auditcore.customers (tenant_id, dealer_id, outlet_id, customer_type_code, display_name) "
+                 "VALUES (:t, :d, :o, 'INDIVIDUAL', 'P2 Customer') RETURNING customer_id"),
+            {"t": j.tenant_id, "d": j.dealer_id, "o": outlet}).scalar_one()
+        other = connection.execute(
+            text("INSERT INTO auditcore.journeys (tenant_id, dealer_id, outlet_id, customer_id, journey_reference) "
+                 "VALUES (:t, :d, :o, :c, :r) RETURNING journey_id"),
+            {"t": j.tenant_id, "d": j.dealer_id, "o": outlet, "c": customer, "r": f"DUP-{uuid4().hex[:6]}"},
+        ).scalar_one()
+        payload = {"customerName": "A Customer", "model": "THAR", "uploadsBlocked": True,
+                   "newJourney": {"reference": "NEW-1", "pcActorId": pc_of_new or j.actor_id, "outletName": "Rasulgarh"},
+                   "existingJourney": {"reference": "OLD-1", "pcActorId": pc_of_existing, "outletName": "Patia"}}
+        connection.execute(
+            text("INSERT INTO auditcore.p2_tenant_alerts (tenant_id, alert_kind, subject_journey_id, "
+                 "subject_journey_reference, related_journey_id, alert_status, outcome, title, body, payload, "
+                 "published_at_utc, expires_at_utc) VALUES (:t, :k, :j, 'NEW-1', :o, 'PUBLISHED', 'FLAGGED', "
+                 "'Duplicate', 'Duplicate', CAST(:p AS jsonb), now(), now() + interval '1 day')"),
+            {"t": j.tenant_id, "k": SAME_DEALERSHIP_KIND, "j": j.journey_id, "o": other, "p": json.dumps(payload)})
+    return other
+
+
+def _block(j, actor: str):
+    with j.engine.begin() as connection:
+        set_tenant_context(connection, j.tenant_id)
+        return duplicate_block(connection, j.tenant_id, actor)
+
+
+@pytest.mark.parametrize("side", ["new", "existing"])
+def test_a_duplicate_booking_at_another_outlet_pauses_both_pcs_uploads(journey, side):
+    j, _ = journey
+    if side == "new":
+        _duplicate_at_another_outlet(j, pc_of_existing="pc-elsewhere")
+    else:
+        _duplicate_at_another_outlet(j, pc_of_new="pc-elsewhere", pc_of_existing=j.actor_id)
+    client = _client()
+    for response in (_init(client, j), _new_booking(client, j)):
+        assert response.status_code == 409, response.text
+        body = response.json()
+        assert body["errorCode"] == DUPLICATE_BLOCK_ERROR_CODE
+        assert "Contact the Reviewer to delete the duplicate booking" in body["detail"]
+        assert "NEW-1 (Rasulgarh) and OLD-1 (Patia)" in body["detail"]
+    status = client.get(f"/p2/v1/tenants/{j.tenant_id}/upload-pause").json()
+    assert status["paused"] is True and status["duplicateBooking"]["newJourney"]["reference"] == "NEW-1"
+    assert status["message"].startswith("NEW-1 (Rasulgarh) and OLD-1 (Patia) are the same customer")
+    # The other PC of the pair is paused too; anyone else is not.
+    assert _block(j, "pc-elsewhere") is not None
+    assert _block(j, "someone-else") is None
+
+
+def test_the_uploads_are_back_once_one_of_the_two_bookings_is_gone(journey):
+    j, _ = journey
+    other = _duplicate_at_another_outlet(j)
+    client = _client()
+    assert _init(client, j).status_code == 409
+    with j.engine.begin() as connection:  # the Reviewer deleted (or cancelled) the duplicate
+        set_tenant_context(connection, j.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code, business_status) "
+                 "VALUES (:t, :j, 'BOOKING', 'BOOKING_CANCELLED')"), {"t": j.tenant_id, "j": other})
+    assert _init(client, j).status_code == 200
+    assert client.get(f"/p2/v1/tenants/{j.tenant_id}/upload-pause").json()["paused"] is False
+
+
+def test_the_maintenance_pause_is_reported_before_a_duplicate_block(journey):
+    j, _ = journey
+    _duplicate_at_another_outlet(j)
+    _pause(j.engine, j.tenant_id)
+    _assert_refused(_init(_client(), j))
