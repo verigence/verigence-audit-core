@@ -1811,6 +1811,11 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     if taken_as_given:
         d_std = str(Decimal(d_std or 0) + sum((Decimal(r["current"]) for r in taken_as_given), Decimal(0)))
     d_bk, d_cur, d_bl = (_column_total(discount_rows, c) for c in ("booking", "current", "billed"))
+    if statement_policy:
+        # The NDC / cost sheet column's total holds only the benefits the deal counts: a
+        # discount printed elsewhere only (marked * on screen) is shown, never added
+        # (product owner 2026-11-04).
+        d_bl = _column_total([r for r in discount_rows if r.get("current") is not None], "billed")
     # Standard net: every line at its standard and the benefits the deal
     # qualifies for. A line the masters do not price (no standard on record)
     # is taken at what is charged for it and listed, so that Variance vs

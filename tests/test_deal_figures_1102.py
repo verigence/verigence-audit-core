@@ -201,6 +201,7 @@ def test_an_invoice_discount_the_ndc_does_not_give_is_shown_never_counted(journe
     on_invoice = [d for d in view["discounts"] if d["billedFrom"] == "invoice"]
     assert on_invoice and all(d["current"] is None and d["variance"] is None for d in on_invoice)
     assert D(view["summary"]["discounts"]["current"]) == D(5000)
+    assert D(view["summary"]["discounts"]["billed"]) == D(5000)  # the * figures are not in the column total
 
 
 def test_with_no_ndc_or_cost_sheet_no_discount_counts(journey) -> None:
