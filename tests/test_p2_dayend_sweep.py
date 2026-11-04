@@ -916,10 +916,11 @@ def test_the_action_belongs_to_the_image_quality_and_large_upload_tasks_only(jou
     # (2026-10-26: the large-upload notice is closed the same way, with a comment;
     # 2026-10-28: so is the information-only cost sheet / NDC difference;
     # 2026-11-02: and copies of the NDC or cost sheet that differ;
-    # 2026-11-04: and the TL's information task for a Reviewer's corrections.)
+    # 2026-11-04: and the TL's information task for a Reviewer's corrections;
+    # and a document's key figure not read, when it is not printed on it.)
     assert sorted(name for name, template in tasks.items() if CLOSE in template.actions) == [
-        "COST_SHEET_NDC_DIFFERENCE", "NDC_COPIES_DIFFERENCE", "PC_LARGE_UPLOAD_REVIEW", "PC_PAGE_QUALITY_REJECTED",
-        "REVIEWER_CORRECTIONS_INFO"]
+        "COST_SHEET_NDC_DIFFERENCE", "DOCUMENT_KEY_FIGURES_NOT_READ", "NDC_COPIES_DIFFERENCE",
+        "PC_LARGE_UPLOAD_REVIEW", "PC_PAGE_QUALITY_REJECTED", "REVIEWER_CORRECTIONS_INFO"]
     # The file's other failed page keeps its own, unchanged task and cannot use it.
     batch_id, rows = _file(journey, [("booking_form", "READY"), (None, "FAILED"), (None, "FAILED")])
     _fail(journey, rows[1]["queue_id"], BLUR)
