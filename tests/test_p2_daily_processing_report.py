@@ -362,9 +362,11 @@ def _file_with_pages(journey, shas: list[str], *, minutes_ago: float) -> str:
 def test_exact_duplicate_files_are_counted_per_pc(journey):
     tl = _tl(journey)
     a, b, c = (uuid4().hex for _ in range(3))
-    first = _file_with_pages(journey, [a, b], minutes_ago=30)          # new
-    again = _file_with_pages(journey, [b, a], minutes_ago=20)          # all pages seen before
-    more = _file_with_pages(journey, [a, c], minutes_ago=10)           # one new page: not a duplicate
+    # Minutes apart, not half an hour: run just after midnight IST the first file
+    # would otherwise fall on the day before the report's (CI, 5 Nov 00:15 IST).
+    first = _file_with_pages(journey, [a, b], minutes_ago=3)           # new
+    again = _file_with_pages(journey, [b, a], minutes_ago=2)           # all pages seen before
+    more = _file_with_pages(journey, [a, c], minutes_ago=1)            # one new page: not a duplicate
     with journey.engine.begin() as conn:                                # the same file uploaded again, cancelled
         set_tenant_context(conn, journey.tenant_id)
         conn.execute(
