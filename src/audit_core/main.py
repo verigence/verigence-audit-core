@@ -130,6 +130,12 @@ from audit_core.uc03_p2_gate_pass import router as uc03_p2_gate_pass_router
 from audit_core.uc03_p2_journey360_api import router as uc03_p2_journey360_router
 from audit_core.uc03_p2_journey_delete import router as uc03_p2_journey_delete_router
 from audit_core.uc03_p2_live import router as uc03_p2_live_router
+from audit_core.uc03_p2_location_checks import (
+    admin_router as uc03_p2_location_checks_admin_router,
+)
+from audit_core.uc03_p2_location_checks import (
+    router as uc03_p2_location_checks_router,
+)
 from audit_core.uc03_p2_missing_documents import (
     router as uc03_p2_missing_documents_router,
 )
@@ -321,6 +327,8 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_upload_pause_router)
     application.include_router(uc03_p2_upload_pause_admin_router)
     application.include_router(uc03_p2_daily_report_router)
+    application.include_router(uc03_p2_location_checks_router)
+    application.include_router(uc03_p2_location_checks_admin_router)
     application.include_router(onboarding_router)
     application.include_router(uc03_p2_deal_router)
     application.include_router(uc03_sku_standard_router)
