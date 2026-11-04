@@ -151,6 +151,7 @@ from audit_core.uc03_review_queue import router as uc03_review_queue_router
 from audit_core.uc03_review_value_normalization import (
     install_uc03_review_value_normalization,
 )
+from audit_core.uc03_reviewer_closure import router as uc03_reviewer_closure_router
 from audit_core.uc03_rule_registry import router as uc03_rule_registry_router
 from audit_core.uc03_rule_status_report import router as uc03_rule_status_report_router
 from audit_core.uc03_run_all_rules import router as uc03_run_all_rules_router
@@ -313,6 +314,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_live_router)
     application.include_router(uc03_p2_reviewer_router)
     application.include_router(uc03_not_mandatory_claims_router)
+    application.include_router(uc03_reviewer_closure_router)
     application.include_router(uc03_p2_journey_delete_router)
     application.include_router(uc03_p2_tenant_alerts_router)
     application.include_router(uc03_p2_bulk_upload_router)

@@ -4126,7 +4126,16 @@ def compliance_report(connection: Connection, *, tenant_id: str, journey_id: UUI
         "deal": {"summary": deal_view["summary"], "sku": deal_view["sku"], "flaggedLines": flagged_lines},
         "duplicates": dupes["pairs"],
         "openTasks": tasks,
+        # The Reviewer's closure summary (product owner 2026-11-04): every open
+        # item at closure and the specific answer given for it. None until closed.
+        "reviewerClosure": _reviewer_closure(connection, tenant_id=tenant_id, journey_id=journey_id),
     }
+
+
+def _reviewer_closure(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    from audit_core.uc03_reviewer_closure import latest_closure
+
+    return latest_closure(connection, tenant_id=tenant_id, journey_id=journey_id)
 
 
 def _timeline(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
