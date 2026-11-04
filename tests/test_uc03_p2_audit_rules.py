@@ -498,6 +498,33 @@ def test_tcs_above_one_percent_of_the_ex_showroom_raises_a_task() -> None:
     assert tcs_excess(sheet("999901")).outcome == "FAIL"
 
 
+def test_a_figure_that_cannot_be_right_for_a_car_raises_a_task() -> None:
+    """Product owner 2026-11-04: "check you are reading the correct values in
+    NDC and Cost sheet". Live 3 Nov: an ex-showroom read as Rs 19,285 (the
+    TCS), a premium of Rs 2,51,540 on a Rs 6,30,500 car, a premium of Re 1."""
+    from types import SimpleNamespace
+
+    from audit_core.uc03_p2_audit_rules import figure_implausible
+
+    ndc = [{"document": "NDC (Account Statement)", "documentType": "account_statement"}]
+
+    def facts(price: str, standard: str, insurance: str, rto: str = "60000") -> SimpleNamespace:
+        def row(key, label, amount, std=None):
+            return {"key": key, "label": label, "current": amount, "billed": amount, "standard": std,
+                    "sources": [{**ndc[0], "amount": amount}]}
+        return SimpleNamespace(sheet={"categories": [{"components": [
+            row("ex_showroom_price", "Ex-showroom price", price, standard),
+            row("insurance_amount", "Insurance premium", insurance),
+            row("road_tax_registration", "Road tax + registration", rto)]}], "discounts": [], "summary": {}})
+
+    assert figure_implausible(facts("630500", "630500", "35000")).outcome == "PASS"
+    misread = figure_implausible(facts("19285", "1928500", "77220", "146280"))
+    assert misread.outcome == "FAIL"
+    assert "Ex-showroom price ₹19,285 on the NDC (Account Statement): against the price master's ₹19,28,500" in misread.reason
+    assert "Insurance premium ₹2,51,540" in figure_implausible(facts("630500", "630500", "251540")).reason
+    assert "Insurance premium ₹1 on the NDC" in figure_implausible(facts("2236000", "2236000", "1")).reason
+
+
 def test_tcs_is_checked_on_the_ndc_then_the_cost_sheet_then_the_invoice() -> None:
     """Product owner 2026-11-04: "TCS is to be checked from NDC, Cost Sheet and
     then may be invoice and not the other way". With no NDC or cost sheet the

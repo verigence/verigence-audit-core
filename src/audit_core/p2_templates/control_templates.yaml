@@ -1448,6 +1448,23 @@ controls:
     task:
       type: FINDING_REVIEW
       owner: TL
+  FIGURE_IMPLAUSIBLE:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
+    category: Pricing & Commercial Anomalies
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: HIGH
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
   TCS_EXCESS:
     executor: NATIVE
     mode: RERUN

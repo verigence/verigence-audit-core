@@ -741,6 +741,47 @@ def tcs_excess(facts: _Facts) -> RuleOutcome:
                                      f"price {_rupees(price)}.")
 
 
+def figure_implausible(facts: _Facts) -> RuleOutcome:
+    """A figure the Deal took from a document that cannot be right for a car
+    (product owner 2026-11-04: "pls do check you are reading the correct
+    values in NDC and Cost sheet.. it cant be possible to be so horribly
+    wrong"). Live on 3 Nov: an NDC's ex-showroom read as Rs 19,285 (its TCS),
+    an insurance premium of Rs 2,51,540 on a Rs 6,30,500 car, a premium of
+    Re 1. Each is named with the document it was read from, for a person to
+    check the reading or the bill."""
+    code = "FIGURE_IMPLAUSIBLE"
+    rows = {c["key"]: c for g in facts.sheet["categories"] for c in g["components"]}
+    vehicle = rows.get("ex_showroom_price")
+    price = _charged(vehicle)
+    if price is None or price <= 0:
+        return RuleOutcome(code, "SKIPPED", "The ex-showroom price has not been read yet.")
+    odd: list[str] = []
+
+    def note(row: dict[str, Any], amount: Decimal, why: str) -> None:
+        odd.append(f"{row.get('label') or row['key']} {_rupees(amount)} on the {_billed_on(row, amount)}: {why}")
+
+    standard = _dec(vehicle.get("standard"))
+    if standard and (price < standard / 2 or price > standard * Decimal("1.5")):
+        note(vehicle, price, f"against the price master's {_rupees(standard)}")
+    for key, row in rows.items():
+        if key == "ex_showroom_price" or row.get("partOf") or row.get("excluded"):
+            continue
+        amount = _charged(row)
+        if amount is None or amount <= 0:
+            continue
+        if amount > price:
+            note(row, amount, f"more than the ex-showroom price {_rupees(price)}")
+        elif key == "insurance_amount" and not (price * Decimal("0.005") <= amount <= price * Decimal("0.12")):
+            note(row, amount, f"not a premium for a car of {_rupees(price)} (0.5% to 12% of its price)")
+        elif key == "road_tax_registration" and amount > price * Decimal("0.2"):
+            note(row, amount, f"more than 20% of the ex-showroom price {_rupees(price)}")
+    if odd:
+        return RuleOutcome(code, "FAIL", "Figures that cannot be right -- check the reading or the bill: "
+                           + "; ".join(odd) + ".", {"findingTitle": "A figure read that cannot be right",
+                                                    "figures": odd})
+    return RuleOutcome(code, "PASS", "Every figure is within the range a car's deal can have.")
+
+
 # ----------------------------------------------- bucket 2: after delivery
 
 
@@ -1425,7 +1466,7 @@ def self_insurance_declared(facts: _Facts) -> RuleOutcome:
 # that need a delivery run with the Delivery unit.
 _BOOKING_RULES = (
     booking_date_unusable,
-    deal_undercharged, excess_discount, tcs_short, tcs_excess,
+    deal_undercharged, excess_discount, tcs_short, tcs_excess, figure_implausible,
     third_party_payment_unconfirmed, third_party_payment_undeclared,
     # Cash transactions raise no tasks (product owner, 2026-10-31): no cash
     # intimation question, so neither it nor its finding runs.
@@ -1448,7 +1489,7 @@ RULE_CODES = {
 # The Findings catalogue entry each check raises under.
 _FINDING_TYPES = {
     "BOOKING_DATE_UNUSABLE": "PROCESS_NON_COMPLIANCE",
-    "DEAL_UNDERCHARGED": "PRICING_ANOMALY", "TCS_SHORT": "PRICING_ANOMALY", "TCS_EXCESS": "PRICING_ANOMALY", "EXCESS_DISCOUNT": "DISCOUNT_ANOMALY",
+    "DEAL_UNDERCHARGED": "PRICING_ANOMALY", "TCS_SHORT": "PRICING_ANOMALY", "TCS_EXCESS": "PRICING_ANOMALY", "FIGURE_IMPLAUSIBLE": "PRICING_ANOMALY", "EXCESS_DISCOUNT": "DISCOUNT_ANOMALY",
     "TRADE_IN_NOT_RESOLD": "COMMERCIAL_EXCEPTION", "TRADE_IN_SOLD_AT_LOSS": "COMMERCIAL_EXCEPTION",
     "DELIVERY_NOT_COMPLETED_IN_TIME": "DELIVERY_EXCEPTION",
     "ACCESSORY_FITTED_UNBILLED": "PROCESS_NON_COMPLIANCE",
