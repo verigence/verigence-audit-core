@@ -118,6 +118,9 @@ from audit_core.uc03_model_selection_corrections import (
 from audit_core.uc03_nightly_reprocessing_reports import (
     router as uc03_nightly_reprocessing_reports_router,
 )
+from audit_core.uc03_not_mandatory_claims import (
+    router as uc03_not_mandatory_claims_router,
+)
 from audit_core.uc03_p2_api import router as uc03_p2_router
 from audit_core.uc03_p2_bulk_upload import router as uc03_p2_bulk_upload_router
 from audit_core.uc03_p2_daily_report import router as uc03_p2_daily_report_router
@@ -309,6 +312,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_journey360_router)
     application.include_router(uc03_p2_live_router)
     application.include_router(uc03_p2_reviewer_router)
+    application.include_router(uc03_not_mandatory_claims_router)
     application.include_router(uc03_p2_journey_delete_router)
     application.include_router(uc03_p2_tenant_alerts_router)
     application.include_router(uc03_p2_bulk_upload_router)

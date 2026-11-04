@@ -484,6 +484,15 @@ def submit_action(
         details=details,
     )
 
+    if action == CLOSE_TASK and task["task_type"] == MISSING_DOCUMENT_TASK:
+        # "Document not required to be uploaded" is the PC's claim, decided by
+        # the Reviewer (product owner 2026-11-04, uc03_not_mandatory_claims).
+        from audit_core.uc03_not_mandatory_claims import is_claim, submit_claim
+
+        if is_claim(str((details or {}).get("choice") or "")):
+            return submit_claim(connection, tenant_id=tenant_id, task=task, actor_id=actor_id,
+                                actor_role_code=actor_role_code, comment=comment)
+
     if action == CLOSE_TASK:
         _close_quality_task(
             connection, tenant_id=tenant_id, task=task, actor_id=actor_id,

@@ -660,6 +660,20 @@ task_types:
     - PROVIDE_FEEDBACK
     - ACCEPT_EXCEPTION
     - ADD_COMMENT
+  # Every "not mandatory" claim a PC made on a journey's missing-document tasks,
+  # as ONE task for the Reviewer to accept or reject claim by claim (product owner
+  # 2026-11-04, uc03_not_mandatory_claims). Closes itself when none is pending.
+  NOT_MANDATORY_REVIEW:
+    category: TASK_CONFIRMATION
+    owner: REVIEWER
+    origin: SYSTEM
+    source: HUMAN_ACTION
+    completion: MACHINE_VERIFIED
+    # Decided claim by claim through POST .../not-mandatory-claims/{task}/decision,
+    # not ACCEPT/REJECT here (those belong to the requester confirmation).
+    actions:
+    - REVIEW_DOCUMENT
+    - ADD_COMMENT
   # Every value a Reviewer corrected on a journey, as ONE task for the Team Lead
   # (product owner 2026-11-04). For information: the corrections are already
   # applied; the TL closes it with a comment and a later correction reopens it.

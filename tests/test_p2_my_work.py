@@ -319,3 +319,20 @@ def test_a_reviewer_closes_a_pcs_task(setup):
         done = submit_action(connection, tenant_id=s.journey.tenant_id, task_id=pc_task, action="CLOSE_TASK",
                              actor_id="a-reviewer", actor_role_code="REVIEWER", comment="Clear copy is on file")
     assert done["status"] == "VERIFIED_COMPLETE"
+
+
+def test_worked_on_lists_the_tasks_the_caller_acted_on_closed_or_awaiting(setup):
+    """Product owner 2026-11-04: a tab for the PC and the Reviewer showing the
+    tasks they worked on, closed or awaiting closure."""
+    s = setup
+    worked = _journey_task(s, role="PC")
+    untouched = _journey_task(s, role="PC")
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        submit_action(connection, tenant_id=s.journey.tenant_id, task_id=worked, action="ADD_COMMENT",
+                      actor_id=s.journey.actor_id, actor_role_code="PC", comment="Asked the customer for it")
+    body = s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/tasks",
+                        params={"view": "worked", "role": "PC", "includeLegacy": "false"})
+    assert body.status_code == 200, body.text
+    ids = {str(t.get("task_id") or t.get("taskId")) for t in body.json()["items"]}
+    assert worked in ids and untouched not in ids
