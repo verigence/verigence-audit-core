@@ -5,7 +5,7 @@ import binascii
 import hashlib
 import json
 from datetime import date, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
@@ -51,6 +51,21 @@ class WorkItem(BaseModel):
     proposalReadyCount: int
     latestActivityAtUtc: datetime
     nextActionCode: str | None
+    # The closed marker every view shows (product owner 2026-11-04).
+    closed: bool = False
+    reviewerClosure: dict[str, Any] | None = None
+
+
+def with_closure(connection: Connection, *, tenant_id: str, items: list[WorkItem]) -> list[WorkItem]:
+    """Set each item's closed marker from one query (uc03_reviewer_closure.closure_states)."""
+    from audit_core.uc03_reviewer_closure import closure_states
+
+    states = closure_states(connection, tenant_id=tenant_id, journey_ids=[i.journeyId for i in items])
+    for item in items:
+        state = states.get(str(item.journeyId), {})
+        item.closed = bool(state.get("closed", False))
+        item.reviewerClosure = state.get("reviewerClosure")
+    return items
 
 
 class WorkItemFilters(BaseModel):
@@ -464,7 +479,8 @@ def list_work_items(
 
     has_more = len(rows) > limit
     page_rows = rows[:limit]
-    items = [_row_to_item(row, project_name=project_name) for row in page_rows]
+    items = with_closure(connection, tenant_id=tenant_id,
+                         items=[_row_to_item(row, project_name=project_name) for row in page_rows])
     next_cursor = None
     if has_more and page_rows:
         last = page_rows[-1]

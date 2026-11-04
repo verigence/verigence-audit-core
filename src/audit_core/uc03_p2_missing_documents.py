@@ -247,6 +247,9 @@ def build_missing_documents(connection: Connection, *, tenant_id: str, outlets: 
     missing = _missing_by_journey(connection, tenant_id, journey_ids) if journey_ids else {}
     gate_passes = _gate_pass_dates(connection, tenant_id, journey_ids) if journey_ids else {}
     other_tasks = _other_open_tasks(connection, tenant_id, journey_ids) if journey_ids else {}
+    from audit_core.uc03_reviewer_closure import closure_states
+
+    states = closure_states(connection, tenant_id=tenant_id, journey_ids=journey_ids)
 
     days: dict[date, list[dict[str, Any]]] = {}
     by_document: dict[str, dict[str, Any]] = {}
@@ -269,6 +272,9 @@ def build_missing_documents(connection: Connection, *, tenant_id: str, outlets: 
             "documents": [d["name"] for d in documents],
             "requirementKeys": [d["requirementKey"] for d in documents],
             "otherOpenTasks": other_tasks.get(jid, 0),
+            # The closed marker every view shows (2026-11-04).
+            "closed": states.get(jid, {}).get("closed", False),
+            "reviewerClosure": states.get(jid, {}).get("reviewerClosure"),
         })
         for d in documents:
             entry = by_document.setdefault(d["requirementKey"], {"name": d["name"], "requirementKey": d["requirementKey"],

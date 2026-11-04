@@ -21,6 +21,7 @@ from audit_core.uc03_work_items import (
     _encode_cursor,
     _filter_fingerprint,
     _row_to_item,
+    with_closure,
 )
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/uc03", tags=["uc03-work-items-fast"])
@@ -315,7 +316,8 @@ def list_first_work_items_fast(
         )
 
     return WorkItemPage(
-        items=[_row_to_item(row, project_name=project_name) for row in visible_rows],
+        items=with_closure(connection, tenant_id=tenant_id,
+                           items=[_row_to_item(row, project_name=project_name) for row in visible_rows]),
         pageSize=len(visible_rows),
         nextCursor=next_cursor,
         previousCursor=None,

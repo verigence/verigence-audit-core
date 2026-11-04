@@ -679,3 +679,42 @@ def closure_fields(row: Any) -> dict[str, Any]:
     if not status:
         return {"reviewerClosure": None}
     return {"reviewerClosure": {"status": status, "closedAtUtc": row.get("reviewer_closed_at_utc")}}
+
+
+def journey_closed_sql(journey_alias: str = "j") -> str:
+    """The one "closed" rule every view uses: Delivery complete, or the booking
+    cancelled / a duplicate / closed without delivery (as the Bookings list)."""
+    a = journey_alias
+    return (f"EXISTS (SELECT 1 FROM auditcore.journey_stage_states cst WHERE cst.tenant_id={a}.tenant_id "
+            f"AND cst.journey_id={a}.journey_id AND ((cst.stage_code='DELIVERY' AND cst.business_completed_at_utc "
+            f"IS NOT NULL) OR (cst.stage_code='BOOKING' AND (cst.business_status IN ('BOOKING_CANCELLED',"
+            f"'DUPLICATE_BOOKING') OR cst.closure_disposition='NO_DELIVERY'))))")
+
+
+def journey_closure_state(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """For a single-journey screen: closed or not, and the Reviewer's closure."""
+    row = connection.execute(
+        text(f"SELECT {journey_closed_sql('j')} AS closed, j.review_completed_at_utc, {closure_columns_sql('j')} "
+             "FROM auditcore.journeys j WHERE j.tenant_id=:t AND j.journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().one_or_none()
+    if row is None:
+        return {"closed": False, "reviewedAtUtc": None, "reviewerClosure": None}
+    return {"closed": bool(row["closed"]), "reviewedAtUtc": row["review_completed_at_utc"], **closure_fields(row)}
+
+
+def closure_states(connection: Connection, *, tenant_id: str, journey_ids: list[Any]) -> dict[str, dict[str, Any]]:
+    """The closed marker for many journeys at once, keyed by journey id (str):
+    {"closed", "reviewedAtUtc", "reviewerClosure"}. For list endpoints whose own
+    query is left as it is; one query whatever the page size."""
+    ids = sorted({str(j) for j in journey_ids if j})
+    if not ids:
+        return {}
+    rows = connection.execute(
+        text(f"SELECT j.journey_id, {journey_closed_sql('j')} AS closed, j.review_completed_at_utc, "
+             f"{closure_columns_sql('j')} FROM auditcore.journeys j "
+             "WHERE j.tenant_id=:t AND j.journey_id = ANY(CAST(:ids AS uuid[]))"),
+        {"t": tenant_id, "ids": ids},
+    ).mappings().all()
+    return {str(r["journey_id"]): {"closed": bool(r["closed"]), "reviewedAtUtc": r["review_completed_at_utc"],
+                                   **closure_fields(r)} for r in rows}

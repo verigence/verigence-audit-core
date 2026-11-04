@@ -252,3 +252,29 @@ def test_a_closure_not_decided_in_96_hours_is_accepted_automatically_and_listed(
                                status="AUTO_ACCEPTED")
     assert [c["closureId"] for c in listed["closures"]] == [result["closureId"]]
     assert listed["counts"]["AUTO_ACCEPTED"] == 1
+
+
+def test_every_view_reads_the_same_closed_marker(journey):
+    """Product owner 2026-11-04: show on every view a journey that got closed."""
+    from audit_core.uc03_reviewer_closure import closure_states, journey_closure_state
+
+    _ready_for_delivery(journey)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        before = journey_closure_state(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert before["closed"] is False and before["reviewerClosure"] is None
+    _closed_journey_after_ready = _close_ready(journey)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        one = journey_closure_state(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        many = closure_states(connection, tenant_id=journey.tenant_id, journey_ids=[journey.journey_id])
+    assert one["closed"] is True and one["reviewerClosure"]["status"] == "PENDING"
+    assert many[str(journey.journey_id)] == one
+    assert _closed_journey_after_ready["closureId"]
+
+
+def _close_ready(journey):
+    _role(journey, "REVIEWER")
+    preview = _preview(journey)
+    return _close(journey, "Delivery confirmed with the outlet manager",
+                  {item["key"]: f"Specific answer for {item['label']}" for item in preview["items"]})

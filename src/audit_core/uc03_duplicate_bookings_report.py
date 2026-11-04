@@ -100,6 +100,9 @@ class DuplicateBookingSide(BaseModel):
     productLabel: str | None = None
     bookingReference: str | None = None
     bookingConfirmDate: date | None = None
+    # The closed marker every view shows (product owner 2026-11-04).
+    closed: bool = False
+    reviewerClosure: dict[str, Any] | None = None
 
 
 class DuplicateBookingPair(BaseModel):
@@ -226,8 +229,11 @@ def _matched_fields(payload: Any) -> list[MatchedField]:
     return fields
 
 
-def _side(row: dict[str, Any], prefix: str) -> DuplicateBookingSide:
+def _side(row: dict[str, Any], prefix: str, states: dict[str, dict[str, Any]] | None = None) -> DuplicateBookingSide:
+    state = (states or {}).get(str(row[f"{prefix}_journey_id"]), {})
     return DuplicateBookingSide(
+        closed=state.get("closed", False),
+        reviewerClosure=state.get("reviewerClosure"),
         journeyId=row[f"{prefix}_journey_id"],
         journeyReference=row[f"{prefix}_journey_reference"],
         customerName=row[f"{prefix}_customer_name"],
@@ -334,6 +340,10 @@ def get_duplicate_bookings(
         },
     ).mappings().all()
 
+    from audit_core.uc03_reviewer_closure import closure_states
+
+    states = closure_states(connection, tenant_id=tenant_id, journey_ids=[
+        row[k] for row in rows for k in ("duplicate_journey_id", "holder_journey_id")])
     pairs = [
         DuplicateBookingPair(
             findingId=row["audit_finding_id"],
@@ -345,8 +355,8 @@ def get_duplicate_bookings(
             matchConfidencePercent=row["match_confidence_percent"],
             matchConfidenceLabel=row["match_confidence_label"],
             matchedFields=_matched_fields(row["matched_fields"]),
-            duplicate=_side(row, "duplicate"),
-            holder=_side(row, "holder"),
+            duplicate=_side(row, "duplicate", states),
+            holder=_side(row, "holder", states),
         )
         for row in rows
     ]
