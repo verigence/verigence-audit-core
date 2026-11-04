@@ -390,6 +390,22 @@ def test_a_bh_series_rto_is_not_compared_with_the_price_master(journey) -> None:
     assert rows[1]["standard"] == "41415"
 
 
+def test_a_financed_cars_rto_standard_includes_the_hypothecation_fee(journey) -> None:
+    """Product owner 2026-11-04: 74 journeys were Rs 1,500 above the price
+    master's RTO, each a financed car -- the RTO's hypothecation fee."""
+    from audit_core.uc03_p2_journey360 import _financed, _hypothecation_on_rto
+
+    rows = [{"key": "road_tax_registration", "standard": "80732.11", "flags": []},
+            {"key": "registration_charges", "standard": None, "partOf": "road_tax_registration", "flags": []},
+            {"key": "insurance_amount", "standard": "41415", "flags": []}]
+    _hypothecation_on_rto(rows)
+    assert rows[0]["standard"] == "82232.11" and "hypothecation" in rows[0]["standardBasis"]
+    assert rows[1]["standard"] is None and rows[2]["standard"] == "41415"
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        assert _financed(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id) is False
+
+
 def test_a_tcs_in_lakhs_on_the_booking_docket_is_a_misread_and_not_shown() -> None:
     """Live 2026-11-04 (SHI-SS-261027-007): the booking form's vehicle price,
     Rs 9,99,901, was read as its TCS and shown. TCS is 1% of the ex-showroom."""

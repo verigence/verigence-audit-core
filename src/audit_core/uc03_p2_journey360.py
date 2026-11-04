@@ -1685,6 +1685,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     vehicle_reading = selection["vehicle"]["representative"] if selection["vehicle"] else None
     sale_value = (vehicle_reading.get("vehicle") or {}).get("saleValue") if vehicle_reading else None
     _tcs_at_one_percent(all_rows)
+    if _financed(connection, tenant_id=tenant_id, journey_id=journey_id):
+        _hypothecation_on_rto(all_rows)
 
     # "Current" is what the deal stands at now: the billed figure; before
     # any invoice, what the booking offered. Once an invoice is on file, a
@@ -2347,6 +2349,32 @@ def _mark_insurance(groups: list[dict[str, Any]], *, self_insured: bool) -> None
             # Insurance is optional too: Inhouse (opted in, the default)
             # or Self (opted out), as the PC confirms it.
             row["opted"] = {"taken": not self_insured, "source": "insurance"}
+
+
+# The RTO's hypothecation (HP) fee on a financed car, which the price
+# master's RTO figure leaves out (product owner 2026-11-04: 74 journeys were
+# Rs 1,500 above the standard, each a financed car).
+_HYPOTHECATION_FEE = Decimal(os.environ.get("P2_RTO_HYPOTHECATION_FEE", "1500"))
+
+
+def _financed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """The deal is financed: the finance rule (uc03_finance_rule) keeps a
+    finance record exactly while a current document proves the loan."""
+    return bool(connection.execute(
+        text("SELECT EXISTS (SELECT 1 FROM auditcore.finance_records WHERE tenant_id=:t AND journey_id=:j)"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one())
+
+
+def _hypothecation_on_rto(all_rows: list[dict[str, Any]]) -> None:
+    """A financed car's RTO standard is the price master's RTO plus the
+    hypothecation fee, on the one RTO row that carries the standard."""
+    rto = next((r for key in (_RTO_COMBINED, *_RTO_PARTS) for r in all_rows
+                if r["key"] == key and not r.get("partOf") and r.get("standard") is not None), None)
+    if rto is None:
+        return
+    rto["standard"] = _money(_dec(rto["standard"]) + _HYPOTHECATION_FEE)
+    rto["standardBasis"] = f"the price master's RTO plus the hypothecation fee of Rs {_HYPOTHECATION_FEE} (financed)"
 
 
 def _tcs_at_one_percent(all_rows: list[dict[str, Any]]) -> None:

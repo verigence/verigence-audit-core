@@ -380,6 +380,9 @@ class StatementRead:
     refunds: Decimal = Decimal(0)
     # lines left blank on purpose, with why
     unmapped: list[dict[str, Any]] = field(default_factory=list)
+    # the customer's money received, line by line (not the finance D/O nor
+    # the old vehicle taken in kind): (row, amount)
+    received: list[tuple[dict[str, Any], Decimal]] = field(default_factory=list)
     conflicts: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -475,6 +478,8 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
                 # the old vehicle taken against the price, among the received
                 # lines on the Shivnath / Utkal forms: paid in kind
                 give("OLD_VEHICLE", "old_vehicle_value", amount)
+            elif not _NOT_MONEY_IN.fullmatch(label) and not row.get("discount_detail"):
+                out.received.append((row, amount))
             continue
         working = _WORKING.fullmatch(label)
         item = next((k for k, pattern in _WORKING_ITEMS if working and pattern.fullmatch(working["item"])), None)
@@ -1061,6 +1066,7 @@ def combine_statements(
     in_use = [reads[id(d)] for d in combined.used]
     primary = reads[id(combined.primary)]
     out.receipts = primary.receipts or next((r.receipts for r in in_use if r.receipts), Decimal(0))
+    out.received = primary.received or next((r.received for r in in_use if r.received), [])
     out.refunds = primary.refunds or next((r.refunds for r in in_use if r.refunds), Decimal(0))
     for read in in_use:
         out.unmapped.extend(read.unmapped)
@@ -1175,52 +1181,48 @@ def journey_cost_sheet(connection: Connection, *, tenant_id: str, journey_id: UU
 
 # The money the NDC lists as received, line by line (product owner
 # 2026-11-04: an NDC receipt line with no receipt document counts as paid,
-# as the customer ledger's do). The finance D/O is the loan, the trade-in the
-# old vehicle, refunds and a cash shortage are not money in.
+# as the customer ledger's do) -- the lines read_statement reads as received,
+# not the finance D/O (the loan), the trade-in (the old vehicle), refunds or a
+# cash shortage.
 _NOT_MONEY_IN = re.compile(r"(REFUND|CASH SHORTAGE)( .*)?")
 _MR_NUMBER = re.compile(r".*\bMR\.? ?NO\.?\s*([A-Z0-9][A-Z0-9/-]*).*")
 _BANK_WORDS = re.compile(r".*\b(BANK|NEFT|RTGS|IMPS|UPI|ONLINE|CHEQUE|PHONE ?PAY|GPAY)\b.*")
 
 
-def statement_received_lines(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def statement_received_lines(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], Decimal]:
     """The NDC's received lines, each with its amount, date and money receipt
-    number when it prints one."""
+    number when it prints one; and the customer's money they add up to."""
     from audit_core.uc03_p2_dates import parse_extracted_date
 
     out = []
-    for row in rows:
-        if row.get("discount_detail"):
-            continue
+    for row, amount in read_statement(rows).received:
         label = _label(row.get("particulars_raw"))
-        side = _side_amount(row)
-        if not label or side is None or _FINANCER.fullmatch(label) or _TRADE_IN.fullmatch(label) \
-                or _NOT_MONEY_IN.fullmatch(label) or not _RECEIPT.fullmatch(label):
-            continue
         number = _MR_NUMBER.fullmatch(label)
         mode = "CASH" if label.startswith("CASH") else "BANK_TRANSFER" if _BANK_WORDS.fullmatch(label) else "OTHERS"
-        out.append({"amount": side[1], "date": parse_extracted_date(row.get("entry_date")),
+        out.append({"amount": amount, "date": parse_extracted_date(row.get("entry_date")),
                     "number": number.group(1) if number else None,
                     "particulars": str(row.get("particulars_raw") or "").strip(), "voucherType": "NDC", "mode": mode})
-    return out
+    return out, sum((line["amount"] for line in out), Decimal(0))
 
 
 def journey_statement_received_lines(connection: Connection, *, tenant_id: str, journey_id: UUID
-                                     ) -> tuple[list[dict[str, Any]], str | None]:
+                                     ) -> tuple[list[dict[str, Any]], Decimal, str | None]:
     """The received lines of the NDC the Deal reads, never added across
     copies: the standing copy's, else the newest other page's that lists any
-    (as combine_statements takes the money received); and that document."""
+    (as combine_statements takes the money received); their total; and that
+    document."""
     documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
     forms = [(d, rows) for d in documents for rows in [line_rows(d["fields"].get("line_items"))]
              if statement_kind(rows) == KIND_FORM]
     _, copies = combine_statements(forms)
     if copies.primary is None:
-        return [], None
+        return [], Decimal(0), None
     rows_of = {id(d): rows for d, rows in forms}
     for document in [copies.primary, *[d for d in copies.used if d is not copies.primary]]:
-        lines = statement_received_lines(rows_of[id(document)])
+        lines, total = statement_received_lines(rows_of[id(document)])
         if lines:
-            return lines, str(document["documentId"])
-    return [], None
+            return lines, total, str(document["documentId"])
+    return [], Decimal(0), None
 
 
 def cost_sheet_discount(connection: Connection, *, tenant_id: str, journey_id: UUID) -> tuple[Decimal, str] | None:
