@@ -424,6 +424,12 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
         if discount is not None:
             give("DISCOUNT", discount, amount)
             continue
+        if row.get("discount_detail"):
+            # Printed among the statement's discounts under a name no benefit
+            # type matches ("Loyalty Govt Corporate", "Accessory MR"): a
+            # discount all the same, counted as the statement's other discount.
+            give("DISCOUNT", "OTHER_SCHEME", amount, label)
+            continue
         if _PRINTED_TOTAL.fullmatch(label):
             give("TOTAL", "printed_total", amount)
             continue
@@ -1127,7 +1133,42 @@ def load_ledger_documents(
         })
         if row["effective_value"] not in (None, "", "null"):
             doc["fields"][str(row["field_key"])] = row["effective_value"]
+    for doc in documents.values():
+        details = _discount_detail_rows(doc["fields"])
+        if details:
+            doc["fields"]["line_items"] = [*line_rows(doc["fields"].get("line_items")), *details]
     return list(documents.values())
+
+
+def _discount_detail_rows(fields: dict[str, Any]) -> list[dict[str, Any]]:
+    """The statement's discounts read into ``discount_details`` (label and
+    amount) rather than among its line items, as credit rows the reader takes
+    like any other (2026-11-04, independent check: UTKAL NDCs' "Corporate
+    Discount" 5,000, "Exchange Loyalty" 20,000, "Other Discount" 10,000 were
+    never counted, and the invoice's matching discounts were set aside as
+    not on the statement). A detail the line items already carry -- the same
+    amount on a row of the same benefit -- is not added again."""
+    raw = fields.get("discount_details")
+    details = line_rows(raw) if raw not in (None, "", "null") else []
+    if not details:
+        return []
+    existing = line_rows(fields.get("line_items"))
+
+    def benefit(label: str) -> str | None:
+        return next((k for k, pattern in _DISCOUNTS if pattern.fullmatch(label)), None)
+
+    taken = {(benefit(_label(r.get("particulars_raw"))) or _label(r.get("particulars_raw")),
+              _amount(r.get("credit_amount")) or _amount(r.get("debit_amount"))) for r in existing}
+    out = []
+    for detail in details:
+        label, amount = _label(detail.get("label") or detail.get("name")), _amount(detail.get("amount"))
+        if not label or amount is None or amount == 0:
+            continue
+        if ((benefit(label) or label), abs(amount)) in taken:
+            continue
+        out.append({"particulars_raw": detail.get("label") or detail.get("name"), "credit_amount": abs(amount),
+                    "discount_detail": True})
+    return out
 
 
 def _write_discount(

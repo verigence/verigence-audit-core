@@ -311,3 +311,30 @@ def test_a_cost_sheet_discount_already_in_its_price_is_not_given_again(journey) 
     assert _benefit(view, "CASH_DISCOUNT")["inPrice"] is True
     assert not any(d["key"] == "COST_SHEET_DISCOUNT" and d.get("current") for d in view["discounts"])
     assert view["summary"]["discounts"]["current"] is None
+
+
+def test_the_ndcs_discount_details_are_its_discounts(journey) -> None:
+    """2026-11-04, independent check: NDC discounts read into
+    ``discount_details`` rather than the line items were never counted
+    (UTK-BP-261102-010: Corporate 5,000, Exchange loyalty 20,000, Other
+    10,000; SHI-KB-261026-003: "Loyalty Govt Corporate" 5,000 among 37,000).
+    A detail the line items already carry is not counted twice; a name no
+    benefit type matches is still a discount."""
+    from p2_support import add_extracted_field
+
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    document_id, _ = _ledger(journey, [
+        {"particulars_raw": "Vehicle cost", "debit_amount": 1100000},
+        {"particulars_raw": "Corporate Discount", "credit_amount": 5000},
+        {"particulars_raw": "Finance D/O", "credit_amount": 900000},
+    ])
+    add_extracted_field(journey, di_document_id=document_id, field_key="discount_details", document_type="customer_ledger",
+                        value=[{"label": "Corporate Discount", "amount": 5000},
+                               {"label": "Exchange Loyalty SURPAGE BONUS", "amount": 20000},
+                               {"label": "Loyalty Govt Corporate", "amount": 3000}])
+    _sync(journey)
+    view = _deal(journey)
+    assert D(_benefit(view, "CORPORATE_PRIVILEGE")["current"]) == D(5000)
+    assert D(_benefit(view, "EXCHANGE_BONUS")["current"]) == D(20000)
+    assert D(_benefit(view, "OTHER_SCHEME")["current"]) == D(3000)
+    assert D(view["summary"]["discounts"]["current"]) == D(28000)
