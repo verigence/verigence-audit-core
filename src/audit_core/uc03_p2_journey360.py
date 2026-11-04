@@ -131,6 +131,8 @@ _DISCOUNT_LABELS = {
     # 2026-10-20: an invoice discount whose printed description names no
     # scheme stays its own line instead of being read as the consumer offer.
     UNCLASSIFIED_DISCOUNT: "Invoice discount (type not printed)",
+    # 2026-11-04: the cost sheet's discount total, beyond the benefits named on billing documents.
+    "COST_SHEET_DISCOUNT": "Discount on the cost sheet (type not printed)",
 }
 
 
@@ -1370,6 +1372,48 @@ def _one_benefit_per_figure(discount_rows: list[dict[str, Any]], *, offer_on_fil
             _take_back(row, same_as=same)
 
 
+COST_SHEET_DISCOUNT_KEY = "COST_SHEET_DISCOUNT"
+
+
+def _cost_sheet_benefits(discount_rows: list[dict[str, Any]], total: Decimal, document_id: str) -> None:
+    """The cost sheet standing in for the NDC prints its benefits as one
+    total, their types not printed (2026-11-04). It is the deal's offer
+    (product owner 2026-11-03: the NDC / cost sheet "should get the priority
+    and no way the initial offering has to be changed"); it was never counted,
+    so the deal was priced with no benefit -- 94 of 118 such deals on 3 Nov,
+    e.g. ADI-RD-261102-015's Rs 4,000 (paid in full less it).
+
+    * The benefits billing documents name (the ledger, credit notes) are part
+      of the total.
+    * When the invoice's discounts, set aside as not on the statement, make
+      up the rest (within Rs 10), they name it and count.
+    * Else the rest is one line, "Discount on the cost sheet (type not
+      printed)", whose entitlement cannot be matched."""
+    counted = sum((Decimal(r["current"]) for r in discount_rows if r.get("current") is not None
+                   and not r.get("sameAs")), Decimal(0))
+    # A discount already inside the price the cost sheet charges is part of
+    # its total too: never given a second time.
+    counted += sum((Decimal(r["billed"]) for r in discount_rows if r.get("inPrice") and r.get("billed") is not None),
+                   Decimal(0))
+    rest = total - counted
+    if rest <= _SAME_BENEFIT_TOLERANCE:
+        return
+    source = {"document": _document_label(_COST_SHEET_STANDIN_TYPE), "documentType": _COST_SHEET_STANDIN_TYPE,
+              "amount": _money(total), "documentId": document_id}
+    aside = [r for r in discount_rows if r.get("current") is None and r.get("billed") is not None
+             and "NOT_ON_STATEMENT" in (r.get("flags") or []) and not r.get("sameAs")]
+    if aside and abs(sum((Decimal(r["billed"]) for r in aside), Decimal(0)) - rest) <= _SAME_BENEFIT_TOLERANCE:
+        for row in aside:
+            row["current"], row["currentSource"] = row["billed"], "invoice"
+            row["flags"] = [f for f in row["flags"] if f != "NOT_ON_STATEMENT"]
+            row["sources"] = [*row["sources"], {**source, "checks": True}]
+            row["variance"] = _minus(row["current"], row["entitled"]) if row.get("entitled") is not None else None
+        return
+    row = _benefit_row_for(discount_rows, COST_SHEET_DISCOUNT_KEY)
+    _give(row, rest, how="document", sources=[source])
+    row["eligibility"] = row["eligibility"] or "NOT_EVALUATED"
+
+
 def _benefit_row_for(discount_rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
     """The Deal's row for a benefit, added when no document or master has
     shown it yet (a credit note naming it, say)."""
@@ -1666,6 +1710,13 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     _invoice_discounts_inside_the_price(all_rows, discount_rows)
     _one_benefit_per_figure(discount_rows, offer_on_file=offer_on_file)
     _link_credit_notes(credit_notes, discount_rows)
+    if offer_on_file and not any(_norm_type(s["source_document_type"]) == _norm_type(_STATEMENT_COLUMN_TYPE)
+                                 for s in sources):
+        from audit_core.uc03_account_statement import cost_sheet_discount
+
+        printed = cost_sheet_discount(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if printed is not None:
+            _cost_sheet_benefits(discount_rows, *printed)
     insurance["invoiceOnFile"] = _insurance_accounted(documents, sources, selection)
     insurance["vehicleInvoiced"] = vehicle_on_file
 

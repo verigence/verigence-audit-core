@@ -1044,6 +1044,17 @@ def chosen_copies(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     }
 
 
+def cost_sheet_discount(connection: Connection, *, tenant_id: str, journey_id: UUID) -> tuple[Decimal, str] | None:
+    """The cost sheet's discount total (one figure, its types not printed) and
+    the document it stands from, when the cost sheet prints one."""
+    sheet, copies = combine_cost_sheets(load_ledger_documents(
+        connection, tenant_id=tenant_id, journey_id=journey_id, document_type=COST_SHEET_TYPE))
+    if sheet is None or sheet.discount_total is None or copies.primary is None:
+        return None
+    origin = copies.origin.get(("SHEET", "discount_total"), copies.primary)
+    return sheet.discount_total, str(origin["documentId"])
+
+
 def standing_figures(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, dict[tuple[str, str], str | None]]:
     """For the Deal: every figure the dealer's books give now, as (line kind,
     key) -> the document it stands from, by source type -- exactly what
@@ -1569,6 +1580,7 @@ __all__ = [
     "COPIES_DIFFERENCE_TASK",
     "COST_SHEET_DIFFERENCE_TASK",
     "COST_SHEET_KEYS",
+    "cost_sheet_discount",
     "COST_SHEET_TYPE",
     "DECLARED_BALANCE",
     "DECLARED_NET",
