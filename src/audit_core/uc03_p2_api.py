@@ -3300,6 +3300,9 @@ def list_tasks(
               AND (CAST(:role AS varchar) IS NULL OR t.assigned_role_code=ANY(CAST(:roles AS varchar[]))
                    OR (t.origin_kind='HUMAN' AND t.raised_by_actor_id=:actor_id)
                    OR CAST(:view AS varchar)='worked')
+              -- The Team Lead's acceptance of a Reviewer's closure is not the Reviewer's to work.
+              AND NOT (t.task_type='CLOSURE_ACCEPTANCE'
+                       AND upper(COALESCE(CAST(:role AS varchar), ''))='REVIEWER')
               AND (
                 -- "Worked on" (product owner 2026-11-04): every task the caller acted on in the
                 -- last 30 days, closed or awaiting closure, whatever its role.

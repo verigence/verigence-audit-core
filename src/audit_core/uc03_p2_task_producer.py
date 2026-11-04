@@ -2208,7 +2208,13 @@ def sync_delivery_review_task(
     dedupe_key = f"delivery-review:{journey_id}"
     if state != "COMPLETE":
         return None
-    if delivery_reviewed(connection, tenant_id=tenant_id, journey_id=journey_id):
+    from audit_core.uc03_reviewer_closure import has_reviewer_closure
+
+    if delivery_reviewed(connection, tenant_id=tenant_id, journey_id=journey_id) or has_reviewer_closure(
+            connection, tenant_id=tenant_id, journey_id=journey_id):
+        # Reviewed -- or closed by a Reviewer, whose closure replaces the Team
+        # Lead's review (product owner 2026-11-04); a rejected closure goes back
+        # to the Reviewer (CLOSURE_REWORK), not to this task.
         resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=dedupe_key,
                         evidence={"reviewed": True, "verifiedAt": datetime.now(UTC).isoformat()})
         return "VERIFIED"

@@ -23,16 +23,33 @@ what the system already holds -- nothing is chosen by the Reviewer:
   information task.
 
 Closing needs a specific answer (10 characters or more) for EVERY item and an
-overall comment. It then completes the Delivery stage exactly as the
-Reviewer's "complete delivery" does, so the Team Lead's review follows as for
-any completed delivery, and writes the summary -- each item with its answer --
-to ``p2_journey_closures``. The latest closure is part of the journey's
-compliance report.
+overall comment. Product owner, 2026-11-04 (second part): "Reviewer's closure
+to replace the TL review ... TL should be now given consolidated informational
+task on what all things have been closed by Reviewer. TL needs to accept it or
+reject it. If TL doesnt take any action within 96 hours, then by default task
+gets accepted ... auto approve ... if it get rejected, TL select which
+specific tasks to be rejected, which gets open up again for Reviewer." So a
+closure:
+
+1. completes the Delivery (as the Reviewer's "complete delivery" does) and
+   marks the journey reviewed (``mark_delivery_reviewed``, actor the
+   Reviewer) -- the Team Lead's "Review the completed delivery" task closes;
+2. writes the summary -- each item with its answer -- to
+   ``p2_journey_closures``; the latest closure is in the compliance report;
+3. raises ONE information task for the Team Lead (CLOSURE_ACCEPTANCE) listing
+   every item and answer, due in 96 hours.
+
+The Team Lead accepts the closure, or rejects specific items, each with a
+reason. A rejection reopens the journey's review (SENT_BACK) and gives the
+Reviewer one task (CLOSURE_REWORK) listing the rejected items; on the next
+close the accepted items keep their answers and only the rejected ones need a
+new one. A closure nobody decides within 96 hours is accepted automatically
+(AUTO_ACCEPTED) by the worker's pass (``auto_accept_due``).
 """
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -55,7 +72,12 @@ _OPEN_TASK_STATUSES = ("READY", "IN_PROGRESS", "RETURNED", "ACTION_COMPLETED", "
 # Tasks that are not open work on the deal: the closure's own follow-up, the
 # Reviewer's combined claims task (its claims are read directly) and
 # information-only notices.
-_NOT_ITEMS = frozenset({"DELIVERY_REVIEW", "NOT_MANDATORY_REVIEW", "REVIEWER_CORRECTIONS_INFO"})
+_NOT_ITEMS = frozenset({"DELIVERY_REVIEW", "NOT_MANDATORY_REVIEW", "REVIEWER_CORRECTIONS_INFO",
+                        "CLOSURE_ACCEPTANCE", "CLOSURE_REWORK"})
+ACCEPTANCE_TASK = "CLOSURE_ACCEPTANCE"
+REWORK_TASK = "CLOSURE_REWORK"
+ACCEPTANCE_WINDOW_HOURS = 96
+DECIDING_ROLES = frozenset({"TL", "PM"})
 
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-reviewer-closure"])
 
@@ -155,26 +177,61 @@ def closure_items(connection: Connection, *, tenant_id: str, journey_id: UUID) -
             "prefilledAnswer": None, "claim": None,
         })
 
+    # After the Team Lead rejected items of the last closure: an item they
+    # accepted keeps its answer; a rejected one shows why and needs a new one.
+    last = latest_closure(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if last and last["acceptanceStatus"] == "REJECTED":
+        previous = {i["key"]: i for i in last["items"]}
+        rejected = {r["key"]: r for r in last["rejections"]}
+        for item in items:
+            if item["key"] in rejected:
+                item["prefilledAnswer"] = None
+                item["rejection"] = {"reason": rejected[item["key"]]["reason"],
+                                     "previousAnswer": (previous.get(item["key"]) or {}).get("answer")}
+            elif item["key"] in previous and previous[item["key"]].get("answer"):
+                item["prefilledAnswer"] = previous[item["key"]]["answer"]
+                item["carried"] = True
+
     blockers = [f"The PC's claim that “{c['document']}” is not mandatory is waiting for a decision."
                 for c in pending]
     return {"items": items, "blockers": blockers}
 
 
+def _closure_view(row: Any) -> dict[str, Any]:
+    summary = row["summary"] or {}
+    return {
+        "closureId": str(row["closure_id"]), "journeyId": str(row["journey_id"]),
+        "closedBy": row["closed_by_actor_id"], "closedRole": row["closed_by_role"],
+        "comment": row["comment"], "itemCount": int(row["item_count"]), "items": summary.get("items", []),
+        "counts": summary.get("counts", {}), "deliveryOutcome": row["delivery_outcome"],
+        "closedAtUtc": row["closed_at_utc"], "acceptanceStatus": row["acceptance_status"],
+        "acceptanceDueUtc": row["acceptance_due_utc"], "acceptanceTaskId": (str(row["acceptance_task_id"])
+                                                                           if row["acceptance_task_id"] else None),
+        "decidedBy": row["decided_by_actor_id"], "decidedRole": row["decided_by_role"],
+        "decidedAtUtc": row["decided_at_utc"], "rejections": row["rejections"] or [],
+    }
+
+
+_CLOSURE_COLUMNS = ("closure_id, journey_id, closed_by_actor_id, closed_by_role, comment, item_count, summary, "
+                    "delivery_outcome, closed_at_utc, acceptance_status, acceptance_due_utc, acceptance_task_id, "
+                    "decided_by_actor_id, decided_by_role, decided_at_utc, rejections")
+
+
 def latest_closure(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
     row = connection.execute(
-        text("SELECT closure_id, closed_by_actor_id, closed_by_role, comment, item_count, summary, delivery_outcome, "
-             "closed_at_utc FROM auditcore.p2_journey_closures WHERE tenant_id=:t AND journey_id=:j "
-             "ORDER BY closed_at_utc DESC LIMIT 1"),
+        text(f"SELECT {_CLOSURE_COLUMNS} FROM auditcore.p2_journey_closures WHERE tenant_id=:t AND journey_id=:j "
+             "ORDER BY closed_at_utc DESC, closure_id DESC LIMIT 1"),
         {"t": tenant_id, "j": journey_id},
     ).mappings().one_or_none()
-    if row is None:
-        return None
-    return {
-        "closureId": str(row["closure_id"]), "closedBy": row["closed_by_actor_id"], "closedRole": row["closed_by_role"],
-        "comment": row["comment"], "itemCount": int(row["item_count"]), "items": (row["summary"] or {}).get("items", []),
-        "counts": (row["summary"] or {}).get("counts", {}), "deliveryOutcome": row["delivery_outcome"],
-        "closedAtUtc": row["closed_at_utc"],
-    }
+    return _closure_view(row) if row else None
+
+
+def has_reviewer_closure(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """A journey a Reviewer closed: its review is the closure's, not the Team Lead's delivery review."""
+    return connection.execute(
+        text("SELECT EXISTS (SELECT 1 FROM auditcore.p2_journey_closures WHERE tenant_id=:t AND journey_id=:j)"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
 
 
 # --------------------------------------------------------------------------- closing
@@ -184,13 +241,30 @@ def close_journey(
     comment: str, answers: dict[str, str], correlation_id: str | None = None,
 ) -> dict[str, Any]:
     from audit_core.uc03_p2_runtime import note_facts_changed, record_activity
-    from audit_core.uc03_p2_workflow import complete_delivery_by_reviewer
+    from audit_core.uc03_p2_task_producer import (
+        resolve_if_open,
+        sync_delivery_review_task,
+    )
+    from audit_core.uc03_p2_tasks import create_p2_task, record_task_event
+    from audit_core.uc03_p2_workflow import (
+        complete_delivery_by_reviewer,
+        mark_delivery_reviewed,
+    )
 
     if actor_role.upper() not in CLOSING_ROLES:
         raise HTTPException(status_code=403, detail="Only a Reviewer closes a journey this way.")
     comment = (comment or "").strip()
     if len(comment) < MIN_ANSWER:
         raise HTTPException(status_code=422, detail="Write the closing comment (at least 10 characters).")
+    reviewed = connection.execute(
+        text("SELECT review_completed_at_utc IS NOT NULL FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j "
+             "FOR UPDATE"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one_or_none()
+    if reviewed is None:
+        raise HTTPException(status_code=404, detail="Journey not found.")
+    if reviewed:
+        raise HTTPException(status_code=409, detail="This journey is already reviewed and closed.")
     current = closure_items(connection, tenant_id=tenant_id, journey_id=journey_id)
     if current["blockers"]:
         raise HTTPException(status_code=409, detail=" ".join(current["blockers"]))
@@ -201,7 +275,8 @@ def close_journey(
         if len(answer) < MIN_ANSWER:
             unanswered.append(item["label"])
             continue
-        answered.append({**item, "answer": answer, "answerSource": "REVIEWER" if typed else "ACCEPTED_CLAIM"})
+        source = "REVIEWER" if typed else ("PREVIOUS_CLOSURE" if item.get("carried") else "ACCEPTED_CLAIM")
+        answered.append({**item, "answer": answer, "answerSource": source})
     if unanswered:
         raise HTTPException(
             status_code=422,
@@ -224,29 +299,213 @@ def close_journey(
     for item in answered:
         counts[item["kind"]] = counts.get(item["kind"], 0) + 1
     summary = {"items": answered, "counts": counts, "pendingAtCompletion": delivery.get("pending", [])}
-    closure_id = connection.execute(
+    row = connection.execute(
         text(
             """
             INSERT INTO auditcore.p2_journey_closures (
                 tenant_id, journey_id, closed_by_actor_id, closed_by_role, comment, item_count, summary,
-                delivery_outcome, correlation_id
-            ) VALUES (:t, :j, :actor, :role, :comment, :n, CAST(:summary AS jsonb), :outcome, :cid)
-            RETURNING closure_id
+                delivery_outcome, correlation_id, acceptance_due_utc
+            ) VALUES (:t, :j, :actor, :role, :comment, :n, CAST(:summary AS jsonb), :outcome, :cid,
+                      now() + make_interval(hours => :hours))
+            RETURNING closure_id, acceptance_due_utc
             """
         ),
         {"t": tenant_id, "j": journey_id, "actor": actor_id, "role": actor_role.upper(), "comment": comment,
-         "n": len(answered), "summary": _json(summary), "outcome": delivery["outcome"], "cid": correlation_id},
-    ).scalar_one()
+         "n": len(answered), "summary": _json(summary), "outcome": delivery["outcome"], "cid": correlation_id,
+         "hours": ACCEPTANCE_WINDOW_HOURS},
+    ).mappings().one()
+    closure_id, due = row["closure_id"], row["acceptance_due_utc"]
+
+    # The Reviewer's closure is the journey's review (it replaces the Team Lead's).
+    mark_delivery_reviewed(connection, tenant_id=tenant_id, journey_id=journey_id, actor_id=actor_id,
+                           actor_role="REVIEWER", correlation_id=correlation_id)
+    sync_delivery_review_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+    resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=_rework_key(journey_id),
+                    evidence={"closedAgain": str(closure_id)})
+
+    # One information task for the Team Lead: everything the Reviewer closed, with the answers.
+    count = len(answered)
+    listed = "; ".join(f"{i['label']}: {i['answer']}" for i in answered[:12])
+    more = f" (first 12 of {count} shown)" if count > 12 else ""
+    task_id = create_p2_task(
+        connection, tenant_id=tenant_id, journey_id=journey_id, task_type=ACCEPTANCE_TASK,
+        category="TASK_CONFIRMATION", origin_kind="SYSTEM", source_type="REVIEW", source_code=ACCEPTANCE_TASK,
+        dedupe_key=f"closure-acceptance:{closure_id}",
+        title=f"Reviewer closed the journey with {count} open item{'s' if count != 1 else ''} answered",
+        description=(f"The Reviewer closed this journey: “{comment}”. "
+                     + (f"Items closed{more}: {listed}. " if count else "Nothing was open. ")
+                     + f"Accept the closure, or reject specific items with a reason; it is accepted automatically "
+                       f"if not decided within {ACCEPTANCE_WINDOW_HOURS} hours."),
+        reference={"sourceCode": ACCEPTANCE_TASK, "closureId": str(closure_id), "comment": comment,
+                   "closedBy": actor_id, "items": answered, "counts": counts,
+                   "autoAcceptAtUtc": due.isoformat()},
+        severity="MEDIUM", priority="NORMAL", assigned_role_code="TL", assigned_actor_id=None,
+        raised_by_actor_id=actor_id, raised_by_role_code="REVIEWER",
+        allowed_actions=["REVIEW_DOCUMENT", "ADD_COMMENT"], completion_protocol="MACHINE_VERIFIED",
+        due_at_utc=due,
+    )
+    connection.execute(
+        text("UPDATE auditcore.p2_journey_closures SET acceptance_task_id=:task WHERE tenant_id=:t AND closure_id=:c"),
+        {"t": tenant_id, "c": closure_id, "task": task_id},
+    )
+    record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id, task_id=task_id, event_type="RAISED",
+                      actor_id=actor_id, actor_role_code="REVIEWER", details={"closureId": str(closure_id)})
     record_activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type="JOURNEY_CLOSED_BY_REVIEWER",
         subject_type="JOURNEY", subject_id=str(journey_id),
         details={"closureId": str(closure_id), "by": actor_id, "comment": comment, "counts": counts},
         correlation_id=correlation_id,
     )
-    if delivery["outcome"] == "COMPLETED":
-        note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id, reason="JOURNEY_CLOSED_BY_REVIEWER")
-    return {"closureId": str(closure_id), "deliveryOutcome": delivery["outcome"], "itemCount": len(answered),
-            "counts": counts}
+    note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id, reason="JOURNEY_CLOSED_BY_REVIEWER")
+    return {"closureId": str(closure_id), "deliveryOutcome": delivery["outcome"], "itemCount": count,
+            "counts": counts, "acceptanceTaskId": str(task_id), "autoAcceptAtUtc": due}
+
+
+def _rework_key(journey_id: UUID | str) -> str:
+    return f"closure-rework:{journey_id}"
+
+
+# --------------------------------------------------------------------------- the Team Lead's decision
+
+def _close_acceptance_task(connection: Connection, *, tenant_id: str, closure: dict[str, Any], outcome: str,
+                           actor_id: str, actor_role: str, comment: str | None,
+                           details: dict[str, Any]) -> None:
+    from audit_core.uc03_p2_tasks import record_task_event
+
+    task_id = closure["acceptanceTaskId"]
+    if not task_id:
+        return
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_tasks
+            SET task_status='VERIFIED_COMPLETE', verified_at_utc=now(), updated_at_utc=now(),
+                completed_by_actor_id=:actor,
+                completion_result=COALESCE(completion_result, '{}'::jsonb) || CAST(:result AS jsonb)
+            WHERE tenant_id=:t AND task_id=:id AND task_status <> 'VERIFIED_COMPLETE'
+            """
+        ),
+        {"t": tenant_id, "id": task_id, "actor": actor_id,
+         "result": _json({"outcome": outcome, "decidedBy": actor_id, "decidedRole": actor_role, **details})},
+    )
+    record_task_event(connection, tenant_id=tenant_id, journey_id=UUID(closure["journeyId"]), task_id=UUID(task_id),
+                      event_type=outcome, actor_id=actor_id, actor_role_code=actor_role, comment=comment,
+                      details=details)
+
+
+def decide_closure(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, closure_id: UUID, decision: str,
+    rejections: list[dict[str, str]] | None, comment: str | None, actor_id: str, actor_role: str,
+) -> dict[str, Any]:
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_runtime import record_activity
+    from audit_core.uc03_p2_task_producer import raise_or_refresh
+
+    role = (actor_role or "").upper()
+    if role not in DECIDING_ROLES:
+        raise HTTPException(status_code=403, detail="Only a Team Lead or Project Manager decides a closure.")
+    row = connection.execute(
+        text(f"SELECT {_CLOSURE_COLUMNS} FROM auditcore.p2_journey_closures WHERE tenant_id=:t AND journey_id=:j "
+             "AND closure_id=:c FOR UPDATE"),
+        {"t": tenant_id, "j": journey_id, "c": closure_id},
+    ).mappings().one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Closure not found on this journey.")
+    closure = _closure_view(row)
+    if closure["acceptanceStatus"] != "PENDING":
+        raise HTTPException(status_code=409, detail=f"This closure is already {closure['acceptanceStatus'].lower()}.")
+    decision = decision.upper()
+
+    if decision == "ACCEPT":
+        connection.execute(
+            text("UPDATE auditcore.p2_journey_closures SET acceptance_status='ACCEPTED', decided_by_actor_id=:a, "
+                 "decided_by_role=:r, decided_at_utc=now() WHERE tenant_id=:t AND closure_id=:c"),
+            {"t": tenant_id, "c": closure_id, "a": actor_id, "r": role},
+        )
+        _close_acceptance_task(connection, tenant_id=tenant_id, closure=closure, outcome="ACCEPTED",
+                               actor_id=actor_id, actor_role=role, comment=(comment or "").strip() or None,
+                               details={"closureId": str(closure_id)})
+        record_activity(connection, tenant_id=tenant_id, journey_id=journey_id, event_type="CLOSURE_ACCEPTED",
+                        subject_type="JOURNEY", subject_id=str(journey_id),
+                        details={"closureId": str(closure_id), "by": actor_id, "role": role})
+        return {"closureId": str(closure_id), "acceptanceStatus": "ACCEPTED"}
+
+    if decision != "REJECT":
+        raise HTTPException(status_code=422, detail="decision is ACCEPT or REJECT.")
+    by_key = {i["key"]: i for i in closure["items"]}
+    chosen: list[dict[str, str]] = []
+    problems: list[str] = []
+    for entry in rejections or []:
+        key, reason = str(entry.get("key") or ""), (entry.get("reason") or "").strip()
+        if key not in by_key:
+            problems.append(f"{key or '(no item)'} is not an item of this closure")
+        elif len(reason) < MIN_ANSWER:
+            problems.append(f"Say why “{by_key[key]['label']}” is rejected (at least 10 characters)")
+        else:
+            chosen.append({"key": key, "label": by_key[key]["label"], "kind": by_key[key]["kind"], "reason": reason})
+    if not chosen and not problems:
+        problems.append("Choose the items to reject, each with a reason")
+    if problems:
+        raise HTTPException(status_code=422, detail={"message": "The rejection is incomplete.", "problems": problems})
+
+    connection.execute(
+        text("UPDATE auditcore.p2_journey_closures SET acceptance_status='REJECTED', decided_by_actor_id=:a, "
+             "decided_by_role=:r, decided_at_utc=now(), rejections=CAST(:rej AS jsonb) "
+             "WHERE tenant_id=:t AND closure_id=:c"),
+        {"t": tenant_id, "c": closure_id, "a": actor_id, "r": role, "rej": _json(chosen)},
+    )
+    # The review is reopened: the Reviewer answers the rejected items again and closes again.
+    connection.execute(
+        text("UPDATE auditcore.journeys SET review_completed_at_utc=NULL, audit_state='SENT_BACK', "
+             "audit_outcome='PENDING', updated_at_utc=now() WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    )
+    _close_acceptance_task(connection, tenant_id=tenant_id, closure=closure, outcome="REJECTED", actor_id=actor_id,
+                           actor_role=role, comment=(comment or "").strip() or None,
+                           details={"closureId": str(closure_id), "rejections": chosen})
+    listed = "; ".join(f"{r['label']}: {r['reason']}" for r in chosen)
+    raise_or_refresh(
+        connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=_rework_key(journey_id),
+        task_type=REWORK_TASK, source_type="REVIEW", source_code=REWORK_TASK,
+        title=f"Team Lead rejected {len(chosen)} item{'s' if len(chosen) != 1 else ''} of your closure",
+        description=(f"The {('Team Lead' if role == 'TL' else 'Project Manager')} rejected: {listed}. Act on them, "
+                     "then close the journey again: the accepted items keep their answers."),
+        reference={"sourceCode": REWORK_TASK, "closureId": str(closure_id), "rejections": chosen,
+                   "fields": [str(closure_id)]},
+        severity="HIGH", registry=get_registry(),
+    )
+    record_activity(connection, tenant_id=tenant_id, journey_id=journey_id, event_type="CLOSURE_REJECTED",
+                    subject_type="JOURNEY", subject_id=str(journey_id),
+                    details={"closureId": str(closure_id), "by": actor_id, "role": role, "rejections": chosen})
+    return {"closureId": str(closure_id), "acceptanceStatus": "REJECTED", "rejected": len(chosen)}
+
+
+def auto_accept_due(connection: Connection, *, tenant_id: str) -> int:
+    """Accept every closure nobody decided within 96 hours (AUTO_ACCEPTED). Run by the worker."""
+    from audit_core.uc03_p2_runtime import record_activity
+
+    rows = connection.execute(
+        text(f"SELECT {_CLOSURE_COLUMNS} FROM auditcore.p2_journey_closures WHERE tenant_id=:t "
+             "AND acceptance_status='PENDING' AND acceptance_due_utc <= now() "
+             "ORDER BY acceptance_due_utc FOR UPDATE SKIP LOCKED LIMIT 200"),
+        {"t": tenant_id},
+    ).mappings().all()
+    for row in rows:
+        closure = _closure_view(row)
+        connection.execute(
+            text("UPDATE auditcore.p2_journey_closures SET acceptance_status='AUTO_ACCEPTED', "
+                 "decided_by_actor_id='SYSTEM', decided_by_role='SYSTEM', decided_at_utc=now() "
+                 "WHERE tenant_id=:t AND closure_id=:c"),
+            {"t": tenant_id, "c": row["closure_id"]},
+        )
+        _close_acceptance_task(connection, tenant_id=tenant_id, closure=closure, outcome="AUTO_ACCEPTED",
+                               actor_id="SYSTEM", actor_role="SYSTEM",
+                               comment=f"Not decided within {ACCEPTANCE_WINDOW_HOURS} hours: accepted automatically.",
+                               details={"closureId": closure["closureId"]})
+        record_activity(connection, tenant_id=tenant_id, journey_id=UUID(closure["journeyId"]),
+                        event_type="CLOSURE_AUTO_ACCEPTED", subject_type="JOURNEY", subject_id=closure["journeyId"],
+                        details={"closureId": closure["closureId"], "dueUtc": closure["acceptanceDueUtc"]})
+    return len(rows)
 
 
 # --------------------------------------------------------------------------- endpoints
@@ -255,6 +514,17 @@ class ClosureCommand(BaseModel):
     comment: str = Field(min_length=1, max_length=4000)
     # Item key (as the preview lists it) -> the specific answer for it.
     answers: dict[str, str] = Field(default_factory=dict)
+
+
+class ClosureRejection(BaseModel):
+    key: str = Field(min_length=1, max_length=300)
+    reason: str = Field(default="", max_length=2000)
+
+
+class ClosureDecision(BaseModel):
+    decision: Literal["ACCEPT", "REJECT"]
+    rejections: list[ClosureRejection] = Field(default_factory=list)
+    comment: str | None = Field(default=None, max_length=4000)
 
 
 @router.get("/journeys/{journey_id}/reviewer-closure")
@@ -268,10 +538,16 @@ def preview_closure(
                           authorization_client=authorization_client, permission_key="audit.journey.read")
     set_tenant_context(connection, tenant_id)
     current = closure_items(connection, tenant_id=tenant_id, journey_id=journey_id)
+    reviewed = connection.execute(
+        text("SELECT review_completed_at_utc IS NOT NULL FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
     return {
         "journeyId": str(journey_id),
-        "canClose": (access.operating_role or "").upper() in CLOSING_ROLES and not current["blockers"],
+        "canClose": (access.operating_role or "").upper() in CLOSING_ROLES and not current["blockers"] and not reviewed,
+        "reviewed": bool(reviewed),
         "minAnswerLength": MIN_ANSWER,
+        "acceptanceWindowHours": ACCEPTANCE_WINDOW_HOURS,
         **current,
         "lastClosure": latest_closure(connection, tenant_id=tenant_id, journey_id=journey_id),
     }
@@ -289,3 +565,117 @@ def post_closure(
     set_tenant_context(connection, tenant_id)
     return close_journey(connection, tenant_id=tenant_id, journey_id=journey_id, actor_id=access.actor_id,
                          actor_role=access.operating_role or "", comment=command.comment, answers=command.answers)
+
+
+@router.post("/journeys/{journey_id}/reviewer-closure/{closure_id}/decision")
+def post_closure_decision(
+    tenant_id: str, journey_id: UUID, closure_id: UUID, command: ClosureDecision,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    access = authorize_p2(connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+                          authorization_client=authorization_client, permission_key="audit.work.update")
+    set_tenant_context(connection, tenant_id)
+    return decide_closure(connection, tenant_id=tenant_id, journey_id=journey_id, closure_id=closure_id,
+                          decision=command.decision, rejections=[r.model_dump() for r in command.rejections],
+                          comment=command.comment, actor_id=access.actor_id,
+                          actor_role=access.operating_role or access.functional_role or "")
+
+
+_CLOSURE_STATUSES = frozenset({"PENDING", "ACCEPTED", "AUTO_ACCEPTED", "REJECTED"})
+
+
+@router.get("/reviewer-closures")
+def list_closures(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    status: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """Reviewer closures in the caller's outlets, newest first: the Team Lead's
+    pending decisions and the ones accepted automatically, which TL, PM and
+    Executive see (product owner 2026-11-04)."""
+    access = authorize_p2(connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,
+                          authorization_client=authorization_client, permission_key="audit.journey.read")
+    set_tenant_context(connection, tenant_id)
+    wanted = (status or "").upper() or None
+    if wanted and wanted not in _CLOSURE_STATUSES:
+        raise HTTPException(status_code=422, detail="status is PENDING, ACCEPTED, AUTO_ACCEPTED or REJECTED.")
+    cols = ", ".join(f"c.{c.strip()}" for c in _CLOSURE_COLUMNS.split(","))
+    rows = connection.execute(
+        text(
+            f"""
+            SELECT {cols}, j.journey_reference, COALESCE(cu.legal_name, cu.display_name) AS customer_name,
+                   o.outlet_name, d.dealer_name
+            FROM auditcore.p2_journey_closures c
+            JOIN auditcore.journeys j ON j.tenant_id=c.tenant_id AND j.journey_id=c.journey_id
+            JOIN auditcore.customers cu ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
+            JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+            JOIN auditcore.dealer_outlets o ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id
+                                           AND o.outlet_id=j.outlet_id
+            WHERE c.tenant_id=:t
+              AND (CAST(:status AS varchar) IS NULL OR c.acceptance_status=CAST(:status AS varchar))
+              AND EXISTS (
+                SELECT 1 FROM auditcore.business_assignments ba
+                WHERE ba.tenant_id=j.tenant_id AND ba.security_actor_id=:actor AND ba.assignment_status='ACTIVE'
+                  AND ba.effective_from <= now() AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                  AND (ba.dealer_id IS NULL OR (ba.dealer_id=j.dealer_id
+                       AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id))))
+            ORDER BY c.closed_at_utc DESC, c.closure_id DESC
+            LIMIT :limit
+            """
+        ),
+        {"t": tenant_id, "status": wanted, "actor": access.actor_id, "limit": max(1, min(limit, 500))},
+    ).mappings().all()
+    counts = {r["acceptance_status"]: int(r["n"]) for r in connection.execute(
+        text(
+            """
+            SELECT c.acceptance_status, count(*) AS n
+            FROM auditcore.p2_journey_closures c
+            JOIN auditcore.journeys j ON j.tenant_id=c.tenant_id AND j.journey_id=c.journey_id
+            WHERE c.tenant_id=:t AND EXISTS (
+                SELECT 1 FROM auditcore.business_assignments ba
+                WHERE ba.tenant_id=j.tenant_id AND ba.security_actor_id=:actor AND ba.assignment_status='ACTIVE'
+                  AND ba.effective_from <= now() AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                  AND (ba.dealer_id IS NULL OR (ba.dealer_id=j.dealer_id
+                       AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id))))
+            GROUP BY 1
+            """
+        ),
+        {"t": tenant_id, "actor": access.actor_id},
+    ).mappings().all()}
+    return {
+        "status": wanted,
+        "counts": {s: counts.get(s, 0) for s in sorted(_CLOSURE_STATUSES)},
+        "closures": [
+            {**_closure_view(r), "journeyReference": r["journey_reference"], "customerName": r["customer_name"],
+             "outletName": r["outlet_name"], "dealerName": r["dealer_name"]}
+            for r in rows
+        ],
+    }
+
+
+# --------------------------------------------------------------------------- shown on every journey view
+
+def closure_columns_sql(journey_alias: str = "j") -> str:
+    """Two columns any journey query adds so every view shows a Reviewer-closed
+    journey the same way (product owner 2026-11-04: "show in all the views
+    across the PC/TL/PM/Executives, journey which get closed"):
+    ``reviewer_closure_status`` (PENDING / ACCEPTED / AUTO_ACCEPTED / REJECTED of
+    the latest closure, or NULL) and ``reviewer_closed_at_utc``."""
+    a = journey_alias
+    latest = (f"FROM auditcore.p2_journey_closures rc WHERE rc.tenant_id={a}.tenant_id "
+              f"AND rc.journey_id={a}.journey_id ORDER BY rc.closed_at_utc DESC, rc.closure_id DESC LIMIT 1")
+    return (f"(SELECT rc.acceptance_status {latest}) AS reviewer_closure_status, "
+            f"(SELECT rc.closed_at_utc {latest}) AS reviewer_closed_at_utc")
+
+
+def closure_fields(row: Any) -> dict[str, Any]:
+    """The API shape of those two columns: ``reviewerClosure`` or None."""
+    status = row.get("reviewer_closure_status") if hasattr(row, "get") else None
+    if not status:
+        return {"reviewerClosure": None}
+    return {"reviewerClosure": {"status": status, "closedAtUtc": row.get("reviewer_closed_at_utc")}}
