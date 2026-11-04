@@ -103,6 +103,8 @@ router = APIRouter(
 _READ_PERMISSION = "audit.journey.read"
 _UPDATE_PERMISSION = "audit.journey.update"
 _WORK_UPDATE_PERMISSION = "audit.work.update"
+# Task Queue views. "worked" (2026-11-04): what the caller acted on, closed or awaiting closure.
+_TASK_VIEWS = frozenset({"open", "done", "all", "worked"})
 _DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 _ALLOWED_CONTENT_TYPES = {
     "application/pdf",
@@ -3296,9 +3298,16 @@ def list_tasks(
             WHERE t.tenant_id=:tenant_id
               AND (CAST(:journey_id AS uuid) IS NULL OR t.journey_id=CAST(:journey_id AS uuid))
               AND (CAST(:role AS varchar) IS NULL OR t.assigned_role_code=ANY(CAST(:roles AS varchar[]))
-                   OR (t.origin_kind='HUMAN' AND t.raised_by_actor_id=:actor_id))
+                   OR (t.origin_kind='HUMAN' AND t.raised_by_actor_id=:actor_id)
+                   OR CAST(:view AS varchar)='worked')
               AND (
-                (CAST(:status AS varchar) IS NOT NULL AND t.task_status=CAST(:status AS varchar))
+                -- "Worked on" (product owner 2026-11-04): every task the caller acted on in the
+                -- last 30 days, closed or awaiting closure, whatever its role.
+                (CAST(:view AS varchar)='worked' AND EXISTS (
+                    SELECT 1 FROM auditcore.p2_task_events we
+                    WHERE we.tenant_id=t.tenant_id AND we.task_id=t.task_id AND we.actor_id=:actor_id
+                      AND we.created_at_utc > now() - interval '30 days'))
+                OR (CAST(:status AS varchar) IS NOT NULL AND t.task_status=CAST(:status AS varchar))
                 OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='open'
                     AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER'))
                 OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='done'
@@ -3333,7 +3342,7 @@ def list_tasks(
             "journey_id": journey_id,
             "status": status,
             "actor_id": human_principal.subject,
-            "view": view if view in {"open", "done", "all"} else "open",
+            "view": view if view in _TASK_VIEWS else "open",
             "role": role,
             # A Reviewer's queue carries the Team Lead's tasks too (task_closure_roles).
             "roles": roles_closable_by(role),
@@ -3341,7 +3350,10 @@ def list_tasks(
     ).mappings().all()
 
     legacy_mode = "all" if includeLegacy else ("none" if includeLegacy is False else "unprocessed")
-    view_mode = view if view in {"open", "done", "all"} else "open"
+    view_mode = view if view in _TASK_VIEWS else "open"
+    if view_mode == "worked":
+        # Phase 1 tasks carry no per-person event trail to read "worked on" from.
+        legacy_mode = "none"
     # Existing (Phase 1) human tasks, read from their own table. Background
     # jobs in the same table (rule runs, reconciles) have no human owner and
     # are never shown.
