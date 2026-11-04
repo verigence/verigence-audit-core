@@ -73,6 +73,18 @@ def _list(board, **filters):
             outlet_id=filters.get("outlet_id"),
             date_from=filters.get("date_from"),
             date_to=filters.get("date_to"),
+            q=filters.get("q"),
+        ) if "state" not in filters else list_reviewer_journeys(
+            tenant_id=board.tenant_id,
+            human_principal=SimpleNamespace(subject=board.reviewer),
+            authorization_client=AllowAllAuthorization(role_key="REVIEWER"),
+            connection=connection,
+            state=filters["state"],
+            limit=200,
+            outlet_id=filters.get("outlet_id"),
+            date_from=filters.get("date_from"),
+            date_to=filters.get("date_to"),
+            q=filters.get("q"),
         )
 
 
@@ -110,3 +122,40 @@ def test_a_reversed_date_range_is_refused(board):
     with pytest.raises(HTTPException) as caught:
         _list(board, date_from=date(2026, 10, 12), date_to=date(2026, 10, 10))
     assert caught.value.status_code == 422
+
+
+def _all_refs(result) -> list[str]:
+    return sorted(j["journeyReference"] for g in result["outlets"] for j in g["journeys"])
+
+
+def test_search_finds_a_journey_by_its_number_and_narrows_the_picker(board):
+    # Product owner 2026-11-04: search on the Reviewer's board. On the server,
+    # so a board cut off at its row limit cannot hide a match.
+    result = _list(board, q="a-12")
+    assert _all_refs(result) == ["A-12"]
+    assert result["filters"]["q"] == "a-12"
+    assert {o["outletId"]: o["journeyCount"] for o in result["outletOptions"]} == {str(board.outlet_a): 1}
+
+
+def test_one_character_is_not_a_search(board):
+    assert _list(board, q="A")["journeyCount"] == _list(board)["journeyCount"]
+
+
+def test_a_search_across_both_states_marks_each_row(board):
+    with board.engine.begin() as connection:
+        set_tenant_context(connection, board.tenant_id)
+        journey_id = connection.execute(
+            text("SELECT journey_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_reference='B-10'"),
+            {"t": board.tenant_id},
+        ).scalar_one()
+        connection.execute(
+            text("INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code, business_status) "
+                 "VALUES (:t, :j, 'BOOKING', 'BOOKING_CANCELLED') "
+                 "ON CONFLICT (tenant_id, journey_id, stage_code) DO UPDATE SET business_status='BOOKING_CANCELLED'"),
+            {"t": board.tenant_id, "j": journey_id},
+        )
+    assert "B-10" not in _all_refs(_list(board, q="-10"))  # open only
+    both = _list(board, q="-10", state="all")
+    assert _all_refs(both) == ["A-10", "B-10"]
+    closed = {j["journeyReference"]: j["closed"] for g in both["outlets"] for j in g["journeys"]}
+    assert closed == {"A-10": False, "B-10": True}
