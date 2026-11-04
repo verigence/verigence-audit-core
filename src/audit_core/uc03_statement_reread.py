@@ -20,6 +20,11 @@ A tag containing "-misread-" picks, instead, the statements whose ex-showroom is
 implausible against the price book (see ex_showroom_implausible), printed net
 value or not, and reports after a commit how many still are.
 
+A tag containing "-norows-" picks, instead, the statements of which Document
+Intelligence read none of the rows -- only the totals (2026-11-04: 20 bookings,
+Utkal's "FINAL VEHICLE ACCOUNTS STATEMENT" among them, whose Deal then fell
+back to the invoice). The same safeguards hold.
+
 A tag containing "-copy-" does not ask DI again: it only copies the pages DI
 has already read (after a worker restart cut a run short).
 
@@ -110,7 +115,8 @@ def _corrected_fields(connection: Connection, tenant_id: str, journey_id: UUID, 
     ).scalar() or 0)
 
 
-def statement_items(connection: Connection, tenant_id: str, *, misread: bool = False) -> list[dict[str, Any]]:
+def statement_items(connection: Connection, tenant_id: str, *, misread: bool = False,
+                    no_rows: bool = False) -> list[dict[str, Any]]:
     """Every customer_ledger statement of the tenant, with whether it needs
     reading again and why not when it is left alone. ``misread`` picks the
     statements whose ex-showroom is implausible against the price book instead
@@ -147,7 +153,20 @@ def statement_items(connection: Connection, tenant_id: str, *, misread: bool = F
             corrected = _corrected_fields(connection, tenant_id, journey_id, di_document_id)
             reviewed = bool(stage) and stage_is_reviewed(
                 connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage)
-            if kind != KIND_FORM:
+            if no_rows:
+                if rows:
+                    decision = "SKIP_HAS_ROWS"
+                elif page is None or stage is None:
+                    decision = "SKIP_PAGE_UNKNOWN"
+                elif page["queue_status"] not in _SETTLED_PAGE_STATES:
+                    decision = "SKIP_PAGE_NOT_SETTLED"
+                elif corrected:
+                    decision = "SKIP_CORRECTED_BY_A_PERSON"
+                elif reviewed:
+                    decision = "SKIP_STAGE_REVIEWED"
+                else:
+                    decision = "REREAD"
+            elif kind != KIND_FORM:
                 decision = "SKIP_NOT_A_STATEMENT_FORM"
             elif misread and not implausible:
                 decision = "SKIP_EX_SHOWROOM_PLAUSIBLE"
@@ -167,7 +186,7 @@ def statement_items(connection: Connection, tenant_id: str, *, misread: bool = F
                 "journeyId": journey_id, "journeyReference": journey["journey_reference"],
                 "diDocumentId": di_document_id, "queueId": page["queue_id"] if page else None,
                 "queueStatus": page["queue_status"] if page else None, "stage": stage, "kind": kind,
-                "hasPrintedTotal": has_total, "exShowroomImplausible": implausible, "correctedFields": corrected, "stageReviewed": reviewed,
+                "rows": len(rows), "hasPrintedTotal": has_total, "exShowroomImplausible": implausible, "correctedFields": corrected, "stageReviewed": reviewed,
                 "decision": decision,
             })
     return items
@@ -303,16 +322,18 @@ def _reread(engine: Engine, tenant_id: str, items: list[dict[str, Any]], tag: st
     return counts
 
 
-def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> None:
+def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> dict[str, Any]:
     commit = tag.endswith("-commit")
     misread = "-misread-" in tag
+    no_rows = "-norows-" in tag
+    summary: dict[str, Any] = {}
     for tenant_id in tenant_ids:
         try:
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
                 if not account_statement_is_source_of_truth(connection, tenant_id=tenant_id):
                     continue
-                items = statement_items(connection, tenant_id, misread=misread)
+                items = statement_items(connection, tenant_id, misread=misread, no_rows=no_rows)
         except Exception:
             logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
             continue
@@ -340,5 +361,19 @@ def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> Non
                                    journey=item["journeyReference"], di_document_id=str(item["diDocumentId"]))
             except Exception:
                 logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
+        if no_rows and commit:
+            # what the statements hold now
+            try:
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    still = [i for i in statement_items(connection, tenant_id, no_rows=True) if i["rows"] == 0]
+                results["still_no_rows"] = len(still)
+                results["stillNoRows"] = sorted({str(i["journeyReference"]) for i in still})
+            except Exception:
+                logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
         logger.info("statement_reread_finished", tag=tag, tenant_id=tenant_id, commit=commit,
-                    statements=len(items), **{f"decision_{k.lower()}": v for k, v in totals.items()}, **results)
+                    statements=len(items), **{f"decision_{k.lower()}": v for k, v in totals.items()},
+                    **{k: v for k, v in results.items() if not isinstance(v, list)})
+        summary[tenant_id] = {"statements": len(items), "decisions": totals, **results,
+                              "picked": sorted({str(i["journeyReference"]) for i in items if i["decision"] == "REREAD"})}
+    return summary
