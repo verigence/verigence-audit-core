@@ -124,7 +124,13 @@ def _match(postings: list[dict[str, Any]], receipts: list[dict[str, Any]]) -> li
         hit = next((i for i in free if number and len(_number(receipts[i]["receipt_number"])) >= 4 and (
             number == _number(receipts[i]["receipt_number"])
             or (number.endswith(_number(receipts[i]["receipt_number"]))
-                and abs(Decimal(receipts[i]["amount"]) - posting["amount"]) <= 1))), None)
+                and abs(Decimal(receipts[i]["amount"]) - posting["amount"]) <= 1)
+            # the NDC writes only the receipt's serial ("RECEIPT 0608" for
+            # PB/26-27/0608; independent check 2026-11-04): the same receipt
+            # when the amounts agree within 1% (a digit misread)
+            or (len(number) >= 3 and _number(receipts[i]["receipt_number"]).endswith(number)
+                and abs(Decimal(receipts[i]["amount"]) - posting["amount"])
+                <= max(Decimal(1), Decimal(receipts[i]["amount"]) / 100)))), None)
         if hit is not None:
             free.remove(hit)
         else:
@@ -247,7 +253,8 @@ def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID)
         left = [p for p in _match(ndc_lines, taken) if not_the_loan(p)]
         on_file = sum((Decimal(r["amount"]) for r in receipts if not_the_loan({"amount": Decimal(r["amount"])})),
                       Decimal(0)) + sum((p["amount"] for p in out), Decimal(0))
-        if sum((p["amount"] for p in left), Decimal(0)) <= ndc_total - on_file + _NDC_TOLERANCE:
+        # (a receipt matched within 1% of its NDC line leaves that 1% of slack)
+        if sum((p["amount"] for p in left), Decimal(0)) <= ndc_total - on_file + max(_NDC_TOLERANCE, on_file / 100):
             out.extend({**p, "documentId": ndc_document, "documentLabel": "NDC (no receipt on file)"} for p in left)
     return out
 

@@ -15,7 +15,8 @@ savepoint that is ALWAYS rolled back (the stage recompute itself,
 uc03_p2_worker.settle_journey) and compares what it would write with what is
 stored: payments, the vehicle, the customer, the booking, the commercial
 lines, discounts, add-ons, finance, insurance, registration, vehicle and
-delivery records, and the booking's open tasks (raised and closed). When and
+delivery records, the figures each document prints for the Deal (2026-11-04),
+and the booking's open tasks (raised and closed). When and
 by whom a row was written is not a change, nor a resolved vehicle's names
 (the SKU check writes them after the recompute). It logs per booking what
 would change. With a
@@ -88,6 +89,18 @@ def snapshot(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         evidence = body.get("match_evidence")
         if isinstance(evidence, dict):
             evidence.pop("decidedAtUtc", None)
+    # The figures each document prints for the Deal (2026-11-04): a newly read
+    # ledger or cost-sheet line changes only these, and the Deal reads them, so
+    # a booking whose only change was here was never rebuilt.
+    tables["commercial_line_source_values"] = _rows(
+        connection,
+        f"""
+        SELECT concat_ws(':', x.line_kind, x.component_key, x.source_document_type, x.source_document_id) AS id,
+               (to_jsonb(x){strip}) AS body
+        FROM auditcore.commercial_line_source_values x WHERE x.tenant_id=:t AND x.journey_id=:j
+        """,
+        params,
+    )
     tables["customers"] = _rows(
         connection,
         f"""

@@ -905,13 +905,14 @@ def _flags(kind: str, standard: Any, booking: Any, billed: Any, ledger: Any) -> 
 _STANDARD_FLAGS = frozenset({"ABOVE_STANDARD", "BELOW_STANDARD", "OVER_ENTITLEMENT", "UNDER_ENTITLEMENT"})
 
 
-def _measured_flags(kind: str, flags: list[str], current: Any, standard: Any) -> list[str]:
+def _measured_flags(kind: str, flags: list[str], current: Any, standard: Any,
+                    tolerance: Decimal | None = None) -> list[str]:
     """The row's flags with the standard comparison taken on the figure the
     deal now stands at (2026-10-20, D-28: once an invoice is on file a
     booking-only figure no longer raises an entitlement flag)."""
     kept = [f for f in flags if f not in _STANDARD_FLAGS]
     cur, std = _dec(current), _dec(standard)
-    if cur is not None and std is not None and abs(cur - std) > _STANDARD_TOLERANCE:
+    if cur is not None and std is not None and abs(cur - std) > (tolerance or _STANDARD_TOLERANCE):
         if kind == "COMMERCIAL":
             kept.append("ABOVE_STANDARD" if cur > std else "BELOW_STANDARD")
         else:
@@ -2356,6 +2357,7 @@ def _mark_insurance(groups: list[dict[str, Any]], *, self_insured: bool) -> None
 # The RTO's hypothecation (HP) fee on a financed car, which the price
 # master's RTO figure leaves out (product owner 2026-11-04: 74 journeys were
 # Rs 1,500 above the standard, each a financed car).
+_TCS_TOLERANCE = Decimal(100)
 _HYPOTHECATION_FEE = Decimal(os.environ.get("P2_RTO_HYPOTHECATION_FEE", "1500"))
 
 
@@ -2388,7 +2390,8 @@ def _tcs_at_one_percent(all_rows: list[dict[str, Any]]) -> None:
     if price is None:
         return
     for row in all_rows:
-        if row["key"] != "tcs_amount" or row["standard"] is None:
+        # the TCS standard needs no price master (product owner 2026-11-04)
+        if row["key"] != "tcs_amount":
             continue
         due = (price * _TCS_RATE_PERCENT / 100).quantize(Decimal("0.01")) if price > _TCS_FREE_UP_TO else Decimal(0)
         row["standard"] = _money(due)
@@ -2594,7 +2597,9 @@ def _settle_component(row: dict[str, Any], situation: _DealSituation) -> None:
     _component_current(row, situation)
     if row["awaiting"] is None:
         row["variance"] = _minus(row["current"], row["standard"])
-        row["flags"] = _measured_flags("COMMERCIAL", row["flags"], row["current"], row["standard"])
+        # TCS is off when more than Rs 100 from 1% (product owner 2026-11-04)
+        row["flags"] = _measured_flags("COMMERCIAL", row["flags"], row["current"], row["standard"],
+                                       _TCS_TOLERANCE if row["key"] == "tcs_amount" else None)
     else:
         row["variance"] = None
         row["flags"] = [f for f in row["flags"] if f not in _STANDARD_FLAGS]

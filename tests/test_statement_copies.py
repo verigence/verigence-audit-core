@@ -107,22 +107,25 @@ def test_cost_sheet_copies_follow_the_same_rule() -> None:
     assert [(d["key"], d["other"]) for d in copies.differences] == [("insurance_amount", D(40000))]
 
 
-def test_of_a_quotation_and_the_final_cost_sheet_the_one_the_invoice_agrees_with_stands() -> None:
-    """16 journeys, 2026-11-04 (UTK-JP-261101-009): two cost sheets pricing
-    the car at Rs 17,95,276 (dated "2024-09-27", a misread) and Rs 17,77,500
-    (undated); the invoice bills Rs 17,77,500. With no invoice agreeing, the
-    newest copy stands as before."""
+def test_of_a_quotation_and_the_final_cost_sheet_the_one_the_proof_documents_agree_with_stands() -> None:
+    """16 journeys, 2026-11-04 (UTK-JP-261101-014): a quotation pricing the car
+    at Rs 9,96,500 with RTO 87,264 (dated "2024-09-15", a misread) and the
+    final sheet at Rs 9,78,501 with RTO 6,816. The invoice prints 9,96,500
+    gross and 9,78,501 net, the challan 6,816: the final sheet agrees on two
+    figures, the quotation on one. With no proof at all the newest stands."""
     quotation = {"documentId": uuid4(), "evidenceId": uuid4(), "linkedAtUtc": NOW,
-                 "fields": {"cost_sheet_date": "2024-09-27", "ex_showroom_price": "1795276", "rto_amount": "180000"}}
+                 "fields": {"cost_sheet_date": "2026-10-06", "ex_showroom_price": "996500", "rto_amount": "87264"}}
     final = {"documentId": uuid4(), "evidenceId": uuid4(), "linkedAtUtc": NOW,
-             "fields": {"ex_showroom_price": "1777500", "insurance_amount": "60000"}}
-    sheet, copies = module.combine_cost_sheets([quotation, final], billed_ex_showroom=(D("1777500.00"),))
-    assert copies.primary is final and sheet.components["ex_showroom_price"] == D(1777500)
-    assert "registration_charges" not in sheet.components  # the quotation's figures are only compared
-    _, copies = module.combine_cost_sheets([quotation, final], billed_ex_showroom=(D(1500000),))
-    assert copies.primary is quotation
-    _, copies = module.combine_cost_sheets([quotation, final])
-    assert copies.primary is quotation
+             "fields": {"cost_sheet_date": "2024-09-15", "ex_showroom_price": "978501", "rto_amount": "6816"}}
+    proof = {"ex_showroom_price": (D("996500.01"), D(978501)), "registration_charges": (D(6816),),
+             "insurance_amount": ()}
+    sheet, copies = module.combine_cost_sheets([quotation, final], proof=proof)
+    assert copies.primary is final and sheet.components["ex_showroom_price"] == D(978501)
+    assert sheet.components["registration_charges"] == D(6816)
+    # a tie (one figure each) leaves the newest copy standing, as with no proof
+    tie = {**proof, "registration_charges": ()}
+    assert module.combine_cost_sheets([quotation, final], proof=tie)[1].primary is quotation
+    assert module.combine_cost_sheets([quotation, final])[1].primary is quotation
 
 
 # ── the sync and the Deal ────────────────────────────────────────────────────

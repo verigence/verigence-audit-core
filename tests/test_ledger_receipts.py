@@ -194,3 +194,30 @@ def test_an_ndc_receipt_line_with_no_receipt_on_file_counts_as_paid_once(journey
     assert D(view["receiptsTotal"]) == D(95000)
     _sync(journey)
     assert D(_payments(journey)["receiptsTotal"]) == D(95000)
+
+
+def test_the_offer_letters_booking_amount_is_its_plan_and_its_receipt_serials_are_the_receipts(journey) -> None:
+    """Independent check 2026-11-04 (5 of 6 Offer Letter / Payment Details
+    statements): the letter plans "BOOKING AMOUNT 21,000" and lists the money
+    as "RECEIPT 0608 21,000" -- one payment, receipt PB/26-27/0608 on file --
+    and the booking amount was added again as money with no receipt."""
+    from audit_core.uc03_account_statement import read_statement
+
+    letter = [
+        {"particulars_raw": "VEHICLE PRICE", "debit_amount": 2235147},
+        {"particulars_raw": "BOOKING AMOUNT", "credit_amount": 21000},
+        {"particulars_raw": "DOWNPAYMENT (15-23)", "credit_amount": 250000},
+        {"particulars_raw": "RECEIPT 0608", "credit_amount": 21000},
+        {"particulars_raw": "RECEIPT 0695", "credit_amount": 250000},
+        {"particulars_raw": "RECEIPT 0847", "credit_amount": 10814},
+    ]
+    assert read_statement(letter).receipts == D(281814)
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    add_receipt_payment(journey, amount="21000", receipt_number="PB/26-27/0608", receipt_date="2026-09-20")
+    add_receipt_payment(journey, amount="250335", receipt_number="PB/26-27/0695", receipt_date="2026-10-10")
+    _ledger(journey, letter)
+    _sync(journey)
+    view = _payments(journey)
+    # 0608 and 0695 (a digit misread, within 1%) are the receipts on file; 0847 is not on file
+    assert [(i["receiptNumber"], D(i["amount"])) for i in view["items"] if i.get("fromLedger")] == [
+        ("0847", D(10814))]

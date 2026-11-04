@@ -410,9 +410,17 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
     def give(kind: str, key: str, amount: Decimal, row: str = "") -> None:
         found.setdefault((kind, key, row), []).append(amount)
 
+    # The Offer Letter / Payment Details form plans the payment ("BOOKING
+    # AMOUNT", "FINANCE AMOUNT", "DOWNPAYMENT") and then lists the money
+    # received as numbered receipts ("RECEIPT 0608"): its booking amount is
+    # the plan's, the money itself is among the receipts (independent check
+    # 2026-11-04: 5 of 6 such letters counted the booking amount twice).
+    plans_its_receipts = any(_NUMBERED_RECEIPT.fullmatch(_label(row.get("particulars_raw"))) for row in lines)
     for row in lines:
         label = _label(row.get("particulars_raw"))
         side = _side_amount(row)
+        if plans_its_receipts and _PLANNED_BOOKING.fullmatch(label):
+            continue
         if side is None and (written := _AMOUNT_IN_LABEL.fullmatch(label)) is not None \
                 and any(pattern.fullmatch(written["label"]) for _, pattern in _CHARGES):
             # A charge's amount written into its label, the amount column
@@ -782,6 +790,7 @@ _TALLY_CHARGES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r".*(\bPERMIT\b|CHOICE NUMBER|\bTR CHARGES\b).*"), "other_charges"),
 )
 _TALLY_BENEFIT_VOUCHER = re.compile(r".*CREDIT ?NOTE.*")
+_TALLY_DISCOUNT_JOURNAL = re.compile(r"DISCOUNT ALLOWED( .*)?")
 
 
 @dataclass
@@ -811,8 +820,13 @@ def read_tally_lines(lines: list[dict[str, Any]]) -> TallyLines:
             key = next((k for pattern, k in _TALLY_CHARGES if pattern.fullmatch(label)), None)
             if key is not None:
                 out.components[key] = out.components.get(key, Decimal(0)) + debit
-        elif credit and credit > 0 and _TALLY_BENEFIT_VOUCHER.fullmatch(voucher):
+        elif credit and credit > 0 and (_TALLY_BENEFIT_VOUCHER.fullmatch(voucher)
+                                        or _TALLY_DISCOUNT_JOURNAL.fullmatch(label)):
             key = classify_discount(label)
+            if key == UNCLASSIFIED_DISCOUNT and _TALLY_DISCOUNT_JOURNAL.fullmatch(label):
+                # "DISCOUNT ALLOWED (NO GST)" posted by journal (independent
+                # check 2026-11-04, ADI-SJ-261023-015): the dealer's own discount
+                key = "ADDITIONAL_DISCOUNT"
             if key == UNCLASSIFIED_DISCOUNT:
                 continue
             out.discounts[key] = out.discounts.get(key, Decimal(0)) + credit
@@ -1075,7 +1089,7 @@ def combine_statements(
 
 
 def combine_cost_sheets(
-    sheets: list[dict[str, Any]], *, billed_ex_showroom: tuple[Decimal, ...] = (),
+    sheets: list[dict[str, Any]], *, proof: dict[str, tuple[Decimal, ...]] | None = None,
 ) -> tuple[CostSheetRead | None, Combined]:
     """The cost sheet the Deal reads, from every cost sheet on file, by the
     same rule as the statement's copies; a copy that reads nothing is not one.
@@ -1083,8 +1097,12 @@ def combine_cost_sheets(
     Two full cost sheets that price the vehicle differently are the
     quotation and the final sheet (16 journeys, 2026-11-04; their dates are
     often misread -- "2024-09-15" on a 2026 deal): the final one is the one
-    the vehicle invoice agrees with, so it stands whatever its date. With no
-    invoice on file, or none agreeing, the newest copy stands as before."""
+    the deal's own proof documents agree with -- the RTO challan's total, the
+    policy's premium, the invoice's price (gross or net of its discount) --
+    so the copy with the most figures agreeing stands whatever its date. The
+    invoice's gross price alone also matches a quotation (independent check
+    2026-11-04: UTK-JP-261101-014, UTK-JI-261026-002), so one figure decides
+    nothing against more. With no clear winner the newest copy stands."""
     copies = []
     for document in sheets:
         read = read_cost_sheet(document["fields"])
@@ -1097,11 +1115,15 @@ def combine_cost_sheets(
             copies.append(Copy(document=document, day=_copy_day(document["fields"], _COST_SHEET_DATE_FIELDS),
                                figures=figures, full="ex_showroom_price" in read.components))
     full = [c for c in copies if c.full]
-    agreeing = [c for c in full if any(abs(c.figures[("COMMERCIAL", "ex_showroom_price")] - Decimal(bill)) <= TOLERANCE
-                                       for bill in billed_ex_showroom)]
-    if agreeing and len(agreeing) < len(full):
-        for copy in agreeing:
-            copy.billed = True
+
+    def agreeing(copy: Copy) -> int:
+        return sum(1 for key, figures in (proof or {}).items()
+                   if ("COMMERCIAL", key) in copy.figures
+                   and any(abs(copy.figures[("COMMERCIAL", key)] - Decimal(f)) <= TOLERANCE for f in figures))
+
+    scores = sorted((agreeing(c) for c in full), reverse=True)
+    if len(full) > 1 and scores[0] > 0 and scores[0] > scores[1]:
+        next(c for c in full if agreeing(c) == scores[0]).billed = True
     combined = combine_copies(copies)
     if combined.primary is None:
         return None, combined
@@ -1155,16 +1177,36 @@ def chosen_copies(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     }
 
 
-def _billed_ex_showroom(connection: Connection, *, tenant_id: str, journey_id: UUID) -> tuple[Decimal, ...]:
-    """The ex-showroom each vehicle invoice on file prints, read on its own."""
+def _proof_figures(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, tuple[Decimal, ...]]:
+    """What the deal's proof documents print, to tell the final cost sheet
+    from a quotation: each vehicle invoice's price, gross and net of its
+    discount; each RTO challan's total; each policy's premium."""
     from audit_core.uc03_invoice_materialization import load_invoice_readings
 
-    figures = []
+    prices = []
     for reading in load_invoice_readings(connection, tenant_id=tenant_id, journey_id=journey_id):
-        value = (reading.get("lines") or {}).get("ex_showroom_price")
-        if value is not None:
-            figures.append(Decimal(str(value)))
-    return tuple(figures)
+        vehicle = reading.get("vehicle") or {}
+        for value in ((reading.get("lines") or {}).get("ex_showroom_price"), vehicle.get("saleValue")):
+            if value is not None:
+                prices.append(Decimal(str(value)))
+    printed: dict[str, list[Decimal]] = {"registration_charges": [], "insurance_amount": []}
+    for document_type, field_key, key in (("rto_challan", "grand_total_amount", "registration_charges"),
+                                          ("insurance_cover", "premium_amount", "insurance_amount")):
+        for value in connection.execute(
+            text(
+                """
+                SELECT f.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields f
+                JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id
+                 AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE' AND e.document_type_key=:type
+                WHERE f.tenant_id=:t AND f.journey_id=:j AND f.field_key=:field
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "type": document_type, "field": field_key},
+        ).scalars().all():
+            amount = _amount(value)
+            if amount is not None and amount > 0:
+                printed[key].append(amount)
+    return {"ex_showroom_price": tuple(prices), **{k: tuple(v) for k, v in printed.items()}}
 
 
 def journey_cost_sheet(connection: Connection, *, tenant_id: str, journey_id: UUID,
@@ -1175,8 +1217,7 @@ def journey_cost_sheet(connection: Connection, *, tenant_id: str, journey_id: UU
                                        document_type=COST_SHEET_TYPE)
     if len(sheets) < 2:
         return combine_cost_sheets(sheets)
-    return combine_cost_sheets(sheets, billed_ex_showroom=_billed_ex_showroom(
-        connection, tenant_id=tenant_id, journey_id=journey_id))
+    return combine_cost_sheets(sheets, proof=_proof_figures(connection, tenant_id=tenant_id, journey_id=journey_id))
 
 
 # The money the NDC lists as received, line by line (product owner
@@ -1185,7 +1226,9 @@ def journey_cost_sheet(connection: Connection, *, tenant_id: str, journey_id: UU
 # not the finance D/O (the loan), the trade-in (the old vehicle), refunds or a
 # cash shortage.
 _NOT_MONEY_IN = re.compile(r"(REFUND|CASH SHORTAGE)( .*)?")
-_MR_NUMBER = re.compile(r".*\bMR\.? ?NO\.?\s*([A-Z0-9][A-Z0-9/-]*).*")
+_MR_NUMBER = re.compile(r".*\b(?:MR\.? ?NO\.?|RECEIPT)\s*([A-Z0-9/-]*\d[A-Z0-9/-]*).*")
+_NUMBERED_RECEIPT = re.compile(r"RECEIPT (NO\.? ?)?[A-Z0-9/-]*\d{3,}[A-Z0-9/-]*")
+_PLANNED_BOOKING = re.compile(r"BOOKING AMOUNT")
 _BANK_WORDS = re.compile(r".*\b(BANK|NEFT|RTGS|IMPS|UPI|ONLINE|CHEQUE|PHONE ?PAY|GPAY)\b.*")
 
 
