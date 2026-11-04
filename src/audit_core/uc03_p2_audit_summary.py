@@ -35,6 +35,7 @@ from uuid import UUID
 from sqlalchemy import Connection, text
 
 TOLERANCE = Decimal(10)
+_TCS_TOLERANCE = Decimal(100)
 
 # Conclusions, as the screen shows them.
 OK = "OK"                      # agrees, within Rs 10
@@ -245,6 +246,11 @@ def conclude_charge(row: dict[str, Any], *, on_file: set[str],
     if proof_types:
         out["proof"] = {"documents": list(proof_types), "onFile": any(t in on_file for t in proof_types),
                         "amount": money(proof_amount)}
+    if billed is None and key == "tcs_amount" and standard is not None and standard > 0:
+        # TCS not charged on a car that owes it is TCS short, not undetermined
+        # (product owner 2026-11-04; independent check: CANNOT_DETERMINE shown).
+        billed = Decimal(0)
+        out.update(billed=money(billed), billedFrom="no bill charges it")
     if billed is None:
         out.update(conclusion=CANNOT, reason="Not billed on any document on file.")
         return out
@@ -272,7 +278,9 @@ def conclude_charge(row: dict[str, Any], *, on_file: set[str],
         return out
     diff = billed - standard
     out["difference"] = money(diff)
-    if abs(diff) <= TOLERANCE:
+    # TCS is off when more than Rs 100 from 1% (product owner 2026-11-04), the
+    # tolerance of the TCS checks themselves
+    if abs(diff) <= (_TCS_TOLERANCE if key == "tcs_amount" else TOLERANCE):
         out.update(conclusion=OK, rule="AS-01")
     else:
         out.update(conclusion=EXCEPTION, rule="AS-01", impact=CUSTOMER if diff > 0 else COMPANY,

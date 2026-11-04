@@ -419,3 +419,13 @@ def test_a_tcs_in_lakhs_on_the_booking_docket_is_a_misread_and_not_shown() -> No
     rows[1]["booking"], rows[1]["flags"] = "9999", []
     _tcs_read_wrongly(rows)
     assert rows[1]["booking"] == "9999" and rows[1]["flags"] == []
+
+
+def test_a_discount_the_ledger_posts_by_journal_is_a_benefit() -> None:
+    """Independent check 2026-11-04 (ADI-SJ-261023-015): "DISCOUNT ALLOWED (NO
+    GST) 8,000" posted by journal, not credit note, was dropped."""
+    rows = [{"particulars_raw": "DISCOUNT ALLOWED (NO GST)", "voucher_type": "Journal_NonGST",
+             "credit_amount": 8000, "running_balance": "8,000.00 Cr"},
+            {"particulars_raw": "ICICI BANK", "voucher_type": "Receipt", "credit_amount": 11000,
+             "running_balance": "19,000.00 Cr"}]
+    assert read_tally_lines(rows).discounts == {"ADDITIONAL_DISCOUNT": D(8000)}

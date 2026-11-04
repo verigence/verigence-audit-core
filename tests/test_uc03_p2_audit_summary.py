@@ -90,6 +90,18 @@ def test_an_invoice_discount_printed_before_gst_is_the_ndcs_amount() -> None:
     assert summary.conclude_benefit(other, unknown_results=frozenset())["conclusion"] == summary.DISPUTED
 
 
+def test_tcs_not_charged_is_short_and_within_rs_100_is_ok() -> None:
+    # independent check 2026-11-04: no TCS on a car that owes it read "cannot
+    # determine", and a gap of Rs 45 raised an exception
+    owed = {"key": "tcs_amount", "label": "TCS", "standard": "10115", "billed": None, "sources": []}
+    out = summary.conclude_charge(owed, on_file=set())
+    assert out["conclusion"] == summary.EXCEPTION and out["difference"] == "-10115.00"
+    close = {**owed, "standard": "10445", "billed": "10400", "sources": [{"documentType": "customer_ledger",
+                                                                       "document": "NDC", "amount": "10400"}]}
+    assert summary.conclude_charge(close, on_file=set())["conclusion"] == summary.OK
+    assert summary.conclude_charge({**owed, "standard": "0"}, on_file=set())["conclusion"] == summary.CANNOT
+
+
 def test_a_statutory_line_is_measured_against_its_proof_document() -> None:
     row = {"key": "insurance_amount", "label": "Insurance premium", "standard": "84180", "billed": "74827",
            "sources": [_src("cost_sheet", "74827"), _src("insurance_cover", "74827")]}
