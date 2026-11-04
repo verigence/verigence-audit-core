@@ -515,6 +515,31 @@ def test_duplicate_receipts_count_once_and_receipts_meet_the_bank_statement(jour
     assert matched["matchedReceipt"] == "AMP-B/04824/26-27" and matched["date"] == "2026-09-12"
 
 
+def test_one_bank_transfer_read_as_two_receipt_numbers_counts_once(journey):
+    """Live 2026-11-04 (UTK-SA-261103-008): one Rs 75,000 transfer, reference
+    CR/828411245393, read on two receipts as "CDAM/2627/02127" and
+    "CDAM/2026/0212": counted twice. The same transfer on another day, or a
+    receipt with no bank reference, is not a duplicate."""
+    add_receipt_payment(journey, amount="75000", receipt_number="CDAM/2627/02127", receipt_date="2026-10-13")
+    add_receipt_payment(journey, amount="75000", receipt_number="CDAM/2026/0212", receipt_date="2026-10-13")
+    add_receipt_payment(journey, amount="5000", receipt_number="CDAM/2627/02200", receipt_date="2026-10-13")
+    add_receipt_payment(journey, amount="5000", receipt_number="CDAM/2627/02201", receipt_date="2026-10-13")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.payments SET payment_reference='CR/828411245393 TILOTTAM' "
+                 "WHERE tenant_id=:t AND amount=75000"),
+            {"t": journey.tenant_id},
+        )
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/360"
+    view = client.get(f"{base}/payments").json()
+    second = next(i for i in view["items"] if i["receiptNumber"] == "CDAM/2026/0212")
+    assert second["counted"] is False and "same bank reference" in second["notCountedReason"]
+    assert Decimal(view["receiptsTotal"]) == 85000  # 75000 once, both receipts of 5000
+    assert Decimal(client.get(base).json()["money"]["paid"]["receipts"]) == 85000
+
+
 def _finance_record(journey, *, linked_receipt: str | None = None, amount: str | None = None) -> None:
     """A financed deal; its loan disbursement linked to the receipt with this
     number, or entered with no receipt (``amount``)."""

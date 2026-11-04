@@ -157,12 +157,38 @@ def billed_figure(row: dict[str, Any]) -> tuple[Decimal | None, str | None]:
     return None, None
 
 
-def disagreement(row: dict[str, Any]) -> list[dict[str, Any]]:
+# The GST rates a vehicle bill prints (GST 2.0: 18% and 40%; 5% and 28% on
+# older or other bills). An invoice prints its discounts before GST, the NDC
+# the amount given (independent check 2026-11-04: the consumer offer
+# Rs 25,000 on the NDC is the invoice's Rs 21,186, 25,000 / 1.18).
+_GST_RATES = (Decimal("0.05"), Decimal("0.18"), Decimal("0.28"), Decimal("0.40"))
+
+
+def _one_figure(a: dict[str, Any], b: dict[str, Any], *, allowances: tuple[Decimal, ...], before_gst: bool) -> bool:
+    """Two documents' figures for one line are the same figure: within Rs 10;
+    or apart by exactly an allowance (a price net of a discount the deal
+    counts); or, for a benefit, one the invoice's figure before GST."""
+    x, y = dec(a["amount"]), dec(b["amount"])
+    if x is None or y is None or abs(x - y) <= TOLERANCE:
+        return True
+    if any(abs(abs(x - y) - allowance) <= TOLERANCE for allowance in allowances):
+        return True
+    if before_gst:
+        pairs = ((x, y, a), (y, x, b))
+        return any(source.get("documentType") in _INVOICE_DOCUMENTS
+                   and any(abs(low * (1 + rate) - high) <= TOLERANCE for rate in _GST_RATES)
+                   for low, high, source in pairs)
+    return False
+
+
+def disagreement(row: dict[str, Any], *, allowances: tuple[Decimal, ...] = (),
+                 before_gst: bool = False) -> list[dict[str, Any]]:
     """The documents that print this line, when they print different figures
-    (more than Rs 10 apart); empty when they agree or only one prints it."""
+    (more than Rs 10 apart, and not the same figure another way: see
+    _one_figure); empty when they agree or only one prints it."""
     printed = _billing_sources(row.get("sources") or [])
-    amounts = [dec(s["amount"]) for s in printed]
-    if len(amounts) < 2 or max(amounts) - min(amounts) <= TOLERANCE:  # type: ignore[type-var, operator]
+    if len(printed) < 2 or all(_one_figure(a, b, allowances=allowances, before_gst=before_gst)
+                               for i, a in enumerate(printed) for b in printed[i + 1:]):
         return []
     return [{"document": s.get("document"), "amount": money(dec(s["amount"]))} for s in printed]
 
@@ -198,13 +224,18 @@ def registration_row(folded: dict[str, Any], parts: list[dict[str, Any]]) -> dic
     return {**folded, "sources": sources}
 
 
-def conclude_charge(row: dict[str, Any], *, on_file: set[str]) -> dict[str, Any]:
+def conclude_charge(row: dict[str, Any], *, on_file: set[str],
+                    discounts: tuple[Decimal, ...] = ()) -> dict[str, Any]:
     """One Deal line (a charge): billed against the price master, or against
-    its own proof document for a statutory / insurance line."""
+    its own proof document for a statutory / insurance line. ``discounts``
+    are the amounts the deal counts off the vehicle: an ex-showroom printed
+    net of one of them (or of all) is the same price (independent check
+    2026-11-04: the NDC's price net of the dealer discount was disputed
+    against the invoice's gross price, 4 journeys)."""
     key = str(row["key"])
     billed, billed_from = billed_figure(row)
     standard = dec(row.get("standard"))
-    disputed = disagreement(row)
+    disputed = disagreement(row, allowances=discounts if key == "ex_showroom_price" else ())
     proof_types = _PROOF_OF_CHARGE.get(key, ())
     proof_amount = next((dec(s["amount"]) for s in row.get("sources") or []
                          if s.get("documentType") in proof_types and dec(s.get("amount")) is not None), None)
@@ -261,7 +292,7 @@ def conclude_benefit(row: dict[str, Any], *, unknown_results: frozenset[str]) ->
     proof = row.get("proof")
     out = _row("BENEFIT", key, str(row.get("label") or key), entitled=money(entitled),
                booked=money(dec(row.get("booking"))), billed=money(given), billedFrom=given_from,
-               documents=disagreement(row), eligibility=eligibility,
+               documents=disagreement(row, before_gst=True), eligibility=eligibility,
                proof={"documents": [proof.get("documentType")], "onFile": bool(proof.get("onFile"))} if proof else None)
     # A figure the Deal does not count is never shown as given (2026-11-03,
     # SHI-SS-261027-024: the NDC's "Exchange / loyalty bonus" Rs 10,000 is the
@@ -547,6 +578,9 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     self_insured = (deal.get("insurance") or {}).get("source") == "SELF"
     in_deal = bool((deal.get("insurance") or {}).get("inDeal"))
 
+    given_amounts = [amount for d in deal.get("discounts") or []
+               if (amount := dec(d.get("current"))) is not None and amount > 0]
+    discount_amounts = tuple(given_amounts) + ((sum(given_amounts, Decimal(0)),) if len(given_amounts) > 1 else ())
     charges, products = [], []
     for group in deal.get("categories") or []:
         lines = group.get("components") or []
@@ -557,7 +591,7 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                 continue
             if line["key"] == "road_tax_registration" and parts:
                 line = registration_row(line, parts)
-            row = conclude_charge(line, on_file=on_file)
+            row = conclude_charge(line, on_file=on_file, discounts=discount_amounts)
             row["category"] = group.get("label")
             if line["key"] in _VAS:
                 taken = (line.get("opted") or {}).get("taken") if isinstance(line.get("opted"), dict) else None
@@ -683,8 +717,11 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         "rules": RULES,
         "billedSource": summary.get("billedSource"),
         "verdict": verdict(rows, delivery_started=delivery_started, missing=missing),
-        "deal": {"charges": charges, "gross": (summary.get("gross") or {}).get("billed"),
-                 "discounts": (summary.get("discounts") or {}).get("billed"),
+        # The deal as it is counted, so the header adds up to its net payable
+        # (independent check 2026-11-04: the billed column also held invoice
+        # discounts the deal does not count, beside a payable that leaves them out).
+        "deal": {"charges": charges, "gross": (summary.get("gross") or {}).get("current"),
+                 "discounts": (summary.get("discounts") or {}).get("current"),
                  "netPayable": summary.get("payable")},
         "benefits": benefits,
         "products": products,

@@ -1,6 +1,8 @@
 """RECEIPTS_EQUAL_INVOICES for a Project whose account statement is the source of
 truth (product owner, 2026-10-26): the payment receipts are compared with the
-"Net value" / "Final price" the statement prints, used as printed. The statement's own received lines are not used."""
+"Net value" / "Final price" the statement prints, used as printed. The statement's own received lines count only for money no
+receipt on file shows (product owner 2026-11-04), never more than the
+statement's own received total leaves unexplained."""
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
