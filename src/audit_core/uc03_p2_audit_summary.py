@@ -276,10 +276,13 @@ def conclude_benefit(row: dict[str, Any], *, unknown_results: frozenset[str]) ->
         out.update(billed=None, billedFrom=None, documents=[], proof=None, conclusion=INFO, reason=(
             "Already in the vehicle price the dealer's statement charges: not given a second time."))
         return out
-    if given and row.get("current") is None and {"NOT_ON_STATEMENT", "INVOICES_DISAGREE"} & set(row.get("flags") or []):
+    if given and "current" in row and row["current"] is None:
+        # The Deal does not count it (2026-11-04: ADI-BA-261019-003, an
+        # invoice discount the NDC does not give, set aside with no flag,
+        # was listed as given): the document's figure is shown, never as given.
         out.update(billed=None, billedFrom=None, conclusion=DISPUTED, rule="AS-03",
                    documents=[{"document": given_from, "amount": money(given)}], reason=(
-                       "Printed on the invoice only: the NDC / cost sheet does not give it, so it is not counted."))
+                       f"Printed on the {given_from or 'invoice'} only: the deal does not count it."))
         return out
     if not given:
         if entitled and eligibility == "ELIGIBLE":

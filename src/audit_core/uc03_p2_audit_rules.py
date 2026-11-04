@@ -92,6 +92,8 @@ _TCS_RATE_PERCENT = Decimal(os.environ.get("P2_TCS_RATE_PERCENT", "1"))
 # The free-accessories benefit (uc03_account_statement.FREE_ACCESSORIES_KEY):
 # it pays for the accessories charged, not for the vehicle.
 _FREE_ACCESSORIES_KEY = "ACCESSORIES_KIT"
+# The dealer's own offer: the NDC (statement) or the cost sheet standing in for it.
+_OFFER_DOCUMENTS = frozenset({"account_statement", "cost_sheet_in_place_of_ndc", "cost_sheet"})
 
 _YES = {"value": "YES", "label": "Yes"}
 _NO = {"value": "NO", "label": "No", "requiresComment": True}
@@ -691,6 +693,17 @@ def tcs_short(facts: _Facts) -> RuleOutcome:
     sale = price - benefits
     on = (f"the ex-showroom price {_rupees(price)}" if benefits == 0 else
           f"the ex-showroom price {_rupees(price)} less benefits of {_rupees(benefits)}, {_rupees(sale)}")
+    # The order of the documents (product owner 2026-11-04: "TCS is to be
+    # checked from NDC, Cost Sheet and then may be invoice and not the other
+    # way"): with the price on the NDC or the cost sheet, the sale value is
+    # theirs, above. Only when neither prices the vehicle is the vehicle
+    # invoice's own sale value -- its ex-showroom less the discounts it
+    # prints -- the one TCS is due on.
+    vehicle = rows.get("ex_showroom_price") or {}
+    from_offer = any(str(s.get("documentType") or "") in _OFFER_DOCUMENTS for s in vehicle.get("sources") or [])
+    invoiced = _dec((facts.sheet.get("summary") or {}).get("saleValue"))
+    if not from_offer and invoiced is not None and Decimal(0) < invoiced < sale:
+        sale, on = invoiced, f"the vehicle invoice's sale value {_rupees(invoiced)}"
     if sale <= _TCS_THRESHOLD:
         return RuleOutcome(code, "PASS", f"The sale value, {on}, is within the TCS threshold of "
                                          f"{_rupees(_TCS_THRESHOLD)}.")
