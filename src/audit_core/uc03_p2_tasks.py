@@ -50,8 +50,10 @@ COPIES_DIFFERENCE_TASK = "NDC_COPIES_DIFFERENCE"
 # The Team Lead's information task for a Reviewer's corrections (2026-11-04,
 # uc03_reviewer_corrections_task) closes the same way, by the Team Lead.
 REVIEWER_CORRECTIONS_TASK = "REVIEWER_CORRECTIONS_INFO"
+# A document's key figure not read (2026-11-04): the PC closes it when the figure is not printed.
+KEY_FIGURES_TASK = "DOCUMENT_KEY_FIGURES_NOT_READ"
 CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK, COST_SHEET_DIFFERENCE_TASK, COPIES_DIFFERENCE_TASK,
-                              REVIEWER_CORRECTIONS_TASK})
+                              REVIEWER_CORRECTIONS_TASK, KEY_FIGURES_TASK})
 # "Upload the ..." tasks (a conditional document, or the booking docket) close
 # by hand too (product owner 2026-11-02): a single page uploaded for them is
 # often refused for scan quality and never read, so the machine check cannot
