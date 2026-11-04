@@ -167,7 +167,7 @@ def test_deal_undercharged_and_excess_discount_name_each_line(journey):
     assert [c["key"] for c in under.details["components"]] == ["ex_showroom_price"]
     excess = result["EXCESS_DISCOUNT"]
     assert excess.outcome == "FAIL"
-    assert "Consumer / cash discount: ₹40,000 given against an entitlement of ₹25,000 (₹15,000 extra)" in excess.reason
+    assert "Consumer offer / scheme discount: ₹40,000 given against an entitlement of ₹25,000 (₹15,000 extra)" in excess.reason
     # A failing check is one open Audit Finding in the check's own words.
     assert _finding(journey, "DEAL_UNDERCHARGED") == ("OPEN", "HIGH", "Deal charged below the standard price")
     assert _finding(journey, "EXCESS_DISCOUNT")[0] == "OPEN"

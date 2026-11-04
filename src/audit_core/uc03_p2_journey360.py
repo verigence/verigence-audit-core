@@ -115,7 +115,10 @@ _COMPONENT_LABELS = {
 }
 
 _DISCOUNT_LABELS = {
-    "CASH_DISCOUNT": "Consumer / cash discount",
+    # The OEM's consumer offer ("CONSUMER OFFER" / "SCHEME DISCOUNT" on the
+    # NDCs). Aditya's "CASH DISCOUNT" is the dealer's own, ADDITIONAL_DISCOUNT
+    # (independent check 2026-11-04: the old label named both "cash").
+    "CASH_DISCOUNT": "Consumer offer / scheme discount",
     "EXCHANGE_BONUS": "Exchange bonus",
     "SCRAPPAGE_BONUS_DEALER": "Scrappage bonus (dealer)",
     "SCRAPPAGE_BONUS_COD": "Scrappage bonus (certificate of deposit)",
@@ -126,7 +129,7 @@ _DISCOUNT_LABELS = {
     "EXT_WARRANTY_4TH_5TH_YR": "Free extended warranty (4th–5th year)",
     "INSURANCE": "Insurance discount",
     "OTHER_SCHEME": "Other scheme",
-    "ADDITIONAL_DISCOUNT": "Additional dealer discount",
+    "ADDITIONAL_DISCOUNT": "Dealer cash / additional discount",
     "MANAGEMENT_REFERRAL": "Management referral (MR)",
     # 2026-10-20: an invoice discount whose printed description names no
     # scheme stays its own line instead of being read as the consumer offer.
