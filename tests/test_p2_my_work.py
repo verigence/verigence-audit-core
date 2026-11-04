@@ -19,7 +19,7 @@ from audit_core.task_closure_roles import (
 )
 from audit_core.task_manager import gate_pass_day_label, previous_gate_pass_day
 from audit_core.uc03_p2_object_keys import ist_day
-from audit_core.uc03_p2_tasks import TaskPermissionError, submit_action
+from audit_core.uc03_p2_tasks import QUALITY_TASK, TaskPermissionError, submit_action
 
 _delivery_file, _register, _upload = (gate_pass_tests._delivery_file, gate_pass_tests._register,
                                      gate_pass_tests._upload)
@@ -63,8 +63,10 @@ def _journey_task(s, *, role: str, task_type: str = "FINDING_REVIEW") -> str:
 
 def test_the_closure_rule():
     assert can_close_as("TL", "TL") and can_close_as("TL", "REVIEWER")
-    assert not can_close_as("PC", "REVIEWER") and not can_close_as("TL", "PC") and not can_close_as("REVIEWER", "TL")
-    assert roles_closable_by("REVIEWER") == ["REVIEWER", "TL"] and roles_closable_by("PC") == ["PC"]
+    # A Reviewer closes the PC's tasks too (product owner 2026-11-04).
+    assert can_close_as("PC", "REVIEWER")
+    assert not can_close_as("TL", "PC") and not can_close_as("REVIEWER", "TL") and not can_close_as("REVIEWER", "PC")
+    assert roles_closable_by("REVIEWER") == ["REVIEWER", "PC", "TL"] and roles_closable_by("PC") == ["PC"]
     assert has_team_lead_authority("REVIEWER", "TL") and not has_team_lead_authority("REVIEWER", "PC")
     assert has_team_lead_authority("PM", "PC")
 
@@ -86,7 +88,7 @@ def test_a_reviewer_closes_a_team_lead_journey_task_but_not_a_pcs(setup):
     assert done["status"] == "VERIFIED_COMPLETE" and done["outcome"] == "EXCEPTION_ACCEPTED"
 
 
-def test_the_reviewers_task_queue_carries_the_team_leads_tasks(setup):
+def test_the_reviewers_task_queue_carries_the_team_leads_and_pcs_tasks(setup):
     s = setup
     tl_task = _journey_task(s, role="TL")
     pc_task = _journey_task(s, role="PC")
@@ -94,7 +96,7 @@ def test_the_reviewers_task_queue_carries_the_team_leads_tasks(setup):
                          params={"role": "REVIEWER", "includeLegacy": "false"})
     assert queue.status_code == 200, queue.text
     ids = {str(t.get("task_id") or t.get("taskId")) for t in queue.json()["items"]}
-    assert tl_task in ids and pc_task not in ids
+    assert tl_task in ids and pc_task in ids  # the PC's too, from 2026-11-04
     tl_queue = s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/tasks",
                             params={"role": "TL", "includeLegacy": "false"}).json()
     assert tl_task in {str(t.get("task_id") or t.get("taskId")) for t in tl_queue["items"]}
@@ -303,3 +305,17 @@ def test_the_tracker_by_week_sums_the_days(setup):
     days_with_register = sum(p["totals"]["gateRegisterDays"] for p in by_day["periods"])
     assert sum(p["totals"]["gateRegisterDays"] for p in by_week["periods"]) == days_with_register
     assert _work(s, by="year").status_code == 400
+
+
+def test_a_reviewer_closes_a_pcs_task(setup):
+    """Product owner 2026-11-04: "reviewer should be able to close the PC tasks"."""
+    s = setup
+    pc_task = _journey_task(s, role="PC", task_type=QUALITY_TASK)
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_tasks SET allowed_actions=CAST(:a AS jsonb) "
+                                "WHERE tenant_id=:t AND task_id=:id"),
+                           {"a": json.dumps(["CLOSE_TASK", "ADD_COMMENT"]), "t": s.journey.tenant_id, "id": pc_task})
+        done = submit_action(connection, tenant_id=s.journey.tenant_id, task_id=pc_task, action="CLOSE_TASK",
+                             actor_id="a-reviewer", actor_role_code="REVIEWER", comment="Clear copy is on file")
+    assert done["status"] == "VERIFIED_COMPLETE"
