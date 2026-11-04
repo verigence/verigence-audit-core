@@ -231,8 +231,10 @@ def test_only_the_statement_gives_a_benefit():
         _benefit("CASH_DISCOUNT_2", "4000", ("customer_invoice_dms", "4000"), fromStatement=True),
         _benefit("EXCHANGE_BONUS", "30000", ("customer_invoice_dms", "30000")),       # the invoice only
     ]
+    rows[0]["takenAsGiven"] = True  # entitlement not known: was taken as given
     _only_the_statement_gives(rows)
     counted = {r["key"] for r in rows if r["current"] is not None}
+    assert rows[0]["takenAsGiven"] is False  # not counted, so not taken as given (live TypeError, 5 Nov)
     assert counted == {"ADDITIONAL_DISCOUNT", "SCRAPPAGE_BONUS", "CASH_DISCOUNT_2"}
     for row in rows:
         if row["key"] not in counted:

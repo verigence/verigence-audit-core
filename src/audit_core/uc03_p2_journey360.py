@@ -1503,6 +1503,9 @@ def _only_the_statement_gives(discount_rows: list[dict[str, Any]]) -> None:
         ):
             continue
         row["current"], row["currentSource"], row["variance"] = None, None, None
+        # Not given, so not "taken as given" in the standard either (deal() adds those
+        # rows' current figure: live 2026-11-05, a TypeError on a None).
+        row["takenAsGiven"] = False
         # A conditional benefit (exchange, scrappage, ...) is in the standard only when
         # claimed or proven; a claim on a document that does not count is no claim.
         row["inStandard"] = row.get("entitled") is not None and (
@@ -1807,7 +1810,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # awaiting its bill or not -- never part of Current, Payable or a variance.
     bk_total = _column_total([r for r in all_rows if not r.get("excluded") and not r.get("partOf")], "booking")
     d_std = _column_total(standard_discounts, "entitled")
-    taken_as_given = [r for r in discount_rows if r.get("takenAsGiven")]
+    taken_as_given = [r for r in discount_rows if r.get("takenAsGiven") and r.get("current") is not None]
     if taken_as_given:
         d_std = str(Decimal(d_std or 0) + sum((Decimal(r["current"]) for r in taken_as_given), Decimal(0)))
     d_bk, d_cur, d_bl = (_column_total(discount_rows, c) for c in ("booking", "current", "billed"))
