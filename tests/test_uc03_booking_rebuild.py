@@ -157,3 +157,28 @@ def test_compare_shows_the_values_of_a_changed_row() -> None:
     after = {"discount_applications": {"d": {"discount_key": "CORPORATE", "actual_discount_amount": 0}}}
     entry = rebuild.compare(before, after)["discount_applications"]
     assert entry["values"] == [{"key": "CORPORATE", "actual_discount_amount": {"before": 5000, "after": 0}}]
+
+
+def test_a_stale_ledger_reading_alone_is_found(journey) -> None:
+    """2026-11-04: a newly read ledger line changes only the figures the
+    documents print for the Deal (commercial_line_source_values); a booking
+    whose only change was there was never rebuilt."""
+    from test_uc03_account_statement import _ledger, _set_policy
+
+    from audit_core.uc03_deal_source_policy import POLICY_ACCOUNT_STATEMENT
+
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    _ledger(journey, [
+        {"particulars_raw": "CHOICE NUMBER A/C", "voucher_type": "Journal_NonGST", "debit_amount": 11300,
+         "running_balance": "11,300.00 Dr"},
+        {"particulars_raw": "FASTAG CHARGES", "voucher_type": "Journal_NonGST", "debit_amount": 600,
+         "running_balance": "11,900.00 Dr"},
+    ])
+    _settle(journey)
+    assert "commercial_line_source_values" not in _check(journey)
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("DELETE FROM auditcore.commercial_line_source_values WHERE tenant_id=:t AND journey_id=:j "
+                       "AND component_key='other_charges'"), {"t": journey.tenant_id, "j": journey.journey_id})
+    changes = _check(journey)
+    assert changes["commercial_line_source_values"]["added"] == 1
