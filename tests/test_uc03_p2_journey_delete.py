@@ -88,7 +88,14 @@ def journey():
                  "dealer_id, outlet_id) VALUES (:t, :a, 'TL', :d, :o)"),
             {"t": created.tenant_id, "a": tl, "d": created.dealer_id, "o": created.outlet_id},
         )
+        reviewer = f"rv-{uuid4().hex[:8]}"
+        connection.execute(
+            text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, "
+                 "dealer_id, outlet_id) VALUES (:t, :a, 'REVIEWER', :d, :o)"),
+            {"t": created.tenant_id, "a": reviewer, "d": created.dealer_id, "o": created.outlet_id},
+        )
     created.tl = tl
+    created.reviewer = reviewer
     try:
         yield created
     finally:
@@ -195,7 +202,17 @@ def test_a_document_digital_intelligence_no_longer_has_is_not_a_failure(journey)
     assert _count(journey, "SELECT count(*) FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j") == 0
 
 
-def test_only_a_team_lead_may_delete(journey):
+def test_a_reviewer_may_delete_and_is_recorded_as_the_reviewer(journey):
+    # Product owner 2026-11-04: the Reviewer deletes a journey as a Team Lead does.
+    di = FakeDi()
+    _run(journey, actor=journey.reviewer, di=di)
+    assert _count(journey, "SELECT count(*) FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j") == 0
+    (record,) = _audit(journey)
+    assert record["deleted_by_role"] == "REVIEWER"
+    assert record["deleted_by_actor_id"] == journey.reviewer
+
+
+def test_only_a_team_lead_or_reviewer_may_delete(journey):
     di = FakeDi()
     with pytest.raises(AuthorizationError) as caught:
         _run(journey, actor=journey.actor_id, di=di)  # the PC who owns the journey

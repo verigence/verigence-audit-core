@@ -235,15 +235,27 @@ def test_resync_is_refused_once_the_stage_is_reviewed_and_a_tl_needs_a_reason(jo
     _open(journey, document, reviewer)
     _mark(journey, reviewer)
 
+    # A PC is refused outright. A Reviewer, like a TL, may override with a
+    # reason (product owner 2026-11-04), so without one they are asked for it.
+    pc = _actor(journey, "PC")
     with journey.engine.begin() as connection, pytest.raises(HTTPException) as refused:
+        resync_page(
+            tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=queue_id,
+            request=_request(), human_principal=SimpleNamespace(subject=pc),
+            authorization_client=AllowAllAuthorization(role_key="PC"),
+            connection=connection, payload=None,
+        )
+    assert refused.value.status_code == 409
+    assert "marked reviewed" in refused.value.detail
+
+    with journey.engine.begin() as connection, pytest.raises(HTTPException) as reviewer_no_reason:
         resync_page(
             tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=queue_id,
             request=_request(), human_principal=SimpleNamespace(subject=reviewer),
             authorization_client=AllowAllAuthorization(role_key="REVIEWER"),
             connection=connection, payload=None,
         )
-    assert refused.value.status_code == 409
-    assert "marked reviewed" in refused.value.detail
+    assert reviewer_no_reason.value.status_code == 422
 
     with journey.engine.begin() as connection, pytest.raises(HTTPException) as no_reason:
         resync_page(
@@ -291,11 +303,12 @@ def test_reading_a_page_again_is_refused_once_the_stage_is_reviewed(journey):
     _open(journey, document, reviewer)
     _mark(journey, reviewer)
 
+    pc = _actor(journey, "PC")
     with journey.engine.begin() as connection, pytest.raises(HTTPException) as refused:
         reread_page(
             tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=queue_id,
-            request=_request(), human_principal=SimpleNamespace(subject=reviewer),
-            authorization_client=AllowAllAuthorization(role_key="REVIEWER"),
+            request=_request(), human_principal=SimpleNamespace(subject=pc),
+            authorization_client=AllowAllAuthorization(role_key="PC"),
             connection=connection, payload=None,
         )
     assert refused.value.status_code == 409
@@ -316,6 +329,23 @@ def test_reading_a_page_again_is_refused_once_the_stage_is_reviewed(journey):
             request=_request(), human_principal=SimpleNamespace(subject=team_lead),
             authorization_client=AllowAllAuthorization(role_key="TL"),
             connection=connection, payload=ReReadPageCommand(reason="Scan was upside down"),
+        )
+    assert overridden["status"] == "REREAD_REQUESTED"
+
+
+def test_a_reviewer_overrides_a_reviewed_stage_with_a_reason(journey):
+    """Product owner 2026-11-04: a Reviewer reads a page of a reviewed stage
+    again, with a reason, as a Team Lead does."""
+    reviewer = _actor(journey, "REVIEWER")
+    _, queue_id, document = add_page(journey, page_number=1, status="NEEDS_REVIEW")
+    _open(journey, document, reviewer)
+    _mark(journey, reviewer)
+    with journey.engine.begin() as connection:
+        overridden = reread_page(
+            tenant_id=journey.tenant_id, journey_id=journey.journey_id, queue_id=queue_id,
+            request=_request(), human_principal=SimpleNamespace(subject=reviewer),
+            authorization_client=AllowAllAuthorization(role_key="REVIEWER"),
+            connection=connection, payload=ReReadPageCommand(reason="Wrong page was read as invoice"),
         )
     assert overridden["status"] == "REREAD_REQUESTED"
 

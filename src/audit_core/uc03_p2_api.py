@@ -103,6 +103,9 @@ router = APIRouter(
 _READ_PERMISSION = "audit.journey.read"
 _UPDATE_PERMISSION = "audit.journey.update"
 _WORK_UPDATE_PERMISSION = "audit.work.update"
+# Who may read a page again into a stage whose documents are marked reviewed,
+# with a reason. The Reviewer was added by the product owner on 2026-11-04.
+_REVIEWED_STAGE_OVERRIDE_ROLES = frozenset({"TL", "PM", "REVIEWER"})
 _DEFAULT_MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 _ALLOWED_CONTENT_TYPES = {
     "application/pdf",
@@ -1874,13 +1877,13 @@ def reread_page(
             connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=reread_stage
         ):
             reason = ((payload.reason if payload else None) or "").strip()
-            if (access.operating_role or "").upper() not in {"TL", "PM"}:
+            if (access.operating_role or "").upper() not in _REVIEWED_STAGE_OVERRIDE_ROLES:
                 raise HTTPException(
                     status_code=409,
                     detail=(
                         f"The {reread_stage.title()} documents are marked reviewed, so this "
-                        "page is not read again. A Team Lead or Project Manager can "
-                        "override this with a reason."
+                        "page is not read again. A Team Lead, Project Manager or "
+                        "Reviewer can override this with a reason."
                     ),
                 )
             if not reason:
@@ -1945,13 +1948,13 @@ def resync_page(
         connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage_code
     ):
         reason = ((payload.reason if payload else None) or "").strip()
-        if (access.operating_role or "").upper() not in {"TL", "PM"}:
+        if (access.operating_role or "").upper() not in _REVIEWED_STAGE_OVERRIDE_ROLES:
             raise HTTPException(
                 status_code=409,
                 detail=(
                     f"The {stage_code.title()} documents are marked reviewed, so this "
-                    "page is not re-read from Document Intelligence. A Team Lead or "
-                    "Project Manager can override this with a reason."
+                    "page is not re-read from Document Intelligence. A Team Lead, "
+                    "Project Manager or Reviewer can override this with a reason."
                 ),
             )
         if not reason:
@@ -2320,12 +2323,12 @@ def _guard_reviewed_stage(
                                                              stage_code=s))
     if not reviewed:
         return None
-    if (role or "").upper() not in {"TL", "PM"}:
+    if (role or "").upper() not in _REVIEWED_STAGE_OVERRIDE_ROLES:
         names = " and ".join(s.title() for s in reviewed)
         raise HTTPException(
             status_code=409,
             detail=(f"The {names} documents are marked reviewed, so this page is not read into them. "
-                    "A Team Lead or Project Manager can override this with a reason."),
+                    "A Team Lead, Project Manager or Reviewer can override this with a reason."),
         )
     override = (reason or "").strip()
     if not override:

@@ -1,8 +1,10 @@
-"""A Team Lead deletes a Phase 2 journey (product owner, 2026-10-23).
+"""A Team Lead or a Reviewer deletes a Phase 2 journey (product owner,
+2026-10-23; the Reviewer added 2026-11-04).
 
 Who and when
-    Only a Team Lead (the caller's operating role on that journey) and only
-    for a journey no reviewer has marked reviewed and that is not closed.
+    Only a Team Lead or a Reviewer (the caller's operating role on that
+    journey) and only for a journey no reviewer has marked reviewed and that
+    is not closed.
     The reason is mandatory.
 
 What is removed
@@ -81,6 +83,9 @@ _DI_AUDIENCE = "di"
 # The Team Lead's own bundle carries audit.work.update (not audit.journey.update);
 # either opens the door, the operating-role check below is what limits it to a TL.
 _PERMISSION_KEYS = ("audit.work.update", "audit.journey.update")
+# Who may delete a journey by hand. The Reviewer was added by the product owner
+# on 2026-11-04 ("delete a journey"); the reviewed / closed guards are the same.
+_DELETING_ROLES = frozenset({"TL", "REVIEWER"})
 MIN_REASON_LENGTH = 10
 
 
@@ -309,15 +314,16 @@ def _start(
             authorization_client=authorization_client,
             permission_keys=_PERMISSION_KEYS,
         )
-        if (access.operating_role or "").upper() != "TL":
+        role = (access.operating_role or "").upper()
+        if role not in _DELETING_ROLES:
             raise AuthorizationError(
                 error_code="VAC-AUTH-002",
                 status_code=403,
-                title="Only a Team Lead can delete a journey",
+                title="Only a Team Lead or a Reviewer can delete a journey",
             )
         return _check_and_record(
             connection, tenant_id=tenant_id, journey_id=journey_id, reason=reason,
-            correlation_id=correlation_id, actor_id=access.actor_id, role="TL",
+            correlation_id=correlation_id, actor_id=access.actor_id, role=role,
         )
 
 
