@@ -3759,6 +3759,22 @@ _WATCHDOG_SECONDS = 60
 # Task Manager pass (recurring occurrences, gate pass tasks): every 5 minutes.
 _last_task_manager_at: dict[str, float] = {}
 _TASK_MANAGER_SECONDS = 300
+
+
+def run_closure_auto_accept(engine: Engine, tenant_id: str) -> None:
+    """A Reviewer's closure the Team Lead has not decided within 96 hours is
+    accepted automatically (product owner 2026-11-04). Every 5 minutes, with
+    the Task Manager pass; a failure is logged and retried on the next pass."""
+    from audit_core.uc03_reviewer_closure import auto_accept_due
+
+    try:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            accepted = auto_accept_due(connection, tenant_id=tenant_id)
+        if accepted:
+            logger.info("p2_closures_auto_accepted", tenant_id=tenant_id, closures=accepted)
+    except Exception:
+        logger.warning("p2_closure_auto_accept_failed", tenant_id=tenant_id, exc_info=True)
 _RETRY_POLICY_RUN = "RETRY_POLICY_2026_10_21"
 _ROLLOUT_REASON = ("Retrying now (the automatic retries were shortened to three attempts within 20 minutes). "
                    "Nothing to do yet.")
@@ -4233,6 +4249,7 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
     if now - _last_task_manager_at.get(tenant_id, 0.0) >= _TASK_MANAGER_SECONDS:
         _last_task_manager_at[tenant_id] = now
         run_task_manager(engine, tenant_id)
+        run_closure_auto_accept(engine, tenant_id)
     due = _nightly_review_due(tenant_id)
     if due is None:
         return

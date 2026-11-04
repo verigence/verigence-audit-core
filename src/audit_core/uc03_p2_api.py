@@ -94,6 +94,7 @@ from audit_core.uc03_requirement_satisfaction import (
     requirements_for_journey,
     resolve_requirement_satisfaction,
 )
+from audit_core.uc03_reviewer_closure import closure_columns_sql, closure_fields
 
 router = APIRouter(
     prefix="/p2/v1/tenants/{tenant_id}",
@@ -649,6 +650,8 @@ def list_p2_journeys(
                    ds.business_completed_at_utc AS delivery_completed_at,
                    (SELECT jr.review_completed_at_utc FROM auditcore.journeys jr
                      WHERE jr.tenant_id=p.tenant_id AND jr.journey_id=p.journey_id) AS delivery_reviewed_at,
+                   -- A Reviewer's closure and where the TL's decision stands (2026-11-04).
+                   {closure_columns_sql("p")},
                    bs.capture_completed_at_utc AS booking_submitted_at,
                    ds.capture_completed_at_utc AS delivery_submitted_at,
                    ev.documents, pq.failed_pages, pq.retrying_pages,
@@ -829,6 +832,7 @@ def list_p2_journeys(
     items: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
+        item.update(closure_fields(item))
         item["journey_id"] = str(item["journey_id"])
         for key in ("documents", "total_tasks", "open_tasks", "overdue_tasks", "open_findings",
                     "pc_open_tasks", "tl_open_tasks"):
@@ -3276,7 +3280,7 @@ def list_tasks(
     # tasks and preserves the old task engine's task-specific completion hooks.
     p2_rows = connection.execute(
         text(
-            """
+            f"""
             SELECT t.task_id, t.journey_id, t.root_task_id, t.parent_task_id,
                    t.round_number, t.task_type, t.category, t.origin_kind,
                    t.source_type, t.source_code, t.title, t.description, t.reference,
@@ -3287,6 +3291,7 @@ def list_tasks(
                    t.completion_result,
                    COALESCE(c.legal_name, c.display_name) AS customer_name,
                    o.outlet_name, jr.journey_reference,
+                   {closure_columns_sql("jr")},
                    NULLIF(concat_ws(' · ', NULLIF(jp.model_name_snapshot,''),
                                            NULLIF(jp.variant_name_snapshot,'')), '') AS vehicle,
                    (SELECT COUNT(*) FROM auditcore.p2_task_events ev
@@ -3303,8 +3308,9 @@ def list_tasks(
               AND (CAST(:role AS varchar) IS NULL OR t.assigned_role_code=ANY(CAST(:roles AS varchar[]))
                    OR (t.origin_kind='HUMAN' AND t.raised_by_actor_id=:actor_id)
                    OR CAST(:view AS varchar)='worked')
-              -- The Team Lead's task about the Reviewer's own corrections is not on the Reviewer's queue.
-              AND NOT (t.task_type='REVIEWER_CORRECTIONS_INFO'
+              -- The Team Lead's tasks about the Reviewer's own work (the closure to accept, the
+              -- Reviewer's corrections) are not on the Reviewer's queue.
+              AND NOT (t.task_type IN ('CLOSURE_ACCEPTANCE', 'REVIEWER_CORRECTIONS_INFO')
                        AND upper(COALESCE(CAST(:role AS varchar), ''))='REVIEWER')
               AND (
                 -- "Worked on" (product owner 2026-11-04): every task the caller acted on in the
@@ -3458,6 +3464,7 @@ def list_tasks(
     items: list[dict[str, Any]] = []
     for row in p2_rows:
         item = dict(row)
+        item.update(closure_fields(item))
         for key in ("task_id", "journey_id", "root_task_id", "parent_task_id"):
             if item.get(key) is not None:
                 item[key] = str(item[key])

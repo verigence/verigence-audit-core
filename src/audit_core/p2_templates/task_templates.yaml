@@ -663,6 +663,29 @@ task_types:
   # Every "not mandatory" claim a PC made on a journey's missing-document tasks,
   # as ONE task for the Reviewer to accept or reject claim by claim (product owner
   # 2026-11-04, uc03_not_mandatory_claims). Closes itself when none is pending.
+  # A Reviewer's closure of a journey, for the Team Lead to accept or reject item
+  # by item (product owner 2026-11-04, uc03_reviewer_closure); accepted
+  # automatically after 96 hours. Decided through .../reviewer-closure/{id}/decision.
+  CLOSURE_ACCEPTANCE:
+    category: TASK_CONFIRMATION
+    owner: TL
+    origin: SYSTEM
+    source: REVIEW
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - ADD_COMMENT
+  # The items the Team Lead rejected, back with the Reviewer; closes when the
+  # Reviewer closes the journey again.
+  CLOSURE_REWORK:
+    category: TASK_CONFIRMATION
+    owner: REVIEWER
+    origin: SYSTEM
+    source: REVIEW
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - ADD_COMMENT
   NOT_MANDATORY_REVIEW:
     category: TASK_CONFIRMATION
     owner: REVIEWER

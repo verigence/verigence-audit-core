@@ -50,6 +50,9 @@ class JourneySearchItem(BaseModel):
     matchedOn: str
     matchedValue: str | None = None
     latestActivityAtUtc: datetime
+    # The closed marker every view shows (product owner 2026-11-04).
+    closed: bool = False
+    reviewerClosure: dict[str, Any] | None = None
 
 
 class JourneySearchResponse(BaseModel):
@@ -470,8 +473,13 @@ def search_journeys(
         },
     ).mappings().all()
 
+    from audit_core.uc03_reviewer_closure import closure_states
+
+    states = closure_states(connection, tenant_id=tenant_id, journey_ids=[row["journey_id"] for row in rows])
     items = [
         JourneySearchItem(
+            closed=states.get(str(row["journey_id"]), {}).get("closed", False),
+            reviewerClosure=states.get(str(row["journey_id"]), {}).get("reviewerClosure"),
             journeyId=row["journey_id"],
             customerDisplayName=row["customer_display_name"],
             customerLegalName=row["customer_legal_name"],

@@ -343,6 +343,9 @@ def build_daily_processing_report(
         {"t": tenant_id},
     ).all())
 
+    from audit_core.uc03_reviewer_closure import closure_states
+
+    states = closure_states(connection, tenant_id=tenant_id, journey_ids=list(journey_ids)) if journey_ids else {}
     rows: dict[tuple[Any, str], dict[str, Any]] = {}
 
     def row_for(journey_id: Any, pc_actor_id: str | None) -> dict[str, Any]:
@@ -358,6 +361,9 @@ def build_daily_processing_report(
                 "dealerName": meta.get("dealer_name"),
                 "pcActorId": pc or None,
                 "pcName": names.get(pc) or None,
+                # The closed marker every view shows (2026-11-04).
+                "closed": states.get(str(journey_id), {}).get("closed", False),
+                "reviewerClosure": states.get(str(journey_id), {}).get("reviewerClosure"),
                 "uploadStartedAt": None,
                 "processingFinishedAt": None,
                 "processingMinutes": None,
