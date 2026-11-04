@@ -691,6 +691,14 @@ def tcs_short(facts: _Facts) -> RuleOutcome:
     sale = price - benefits
     on = (f"the ex-showroom price {_rupees(price)}" if benefits == 0 else
           f"the ex-showroom price {_rupees(price)} less benefits of {_rupees(benefits)}, {_rupees(sale)}")
+    # The vehicle invoice's own sale value -- its ex-showroom less the
+    # discounts it prints -- is what the dealer charges TCS on, whatever the
+    # Deal names those discounts (2026-11-04: SHI-SS-261031-008's invoice
+    # prices Rs 17,48,400 less its Rs 30,001 accessory discount, TCS Rs
+    # 17,183.99 on Rs 17,18,399, was held Rs 300 short).
+    invoiced = _dec((facts.sheet.get("summary") or {}).get("saleValue"))
+    if invoiced is not None and Decimal(0) < invoiced < sale:
+        sale, on = invoiced, f"the vehicle invoice's sale value {_rupees(invoiced)}"
     if sale <= _TCS_THRESHOLD:
         return RuleOutcome(code, "PASS", f"The sale value, {on}, is within the TCS threshold of "
                                          f"{_rupees(_TCS_THRESHOLD)}.")

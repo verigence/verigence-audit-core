@@ -477,6 +477,24 @@ def test_cash_limit_tcs_and_payment_before_booking(journey):
     assert "TCS ₹5,000 charged against ₹15,000 due (1% of the ex-showroom price ₹15,00,000; ₹10,000 short)" in result["TCS_SHORT"].reason
 
 
+def test_tcs_is_due_on_the_vehicle_invoices_sale_value() -> None:
+    """2026-11-04 (SHI-SS-261031-008): the invoice prices Rs 17,48,400 less its
+    accessory discount of Rs 30,001; TCS Rs 17,183.99 is 1% of Rs 17,18,399."""
+    from types import SimpleNamespace
+
+    from audit_core.uc03_p2_audit_rules import tcs_short
+
+    sheet = {"categories": [{"components": [
+        {"key": "ex_showroom_price", "current": "1748401", "billed": "1748401", "sources": []},
+        {"key": "tcs_amount", "current": "17183.99", "billed": "17183.99", "sources": []}]}],
+        "discounts": [{"key": "SCRAPPAGE_BONUS_DEALER", "current": "20000"}],
+        "summary": {"saleValue": "1718399.00"}}
+    out = tcs_short(SimpleNamespace(sheet=sheet))
+    assert out.outcome == "PASS", out.reason
+    sheet["summary"]["saleValue"] = None
+    assert tcs_short(SimpleNamespace(sheet=sheet)).outcome == "FAIL"
+
+
 def test_tcs_is_due_on_the_price_after_the_benefits_given_on_it(journey):
     """2026-11-03: the dealers charge TCS on what the vehicle is sold for, the
     ex-showroom price less its discount (SHI-SS-261027-006: Rs 30,59,000 less a
