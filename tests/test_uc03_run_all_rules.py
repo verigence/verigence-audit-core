@@ -80,7 +80,7 @@ def test_run_all_rules_for_a_fresh_booking_journey_returns_all_expected_rule_cod
     rule_codes = {r.ruleCode for r in results}
     assert rule_codes == {
         "WRONG_DOCUMENT", "DUPLICATE_RECEIPT", "DUPLICATE_BOOKING", "MODEL_NOT_IDENTIFIED",
-        "DEAL_RECONCILIATION_REFRESH", "MANUAL_VERIFICATION", "PAYMENT_BANK_UNMATCHED",
+        "DEAL_RECONCILIATION_REFRESH", "MANUAL_VERIFICATION", "PAYMENT_BANK_UNMATCHED", "DOCUMENT_KEY_FIGURES",
         "AUTOMATED_SYNC_FAILURE",
         # The deal-audit checks that run with the Booking stage.
         "DEAL_UNDERCHARGED", "EXCESS_DISCOUNT",
@@ -136,7 +136,7 @@ def test_run_all_rules_for_delivery_stage_only_runs_delivery_scoped_rules(
     rule_codes = {r.ruleCode for r in results}
     assert rule_codes == {
         "MODEL_NOT_IDENTIFIED", "INVOICE_SKU_MISMATCH",
-        "MANUAL_VERIFICATION", "PAYMENT_BANK_UNMATCHED", "AUTOMATED_SYNC_FAILURE",
+        "MANUAL_VERIFICATION", "PAYMENT_BANK_UNMATCHED", "AUTOMATED_SYNC_FAILURE", "DOCUMENT_KEY_FIGURES",
         # The deal-audit checks that need a delivery.
         "DELIVERED_ON_SHORT_PAYMENT", "RECEIPTS_EQUAL_INVOICES",
         "PAYMENT_AFTER_DELIVERY_WITHIN_GRACE", "PAYMENT_AFTER_DELIVERY_BEYOND_GRACE",

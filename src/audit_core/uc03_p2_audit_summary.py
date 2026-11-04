@@ -722,6 +722,16 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     if still_needed:
         missing.append(f"{len(still_needed)} required document{'s' if len(still_needed) != 1 else ''} "
                        "not on file: " + ", ".join(d["label"] for d in still_needed) + ".")
+    # A document on file that was not fully read (2026-11-04) leaves the audit
+    # incomplete, said so, never concluded on what the other documents give.
+    for unread in summary.get("statementNotRead") or []:
+        missing.append(f"The NDC ({unread.get('title') or 'account statement'}) is on file but none of its "
+                       "rows was read.")
+    not_read = summary.get("figuresNotRead") or []
+    if not_read:
+        from audit_core.uc03_document_key_figures import describe
+
+        missing.append("Figures not read from documents on file: " + describe(not_read) + ".")
     disputed = [r for r in charges + benefits + products if r["conclusion"] == DISPUTED]
     return {
         "generatedAtUtc": datetime.now(UTC).isoformat(),
@@ -741,4 +751,5 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         "settlement": settle,
         "disputed": [{"label": r["label"], "documents": r["documents"]} for r in disputed],
         "requiredDocuments": file_documents,
+        "documentsNotFullyRead": not_read,
     }

@@ -320,6 +320,15 @@ def _run_audit_core_rules_for_stage(
             )
             _record("PAYMENT_BANK_UNMATCHED", outcome)
 
+    # Every document on file gives its key figures, or the booking says it did
+    # not (product owner 2026-11-04): one task per booking. Never raises.
+    from audit_core.uc03_document_key_figures import sync_document_key_figures
+
+    key_figures = sync_document_key_figures(connection, tenant_id=tenant_id, journey_id=journey_id)
+    _record("DOCUMENT_KEY_FIGURES", "ERROR" if key_figures.get("error") else (
+        "SKIPPED" if not key_figures.get("examined") else "FAIL" if key_figures.get("documents") else "PASS"),
+        key_figures)
+
     # The deal-audit checks (price, discounts, settlement, financier, trade-in,
     # third-party payer, cash limit): journey-wide ones run with
     # BOOKING, delivery-dependent ones with DELIVERY.

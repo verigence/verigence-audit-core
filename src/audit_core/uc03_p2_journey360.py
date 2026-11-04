@@ -1908,6 +1908,9 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             # the screen says so instead of showing an invoice-built Deal as the NDC's.
             "statementNotRead": _statement_not_read(connection, tenant_id=tenant_id, journey_id=journey_id)
             if statement_policy else [],
+            # Documents on file with a key figure not read (2026-11-04,
+            # uc03_document_key_figures): listed, never silently left out.
+            "figuresNotRead": _figures_not_read(connection, tenant_id=tenant_id, journey_id=journey_id),
             # Lines awaiting their own document with no figure yet: not in
             # Current net, Standard net or Balance due.
             "awaiting": [{"key": r["key"], "label": r["label"], "document": r["awaiting"],
@@ -3440,6 +3443,12 @@ def payments_section(connection: Connection, *, tenant_id: str, journey_id: UUID
 
 
 # ── vehicle, registration, delivery ──────────────────────────────────────────
+def _figures_not_read(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    from audit_core.uc03_document_key_figures import documents_not_fully_read
+
+    return documents_not_fully_read(connection, tenant_id=tenant_id, journey_id=journey_id)
+
+
 def _statement_not_read(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
     from audit_core.uc03_account_statement import statement_reading
 
