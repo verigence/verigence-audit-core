@@ -377,9 +377,22 @@ def journey_etag(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
 
 
 # ── money helpers ────────────────────────────────────────────────────────────
+# A bank reference (UTR) names one payment: two receipts with the same
+# reference, amount and date are the one payment read twice, whatever their
+# receipt numbers (live 2026-11-04, UTK-SA-261103-008: one Rs 75,000 transfer
+# read as receipt "CDAM/2627/02127" and as "CDAM/2026/0212", counted twice).
+_MIN_REFERENCE = re.compile(r"(?=(.*\d){6})[A-Z0-9]{8,}")
+
+
+def _payment_reference(row: Any) -> str | None:
+    value = "".join(ch for ch in str(row.get("payment_reference") or "").upper() if ch.isalnum())
+    return value if _MIN_REFERENCE.fullmatch(value) else None
+
+
 def _duplicate_receipts(rows: list[Any]) -> dict[Any, Any]:
     """payment_id -> the earlier payment it repeats (same receipt number,
-    amount and date), by the stage engine's own rule."""
+    amount and date, by the stage engine's own rule; or the same bank
+    reference, amount and date)."""
     records = [
         ReceiptRecord(
             document_id=r["payment_id"], stage_code="BOOKING", document_type_key="receipt",
@@ -393,6 +406,16 @@ def _duplicate_receipts(rows: list[Any]) -> dict[Any, Any]:
         if group.dates_match:
             for later in group.documents[1:]:
                 out[later.document_id] = group.documents[0].document_id
+    first: dict[tuple[str, Decimal, Any], Any] = {}
+    for r in rows:
+        reference = _payment_reference(r)
+        if reference is None or r["payment_id"] in out:
+            continue
+        key = (reference, Decimal(str(r["amount"])), normalize_receipt_date(r["receipt_date"]))
+        if key in first:
+            out[r["payment_id"]] = first[key]
+        else:
+            first[key] = r["payment_id"]
     return out
 
 
@@ -558,7 +581,7 @@ def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[s
     rows = connection.execute(
         text(
             """
-            SELECT p.payment_id, p.amount, p.receipt_number, p.receipt_date
+            SELECT p.payment_id, p.amount, p.receipt_number, p.receipt_date, p.payment_reference
             FROM auditcore.payments p
             JOIN auditcore.evidence e
               ON e.tenant_id=p.tenant_id AND e.journey_id=p.journey_id AND e.di_document_id=p.source_di_document_id
@@ -3178,7 +3201,11 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         stage = derived_stage.get(payment_id) if counted else None
         if counted and stage is not None:
             by_stage[stage] = by_stage.get(stage, Decimal(0)) + Decimal(r["amount"])
-        if original is not None:
+        if original is not None and _normalize_ref(number_of.get(original)) != _normalize_ref(r["receipt_number"]) \
+                and _payment_reference(r) is not None:
+            reason = "Duplicate: the same bank reference, amount and date as " + (
+                f"receipt {number_of.get(original)}" if number_of.get(original) else "an earlier receipt")
+        elif original is not None:
             reason = "Duplicate: the same receipt number, amount and date as " + (
                 f"receipt {number_of.get(original)}" if number_of.get(original) else "an earlier receipt")
         elif not evidenced and r["association_status"] == "FOREIGN":

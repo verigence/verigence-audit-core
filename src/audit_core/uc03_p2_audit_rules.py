@@ -161,7 +161,7 @@ class _Facts:
         rows = self._rows(
             """
             SELECT p.payment_id, p.amount, p.receipt_number, p.receipt_date, p.created_at_utc,
-                   p.source_di_document_id, p.receipt_customer_name,
+                   p.source_di_document_id, p.receipt_customer_name, p.payment_reference,
                    COALESCE(p.payment_mode_code, p.payment_method_code) AS mode,
                    (SELECT l.counterparty_name FROM auditcore.payment_bank_matches m
                       JOIN auditcore.bank_statement_lines l
