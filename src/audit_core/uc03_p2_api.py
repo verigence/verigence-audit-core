@@ -3297,6 +3297,9 @@ def list_tasks(
               AND (CAST(:journey_id AS uuid) IS NULL OR t.journey_id=CAST(:journey_id AS uuid))
               AND (CAST(:role AS varchar) IS NULL OR t.assigned_role_code=ANY(CAST(:roles AS varchar[]))
                    OR (t.origin_kind='HUMAN' AND t.raised_by_actor_id=:actor_id))
+              -- The Team Lead's task about the Reviewer's own corrections is not on the Reviewer's queue.
+              AND NOT (t.task_type='REVIEWER_CORRECTIONS_INFO'
+                       AND upper(COALESCE(CAST(:role AS varchar), ''))='REVIEWER')
               AND (
                 (CAST(:status AS varchar) IS NOT NULL AND t.task_status=CAST(:status AS varchar))
                 OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='open'

@@ -1038,6 +1038,14 @@ def correct_p2_document_field(
         ),
         remarks=(command.remarks or "").strip() or None,
     )
+    if reviewer:
+        # One information task for the Team Lead listing every value the
+        # Reviewer corrected on this journey (product owner 2026-11-04).
+        from audit_core.uc03_reviewer_corrections_task import (
+            refresh_reviewer_corrections_task,
+        )
+
+        refresh_reviewer_corrections_task(connection, tenant_id=tenant_id, journey_id=journey_id)
     if not reviewer and not requires_pc_review(confidence):
         record_activity(
             connection, tenant_id=tenant_id, journey_id=journey_id, event_type="FIELD_CORRECTED_FOR_INFORMATION",

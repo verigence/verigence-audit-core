@@ -47,7 +47,11 @@ CLOSE_TASK = "CLOSE_TASK"
 COST_SHEET_DIFFERENCE_TASK = "COST_SHEET_NDC_DIFFERENCE"
 # Copies of the NDC or cost sheet that differ: information too (2026-11-02).
 COPIES_DIFFERENCE_TASK = "NDC_COPIES_DIFFERENCE"
-CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK, COST_SHEET_DIFFERENCE_TASK, COPIES_DIFFERENCE_TASK})
+# The Team Lead's information task for a Reviewer's corrections (2026-11-04,
+# uc03_reviewer_corrections_task) closes the same way, by the Team Lead.
+REVIEWER_CORRECTIONS_TASK = "REVIEWER_CORRECTIONS_INFO"
+CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK, COST_SHEET_DIFFERENCE_TASK, COPIES_DIFFERENCE_TASK,
+                              REVIEWER_CORRECTIONS_TASK})
 # "Upload the ..." tasks (a conditional document, or the booking docket) close
 # by hand too (product owner 2026-11-02): a single page uploaded for them is
 # often refused for scan quality and never read, so the machine check cannot
@@ -447,6 +451,9 @@ def submit_action(
             raise TaskPermissionError("Only a Team Lead or Project Manager can accept an exception")
     elif observation:
         pass
+    elif task["task_type"] == REVIEWER_CORRECTIONS_TASK and str(actor_role_code or "").upper() not in {"TL", "PM"}:
+        # It tells the Team Lead what the Reviewer changed: not the Reviewer's to close.
+        raise TaskPermissionError("Only a Team Lead or Project Manager can close the Reviewer's corrections task")
     elif assigned_actor_id is not None and str(assigned_actor_id) != actor_id:
         raise TaskPermissionError("This task is assigned to a different actor")
     elif assigned_actor_id is None and assigned_role_code and not can_close_as(assigned_role_code, actor_role_code):

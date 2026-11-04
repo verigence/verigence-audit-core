@@ -409,3 +409,56 @@ def test_a_pc_correcting_a_confident_value_applies_it_too(journey):
     )
     assert result["applied"] is True
     assert result["taskId"] is None
+
+
+def _corrections_task(journey):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return connection.execute(
+            text("SELECT task_id, task_status, assigned_role_code, reference, title FROM auditcore.p2_tasks "
+                 "WHERE tenant_id=:t AND journey_id=:j AND task_type='REVIEWER_CORRECTIONS_INFO'"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        ).mappings().all()
+
+
+def test_a_reviewers_corrections_go_to_the_team_lead_as_one_information_task(journey):
+    """Product owner 2026-11-04: all the data the Reviewer corrected goes to
+    the TL as one information task, combined. The Reviewer does not close it;
+    the TL does, with a comment; a later correction opens it again."""
+    from audit_core.uc03_p2_tasks import TaskPermissionError, submit_action
+
+    reviewer = _actor(journey, "REVIEWER")
+    team_lead = _actor(journey, "TL")
+    _, _, document = add_page(journey, page_number=1, status="READY")
+    _confident_field(journey, document)
+
+    _correct(journey, document, reviewer, "REVIEWER", value="125000", remarks="Invoice total misread")
+    (task,) = _corrections_task(journey)
+    assert task["assigned_role_code"] == "TL" and task["task_status"] not in ("VERIFIED_COMPLETE",)
+    assert task["reference"]["correctionCount"] == 1
+    (item,) = task["reference"]["corrections"]
+    assert (item["fieldKey"], item["previousValue"], item["newValue"]) == ("amount", "100000", "125000")
+    assert item["remarks"] == "Invoice total misread" and item["reviewerActorId"] == reviewer
+
+    _correct(journey, document, reviewer, "REVIEWER", value="126000")
+    (task,) = _corrections_task(journey)          # still one task: combined
+    assert task["reference"]["correctionCount"] == 2
+
+    # A PC's correction is not on it.
+    _correct(journey, document, _actor(journey, "PC"), "PC", value="127000")
+    assert _corrections_task(journey)[0]["reference"]["correctionCount"] == 2
+
+    task_id = task["task_id"]
+    with journey.engine.begin() as connection, pytest.raises(TaskPermissionError):
+        set_tenant_context(connection, journey.tenant_id)
+        submit_action(connection, tenant_id=journey.tenant_id, task_id=task_id, action="CLOSE_TASK",
+                      actor_id=reviewer, actor_role_code="REVIEWER", comment="seen")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        submit_action(connection, tenant_id=journey.tenant_id, task_id=task_id, action="CLOSE_TASK",
+                      actor_id=team_lead, actor_role_code="TL", comment="Seen, both corrections agree with the invoice")
+    assert _corrections_task(journey)[0]["task_status"] == "VERIFIED_COMPLETE"
+
+    _correct(journey, document, reviewer, "REVIEWER", value="125500")
+    (task,) = _corrections_task(journey)
+    assert task["task_status"] != "VERIFIED_COMPLETE" and task["reference"]["correctionCount"] == 3
