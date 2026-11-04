@@ -228,6 +228,11 @@ def test_the_offer_letters_scheme_is_a_benefit_of_the_type_the_letter_names() ->
     assert read.components["ex_showroom_price"] == D(1340902) and read.discounts == {}
     assert [u["label"] for u in read.unmapped] == ["SCHEME"]
 
+    # The Ex Showroom row off by more than half is the row misread (SHI-SS-261027-021).
+    read = read_statement([{"particulars_raw": "VEHICLE PRICE", "debit_amount": 1928501},
+                           {"particulars_raw": "EX SHOWROOM (1-2)", "debit_amount": 19285}])
+    assert read.components["ex_showroom_price"] == D(1928501) and read.discounts == {}
+
 
 def test_a_kit_written_into_another_row_of_the_offer_letter_is_accessories() -> None:
     """Live 2026-11-03 (SHI-SS-261031-008): "ACCESSORIES Free 30,000" and, in
