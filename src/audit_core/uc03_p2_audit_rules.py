@@ -6,6 +6,7 @@ and answer the questions a manual deal audit asks:
 
   Deal undercharged        DEAL_UNDERCHARGED           per price component + net
                            TCS_SHORT                   statutory rate above the threshold
+                           TCS_EXCESS                  TCS above 1% of the ex-showroom price
   Excess discount          EXCESS_DISCOUNT             per discount + total
   Short payment            DELIVERED_ON_SHORT_PAYMENT, PAYMENT_AFTER_DELIVERY_WITHIN_GRACE,
                            PAYMENT_AFTER_DELIVERY_BEYOND_GRACE
@@ -717,6 +718,29 @@ def tcs_short(facts: _Facts) -> RuleOutcome:
     return RuleOutcome(code, "PASS", f"TCS {_rupees(charged)} charged against {_rupees(expected)} due.")
 
 
+def tcs_excess(facts: _Facts) -> RuleOutcome:
+    """TCS is 1% of the ex-showroom price (product owner 2026-11-04: "TCS is
+    always 1% of exshowroom ... if TCS is more than 1% of the ex showroom
+    price then pls raise the task"). A TCS above it is either overcharged or
+    a figure misread from the document -- either way a person looks at it."""
+    code = "TCS_EXCESS"
+    rows = {c["key"]: c for g in facts.sheet["categories"] for c in g["components"]}
+    price = _charged(rows.get("ex_showroom_price"))
+    charged = _charged(rows.get("tcs_amount"))
+    if price is None or charged is None:
+        return RuleOutcome(code, "SKIPPED", "The ex-showroom price or the TCS has not been read yet.")
+    ceiling = (price * _TCS_RATE_PERCENT / 100).quantize(Decimal("0.01"))
+    if charged - ceiling > _LINE_TOLERANCE:
+        where = _billed_on(rows["tcs_amount"], charged)
+        return RuleOutcome(code, "FAIL", (
+            f"TCS {_rupees(charged)} on the {where} is more than {_TCS_RATE_PERCENT}% of the ex-showroom price "
+            f"{_rupees(price)} ({_rupees(ceiling)}): {_rupees(charged - ceiling)} above. Check the figure on the "
+            f"{where} -- overcharged, or read wrongly."
+        ), {"findingTitle": "TCS above 1% of the ex-showroom price", "expected": str(ceiling), "observed": str(charged)})
+    return RuleOutcome(code, "PASS", f"TCS {_rupees(charged)} is within {_TCS_RATE_PERCENT}% of the ex-showroom "
+                                     f"price {_rupees(price)}.")
+
+
 # ----------------------------------------------- bucket 2: after delivery
 
 
@@ -1401,7 +1425,7 @@ def self_insurance_declared(facts: _Facts) -> RuleOutcome:
 # that need a delivery run with the Delivery unit.
 _BOOKING_RULES = (
     booking_date_unusable,
-    deal_undercharged, excess_discount, tcs_short,
+    deal_undercharged, excess_discount, tcs_short, tcs_excess,
     third_party_payment_unconfirmed, third_party_payment_undeclared,
     # Cash transactions raise no tasks (product owner, 2026-10-31): no cash
     # intimation question, so neither it nor its finding runs.
@@ -1424,7 +1448,7 @@ RULE_CODES = {
 # The Findings catalogue entry each check raises under.
 _FINDING_TYPES = {
     "BOOKING_DATE_UNUSABLE": "PROCESS_NON_COMPLIANCE",
-    "DEAL_UNDERCHARGED": "PRICING_ANOMALY", "TCS_SHORT": "PRICING_ANOMALY", "EXCESS_DISCOUNT": "DISCOUNT_ANOMALY",
+    "DEAL_UNDERCHARGED": "PRICING_ANOMALY", "TCS_SHORT": "PRICING_ANOMALY", "TCS_EXCESS": "PRICING_ANOMALY", "EXCESS_DISCOUNT": "DISCOUNT_ANOMALY",
     "TRADE_IN_NOT_RESOLD": "COMMERCIAL_EXCEPTION", "TRADE_IN_SOLD_AT_LOSS": "COMMERCIAL_EXCEPTION",
     "DELIVERY_NOT_COMPLETED_IN_TIME": "DELIVERY_EXCEPTION",
     "ACCESSORY_FITTED_UNBILLED": "PROCESS_NON_COMPLIANCE",

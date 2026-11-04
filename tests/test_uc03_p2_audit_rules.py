@@ -477,6 +477,27 @@ def test_cash_limit_tcs_and_payment_before_booking(journey):
     assert "TCS ₹5,000 charged against ₹15,000 due (1% of the ex-showroom price ₹15,00,000; ₹10,000 short)" in result["TCS_SHORT"].reason
 
 
+def test_tcs_above_one_percent_of_the_ex_showroom_raises_a_task() -> None:
+    """Product owner 2026-11-04: "TCS is always 1% of exshowroom ... if TCS is
+    more than 1% of the ex showroom price then pls raise the task"."""
+    from types import SimpleNamespace
+
+    from audit_core.uc03_p2_audit_rules import tcs_excess
+
+    def sheet(tcs: str) -> SimpleNamespace:
+        return SimpleNamespace(sheet={"categories": [{"components": [
+            {"key": "ex_showroom_price", "current": "2284999", "billed": "2284999", "sources": []},
+            {"key": "tcs_amount", "current": tcs, "billed": tcs,
+             "sources": [{"document": "Customer Invoice (DMS)", "documentType": "customer_invoice_dms",
+                          "amount": tcs}]}]}], "discounts": [], "summary": {}})
+
+    over = tcs_excess(sheet("27850"))
+    assert over.outcome == "FAIL"
+    assert "TCS ₹27,850 on the Customer Invoice (DMS) is more than 1% of the ex-showroom price ₹22,84,999" in over.reason
+    assert tcs_excess(sheet("22850")).outcome == "PASS"
+    assert tcs_excess(sheet("999901")).outcome == "FAIL"
+
+
 def test_tcs_is_checked_on_the_ndc_then_the_cost_sheet_then_the_invoice() -> None:
     """Product owner 2026-11-04: "TCS is to be checked from NDC, Cost Sheet and
     then may be invoice and not the other way". With no NDC or cost sheet the

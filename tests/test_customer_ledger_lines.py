@@ -370,3 +370,18 @@ def test_a_bh_series_rto_is_not_compared_with_the_price_master(journey) -> None:
     _rto_without_standard(rows)
     assert (rows[0]["standard"], rows[0]["variance"], rows[0]["flags"]) == (None, None, ["INVOICES_DISAGREE"])
     assert rows[1]["standard"] == "41415"
+
+
+def test_a_tcs_in_lakhs_on_the_booking_docket_is_a_misread_and_not_shown() -> None:
+    """Live 2026-11-04 (SHI-SS-261027-007): the booking form's vehicle price,
+    Rs 9,99,901, was read as its TCS and shown. TCS is 1% of the ex-showroom."""
+    from audit_core.uc03_p2_journey360 import _tcs_read_wrongly
+
+    rows = [{"key": "ex_showroom_price", "current": "999901", "billed": "999901", "booking": None,
+             "standard": "999901.32", "flags": []},
+            {"key": "tcs_amount", "current": "0", "billed": None, "booking": "999901", "standard": "0", "flags": []}]
+    _tcs_read_wrongly(rows)
+    assert rows[1]["booking"] is None and "READ_ERROR" in rows[1]["flags"]
+    rows[1]["booking"], rows[1]["flags"] = "9999", []
+    _tcs_read_wrongly(rows)
+    assert rows[1]["booking"] == "9999" and rows[1]["flags"] == []

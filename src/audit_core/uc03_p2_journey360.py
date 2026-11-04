@@ -1253,6 +1253,27 @@ def _rto_without_standard(rows: list[dict[str, Any]]) -> None:
             row["standardNote"] = "BH series registration: the price master's RTO figure is not compared."
 
 
+def _tcs_read_wrongly(rows: list[dict[str, Any]]) -> None:
+    """TCS is 1% of the ex-showroom price (product owner 2026-11-04: "TCS is
+    always 1% of exshowroom ... how can it goes in lakh of rs"). A booking
+    docket figure far above it is a misread -- SHI-SS-261027-007's booking form
+    read the vehicle price, Rs 9,99,901, as its TCS -- and is not shown, not
+    even for information. A billing document's TCS above 1% stays and raises
+    TCS_EXCESS for a person to check."""
+    by_key = {r["key"]: r for r in rows}
+    tcs, vehicle = by_key.get("tcs_amount"), by_key.get("ex_showroom_price")
+    if tcs is None or vehicle is None:
+        return
+    prices = [_dec(vehicle.get(c)) for c in ("current", "billed", "booking", "standard")]
+    price = max((p for p in prices if p is not None and p > 0), default=None)
+    booked = _dec(tcs.get("booking"))
+    if price is None or booked is None:
+        return
+    if booked > price * Decimal("0.01") + Decimal(100):
+        tcs["booking"] = None
+        tcs["flags"] = [*tcs["flags"], "READ_ERROR"]
+
+
 def _one_charge_per_figure(rows: list[dict[str, Any]]) -> None:
     """One charge the NDC and the dealer's ledger print under two names counts
     once (2026-11-03), as a benefit does: the ledger's posting names it, the
@@ -1638,6 +1659,7 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             row["variance"] = None
             row["flags"] = [f for f in row["flags"] if f not in _STANDARD_FLAGS]
     _one_charge_per_figure(all_rows)
+    _tcs_read_wrongly(all_rows)
     if _bh_series(connection, tenant_id=tenant_id, journey_id=journey_id):
         _rto_without_standard(all_rows)
     for row in discount_rows:
