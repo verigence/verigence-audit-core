@@ -5,6 +5,10 @@ on:
     branches:
       - dev
       - main
+    # A myHR release (deploy/hrmgmt-dev.sha) changes nothing in Audit Core: no Audit Core redeploy.
+    paths-ignore:
+      - deploy/hrmgmt-dev.sha
+      - .github/workflows/hrmgmt-dev-deploy.yml
   pull_request:
     branches:
       - dev

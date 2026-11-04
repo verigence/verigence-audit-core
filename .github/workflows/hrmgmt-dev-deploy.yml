@@ -1,0 +1,97 @@
+name: Deploy myHR DEV
+
+# myHR (Verigence-admin/hrmgmt) is deployed from here because this repository holds the Railway
+# token (product owner rule: deploys only through GitHub Actions). To deploy, put the myHR dev
+# commit to release in deploy/hrmgmt-dev.sha and merge to dev. The commit must have passed
+# myHR's own CI (tests and image); this workflow checks that before uploading it.
+
+on:
+  push:
+    branches: [dev]
+    paths:
+      - deploy/hrmgmt-dev.sha
+      - .github/workflows/hrmgmt-dev-deploy.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hrmgmt-dev-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      HR_SERVICE: HRMgmt
+      HR_REPO: Verigence-admin/hrmgmt
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the myHR commit to deploy
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(tr -d '[:space:]' < deploy/hrmgmt-dev.sha)"
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::deploy/hrmgmt-dev.sha must hold a full commit SHA"; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      - name: The commit passed myHR CI
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${HR_REPO}/commits/${SHA}/check-runs?per_page=100" > /tmp/checks.json
+          python3 - <<'PY'
+          import json
+          runs = {r["name"]: r for r in json.load(open("/tmp/checks.json"))["check_runs"]}
+          for name in ("test", "image"):
+              r = runs.get(name)
+              if not r or r.get("conclusion") != "success":
+                  raise SystemExit(f"myHR CI job '{name}' has not passed for this commit: {r and r.get('conclusion')}")
+          print("MYHR_CI=PASS")
+          PY
+      - name: Check out myHR at that commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HR_REPO }}
+          ref: ${{ steps.target.outputs.sha }}
+          path: hrmgmt
+      - name: Install Railway CLI
+        run: npm install --global @railway/cli
+      - name: Deploy myHR
+        working-directory: hrmgmt
+        shell: bash
+        env:
+          SHA: ${{ steps.target.outputs.sha }}
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN secret is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$HR_SERVICE" --json >/dev/null
+          railway deployment list --service "$HR_SERVICE" --limit 1 --json >/tmp/before.json
+          previous="$(python3 -c "import json;r=json.load(open('/tmp/before.json'));print(r[0].get('id','') if r else '')")"
+          echo "PREVIOUS_DEPLOYMENT_ID=$previous" >> "$GITHUB_ENV"
+          railway up . --path-as-root --service "$HR_SERVICE" --detach --yes --message "myHR DEV ${SHA}" >/dev/null
+      - name: Verify the new deployment is live
+        working-directory: hrmgmt
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 40); do
+            railway deployment list --service "$HR_SERVICE" --limit 1 --json >/tmp/now.json
+            read -r id status <<<"$(python3 -c "import json;r=json.load(open('/tmp/now.json'));print(r[0].get('id',''), r[0].get('status','')) if r else print(' ')")"
+            if [[ -z "$id" || "$id" == "${PREVIOUS_DEPLOYMENT_ID:-}" ]]; then sleep 10; continue; fi
+            case "$status" in
+              SUCCESS) echo "MYHR_DEPLOYMENT=PASS $id"; exit 0 ;;
+              FAILED|CRASHED|REMOVED) echo "::error::myHR deployment $id ended $status"; exit 1 ;;
+              *) echo "Deployment $id is $status (attempt $attempt/40)"; sleep 15 ;;
+            esac
+          done
+          echo "::error::myHR deployment did not finish in time"; exit 1
