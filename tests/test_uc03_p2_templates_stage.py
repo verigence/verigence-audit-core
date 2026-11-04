@@ -37,7 +37,7 @@ def test_templates_load_and_validate():
     assert validate_registry(registry) == []
     # 26 + 22 deal-audit Audit Core + 40 Rule Engine (blueprint 8.1, seven retired; the two
     # NDC signature checks retired 2026-10-28, the two cash intimation checks 2026-10-31)
-    assert len(registry.controls) == 88
+    assert len(registry.controls) == 90  # TCS_EXCESS and FIGURE_IMPLAUSIBLE (2026-11-04)
     assert SUPPORTING_TEMPLATE in registry.documents
 
 
