@@ -64,7 +64,10 @@ COMPONENT_LABELS: dict[str, str] = {
     "REGISTRATION_CORPORATE": "Registration (corporate)",
 }
 BENEFIT_LABELS: dict[str, str] = {
-    "CASH_DISCOUNT": "Consumer / cash discount",
+    # The OEM's consumer offer ("CONSUMER OFFER" / "SCHEME DISCOUNT" on the
+    # NDCs). Aditya's "CASH DISCOUNT" is the dealer's own, ADDITIONAL_DISCOUNT
+    # (independent check 2026-11-04: the old label named both "cash").
+    "CASH_DISCOUNT": "Consumer offer / scheme discount",
     "ACCESSORIES_KIT": "Free accessories",
     "EXT_WARRANTY_4TH_YR": "Free extended warranty (4th year)",
     "EXT_WARRANTY_4TH_5TH_YR": "Free extended warranty (4th and 5th year)",

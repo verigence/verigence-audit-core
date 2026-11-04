@@ -536,6 +536,51 @@ def get_resync_preview(
     }
 
 
+# What the board's search box matches. Every term is an EXISTS or a column of
+# the row itself, so a journey with two vehicle or registration rows still
+# appears once. Inactive when no search text is given.
+_SEARCH_PREDICATE = """
+    (CAST(:search_text AS varchar) IS NULL
+     OR lower(COALESCE(c.display_name, '')) LIKE :name_contains
+     OR lower(COALESCE(c.legal_name, '')) LIKE :name_contains
+     OR upper(COALESCE(j.journey_reference, '')) LIKE :ref_contains
+     OR (:mobile_candidate
+         AND regexp_replace(COALESCE(c.mobile_number, ''), '[^0-9]', '', 'g') LIKE :mobile_suffix)
+     OR EXISTS (SELECT 1 FROM auditcore.bookings sb
+                 WHERE sb.tenant_id=j.tenant_id AND sb.journey_id=j.journey_id
+                   AND upper(COALESCE(sb.booking_reference, '')) LIKE :ref_contains)
+     OR EXISTS (SELECT 1 FROM auditcore.vehicle_records sv
+                 WHERE sv.tenant_id=j.tenant_id AND sv.journey_id=j.journey_id
+                   AND (upper(COALESCE(sv.vin, '')) LIKE :ref_contains
+                        OR upper(COALESCE(sv.chassis_number, '')) LIKE :ref_contains
+                        OR upper(COALESCE(sv.invoice_reference, '')) LIKE :ref_contains))
+     OR EXISTS (SELECT 1 FROM auditcore.registration_records sr
+                 WHERE sr.tenant_id=j.tenant_id AND sr.journey_id=j.journey_id
+                   AND upper(replace(COALESCE(sr.registration_number, ''), ' ', ''))
+                       LIKE :reg_contains))
+"""
+
+
+def _board_search(q: str | None) -> dict[str, Any]:
+    """Bind values for _SEARCH_PREDICATE. Fewer than 2 characters is no search."""
+    text_ = (q or "").strip()
+    if len(text_) < 2:
+        return {
+            "search_text": None, "name_contains": "", "ref_contains": "",
+            "reg_contains": "", "mobile_candidate": False, "mobile_suffix": "",
+        }
+    digits = "".join(ch for ch in text_ if ch.isdigit())
+    escaped = text_.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return {
+        "search_text": text_,
+        "name_contains": f"%{escaped.lower()}%",
+        "ref_contains": f"%{escaped.upper()}%",
+        "reg_contains": f"%{escaped.upper().replace(' ', '')}%",
+        "mobile_candidate": len(digits) >= 4 and all(ch.isdigit() or ch in "+- ()." for ch in text_),
+        "mobile_suffix": f"%{digits}",
+    }
+
+
 @router.get("/reviewer/journeys")
 def list_reviewer_journeys(
     tenant_id: str,
@@ -549,6 +594,7 @@ def list_reviewer_journeys(
     outlet_id: Annotated[UUID | None, Query(alias="outletId")] = None,
     date_from: Annotated[date | None, Query(alias="dateFrom")] = None,
     date_to: Annotated[date | None, Query(alias="dateTo")] = None,
+    q: Annotated[str | None, Query(max_length=160)] = None,
 ) -> dict[str, Any]:
     """The Reviewer's board, grouped by dealership and Outlet, then by upload date.
 
@@ -563,6 +609,15 @@ def list_reviewer_journeys(
     first to look at -- and the newest first for closed ones. ``outletOptions``
     always lists every Outlet the caller covers, with its journey count in this
     state, so a picker does not shrink to the Outlet already chosen.
+
+    ``q`` searches the board (product owner 2026-11-04: "give search option to
+    the reviewer on their booking and journey page"): customer name (entered or
+    from the documents), journey or dealer booking number, mobile number, VIN,
+    chassis, registration or invoice number. It runs on the server, not over the
+    rows already read, because the board stops at 500 rows and a search over a
+    cut-off list would silently miss journeys. ``state=all`` searches open and
+    closed together -- a Reviewer looking for a customer does not know which
+    one the journey is in -- and each row then says whether it is closed.
     """
     access = _authorize(
         connection,
@@ -572,11 +627,12 @@ def list_reviewer_journeys(
         authorization_client=authorization_client,
         permission_key=_READ_PERMISSION,
     )
-    wanted = state if state in {"open", "closed"} else "open"
+    wanted = state if state in {"open", "closed", "all"} else "open"
+    search = _board_search(q)
     if date_from is not None and date_to is not None and date_from > date_to:
         raise HTTPException(status_code=422, detail="dateFrom must not be after dateTo.")
     timezone = _project_timezone(connection, tenant_id=tenant_id)
-    # Open journeys: oldest day first. Closed: newest day first.
+    # Open journeys: oldest day first. Closed (and a search across both): newest first.
     day_order = "ASC" if wanted == "open" else "DESC"
     rows = connection.execute(
         text(
@@ -599,7 +655,12 @@ def list_reviewer_journeys(
                    (SELECT count(*) FROM auditcore.document_capture_v2_documents dc
                      WHERE dc.tenant_id=j.tenant_id AND dc.journey_id=j.journey_id
                        AND dc.stage_code='DELIVERY' AND dc.capture_status <> 'SUPERSEDED'
-                   ) AS delivery_documents
+                   ) AS delivery_documents,
+                   (SELECT b.booking_reference FROM auditcore.bookings b
+                     WHERE b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
+                     ORDER BY b.created_at_utc DESC LIMIT 1) AS booking_reference,
+                   c.mobile_last4 AS customer_mobile_last4,
+                   {_CLOSED_PREDICATE} AS is_closed
             FROM auditcore.journeys j
             JOIN auditcore.customers c
               ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
@@ -617,7 +678,9 @@ def list_reviewer_journeys(
              AND dl.stage_code='DELIVERY'
             WHERE j.tenant_id=:tenant_id
               AND {_SCOPE_PREDICATE}
-              AND (CAST(:state AS varchar) = 'closed') = {_CLOSED_PREDICATE}
+              AND (CAST(:state AS varchar) = 'all'
+                   OR (CAST(:state AS varchar) = 'closed') = {_CLOSED_PREDICATE})
+              AND {_SEARCH_PREDICATE}
               AND (CAST(:outlet_id AS uuid) IS NULL OR j.outlet_id = CAST(:outlet_id AS uuid))
               AND (CAST(:date_from AS date) IS NULL
                    OR (j.created_at_utc AT TIME ZONE :timezone)::date >= CAST(:date_from AS date))
@@ -637,6 +700,7 @@ def list_reviewer_journeys(
             "date_from": date_from,
             "date_to": date_to,
             "timezone": timezone,
+            **search,
         },
     ).mappings().all()
 
@@ -649,13 +713,17 @@ def list_reviewer_journeys(
                    count(*) AS journey_count,
                    min((j.created_at_utc AT TIME ZONE :timezone)::date) AS oldest_upload_date
             FROM auditcore.journeys j
+            JOIN auditcore.customers c
+              ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
             JOIN auditcore.dealers d
               ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
             JOIN auditcore.dealer_outlets o
               ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
             WHERE j.tenant_id=:tenant_id
               AND {_SCOPE_PREDICATE}
-              AND (CAST(:state AS varchar) = 'closed') = {_CLOSED_PREDICATE}
+              AND (CAST(:state AS varchar) = 'all'
+                   OR (CAST(:state AS varchar) = 'closed') = {_CLOSED_PREDICATE})
+              AND {_SEARCH_PREDICATE}
             GROUP BY j.dealer_id, j.outlet_id, d.dealer_name, o.outlet_name, o.outlet_code
             ORDER BY lower(d.dealer_name), lower(o.outlet_name), j.dealer_id, j.outlet_id
             """
@@ -665,6 +733,7 @@ def list_reviewer_journeys(
             "actor_id": access.actor_id,
             "state": wanted,
             "timezone": timezone,
+            **search,
         },
     ).mappings().all()
 
@@ -688,7 +757,10 @@ def list_reviewer_journeys(
             {
                 "journeyId": str(row["journey_id"]),
                 "journeyReference": row["journey_reference"],
+                "bookingReference": row["booking_reference"],
                 "customerName": row["customer_name"],
+                "customerMobileLast4": row["customer_mobile_last4"],
+                "closed": bool(row["is_closed"]),
                 "pcName": row["pc_name"],
                 "createdAtUtc": row["created_at_utc"],
                 "uploadDate": row["upload_date"].isoformat(),
@@ -719,6 +791,7 @@ def list_reviewer_journeys(
             "outletId": str(outlet_id) if outlet_id else None,
             "dateFrom": date_from.isoformat() if date_from else None,
             "dateTo": date_to.isoformat() if date_to else None,
+            "q": search["search_text"],
         },
         "outletOptions": [
             {
