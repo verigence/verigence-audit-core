@@ -1,4 +1,5 @@
-"""Who may close a task besides the role it is assigned to (product owner, 2026-11-02).
+"""Who may close a task besides the role it is assigned to (product owner, 2026-11-02;
+the PC's tasks added 2026-11-04: "reviewer to be able to close the PC tasks").
 
 "The tasks marked for TL closure should now also be marked for Reviewers for the
 given outlets." One task, not a copy: a task assigned to the Team Lead role is on
@@ -19,6 +20,8 @@ from typing import Any
 # Assigned role -> the other roles that may close the same task.
 CO_CLOSERS: dict[str, frozenset[str]] = {
     "TL": frozenset({"REVIEWER"}),
+    # A Reviewer closes the PC's tasks of the outlets they cover (2026-11-04).
+    "PC": frozenset({"REVIEWER"}),
 }
 
 # Roles that hold the Team Lead's authority on any task (accepting an exception,
