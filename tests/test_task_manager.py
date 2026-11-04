@@ -301,6 +301,11 @@ def test_gate_pass_task_is_system_reviewed(project):
         tm.run_tick(c, tenant_id=p.tenant, now=_at(tuesday, 7, 5))
         assert tm.run_tick(c, tenant_id=p.tenant, now=_at(tuesday + timedelta(days=1), 23, 0))["gatePassIncomplete"] == 0
         assert tm.run_tick(c, tenant_id=p.tenant, now=_at(tuesday + timedelta(days=2), 0, 5))["gatePassIncomplete"] == 1
+        # The tasks were inserted at the real time; the report counts what existed by the
+        # simulated day's end, so they are dated to the simulated tick (the test failed
+        # once the real date passed that day, 5 Nov 2026).
+        c.execute(text("UPDATE auditcore.p2_tasks SET created_at_utc = :at WHERE tenant_id = :t AND created_at_utc > :at"),
+                  {"at": _at(tuesday, 7, 5), "t": p.tenant})
         status = build_task_status(c, tenant_id=p.tenant, day=tuesday + timedelta(days=1),
                                    now=_at(tuesday + timedelta(days=2), 0, 10))
     assert status["taskManager"]["totals"]["incomplete"] == 1
