@@ -114,6 +114,9 @@ _SEVERITY_BY_BASIS: dict[str, str] = {
     "NAME_AND_ADDRESS": "MEDIUM",
     "GST": "CRITICAL",
     "MOBILE": "CRITICAL",
+    # the same mobile only, at another dealership (product owner 2026-11-04): a
+    # duplicate booking of less probability
+    "MOBILE_OTHER_DEALERSHIP": "LOW",
     "SURNAME_AND_PINCODE": "MEDIUM",
     "SIMILAR_ADDRESS": "LOW",  # no longer raised; kept to read old findings
 }
@@ -134,6 +137,7 @@ _CONFIDENCE_PERCENT_BY_BASIS: dict[str, int] = {
     "NAME_AND_ADDRESS": 60,
     "GST": 95,
     "MOBILE": 95,
+    "MOBILE_OTHER_DEALERSHIP": 40,
     "SURNAME_AND_PINCODE": 50,
     "SIMILAR_ADDRESS": 35,
 }
@@ -154,6 +158,7 @@ _BASIS_LABEL: dict[str, str] = {
     "NAME_AND_ADDRESS": "name and address",
     "GST": "GSTIN",
     "MOBILE": "mobile number",
+    "MOBILE_OTHER_DEALERSHIP": "mobile number, at another dealership",
     "SURNAME_AND_PINCODE": "surname and pincode",
     "SIMILAR_ADDRESS": "similar address",
 }
@@ -421,7 +426,13 @@ def _identity_signals(
         {"tenant_id": tenant_id, "journey_id": journey_id, "field_keys": _IDENTITY_FIELD_KEYS},
     ).mappings().all()
     gst = _valid_gstin(_buyer_gstin(connection, tenant_id=tenant_id, journey_id=journey_id))
-    return _extract_signals(rows, gst=gst)
+    signals = _extract_signals(rows, gst=gst)
+    if signals is not None:
+        signals["dealer_id"] = connection.execute(
+            text("SELECT dealer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": tenant_id, "j": journey_id},
+        ).scalar_one_or_none()
+    return signals
 
 
 # The customer's GSTIN (product owner 2026-10-28): the buyer GSTIN of a live
@@ -488,7 +499,7 @@ def _candidate_journeys(
                   AND f.effective_value IS NOT NULL
                   AND """ + _NOT_TAKEN_OUT + """
             )
-            SELECT r.journey_id, r.field_key, r.effective_value, j.created_at_utc
+            SELECT r.journey_id, r.field_key, r.effective_value, j.created_at_utc, j.dealer_id
             FROM ranked r
             JOIN auditcore.journeys j
               ON j.tenant_id = :tenant_id AND j.journey_id = r.journey_id
@@ -500,9 +511,11 @@ def _candidate_journeys(
 
     by_journey: dict[UUID, list[Any]] = {}
     created_at_by_journey: dict[UUID, Any] = {}
+    dealer_by_journey: dict[UUID, Any] = {}
     for row in rows:
         by_journey.setdefault(row["journey_id"], []).append(row)
         created_at_by_journey[row["journey_id"]] = row["created_at_utc"]
+        dealer_by_journey[row["journey_id"]] = row["dealer_id"]
 
     gst_rows = connection.execute(
         text(
@@ -536,6 +549,7 @@ def _candidate_journeys(
             continue
         signals["journey_id"] = candidate_journey_id
         signals["created_at_utc"] = created_at_by_journey[candidate_journey_id]
+        signals["dealer_id"] = dealer_by_journey.get(candidate_journey_id)
         candidates.append(signals)
     return candidates
 
@@ -557,6 +571,8 @@ def _match_basis(signals: dict[str, Any], candidate: dict[str, Any]) -> str | No
     if signals["gst"] and candidate["gst"] and signals["gst"] == candidate["gst"]:
         return "GST"
     if signals["mobile"] and candidate["mobile"] and signals["mobile"] == candidate["mobile"]:
+        if signals.get("dealer_id") and candidate.get("dealer_id") and signals["dealer_id"] != candidate["dealer_id"]:
+            return "MOBILE_OTHER_DEALERSHIP"
         return "MOBILE"
     if (
         signals["surname"] and candidate["surname"] and signals["surname"] == candidate["surname"]
@@ -593,6 +609,7 @@ _BASIS_FIELDS: dict[str, tuple[str, ...]] = {
     "NAME_AND_ADDRESS": ("name", "pincode"),
     "GST": ("gst",),
     "MOBILE": ("mobile",),
+    "MOBILE_OTHER_DEALERSHIP": ("mobile",),
     "SURNAME_AND_PINCODE": ("surname", "pincode"),
     "SIMILAR_ADDRESS": ("address",),
 }
@@ -716,7 +733,7 @@ def _booking_numbers(connection: Connection, *, tenant_id: str, journey_id: UUID
 # for these does a different model make two separate bookings. A relative's
 # name or a shared surname and pincode stays for the Team Lead (product
 # owner, 2026-11-02: "Keep, TL closes them").
-_SAME_CUSTOMER_BASES = frozenset({"PAN", "AADHAAR", "GST", "MOBILE"})
+_SAME_CUSTOMER_BASES = frozenset({"PAN", "AADHAAR", "GST", "MOBILE", "MOBILE_OTHER_DEALERSHIP"})
 
 
 def different_bookings(left: dict[str, set[str]], right: dict[str, set[str]], *, by_model: bool = True) -> bool:

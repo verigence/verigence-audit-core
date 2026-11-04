@@ -193,7 +193,7 @@ def create_bulk_upload(
 
     authorize_p2(connection, tenant_id=tenant_id, journey_id=None, human_principal=principal,
                  authorization_client=client, permission_key=_UPDATE)
-    refuse_upload_if_paused(connection, tenant_id)
+    refuse_upload_if_paused(connection, tenant_id, principal.subject)
     outlet = _my_pc_outlet(connection, tenant_id, principal.subject, command.outletId)
     folder = bulk_folder(tenant_id, outlet["dealer_name"], outlet["outlet_name"])
     row = connection.execute(

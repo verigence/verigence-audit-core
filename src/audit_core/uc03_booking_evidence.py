@@ -157,7 +157,7 @@ def upload_booking_document(
 
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
-        refuse_upload_if_paused(connection, tenant_id)
+        refuse_upload_if_paused(connection, tenant_id, human_principal.subject)
         booking_context = _booking_journey_context(
             connection,
             tenant_id=tenant_id,

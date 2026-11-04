@@ -343,6 +343,31 @@ def test_exact_mobile_match_flags_as_high_probability(two_journeys) -> None:
     assert findings[0]["severity"] == "CRITICAL"
 
 
+def test_the_same_mobile_at_another_dealership_is_a_less_probable_duplicate(two_journeys) -> None:
+    """Product owner 2026-11-04: "if the mobile number is same only across different dealership
+    that should also be considered under duplicate booking with some less probability"."""
+    c = two_journeys
+    other_dealer = c.execute(
+        text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
+             "VALUES (:t, :c, 'D2') RETURNING dealer_id"), {"t": c.tenant_id, "c": f"DBD-D2-{uuid4().hex[:6]}"},
+    ).scalar_one()
+    other_outlet = c.execute(
+        text("INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_code, outlet_name) "
+             "VALUES (:t, :d, :c, 'O2') RETURNING outlet_id"),
+        {"t": c.tenant_id, "d": other_dealer, "c": f"DBD-O2-{uuid4().hex[:6]}"},
+    ).scalar_one()
+    c.execute(text("UPDATE auditcore.journeys SET dealer_id=:d, outlet_id=:o WHERE tenant_id=:t AND journey_id=:j"),
+              {"d": other_dealer, "o": other_outlet, "t": c.tenant_id, "j": c.journey_b})
+    _set_field(c, journey_id=c.journey_a, document_type_key="booking_form", field_key="customer_phone", value="+91 98765 43210")
+    _set_field(c, journey_id=c.journey_b, document_type_key="booking_form", field_key="customer_phone", value="09876543210")
+
+    _assert_exactly_one_flagged_as_duplicate_of_the_other(c)
+    [finding] = [f for f in _findings_with_basis(c) if f["finding_status"] != "VOIDED"]
+    assert finding["severity"] == "LOW"
+    assert finding["raised"]["matchBasis"] == "MOBILE_OTHER_DEALERSHIP"
+    assert finding["raised"]["matchConfidencePercent"] == 40
+
+
 def test_customer_matches_relative_on_other_booking_flags_as_probable(two_journeys) -> None:
     """Product owner 2026-10-28: a probable case, not a high-probability one."""
     c = two_journeys
