@@ -216,6 +216,9 @@ def test_the_section_is_built_on_demand_from_the_other_tabs(journey):
     assert body["settlement"]["received"] == "50000.00"
     assert body["verdict"]["status"] == "EXCEPTIONS"
     assert body["verdict"]["amountAtRisk"]["customerOvercharged"] == "5000.00"
+    # the header adds up: gross less the discounts the deal counts is the net payable
+    head = body["deal"]
+    assert Decimal(head["gross"]) - Decimal(head["discounts"] or 0) == Decimal(head["netPayable"])
 
 
 def test_the_loan_receipt_shows_under_loan_received_not_receipts_and_is_counted_once(journey):

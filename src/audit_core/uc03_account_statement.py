@@ -948,6 +948,8 @@ class Copy:
     day: Any
     figures: dict[tuple[str, str], Decimal]
     full: bool
+    # the vehicle invoice agrees with this copy's ex-showroom (cost sheets)
+    billed: bool = False
 
 
 @dataclass
@@ -976,10 +978,10 @@ def _copy_day(fields: dict[str, Any], keys: tuple[str, ...]) -> Any:
 
 
 def _newest_first(copies: list[Copy]) -> list[Copy]:
-    def order(copy: Copy) -> tuple[bool, str, float]:
+    def order(copy: Copy) -> tuple[bool, bool, str, float]:
         linked = copy.document.get("linkedAtUtc")
         stamp = linked.timestamp() if hasattr(linked, "timestamp") else 0.0
-        return (copy.day is not None, copy.day.isoformat() if copy.day is not None else "", stamp)
+        return (copy.billed, copy.day is not None, copy.day.isoformat() if copy.day is not None else "", stamp)
 
     return sorted(copies, key=order, reverse=True)
 
@@ -1066,9 +1068,17 @@ def combine_statements(
     return out, combined
 
 
-def combine_cost_sheets(sheets: list[dict[str, Any]]) -> tuple[CostSheetRead | None, Combined]:
+def combine_cost_sheets(
+    sheets: list[dict[str, Any]], *, billed_ex_showroom: tuple[Decimal, ...] = (),
+) -> tuple[CostSheetRead | None, Combined]:
     """The cost sheet the Deal reads, from every cost sheet on file, by the
-    same rule as the statement's copies; a copy that reads nothing is not one."""
+    same rule as the statement's copies; a copy that reads nothing is not one.
+
+    Two full cost sheets that price the vehicle differently are the
+    quotation and the final sheet (16 journeys, 2026-11-04; their dates are
+    often misread -- "2024-09-15" on a 2026 deal): the final one is the one
+    the vehicle invoice agrees with, so it stands whatever its date. With no
+    invoice on file, or none agreeing, the newest copy stands as before."""
     copies = []
     for document in sheets:
         read = read_cost_sheet(document["fields"])
@@ -1080,6 +1090,12 @@ def combine_cost_sheets(sheets: list[dict[str, Any]]) -> tuple[CostSheetRead | N
         if figures:
             copies.append(Copy(document=document, day=_copy_day(document["fields"], _COST_SHEET_DATE_FIELDS),
                                figures=figures, full="ex_showroom_price" in read.components))
+    full = [c for c in copies if c.full]
+    agreeing = [c for c in full if any(abs(c.figures[("COMMERCIAL", "ex_showroom_price")] - Decimal(bill)) <= TOLERANCE
+                                       for bill in billed_ex_showroom)]
+    if agreeing and len(agreeing) < len(full):
+        for copy in agreeing:
+            copy.billed = True
     combined = combine_copies(copies)
     if combined.primary is None:
         return None, combined
@@ -1126,19 +1142,41 @@ def chosen_copies(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     forms = [(d, rows) for d in documents for rows in [line_rows(d["fields"].get("line_items"))]
              if statement_kind(rows) == KIND_FORM]
     _, statement = combine_statements(forms)
-    _, sheet = combine_cost_sheets(load_ledger_documents(
-        connection, tenant_id=tenant_id, journey_id=journey_id, document_type=COST_SHEET_TYPE))
+    _, sheet = journey_cost_sheet(connection, tenant_id=tenant_id, journey_id=journey_id)
     return {
         ACCOUNT_STATEMENT_TYPE: {k: str(d["documentId"]) for k, d in statement.origin.items()},
         COST_SHEET_TYPE: {k: str(d["documentId"]) for k, d in sheet.origin.items()},
     }
 
 
+def _billed_ex_showroom(connection: Connection, *, tenant_id: str, journey_id: UUID) -> tuple[Decimal, ...]:
+    """The ex-showroom each vehicle invoice on file prints, read on its own."""
+    from audit_core.uc03_invoice_materialization import load_invoice_readings
+
+    figures = []
+    for reading in load_invoice_readings(connection, tenant_id=tenant_id, journey_id=journey_id):
+        value = (reading.get("lines") or {}).get("ex_showroom_price")
+        if value is not None:
+            figures.append(Decimal(str(value)))
+    return tuple(figures)
+
+
+def journey_cost_sheet(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                       sheets: list[dict[str, Any]] | None = None) -> tuple[CostSheetRead | None, Combined]:
+    """The journey's cost sheet: every copy on file combined (combine_cost_sheets)."""
+    if sheets is None:
+        sheets = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                       document_type=COST_SHEET_TYPE)
+    if len(sheets) < 2:
+        return combine_cost_sheets(sheets)
+    return combine_cost_sheets(sheets, billed_ex_showroom=_billed_ex_showroom(
+        connection, tenant_id=tenant_id, journey_id=journey_id))
+
+
 def cost_sheet_discount(connection: Connection, *, tenant_id: str, journey_id: UUID) -> tuple[Decimal, str] | None:
     """The cost sheet's discount total (one figure, its types not printed) and
     the document it stands from, when the cost sheet prints one."""
-    sheet, copies = combine_cost_sheets(load_ledger_documents(
-        connection, tenant_id=tenant_id, journey_id=journey_id, document_type=COST_SHEET_TYPE))
+    sheet, copies = journey_cost_sheet(connection, tenant_id=tenant_id, journey_id=journey_id)
     if sheet is None or sheet.discount_total is None or copies.primary is None:
         return None
     origin = copies.origin.get(("SHEET", "discount_total"), copies.primary)
@@ -1179,8 +1217,7 @@ def standing_figures(connection: Connection, *, tenant_id: str, journey_id: UUID
         read = read_tally_lines(combined_tally_rows(tallies))
         tally = {(kind, key): None for kind, figures in (("COMMERCIAL", read.components), ("DISCOUNT", read.discounts))
                  for key in figures}
-    sheet, sheet_copies = combine_cost_sheets(load_ledger_documents(
-        connection, tenant_id=tenant_id, journey_id=journey_id, document_type=COST_SHEET_TYPE))
+    sheet, sheet_copies = journey_cost_sheet(connection, tenant_id=tenant_id, journey_id=journey_id)
     cost: dict[tuple[str, str], str | None] = {}
     if sheet is not None:
         cost = {("COMMERCIAL", key): str(sheet_copies.origin[("COMMERCIAL", key)]["documentId"])
@@ -1582,7 +1619,7 @@ def sync_account_statement(
     # uc03_p2_journey360), and compared with the NDC when both are in.
     sheets = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
                                    document_type=COST_SHEET_TYPE)
-    sheet, sheet_copies = combine_cost_sheets(sheets)
+    sheet, sheet_copies = journey_cost_sheet(connection, tenant_id=tenant_id, journey_id=journey_id, sheets=sheets)
     if sheet is not None:
         for key, amount in sorted(sheet.components.items()):
             origin = sheet_copies.origin[("COMMERCIAL", key)]

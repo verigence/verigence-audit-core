@@ -683,8 +683,11 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         "rules": RULES,
         "billedSource": summary.get("billedSource"),
         "verdict": verdict(rows, delivery_started=delivery_started, missing=missing),
-        "deal": {"charges": charges, "gross": (summary.get("gross") or {}).get("billed"),
-                 "discounts": (summary.get("discounts") or {}).get("billed"),
+        # The deal as it is counted, so the header adds up to its net payable
+        # (independent check 2026-11-04: the billed column also held invoice
+        # discounts the deal does not count, beside a payable that leaves them out).
+        "deal": {"charges": charges, "gross": (summary.get("gross") or {}).get("current"),
+                 "discounts": (summary.get("discounts") or {}).get("current"),
                  "netPayable": summary.get("payable")},
         "benefits": benefits,
         "products": products,
