@@ -1,10 +1,11 @@
 """The same file uploaded again (product owner, 2026-10-31; rule of 2026-11-04).
 
-PAN and/or Aadhaar, mobile, model and outlet all those of another journey: the
-journey with fewer documents is deleted (when the PAN is an individual's) and
-the Project alerted; the customer name and the booking reference number no
-longer decide. The same customer at another outlet of the same dealership
-pauses both PCs' uploads; at another dealership, a red alert on every screen.
+PAN and/or Aadhaar, mobile, model, customer name, booking reference number and
+outlet all those of another journey: the journey with fewer documents is
+deleted (when the PAN is an individual's) and the Project alerted; no booking
+reference read on a copy: alert only. The same customer at another outlet of
+the same dealership pauses both PCs' uploads; at another dealership, a red
+alert on every screen.
 Real Postgres; Document Intelligence, Security and R2 are doubles.
 """
 from __future__ import annotations
@@ -251,9 +252,7 @@ def test_all_must_match():
     assert matched_fields(_identity(), base) is not None
     assert matched_fields(_identity(pan="ABCPE9999F"), base) is None
     assert matched_fields(_identity(mobile="9876500000"), base) is None
-    # 2026-11-04: the name and the booking reference number no longer decide.
-    assert matched_fields(_identity(name="Sunil Kumar Mallick"), base) is not None
-    assert matched_fields(_identity(booking_refs=frozenset({"BK-13"})), base) is not None
+    assert matched_fields(_identity(name="Sunil Kumar Mallick"), base) is None
     assert matched_fields(_identity(model_name="SCORPIO N"), base) is None
     # A missing value is not a match.
     assert matched_fields(_identity(model_name=None), base) is None
@@ -317,8 +316,9 @@ def test_same_file_with_an_individual_pan_is_deleted_and_alerted(tenant):
     assert alert["expires_at_utc"] > alert["published_at_utc"]
     assert "was deleted" in alert["body"] and "New PC" in alert["body"]
     fields = {f["field"]: f for f in alert["payload"]["matchedFields"]}
-    assert set(fields) == {"pan", "mobile", "model", "outlet"}
+    assert set(fields) == {"pan", "mobile", "name", "model", "outlet", "bookingReference"}
     assert fields["pan"]["newValue"] == "XXXXXX234F"
+    assert fields["bookingReference"]["exact"] and fields["bookingReference"]["newValue"] == BOOKING_REF
     # The PC who entered the new file is named by id, so their own screen beeps (2026-10-31).
     with new.engine.begin() as connection:
         set_tenant_context(connection, new.tenant_id)
@@ -344,7 +344,8 @@ def test_same_file_with_an_individual_pan_is_deleted_and_alerted(tenant):
 
 
 @pytest.mark.parametrize("differs", [
-    {"pan": "ABCPE9999F"}, {"mobile": "9000000001"}, {"model": "SCORPIO N"}, {"model": None},
+    {"pan": "ABCPE9999F"}, {"mobile": "9000000001"}, {"name": "Sunil Kumar Mallick"}, {"model": "SCORPIO N"},
+    {"model": None}, {"booking_ref": "BK/0013"},
 ])
 def test_one_value_different_is_not_the_same_file(tenant, differs):
     _, new = _pair(tenant, **differs)
@@ -893,12 +894,15 @@ def test_booking_reference_normalisation():
         assert norm(nothing) is None, nothing
 
 
-def test_the_booking_reference_no_longer_decides():
+def test_the_booking_reference_decides():
     base = _identity()
-    # 2026-11-04: read on both and different, or not read on one -- the same file all the same.
-    assert matched_fields(_identity(booking_refs=frozenset({"BK-13"})), base) is not None
+    # Read on both and different: two bookings.
+    assert matched_fields(_identity(booking_refs=frozenset({"BK-13"})), base) is None
+    # Not read on one: still a match, the booking row not exact (kept with an alert).
     fields = matched_fields(_identity(booking_refs=frozenset(), booking_ref_display=None), base)
-    assert fields is not None and [f["field"] for f in fields] == ["pan", "mobile", "model", "outlet"]
+    assert fields is not None and fields[-1] == {
+        "field": "bookingReference", "label": "Booking reference number", "newValue": None,
+        "existingValue": "BK/0012", "exact": False}
     # Each dealership numbers its own bookings.
     assert matched_fields(_identity(dealer_id=uuid4()), _identity(dealer_id=uuid4())) is None
 
@@ -930,15 +934,43 @@ def test_same_booking_reference_differently_written_is_deleted(tenant):
     assert not _exists(new) and _exists(old)
 
 
-@pytest.mark.parametrize("differs", [{"booking_ref": "BK/0099"}, {"booking_ref": None},
-                                     {"name": "Sunil Kumar Mallick"}])
-def test_a_different_or_missing_booking_reference_or_name_is_still_the_same_file(tenant, differs):
-    """Product owner 2026-11-04: PAN/Aadhaar + mobile + model + outlet decide."""
-    old, new = _pair(tenant, **differs)
-    _quiet(new)
+def test_a_different_booking_reference_is_not_a_duplicate(tenant):
+    _, new = _pair(tenant, booking_ref="BK/0099")
+    assert _detect(new).get("raised", 0) == 0
+    assert _alerts(new) == [] and _queued(new) == []
+
+
+def test_no_booking_reference_on_one_copy_is_alerted_and_kept(tenant):
+    old, new = _pair(tenant, booking_ref=None)
+    assert _detect(new)["outcomes"] == ["KEPT_NO_BOOKING_REFERENCE"]
+    [alert] = _alerts(new)
+    assert alert["alert_status"] == "PUBLISHED" and alert["outcome"] == "KEPT_NO_BOOKING_REFERENCE"
+    assert "kept for review: the booking reference number was not read on the new file" in alert["body"]
+    assert "booking reference number" not in alert["body"].split(" on ")[-1]  # not listed as matched
+    assert _queued(new) == [] and _exists(new)
+    # Read later and the same: the copy is deleted after all, under the same alert.
+    form = uuid4()
+    add_evidence(new, di_document_id=form, document_type_key="booking_docket")
+    add_extracted_field(new, di_document_id=form, field_key="booking_reference_number", value="BK 12",
+                        document_type="booking_docket")
+    add_evidence(old, di_document_id=uuid4(), document_type_key="payment_receipt")  # as many documents on each
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
-    assert _delete(new) == "DELETED"
-    assert not _exists(new) and _exists(old)
+    [alert] = _alerts(new)
+    assert alert["alert_status"] == "PENDING" and len(_queued(new)) == 1
+    _quiet(new)
+    assert _delete(new) == "DELETED" and _exists(old)
+
+
+def test_no_booking_reference_at_delete_time_keeps_the_copy(tenant):
+    _, new = _ready_to_delete(tenant)
+    with new.engine.begin() as connection:  # the booking form removed since
+        set_tenant_context(connection, new.tenant_id)
+        connection.execute(text("UPDATE auditcore.evidence SET association_status='VOIDED' WHERE tenant_id=:t "
+                                "AND journey_id=:j AND document_type_key='booking_form'"),
+                           {"t": new.tenant_id, "j": new.journey_id})
+    _quiet(new)
+    assert _delete(new) == "KEPT_CHANGED" and _exists(new)
+    assert "booking reference number was not read" in _alerts(new)[0]["body"]
 
 
 def test_the_journey_with_more_documents_is_kept_even_when_it_is_the_newer(tenant):

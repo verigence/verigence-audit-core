@@ -1,11 +1,11 @@
 """The same file uploaded again, and a duplicate booking across outlets.
 
-Product owner 2026-11-04 (supersedes the name and booking-number rules below):
-    - PAN/Aadhaar + mobile + model + OUTLET the same: the journey with FEWER
-      documents is deleted ("keep deleting the files where we have less
-      number of documents uploaded in the journey"); the earlier one is kept
-      on a tie. Neither the customer name nor the booking reference number is
-      compared any more (``matched_fields``).
+Product owner 2026-11-04 (enhancements to the rules below, which all still hold):
+    - The same file at ONE OUTLET (PAN/Aadhaar + mobile + model + outlet, and,
+      as before, the customer name and the booking reference number): the
+      journey with FEWER documents is deleted ("keep deleting the files where
+      we have less number of documents uploaded in the journey"); the earlier
+      one is kept on a tie.
     - The same at another outlet of the SAME DEALERSHIP: nothing is deleted;
       the PCs of both bookings may not start an upload until a Reviewer
       deletes the duplicate ("temporary block the upload for them ... they have
@@ -47,8 +47,7 @@ The same file uploaded again (product owner, 2026-10-31).
     Dealership, and delete the journey completely. This alert should be seen
     by all team on their respective screens, if they are active."
 
-What was "the same file" (product owner, 2026-11-02; name and booking number
-dropped 2026-11-04, outlet added)
+What is "the same file" (product owner, 2026-11-02; the same outlet, 2026-11-03)
     Two open journeys of one dealership that agree on ALL of:
       - the customer: the same PAN and/or the same Aadhaar -- either one
         equal is enough (``pan_number`` in PAN shape by ``_valid_pan``;
@@ -100,8 +99,10 @@ What happens to it
       can genuinely book two identical vehicles (product owner 2026-10-31).
     - A journey whose documents a reviewer already marked reviewed is kept
       too (the delete guard), and the alert says so.
-    - (Until 2026-11-04 a copy whose booking reference number was not read
-      was kept, KEPT_NO_BOOKING_REFERENCE; old alerts may still say so.)
+    - A copy whose booking reference number was not read (on either side)
+      is kept and alerted (KEPT_NO_BOOKING_REFERENCE). Once the booking
+      numbers are read and agree, the check runs again and the copy is
+      deleted after all (the kept alert is turned into a pending delete).
     - Every copy deleted keeps, on its ``p2_journey_deletions`` row, the PAN,
       the mobile, the Aadhaar masked to its last four digits ("XXXX XXXX
       1234" -- the full number is never stored), the booking reference
@@ -342,9 +343,10 @@ class FileIdentity:
 
     @property
     def complete(self) -> bool:
-        """A PAN or an Aadhaar, the mobile and the model: everything compared
-        (product owner 2026-11-04)."""
-        return bool((self.pan or self.aadhaar) and self.mobile and (self.model_id or self.model_key))
+        """A PAN or an Aadhaar, the mobile, the customer name and the model --
+        everything compared except the booking reference number, whose
+        absence keeps the copy with an alert instead."""
+        return bool((self.pan or self.aadhaar) and self.mobile and self.name and (self.model_id or self.model_key))
 
     @property
     def comparable(self) -> bool:
@@ -450,6 +452,11 @@ def mask_aadhaar(value: Any) -> str | None:
     return f"XXXX XXXX {digits[-4:]}" if len(digits) >= 4 else None
 
 
+def booking_reference_shared(left: FileIdentity, right: FileIdentity) -> bool:
+    """Both copies carry the same booking reference number."""
+    return bool(left.booking_refs & right.booking_refs)
+
+
 def same_outlet(left: FileIdentity, right: FileIdentity) -> bool:
     return not (left.outlet_id and right.outlet_id and left.outlet_id != right.outlet_id)
 
@@ -502,11 +509,15 @@ def matched_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, 
     """The fields, as a reviewer should see them, when the two journeys are one
     booking entered twice at one outlet; None otherwise.
 
-    Product owner 2026-11-04: the same PAN and/or the same Aadhaar (either one
-    equal is enough; one read on both and different says two people), the same
-    mobile, the same model and the same outlet. The customer name and the
-    booking reference number are no longer compared (2026-11-02 rule
-    replaced): both were read wrongly on real copies and kept them."""
+    Product owner 2026-11-02: the same PAN and/or the same Aadhaar (either
+    one equal is enough; one read on both and different says two people),
+    the same mobile, the same model, the same customer name (kept from
+    2026-10-31) and the same booking reference number -- within one outlet
+    (2026-11-03). Booking numbers read on both copies and none in common: two
+    bookings, None. A booking number not read on one copy (or either) still
+    returns the fields, with the booking reference row not exact: the caller
+    then alerts and keeps the copy (KEPT_NO_BOOKING_REFERENCE), never deletes
+    it. The 2026-11-04 rules were added to these, not in their place."""
     if not same_outlet(new, existing):  # another outlet: a duplicate booking across outlets
         return None
     if new.dealer_id and existing.dealer_id and new.dealer_id != existing.dealer_id:
@@ -514,7 +525,11 @@ def matched_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, 
     customer = same_customer(new, existing)
     if customer is None:
         return None
-    if not (new.complete and existing.complete and new.mobile == existing.mobile and same_model(new, existing)):
+    if not (new.complete and existing.complete and new.mobile == existing.mobile
+            and same_model(new, existing) and same_name(new.name, existing.name)):
+        return None
+    shared = sorted(new.booking_refs & existing.booking_refs)
+    if new.booking_refs and existing.booking_refs and not shared:
         return None
     same_pan, same_aadhaar = customer
     fields: list[dict[str, Any]] = []
@@ -529,8 +544,13 @@ def matched_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, 
          "existingValue": _masked(existing.mobile), "exact": True},
         {"field": "model", "label": "Model", "newValue": new.model_name, "existingValue": existing.model_name,
          "exact": bool(new.model_id and new.model_id == existing.model_id) or new.model_name == existing.model_name},
+        {"field": "name", "label": "Customer name", "newValue": new.name, "existingValue": existing.name,
+         "exact": new.name == existing.name},
         {"field": "outlet", "label": "Outlet", "newValue": _place(new.dealer_name, new.outlet_name),
          "existingValue": _place(existing.dealer_name, existing.outlet_name), "exact": True},
+        {"field": "bookingReference", "label": "Booking reference number",
+         "newValue": new.booking_ref_display, "existingValue": existing.booking_ref_display,
+         "exact": bool(shared)},
     ]
     return fields
 
@@ -543,6 +563,16 @@ def document_counts(connection: Connection, *, tenant_id: str, journey_ids: Iter
              "AND association_status='ACTIVE' GROUP BY journey_id"),
         {"t": tenant_id, "ids": ids},
     ).all()}
+
+
+def _no_booking_reference_reason(new: FileIdentity, existing: FileIdentity) -> str:
+    if not new.booking_refs and not existing.booking_refs:
+        where = "either copy"
+    elif not new.booking_refs:
+        where = f"the new file {new.reference or ''}".rstrip()
+    else:
+        where = existing.reference or "the earlier journey"
+    return f"the booking reference number was not read on {where}"
 
 
 def is_individual_pan(pan: str | None) -> bool:
@@ -864,6 +894,8 @@ def _raise(
         outcome = KEPT_NOT_INDIVIDUAL
     elif _reviewed(connection, tenant_id=tenant_id, journey_id=new.journey_id):
         outcome = KEPT_REVIEWED
+    elif not booking_reference_shared(new, existing):
+        outcome, kept_reason = KEPT_NO_BOOKING_REFERENCE, _no_booking_reference_reason(new, existing)
     elif (plan := carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing)).unsure:
         outcome, kept_reason = KEPT_OWN_DOCUMENTS, plan.unsure
     else:
@@ -1135,7 +1167,10 @@ def recheck_before_delete(
     if new.closed:
         raise SameFileNoLongerHolds("it is already closed")
     if matched_fields(new, existing) is None:
-        raise SameFileNoLongerHolds(f"its PAN / Aadhaar, mobile, model or outlet no longer match {ref}")
+        raise SameFileNoLongerHolds(
+            f"its PAN / Aadhaar, mobile, model, customer name or booking reference number no longer match {ref}")
+    if not booking_reference_shared(new, existing):
+        raise SameFileNoLongerHolds(_no_booking_reference_reason(new, existing))
     counts = document_counts(connection, tenant_id=tenant_id, journey_ids=[new_journey_id, existing_journey_id])
     if counts.get(new_journey_id, 0) > counts.get(existing_journey_id, 0):
         # the copy now holds more documents (pages still arriving): the other one is the copy
