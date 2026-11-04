@@ -83,13 +83,16 @@ _WS = re.compile(r"\s+")
 
 _LESS = re.compile(r"^LESS:?\s*")
 _IF_APPLICABLE = re.compile(r"\s*\(IF ?APPLICABLE\)")
+_CLOSING_RULE = re.compile(r"(?<=[A-Z.])\s*[-:]+$")
 
 
 def _label(value: Any) -> str:
     """Upper-case, one space between words, without the form's own decoration
     ("LESS:", "(IF APPLICABLE)", the "**" on the cash discount)."""
     text_ = _WS.sub(" ", re.sub(r"\*+", "", str(value or "").upper())).strip()
-    return _WS.sub(" ", _IF_APPLICABLE.sub("", _LESS.sub("", text_))).strip()
+    # a dash or colon closing a word is the form's ruling ("REGISTRATION IN
+    # HOUSE-"), not an amount's "/-"
+    return _CLOSING_RULE.sub("", _WS.sub(" ", _IF_APPLICABLE.sub("", _LESS.sub("", text_))).strip())
 
 
 def _amount(value: Any) -> Decimal | None:
@@ -118,9 +121,9 @@ def line_rows(value: Any) -> list[dict[str, Any]]:
 
 
 # ── the mapping ──────────────────────────────────────────────────────────────
-# Each pattern is matched against the WHOLE normalised label, so a label that
-# carries a second item ("FASTAG CHARGESRSA", "HANDLING CHARGES TCS") matches
-# nothing and is reported, never read as the first item.
+# Each pattern is matched against the WHOLE normalised label. A label that
+# carries a second item ("FASTAG CHARGESRSA", "HANDLING CHARGES TCS") is never
+# read as the first item: the handwritten word decides (_charge_noted_on).
 _VLTD = r"V\.?L\.?T\.?D\.?"
 # Other charges: the Deal has one line for them, but each printed row is a
 # charge of its own, so two rows add up (a permit and a tracking device on one
@@ -141,6 +144,15 @@ _OTHER_CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("TEMP_REGISTRATION", r"TEMPORARY REGISTRATION"),
         ("RTO_CHOICE", r"RTO CHOICE( NO\.?)?"),
         ("3M", r"3M"),
+        # Rows of the Utkal / Shivnath forms (all journeys, 2026-11-04): the
+        # home delivery, a choice (fancy) number.
+        ("HOME_DELIVERY", r"HOME (DLY\.?|DELIVERY)( CHARGES?)?"),
+        ("CHOICE_NUMBER", r"CH(OICE)? (NO\.?|NUMBER)( A/C)?|FANCY( NO\.?| NUMBER)?"),
+        # The certificate of deposit bought for a scrappage, written in the RSA
+        # or the "If any others" row ("RSA COD" 20,700, "IF ANY OTHERS DigiELV"
+        # 24,143, read also "D141 LV", "Digilence"): an other charge, the
+        # statement's net value adding up only with it (product owner 2026-11-04).
+        ("SCRAPPAGE_COD", r"(RSA|IF ANY OTHERS?) (CO[DP]|DIGI ?E ?LV|D141 LV|DIGILENCE)"),
         ("OTHERS", r"OTHERS( .*)?"),
     )
 )
@@ -148,26 +160,35 @@ _CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (key, re.compile(pattern)) for key, pattern in (
         # "EX SHOWROOM (1-2)": the Offer Letter / Payment Details form prints
         # the vehicle price less its scheme on this row (2026-11-03).
-        ("ex_showroom_price", r"EX[- ]?SHOW ?ROOM( PRICE( OF VEHICLE)?| ?\( ?1 ?- ?2 ?\))?|VEHICLE COST"),
+        # Also "EX SHOWROOM BILLING PRICE", "EX-SHOWROOM PRICE (1-2)", "EX.
+        # SHOWROOM PRICE (INCLUSIVE OF __ KW CHARGER COST)" (2026-11-04).
+        ("ex_showroom_price",
+         r"EX[-. ]*SHOW ?ROOM( BILLING)?( PRICE)?( OF VEHICLE)?( ?\( ?1 ?- ?2 ?\))?( \(INCLUSIVE OF .*\))?|VEHICLE COST"),
         # The Utkal form prints its TCS row as "W/s billing TCS (1%)"; read also
         # as "W/S BILLING", "W/S BILLING TCS(1%)" and "W/S BILLING TU (1%)", and
         # every amount on it is 1% of the sale (five live statements, 2026-11-02).
-        ("tcs_amount", r"TCS( ON INVOICE)?( \d+(\.\d+)?%)?|W/S BILLING( TCS| TU)? ?(\( ?1 ?%\)|1 ?%)?"),
-        ("insurance_amount", r"INSURANCE( AMOUNT| COST)?( \((NORMAL|NIL DEP)\))?"),
+        # "T-U" is the handwritten TCS too: "HANDLING CHARGES T-U" 10,400 on the
+        # copy whose twin prints "TCS" 10,445 on a 10,44,500 vehicle (2026-11-04).
+        ("tcs_amount", (r"TCS( ON INVOICE| TAX COLLECTION AT SOURCE( \(IF ANY\))?)?( \d+(\.\d+)? ?%)?|"
+                        r"W/S BILLING( TCS| TU)? ?(\( ?1 ?%\)|1 ?%)?|T-U")),
+        ("insurance_amount", r"INSURANCE( AMOUNT| COST| IN HOUSE)?( \((NORMAL|NIL DEP)\))?"),
         # "RTO BH" / "RTO (BH Series)": the Offer Letter's RTO row for a BH-series number (2026-11-03).
         ("registration_charges",
-         r"REGISTRATION( COST| CHARGES)?( BH| \(BH\)| RTO)?|ONLINE RTO|RTO CHARGES.*|RTO( \(?BH( SERIES)?\)?)?"),
+         (r"REGISTRATION( COST| CHARGES| IN HOUSE)?( BH| \(BH\)| RTO)?|ONLINE RTO|RTO CHARGES.*|RTO( \(?BH( SERIES)?\)?)?|"
+          r"ROAD TAX")),
         # The Offer Letter's "Others" row with "FT" / "Fastag" written on it is
         # the FASTag (2026-11-03), so it is matched before the other charges.
-        ("fastag_amount", r"(OTHERS )?(FAST ?T?AG( CHARGES)?|FT)"),
+        ("fastag_amount", r"(OTHERS )?(FAST ?T?AGE?( CHARGES)?|FT)"),
         ("other_charges", "|".join(f"(?:{p.pattern})" for _, p in _OTHER_CHARGES)),
-        ("accessories_cost", r"ACCESSORIES|SALE OF ACCESSORIES"),
+        ("accessories_cost", r"(PAID )?ACCESSOR(IES|Y)|SALE OF ACCESSORIES"),
         # Not "RSA COD" / "RSA COP": their amounts are the certificate of
         # deposit bought for a scrappage (Rs 20,700 / 24,143 against an RSA of
-        # Rs 2,021 on live statements, 2026-11-02), written in the RSA row.
+        # Rs 2,021 on live statements, 2026-11-02), written in the RSA row: an
+        # other charge (SCRAPPAGE_COD).
         ("rsa_amount", r"(RSA|ROAD SIDE ASSISTANCE)( 1 ?(YEAR|YR))?"),
         ("additional_warranty_amount",
-         r"(SHIELD|EXTENDED|EXT\.?) WARR?ANT(Y|IES)?( \(\d(ST|ND|RD|TH)( ?[-+&] ?\d(ST|ND|RD|TH))? ?(YR|YEAR)S?\))?"),
+         (r"((SHIELD|SHEILD|EXTENDED|EXT\.?) WARR?[AE]NT(Y|IES)?( \(\d(ST|ND|RD|TH)( ?[-+&] ?\d(ST|ND|RD|TH))? ?(YR|YEAR)S?\))?"
+          r"|SHIELD|SHEILD)")),
         ("service_package_amount", r"SERVICE PACK(AGE)?"),
         ("handling_charges", r"HANDLING CHARGES?"),
     )
@@ -208,7 +229,8 @@ _PRINTED_TOTAL = re.compile(r"(NET VALUE|FINAL PRICE|NET RECEIVABLE( \(A ?\+ ?B\
 # (_price_and_scheme), whether or not the dealer wrote the Ex Showroom row
 # (SHI-SS-261027-024, 2026-11-03: only the vehicle price, Rs 19,28,561).
 _VEHICLE_PRICE = re.compile(r"VEHICLE PRICE")
-_SCHEME_ROW = re.compile(r"SCHEME( OF (THE )?MONTH)?")
+# also read "SCH" / "SCHME" (2026-11-04)
+_SCHEME_ROW = re.compile(r"SCH(E?ME?)?( OF (THE )?MONTH)?")
 _SUMMARY = re.compile(
     r"GROSS VALUE|DISCOUNT|TOTAL( COST| RECEIPTS?| \(A\))?|NET AMOUNT RECEIVED( \(E\))?|"
     r"SHORT ?/ ?EXCESS|BALANCE ?(EXCESS ?/ ?SHORTAGE)?( \(C-E\))?|DUE|"
@@ -241,14 +263,15 @@ _COD = re.compile(r".*(\bCOD\b|\bC\.O\.D\b|CERTIFICATE OF DEPOSIT).*")
 # NO. PLSM/1066") or as "FINANCE" alone (product owner 2026-11-02).
 _FINANCER = re.compile(
     r"FINANCER? AMOUNT( .*)?|BANK DO( .*)?|"
-    r"FINANCE( D/?O( .*)?| D/O\S.*| D/P( .*)?| [A-Z][A-Z&.]*( [A-Z][A-Z&.]*)* MR NO\.?.*)?"
+    # "FINANCE D/D" (the financer's demand draft) and "FINANCE B/O" too (2026-11-04)
+    r"FINANCE( D/?O( .*)?| D/O\S.*| D/[PD]( .*)?| B/O( .*)?| [A-Z][A-Z&.]*( [A-Z][A-Z&.]*)* MR NO\.?.*)?"
 )
 _RECEIPT = re.compile(
     r"(BOOKING AMOUNT|DEPOSITED INTO BANK|CASH|CHEQUE|ONLINE TRANSFER|TRADE IN VALUE|CASH SHORTAGE|"
     r"MR NO\.?.*|PAYMENT A/C DETAILS|REFUND|RECEIPT)( .*)?"
 )
 _FORM_MARKERS = tuple(re.compile(p) for p in (
-    r"(EX[- ]?SHOW ?ROOM|VEHICLE COST)", r"FINANCER AMOUNT", r"DEPOSITED INTO BANK", r"BOOKING AMOUNT",
+    r"(EX[-. ]*SHOW ?ROOM|VEHICLE COST)", r"FINANCER AMOUNT", r"DEPOSITED INTO BANK", r"BOOKING AMOUNT",
     r"FINANCE D/?O", r"MR NO", r"PAYMENT A/C", r"SCHEME DISCOUNT", r"OTHER DISCOUNT", r"CORPORATE DISCOUNT",
     r"BANK DO", r"TRADE IN VALUE", r"ONLINE TRANSFER", r"OFFER LETTER", r"ON ?ROAD PRICE", r"FINANCE AMOUNT",
 ))
@@ -329,8 +352,12 @@ def statement_kind(lines: list[dict[str, Any]]) -> str:
     # a Tally printout. A Tally printout has no TOTAL / NET VEHICLE COST line.
     if any(_ERP_TOTALS.fullmatch(label) for label in labels):
         return KIND_ERP
-    if any(row.get("running_balance") and not _SUMMARY.fullmatch(_label(row.get("particulars_raw")))
-           for row in lines):
+    # One balance written beside a form's row ("ACCESSORIES" with "bal 5,112",
+    # ADI-RD-261102-007, 2026-11-04) is a note on the form, not a Tally
+    # printout: that carries its balance on its postings, or its voucher types.
+    balances = sum(1 for row in lines
+                   if row.get("running_balance") and not _SUMMARY.fullmatch(_label(row.get("particulars_raw"))))
+    if balances >= 2 or (balances and any(row.get("voucher_type") for row in lines)):
         return KIND_TALLY
     if any(marker.match(label) for label in labels for marker in _FORM_MARKERS):
         return KIND_FORM
@@ -462,6 +489,11 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             if free:
                 give("DISCOUNT", FREE_ACCESSORIES_KEY, free)
             continue
+        noted = _charge_noted_on(label) if side[0] == "DR" else None
+        if noted is not None:
+            charge, named = noted
+            give("COMMERCIAL", charge, amount, _other_charge_row(named) if charge == "other_charges" else "")
+            continue
         out.unmapped.append({"label": label, "amount": amount, "why": "label not in the mapping"})
     totals: dict[tuple[str, str], Decimal] = {}
     in_conflict: set[tuple[str, str]] = set()
@@ -542,6 +574,52 @@ def _price_and_scheme(out: StatementRead, totals: dict[tuple[str, str], Decimal]
     if len(named) == 1:
         return  # the scheme, written again on the right under its name
     out.discounts["CASH_DISCOUNT"] = out.discounts.get("CASH_DISCOUNT", Decimal(0)) + scheme
+
+
+# A charge written by hand on another printed row (product owner 2026-11-04,
+# all journeys): the handwritten word is the charge. "HANDLING CHARGES TCS"
+# 10,285 is 1% of the ex-showroom, "SHIELD WARANTY RSA" the RSA, "REGISTRATION
+# FT" the FASTag's 600 -- so the amount is counted under the word written.
+# With no charge written, the rest is a note on the printed row, whose charge
+# it is ("INSURANCE AMOUNT (3+3)", "RTO B-H", "RTO COD", "ACCESSORIES
+# PENDING"; the statement's net value adds up with it) -- but not on a general
+# row ("IF ANY OTHERS MOTO", whose word names no charge), not a row written
+# FREE (not billed) or as money going back or not yet settled ("Insurance
+# refund pending"). Debits only.
+_RUN_TOGETHER = re.compile(r"(?<=CHARGES)(?=[A-Z])")
+_GENERAL_ROWS = frozenset({"OTHERS", "IF_ANY_OTHERS", "MISC"})
+_NOTE_NOT_BILLED = re.compile(r"(.* )?(FREE|REFUND\w*|RETURN\w*|ADJUST\w*|CANCEL\w*|EXCESS|SHORT\w*|DIFF\w*)( .*)?")
+
+
+def _charge_of(text: str) -> str | None:
+    return next((key for key, pattern in _CHARGES if pattern.fullmatch(text)), None)
+
+
+def _names_an_item(words: list[str]) -> bool:
+    spans = (" ".join(words[i:j]).strip(" ()/-") for i in range(len(words)) for j in range(i + 1, len(words) + 1))
+    return any(span and (_charge_of(span) or any(p.fullmatch(span) for _, p in _DISCOUNTS)) for span in spans)
+
+
+def _charge_noted_on(label: str) -> tuple[str, str] | None:
+    """The charge a row is for: the charge written by hand on it, else the
+    printed row it starts with, the rest being a note -- (charge, the text
+    that names it)."""
+    words = _RUN_TOGETHER.sub(" ", label).split(" ")
+    for start in range(1, len(words)):
+        written = " ".join(words[start:]).strip(" ()/-")
+        key = _charge_of(written)
+        if key is not None and not (key == "other_charges" and _other_charge_row(written) in _GENERAL_ROWS):
+            return key, written
+    for end in range(len(words) - 1, 0, -1):
+        printed, rest = " ".join(words[:end]), words[end:]
+        key = _charge_of(printed)
+        if key is None:
+            continue
+        if (key == "other_charges" and _other_charge_row(printed) in _GENERAL_ROWS) \
+                or _NOTE_NOT_BILLED.fullmatch(" ".join(rest)) or _names_an_item(rest):
+            return None
+        return key, printed
+    return None
 
 
 def _other_charge_row(label: str) -> str:
@@ -686,11 +764,17 @@ def tally_postings(lines: list[dict[str, Any]]) -> dict[str, Decimal]:
 TALLY_LEDGER_TYPE = "customer_ledger_tally"
 _TALLY_CHARGES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r".*(INS POLICY|INSURANCE|\(INS\b).*"), "insurance_amount"),
-    (re.compile(r".*\bRTO\b.*"), "road_tax_registration"),
+    # "COMMERCIAL REGISTRATION ACCOUNT-20309400": the RTO of a commercial
+    # vehicle (Utkal, 13 journeys, 2026-11-04).
+    (re.compile(r".*(\bRTO\b|REGISTRATION).*"), "road_tax_registration"),
     (re.compile(r".*ACCESSOR.*"), "accessories_cost"),
-    (re.compile(r".*\bFAST ?TAG\b.*"), "fastag_amount"),
-    (re.compile(r".*(EXTENDED WARRANTY|EXT\.? ?WARRANTY|SHIELD).*"), "extended_warranty_amount"),
+    # "FASTAG CHARGES" (five journeys were not read, 2026-11-04)
+    (re.compile(r".*\bFAST ?T?AG\b.*"), "fastag_amount"),
+    (re.compile(r".*(EXT(ENDED|\.)? ?WARR?[AE]NTY|SHIELD).*"), "extended_warranty_amount"),
     (re.compile(r".*(\bRSA\b|ROAD ?SIDE).*"), "rsa_amount"),
+    # the permit, a choice number, the temporary registration ("TR CHARGES
+    # PAYABLE"): the Deal's other charges
+    (re.compile(r".*(\bPERMIT\b|CHOICE NUMBER|\bTR CHARGES\b).*"), "other_charges"),
 )
 _TALLY_BENEFIT_VOUCHER = re.compile(r".*CREDIT ?NOTE.*")
 
@@ -1621,7 +1705,6 @@ __all__ = [
     "COPIES_DIFFERENCE_TASK",
     "COST_SHEET_DIFFERENCE_TASK",
     "COST_SHEET_KEYS",
-    "cost_sheet_discount",
     "COST_SHEET_TYPE",
     "DECLARED_BALANCE",
     "DECLARED_NET",
@@ -1647,6 +1730,7 @@ __all__ = [
     "combine_statements",
     "combined_tally_rows",
     "cost_sheet_differences",
+    "cost_sheet_discount",
     "line_rows",
     "load_ledger_documents",
     "read_cost_sheet",

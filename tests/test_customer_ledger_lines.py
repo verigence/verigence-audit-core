@@ -49,6 +49,19 @@ def test_the_ledger_postings_are_read_as_lines_and_benefits() -> None:
     assert read.credit_notes == {"UOV27C000046": "SCRAPPAGE_BONUS_DEALER", "UOV27C000047": "ADDITIONAL_DISCOUNT"}
 
 
+def test_the_ledgers_commercial_registration_fastag_permit_and_warranty_postings_are_read() -> None:
+    """All Tally ledgers, 2026-11-04: Utkal's "COMMERCIAL REGISTRATION
+    ACCOUNT-20309400" (13 journeys) and "FASTAG CHARGES" (5), the permit, the
+    choice number and "EXTENDED WARRENTY A/C" were debited but not read."""
+    rows = [{"particulars_raw": p, "voucher_type": "Journal_NonGST", "debit_amount": a, "running_balance": "1 Dr"}
+            for p, a in (("COMMERCIAL REGISTRATION ACCOUNT-20309400", 177514), ("FASTAG CHARGES 17900", 600),
+                         ("PERMIT BBSR", 6000), ("CHOICE NUMBER A/C", 11300), ("TR CHARGES PAYABLE", 1000),
+                         ("EXTENDED WARRENTY A/C 52802", 22750), ("ROUND OFF", 3))]
+    assert read_tally_lines(rows).components == {
+        "road_tax_registration": D(177514), "fastag_amount": D(600), "other_charges": D(18300),
+        "extended_warranty_amount": D(22750)}
+
+
 @pytest.fixture
 def journey():
     engine = database_engine()

@@ -174,18 +174,45 @@ def test_form_without_a_vehicle_line_gives_no_ex_showroom() -> None:
     assert read.financer == D(930990)
 
 
-# Two printed rows run together by the handwriting reading (product owner
-# 2026-11-02): fixed when the page is read, never split here.
-MERGED_LABELS = [
-    "SHIELD WARANTY TCS", "FASTAG CHARGESRSA", "HANDLING CHARGES TCS", "Fastag charges TCS", "Shield waranty RSA",
-    "Accessories TCS 1%", "MMFSL Cheque TCS 1%",
-    "LESS: EXCHANGED VEHICLE (Welcome Bonus)", "IF ANY OTHERS COD", "IF ANY OTHERS MOTO", "IF ANY OTHERS D141 LV",
-    "IF ANY OTHERS Digilence", "Shield waranty Accessory", "FAST TAG Fancy NO",
+# A charge written by hand on another printed row (product owner 2026-11-04,
+# across all statements: the amount always fits the word written -- the TCS
+# rows are 1% of the ex-showroom, the RSA rows 2,021 / 1,000, the FASTag rows
+# 500 / 600): the handwritten word is the charge.
+WRITTEN_ON_ANOTHER_ROW = [
+    ("SHIELD WARANTY TCS", "tcs_amount"), ("FASTAG CHARGESRSA", "rsa_amount"), ("HANDLING CHARGES TCS", "tcs_amount"),
+    ("Fastag charges TCS", "tcs_amount"), ("Shield waranty RSA", "rsa_amount"), ("Accessories TCS 1%", "tcs_amount"),
+    ("MMFSL Cheque TCS 1%", "tcs_amount"), ("HANDLING CHARGES (TCS)", "tcs_amount"), ("HANDLING CHARGES T-U", "tcs_amount"),
+    ("Shield waranty Accessory", "accessories_cost"), ("FAST TAG Fancy NO", "other_charges"),
+    ("REGISTRATION FT", "fastag_amount"), ("W/S BILLING FAST TAG", "fastag_amount"),
+    ("RTO CHOICE NO. FASTAGE", "fastag_amount"), ("EXTENDED WARRANTY (FASTAG)", "fastag_amount"),
+    ("SHIELD WARRANTY / FAST TAG", "fastag_amount"), ("MISC (IF ANY) RSA", "rsa_amount"),
 ]
 
 
-@pytest.mark.parametrize("label", MERGED_LABELS)
-def test_two_items_merged_by_the_handwriting_reading_are_left_unmapped(label: str) -> None:
+@pytest.mark.parametrize(("label", "key"), WRITTEN_ON_ANOTHER_ROW)
+def test_a_charge_written_on_another_row_is_the_charge_written(label: str, key: str) -> None:
+    read = read_statement([{"particulars_raw": "Ex Showroom", "debit_amount": 1000000},
+                           {"particulars_raw": label, "debit_amount": 12345}])
+    assert read.components == {"ex_showroom_price": D(1000000), key: D(12345)}
+    assert read.discounts == {} and read.unmapped == [] and read.conflicts == []
+
+
+@pytest.mark.parametrize(("label", "key"), [
+    ("INSURANCE AMOUNT (3+3)", "insurance_amount"), ("RTO B-H", "registration_charges"),
+    ("RTO (COR) 25", "registration_charges"), ("RTO COD", "registration_charges"),
+    ("ACCESSORIES PENDING", "accessories_cost"), ("ACCESSORIES BALL PENDING", "accessories_cost"),
+    ("REGISTRATION COST TR", "registration_charges"), ("TCS 1-/", "tcs_amount"),
+])
+def test_a_note_written_on_a_charge_row_keeps_the_rows_charge(label: str, key: str) -> None:
+    # live 2026-11-04: each statement's net value adds up with the row read
+    read = _one(label, 18799)
+    assert read.components == {key: D(18799)} and read.unmapped == []
+
+
+@pytest.mark.parametrize("label", [
+    "LESS: EXCHANGED VEHICLE (Welcome Bonus)", "IF ANY OTHERS MOTO", "EXTENDED WARRANTY FREE",
+])
+def test_a_row_whose_writing_names_no_charge_it_bills_is_left_unmapped(label: str) -> None:
     read = read_statement([{"particulars_raw": "Ex Showroom", "debit_amount": 1000000},
                            {"particulars_raw": label, "debit_amount": 12345}])
     assert read.components == {"ex_showroom_price": D(1000000)} and read.discounts == {}
@@ -299,6 +326,32 @@ def test_the_finance_do_however_it_is_read_is_the_loan(label: str) -> None:
     assert read.financer == D(838491) and read.receipts == D(838491) and read.unmapped == []
 
 
+@pytest.mark.parametrize("label", ["FINANCE D/D MR NO. CDAM-1742", "FINANCE B/O 01087"])
+def test_the_financers_demand_draft_is_the_loan(label: str) -> None:
+    # UTK-SA-261102-004: its twin copy prints "FINANCE D/O CDAM-1742" 14,00,000
+    read = _one(label, 1400000, "credit_amount")
+    assert read.financer == D(1400000) and read.receipts == D(1400000) and read.unmapped == []
+
+
+@pytest.mark.parametrize(("label", "amount"), [("SCH", 25000), ("SCHME", 50000)])
+def test_the_scheme_row_misspelt_is_the_scheme(label: str, amount: int) -> None:
+    read = read_statement([{"particulars_raw": "VEHICLE PRICE", "debit_amount": 1000000},
+                           {"particulars_raw": label, "debit_amount": amount}])
+    assert read.unmapped == [] and read.components["ex_showroom_price"] == D(1000000)
+
+
+def test_one_balance_written_beside_a_form_row_does_not_make_it_a_tally() -> None:
+    # ADI-RD-261102-007: "ACCESSORIES" with "bal 5,112" beside it; the whole
+    # form was read as a Tally printout and none of it reached the Deal.
+    rows = [{"particulars_raw": "EX-SHOW ROOM PRICE OF VEHICLE", "debit_amount": 1091500},
+            {"particulars_raw": "TCS ON INVOICE", "debit_amount": 10888},
+            {"particulars_raw": "ACCESSORIES", "debit_amount": 3440, "running_balance": 5112},
+            {"particulars_raw": "FINANCER AMOUNT", "credit_amount": 1010800}]
+    assert statement_kind(rows) == KIND_FORM
+    read = read_statement(rows)
+    assert read.components["ex_showroom_price"] == D(1091500) and read.financer == D(1010800)
+
+
 @pytest.mark.parametrize("label", ["FINANCE DOCUMENTATION CHARGES", "FINANCE CHARGES"])
 def test_a_finance_charge_is_not_the_loan(label: str) -> None:
     read = _one(label, 1500)
@@ -322,6 +375,17 @@ def test_a_finance_charge_is_not_the_loan(label: str) -> None:
     ("W/s billing TCS 1%", 18723, "tcs_amount"),
     ("W/s billing TU (1%)", 10250, "tcs_amount"),
     ("Workshop billing Amount COD", 22000, "other_charges"),
+    # every statement, 2026-11-04
+    ("EX SHOWROOM BILLING PRICE", 899000, "ex_showroom_price"),
+    ("EX-SHOWROOM PRICE (1-2)", 2950000, "ex_showroom_price"),
+    ("EX. SHOWROOM PRICE (INCLUSIVE OF ___ KW CHARGER COST)", 2505000, "ex_showroom_price"),
+    ("TCS TAX COLLECTION AT SOURCE (IF ANY)", 30500, "tcs_amount"),
+    ("INSURANCE IN HOUSE", 38000, "insurance_amount"),
+    ("REGISTRATION IN HOUSE-", 75000, "registration_charges"),
+    ("ROAD TAX", 82232, "registration_charges"),
+    ("PAID ACCESSORIES", 10000, "accessories_cost"),
+    ("HOME DLY. CHARGES", 1300, "other_charges"),
+    ("SHEILD", 22750, "additional_warranty_amount"),
 ])
 def test_clear_spellings_are_read_onto_the_existing_lines(label: str, amount: int, key: str) -> None:
     read = _one(label, amount)
@@ -333,13 +397,17 @@ def test_exchange_loyalty_misspelt_is_the_exchange_bonus(label: str) -> None:
     assert _one(label, 20000, "credit_amount").discounts == {"EXCHANGE_BONUS": D(20000)}
 
 
-@pytest.mark.parametrize(("label", "amount"), [("RSA COD", 20700), ("RSA COP", 24143)])
-def test_the_certificate_of_deposit_written_in_the_rsa_row_is_not_the_rsa(label: str, amount: int) -> None:
+@pytest.mark.parametrize(("label", "amount"), [
+    ("RSA COD", 20700), ("RSA COP", 24143), ("IF ANY OTHERS COD", 24143), ("IF ANY OTHERS D141 LV", 24143),
+    ("IF ANY OTHERS DigiELV", 24143), ("IF ANY OTHERS DIGI ELV", 24143), ("IF ANY OTHERS Digilence", 24113),
+])
+def test_the_certificate_of_deposit_is_an_other_charge_not_the_rsa(label: str, amount: int) -> None:
     # UTK-BP-261102-008 / ADI-SJ-261025-001: the amounts are the certificate of
     # deposit's (Rs 24,143 is the DigiELV COD on four other statements), not an
-    # RSA of Rs 2,021; both statements add up only with them as a charge.
+    # RSA of Rs 2,021; the statements add up only with them as a charge
+    # (product owner 2026-11-04: an other charge).
     read = _one(label, amount)
-    assert read.components == {} and [u["label"] for u in read.unmapped] == [label]
+    assert read.components == {"other_charges": D(amount)} and read.unmapped == []
 
 
 def test_other_charges_on_separate_rows_add_up() -> None:
