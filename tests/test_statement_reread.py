@@ -233,3 +233,26 @@ def test_the_misread_run_picks_only_the_implausible_statement_even_with_a_printe
         "decision"] == "SKIP_EX_SHOWROOM_PLAUSIBLE"
     assert reread.statement_items(_wire(monkeypatch, lines=bad, book=book), "t1")[0][
         "decision"] == "SKIP_HAS_PRINTED_TOTAL"
+
+
+# ── 2026-11-04: statements of which none of the rows were read ───────────────
+def _no_rows_decision(monkeypatch, **kwargs) -> str:
+    [item] = reread.statement_items(_wire(monkeypatch, **kwargs), "t1", no_rows=True)
+    return item["decision"]
+
+
+def test_a_statement_with_no_rows_read_is_read_again(monkeypatch):
+    for nothing in (None, [], "null"):
+        assert _no_rows_decision(monkeypatch, lines=nothing,
+                                 fields_extra={"statement_title": "FINAL VEHICLE ACCOUNTS STATEMENT"}) == "REREAD"
+
+
+def test_a_statement_with_rows_is_left_alone_in_the_no_rows_run(monkeypatch):
+    assert _no_rows_decision(monkeypatch) == "SKIP_HAS_ROWS"
+    assert _no_rows_decision(monkeypatch, lines=TALLY) == "SKIP_HAS_ROWS"
+
+
+def test_the_no_rows_run_keeps_the_safeguards(monkeypatch):
+    assert _no_rows_decision(monkeypatch, lines=[], corrected=1) == "SKIP_CORRECTED_BY_A_PERSON"
+    assert _no_rows_decision(monkeypatch, lines=[], reviewed=True) == "SKIP_STAGE_REVIEWED"
+    assert _no_rows_decision(monkeypatch, lines=[], queue_status="EXTRACTING") == "SKIP_PAGE_NOT_SETTLED"

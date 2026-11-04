@@ -167,7 +167,8 @@ def test_the_vehicle_line_awaits_the_ndc_not_a_vehicle_invoice(journey) -> None:
 def test_a_credit_note_is_linked_to_the_benefit_of_its_amount_and_counted_once(journey) -> None:
     """2026-11-02: a credit note is a billing document. CN-1 pays the 5,000
     the NDC already gives: checked, not added. CN-2 names no benefit and
-    matches none: a benefit of its own, counted."""
+    matches none: a benefit of its own -- since 2026-11-04 shown, never
+    counted ("discounts to be applicable from NDC, Cost Sheet")."""
     _statement(journey, UTKAL)  # Other Discount (if any) 5,000
     add_ready_document(journey, "credit_note", process_area="DELIVERY", invoice_number="CN-1",
                        invoice_date="2026-10-20", grand_total_amount="5000")
@@ -180,7 +181,65 @@ def test_a_credit_note_is_linked_to_the_benefit_of_its_amount_and_counted_once(j
     benefit = next(d for d in view["discounts"] if d["key"] == "ADDITIONAL_DISCOUNT")
     assert [c["number"] for c in benefit["paidByCreditNotes"]] == ["CN-1"] and D(benefit["current"]) == D(5000)
     unnamed = next(d for d in view["discounts"] if d["key"] == "CREDIT_NOTE")
-    assert D(unnamed["current"]) == D(7777) and "BENEFIT_NOT_NAMED" in unnamed["flags"]
+    assert unnamed["current"] is None and D(unnamed["billed"]) == D(7777)
+    assert "BENEFIT_NOT_NAMED" in unnamed["flags"] and "NOT_ON_STATEMENT" in unnamed["flags"]
+    assert D(view["summary"]["discounts"]["current"]) == D(5000)
+
+
+# ── 4b. discounts come from the NDC / cost sheet only (product owner 2026-11-04) ──
+def _counted(view: dict) -> dict[str, D]:
+    return {d["key"]: D(d["current"]) for d in view["discounts"] if d["current"] is not None}
+
+
+def test_an_invoice_discount_the_ndc_does_not_give_is_shown_never_counted(journey) -> None:
+    """UTK-BP-261104-002: the DMS invoice's Rs 80,000 "consumer offer" and Rs 20,000 dealer
+    cash were counted with no NDC or cost sheet giving them."""
+    _statement(journey, UTKAL)  # Other Discount (if any) 5,000
+    add_ready_document(journey, "customer_invoice_dms", process_area="DELIVERY", **VEHICLE_INVOICE)
+    view = _deal(journey)
+    assert _counted(view) == {"ADDITIONAL_DISCOUNT": D(5000)}
+    on_invoice = [d for d in view["discounts"] if d["billedFrom"] == "invoice"]
+    assert on_invoice and all(d["current"] is None and d["variance"] is None for d in on_invoice)
+    assert D(view["summary"]["discounts"]["current"]) == D(5000)
+    assert D(view["summary"]["discounts"]["billed"]) == D(5000)  # the * figures are not in the column total
+
+
+def test_with_no_ndc_or_cost_sheet_no_discount_counts(journey) -> None:
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    add_ready_document(journey, "customer_invoice_dms", process_area="DELIVERY", **VEHICLE_INVOICE)
+    view = _deal(journey)
+    assert _counted(view) == {}
+    assert any(d["billed"] is not None and "NOT_ON_STATEMENT" in d["flags"] for d in view["discounts"])
+
+
+def _benefit(key: str, current: str, *sources: tuple[str, str], **extra) -> dict:
+    return {"key": key, "current": current, "currentSource": "document", "billed": current, "variance": "1",
+            "entitled": "0", "inStandard": True, "proof": None, "flags": ["OVER_ENTITLEMENT"],
+            "sources": [{"documentType": t, "amount": a} for t, a in sources], **extra}
+
+
+def test_only_the_statement_gives_a_benefit():
+    from audit_core.uc03_p2_journey360 import _only_the_statement_gives
+
+    rows = [
+        _benefit("CASH_DISCOUNT", "3000", ("customer_ledger_tally", "3000")),          # the Tally ledger only
+        _benefit("CREDIT_NOTE", "7777", ("credit_note", "7777")),                      # a credit note only
+        _benefit("ADDITIONAL_DISCOUNT", "5000", ("account_statement", "5000")),        # the NDC
+        # The ledger names a benefit the NDC gives (the NDC row checks it): counted.
+        _benefit("SCRAPPAGE_BONUS", "20000", ("customer_ledger_tally", "20000"), ("account_statement", "20000")),
+        # The cost sheet's total named by the invoice.
+        _benefit("CASH_DISCOUNT_2", "4000", ("customer_invoice_dms", "4000"), fromStatement=True),
+        _benefit("EXCHANGE_BONUS", "30000", ("customer_invoice_dms", "30000")),       # the invoice only
+    ]
+    _only_the_statement_gives(rows)
+    counted = {r["key"] for r in rows if r["current"] is not None}
+    assert counted == {"ADDITIONAL_DISCOUNT", "SCRAPPAGE_BONUS", "CASH_DISCOUNT_2"}
+    for row in rows:
+        if row["key"] not in counted:
+            assert row["variance"] is None and row["flags"] == ["NOT_ON_STATEMENT"], row["key"]
+            assert row["billed"] is not None  # still shown
+    # A conditional benefit claimed only on the invoice is not in the standard.
+    assert next(r for r in rows if r["key"] == "EXCHANGE_BONUS")["inStandard"] is False
 
 
 # ── 5. payable ───────────────────────────────────────────────────────────────
