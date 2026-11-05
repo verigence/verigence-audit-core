@@ -98,3 +98,44 @@ def test_a_bad_tag_or_section_is_refused(journey):
         snap.run_journey_snapshot(journey.engine, f"{journey.tenant_id}:x", ["section:nope"])
     with pytest.raises(ValueError):
         snap.run_journey_snapshot_diff(journey.engine, f"{journey.tenant_id}:x", ["only-one"])
+
+
+def test_statement_totals_are_measured_only_when_named(journey):
+    """The NDC's and cost sheet's rows added up beside the totals they print
+    (product owner 2026-11-05), kept as a snapshot section of its own."""
+    import json
+    from uuid import uuid4
+
+    from p2_support import add_evidence, add_extracted_field
+
+    ndc = uuid4()
+    add_evidence(journey, di_document_id=ndc, document_type_key="customer_ledger")
+    rows = [
+        {"particulars_raw": "Vehicle cost", "debit_amount": "852000"},
+        {"particulars_raw": "Registration", "debit_amount": "3685"},
+        {"particulars_raw": "Accessories", "debit_amount": "5140"},
+        {"particulars_raw": "MR No KRM/2627/3592", "credit_amount": "11000"},
+        {"particulars_raw": "Scheme Discount", "credit_amount": "13000"},
+    ]
+    for key, value in {"line_items": json.dumps(rows), "total_cost": "860825", "total_receipts": "24000",
+                       "statement_title": "VEHICLE ACCOUNT STATEMENT"}.items():
+        add_extracted_field(journey, di_document_id=ndc, field_key=key, value=value, document_type="customer_ledger")
+    sheet = uuid4()
+    add_evidence(journey, di_document_id=sheet, document_type_key="cost_sheet")
+    add_extracted_field(journey, di_document_id=sheet, field_key="total_on_road_price", value="870000",
+                        document_type="cost_sheet")
+
+    out = snap.run_journey_snapshot(journey.engine, f"{journey.tenant_id}:totals", ["all"])
+    assert "statement-totals" not in [r["section"] for r in _rows(journey, "totals")] and out["failed"] == 0
+    out = snap.run_journey_snapshot(journey.engine, f"{journey.tenant_id}:totals2", ["all", "section:statement-totals"])
+    assert out["built"] == 1
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        payload = connection.execute(
+            text("SELECT payload FROM auditcore.p2_journey_snapshots WHERE tenant_id=:t AND tag='totals2'"),
+            {"t": journey.tenant_id}).scalar_one()
+    [statement] = payload["statements"]
+    assert statement["kind"] == "FORM" and statement["charges"] == "860825"
+    assert statement["printed"]["total_cost"] == "860825" and statement["discounts"] == "13000"
+    assert statement["receipts"] == "11000"
+    assert payload["costSheets"][0]["printed"] == {"total_on_road_price": "870000"}
