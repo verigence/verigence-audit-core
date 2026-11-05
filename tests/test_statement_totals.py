@@ -208,3 +208,16 @@ def test_the_pc_can_close_it_when_the_dealers_sum_is_wrong():
     from audit_core.uc03_p2_tasks import CLOSE_TASK_TYPES
 
     assert TASK_TYPE in CLOSE_TASK_TYPES
+
+
+def test_the_cost_sheets_titled_as_statements_are_found(journey):
+    from audit_core.uc03_cost_sheet_statements import statement_pages
+
+    for page, title in ((16, "FINAL VEHICLE ACCOUNTS STATEMENT"), (17, "QUOTATION")):
+        document_id = uuid4()
+        add_page(journey, page_number=page, status="READY", di_document_id=document_id)
+        add_evidence(journey, di_document_id=document_id, document_type_key="cost_sheet")
+        add_extracted_field(journey, di_document_id=document_id, field_key="document_title", value=title,
+                            document_type="cost_sheet")
+    [found] = statement_pages(journey.engine, journey.tenant_id)
+    assert found["page_number"] == 16 and found["title"] == "FINAL VEHICLE ACCOUNTS STATEMENT"

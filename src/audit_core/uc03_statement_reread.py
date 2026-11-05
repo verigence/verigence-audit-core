@@ -25,6 +25,14 @@ Intelligence read none of the rows -- only the totals (2026-11-04: 20 bookings,
 Utkal's "FINAL VEHICLE ACCOUNTS STATEMENT" among them, whose Deal then fell
 back to the invoice). The same safeguards hold.
 
+A tag containing "-addsup-" picks, instead, the statement forms whose rows do
+not add up to a total they print (2026-11-05, uc03_statement_totals), and
+reports after a commit how many still do not.
+
+A tag containing "-costsheet-" picks, instead, the cost sheets read before
+cost_sheet schema 1.1, which reads every priced row and the printed title
+(2026-11-05): no rows and no title yet. The same safeguards hold.
+
 A tag containing "-copy-" does not ask DI again: it only copies the pages DI
 has already read (after a worker restart cut a run short).
 
@@ -53,6 +61,7 @@ from audit_core.db import set_tenant_context
 from audit_core.di_capture_v2_client import DiCaptureV2Error
 from audit_core.uc03_account_statement import (
     ACCOUNT_STATEMENT_TYPE,
+    COST_SHEET_TYPE,
     KIND_FORM,
     line_rows,
     load_ledger_documents,
@@ -61,6 +70,7 @@ from audit_core.uc03_account_statement import (
     statement_total,
 )
 from audit_core.uc03_deal_source_policy import account_statement_is_source_of_truth
+from audit_core.uc03_statement_totals import statement_differences
 
 logger = structlog.get_logger(__name__)
 
@@ -116,7 +126,7 @@ def _corrected_fields(connection: Connection, tenant_id: str, journey_id: UUID, 
 
 
 def statement_items(connection: Connection, tenant_id: str, *, misread: bool = False,
-                    no_rows: bool = False) -> list[dict[str, Any]]:
+                    no_rows: bool = False, adds_up: bool = False, cost_sheets: bool = False) -> list[dict[str, Any]]:
     """Every customer_ledger statement of the tenant, with whether it needs
     reading again and why not when it is left alone. ``misread`` picks the
     statements whose ex-showroom is implausible against the price book instead
@@ -134,12 +144,13 @@ def statement_items(connection: Connection, tenant_id: str, *, misread: bool = F
             ORDER BY j.journey_reference
             """
         ),
-        {"t": tenant_id, "type": ACCOUNT_STATEMENT_TYPE},
+        {"t": tenant_id, "type": COST_SHEET_TYPE if cost_sheets else ACCOUNT_STATEMENT_TYPE},
     ).mappings().all()
     items: list[dict[str, Any]] = []
     for journey in journeys:
         journey_id = UUID(str(journey["journey_id"]))
-        for document in load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id):
+        for document in load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                              document_type=COST_SHEET_TYPE if cost_sheets else ACCOUNT_STATEMENT_TYPE):
             rows = line_rows(document["fields"].get("line_items"))
             kind = statement_kind(rows)
             read = read_statement(rows) if kind == KIND_FORM else None
@@ -153,9 +164,14 @@ def statement_items(connection: Connection, tenant_id: str, *, misread: bool = F
             corrected = _corrected_fields(connection, tenant_id, journey_id, di_document_id)
             reviewed = bool(stage) and stage_is_reviewed(
                 connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage)
-            if no_rows:
-                if rows:
+            differences = statement_differences(document["fields"]) if adds_up else None
+            if cost_sheets or no_rows or adds_up:
+                if cost_sheets and (rows or document["fields"].get("document_title")):
+                    decision = "SKIP_READ_SINCE_1_1"
+                elif no_rows and rows:
                     decision = "SKIP_HAS_ROWS"
+                elif adds_up and not differences:
+                    decision = "SKIP_ADDS_UP" if differences is not None else "SKIP_NOT_JUDGED"
                 elif page is None or stage is None:
                     decision = "SKIP_PAGE_UNKNOWN"
                 elif page["queue_status"] not in _SETTLED_PAGE_STATES:
@@ -186,7 +202,7 @@ def statement_items(connection: Connection, tenant_id: str, *, misread: bool = F
                 "journeyId": journey_id, "journeyReference": journey["journey_reference"],
                 "diDocumentId": di_document_id, "queueId": page["queue_id"] if page else None,
                 "queueStatus": page["queue_status"] if page else None, "stage": stage, "kind": kind,
-                "rows": len(rows), "hasPrintedTotal": has_total, "exShowroomImplausible": implausible, "correctedFields": corrected, "stageReviewed": reviewed,
+                "rows": len(rows), "hasPrintedTotal": has_total, "addsUp": None if differences is None else not differences, "exShowroomImplausible": implausible, "correctedFields": corrected, "stageReviewed": reviewed,
                 "decision": decision,
             })
     return items
@@ -326,6 +342,8 @@ def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> dic
     commit = tag.endswith("-commit")
     misread = "-misread-" in tag
     no_rows = "-norows-" in tag
+    adds_up = "-addsup-" in tag
+    cost_sheets = "-costsheet-" in tag
     summary: dict[str, Any] = {}
     for tenant_id in tenant_ids:
         try:
@@ -333,7 +351,8 @@ def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> dic
                 set_tenant_context(connection, tenant_id)
                 if not account_statement_is_source_of_truth(connection, tenant_id=tenant_id):
                     continue
-                items = statement_items(connection, tenant_id, misread=misread, no_rows=no_rows)
+                items = statement_items(connection, tenant_id, misread=misread, no_rows=no_rows, adds_up=adds_up,
+                                        cost_sheets=cost_sheets)
         except Exception:
             logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
             continue
@@ -369,6 +388,26 @@ def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> dic
                     still = [i for i in statement_items(connection, tenant_id, no_rows=True) if i["rows"] == 0]
                 results["still_no_rows"] = len(still)
                 results["stillNoRows"] = sorted({str(i["journeyReference"]) for i in still})
+            except Exception:
+                logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
+        if adds_up and commit:
+            # the same check again, on what the re-read copies now hold
+            try:
+                picked = {str(i["diDocumentId"]) for i in items if i["decision"] == "REREAD"}
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    after = [i for i in statement_items(connection, tenant_id, adds_up=True)
+                             if str(i["diDocumentId"]) in picked]
+                results["now_add_up"] = sum(1 for i in after if i["addsUp"])
+                results["still_do_not"] = sorted({str(i["journeyReference"]) for i in after if i["addsUp"] is False})
+            except Exception:
+                logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
+        if cost_sheets and commit:
+            try:
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    after = statement_items(connection, tenant_id, cost_sheets=True)
+                results["cost_sheets_read_since_1_1"] = sum(1 for i in after if i["decision"] == "SKIP_READ_SINCE_1_1")
             except Exception:
                 logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
         logger.info("statement_reread_finished", tag=tag, tenant_id=tenant_id, commit=commit,
