@@ -93,7 +93,9 @@ def mahindra_tenants(engine: Engine) -> list[str]:
         return list(connection.execute(text(
             """
             SELECT p.tenant_id FROM auditcore.projects p JOIN auditcore.oems o ON o.oem_id = p.oem_id
-            WHERE o.oem_code = 'MAHINDRA' AND p.project_status = 'ACTIVE' ORDER BY p.tenant_id
+            WHERE o.oem_code = 'MAHINDRA' AND p.project_status = 'ACTIVE'
+              AND p.audit_type = 'SALES'  -- a service audit has no sales masters (2026-11-05)
+            ORDER BY p.tenant_id
             """
         )).scalars().all())
 
@@ -1296,14 +1298,61 @@ def reprice_deals(engine: Engine, *, tenant_id: str, start: date, tag: str) -> d
     return summary
 
 
+REPRICE_FROM = date(2026, 9, 3)
+
+
+def _run_reprice_only(engine: Engine, tag: str, *, commit: bool,
+                      tenant_ids: list[str] | None) -> list[dict[str, Any]]:
+    """Run the deal check again on the masters already loaded, nothing else.
+    For a reload whose reprice was cut short (a worker restart mid-way): the
+    masters committed, the Journeys were not all checked again. The deal check
+    is idempotent, so running it twice on a Journey changes nothing.
+    A dry run only counts the Journeys."""
+    results: list[dict[str, Any]] = []
+    for tenant_id in tenant_ids if tenant_ids is not None else mahindra_tenants(engine):
+        mode = "COMMIT" if commit else "DRY_RUN"
+        try:
+            if not _claim(engine, tag, tenant_id, mode):
+                results.append({"tenantId": tenant_id, "status": "ALREADY_DONE"})
+                continue
+            if commit:
+                outcome: dict[str, Any] = {"passed": True,
+                                           "reprice": reprice_deals(engine, tenant_id=tenant_id,
+                                                                    start=REPRICE_FROM, tag=tag)}
+                status = "COMMITTED"
+            else:
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    journeys = connection.execute(text(
+                        "SELECT count(*) FROM auditcore.journeys j JOIN auditcore.bookings b "
+                        "ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id "
+                        "WHERE j.tenant_id = :t AND coalesce(b.pricing_effective_on, b.booking_date) >= :start"),
+                        {"t": tenant_id, "start": REPRICE_FROM}).scalar_one()
+                outcome = {"passed": True, "reprice": {"from": str(REPRICE_FROM), "journeys": int(journeys)}}
+                status = "DRY_RUN_PASSED"
+        except Exception as exc:  # logged and recorded
+            outcome = {"error": f"{exc.__class__.__name__}: {exc}"[:2000]}
+            status = "FAILED" if commit else "DRY_RUN_FAILED"
+            logger.warning("oem_master_reprice_error", tenant_id=tenant_id, tag=tag, exc_info=True)
+        try:
+            _finish(engine, tag, tenant_id, status, outcome)
+        except Exception:
+            logger.warning("oem_master_reload_finish_failed", tenant_id=tenant_id, tag=tag, exc_info=True)
+        results.append({"tenantId": tenant_id, "status": status})
+    return results
+
+
 def run_master_reload(engine: Engine, tag: str, *, tenant_ids: list[str] | None = None) -> list[dict[str, Any]]:
     """The one-off, for every Mahindra tenant (or ``tenant_ids``). Never raises.
     A tag containing "-schemes" re-loads the scheme masters
     (``SCHEME_RELOAD_PLAN``), "-grids" only the two dealer discount grids,
     "-octcarry" completes the October book (``complete_october_tenant``),
-    "-month" loads the month's book and grid (``load_month_tenant``), any
+    "-month" loads the month's book and grid (``load_month_tenant``),
+    "-reprice" only runs the deal check again (``reprice_deals``), any
     other tag the price books."""
     commit = tag.endswith("-commit")
+    if "-reprice" in tag:
+        return _run_reprice_only(engine, tag, commit=commit, tenant_ids=tenant_ids)
     if "-month" in tag:
         job = load_month_tenant
     elif "-octcarry" in tag:

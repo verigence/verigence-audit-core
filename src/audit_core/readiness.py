@@ -306,20 +306,22 @@ def _mahindra_master_gaps(connection: Connection, tenant_id: str) -> list[str]:
 
 
 def _project_masters_check(connection: Connection, tenant_id: str) -> ReadinessCheck:
-    oem_code = connection.execute(
+    oem_code, audit_type = connection.execute(
         text(
             """
-            SELECT o.oem_code
+            SELECT o.oem_code, p.audit_type
             FROM auditcore.projects p
             JOIN auditcore.oems o ON o.oem_id=p.oem_id
             WHERE p.tenant_id=:tenant_id
             """
         ),
         {"tenant_id": tenant_id},
-    ).scalar_one()
+    ).one()
 
-    missing = _mahindra_master_gaps(connection, tenant_id) if oem_code == "MAHINDRA" else []
-    if oem_code != "MAHINDRA":
+    # A service audit needs no sales price, discount or product masters (product owner 2026-11-05).
+    sales = audit_type != "SERVICE"
+    missing = _mahindra_master_gaps(connection, tenant_id) if sales and oem_code == "MAHINDRA" else []
+    if sales and oem_code != "MAHINDRA":
         product_ready = bool(
             connection.execute(
                 text(

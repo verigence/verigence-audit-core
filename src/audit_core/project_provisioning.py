@@ -48,6 +48,9 @@ class ProjectCreateRequest(BaseModel):
     effectiveEndDate: date | None = None
     timezoneName: str = Field(default="Asia/Kolkata", min_length=1, max_length=100)
     regionCode: str | None = Field(default=None, max_length=100)
+    # What the Project audits (product owner 2026-11-05): a SERVICE audit needs no sales
+    # price, discount or product masters and the sales master jobs leave it alone.
+    auditType: Literal["SALES", "SERVICE"] = "SALES"
 
 
 class ProjectSelectionResponse(BaseModel):
@@ -221,11 +224,11 @@ def _ensure_project_projection(
                 INSERT INTO auditcore.projects (
                     tenant_id, project_code, business_code, project_name, oem_id, product_category_id,
                     effective_start_date, effective_end_date, timezone_name, region_code,
-                    project_status, created_by_actor_id, updated_by_actor_id
+                    project_status, audit_type, created_by_actor_id, updated_by_actor_id
                 ) VALUES (
                     :tenant_id, :project_code, :business_code, :project_name, :oem_id, NULL,
                     :effective_start, :effective_end, :timezone_name, :region_code,
-                    'CONFIGURING', :actor_id, :actor_id
+                    'CONFIGURING', :audit_type, :actor_id, :actor_id
                 )
                 RETURNING tenant_id, project_code, project_name, oem_id,
                           effective_start_date, effective_end_date, timezone_name, region_code,
@@ -242,6 +245,7 @@ def _ensure_project_projection(
                 "effective_end": request.effectiveEndDate,
                 "timezone_name": request.timezoneName.strip(),
                 "region_code": request.regionCode.strip() if request.regionCode else None,
+                "audit_type": request.auditType,
                 "actor_id": actor_id,
             },
         ).mappings().one()
