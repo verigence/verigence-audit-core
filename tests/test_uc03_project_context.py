@@ -211,6 +211,7 @@ def test_me_projects_returns_only_active_projects_for_current_actor(uc03_project
         "projectCode": f"P-{setup['tenant_pc']}",
         "projectName": "Alpha Project",
         "projectStatus": "ACTIVE",
+        "auditType": "SALES",
         "timezoneName": "Asia/Kolkata",
         "operatingRole": "PC",
         "scope": {
@@ -240,6 +241,7 @@ def test_me_projects_returns_only_active_projects_for_current_actor(uc03_project
         "projectCode": f"P-{setup['tenant_pm']}",
         "projectName": "Beta Project",
         "projectStatus": "ACTIVE",
+        "auditType": "SALES",
         "timezoneName": "Asia/Kolkata",
         "operatingRole": "PM",
         "scope": {

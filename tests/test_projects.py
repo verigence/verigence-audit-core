@@ -152,6 +152,17 @@ def test_project_get_and_patch_are_admin_authorized_and_versioned(project_setup)
     assert names[tenant_b] == "Project B"
 
 
+def test_project_says_whether_it_is_a_sales_or_service_audit(project_setup) -> None:
+    """2026-11-05: the screens hide the sales masters for a service audit."""
+    engine, tenant_a, _ = project_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.get(f"/v1/tenants/{tenant_a}/project").json()["auditType"] == "SALES"
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE auditcore.projects SET audit_type = 'SERVICE' WHERE tenant_id = :t"),
+                           {"t": tenant_a})
+    assert client.get(f"/v1/tenants/{tenant_a}/project").json()["auditType"] == "SERVICE"
+
+
 def test_project_restricted_fields_lock_after_published_master_exists(project_setup) -> None:
     engine, tenant_a, _ = project_setup
     client = TestClient(app, raise_server_exceptions=False)
