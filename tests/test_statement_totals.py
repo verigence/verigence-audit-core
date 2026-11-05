@@ -280,3 +280,19 @@ def test_a_copy_not_adding_up_is_an_audit_summary_exception_and_the_dealers_once
     [row] = rows()
     assert row["dealerArithmetic"] is True and row["impact"] == "COMPANY"
     assert "dealer's own sum is wrong (Dealer added wrong)" in row["reason"]
+
+
+def test_rows_the_reader_left_unnamed_on_live_forms():
+    """2026-11-05, from the copies that did not add up: the plan rows of the
+    Offer Letter with their numbering, "EXCHANGE LOYALLY BONUS", "OTHER
+    DISCOUNT(IF ANY)" and "SCHME (-)"."""
+    read = read_statement([
+        {"particulars_raw": "VEHICLE PRICE", "debit_amount": "1000000"},
+        {"particulars_raw": "BALANCE PAYMENT (11-24)", "debit_amount": "37071"},
+        {"particulars_raw": "1ST EMI DP", "credit_amount": "45630"},
+        {"particulars_raw": "FINANCE FEES D.P.", "credit_amount": "600000"},
+        {"particulars_raw": "EXCHANGE LOYALLY BONUS COD", "credit_amount": "20000"},
+        {"particulars_raw": "OTHER DISCOUNT(IF ANY)", "credit_amount": "12000"},
+    ])
+    assert read.unmapped == []
+    assert read.discounts == {"EXCHANGE_BONUS": D(20000), "ADDITIONAL_DISCOUNT": D(12000)}

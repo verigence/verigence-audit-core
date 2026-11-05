@@ -299,3 +299,15 @@ def test_an_account_statement_title_is_told_from_a_quotation():
     for title in ("QUOTATION", "Quotation cum Proforma Invoice", "QUOTATION / PROFORMA INVOICE", "Cost Sheet",
                   None, ""):
         assert not is_statement_title(title), title
+
+
+def test_a_cost_sheet_whose_rows_do_not_add_up_is_read_again(monkeypatch):
+    rows = [{"particulars_raw": "Ex Showroom Price", "amount": "1091500"}, {"particulars_raw": "TCS", "amount": "10915"}]
+
+    def decision(**kwargs):
+        [item] = reread.statement_items(_wire(monkeypatch, **kwargs), "t1", cost_adds_up=True)
+        return item["decision"], item["documentType"]
+
+    assert decision(lines=rows, fields_extra={"total_on_road_price": "1102415"}) == ("SKIP_ADDS_UP", "cost_sheet")
+    assert decision(lines=rows, fields_extra={"total_on_road_price": "1112415"})[0] == "REREAD"
+    assert decision(lines=None, fields_extra={"total_on_road_price": "1112415"})[0] == "SKIP_NOT_JUDGED"

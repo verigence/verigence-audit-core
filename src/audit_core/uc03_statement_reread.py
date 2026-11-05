@@ -32,6 +32,10 @@ it adds up at least as well as the one it replaces; otherwise the copy's
 previous reading is put back and its NDC synced again (live 5 Nov: of 122
 copies read again, 19 came back further from their printed totals).
 
+A tag containing "-csaddsup-" picks, instead, the cost sheets whose rows do not
+add up to their on-road total, with the same rule: a new reading is kept only
+when it adds up at least as well.
+
 A tag containing "-costsheet-" picks, instead, the cost sheets read before
 cost_sheet schema 1.1, which reads every priced row and the printed title
 (2026-11-05): no rows and no title yet. The same safeguards hold.
@@ -74,7 +78,12 @@ from audit_core.uc03_account_statement import (
     statement_total,
 )
 from audit_core.uc03_deal_source_policy import account_statement_is_source_of_truth
-from audit_core.uc03_statement_totals import reading_error, statement_differences
+from audit_core.uc03_statement_totals import (
+    cost_sheet_differences,
+    cost_sheet_error,
+    reading_error,
+    statement_differences,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -130,7 +139,8 @@ def _corrected_fields(connection: Connection, tenant_id: str, journey_id: UUID, 
 
 
 def statement_items(connection: Connection, tenant_id: str, *, misread: bool = False,
-                    no_rows: bool = False, adds_up: bool = False, cost_sheets: bool = False) -> list[dict[str, Any]]:
+                    no_rows: bool = False, adds_up: bool = False, cost_sheets: bool = False,
+                    cost_adds_up: bool = False) -> list[dict[str, Any]]:
     """Every customer_ledger statement of the tenant, with whether it needs
     reading again and why not when it is left alone. ``misread`` picks the
     statements whose ex-showroom is implausible against the price book instead
@@ -138,6 +148,8 @@ def statement_items(connection: Connection, tenant_id: str, *, misread: bool = F
     from audit_core.uc03_account_statement_rebuild import book_ex_showroom
     from audit_core.uc03_p2_reviewer import page_stage_code, stage_is_reviewed
 
+    if cost_adds_up:
+        cost_sheets = True
     journeys = connection.execute(
         text(
             """
@@ -168,9 +180,12 @@ def statement_items(connection: Connection, tenant_id: str, *, misread: bool = F
             corrected = _corrected_fields(connection, tenant_id, journey_id, di_document_id)
             reviewed = bool(stage) and stage_is_reviewed(
                 connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage)
-            differences = statement_differences(document["fields"]) if adds_up else None
+            differences = (cost_sheet_differences(document["fields"]) if cost_adds_up
+                           else statement_differences(document["fields"]) if adds_up else None)
+            if cost_adds_up:
+                adds_up = True
             if cost_sheets or no_rows or adds_up:
-                if cost_sheets and (rows or document["fields"].get("document_title")):
+                if cost_sheets and not cost_adds_up and (rows or document["fields"].get("document_title")):
                     decision = "SKIP_READ_SINCE_1_1"
                 elif no_rows and rows:
                     decision = "SKIP_HAS_ROWS"
@@ -206,6 +221,7 @@ def statement_items(connection: Connection, tenant_id: str, *, misread: bool = F
                 "journeyId": journey_id, "journeyReference": journey["journey_reference"],
                 "diDocumentId": di_document_id, "queueId": page["queue_id"] if page else None,
                 "queueStatus": page["queue_status"] if page else None, "stage": stage, "kind": kind,
+                "documentType": COST_SHEET_TYPE if cost_sheets else ACCOUNT_STATEMENT_TYPE,
                 "rows": len(rows), "hasPrintedTotal": has_total, "addsUp": None if differences is None else not differences, "exShowroomImplausible": implausible, "correctedFields": corrected, "stageReviewed": reviewed,
                 "decision": decision,
             })
@@ -277,8 +293,9 @@ def _stored_fields(engine: Engine, tenant_id: str, item: dict[str, Any]) -> list
         ).mappings().all()]
 
 
-def _error_of(rows: list[dict[str, Any]]) -> Decimal | None:
-    return reading_error({str(r["field_key"]): r["effective_value"] for r in rows})
+def _error_of(rows: list[dict[str, Any]], document_type: str = ACCOUNT_STATEMENT_TYPE) -> Decimal | None:
+    fields = {str(r["field_key"]): r["effective_value"] for r in rows}
+    return cost_sheet_error(fields) if document_type == COST_SHEET_TYPE else reading_error(fields)
 
 
 def _keep_the_better(engine: Engine, tenant_id: str, item: dict[str, Any], before: list[dict[str, Any]],
@@ -287,7 +304,8 @@ def _keep_the_better(engine: Engine, tenant_id: str, item: dict[str, Any], befor
     than the one it replaced, put the previous one back. True when it did."""
     from audit_core.uc03_account_statement import sync_if_source_of_truth
 
-    old_error, new_error = _error_of(before), _error_of(_stored_fields(engine, tenant_id, item))
+    kind = item.get("documentType", ACCOUNT_STATEMENT_TYPE)
+    old_error, new_error = _error_of(before, kind), _error_of(_stored_fields(engine, tenant_id, item), kind)
     if old_error is None or (new_error is not None and new_error <= old_error):
         return False
     with engine.begin() as connection:
@@ -411,6 +429,7 @@ def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> dic
     misread = "-misread-" in tag
     no_rows = "-norows-" in tag
     adds_up = "-addsup-" in tag
+    cost_adds_up = "-csaddsup-" in tag
     cost_sheets = "-costsheet-" in tag
     summary: dict[str, Any] = {}
     for tenant_id in tenant_ids:
@@ -420,7 +439,7 @@ def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> dic
                 if not account_statement_is_source_of_truth(connection, tenant_id=tenant_id):
                     continue
                 items = statement_items(connection, tenant_id, misread=misread, no_rows=no_rows, adds_up=adds_up,
-                                        cost_sheets=cost_sheets)
+                                        cost_sheets=cost_sheets, cost_adds_up=cost_adds_up)
         except Exception:
             logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
             continue
@@ -433,7 +452,7 @@ def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> dic
         if commit:
             try:
                 results = _reread(engine, tenant_id, [i for i in items if i["decision"] == "REREAD"], tag,
-                                  ask="-copy-" not in tag, keep_better=adds_up)
+                                  ask="-copy-" not in tag, keep_better=adds_up or cost_adds_up)
             except Exception:
                 logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
         if misread and commit:
@@ -458,13 +477,14 @@ def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> dic
                 results["stillNoRows"] = sorted({str(i["journeyReference"]) for i in still})
             except Exception:
                 logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
-        if adds_up and commit:
+        if (adds_up or cost_adds_up) and commit:
             # the same check again, on what the re-read copies now hold
             try:
                 picked = {str(i["diDocumentId"]) for i in items if i["decision"] == "REREAD"}
                 with engine.begin() as connection:
                     set_tenant_context(connection, tenant_id)
-                    after = [i for i in statement_items(connection, tenant_id, adds_up=True)
+                    after = [i for i in statement_items(connection, tenant_id, adds_up=adds_up,
+                                                        cost_adds_up=cost_adds_up)
                              if str(i["diDocumentId"]) in picked]
                 results["now_add_up"] = sum(1 for i in after if i["addsUp"])
                 results["still_do_not"] = sorted({str(i["journeyReference"]) for i in after if i["addsUp"] is False})

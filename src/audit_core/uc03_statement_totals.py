@@ -211,6 +211,13 @@ def reading_error(fields: dict[str, Any]) -> Decimal | None:
     return None if differences is None else sum((abs(d["difference"]) for d in differences), Decimal(0))
 
 
+def cost_sheet_error(fields: dict[str, Any]) -> Decimal | None:
+    """How far a cost sheet's rows are from its on-road total (0 when it adds
+    up); None when it is not judged."""
+    differences = cost_sheet_differences({k: v for k, v in fields.items() if v not in (None, "", "null")})
+    return None if differences is None else sum((abs(d["difference"]) for d in differences), Decimal(0))
+
+
 def cost_sheet_rows(fields: dict[str, Any]) -> tuple[Decimal, list[Decimal]] | None:
     """A cost sheet's charges and deductions from its rows, None when its rows
     were not read."""
