@@ -624,3 +624,19 @@ def test_counts_are_not_corrected_after_the_day_of_the_upload(setup):
     late = _register(s, gp, 3, 3)
     assert late.status_code == 409 and "day the gate register was uploaded" in late.text
     assert s.client.get(f"{s.base}/outlets").json()["editableToday"] == []
+
+
+def test_stock_transfers_on_the_register_are_kept_apart_from_deliveries(setup):
+    """Product owner 2026-11-05: big outlets also move stock between outlets, so
+    the gate register takes stock transfer entries. They are recorded and shown
+    in the consolidated view, never counted as deliveries or in the gap."""
+    s = setup
+    _delivery_file(s, journeys=2)
+    gp = _upload(s).json()["gatePassId"]
+    result = s.client.post(f"{s.base}/{gp}/counts",
+                           json={"newDeliveries": 2, "intimatedToPc": 2, "stockTransfers": 3})
+    assert result.status_code == 200, result.text
+    assert result.json()["gatePass"]["stockTransfers"] == 3
+    view = s.client.get(f"{s.base}/summary").json()
+    assert view["totals"]["stockTransfers"] == 3 and view["outlets"][0]["days"][-1]["stockTransfers"] == 3
+    assert (view["totals"]["asPerRegister"], view["totals"]["pendingDueToPc"]) == (2, 0)

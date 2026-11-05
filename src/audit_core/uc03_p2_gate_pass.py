@@ -844,7 +844,9 @@ def gate_pass_summary(
     - notNotifiedToPc: how many of the rest the PC said the dealership did not notify to them
       ("Not notified to PC", 2026-10-27; also returned as pendingDueToClient for older clients);
     - pendingDueToPc: as per register - (updated in tool + not notified to PC): what the PC has
-      not uploaded (the whole gap while the PC has not answered).
+      not uploaded (the whole gap while the PC has not answered);
+    - stockTransfers: stock transfer movements on the register (product owner 2026-11-05: big
+      outlets move stock between outlets). Reported beside the deliveries, never part of them.
     """
     _authorize(connection, tenant_id, principal, client, _READ)
     today = ist_day().date()
@@ -857,13 +859,13 @@ def gate_pass_summary(
             if (start + timedelta(days=i)).isoweekday() != 7]
     ids = [str(o["outlet_id"]) for o in outlets]
     empty = {"asPerRegister": 0, "updatedInTool": 0, "notNotifiedToPc": 0, "pendingDueToPc": 0,
-             "gatePassDays": 0, "gatePassesFinished": 0, "gatePassesMissing": 0}
+             "stockTransfers": 0, "gatePassDays": 0, "gatePassesFinished": 0, "gatePassesMissing": 0}
     if not ids or not days:
         return {"from": start.isoformat(), "to": end.isoformat(), "outlets": [], "totals": dict(empty), "notes": []}
     passes = {(r["business_date"], str(r["outlet_id"])): dict(r) for r in connection.execute(
         text("""
             SELECT g.business_date, g.outlet_id, g.gate_pass_id, g.pc_name, g.new_deliveries, g.files_held,
-                   g.not_notified_count,
+                   g.not_notified_count, g.stock_transfers,
                    g.divergence, g.counts_submitted_at_utc, g.completed_at_utc, g.quality_flag, g.photo_mode,
                    (SELECT count(*) FROM auditcore.p2_gate_pass_pages pp
                     WHERE pp.tenant_id = g.tenant_id AND pp.gate_pass_id = g.gate_pass_id) AS pages
@@ -885,7 +887,7 @@ def gate_pass_summary(
             gp = passes.get((d, oid))
             files = uploaded.get((d, oid), 0)
             entry = {"date": d.isoformat(), "label": gate_pass_day_label(d), "updatedInTool": files,
-                     "asPerRegister": None, "notNotifiedToPc": 0, "pendingDueToPc": 0,
+                     "asPerRegister": None, "notNotifiedToPc": 0, "pendingDueToPc": 0, "stockTransfers": None,
                      "status": "NOT_UPLOADED", "gatePassId": None, "pcName": None, "photoQuality": None}
             line["gatePassDays"] += 1
             line["updatedInTool"] += files
@@ -911,6 +913,8 @@ def gate_pass_summary(
                     entry["notNotifiedToPc"] = min(int(not_notified), pending)
                     entry["pendingDueToPc"] = pending - entry["notNotifiedToPc"]
                     entry["status"] = "DONE" if gp["completed_at_utc"] is not None else "ANSWER_PENDING"
+                    entry["stockTransfers"] = int(gp["stock_transfers"] or 0)
+                    line["stockTransfers"] += entry["stockTransfers"]
                     line["asPerRegister"] += register
                     line["notNotifiedToPc"] += entry["notNotifiedToPc"]
                     line["pendingDueToPc"] += entry["pendingDueToPc"]
@@ -934,6 +938,7 @@ def gate_pass_summary(
             ("Not notified to PC: deliveries the PC said the dealership did not notify to them. Pending due to PC: "
              "as per register - (updated in tool + not notified to PC): deliveries the PC has not uploaded, "
              "or the whole gap while the PC has not answered yet."),
+            "Stock transfers: vehicles moved between outlets on the register; not deliveries, not in the gap.",
         ],
     }
 
