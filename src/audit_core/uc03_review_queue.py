@@ -782,6 +782,7 @@ _TASK_TYPE_FINDING_CLASS: dict[str, str] = {
     "INVOICE_DISCREPANCY_REVIEW": "DATA_GAP",
     "ACCOUNT_STATEMENT_NO_EX_SHOWROOM": "DATA_GAP",
     "DOCUMENT_KEY_FIGURES_NOT_READ": "DATA_GAP",
+    "STATEMENT_ROWS_DO_NOT_ADD_UP": "DATA_GAP",
     "ACCOUNT_STATEMENT_TALLY_DEVIATION": "DATA_GAP",
     # 2026-10-20: an invoice whose own figures do not add up, or whose taxes
     # were not read (uc03_invoice_materialization) -- the PC re-checks it.

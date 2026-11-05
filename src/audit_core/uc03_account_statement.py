@@ -246,7 +246,10 @@ _SUMMARY = re.compile(
 # bonus (that is "EXCHANGE CLAIM") -- and, being already netted off the net
 # receivable, not one of the statement's received lines either.
 _OLD_VEHICLE = re.compile(r"EXCHANGED? VEHICLE( VALUE| AMT| AMOUNT)?")
-_TRADE_IN = re.compile(r"TRADE IN VALUE( .*)?")
+# Utkal's "Exchange Value", in the payment column and counted in its Total
+# Receipt (2026-11-05: UTK-BP-261104-002 Rs 6,70,000, left unread), is the
+# old vehicle taken in kind, as the Shivnath form's "Trade in value".
+_TRADE_IN = re.compile(r"(TRADE IN|EXCHANGE) VALUE( .*)?")
 # Scrappage is a Deal line of its own (product owner 2026-11-02): the row that
 # names the scrappage bonus is the benefit -- the certificate of deposit's
 # when it says COD, else the dealer's. The handwriting reading spells the word
@@ -267,7 +270,7 @@ _FINANCER = re.compile(
     r"FINANCE( D/?O( .*)?| D/O\S.*| D/[PD]( .*)?| B/O( .*)?| [A-Z][A-Z&.]*( [A-Z][A-Z&.]*)* MR NO\.?.*)?"
 )
 _RECEIPT = re.compile(
-    r"(BOOKING AMOUNT|DEPOSITED INTO BANK|CASH|CHEQUE|ONLINE TRANSFER|TRADE IN VALUE|CASH SHORTAGE|"
+    r"(BOOKING AMOUNT|DEPOSITED INTO BANK|CASH|CHEQUE|ONLINE TRANSFER|TRADE IN VALUE|EXCHANGE VALUE|CASH SHORTAGE|"
     r"MR NO\.?.*|PAYMENT A/C DETAILS|REFUND|RECEIPT)( .*)?"
 )
 _FORM_MARKERS = tuple(re.compile(p) for p in (
@@ -415,7 +418,13 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
     # received as numbered receipts ("RECEIPT 0608"): its booking amount is
     # the plan's, the money itself is among the receipts (independent check
     # 2026-11-04: 5 of 6 such letters counted the booking amount twice).
-    plans_its_receipts = any(_NUMBERED_RECEIPT.fullmatch(_label(row.get("particulars_raw"))) for row in lines)
+    # The receipts may be listed without their number ("RECEIPT MR-", 2026-11-05:
+    # SHI-SS-261102-005), beside the plan's own rows.
+    labels = [_label(row.get("particulars_raw")) for row in lines]
+    plans_its_receipts = any(_NUMBERED_RECEIPT.fullmatch(label) for label in labels) or (
+        any(_RECEIPT_ROW.fullmatch(label) for label in labels) and any(_PLAN_ROW.fullmatch(label) for label in labels))
+    listed_receipts = [side[1] for row in lines if _RECEIPT_ROW.fullmatch(_label(row.get("particulars_raw")))
+                       and (side := _side_amount(row)) is not None]
     for row in lines:
         label = _label(row.get("particulars_raw"))
         side = _side_amount(row)
@@ -478,7 +487,13 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             continue
         if _FINANCER.fullmatch(label):
             out.financer = (out.financer or Decimal(0)) + amount
-            out.receipts += amount
+            if not (plans_its_receipts and _PLANNED_FINANCE.fullmatch(label)
+                    and any(abs(amount - listed) <= _SAME_AMOUNT for listed in listed_receipts)):
+                # The plan's finance amount is money in, unless the letter lists
+                # the financier's payment among its receipts: then it was counted
+                # twice (2026-11-05, the rows against the printed total receipts:
+                # SHI-SS-261029-001, Rs 20,00,000 planned and received).
+                out.receipts += amount
             continue
         if _RECEIPT.fullmatch(label):
             out.receipts += amount
@@ -1229,6 +1244,10 @@ _NOT_MONEY_IN = re.compile(r"(REFUND|CASH SHORTAGE)( .*)?")
 _MR_NUMBER = re.compile(r".*\b(?:MR\.? ?NO\.?|RECEIPT)\s*([A-Z0-9/-]*\d[A-Z0-9/-]*).*")
 _NUMBERED_RECEIPT = re.compile(r"RECEIPT (NO\.? ?)?[A-Z0-9/-]*\d{3,}[A-Z0-9/-]*")
 _PLANNED_BOOKING = re.compile(r"BOOKING AMOUNT")
+_PLANNED_FINANCE = re.compile(r"FINANCE AMOUNT")
+_SAME_AMOUNT = Decimal(10)
+_RECEIPT_ROW = re.compile(r"RECEIPT\b.*")
+_PLAN_ROW = re.compile(r"BOOKING AMOUNT|FINANCE AMOUNT|DOWN ?PAYMENT.*|FINAL PAYMENT")
 _BANK_WORDS = re.compile(r".*\b(BANK|NEFT|RTGS|IMPS|UPI|ONLINE|CHEQUE|PHONE ?PAY|GPAY)\b.*")
 
 
