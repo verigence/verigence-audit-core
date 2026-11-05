@@ -52,8 +52,10 @@ COPIES_DIFFERENCE_TASK = "NDC_COPIES_DIFFERENCE"
 REVIEWER_CORRECTIONS_TASK = "REVIEWER_CORRECTIONS_INFO"
 # A document's key figure not read (2026-11-04): the PC closes it when the figure is not printed.
 KEY_FIGURES_TASK = "DOCUMENT_KEY_FIGURES_NOT_READ"
+# An NDC / cost sheet whose rows do not add up (2026-11-05): the PC closes it when the dealer's sum is wrong.
+ADDS_UP_TASK = "STATEMENT_ROWS_DO_NOT_ADD_UP"
 CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK, COST_SHEET_DIFFERENCE_TASK, COPIES_DIFFERENCE_TASK,
-                              REVIEWER_CORRECTIONS_TASK, KEY_FIGURES_TASK})
+                              REVIEWER_CORRECTIONS_TASK, KEY_FIGURES_TASK, ADDS_UP_TASK})
 # "Upload the ..." tasks (a conditional document, or the booking docket) close
 # by hand too (product owner 2026-11-02): a single page uploaded for them is
 # often refused for scan quality and never read, so the machine check cannot

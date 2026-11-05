@@ -329,6 +329,14 @@ def _run_audit_core_rules_for_stage(
         "SKIPPED" if not key_figures.get("examined") else "FAIL" if key_figures.get("documents") else "PASS"),
         key_figures)
 
+    # The NDC's and cost sheet's rows add up to the totals they print (product
+    # owner 2026-11-05): one task per booking. Never raises.
+    from audit_core.uc03_statement_totals import sync_statement_totals
+
+    totals = sync_statement_totals(connection, tenant_id=tenant_id, journey_id=journey_id)
+    _record("STATEMENT_ROWS_ADD_UP", "ERROR" if totals.get("error") else (
+        "SKIPPED" if not totals.get("judged") else "FAIL" if totals.get("copies") else "PASS"), totals)
+
     # The deal-audit checks (price, discounts, settlement, financier, trade-in,
     # third-party payer, cash limit): journey-wide ones run with
     # BOOKING, delivery-dependent ones with DELIVERY.
