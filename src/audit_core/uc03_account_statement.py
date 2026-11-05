@@ -212,8 +212,9 @@ _DISCOUNTS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         # "EXCHANGE CLAIM" is the exchange bonus (product owner 2026-10-29, the
         # Aditya form; written "EXCHANNGE CLAIM" on it, and read "EXCHANNG
         # CLAIM"); "EXCHANGE LOYALITY" is the loyalty bonus misspelt.
-        ("EXCHANGE_BONUS", r"EXCHAN+GE? ?[ /] ?(LOYALI?TY|BONUS|CLAIM)( .*)?"),
-        ("ADDITIONAL_DISCOUNT", r"(OTHER DISCOUNT( \(IF ANY\))?|CASH DISCOUNT|ADDITIONAL DISCOUNT)( .*)?"),
+        # "EXCHANGE LOYALLY BONUS" too (2026-11-05, the rows against the printed totals).
+        ("EXCHANGE_BONUS", r"EXCHAN+GE? ?[ /] ?(LOYAL(I?TY|LY)|BONUS|CLAIM)( .*)?"),
+        ("ADDITIONAL_DISCOUNT", r"(OTHER DISCOUNT( ?\(IF ANY\))?|CASH DISCOUNT|ADDITIONAL DISCOUNT)( .*)?"),
     )
 )
 # The total the statement prints for what the customer owes (product owner,
@@ -230,14 +231,16 @@ _PRINTED_TOTAL = re.compile(r"(NET VALUE|FINAL PRICE|NET RECEIVABLE( \(A ?\+ ?B\
 # (SHI-SS-261027-024, 2026-11-03: only the vehicle price, Rs 19,28,561).
 _VEHICLE_PRICE = re.compile(r"VEHICLE PRICE")
 # also read "SCH" / "SCHME" (2026-11-04)
-_SCHEME_ROW = re.compile(r"SCH(E?ME?)?( OF (THE )?MONTH)?")
+_SCHEME_ROW = re.compile(r"SCH(E?ME?)?( OF (THE )?MONTH)?( ?\(-\))?")
 _SUMMARY = re.compile(
     r"GROSS VALUE|DISCOUNT|TOTAL( COST| RECEIPTS?| \(A\))?|NET AMOUNT RECEIVED( \(E\))?|"
     r"SHORT ?/ ?EXCESS|BALANCE ?(EXCESS ?/ ?SHORTAGE)?( \(C-E\))?|DUE|"
     # The Offer Letter / Payment Details form's working rows (2026-11-03): the
     # vehicle price and its scheme (the Ex Showroom (1-2) row is their
     # difference), its sub-totals, the finance plan, the final payment.
-    r"VEHICLE PRICE|SCHEME|BALANCE PAYMENT|SUB ?TOTAL.*|DOWN ?PAYMENT.*|1ST EMI|FINANCE FEES|"
+    # (with the form's numbering or a note after them: "BALANCE PAYMENT (11-24)",
+    # "1ST EMI DP", "FINANCE FEES D.P.", 2026-11-05)
+    r"VEHICLE PRICE|SCHEME|BALANCE PAYMENT( .*)?|SUB ?TOTAL.*|DOWN ?PAYMENT.*|1ST EMI( .*)?|FINANCE FEES( .*)?|"
     r"MISC PAYMENT|FINAL PAYMENT"
 )
 # The old vehicle's value (product owner 2026-10-29): Aditya's form deducts
