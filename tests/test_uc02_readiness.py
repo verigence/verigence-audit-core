@@ -311,6 +311,24 @@ def test_only_project_and_security_are_activation_blockers(readiness_setup) -> N
     assert all(call[1] == "same-human-superadmin-token" for call in setup["di"].calls)
 
 
+def test_a_service_audit_project_is_not_asked_for_sales_masters(readiness_setup) -> None:
+    """Product owner 2026-11-05: a service audit needs no sales price, discount or product master."""
+    setup = readiness_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    url = f"/v1/tenants/{setup['tenant_id']}/project/readiness"
+    assert "Product Master" in _checks(client.get(url).json())["PROJECT_MASTERS_READY"]["message"]
+    with setup["engine"].begin() as connection:
+        connection.execute(
+            text("UPDATE auditcore.projects SET audit_type='SERVICE' WHERE tenant_id=:t"),
+            {"t": setup["tenant_id"]},
+        )
+    payload = client.get(url).json()
+    assert payload["readyToActivate"] is True
+    message = _checks(payload)["PROJECT_MASTERS_READY"]["message"]
+    assert "Product Master" not in message
+    assert "Price Master" not in message and "Discount" not in message
+
+
 def test_missing_pc_coverage_is_warning_and_satellite_is_supported(readiness_setup) -> None:
     setup = readiness_setup
     with setup["engine"].begin() as connection:

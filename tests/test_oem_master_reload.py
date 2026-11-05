@@ -468,3 +468,41 @@ def test_november_loads_on_4_nov_keeps_what_it_does_not_print_and_takes_the_new_
     assert thar_nov["model_alias"] == "Thar OG" and thar_oct["model_alias"] == "Thar"
     # once per tag
     assert run_master_reload(engine, f"{tag}-month-commit", tenant_ids=[tenant_id])[0]["status"] == "ALREADY_DONE"
+
+
+def test_service_audit_projects_are_left_out_of_the_sales_master_jobs(tenant) -> None:
+    """Product owner 2026-11-05: a service audit Project has no sales price book."""
+    engine, tenant_id = tenant
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE auditcore.oems SET oem_code = 'MAHINDRA' WHERE oem_id = "
+                          "(SELECT oem_id FROM auditcore.projects WHERE tenant_id = :t) AND NOT EXISTS "
+                          "(SELECT 1 FROM auditcore.oems WHERE oem_code = 'MAHINDRA')"), {"t": tenant_id})
+        conn.execute(text("UPDATE auditcore.projects SET project_status = 'ACTIVE', oem_id = "
+                          "(SELECT oem_id FROM auditcore.oems WHERE oem_code = 'MAHINDRA') WHERE tenant_id = :t"),
+                     {"t": tenant_id})
+    assert tenant_id in oem_master_reload.mahindra_tenants(engine)
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE auditcore.projects SET audit_type = 'SERVICE' WHERE tenant_id = :t"),
+                     {"t": tenant_id})
+    assert tenant_id not in oem_master_reload.mahindra_tenants(engine)
+
+
+def test_a_reprice_tag_runs_only_the_deal_check_again_and_once(tenant, monkeypatch) -> None:
+    """For a reload whose reprice a worker restart cut short (5 Nov 2026)."""
+    engine, tenant_id = tenant
+    calls: list[tuple[str, date]] = []
+
+    def fake_reprice(engine_, *, tenant_id, start, tag):
+        calls.append((tenant_id, start))
+        return {"from": str(start), "journeys": 0, "entitlementsChanged": 0, "failed": [], "changed": []}
+
+    monkeypatch.setattr(oem_master_reload, "reprice_deals", fake_reprice)
+    tag = f"test-{uuid4().hex[:6]}-reprice"
+    (dry,) = run_master_reload(engine, tag, tenant_ids=[tenant_id])
+    assert dry["status"] == "DRY_RUN_PASSED" and calls == []
+    (done,) = run_master_reload(engine, f"{tag}-commit", tenant_ids=[tenant_id])
+    assert done["status"] == "COMMITTED"
+    assert calls == [(tenant_id, oem_master_reload.REPRICE_FROM)]
+    assert _versions(engine, tenant_id) == 0  # no master was loaded
+    assert run_master_reload(engine, f"{tag}-commit", tenant_ids=[tenant_id])[0]["status"] == "ALREADY_DONE"
+    assert len(calls) == 1
