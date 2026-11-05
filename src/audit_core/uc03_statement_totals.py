@@ -198,6 +198,19 @@ def statement_differences(fields: dict[str, Any]) -> list[dict[str, Any]] | None
     return [d for label, amount, ways in printed if (d := _difference(label, amount, ways)) is not None]
 
 
+def reading_error(fields: dict[str, Any]) -> Decimal | None:
+    """How far one NDC copy's rows are from its printed totals, all added (0 when
+    it adds up), from its fields as stored; None when it is not judged."""
+    from audit_core.uc03_account_statement import _discount_detail_rows
+
+    fields = {k: v for k, v in fields.items() if v not in (None, "", "null")}
+    details = _discount_detail_rows(fields)
+    if details:
+        fields["line_items"] = [*line_rows(fields.get("line_items")), *details]
+    differences = statement_differences(fields)
+    return None if differences is None else sum((abs(d["difference"]) for d in differences), Decimal(0))
+
+
 def cost_sheet_rows(fields: dict[str, Any]) -> tuple[Decimal, list[Decimal]] | None:
     """A cost sheet's charges and deductions from its rows, None when its rows
     were not read."""
