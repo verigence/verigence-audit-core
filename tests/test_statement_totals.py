@@ -251,3 +251,32 @@ def test_a_reread_that_reads_further_from_the_totals_keeps_the_previous_reading(
     # A reading at least as good is kept.
     reading(UTKAL)
     assert _keep_the_better(journey.engine, journey.tenant_id, item, before, "t") is False
+
+
+def test_a_copy_not_adding_up_is_an_audit_summary_exception_and_the_dealers_once_the_pc_confirms(journey):
+    """Product owner 2026-11-05: the dealer's own sum wrong shows on the Audit
+    Summary as an exception; the PC's task stays for a misreading."""
+    from audit_core.uc03_p2_audit_summary import statement_totals
+
+    misread = [dict(r) for r in UTKAL]
+    misread[0]["debit_amount"] = "853000"  # rows Rs 1,000 under the printed Total Cost
+    _ndc(journey, misread, UTKAL_PRINTED)
+    _sync(journey)
+
+    def rows():
+        with journey.engine.begin() as c:
+            set_tenant_context(c, journey.tenant_id)
+            return statement_totals(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+    [row] = rows()
+    assert (row["conclusion"], row["rule"], row["impact"], row["dealerArithmetic"]) == ("EXCEPTION", "AS-11", None, False)
+    assert row["difference"] == "-1000.00" or row["difference"] == "-1000"
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("UPDATE auditcore.p2_tasks SET task_status='VERIFIED_COMPLETE', completion_result="
+                       "CAST(:r AS jsonb) WHERE tenant_id=:t AND task_type=:k"),
+                  {"r": json.dumps({"outcome": "CLOSED_BY_PC", "reason": "Dealer added wrong"}),
+                   "t": journey.tenant_id, "k": TASK_TYPE})
+    [row] = rows()
+    assert row["dealerArithmetic"] is True and row["impact"] == "COMPANY"
+    assert "dealer's own sum is wrong (Dealer added wrong)" in row["reason"]

@@ -315,8 +315,9 @@ def sync_statement_totals(connection: Connection, *, tenant_id: str, journey_id:
                     description=(
                         "The rows read from these copies do not add up to the total the dealer printed on them: "
                         + describe(copies) + ". A row was misread, read twice or not read: correct the reading "
-                        "of the copy. If the dealer's own sum on the page is wrong, close this task with a "
-                        "comment saying so."
+                        "of the copy. If the page was read right and the dealer's own sum on it is wrong, close "
+                        "this task with a comment saying so: it then stands on the Audit Summary as the "
+                        "dealer's arithmetic."
                     ),
                     reference={"sourceCode": TASK_TYPE, "copies": [
                         {"documentId": c["documentId"], "documentType": c["documentType"],

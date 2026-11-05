@@ -21,6 +21,12 @@ taken as a corporate discount and the letter's lines never reached the Deal.
 The page asked for is read alone as the type asked for; every other page of
 the group is read alone as the group's own type, each from its own stored
 page; the group is retired (MERGED into the page asked for).
+
+The template ``supporting_document`` keeps the page on file as a supporting
+document, read for no figure (2026-11-05: the dealers' Transaction
+Regularization Form, their internal discount sanction, read as a cost sheet):
+the page stays on the booking under the title printed on it, as the PC's
+"Others" leaves one, and the document it was read as no longer counts.
 """
 from __future__ import annotations
 
@@ -42,6 +48,53 @@ MAX_PAGES = 60
 _ITEM = re.compile(r"^(?P<reference>[A-Z0-9][A-Z0-9-]{2,63}):(?P<page>[1-9][0-9]{0,3}):(?P<template>[a-z0-9_]{2,64})"
                    r"(:(?P<current>[a-z0-9_]{2,64}))?$")
 _ACTOR = "SYSTEM:PAGE_RETYPE"
+_SUPPORTING = "supporting_document"
+
+
+def _keep_as_supporting(connection: Any, *, tenant_id: str, journey_id: UUID, unit: dict[str, Any],
+                        tag: str) -> str:
+    """The page stays on file as a supporting document under its printed title;
+    the document it was read as is set aside (never deleted). Returns the name."""
+    from audit_core.uc03_account_statement import sync_if_source_of_truth
+    from audit_core.uc03_p2_runtime import record_activity
+
+    document_id = unit.get("di_document_id")
+    title = connection.execute(
+        text("SELECT effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields "
+             "WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d AND field_key='document_title' LIMIT 1"),
+        {"t": tenant_id, "j": journey_id, "d": document_id},
+    ).scalar_one_or_none() if document_id else None
+    name = " ".join(str(title or "").split()).title() or "Supporting document"
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue
+            SET queue_status='SUPPORTING', template_key=:k, display_name=:n, status_reason=:why, updated_at_utc=now()
+            WHERE tenant_id=:t AND queue_id=:q
+            """
+        ),
+        {"t": tenant_id, "q": unit["queue_id"], "k": _SUPPORTING, "n": name[:200],
+         "why": f"Kept as a supporting document ({name}) by job {tag}: on file, not read for figures."},
+    )
+    if document_id:
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.evidence
+                SET association_status='SUPERSEDED', void_reason=:why, voided_by_actor_id=:actor, voided_at_utc=now()
+                WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d AND association_status='ACTIVE'
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "d": document_id, "actor": _ACTOR,
+             "why": f"Kept as a supporting document ({name}): not a {unit.get('template_key') or 'checklist document'}"},
+        )
+    record_activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="PAGE_KEPT_AS_OTHER",
+        subject_type="DOCUMENT_PAGE", subject_id=str(unit["queue_id"]),
+        details={"templateKey": _SUPPORTING, "name": name, "by": f"system:{tag}"}, correlation_id=tag,
+    )
+    sync_if_source_of_truth(connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=tag)
+    return name
 
 
 def parse_request(tag: str, reports: list[str]) -> tuple[str, bool, list[tuple[str, int, str, str | None]]]:
@@ -179,6 +232,30 @@ def run_page_retype(engine: Engine, tag: str, reports: list[str]) -> dict[str, A
         if (reference, page) in split_done:
             continue  # read alone already, as asked, when its group was split
         template = registry.documents.get(template_key)
+        if template_key == _SUPPORTING and template is not None:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                found = _current_unit(connection, tenant_id=tenant_id, reference=reference, page=page, current=current)
+                if found is None:
+                    out["skipped"].append({"journey": reference, "page": page, "why": "no live page"})
+                    continue
+                journey_id = UUID(str(found["journey_id"]))
+                unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                  queue_id=UUID(str(found["queue_id"])))
+                if unit["queue_status"] not in ("READY", "NEEDS_REVIEW", "SUPPORTING"):
+                    out["skipped"].append({"journey": reference, "page": page,
+                                           "why": f"page is {unit['queue_status']} (still being read)"})
+                    continue
+                entry = {"journey": reference, "page": page,
+                         "from": unit["template_key"] or unit["classified_document_type"], "to": _SUPPORTING}
+                if not commit:
+                    out["wouldSend"].append(entry)
+                    continue
+                entry["name"] = _keep_as_supporting(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                                    unit=unit, tag=tag)
+                out["sent"].append(entry)
+            logger.info("page_retype_item", tag=tag, journey=reference, page=page, to=template_key, commit=commit)
+            continue
         if template is None or not template.di_types:
             out["skipped"].append({"journey": reference, "page": page, "why": f"unknown template {template_key}"})
             continue
