@@ -75,7 +75,10 @@ EXPECTED_SKUS: dict[date, int | None] = {
     date(2026, 9, 7): 319,
     date(2026, 9, 8): 319,
     date(2026, 9, 19): None,
-    date(2026, 10, 3): 327,
+    # 327 printed + 29 September SKUs October does not print: since the
+    # standing rule of 2 Nov 2026 the ingest itself keeps them (what the
+    # "-octcarry" job did for the live October book on 1 Nov).
+    date(2026, 10, 3): 356,
 }
 UNTOUCHED_DATES = (date(2026, 9, 8), date(2026, 9, 19))
 SPOT_PRICES = (
@@ -252,7 +255,6 @@ def reload_tenant(connection: Connection, *, tenant_id: str, tag: str, store: bo
 # upload on a date wins, and its tombstones withdraw the old schemes the
 # re-upload no longer names.
 SCHEME_RELOAD_PLAN: tuple[tuple[str, str, date, date | None], ...] = (
-    ("DISCOUNT_GRID", "2026-09/Odisha PV & CV Discount Grid-1 Aug 2026.xlsx", date(2026, 9, 1), None),
     ("CONSUMER_SCHEME", "2026-09/Consumer Scheme Bhubaneswar RO_Sep'26.pdf", date(2026, 9, 3), date(2026, 9, 30)),
     ("EXCHANGE_SCHEME", "2026-09/Exchange scheme Sept'26 - Bhubaneswar.pdf", date(2026, 9, 3), date(2026, 9, 30)),
     ("CORPORATE_POLICY", "2026-09/260903 Sept'26 Corporate Privilege Policy Mahindra PV and CV.xlsx",
@@ -262,13 +264,26 @@ SCHEME_RELOAD_PLAN: tuple[tuple[str, str, date, date | None], ...] = (
      date(2026, 10, 3), date(2026, 10, 31)),
     ("CORPORATE_POLICY", "2026-10/261003 Oct'26 Corporate Privilege Policy Mahindra PV and CV.xlsx",
      date(2026, 10, 3), date(2026, 10, 31)),
-    ("DISCOUNT_GRID", "2026-10/Odisha PV & CV Discount Grid-1 Oct 2026.xlsx", date(2026, 10, 1), None),
 )
-SCHEME_CHECK_DATES = (date(2026, 9, 15), date(2026, 10, 15))
+# The dates printed above are checked against each document; a file listed
+# here is in force to the date given instead. Product owner, 5 Nov 2026:
+# November has no new consumer, exchange or corporate bulletin -- October's
+# stand for November.
+SCHEME_VALID_TO: dict[str, date] = {
+    "2026-10/Consumer Scheme Bhubaneswar RO_Oct'26.pdf": date(2026, 11, 30),
+    "2026-10/Exchange scheme Oct'26 - B'newar_Raipur_Patna_Guwa.pdf": date(2026, 11, 30),
+    "2026-10/261003 Oct'26 Corporate Privilege Policy Mahindra PV and CV.xlsx": date(2026, 11, 30),
+}
+# (The dealer discount grids left this plan on 5 Nov 2026: they load by
+# their own "-grids" / "-month" jobs, and November's grid stands from 4 Nov.)
+SCHEME_CHECK_DATES = (date(2026, 9, 15), date(2026, 10, 15), date(2026, 11, 10))
+# October's benefits must answer on this November date for every SKU on sale.
+SCHEME_CARRY_CHECK = (date(2026, 10, 15), date(2026, 11, 10))
 # Models with at least one scheme row applied (consumer, exchange, scrappage,
 # welcome, corporate) on each check date, from the dry run on the live-shaped
 # copy; a re-load that applies to fewer models fails.
-EXPECTED_MODELS_WITH_SCHEMES: dict[date, int] = {date(2026, 9, 15): 16, date(2026, 10, 15): 16}
+EXPECTED_MODELS_WITH_SCHEMES: dict[date, int] = {date(2026, 9, 15): 16, date(2026, 10, 15): 16,
+                                                 date(2026, 11, 10): 16}
 SCHEME_SPOT_CHECKS = (
     # Utkal's deal: XUV 3XO AX5 PM MT, the September cash offer.
     ("XUV 3XO", "AX5 PM MT", date(2026, 9, 15), "CASH_DISCOUNT", Decimal(30000)),
@@ -351,10 +366,13 @@ def reload_schemes_tenant(connection: Connection, *, tenant_id: str, tag: str, s
 
     grid_dates = [on for kind, _, on, _ in SCHEME_RELOAD_PLAN if kind == "DISCOUNT_GRID"]
     planned: list[tuple[str, Path, date, date | None]] = []
+    printed_to: dict[Path, date | None] = {}
     for kind, relative, on, until in SCHEME_RELOAD_PLAN:
-        shadow_until = until if kind != "DISCOUNT_GRID" else next((d for d in grid_dates if d > on), None)
+        printed_to[DATA_DIR / relative] = until
+        valid_to = SCHEME_VALID_TO.get(relative, until)
+        shadow_until = valid_to if kind != "DISCOUNT_GRID" else next((d for d in grid_dates if d > on), None)
         for when in [on, *_shadow_dates(connection, tenant_id, kind, on, shadow_until)]:
-            planned.append((kind, DATA_DIR / relative, when, until))
+            planned.append((kind, DATA_DIR / relative, when, valid_to))
 
     uploads: list[dict[str, Any]] = []
     grid_versions: list[tuple[date, Any]] = []
@@ -364,8 +382,8 @@ def reload_schemes_tenant(connection: Connection, *, tenant_id: str, tag: str, s
         plan_from = next(d for k, r, d, _ in SCHEME_RELOAD_PLAN if DATA_DIR / r == path)
         if on == plan_from:
             check(f"{path.name}: the dates the document prints", parsed.effective_from_hint == on
-                  and (kind == "DISCOUNT_GRID" or parsed.effective_to_hint == until),
-                  f"{on} to {until}", f"{parsed.effective_from_hint} to {parsed.effective_to_hint}")
+                  and (kind == "DISCOUNT_GRID" or parsed.effective_to_hint == printed_to[path]),
+                  f"{on} to {printed_to[path]}", f"{parsed.effective_from_hint} to {parsed.effective_to_hint}")
         upload_id = connection.execute(text(
             """
             INSERT INTO auditcore.oem_master_uploads (
@@ -454,6 +472,42 @@ def reload_schemes_tenant(connection: Connection, *, tenant_id: str, tag: str, s
                                             effective_on=on, basis="INDIVIDUAL", variant_name=variant)
             actual = next((Decimal(str(b["amount_value"])) for b in benefits if b["canonical_key"] == key), None)
         check(f"{model} {variant} {key} on {on}", actual == amount, str(amount), str(actual))
+    # October's bulletins stand for November (product owner, 5 Nov 2026):
+    # every SKU on sale on the November date gets the benefits it got in
+    # October, scheme for scheme.
+    october, november = SCHEME_CARRY_CHECK
+    differ: list[dict[str, Any]] = []
+    plan_on = find_effective_price_plan(connection, tenant_id=tenant_id, effective_on=november)
+    skus = connection.execute(text(
+        """
+        SELECT DISTINCT s.product_sku_id, s.model_id, s.variant_id, pv.variant_name
+        FROM auditcore.price_list_items i JOIN auditcore.product_skus s ON s.product_sku_id = i.product_sku_id
+        JOIN auditcore.product_variants pv ON pv.variant_id = s.variant_id
+        WHERE i.tenant_id = :t AND i.price_list_version_id = :v AND NOT (i.metadata ? 'carriedReason')
+        """
+    ), {"t": tenant_id, "v": plan_on["price_list_version_id"]}).all() if plan_on else []
+    def got(on: date, sku_id: Any, model_id: Any, variant_id: Any, variant_name: str) -> list[tuple[str, str]]:
+        return sorted((str(b["canonical_key"]), str(b["amount_value"])) for b in _applicable_benefits(
+            connection, tenant_id=tenant_id, model_id=model_id, variant_id=variant_id, effective_on=on,
+            basis="INDIVIDUAL", variant_name=variant_name, product_sku_id=sku_id))
+
+    for sku_id, model_id, variant_id, variant_name in skus:
+        before = got(october, sku_id, model_id, variant_id, variant_name)
+        after = got(november, sku_id, model_id, variant_id, variant_name)
+        if before != after:
+            differ.append({"variant": variant_name, "october": before, "november": after})
+    check(f"every SKU on sale on {november} gets the benefits it got on {october} ({len(skus)} SKUs)",
+          bool(skus) and not differ, [], differ[:30])
+
+    def scheme_rows(on: date) -> set[tuple[str, str, str]]:
+        return {(str(r["scheme_code"]), str(r["model_name"]), str(r["variant_id"]))
+                for r in _standing_rows(connection, tenant_id, on)}
+
+    october_rows, november_rows = scheme_rows(october), scheme_rows(november)
+    check(f"every scheme row standing on {october} (consumer, exchange, corporate) stands on {november}",
+          bool(october_rows) and october_rows == november_rows, len(october_rows),
+          {"same": len(october_rows & november_rows), "onlyOctober": sorted(october_rows - november_rows)[:20],
+           "onlyNovember": sorted(november_rows - october_rows)[:20]})
     for row in checks:
         logger.info("oem_master_reload_check", tenant_id=tenant_id, tag=tag, **{k: str(v) for k, v in row.items()})
     return {"checks": checks, "passed": all(c["ok"] for c in checks), "uploads": uploads, "appliedPerModel": applied}
@@ -888,14 +942,371 @@ def complete_october_tenant(connection: Connection, *, tenant_id: str, tag: str,
             "priceMasterTasksOpen": open_tasks}
 
 
+# ── a month's masters (2026-11-05) ────────────────────────────────────────────
+# A tag containing "-month" loads ``MONTH_PLAN``: the month's consolidated
+# price book and dealer discount grid, both effective ``MONTH_FROM``, through
+# the same ingest the SuperAdmin upload uses, with the checks below; a dry run
+# unless the tag ends with "-commit". Next month only the plan and its spot
+# checks change.
+#
+# November 2026 (product owner, 5 Nov: "upload the new price masters effective
+# from 04th Nov 2026"; consumer and corporate discounts stay October's). The
+# book is the dealer's "PV & CV Price List Nov'26" and "EV Price List Nov'26"
+# consolidated in the October book's layout and model spellings. What it does
+# not print keeps the October book's figure, not on sale (standing rule, 2 Nov:
+# the old-series Scorpio N, BE 6 One, BE 6 SPORTEQ THREE, four Veero); its one
+# old-series Scorpio N row ("SCORPIO N D old") is loaded as printed under the
+# old model's own SKU; "SCORPIO N" on a November document still names the new
+# Scorpio N (the SKU resolver's successor-first rule). The grid ("Odisha PV & CV Discount Grid-4 Nov 2026 Updated") has
+# the October figures under new spellings ("3XO", "Thar OG", "BE6 - New", ...)
+# and CV OD caps of 75%; a model it does not cover (XUV400, the old Scorpio N)
+# takes the line its last grid gave it.
+MONTH_FROM = date(2026, 11, 4)
+MONTH_PRICE_FILE = "2026-11/Mahindra_Consolidated_Price_List_04Nov2026.xlsx"
+MONTH_GRID_FILE = "2026-11/Odisha PV & CV Discount Grid-4 Nov 2026 Updated.xlsx"
+MONTH_CHECK_DATE = date(2026, 11, 10)
+MONTH_PRINTED_SKUS = 328
+MONTH_SPOT_PRICES: tuple[tuple[str, str, date, Decimal], ...] = (
+    # November's own figures ...
+    ("XUV 7XO", "AX DSL MT 7 STR", MONTH_CHECK_DATE, Decimal("1536498.97")),
+    ("SCORPIO-N", "Z8 S D AT 2WD 7 STR BS6.2 - Refresh", MONTH_CHECK_DATE, Decimal("1998996.00")),
+    # ... under October's spelling and the booking form's "SCORPIO N": the new car
+    ("SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - N", MONTH_CHECK_DATE, Decimal("1998996.00")),
+    ("SCORPION", "Z8 S D AT 2WD 7 STR BS6.2 - N", MONTH_CHECK_DATE, Decimal("1998996.00")),
+    # the old-series row November prints, at November's figure, under its own SKU
+    ("SCORPIO N", "Z8 L D AT 2WD 7 STR BS6.2 - N - ADAS", MONTH_CHECK_DATE, Decimal("2276500.23")),
+    # what November does not print: October's figure
+    ("SCORPIO N", "Z8 G AT 2WD 7 STR BS6.2 - N", MONTH_CHECK_DATE, Decimal("2026499.58")),
+    ("BE 6", "BE 6 One B59 R18 C11", MONTH_CHECK_DATE, Decimal("1965000.45")),
+    ("VEERO", "1.5XXL CBC V2", MONTH_CHECK_DATE, Decimal("824500.12")),
+    # the day before: still the October book
+    ("MAXX CITY", "MAXX CITY 1.5 LX BS6.2", date(2026, 11, 3), Decimal("852000.62")),
+)
+_TIERS_0_0_5K = {"BASE": "0.00", "WITH_INSURANCE": "0.00", "WITH_EW_INSURANCE": "5000.00"}
+MONTH_GRID_SPOT_CHECKS: tuple[tuple[str, str | None, str, bool, Any, bool], ...] = (
+    # (model, variant, line, in scope, tiers, from an earlier grid)
+    ("XUV3XO", "AX5 PM MT", "3XO", True, {"BASE": "5000.00", "WITH_INSURANCE": "7000.00", "WITH_EW_INSURANCE": "10000.00"},
+     False),
+    ("NEW THAR 2WD & 4WD", None, "Thar OG", True, {"BASE": "0.00", "WITH_INSURANCE": "5000.00",
+                                                   "WITH_EW_INSURANCE": "5000.00"}, False),
+    ("NEW SCORPIO N", None, "SCORPIO N New", True, _TIERS_0_0_5K, False),
+    ("BE 6", None, "BE6 - New", True, _TIERS_0_0_5K, False),
+    ("BE6 SPORTEQ", None, "BE6 - New", True, _TIERS_0_0_5K, False),
+    ("BOLERO NEO PLUS", "P10 BS6.2", "BOLERO NEO", True, {"BASE": "5000.00", "WITH_INSURANCE": "5000.00",
+                                                          "WITH_EW_INSURANCE": "7000.00"}, False),
+    ("MAXX CITY", None, "MAXX", True, {"BASE": "5000.00", "WITH_INSURANCE": "7000.00", "WITH_EW_INSURANCE": "7000.00"},
+     False),
+    ("MAXX HD", "MAXX HD 2.0L SXi AC - BS6.2", "MAXX HD 2.0", True,
+     {"BASE": "0.00", "WITH_INSURANCE": "0.00", "WITH_EW_INSURANCE": "0.00"}, False),
+    ("PICK UP", "BOL CAMPER 2WD BS6.2 - Refresh", "Camper", True,
+     {"BASE": "0.00", "WITH_INSURANCE": "0.00", "WITH_EW_INSURANCE": "0.00"}, False),
+    # not in the November grid: the line the last grid gave
+    ("XUV400", None, "XUV400 EV", True, None, True),
+    ("SCORPIO N", None, "SCORPIO N Old", False, None, True),
+)
+
+
+def _store_master_file(*, tenant_id: str, oem_code: str, kind: str, on: date, upload_id: UUID, path: Path,
+                       content: bytes) -> str | None:
+    key = _master_object_key(tenant_id=tenant_id, oem_code=oem_code, master_kind=kind, effective_from=on,
+                             upload_id=upload_id, filename=path.name)
+    try:
+        from audit_core.uc03_p2_storage import get_p2_document_storage
+
+        get_p2_document_storage().put_object(key, content, content_type=_master_content_type(path.name))
+        return key
+    except Exception as exc:  # noqa: BLE001 - the figures are published; the file is noted as not stored
+        logger.warning("oem_master_reload_file_not_stored", tenant_id=tenant_id, file=path.name,
+                       error=exc.__class__.__name__)
+        return None
+
+
+def load_month_tenant(connection: Connection, *, tenant_id: str, tag: str, store: bool) -> dict[str, Any]:
+    """The month's price book and grid, and every check, on one open
+    transaction (the caller commits or rolls back)."""
+    from audit_core.oem_master_parsers import parse_master
+    from audit_core.oem_price_masters import (
+        _models_in_book,
+        grid_lines_unbound_to_books,
+        grid_row_for_model,
+        grid_version_for_date,
+        ingest_discount_grid,
+    )
+
+    set_platform_super_admin_context(connection)
+    set_tenant_context(connection, tenant_id)
+    project = connection.execute(text(
+        "SELECT p.oem_id, o.oem_code FROM auditcore.projects p JOIN auditcore.oems o ON o.oem_id = p.oem_id "
+        "WHERE p.tenant_id = :t"), {"t": tenant_id}).mappings().one()
+    actor = f"worker:{tag}"[:160]
+    checks: list[dict[str, Any]] = []
+
+    def check(name: str, ok: bool, expected: Any, actual: Any) -> None:
+        checks.append({"check": name, "ok": bool(ok), "expected": expected, "actual": actual})
+
+    def sku_count() -> int:
+        return int(connection.execute(text(
+            "SELECT count(*) FROM auditcore.product_skus s JOIN auditcore.product_models m ON m.model_id = s.model_id "
+            "WHERE m.oem_id = :o"), {"o": project["oem_id"]}).scalar_one())
+
+    eve = MONTH_FROM - timedelta(days=1)
+    eve_before = _book_items(connection, tenant_id, eve)
+    standing_plan, standing_items = _book_items(connection, tenant_id, MONTH_FROM)
+    grid_eve_before = grid_version_for_date(connection, tenant_id=tenant_id, effective_on=eve)
+    skus_before = sku_count()
+    uploads: list[dict[str, Any]] = []
+
+    # 1) the price book
+    path = DATA_DIR / MONTH_PRICE_FILE
+    content = path.read_bytes()
+    parsed = parse_price_list(content, filename=path.name)
+    check(f"{path.name}: the date the book prints", parsed.effective_from_hint == MONTH_FROM, str(MONTH_FROM),
+          str(parsed.effective_from_hint))
+    check(f"{path.name}: every row reconciles", not parsed.errors, [], parsed.errors[:20])
+    check(f"{path.name}: rows", len(parsed.price_rows) == MONTH_PRINTED_SKUS, MONTH_PRINTED_SKUS, len(parsed.price_rows))
+    stats: dict[str, Any] = {}
+    upload_id = connection.execute(text(
+        """
+        INSERT INTO auditcore.oem_master_uploads (
+            tenant_id, oem_code, master_kind, source_filename, source_sha256, effective_from, status,
+            row_counts, preview, uploaded_by_actor_id
+        ) VALUES (:t, :oem, 'PRICE_LIST', :name, :sha, :eff, 'STAGED', CAST(:rows AS jsonb),
+                  CAST(:preview AS jsonb), :actor) RETURNING upload_id
+        """
+    ), {"t": tenant_id, "oem": project["oem_code"], "name": path.name, "sha": hashlib.sha256(content).hexdigest(),
+        "eff": MONTH_FROM, "rows": json.dumps({"priceRows": len(parsed.price_rows), **parsed.meta}, default=str),
+        "preview": json.dumps({"reloadTag": tag, "warnings": parsed.warnings}), "actor": actor}).scalar_one()
+    version_id, sku_by_code = ingest_price_list(connection, tenant_id=tenant_id, oem_id=project["oem_id"],
+                                                effective_from=MONTH_FROM, parsed=parsed, actor_id=actor, stats=stats)
+    stored = _store_master_file(tenant_id=tenant_id, oem_code=project["oem_code"], kind="PRICE_LIST", on=MONTH_FROM,
+                                upload_id=upload_id, path=path, content=content) if store else None
+    connection.execute(text(
+        """
+        UPDATE auditcore.oem_master_uploads
+        SET status = 'PUBLISHED', published_at_utc = now(), price_list_version_id = :v, source_object_key = :key,
+            row_counts = row_counts || CAST(:stats AS jsonb)
+        WHERE tenant_id = :t AND upload_id = :u
+        """
+    ), {"v": version_id, "key": stored, "stats": json.dumps(stats, default=str), "t": tenant_id, "u": upload_id})
+    uploads.append({"file": path.name, "effectiveFrom": MONTH_FROM, "uploadId": upload_id, "stored": stored is not None,
+                    **{k: stats.get(k) for k in ("uploaded", "changed", "unchanged", "carriedForward",
+                                                 "carriedNotOnSale", "oldSeriesNotOnSale", "journeysRechecked")}})
+
+    plan, items = _book_items(connection, tenant_id, MONTH_CHECK_DATE)
+    check(f"the new book is the one in force on {MONTH_FROM} and {MONTH_CHECK_DATE}",
+          plan is not None and plan["price_list_version_id"] == version_id
+          and (_book_items(connection, tenant_id, MONTH_FROM)[0] or {}).get("price_list_version_id") == version_id,
+          str(version_id), str(plan["price_list_version_id"]) if plan else None)
+    eve_after = _book_items(connection, tenant_id, eve)
+    check(f"the book in force on {eve} unchanged", eve_after[1] == eve_before[1] and (
+        (eve_after[0] or {}).get("price_list_version_id") == (eve_before[0] or {}).get("price_list_version_id")),
+        len(eve_before[1]), len(eve_after[1]))
+    printed = set(sku_by_code.values())
+    new_skus = {sku for sku, _, _ in items}
+    standing_skus = {sku for sku, _, _ in standing_items}
+    check("the new book prices every SKU the October book did, plus what November prints",
+          new_skus == printed | standing_skus, len(printed | standing_skus), len(new_skus))
+    in_force = {(sku, component): amount for sku, component, amount in items}
+    kept = {(sku, component): amount for sku, component, amount in standing_items if sku not in printed}
+    check("every SKU November does not print at its October figure",
+          all(in_force.get(key) == amount for key, amount in kept.items()), len(kept),
+          sum(1 for key, amount in kept.items() if in_force.get(key) == amount))
+    check("SKUs minted (every November row is a vehicle already known)", sku_count() == skus_before, 0,
+          sku_count() - skus_before)
+    check("model identity conflicts", not stats.get("modelIdentityConflicts"), 0,
+          stats.get("modelIdentityConflicts") or 0)
+    names = {row[0]: row[1] for row in connection.execute(text(
+        "SELECT pm.model_id, pm.model_name FROM auditcore.product_models pm WHERE pm.oem_id = :o"),
+        {"o": project["oem_id"]}).all()}
+    on_sale = {names.get(m) for m in (_models_in_book(connection, tenant_id=tenant_id, effective_on=MONTH_CHECK_DATE)
+                                      or set())}
+    old_row = connection.execute(text(
+        "SELECT pm.model_name, i.metadata ? 'carriedReason' FROM auditcore.price_list_items i "
+        "JOIN auditcore.product_skus s ON s.product_sku_id = i.product_sku_id "
+        "JOIN auditcore.product_models pm ON pm.model_id = s.model_id "
+        "WHERE i.tenant_id = :t AND i.price_list_version_id = :v AND i.component_key = 'EX_SHOWROOM' "
+        "AND i.metadata -> 'printedAs' ->> 'model' = 'SCORPIO N' AND NOT (i.metadata ? 'carriedForwardFrom')"),
+        {"t": tenant_id, "v": version_id}).all()
+    check("the old-series Scorpio N row is loaded as printed, under the old model's own SKU",
+          [tuple(r) for r in old_row] == [("SCORPIO N", False)], [("SCORPIO N", False)], [tuple(r) for r in old_row])
+    for model, variant, on, amount in MONTH_SPOT_PRICES:
+        found = find_book_sku(connection, tenant_id=tenant_id, model_text=model, variant_text=variant, effective_on=on)
+        actual = Decimal(str(found["sku"]["ex_showroom"])) if found["sku"] else found["reason"]
+        check(f"{model} {variant} ex-showroom on {on}", actual == amount, str(amount), str(actual))
+    if standing_plan is not None:
+        october_printed = sorted({(str(m), str(v)) for m, v in connection.execute(text(
+            "SELECT metadata -> 'printedAs' ->> 'model', metadata -> 'printedAs' ->> 'variant' "
+            "FROM auditcore.price_list_items WHERE tenant_id = :t AND price_list_version_id = :v "
+            "AND component_key = 'EX_SHOWROOM' AND metadata ? 'printedAs' AND NOT (metadata ? 'carriedReason')"),
+            {"t": tenant_id, "v": standing_plan["price_list_version_id"]}).all()})
+        october_printed += [("SCORPIO N", v) for m, v in october_printed if m.upper() == "SCORPIO-N"]
+        named = _readings_named(connection, tenant_id=tenant_id, old_version=standing_plan["price_list_version_id"],
+                                new_version=version_id, printed=october_printed)
+        check(f"the SKU resolver names the same SKU on both books for every reading ({named['readings']})",
+              not named["changed"], [], named["changed"][:40])
+        for row in named["nowCarried"]:
+            logger.info("oem_month_reading_now_named", tenant_id=tenant_id, tag=tag, **row)
+
+    # 2) the dealer discount grid
+    path = DATA_DIR / MONTH_GRID_FILE
+    content = path.read_bytes()
+    grid = parse_master("DISCOUNT_GRID", content, filename=path.name)
+    check(f"{path.name}: the date the grid prints", grid.effective_from_hint == MONTH_FROM, str(MONTH_FROM),
+          str(grid.effective_from_hint))
+    check(f"{path.name}: read without errors", not grid.errors, [], grid.errors[:20])
+    upload_id = connection.execute(text(
+        """
+        INSERT INTO auditcore.oem_master_uploads (
+            tenant_id, oem_code, master_kind, source_filename, source_sha256, effective_from, status,
+            row_counts, preview, uploaded_by_actor_id
+        ) VALUES (:t, :oem, 'DISCOUNT_GRID', :name, :sha, :eff, 'STAGED', CAST(:rows AS jsonb),
+                  CAST(:preview AS jsonb), :actor) RETURNING upload_id
+        """
+    ), {"t": tenant_id, "oem": project["oem_code"], "name": path.name, "sha": hashlib.sha256(content).hexdigest(),
+        "eff": MONTH_FROM, "rows": json.dumps({"gridRows": len(grid.grid_rows)}),
+        "preview": json.dumps({"reloadTag": tag, "warnings": grid.warnings[:50]}), "actor": actor}).scalar_one()
+    summary = ingest_discount_grid(connection, tenant_id=tenant_id, oem_id=project["oem_id"],
+                                   oem_code=project["oem_code"], effective_from=MONTH_FROM, parsed=grid,
+                                   upload_id=upload_id, actor_id=actor)
+    stored = _store_master_file(tenant_id=tenant_id, oem_code=project["oem_code"], kind="DISCOUNT_GRID",
+                                on=MONTH_FROM, upload_id=upload_id, path=path, content=content) if store else None
+    connection.execute(text(
+        "UPDATE auditcore.oem_master_uploads SET status = 'PUBLISHED', published_at_utc = now(), "
+        "source_object_key = :key, discount_scheme_summary = CAST(:summary AS jsonb) "
+        "WHERE tenant_id = :t AND upload_id = :u"
+    ), {"key": stored, "summary": json.dumps(summary, default=str), "t": tenant_id, "u": upload_id})
+    uploads.append({"file": path.name, "effectiveFrom": MONTH_FROM, "uploadId": upload_id, "stored": stored is not None,
+                    "published": summary.get("published"), "resolved": summary.get("resolved"),
+                    "unresolved": summary.get("unresolved")})
+    check(f"{path.name}: every line names a model", not summary.get("unresolved"), [], summary.get("unresolved"))
+    gaps = grid_lines_unbound_to_books(connection, tenant_id=tenant_id, oem_id=project["oem_id"],
+                                       oem_code=project["oem_code"], grid_version_id=summary["gridVersionId"])
+    check("every grid line bound to a model of the book it is used with", not gaps, [], gaps)
+    in_force_grid = grid_version_for_date(connection, tenant_id=tenant_id, effective_on=MONTH_CHECK_DATE)
+    check(f"the new grid is the one in force on {MONTH_CHECK_DATE}",
+          in_force_grid is not None and str(in_force_grid["grid_version_id"]) == str(summary["gridVersionId"]),
+          summary["gridVersionId"], str(in_force_grid["grid_version_id"]) if in_force_grid else None)
+    grid_eve_after = grid_version_for_date(connection, tenant_id=tenant_id, effective_on=eve)
+    check(f"the grid in force on {eve} unchanged",
+          (grid_eve_after or {}).get("grid_version_id") == (grid_eve_before or {}).get("grid_version_id"),
+          str((grid_eve_before or {}).get("grid_version_id")), str((grid_eve_after or {}).get("grid_version_id")))
+    for model, variant, alias, in_scope, tiers, earlier in MONTH_GRID_SPOT_CHECKS:
+        model_id = connection.execute(text(
+            "SELECT model_id FROM auditcore.product_models WHERE oem_id = :o AND model_name = :m"),
+            {"o": project["oem_id"], "m": model}).scalar_one_or_none()
+        row = grid_row_for_model(connection, tenant_id=tenant_id, model_id=model_id, effective_on=MONTH_CHECK_DATE,
+                                 variant_name=variant) if model_id else None
+        raw = (row or {}).get("raw") or {}
+        raw = raw if isinstance(raw, dict) else json.loads(raw)
+        actual = ((row or {}).get("model_alias"), (row or {}).get("in_scope"),
+                  raw.get("tiers") if tiers is not None else None, bool((row or {}).get("carriedFromPreviousGrid")))
+        check(f"{model} {variant or ''} on {MONTH_CHECK_DATE}: the grid line", actual == (alias, in_scope, tiers, earlier),
+              str((alias, in_scope, tiers, earlier)), str(actual))
+    by_model = grid_by_model(connection, tenant_id, MONTH_CHECK_DATE)
+    for row in by_model:
+        logger.info("oem_grid_line_for_model", tenant_id=tenant_id, tag=tag, on=str(MONTH_CHECK_DATE),
+                    **{k: str(v) for k, v in row.items()})
+    # A model whose lines are per variant group (PICK UP: Pick-Up and Camper)
+    # has no model-wide line: each of its variants on sale must get one.
+    without_line: list[str] = []
+    for r in by_model:
+        if r["model"] not in on_sale or r["line"]:
+            continue
+        variants = connection.execute(text(
+            """
+            SELECT DISTINCT s.model_id, v.variant_name FROM auditcore.price_list_items i
+            JOIN auditcore.product_skus s ON s.product_sku_id = i.product_sku_id
+            JOIN auditcore.product_models pm ON pm.model_id = s.model_id
+            JOIN auditcore.product_variants v ON v.variant_id = s.variant_id
+            WHERE i.tenant_id = :t AND i.price_list_version_id = :v AND pm.model_name = :m
+              AND NOT (i.metadata ? 'carriedReason')
+            """
+        ), {"t": tenant_id, "v": version_id, "m": r["model"]}).all()
+        without_line += [f"{r['model']} / {name}" for model_id, name in variants
+                         if grid_row_for_model(connection, tenant_id=tenant_id, model_id=model_id,
+                                               effective_on=MONTH_CHECK_DATE, variant_name=name) is None]
+    check(f"every vehicle on sale on {MONTH_CHECK_DATE} has a grid line", not without_line, [], without_line[:40])
+    for row in checks:
+        logger.info("oem_master_reload_check", tenant_id=tenant_id, tag=tag, **{k: str(v) for k, v in row.items()})
+    return {"checks": checks, "passed": all(c["ok"] for c in checks), "uploads": uploads,
+            "priceListVersionId": str(version_id), "gridVersionId": summary["gridVersionId"],
+            "carriedNotOnSale": stats.get("carriedNotOnSale"), "gridByModel": by_model}
+
+
+# ── the deals the reloaded masters price (2026-11-05) ─────────────────────────
+# A deal's standards and entitlements are materialised when its facts move.
+# Masters published for dates already past (the October bulletins, live from
+# 5 Nov) leave every deal of those dates on the masters it last read --
+# September's schemes for October and November deals on 5 Nov. After a
+# committed "-schemes" or "-month" job, each Journey priced on or after the
+# earliest date the job published for is re-priced (the deal check itself,
+# ``sync_deal_reconciliation``), one Journey per transaction.
+def _job_starts(tag: str) -> date | None:
+    if "-month" in tag:
+        return MONTH_FROM
+    if "-schemes" in tag:
+        return min(on for kind, _, on, _ in SCHEME_RELOAD_PLAN if kind != "DISCOUNT_GRID")
+    return None
+
+
+def reprice_deals(engine: Engine, *, tenant_id: str, start: date, tag: str) -> dict[str, Any]:
+    """Run the deal check again for every Journey priced on or after ``start``.
+    Returns counts and the Journeys whose discount entitlements changed."""
+    from audit_core.uc03_deal_reconciliation import sync_deal_reconciliation
+
+    def entitlements(connection: Connection, journey_id: UUID) -> dict[str, tuple[str, str]]:
+        return {str(k): (str(a), str(r)) for k, a, r in connection.execute(text(
+            "SELECT discount_key, standard_eligible_amount, eligibility_result FROM auditcore.discount_applications "
+            "WHERE tenant_id = :t AND journey_id = :j"), {"t": tenant_id, "j": journey_id}).all()}
+
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        journeys = connection.execute(text(
+            """
+            SELECT j.journey_id, j.journey_reference FROM auditcore.journeys j
+            JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
+            WHERE j.tenant_id = :t AND coalesce(b.pricing_effective_on, b.booking_date) >= :start
+            ORDER BY j.created_at_utc, j.journey_id
+            """
+        ), {"t": tenant_id, "start": start}).all()
+    changed: list[dict[str, Any]] = []
+    failed: list[str] = []
+    for journey_id, reference in journeys:
+        try:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                before = entitlements(connection, journey_id)
+                result = sync_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                                  correlation_id=f"masters:{tag}"[:120])
+                after = entitlements(connection, journey_id)
+            if result.get("error"):
+                failed.append(str(reference))
+            elif before != after:
+                changed.append({"journey": reference, "before": before, "after": after})
+                logger.info("oem_master_reprice_changed", tenant_id=tenant_id, tag=tag, journey=reference,
+                            before=str(before), after=str(after))
+        except Exception:  # one Journey never stops the others
+            failed.append(str(reference))
+            logger.warning("oem_master_reprice_failed", tenant_id=tenant_id, tag=tag, journey=reference,
+                           exc_info=True)
+    summary = {"from": str(start), "journeys": len(journeys), "entitlementsChanged": len(changed),
+               "failed": failed, "changed": changed[:200]}
+    logger.info("oem_master_reprice_finished", tenant_id=tenant_id, tag=tag, journeys=len(journeys),
+                changed=len(changed), failed=len(failed))
+    return summary
+
+
 def run_master_reload(engine: Engine, tag: str, *, tenant_ids: list[str] | None = None) -> list[dict[str, Any]]:
     """The one-off, for every Mahindra tenant (or ``tenant_ids``). Never raises.
     A tag containing "-schemes" re-loads the scheme masters
     (``SCHEME_RELOAD_PLAN``), "-grids" only the two dealer discount grids,
-    "-octcarry" completes the October book (``complete_october_tenant``), any
+    "-octcarry" completes the October book (``complete_october_tenant``),
+    "-month" loads the month's book and grid (``load_month_tenant``), any
     other tag the price books."""
     commit = tag.endswith("-commit")
-    if "-octcarry" in tag:
+    if "-month" in tag:
+        job = load_month_tenant
+    elif "-octcarry" in tag:
         job = complete_october_tenant
     elif "-grids" in tag:
         job = reload_grids_tenant
@@ -926,6 +1337,9 @@ def run_master_reload(engine: Engine, tag: str, *, tenant_ids: list[str] | None 
                 logger.warning("oem_master_reload_error", tenant_id=tenant_id, tag=tag, exc_info=True)
             finally:
                 connection.close()
+            start = _job_starts(tag)
+            if status == "COMMITTED" and start is not None:
+                outcome["reprice"] = reprice_deals(engine, tenant_id=tenant_id, start=start, tag=tag)
             _finish(engine, tag, tenant_id, status, outcome)
             logger.info("oem_master_reload_finished", tenant_id=tenant_id, tag=tag, status=status,
                         books_after=outcome.get("booksAfter"), failed_checks=[
@@ -938,6 +1352,7 @@ def run_master_reload(engine: Engine, tag: str, *, tenant_ids: list[str] | None 
 
 
 __all__ = [
-    "GRID_PLAN", "RELOAD_PLAN", "SCHEME_RELOAD_PLAN", "complete_october_tenant", "reload_grids_tenant",
+    "GRID_PLAN", "RELOAD_PLAN", "SCHEME_RELOAD_PLAN", "complete_october_tenant", "load_month_tenant",
+    "reload_grids_tenant",
     "reload_schemes_tenant", "reload_tenant", "run_master_reload",
 ]

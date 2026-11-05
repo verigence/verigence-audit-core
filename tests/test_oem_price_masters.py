@@ -431,11 +431,11 @@ def _code_of(skus: dict, model_prefix_free_variant: str) -> str:
 
 def test_a_complete_book_withdraws_what_it_does_not_list_and_dates_each_price(connection) -> None:
     """2026-10-20 product owner rules: the consolidated list is the whole book
-    for its date. A SKU it does not list is withdrawn from that date, never
-    carried forward at an older month's price (it used to be: the October
-    book held 144 September SKUs at September prices). Every row keeps its
-    own price-since date. (Replaces the 2026-09-30 test that carried a
-    consolidated file's missing SKUs forward.)"""
+    for its date. Within its month a re-issue that does not list a SKU
+    withdraws it from that date (a new month keeps it at the previous
+    month's price, not on sale: the standing rule of 2 Nov 2026, below).
+    Every row keeps its own price-since date. (Replaces the 2026-09-30 test
+    that carried a consolidated file's missing SKUs forward.)"""
     tenant_id = connection.tenant_id
     project = _project_oem(connection, tenant_id)
     v1, first_skus = ingest_price_list(
@@ -450,7 +450,7 @@ def test_a_complete_book_withdraws_what_it_does_not_list_and_dates_each_price(co
         actor_id="admin", stats=stats,
     )
     assert stats == {"uploaded": 1, "changed": 1, "unchanged": 0, "carriedForward": 0, "withdrawn": 1,
-                     "completeBook": True, "standingVersionId": str(v1), "laterVersionsRederived": 0,
+                     "carriedNotOnSale": 0, "completeBook": True, "standingVersionId": str(v1), "laterVersionsRederived": 0,
                      "journeysRechecked": 0}
     thar, xuv = _code_of(first_skus, "MX1 PMT 2WD"), _code_of(first_skus, "MX1")
     first, second = _items(connection, tenant_id, v1), _items(connection, tenant_id, v2)
@@ -1009,7 +1009,8 @@ def test_october_names_reach_the_september_models(fresh_oem) -> None:
         "NEW_THAR_2WD_4WD::LXT D MT 4WD 4S HT BS6.2 - Refresh",  # genuinely new
     }
     assert october["NEW_SCORPIO_N::Z8 S D AT 2WD 7 STR BS6.2 - Refresh"] == sept["NEW_SCORPIO_N::Z8 S D AT 2WD 7 STR BS6.2 - Refresh"]
-    assert stats["withdrawn"] == 1  # the old Scorpio N
+    # October does not print the old Scorpio N: September's price, not on sale (standing rule, 2 Nov 2026).
+    assert stats["withdrawn"] == 0 and stats["carriedNotOnSale"] == 1
     printed = c.execute(text("""
         SELECT i.metadata->'printedAs'->>'model', i.metadata->'printedAs'->>'variant'
         FROM auditcore.price_list_items i WHERE i.price_list_version_id = :v AND i.product_sku_id = :s
@@ -1310,8 +1311,9 @@ def test_the_07_sep_added_ev_sheet_prices_its_additions_from_07_sep(fresh_oem) -
     """Review of PR 468, S1: the "02 Nos Added ... 07th Sept'26" sheet keeps
     the month's "w.e.f. 01.09.2026" header. Dated by the header, its two
     added variants were priced 01-02 Sep only (the complete 03 Sep book does
-    not list them). Dated by its name, they are priced from 07 Sep until
-    the October book."""
+    not list them). Dated by its name, they are priced from 07 Sep; the
+    October book does not print the THREE, so from 3 Oct it keeps its
+    September price, not on sale (standing rule, 2 Nov 2026)."""
     from openpyxl import load_workbook
 
     c = fresh_oem
@@ -1335,7 +1337,12 @@ def test_the_07_sep_added_ev_sheet_prices_its_additions_from_07_sep(fresh_oem) -
                                            "price_list_version_id = :v"), {"v": plan["price_list_version_id"]}).scalars())
 
     assert [priced(d) for d in (date(2026, 9, 6), date(2026, 9, 7), date(2026, 10, 2), date(2026, 10, 3))] == \
-        [False, True, True, False]
+        [False, True, True, True]
+    october = find_effective_price_plan(c, tenant_id=c.tenant_id, effective_on=date(2026, 10, 3))
+    carried = c.execute(text("SELECT bool_and(metadata ? 'carriedReason') FROM auditcore.price_list_items "
+                             "WHERE price_list_version_id = :v AND product_sku_id = :s"),
+                        {"v": october["price_list_version_id"], "s": three}).scalar_one()
+    assert carried is True
 
 
 def test_a_refused_upload_is_recorded_and_a_preview_is_labelled(connection) -> None:
