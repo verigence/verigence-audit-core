@@ -44,6 +44,8 @@ logger = structlog.get_logger(__name__)
 _JOB = "JOURNEY_SNAPSHOT"
 # The money tabs (Journey 360): what a structural Deal change can move.
 SECTIONS = ("deal", "invoices", "payments", "addons", "tradein", "audit-summary")
+# Sections taken only when named ("section:<name>"): measurements, not screens.
+EXTRA_SECTIONS = ("statement-totals",)
 # Keys whose value is the time of building, not a fact of the booking.
 _VOLATILE = frozenset({"generatedAtUtc"})
 _PAUSE_S = float(os.environ.get("AUDIT_CORE_SNAPSHOT_PAUSE_S", "0.05"))
@@ -82,8 +84,8 @@ def _wanted(reports: list[str]) -> tuple[list[str], tuple[str, ...]]:
         entry = str(entry or "").strip()
         if entry.lower().startswith("section:"):
             name = entry.split(":", 1)[1].strip()
-            if name not in SECTIONS:
-                raise ValueError(f"unknown section {name!r}; one of {', '.join(SECTIONS)}")
+            if name not in SECTIONS + EXTRA_SECTIONS:
+                raise ValueError(f"unknown section {name!r}; one of {', '.join(SECTIONS + EXTRA_SECTIONS)}")
             sections.append(name)
         elif entry:
             references.append(entry)
@@ -112,12 +114,14 @@ def build_section(engine: Engine, tenant_id: str, journey_id: UUID, section: str
     """One Journey 360 section exactly as the endpoint builds it, in a READ
     ONLY transaction (a builder that tries to write fails here instead)."""
     from audit_core.uc03_p2_journey360 import BUILDERS
+    from audit_core.uc03_statement_totals import journey_statement_totals
 
+    builders = {**BUILDERS, "statement-totals": journey_statement_totals}
     try:
         with engine.begin() as connection:
             connection.execute(text("SET TRANSACTION READ ONLY"))
             set_tenant_context(connection, tenant_id)
-            payload = BUILDERS[section](connection, tenant_id=tenant_id, journey_id=journey_id)
+            payload = builders[section](connection, tenant_id=tenant_id, journey_id=journey_id)
         return _plain_json(payload), None
     except Exception as exc:  # noqa: BLE001 - kept on the row: a failing section is a finding
         return None, f"{type(exc).__name__}: {exc}"[:1000]

@@ -256,3 +256,46 @@ def test_the_no_rows_run_keeps_the_safeguards(monkeypatch):
     assert _no_rows_decision(monkeypatch, lines=[], corrected=1) == "SKIP_CORRECTED_BY_A_PERSON"
     assert _no_rows_decision(monkeypatch, lines=[], reviewed=True) == "SKIP_STAGE_REVIEWED"
     assert _no_rows_decision(monkeypatch, lines=[], queue_status="EXTRACTING") == "SKIP_PAGE_NOT_SETTLED"
+
+
+# ── 2026-11-05: statements whose rows do not add up; cost sheets before 1.1 ──
+UTKAL = [
+    {"particulars_raw": "Vehicle cost", "debit_amount": "852000"},
+    {"particulars_raw": "Registration", "debit_amount": "3685"},
+    {"particulars_raw": "MR No KRM/2627/3592", "credit_amount": "11000"},
+    {"particulars_raw": "Scheme Discount", "credit_amount": "13000"},
+]
+
+
+def test_a_statement_whose_rows_do_not_add_up_is_read_again(monkeypatch):
+    def decision(**kwargs):
+        [item] = reread.statement_items(_wire(monkeypatch, **kwargs), "t1", adds_up=True)
+        return item["decision"]
+
+    assert decision(lines=UTKAL, fields_extra={"total_cost": "855685"}) == "SKIP_ADDS_UP"
+    assert decision(lines=UTKAL, fields_extra={"total_cost": "865685"}) == "REREAD"
+    assert decision(lines=UTKAL, fields_extra={"total_cost": "865685"}, corrected=1) == "SKIP_CORRECTED_BY_A_PERSON"
+    assert decision(lines=UTKAL) == "SKIP_NOT_JUDGED"  # prints no total
+    assert decision(lines=TALLY, fields_extra={"total_receipts": "100"}) == "SKIP_NOT_JUDGED"
+
+
+def test_a_cost_sheet_read_before_its_rows_were_is_read_again(monkeypatch):
+    def decision(**kwargs):
+        [item] = reread.statement_items(_wire(monkeypatch, **kwargs), "t1", cost_sheets=True)
+        return item["decision"]
+
+    assert decision(lines=None, fields_extra={"total_on_road_price": "1149436"}) == "REREAD"
+    assert decision(lines=[{"particulars_raw": "TCS", "amount": "10915"}]) == "SKIP_READ_SINCE_1_1"
+    assert decision(lines=None, fields_extra={"document_title": "QUOTATION"}) == "SKIP_READ_SINCE_1_1"
+    assert decision(lines=None, reviewed=True) == "SKIP_STAGE_REVIEWED"
+
+
+def test_an_account_statement_title_is_told_from_a_quotation():
+    from audit_core.uc03_cost_sheet_statements import is_statement_title
+
+    for title in ("VEHICLE ACCOUNT STATEMENT", "Final Vehicle Accounts Statement", '"Account Statement"',
+                  "OFFER LETTER /PAYMENT DETAILS", "ACCOUNTS STATEMENT"):
+        assert is_statement_title(title), title
+    for title in ("QUOTATION", "Quotation cum Proforma Invoice", "QUOTATION / PROFORMA INVOICE", "Cost Sheet",
+                  None, ""):
+        assert not is_statement_title(title), title

@@ -4881,6 +4881,12 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # document type" does (2026-11-02): see uc03_page_retype.
         from audit_core.uc03_page_retype import run_page_retype
         return run_page_retype, (engine, tag, reports)
+    if kind == "COST_SHEET_STATEMENTS":
+        # Account statements filed as cost sheets before the classifier knew
+        # the difference, read again as the NDC (2026-11-05): see
+        # uc03_cost_sheet_statements. A dry run lists them.
+        from audit_core.uc03_cost_sheet_statements import run_cost_sheet_statements
+        return run_cost_sheet_statements, (engine, tag, reports)
     if kind == "STATEMENT_COPY_RESTORE":
         # The NDC and cost-sheet pages a newer page hid when the requirement
         # kept one document, brought back for the tenant the tag names
