@@ -221,3 +221,33 @@ def test_the_cost_sheets_titled_as_statements_are_found(journey):
                             document_type="cost_sheet")
     [found] = statement_pages(journey.engine, journey.tenant_id)
     assert found["page_number"] == 16 and found["title"] == "FINAL VEHICLE ACCOUNTS STATEMENT"
+
+
+def test_a_reread_that_reads_further_from_the_totals_keeps_the_previous_reading(journey):
+    """Live 5 Nov: of 122 NDC copies read again, 19 came back further from their
+    printed totals; the re-read now puts the previous reading back."""
+    from audit_core.uc03_statement_reread import _keep_the_better, _stored_fields
+
+    misread = [dict(r) for r in UTKAL]
+    misread[0]["debit_amount"] = "852010"  # Rs 10 apart: adds up
+    document_id = _ndc(journey, misread, UTKAL_PRINTED)
+    item = {"journeyId": journey.journey_id, "diDocumentId": document_id, "stage": "BOOKING", "journeyReference": "J"}
+    before = _stored_fields(journey.engine, journey.tenant_id, item)
+
+    def reading(rows):
+        with journey.engine.begin() as c:
+            set_tenant_context(c, journey.tenant_id)
+            c.execute(text("UPDATE auditcore.journey_document_extracted_fields SET effective_value=CAST(:v AS jsonb), "
+                           "extracted_value=CAST(:v AS jsonb) WHERE tenant_id=:t AND di_document_id=:d "
+                           "AND field_key='line_items'"),
+                      {"v": json.dumps(json.dumps(rows)), "t": journey.tenant_id, "d": document_id})
+
+    worse = [dict(r) for r in UTKAL]
+    worse[0]["debit_amount"] = "8520000"
+    reading(worse)
+    assert _keep_the_better(journey.engine, journey.tenant_id, item, before, "t") is True
+    [row] = [r for r in _stored_fields(journey.engine, journey.tenant_id, item) if r["field_key"] == "line_items"]
+    assert json.loads(row["effective_value"])[0]["debit_amount"] == "852010"
+    # A reading at least as good is kept.
+    reading(UTKAL)
+    assert _keep_the_better(journey.engine, journey.tenant_id, item, before, "t") is False

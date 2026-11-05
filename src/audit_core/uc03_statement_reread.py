@@ -27,7 +27,10 @@ back to the invoice). The same safeguards hold.
 
 A tag containing "-addsup-" picks, instead, the statement forms whose rows do
 not add up to a total they print (2026-11-05, uc03_statement_totals), and
-reports after a commit how many still do not.
+reports after a commit how many still do not. A new reading is kept only when
+it adds up at least as well as the one it replaces; otherwise the copy's
+previous reading is put back and its NDC synced again (live 5 Nov: of 122
+copies read again, 19 came back further from their printed totals).
 
 A tag containing "-costsheet-" picks, instead, the cost sheets read before
 cost_sheet schema 1.1, which reads every priced row and the printed title
@@ -47,6 +50,7 @@ again: a statement that has its printed net value is no longer picked.
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from decimal import Decimal
@@ -70,7 +74,7 @@ from audit_core.uc03_account_statement import (
     statement_total,
 )
 from audit_core.uc03_deal_source_policy import account_statement_is_source_of_truth
-from audit_core.uc03_statement_totals import statement_differences
+from audit_core.uc03_statement_totals import reading_error, statement_differences
 
 logger = structlog.get_logger(__name__)
 
@@ -255,7 +259,61 @@ def _copy_into_audit_core(engine: Engine, tenant_id: str, item: dict[str, Any], 
         )
 
 
-def _reread(engine: Engine, tenant_id: str, items: list[dict[str, Any]], tag: str, *, ask: bool = True) -> dict[str, int]:
+def _stored_fields(engine: Engine, tenant_id: str, item: dict[str, Any]) -> list[dict[str, Any]]:
+    """The copy's fields as Document Intelligence's reading left them (a
+    person's correction is never among those put back)."""
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        return [dict(r) for r in connection.execute(
+            text(
+                """
+                SELECT field_key, stage_code, effective_value, extracted_value
+                FROM auditcore.journey_document_extracted_fields
+                WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d
+                  AND NOT is_modified AND modified_value IS NULL
+                """
+            ),
+            {"t": tenant_id, "j": item["journeyId"], "d": item["diDocumentId"]},
+        ).mappings().all()]
+
+
+def _error_of(rows: list[dict[str, Any]]) -> Decimal | None:
+    return reading_error({str(r["field_key"]): r["effective_value"] for r in rows})
+
+
+def _keep_the_better(engine: Engine, tenant_id: str, item: dict[str, Any], before: list[dict[str, Any]],
+                     tag: str) -> bool:
+    """After a copy: when the new reading is further from the printed totals
+    than the one it replaced, put the previous one back. True when it did."""
+    from audit_core.uc03_account_statement import sync_if_source_of_truth
+
+    old_error, new_error = _error_of(before), _error_of(_stored_fields(engine, tenant_id, item))
+    if old_error is None or (new_error is not None and new_error <= old_error):
+        return False
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        for row in before:
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.journey_document_extracted_fields
+                    SET effective_value=CAST(:v AS jsonb), extracted_value=CAST(:x AS jsonb), updated_at_utc=now()
+                    WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d AND field_key=:k AND stage_code=:s
+                      AND NOT is_modified AND modified_value IS NULL
+                    """
+                ),
+                {"v": json.dumps(row["effective_value"]), "x": json.dumps(row["extracted_value"]), "t": tenant_id,
+                 "j": item["journeyId"], "d": item["diDocumentId"], "k": row["field_key"], "s": row["stage_code"]},
+            )
+        sync_if_source_of_truth(connection, tenant_id=tenant_id, journey_id=item["journeyId"],
+                                stage_code=str(item["stage"]).upper(), correlation_id=f"statement-reread:{tag}")
+    logger.info("statement_reread_kept_previous", tag=tag, tenant_id=tenant_id, journey=item["journeyReference"],
+                di_document_id=str(item["diDocumentId"]), previous_error=str(old_error), new_error=str(new_error))
+    return True
+
+
+def _reread(engine: Engine, tenant_id: str, items: list[dict[str, Any]], tag: str, *, ask: bool = True,
+            keep_better: bool = False) -> dict[str, int]:
     from audit_core.uc03_document_capture_v2 import (
         _DI_AUDIENCE,
         _ensure_di_context,
@@ -265,7 +323,8 @@ def _reread(engine: Engine, tenant_id: str, items: list[dict[str, Any]], tag: st
     )
 
     security, di, v2 = get_security_oauth_client(), get_di_client(), get_di_capture_v2_client()
-    counts = {"asked": 0, "refused": 0, "finished": 0, "failed": 0, "timed_out": 0}
+    counts = {"asked": 0, "refused": 0, "finished": 0, "failed": 0, "timed_out": 0, "kept_previous": 0}
+    before: dict[str, list[dict[str, Any]]] = {}
     pending: list[dict[str, Any]] = []
     for item in items:
         try:
@@ -275,6 +334,8 @@ def _reread(engine: Engine, tenant_id: str, items: list[dict[str, Any]], tag: st
                 context_ref, token = _ensure_di_context(
                     connection=connection, engine=engine, tenant_id=tenant_id,
                     journey_id=item["journeyId"], security_client=security, di_client=di)
+            if keep_better:
+                before[str(item["diDocumentId"])] = _stored_fields(engine, tenant_id, item)
             if not ask:
                 # "-copy-" tag: DI already read these; only copy what it holds.
                 pending.append({**item, "contextRef": context_ref})
@@ -324,6 +385,13 @@ def _reread(engine: Engine, tenant_id: str, items: list[dict[str, Any]], tag: st
                                    journey=item["journeyReference"], exc_info=True)
                     continue
                 counts["finished"] += 1
+                if keep_better:
+                    try:
+                        if _keep_the_better(engine, tenant_id, item, before.get(str(item["diDocumentId"]), []), tag):
+                            counts["kept_previous"] += 1
+                    except Exception:
+                        logger.warning("statement_reread_keep_failed", tag=tag, tenant_id=tenant_id,
+                                       journey=item["journeyReference"], exc_info=True)
                 logger.info("statement_reread_copied", tag=tag, tenant_id=tenant_id, journey=item["journeyReference"])
             elif processing == "FAILED":
                 counts["failed"] += 1
@@ -365,7 +433,7 @@ def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> dic
         if commit:
             try:
                 results = _reread(engine, tenant_id, [i for i in items if i["decision"] == "REREAD"], tag,
-                                  ask="-copy-" not in tag)
+                                  ask="-copy-" not in tag, keep_better=adds_up)
             except Exception:
                 logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
         if misread and commit:
