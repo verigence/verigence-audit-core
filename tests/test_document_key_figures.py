@@ -133,3 +133,21 @@ def test_the_pc_can_close_it_when_a_figure_is_not_printed(journey):
     from audit_core.uc03_p2_tasks import CLOSE_TASK_TYPES
 
     assert TASK_TYPE in CLOSE_TASK_TYPES
+
+
+def test_the_payments_and_insurance_tabs_say_which_figures_were_not_read(journey):
+    """Product owner 2026-11-05: "not read" markers on the Payments and
+    Insurance screens, not only on the Deal."""
+    from audit_core.uc03_p2_journey360 import addons, payments_section
+
+    _document(journey, "dealer_receipt", {"receipt_date": "2026-09-21", "receipt_number": "MR/7867",
+                                          "payment_mode": "UPI"}, page=3)
+    _document(journey, "insurance_cover", {"premium_amount": "170879", "policy_number": "P-1",
+                                           "insurer_name": "ICICI", "policy_start_date": "2026-10-05"}, page=7)
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        paid = payments_section(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        cover = addons(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert [(d["document"], d["missing"]) for d in paid["figuresNotRead"]] == [("Dealer receipt", ["amount"])]
+    assert [(d["document"], d["missing"]) for d in cover["insurance"]["figuresNotRead"]] == [
+        ("Insurance policy", ["chassis number"])]

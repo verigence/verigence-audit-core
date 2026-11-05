@@ -3003,7 +3003,9 @@ def addons(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[
     return {
         "taken": _taken_addons(connection, tenant_id=tenant_id, journey_id=journey_id, deal_view=deal_view),
         "insurance": {"records": insurance, "charges": lines.get("INSURANCE"),
-                      "discount": discounts.get("INSURANCE")},
+                      "discount": discounts.get("INSURANCE"),
+                      "figuresNotRead": _figures_not_read(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                                          types=_INSURANCE_TYPES)},
         "accessories": {"records": [p for p in plans if is_accessory(p)], "charges": lines.get("ACCESSORIES"),
                         "discount": discounts.get("ACCESSORIES_KIT")},
         "protection": {"records": [p for p in plans if not is_accessory(p)], "charges": lines.get("PROTECTION"),
@@ -3441,15 +3443,27 @@ def payments_section(connection: Connection, *, tenant_id: str, journey_id: UUID
         "refunds": paid["refunds"],
         "paidTotal": paid["total"],
         "loanWithoutReceipt": view["loanWithoutReceipt"] if paid["loanWithoutReceipt"] else None,
+        # Receipts on file with a figure not read (2026-11-05): said on this tab
+        # too, never only on the Deal.
+        "figuresNotRead": _figures_not_read(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                            types=_RECEIPT_TYPES),
     })
     return view
 
 
 # ── vehicle, registration, delivery ──────────────────────────────────────────
-def _figures_not_read(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+# The documents whose figures not read the Payments and Insurance tabs say
+# (product owner 2026-11-05: "not read" markers beyond the Deal).
+_RECEIPT_TYPES = frozenset({"dealer_receipt", "payment_receipt"})
+_INSURANCE_TYPES = frozenset({"insurance_cover"})
+
+
+def _figures_not_read(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                      types: frozenset[str] | None = None) -> list[dict[str, Any]]:
     from audit_core.uc03_document_key_figures import documents_not_fully_read
 
-    return documents_not_fully_read(connection, tenant_id=tenant_id, journey_id=journey_id)
+    documents = documents_not_fully_read(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return documents if types is None else [d for d in documents if d["documentType"] in types]
 
 
 def _statement_not_read(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
