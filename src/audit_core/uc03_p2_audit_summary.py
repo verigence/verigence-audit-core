@@ -59,6 +59,7 @@ RULES = {
     "AS-08": "Customer payments verified against a bank statement",
     "AS-09": "Money received against the net payable",
     "AS-10": "The deal's balance against the customer ledger's balance",
+    "AS-11": "The NDC's and the cost sheet's rows add up to the totals they print",
 }
 
 # The document that proves a charge, by Deal line (third party: issued by the
@@ -514,6 +515,54 @@ def ledger_check(ledger: dict[str, Any] | None, settle: dict[str, Any]) -> dict[
                       f"({'due' if deal_balance > 0 else 'paid over'}): they differ by Rs {abs(difference):,.2f}."}
 
 
+# The totals whose excess the customer pays (a charges or net total printed above
+# its rows); a receipts total is the dealer's record of money in, no impact.
+_CHARGED_TOTALS = frozenset({"Total Cost", "Gross Value", "Net Value", "On-road total"})
+
+
+def statement_totals(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """AS-11 (product owner 2026-11-05): every NDC / cost-sheet copy whose rows do
+    not give a total it prints is an exception on the summary. While the PC
+    has not looked at it, it may still be a misreading (the PC's task,
+    STATEMENT_ROWS_DO_NOT_ADD_UP, says so): no amount is put at risk. Once the
+    PC closes that task saying the page was read right, it is the dealer's own
+    arithmetic: the difference is the customer's (a charge or net total
+    printed above its rows) or the dealership's (below)."""
+    from audit_core.uc03_statement_totals import (
+        TASK_TYPE,
+        _rupees,
+        copies_not_adding_up,
+    )
+
+    _, copies = copies_not_adding_up(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if not copies:
+        return []
+    task = connection.execute(
+        text("SELECT completion_result FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+             "AND task_type=:k ORDER BY created_at_utc DESC LIMIT 1"),
+        {"t": tenant_id, "j": journey_id, "k": TASK_TYPE},
+    ).scalar_one_or_none() or {}
+    confirmed = (task or {}).get("outcome") == "CLOSED_BY_PC"
+    out = []
+    for copy in copies:
+        page = f" (page {copy['pageNumber']})" if copy["pageNumber"] else ""
+        for d in copy["differences"]:
+            difference = d["printed"] - d["rows"]
+            impact = None
+            if confirmed and d["total"] in _CHARGED_TOTALS:
+                impact = CUSTOMER if difference > 0 else COMPANY
+            reason = (f"{d['total']} printed {_rupees(d['printed'])}, its rows add up to {_rupees(d['rows'])}. "
+                      + ("The PC confirmed the page was read right: the dealer's own sum is wrong"
+                         + (f" ({(task or {}).get('reason')})" if (task or {}).get("reason") else "") + "."
+                         if confirmed else "A row may be misread: the PC is checking the reading."))
+            out.append({"label": f"{copy['document']}{page}: {d['total']}", "documentId": copy["documentId"],
+                        "document": copy["document"], "pageNumber": copy["pageNumber"], "total": d["total"],
+                        "printed": money(d["printed"]), "rows": money(d["rows"]), "difference": money(difference),
+                        "conclusion": EXCEPTION, "rule": "AS-11", "impact": impact,
+                        "dealerArithmetic": confirmed, "reason": reason})
+    return out
+
+
 def verdict(rows: list[dict[str, Any]], *, delivery_started: bool, missing: list[str]) -> dict[str, Any]:
     counts = {c: sum(1 for r in rows if r.get("conclusion") == c) for c in (OK, EXCEPTION, UNSUPPORTED, DISPUTED, CANNOT)}
     customer = sum((abs(dec(r.get("difference")) or Decimal(0)) for r in rows
@@ -714,6 +763,8 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                                             dict(settle, label="Money received against net payable",
                                                  difference=settle.get("balance")),
                                             *([ledger] if ledger else [])]
+    totals = statement_totals(connection, tenant_id=tenant_id, journey_id=journey_id)
+    rows += totals
     missing = []
     if not on_file & {"customer_invoice_dms", "tax_invoice_tally", "customer_ledger", "cost_sheet"}:
         missing.append("No invoice, account statement or cost sheet on file.")
@@ -752,4 +803,5 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         "disputed": [{"label": r["label"], "documents": r["documents"]} for r in disputed],
         "requiredDocuments": file_documents,
         "documentsNotFullyRead": not_read,
+        "statementTotals": totals,
     }
