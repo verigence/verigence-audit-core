@@ -92,22 +92,36 @@ def test_the_scheme_reload_dry_runs_then_commits_the_bulletins_on_their_dates(te
                           "WHERE oem_code = 'MAHINDRA' ON CONFLICT DO NOTHING"), {"o": oem_code})
     tag = f"test-{uuid4().hex[:6]}"
     assert run_master_reload(engine, f"{tag}-commit", tenant_ids=[tenant_id])[0]["status"] == "COMMITTED"
+    _legacy_september_scheme(engine, tenant_id)
 
     (dry,) = run_master_reload(engine, f"{tag}-schemes", tenant_ids=[tenant_id])
     assert dry["status"] == "DRY_RUN_PASSED", [c for c in dry.get("checks", []) if not c["ok"]] or dry.get("error")
-    assert [(u["kind"], u["effectiveFrom"], u["effectiveTo"]) for u in dry["uploads"]] == [
-        (kind, on, until) for kind, _, on, until in oem_master_reload.SCHEME_RELOAD_PLAN]
+    planned = [(kind, on, oem_master_reload.SCHEME_VALID_TO.get(relative, until))
+               for kind, relative, on, until in oem_master_reload.SCHEME_RELOAD_PLAN]
+    # each file on its own date, and again on 8 Sep (the legacy upload's date) inside September
+    assert [(u["kind"], u["effectiveFrom"], u["effectiveTo"]) for u in dry["uploads"]
+            if u["effectiveFrom"] != date(2026, 9, 8)] == planned
     assert dry["appliedPerModel"]["2026-09-15"]["XUV3XO"] > 0
 
     (done,) = run_master_reload(engine, f"{tag}-schemes-commit", tenant_ids=[tenant_id])
     assert done["status"] == "COMMITTED", [c for c in done.get("checks", []) if not c["ok"]] or done.get("error")
+    # every deal priced from the first bulletin's date is re-priced (none on this tenant)
+    assert done["reprice"]["from"] == "2026-09-03" and done["reprice"]["failed"] == []
     with engine.begin() as conn:
         conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
         ends = dict(conn.execute(text(
             "SELECT DISTINCT v.effective_from, v.effective_to FROM auditcore.discount_scheme_versions v "
             "JOIN auditcore.discount_scheme_benefits b ON b.discount_scheme_version_id = v.discount_scheme_version_id "
             "WHERE v.tenant_id = :t"), {"t": tenant_id}).all())
-    assert ends == {date(2026, 9, 3): date(2026, 9, 30), date(2026, 10, 3): date(2026, 10, 31)}
+    # October's bulletins stand for November (product owner, 5 Nov 2026).
+    assert ends[date(2026, 9, 3)] == date(2026, 9, 30) and ends[date(2026, 10, 3)] == date(2026, 11, 30)
+    # The legacy 8 Sep scheme the bulletins no longer name answers on no later date.
+    with engine.begin() as conn:
+        conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        for on in (date(2026, 9, 15), date(2026, 10, 15), date(2026, 11, 10)):
+            codes = {r["scheme_code"] for r in oem_master_reload._standing_rows(conn, tenant_id, on)}
+            assert "MAH_CONSUMER_LEGACY_8SEP" not in codes, on
+            assert codes, on
     # The standing rows name their scheme, so a failed "model-wide rows of unresolved variants"
     # check can log which schemes and variant texts the rows are.
     with engine.begin() as conn:
@@ -116,12 +130,46 @@ def test_the_scheme_reload_dry_runs_then_commits_the_bulletins_on_their_dates(te
     assert standing and all(r["scheme_code"] and r["scheme_name"] for r in standing)
 
 
+def _legacy_september_scheme(engine, tenant_id) -> None:
+    """A consumer scheme as the old ingestion stored it on live: loaded on
+    8 Sep, open-ended, under a code the re-load never produces (5 Nov 2026:
+    the tombstone read the highest version number, so after a 3 Sep
+    tombstone this 8 Sep version kept answering into November)."""
+    from decimal import Decimal as D
+
+    from audit_core.db import set_platform_super_admin_context, set_tenant_context
+    from audit_core.discount_schemes import (
+        add_discount_benefit,
+        create_discount_scheme,
+        create_discount_scheme_version,
+        publish_discount_scheme_version,
+    )
+
+    with engine.begin() as conn:
+        set_platform_super_admin_context(conn)
+        set_tenant_context(conn, tenant_id)
+        model_id = conn.execute(text(
+            "SELECT pm.model_id FROM auditcore.product_models pm JOIN auditcore.projects p ON p.oem_id = pm.oem_id "
+            "WHERE p.tenant_id = :t AND pm.model_name = 'MAXX HD'"), {"t": tenant_id}).scalar_one()
+        scheme = create_discount_scheme(conn, tenant_id=tenant_id, code="MAH_CONSUMER_LEGACY_8SEP",
+                                        name="legacy", category="CONSUMER", actor_id="test")
+        version = create_discount_scheme_version(conn, tenant_id=tenant_id, discount_scheme_id=scheme, version_no=1,
+                                                 effective_from=date(2026, 9, 8), actor_id="test")
+        add_discount_benefit(conn, tenant_id=tenant_id, discount_scheme_version_id=version,
+                             benefit_key="CASH_DISCOUNT", benefit_type="AMOUNT", amount_value=D(5000))
+        conn.execute(text(
+            "INSERT INTO auditcore.discount_scheme_eligibility (tenant_id, discount_scheme_version_id, model_id, criteria) "
+            "VALUES (:t, :v, :m, CAST(:c AS jsonb))"),
+            {"t": tenant_id, "v": version, "m": model_id, "c": '{"unresolvedVariantTexts": ["MAXX HD 1.3 LX"]}'})
+        publish_discount_scheme_version(conn, tenant_id=tenant_id, discount_scheme_version_id=version, actor_id="test")
+
+
 def test_the_real_october_grid_binds_scorpio_n_to_the_model_the_october_book_prices(tenant) -> None:
     """Review of PR 472: the October grid (dated 1 Oct) names "SCORPIO-N"; the
     October book (3 Oct) carries only NEW SCORPIO N. With the real files, the
-    line is bound to it, a deal of 15 Oct finds its grid line, and the dry
-    run's grid check is among the checks that pass."""
-    from audit_core.oem_master_reload import reload_schemes_tenant, reload_tenant
+    line is bound to it, a deal of 15 Oct finds its grid line, and the grid
+    job's checks pass (the grids left the scheme plan on 5 Nov 2026)."""
+    from audit_core.oem_master_reload import reload_grids_tenant, reload_tenant
     from audit_core.oem_price_masters import grid_row_for_model
 
     engine, tenant_id = tenant
@@ -136,7 +184,7 @@ def test_the_real_october_grid_binds_scorpio_n_to_the_model_the_october_book_pri
     try:
         tag = f"test-{uuid4().hex[:6]}"
         assert reload_tenant(connection, tenant_id=tenant_id, tag=tag, store=False)["passed"]
-        outcome = reload_schemes_tenant(connection, tenant_id=tenant_id, tag=f"{tag}-schemes", store=False)
+        outcome = reload_grids_tenant(connection, tenant_id=tenant_id, tag=f"{tag}-grids", store=False)
         failed = [c for c in outcome["checks"] if not c["ok"]]
         assert not failed, failed
         grid_checks = [c for c in outcome["checks"] if c["check"].startswith("discount grid of")]
@@ -320,6 +368,39 @@ def test_a_carried_row_answers_only_when_the_words_fit_nothing_on_sale() -> None
     assert named("VEERO", "1.6XL SD V2 LNT", veero) == ("IDENTIFIED", "VEERO::1.6XL SD V2 - LNT")
 
 
+def test_scorpio_n_words_name_the_new_car_when_the_list_also_prints_an_old_series_row() -> None:
+    """Product owner, 5 Nov 2026: the old-series row November prints is loaded
+    as printed, under the old model's own SKU; "SCORPIO N" is not mapped to
+    the old model. Booking forms write the new car as "SCORPIO N", "SCORPIO-N"
+    and "SCORPION", so those words name the new Scorpio N whenever the book
+    prices it, and the old series only when the variant fits no new car."""
+    from audit_core.oem_price_masters import _SUCCESSOR_IDENTITY, price_list_model_key
+    from audit_core.uc03_sku_words import identify
+
+    def row(model, variant, carried=False, fuel="DIESEL"):
+        return {"product_sku_id": f"{model}::{variant}", "sku_code": f"{model}::{variant}", "model_name": model,
+                "variant_name": variant, "colour_name": None, "fuel_powertrain": fuel, "transmission": None,
+                "drive": None, "seater": None, "trim": None, "category": "PV", "segment_code": "PASSENGER_VEHICLE",
+                "carried": carried}
+
+    november = [row("NEW SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - Refresh"),
+                row("NEW SCORPIO N", "Z8T D MT 4WD 7 STR BS6.2 - Refresh"),
+                row("SCORPIO N", "Z8 L D AT 2WD 7 STR BS6.2 - N - ADAS"),  # printed: the "SCORPIO N D old" tab
+                row("SCORPIO N", "Z8 S D AT 2WD 7 STR BS6.2 - N", carried=True),
+                row("SCORPIO N", "Z8 G AT 2WD 7 STR BS6.2 - N", carried=True, fuel="PETROL")]
+
+    def named(model, variant):
+        result = identify(rows=november, model_text=model, variant_text=variant, identity=price_list_model_key,
+                          successors=dict(_SUCCESSOR_IDENTITY))
+        return result.status, (result.row or {}).get("sku_code")
+
+    for model in ("SCORPIO N", "SCORPIO-N", "SCORPION"):
+        assert named(model, "Z8 S D AT 2WD 7 STR") == ("IDENTIFIED", "NEW SCORPIO N::Z8 S D AT 2WD 7 STR BS6.2 - Refresh")
+        assert named(model, "Z8T D MT 4WD") == ("IDENTIFIED", "NEW SCORPIO N::Z8T D MT 4WD 7 STR BS6.2 - Refresh")
+    # words no new car fits keep the old model's own SKUs
+    assert named("SCORPIO N", "Z8 G AT 2WD 7 STR BS6.2 - N") == ("IDENTIFIED", "SCORPIO N::Z8 G AT 2WD 7 STR BS6.2 - N")
+
+
 # ── a month's masters: November 2026 (a "-month" tag) ────────────────────────
 def _month_history(engine, tenant_id) -> str:
     _with_mahindra_aliases(engine, tenant_id)
@@ -335,8 +416,8 @@ def test_november_loads_on_4_nov_keeps_what_it_does_not_print_and_takes_the_new_
     """Product owner, 5 Nov 2026: the new price list and discount grid from
     4 Nov. What November does not print keeps October's figure, not on sale
     (standing rule, 2 Nov); the one old-series Scorpio N row November prints
-    is November's price but not on sale, so "SCORPIO N" still names the new
-    car; the grid's new spellings all name a model, and XUV400 / the old
+    is loaded as printed under the old model's own SKU, and "SCORPIO N"
+    still names the new car; the grid's new spellings all name a model, and XUV400 / the old
     Scorpio N take the line their last grid gave them."""
     from audit_core.oem_price_masters import (
         _models_in_book,
@@ -356,6 +437,7 @@ def test_november_loads_on_4_nov_keeps_what_it_does_not_print_and_takes_the_new_
 
     (done,) = run_master_reload(engine, f"{tag}-month-commit", tenant_ids=[tenant_id])
     assert done["status"] == "COMMITTED", [c for c in done.get("checks", []) if not c["ok"]] or done.get("error")
+    assert done["reprice"]["from"] == "2026-11-04" and done["reprice"]["failed"] == []
     assert _versions(engine, tenant_id) == before + 1
     on = date(2026, 11, 20)
     with engine.begin() as conn:
@@ -380,9 +462,9 @@ def test_november_loads_on_4_nov_keeps_what_it_does_not_print_and_takes_the_new_
         thar_oct = grid_row_for_model(conn, tenant_id=tenant_id, model_id=thar, effective_on=date(2026, 11, 3))
     assert [tuple(u) for u in uploads] == [("DISCOUNT_GRID", date(2026, 11, 4), "PUBLISHED"),
                                            ("PRICE_LIST", date(2026, 11, 4), "PUBLISHED")]
-    assert old["oldSeries"] is True and "carriedReason" in old
+    assert "carriedReason" not in old  # loaded as printed
     assert new_car["sku"]["model_name"] == "NEW SCORPIO N" and new_car["sku"]["ex_showroom"] == Decimal("1998996.00")
-    assert "NEW SCORPIO N" in on_sale and "SCORPIO N" not in on_sale
+    assert {"NEW SCORPIO N", "SCORPIO N"} <= on_sale  # the old-series row is on the list
     assert thar_nov["model_alias"] == "Thar OG" and thar_oct["model_alias"] == "Thar"
     # once per tag
     assert run_master_reload(engine, f"{tag}-month-commit", tenant_ids=[tenant_id])[0]["status"] == "ALREADY_DONE"

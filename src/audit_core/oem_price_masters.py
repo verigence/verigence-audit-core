@@ -823,15 +823,16 @@ def ingest_price_list(
       every load). Within the same month such a SKU is withdrawn: a re-issue
       that drops a variant takes it off sale (3 Sep 2026).
 
-    A model printed beside its successor in the same book (the dealer's
-    "SCORPIO N D old" sheet next to the new Scorpio N, 4 Nov 2026) is priced
-    at this file's figures but likewise not on sale, so the words "SCORPIO N"
-    keep naming the car on sale (``_SUCCESSOR_IDENTITY``).
+    A row the list prints is loaded as printed, whatever the series: the
+    dealer's "SCORPIO N D old" tab (4 Nov 2026) prices its old-series
+    variant under the old model's own SKU (product owner, 5 Nov: whether it
+    is on sale is the dealership's call). Which model a document's words name
+    is the SKU resolver's rule (``uc03_sku_words``), not the book's.
 
     Each row keeps ``price_since``: the effective date when its figure
     changed, else the date it already held. ``stats`` (when given) receives
     the counts: uploaded, changed, unchanged, carriedForward (on sale),
-    carriedNotOnSale, oldSeriesNotOnSale, withdrawn."""
+    carriedNotOnSale, withdrawn."""
     price_list_id = connection.execute(
         text(
             "SELECT price_list_id FROM auditcore.price_lists "
@@ -932,35 +933,10 @@ def ingest_price_list(
     uploaded_skus = {sku_id_by_code[code] for code in sku_codes}
     file_models = set(model_ids)
     complete = _is_complete_book(parsed)
-    # A model that had left the book (the standing book prices it only as
-    # carried, not on sale) and that this file prints again beside its
-    # successor is the old series: priced, still not on sale (see the
-    # docstring). The successor counts as on sale when this file prints it
-    # or, for a dealer sheet, when the standing book sells it. In September
-    # both series were on sale and nothing changes for them.
-    row_keys = [price_list_model_key(row.model_name, row.variant_name) for row in rows]
-    standing_name = dict(connection.execute(
-        text("SELECT model_id, model_name FROM auditcore.product_models WHERE model_id = ANY(:ids)"),
-        {"ids": list({before["model_id"] for before in standing.values()})},
-    ).all()) if standing else {}
-    standing_priced = {price_list_model_key(name) for name in standing_name.values()}
-    standing_on_sale = {
-        price_list_model_key(standing_name[before["model_id"]]) for before in standing.values()
-        if "carriedReason" not in (before["metadata"] or {}) and before["model_id"] in standing_name
-    }
-    on_sale_keys = set(row_keys) | (standing_on_sale if not complete else set())
-    old_series_keys = {
-        old for old, new in _SUCCESSOR_IDENTITY.items()
-        if old in row_keys and new in on_sale_keys and old in standing_priced and old not in standing_on_sale
-    }
-    old_series_skus: set[UUID] = set()
     changed_skus: set[UUID] = set()
     item_rows: list[dict[str, Any]] = []
-    for row, sku_code, row_key in zip(rows, sku_codes, row_keys):
+    for row, sku_code in zip(rows, sku_codes):
         sku_id = sku_id_by_code[sku_code]
-        old_series = row_key in old_series_keys
-        if old_series:
-            old_series_skus.add(sku_id)
         for component_key, amount in row.components.items():
             before = standing.get((sku_id, component_key))
             unchanged = before is not None and Decimal(str(before["standard_amount"])) == amount
@@ -976,12 +952,6 @@ def ingest_price_list(
                 # changed release marker keeps the SKU it already had.
                 "printedAs": {"model": row.model_name, "variant": row.variant_name},
             }
-            if old_series:
-                metadata["oldSeries"] = True
-                metadata["carriedReason"] = (
-                    "old series printed beside its successor: this list's price, not on sale "
-                    "(product owner, 4 Nov 2026)"
-                )
             item_rows.append({
                 "tenant_id": tenant_id,
                 "price_list_version_id": version_id,
@@ -1051,7 +1021,6 @@ def ingest_price_list(
             "unchanged": len(uploaded_skus - changed_skus),
             "carriedForward": len(carried_skus),
             "carriedNotOnSale": len(carried_not_on_sale),
-            "oldSeriesNotOnSale": len(old_series_skus),
             "withdrawn": len(withdrawn_skus),
             "completeBook": complete,
             "standingVersionId": str(standing_version) if standing_version else None,
@@ -1257,9 +1226,15 @@ def find_book_sku(
 
     # The rows the list prints first; a carried row (the previous month's
     # price for a variant the list no longer prints, 2026-11-01) only when
-    # the words name none of them (the same rule as the SKU resolver).
+    # the words name none of them (the same rule as the SKU resolver). Among
+    # the rows the list prints, the successor's first: "SCORPIO N" names the
+    # new Scorpio N, and an old-series row the list prints is named only by
+    # words that fit no new one (5 Nov 2026).
     pool = [r for r in every if not r["carried"]]
-    named = naming(pool)
+    successor = _SUCCESSOR_IDENTITY.get(keys[0]) if keys else None
+    named = naming([r for r in pool if price_list_model_key(r["model_name"]) == successor]) if successor else []
+    if not named:
+        named = naming(pool)
     if not named:
         pool = every
         named = naming([r for r in every if r["carried"]])
@@ -1928,9 +1903,24 @@ def _tombstone_absent_schemes(
     effective_from: date,
     actor_id: str,
 ) -> int:
+    # A scheme the new bulletin does not name is withdrawn from its date when
+    # the version that stands on that date carries benefits. "Stands" is the deal check's own rule (the
+    # latest effective_from on or before the date, the latest created on
+    # it). Reading the highest version number instead (before 5 Nov 2026)
+    # missed the live September schemes loaded on 8 Sep: once a re-load
+    # tombstoned them on 3 Sep, their 8 Sep versions (lower numbers) kept
+    # answering into October and November, so October's bulletins never
+    # replaced them.
     rows = connection.execute(
         text(
             """
+            WITH standing AS (
+                SELECT DISTINCT ON (v.discount_scheme_id) v.discount_scheme_id, v.discount_scheme_version_id
+                FROM auditcore.discount_scheme_versions v
+                WHERE v.tenant_id = :tenant_id AND v.lifecycle_status = 'PUBLISHED'
+                  AND v.effective_from <= :effective_from
+                ORDER BY v.discount_scheme_id, v.effective_from DESC, v.created_at_utc DESC
+            )
             SELECT s.discount_scheme_id, s.scheme_code
             FROM auditcore.discount_schemes s
             WHERE s.tenant_id = :tenant_id
@@ -1943,15 +1933,11 @@ def _tombstone_absent_schemes(
                   WHERE v.tenant_id = s.tenant_id
                     AND v.discount_scheme_id = s.discount_scheme_id
                     AND v.lifecycle_status = 'PUBLISHED'
-                    AND v.version_no = (
-                        SELECT MAX(v2.version_no) FROM auditcore.discount_scheme_versions v2
-                        WHERE v2.tenant_id = v.tenant_id
-                          AND v2.discount_scheme_id = v.discount_scheme_id
-                    )
+                    AND v.discount_scheme_version_id IN (SELECT discount_scheme_version_id FROM standing)
               )
             """
         ),
-        {"tenant_id": tenant_id, "categories": list(categories)},
+        {"tenant_id": tenant_id, "categories": list(categories), "effective_from": effective_from},
     ).mappings().all()
 
     tombstoned = 0

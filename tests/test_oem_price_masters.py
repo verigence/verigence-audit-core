@@ -450,7 +450,7 @@ def test_a_complete_book_withdraws_what_it_does_not_list_and_dates_each_price(co
         actor_id="admin", stats=stats,
     )
     assert stats == {"uploaded": 1, "changed": 1, "unchanged": 0, "carriedForward": 0, "withdrawn": 1,
-                     "carriedNotOnSale": 0, "oldSeriesNotOnSale": 0, "completeBook": True, "standingVersionId": str(v1), "laterVersionsRederived": 0,
+                     "carriedNotOnSale": 0, "completeBook": True, "standingVersionId": str(v1), "laterVersionsRederived": 0,
                      "journeysRechecked": 0}
     thar, xuv = _code_of(first_skus, "MX1 PMT 2WD"), _code_of(first_skus, "MX1")
     first, second = _items(connection, tenant_id, v1), _items(connection, tenant_id, v2)

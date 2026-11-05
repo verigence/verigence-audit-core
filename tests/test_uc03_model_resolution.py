@@ -717,12 +717,11 @@ def test_integration_reports_narrower_candidates_even_when_still_ambiguous(mahin
 
 
 def test_integration_the_spelling_names_the_generation_never_the_price(mahindra_journey) -> None:
-    """2026-10-20 product owner rule R3 (this test used to expect the
-    booking's ex-showroom to bridge "Scorpio N" to the refresh generation):
-    with the price masters' model identity, "Scorpio N" names the old
-    SCORPIO N while it is on sale and "SCORPIO-N" / "New Scorpio N" the
-    refresh. The booking's price (the refresh's) does not move it: the old
-    Z8L is pinned as a price mismatch and the PC is asked."""
+    """Product owner, 5 Nov 2026 (replaces R3 of 2026-10-20 for "Scorpio N"):
+    booking forms write the new Scorpio N as "SCORPIO N" / "SCORPIO-N" /
+    "SCORPION", so "Scorpio N" names the new car whenever the book prices it,
+    also while the old series is printed; the old model keeps its own SKUs.
+    The price still never decides: here it agrees with the words."""
     c = mahindra_journey
     old, new = _seed_price_list(c, [
         {"model": "SCORPIO N", "variant": "Z8 L G MT 2WD 7 STR BS6.2 - N - ADAS",
@@ -738,8 +737,8 @@ def test_integration_the_spelling_names_the_generation_never_the_price(mahindra_
     result = mr.sync_model_resolution(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
     )
-    assert result.get("basis") == "AUTO_PRICE_MISMATCH"
-    assert _vehicle(c)["product_sku_id"] == old and old != new
+    assert result.get("basis") == "AUTO_MATCHED"
+    assert _vehicle(c)["product_sku_id"] == new and old != new
 
 
 def test_integration_a_stated_attribute_outranks_a_conflicting_price(mahindra_journey) -> None:

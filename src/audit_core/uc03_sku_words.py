@@ -477,6 +477,7 @@ def _match_one_model(doc: Reading, sigs: list[RowWords]) -> tuple[list[RowWords]
 def _pick_by_identity(
     model_text: str | None, variant_text: str | None, *, groups: set[str], aliases: list[tuple[str, str]],
     identity: Callable[[str | None, str | None], str], successors: dict[str, str],
+    prefer_successor: bool = False,
 ) -> tuple[str, str, str, str] | None:
     """The model the document names, by the price masters' own model
     identity (``oem_price_masters.price_list_model_key``: any month's
@@ -484,8 +485,14 @@ def _pick_by_identity(
     "SCORPIO-N" = the new Scorpio N, the Bolero family split by series).
     The longest run of the document's leading words that is a model of this
     book wins; then an alias of one; then, when the model the words name has
-    left the book, its successor ("SCORPIO N" on an October date). Returns
-    (identity, the words that name it, the rest, how) or None."""
+    left the book, its successor ("SCORPIO N" on an October date). With
+    ``prefer_successor`` the successor comes first whenever the book prices
+    it: the booking forms write the new Scorpio N as "SCORPIO N",
+    "SCORPIO-N" and "SCORPION" (live, 5 Nov 2026: 62 of 66 Scorpio N
+    journeys are the new car), so those words name it even in a month whose
+    list also prints an old-series row (product owner, 5 Nov: "we don't need
+    to map Scorpio N with the old model"). Returns (identity, the words that
+    name it, the rest, how) or None."""
     words = " ".join(str(v) for v in (model_text, variant_text) if v and str(v).strip()).split()
     alias_by_key = {normalized_key(a): c for a, c in aliases if normalized_key(a)}
     splits = [(" ".join(words[:i]), " ".join(words[i:]) or None) for i in range(len(words), 0, -1)]
@@ -508,6 +515,8 @@ def _pick_by_identity(
     splits = [(prefix, without_repeat(prefix, rest)) for prefix, rest in splits]
     for prefix, rest in splits:
         key = identity(prefix, rest)
+        if prefer_successor and successors.get(key) in groups:
+            return successors[key], prefix, rest or "", "SUCCESSOR"
         if key in groups:
             return key, prefix, rest or "", "NAME"
         canonical = alias_by_key.get(normalized_key(prefix))
@@ -552,7 +561,14 @@ def identify(
     carried = [r for r in rows if r.get("carried")]
     args = {"model_text": model_text, "variant_text": variant_text, "aliases": aliases,
             "registration": registration, "gst_rate": gst_rate, "identity": identity, "successors": successors}
-    result = _identify_rows(rows=on_sale, **args)
+    # The successor first (the new Scorpio N for "SCORPIO N"); the model the
+    # words name only when its successor has nothing that fits -- an
+    # old-series variant the list prints keeps its own SKU (5 Nov 2026).
+    result = _identify_rows(rows=on_sale, prefer_successor=True, **args)
+    if result.status in _NOTHING_ON_SALE and successors:
+        named_first = _identify_rows(rows=on_sale, **args)
+        if named_first.status not in _NOTHING_ON_SALE:
+            result = named_first
     if carried and result.status in _NOTHING_ON_SALE:
         # Read against the whole book, never the carried rows alone: on its
         # own the small carried set leaves the document's other words
@@ -575,6 +591,7 @@ def _identify_rows(
     gst_rate: Decimal | None = None,
     identity: Callable[[str | None, str | None], str] | None = None,
     successors: dict[str, str] | None = None,
+    prefer_successor: bool = False,
 ) -> WordResult:
     """Name the SKU from one document's words. ``registration`` is PRIVATE /
     COMMERCIAL when known; ``gst_rate`` is the invoice's printed GST rate in
@@ -599,7 +616,8 @@ def _identify_rows(
 
     if identity is not None:
         found = _pick_by_identity(model_text, variant_text, groups=set(sigs_by_model), aliases=aliases or [],
-                                  identity=identity, successors=successors or {})
+                                  identity=identity, successors=successors or {},
+                                  prefer_successor=prefer_successor)
         if found is None:
             return WordResult(status="NO_MODEL", detail={"words": tokens})
         key, prefix, rest_text, via = found

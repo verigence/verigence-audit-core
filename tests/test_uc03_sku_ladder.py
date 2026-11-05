@@ -418,8 +418,10 @@ _OCT = [
 @pytest.mark.parametrize(("model", "variant", "september", "october"), [
     ("SCORPIO-N", "Z8 S D AT 2WD 7 STR", "New SCORPIO N", "SCORPIO-N"),
     ("New SCORPIO N", "Z8 S D AT 2WD 7 STR", "New SCORPIO N", "SCORPIO-N"),
-    # "SCORPIO N" is the old model while it is on sale, its successor after.
-    ("SCORPIO N", "Z8 S D AT 2WD 7 STR", "SCORPIO N", "SCORPIO-N"),
+    # "SCORPIO N" names the new Scorpio N whenever the book prices it (product
+    # owner, 5 Nov 2026, replacing R3 of 2026-10-20: booking forms write the new
+    # car as "SCORPIO N"); the old series keeps its own SKUs.
+    ("SCORPIO N", "Z8 S D AT 2WD 7 STR", "New SCORPIO N", "SCORPIO-N"),
     ("SCORPIO", "Classic S 9 STR", "SCORPIO CLASSIC", "SCORPIO"),
     ("SCORPIO CLASSIC", "S 9 STR", "SCORPIO CLASSIC", "SCORPIO"),
     ("NEW THAR", "AXT D MT 2WD", "NEW THAR 2WD & 4WD", "NEW THAR"),
