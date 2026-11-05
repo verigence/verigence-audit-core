@@ -146,3 +146,35 @@ def test_a_document_never_read_is_split_with_each_page_read_as_named(journey):
     sent = {p["page"]: p["to"] for p in done["sent"][0]["pages"]}
     assert sent == {2: "customer_ledger", 1: "supporting_document"}
     assert _unit(journey, group)["queue_status"] == "MERGED"
+
+
+def test_a_page_kept_as_a_supporting_document_stays_on_file_and_counts_as_nothing(journey):
+    """2026-11-05: the dealers' Transaction Regularization Form, read as a cost
+    sheet, is kept as a supporting document under its printed title."""
+    from uuid import uuid4
+
+    from p2_support import add_evidence, add_extracted_field
+
+    document_id = uuid4()
+    _, [page] = add_batch_pages(journey, [("cost_sheet", "READY")], grouping_status="NOT_NEEDED")
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("UPDATE auditcore.p2_document_queue SET di_document_id=:d, template_key='cost_sheet' "
+                       "WHERE queue_id=:q"), {"d": document_id, "q": page["queue_id"]})
+    add_evidence(journey, di_document_id=document_id, document_type_key="cost_sheet")
+    add_extracted_field(journey, di_document_id=document_id, field_key="document_title",
+                        value="TRANSACTION REGULARIZATION FORM", document_type="cost_sheet")
+    number = _unit(journey, page["queue_id"])["page_number"]
+    ask = [f"{_reference(journey)}:{number}:supporting_document:cost_sheet"]
+    dry = retype.run_page_retype(journey.engine, f"{journey.tenant_id}:trf", ask)
+    assert len(dry["wouldSend"]) == 1 and _unit(journey, page["queue_id"])["queue_status"] == "READY"
+    out = retype.run_page_retype(journey.engine, f"{journey.tenant_id}:trf-commit", ask)
+    assert out["sent"][0]["name"] == "Transaction Regularization Form"
+    unit = _unit(journey, page["queue_id"])
+    assert (unit["queue_status"], unit["template_key"], unit["display_name"]) == (
+        "SUPPORTING", "supporting_document", "Transaction Regularization Form")
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        status = c.execute(text("SELECT association_status FROM auditcore.evidence WHERE di_document_id=:d"),
+                           {"d": document_id}).scalar_one()
+    assert status == "SUPERSEDED"
