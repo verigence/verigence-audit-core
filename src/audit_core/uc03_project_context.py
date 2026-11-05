@@ -37,6 +37,8 @@ class OperationalProject(BaseModel):
     projectCode: str
     projectName: str
     projectStatus: str
+    # SALES or SERVICE (2026-11-05): a service audit shows no sales price masters.
+    auditType: str = "SALES"
     timezoneName: str
     operatingRole: str
     scope: ProjectScopeSummary
@@ -124,6 +126,7 @@ def list_my_projects(
                         p.project_code,
                         p.project_name,
                         p.project_status,
+                        p.audit_type,
                         p.timezone_name,
                         min(a.business_role_code) AS operating_role,
                         count(DISTINCT a.business_role_code) AS operating_role_count,
@@ -140,6 +143,7 @@ def list_my_projects(
                         p.project_code,
                         p.project_name,
                         p.project_status,
+                        p.audit_type,
                         p.timezone_name
                 ),
                 -- Outlet-scoped roles: a PC covers Outlets and works one at a
@@ -189,6 +193,7 @@ def list_my_projects(
                     ps.project_code,
                     ps.project_name,
                     ps.project_status,
+                    ps.audit_type,
                     ps.timezone_name,
                     ps.operating_role,
                     ps.operating_role_count,
@@ -217,6 +222,7 @@ def list_my_projects(
                 projectCode=str(row["project_code"]),
                 projectName=str(row["project_name"]),
                 projectStatus=str(row["project_status"]),
+                auditType=str(row["audit_type"] or "SALES"),
                 timezoneName=str(row["timezone_name"]),
                 operatingRole=str(row["operating_role"]),
                 scope=ProjectScopeSummary(

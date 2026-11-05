@@ -44,6 +44,8 @@ class ProjectResponse(BaseModel):
     timezoneName: str
     regionCode: str | None
     projectStatus: str
+    # SALES or SERVICE (2026-11-05): a service audit has no sales price, discount or product masters.
+    auditType: str = "SALES"
     versionNo: int
     createdAtUtc: datetime
     updatedAtUtc: datetime
@@ -82,7 +84,7 @@ def _project_row(connection: Connection, tenant_id: str):
             """
             SELECT tenant_id, project_code, business_code, project_name, oem_id, product_category_id,
                    effective_start_date, effective_end_date, timezone_name, region_code,
-                   project_status, version_no, created_at_utc, updated_at_utc
+                   project_status, audit_type, version_no, created_at_utc, updated_at_utc
             FROM auditcore.projects
             WHERE tenant_id = :tenant_id
             """
@@ -130,6 +132,7 @@ def _project_response(connection: Connection, row) -> ProjectResponse:
         timezoneName=row["timezone_name"],
         regionCode=row["region_code"],
         projectStatus=row["project_status"],
+        auditType=row.get("audit_type") or "SALES",
         versionNo=row["version_no"],
         createdAtUtc=row["created_at_utc"],
         updatedAtUtc=row["updated_at_utc"],
@@ -412,7 +415,7 @@ def patch_project(
                     WHERE tenant_id = :tenant_id AND version_no = :expected_version
                     RETURNING tenant_id, project_code, business_code, project_name, oem_id, product_category_id,
                               effective_start_date, effective_end_date, timezone_name, region_code,
-                              project_status, version_no, created_at_utc, updated_at_utc
+                              project_status, audit_type, version_no, created_at_utc, updated_at_utc
                     """
                 ),
                 parameters,
