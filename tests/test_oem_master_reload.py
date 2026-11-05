@@ -14,6 +14,7 @@ from sqlalchemy import create_engine, text
 
 from audit_core import oem_master_reload
 from audit_core.oem_master_reload import run_master_reload
+from audit_core.price_lists import find_effective_price_plan
 
 
 @pytest.fixture
@@ -49,7 +50,7 @@ def test_the_reload_dry_runs_commits_once_and_checks_the_books(tenant) -> None:
     (dry,) = run_master_reload(engine, tag, tenant_ids=[tenant_id])
     assert dry["status"] == "DRY_RUN_PASSED", [c for c in dry.get("checks", []) if not c["ok"]] or dry.get("error")
     assert dry["booksAfter"] == {"2026-09-01": 323, "2026-09-02": 323, "2026-09-03": 317, "2026-09-07": 319,
-                                 "2026-09-08": 319, "2026-09-19": 319, "2026-10-03": 327}
+                                 "2026-09-08": 319, "2026-09-19": 319, "2026-10-03": 356}
     assert _versions(engine, tenant_id) == 0  # a dry run leaves nothing
     assert run_master_reload(engine, tag, tenant_ids=[tenant_id])[0]["status"] == "ALREADY_DONE"
 
@@ -205,14 +206,16 @@ def test_the_two_grids_load_alone_with_both_scorpio_n_lines_bound(tenant) -> Non
     assert line["model_alias"] == "SCORPIO N New" and line["in_scope"]
 
 
-def test_october_gets_septembers_price_for_the_variants_it_no_longer_lists(tenant, monkeypatch) -> None:
+def test_october_gets_septembers_price_for_the_variants_it_no_longer_lists(tenant) -> None:
     """2026-11-01, product owner: "the model which are not available in Oct,
     for them pls get the price of September"; "old scorpio to be priced at sep
-    price". The 3 Oct book is published again with every October row
-    unchanged plus September's rows for the SKUs October does not print,
-    marked carried. October's words still name what October sells: "SCORPIO
-    N Z8 S D AT ... - N" is the new Scorpio N at October's price; only an
-    old-only variant (ADAS) reaches the old series, at September's price."""
+    price". Since the standing rule of 2 Nov the ingest itself keeps them: the
+    3 Oct book holds every October row plus September's rows for the SKUs
+    October does not print, marked carried, and the "-octcarry" job that did
+    it for the live book has nothing left to do. October's words still name
+    what October sells: "SCORPIO N Z8 S D AT ... - N" is the new Scorpio N at
+    October's price; only an old-only variant (ADAS) reaches the old series,
+    at September's price."""
     from audit_core.oem_master_reload import complete_october_tenant
     from audit_core.oem_price_masters import _models_in_book, find_book_sku
 
@@ -220,24 +223,19 @@ def test_october_gets_septembers_price_for_the_variants_it_no_longer_lists(tenan
     _with_mahindra_aliases(engine, tenant_id)
     tag = f"test-{uuid4().hex[:6]}"
     assert run_master_reload(engine, f"{tag}-commit", tenant_ids=[tenant_id])[0]["status"] == "COMMITTED"
-    # The five re-load files only (no live 19 Sep Veero LNT sheet): the 24 old
-    # Scorpio N, BE 6 One x2, BE 6 SPORTEQ THREE x2 and Veero 1.5XXL CBC V2.
-    monkeypatch.setattr(oem_master_reload, "OCTOBER_EXPECTED_CARRIED", 29)
-
-    (dry,) = run_master_reload(engine, f"{tag}-octcarry", tenant_ids=[tenant_id])
-    assert dry["status"] == "DRY_RUN_PASSED", [c for c in dry.get("checks", []) if not c["ok"]] or dry.get("error")
-    models = {}
-    for row in dry["carried"]:
-        models[row["model"]] = models.get(row["model"], 0) + 1
-    assert models == {"SCORPIO N": 24, "BE 6": 2, "BE6 SPORTEQ": 2, "VEERO": 1}
-    assert _versions(engine, tenant_id) == 5  # a dry run leaves nothing
-
-    (done,) = run_master_reload(engine, f"{tag}-octcarry-commit", tenant_ids=[tenant_id])
-    assert done["status"] == "COMMITTED", [c for c in done.get("checks", []) if not c["ok"]] or done.get("error")
-    assert _versions(engine, tenant_id) == 6
+    assert _versions(engine, tenant_id) == 5
     on = date(2026, 10, 20)
     with engine.begin() as conn:
         conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        october = find_effective_price_plan(conn, tenant_id=tenant_id, effective_on=on)["price_list_version_id"]
+        # The five re-load files only (no live 19 Sep Veero LNT sheet): the 24 old
+        # Scorpio N, BE 6 One x2, BE 6 SPORTEQ THREE x2 and Veero 1.5XXL CBC V2.
+        models = dict(conn.execute(text(
+            "SELECT pm.model_name, count(DISTINCT s.product_sku_id) FROM auditcore.price_list_items i "
+            "JOIN auditcore.product_skus s ON s.product_sku_id = i.product_sku_id "
+            "JOIN auditcore.product_models pm ON pm.model_id = s.model_id "
+            "WHERE i.tenant_id = :t AND i.price_list_version_id = :v AND i.metadata ? 'carriedReason' "
+            "GROUP BY pm.model_name"), {"t": tenant_id, "v": october}).all())
         new_car = find_book_sku(conn, tenant_id=tenant_id, model_text="SCORPIO N",
                                 variant_text="Z8 S D AT 2WD 7 STR BS6.2 - N", effective_on=on)
         old_car = find_book_sku(conn, tenant_id=tenant_id, model_text="SCORPIO N",
@@ -261,21 +259,18 @@ def test_october_gets_septembers_price_for_the_variants_it_no_longer_lists(tenan
         on_sale_7_sep = _models_in_book(conn, tenant_id=tenant_id, effective_on=date(2026, 9, 7))
         z8l = find_book_sku(conn, tenant_id=tenant_id, model_text="NEW SCORPIO N",
                             variant_text="Z8 L D AT 2WD 7 STR BS6.2 - Refresh", effective_on=date(2026, 9, 7))
-        marked = conn.execute(text(
-            "SELECT count(DISTINCT product_sku_id) FROM auditcore.price_list_items WHERE tenant_id = :t "
-            "AND price_list_version_id = :v AND metadata ? 'carriedForwardFrom'"),
-            {"t": tenant_id, "v": done["newVersionId"]}).scalar_one()
+    assert models == {"SCORPIO N": 24, "BE 6": 2, "BE6 SPORTEQ": 2, "VEERO": 1}
     assert new_car["sku"]["model_name"] == "NEW SCORPIO N"
     assert old_car["sku"]["model_name"] == "SCORPIO N" and old_car["sku"]["ex_showroom"] == Decimal("2276499.58")
     assert veero["sku"] and veero["sku"]["model_name"] == "VEERO"
     assert "NEW SCORPIO N" in on_sale and "SCORPIO N" not in on_sale  # the old series is priced, not on sale
-    assert marked == 29
     assert sheet_carried > 0 and on_sale_7_sep == set(book_7_sep)
     assert z8l["sku"] and z8l["sku"]["model_name"] == "NEW SCORPIO N"
-    # Nothing left to carry: a second run publishes nothing.
+    # Nothing left to carry: the October job publishes nothing.
     with engine.connect() as connection, connection.begin():
-        again = complete_october_tenant(connection, tenant_id=tenant_id, tag=f"{tag}-octcarry-again", store=False)
+        again = complete_october_tenant(connection, tenant_id=tenant_id, tag=f"{tag}-octcarry", store=False)
     assert again["passed"] and again["carried"] == []
+    assert _versions(engine, tenant_id) == 5
 
 
 def test_a_carried_row_answers_only_when_the_words_fit_nothing_on_sale() -> None:

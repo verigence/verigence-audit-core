@@ -805,16 +805,33 @@ def ingest_price_list(
 ) -> tuple[UUID, dict[str, UUID]]:
     """Load a parsed price list; returns (price_list_version_id, {sku_code: sku_id}).
 
-    The OEM's consolidated list is a complete book (2026-10-20 product owner
-    rules): the new version holds exactly its rows, and a SKU it does not
-    carry is withdrawn from that date, never carried forward at an older
-    month's price. A dealer per-model sheet prices only its own models, so
-    it is merged over the version standing on the effective date: SKUs of
-    the models it does not cover are carried forward at their standing
-    price; SKUs of a model it covers but no longer lists are dropped. Each
-    row keeps ``price_since``: the effective date when its figure changed,
-    else the date it already held. ``stats`` (when given) receives the
-    counts: uploaded, changed, unchanged, carriedForward, withdrawn."""
+    Standing product owner rule (1-2 Nov 2026, replacing the 2026-10-20
+    "withdrawn" rule for a new month): whatever the current month's list
+    does not print is picked from the previous month's series. A SKU the
+    version standing on the effective date prices and this file does not
+    print keeps its standing figures in the new version:
+
+    * on sale (``carriedForwardFrom`` alone) when the file is a dealer
+      per-model sheet that does not cover its model -- the sheet prices only
+      its own models;
+    * priced but not on sale (``carriedReason`` as well) when the file is
+      the complete consolidated book, or a dealer sheet covering its model
+      that no longer prints it, and the standing book is an earlier month's.
+      The SKU resolver and the book lookup read a document's words against
+      the rows the list prints first and reach such a row only when they fit
+      nothing on sale (the October carry of 1 Nov 2026, now the rule for
+      every load). Within the same month such a SKU is withdrawn: a re-issue
+      that drops a variant takes it off sale (3 Sep 2026).
+
+    A model printed beside its successor in the same book (the dealer's
+    "SCORPIO N D old" sheet next to the new Scorpio N, 4 Nov 2026) is priced
+    at this file's figures but likewise not on sale, so the words "SCORPIO N"
+    keep naming the car on sale (``_SUCCESSOR_IDENTITY``).
+
+    Each row keeps ``price_since``: the effective date when its figure
+    changed, else the date it already held. ``stats`` (when given) receives
+    the counts: uploaded, changed, unchanged, carriedForward (on sale),
+    carriedNotOnSale, oldSeriesNotOnSale, withdrawn."""
     price_list_id = connection.execute(
         text(
             "SELECT price_list_id FROM auditcore.price_lists "
@@ -915,10 +932,35 @@ def ingest_price_list(
     uploaded_skus = {sku_id_by_code[code] for code in sku_codes}
     file_models = set(model_ids)
     complete = _is_complete_book(parsed)
+    # A model that had left the book (the standing book prices it only as
+    # carried, not on sale) and that this file prints again beside its
+    # successor is the old series: priced, still not on sale (see the
+    # docstring). The successor counts as on sale when this file prints it
+    # or, for a dealer sheet, when the standing book sells it. In September
+    # both series were on sale and nothing changes for them.
+    row_keys = [price_list_model_key(row.model_name, row.variant_name) for row in rows]
+    standing_name = dict(connection.execute(
+        text("SELECT model_id, model_name FROM auditcore.product_models WHERE model_id = ANY(:ids)"),
+        {"ids": list({before["model_id"] for before in standing.values()})},
+    ).all()) if standing else {}
+    standing_priced = {price_list_model_key(name) for name in standing_name.values()}
+    standing_on_sale = {
+        price_list_model_key(standing_name[before["model_id"]]) for before in standing.values()
+        if "carriedReason" not in (before["metadata"] or {}) and before["model_id"] in standing_name
+    }
+    on_sale_keys = set(row_keys) | (standing_on_sale if not complete else set())
+    old_series_keys = {
+        old for old, new in _SUCCESSOR_IDENTITY.items()
+        if old in row_keys and new in on_sale_keys and old in standing_priced and old not in standing_on_sale
+    }
+    old_series_skus: set[UUID] = set()
     changed_skus: set[UUID] = set()
     item_rows: list[dict[str, Any]] = []
-    for row, sku_code in zip(rows, sku_codes):
+    for row, sku_code, row_key in zip(rows, sku_codes, row_keys):
         sku_id = sku_id_by_code[sku_code]
+        old_series = row_key in old_series_keys
+        if old_series:
+            old_series_skus.add(sku_id)
         for component_key, amount in row.components.items():
             before = standing.get((sku_id, component_key))
             unchanged = before is not None and Decimal(str(before["standard_amount"])) == amount
@@ -934,6 +976,12 @@ def ingest_price_list(
                 # changed release marker keeps the SKU it already had.
                 "printedAs": {"model": row.model_name, "variant": row.variant_name},
             }
+            if old_series:
+                metadata["oldSeries"] = True
+                metadata["carriedReason"] = (
+                    "old series printed beside its successor: this list's price, not on sale "
+                    "(product owner, 4 Nov 2026)"
+                )
             item_rows.append({
                 "tenant_id": tenant_id,
                 "price_list_version_id": version_id,
@@ -947,14 +995,35 @@ def ingest_price_list(
         # carries for the SKU is dropped for that SKU: the file is the SKU's
         # whole line
     carried_skus: set[UUID] = set()
+    carried_not_on_sale: set[UUID] = set()
     withdrawn_skus: set[UUID] = set()
+    standing_from = connection.execute(
+        text("SELECT effective_from FROM auditcore.price_list_versions WHERE price_list_version_id = :v"),
+        {"v": standing_version},
+    ).scalar_one() if standing_version is not None else None
+    new_month = standing_from is not None and (standing_from.year, standing_from.month) < (
+        effective_from.year, effective_from.month)
+    not_on_sale_reason = (
+        "not in this month's list: the previous month's price, not on sale "
+        "(product owner standing rule, 2 Nov 2026)"
+    )
     for (sku_id, component_key), before in standing.items():
         if sku_id in uploaded_skus:
             continue
+        carried_metadata = {**(before["metadata"] or {}), "carriedForwardFrom": str(standing_version)}
         if complete or before["model_id"] in file_models:
-            withdrawn_skus.add(sku_id)
-            continue
-        carried_skus.add(sku_id)
+            if not new_month and "carriedReason" not in (before["metadata"] or {}):
+                # A re-issue within the month that drops a variant it sold
+                # withdraws it (the OEM's 3 Sep 2026 list withdrew six old
+                # Scorpio N). A row already carried from the previous month
+                # stays carried.
+                withdrawn_skus.add(sku_id)
+                continue
+            carried_not_on_sale.add(sku_id)
+            # A row already carried keeps the reason it was first carried for.
+            carried_metadata.setdefault("carriedReason", not_on_sale_reason)
+        else:
+            carried_skus.add(sku_id)
         item_rows.append({
             "tenant_id": tenant_id,
             "price_list_version_id": version_id,
@@ -962,7 +1031,7 @@ def ingest_price_list(
             "component_key": component_key,
             "standard_amount": before["standard_amount"],
             "price_since": before["price_since"],
-            "metadata": json.dumps({**(before["metadata"] or {}), "carriedForwardFrom": str(standing_version)}),
+            "metadata": json.dumps(carried_metadata),
         })
     _chunked_insert_returning(
         connection,
@@ -981,6 +1050,8 @@ def ingest_price_list(
             "changed": len(changed_skus),
             "unchanged": len(uploaded_skus - changed_skus),
             "carriedForward": len(carried_skus),
+            "carriedNotOnSale": len(carried_not_on_sale),
+            "oldSeriesNotOnSale": len(old_series_skus),
             "withdrawn": len(withdrawn_skus),
             "completeBook": complete,
             "standingVersionId": str(standing_version) if standing_version else None,
@@ -2178,6 +2249,11 @@ _GRID_MODEL_ALIASES: dict[str, str] = {
     "MAXX HD 2.0": "MAXX HD",
     # The Camper is a variant group of PICK UP (review of PR 472, B1).
     "CAMPER": "PICK UP",
+    # The 4 Nov 2026 grid's spellings: "Thar OG" is the three-door Thar (the
+    # line beside "Thar Roxx"), "BE6 - New" the BE 6 line (same figures as
+    # October's "BE6"; it covers the BE 6 SPORTEQ through _GRID_ALSO_COVERS).
+    "THAR OG": "NEW THAR 2WD & 4WD",
+    "BE6 - NEW": "BE 6",
 }
 
 
@@ -2429,17 +2505,27 @@ def grid_row_for_model(
     # grid does not cover is taken from the previous month's grid -- the
     # October grid has no XUV400 line (September's "XUV400 EV" answers),
     # and the old Scorpio N, sold in October from the September series, takes
-    # September's "SCORPIO N Old" line. One month back only.
-    previous = grid_version_for_date(connection, tenant_id=tenant_id,
-                                     effective_on=version["effective_from"] - timedelta(days=1))
-    if previous is None or previous["grid_version_id"] == version["grid_version_id"]:
-        return None
-    carried = _grid_line_in_version(connection, tenant_id=tenant_id, version=previous, model_id=model_id,
-                                    variant_name=variant_name)
-    if carried is None:
-        return None
-    return {**carried, "carriedFromPreviousGrid": True, "gridInForceVersionNo": version["version_no"],
-            "gridInForceEffectiveFrom": str(version["effective_from"])}
+    # September's "SCORPIO N Old" line. The previous month's line is the one
+    # that month answered with, so the walk goes on back (4 Nov 2026: the
+    # November grid has no XUV400 line either, and October's answer was
+    # September's line).
+    current = version
+    for _ in range(_GRID_FALLBACK_MONTHS):
+        previous = grid_version_for_date(connection, tenant_id=tenant_id,
+                                         effective_on=current["effective_from"] - timedelta(days=1))
+        if previous is None or previous["grid_version_id"] == current["grid_version_id"]:
+            return None
+        carried = _grid_line_in_version(connection, tenant_id=tenant_id, version=previous, model_id=model_id,
+                                        variant_name=variant_name)
+        if carried is not None:
+            return {**carried, "carriedFromPreviousGrid": True, "gridInForceVersionNo": version["version_no"],
+                    "gridInForceEffectiveFrom": str(version["effective_from"])}
+        current = previous
+    return None
+
+
+# How far back a model's last grid line is looked for (a year of monthly grids).
+_GRID_FALLBACK_MONTHS = 12
 
 
 def _grid_line_in_version(

@@ -216,8 +216,9 @@ def test_publishing_the_missing_book_closes_the_task_without_a_journey_event(jou
 
 def test_a_pinned_sku_withdrawn_from_the_book_raises_a_pc_task_and_clears_its_standard(journey) -> None:
     """Review of PR 468, S4: a complete book that no longer lists the SKU
-    (the old Scorpio N in October) must say so: a PC task, and no standard
-    from an older book left standing."""
+    must say so: a PC task, and no standard from an older book left
+    standing. Within the month (a re-issue that withdraws the vehicle); a
+    new month's book keeps last month's price instead (the next test)."""
     from audit_core.uc03_deal_reconciliation import sync_deal_reconciliation
 
     c = journey
@@ -230,7 +231,7 @@ def test_a_pinned_sku_withdrawn_from_the_book_raises_a_pc_task_and_clears_its_st
                               "AND component_key='ex_showroom_price'"), {"t": c.tenant_id, "j": c.journey_id}).scalar_one()
     assert standard == Decimal("839501.15")
 
-    # A November book that no longer lists the vehicle.
+    # An October re-issue (20 Oct) that no longer lists the vehicle.
     wb_rows = _book(900_000.00)
     from openpyxl import load_workbook
 
@@ -238,22 +239,54 @@ def test_a_pinned_sku_withdrawn_from_the_book_raises_a_pc_task_and_clears_its_st
     wb.active["C2"] = "MAXX HD"
     buf = BytesIO()
     wb.save(buf)
-    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 11, 1),
+    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 10, 20),
                       parsed=parse_price_list(buf.getvalue()), actor_id="admin")
-    _set(c, pricing_effective_on=date(2026, 11, 5))  # the deal priced on its (later) invoice date
+    _set(c, pricing_effective_on=date(2026, 10, 25))  # the deal priced on its (later) invoice date
     result = sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert result["skuNotInPriceList"] is True and "error" not in result  # discounts still refreshed
     task = _task(c, SKU_NOT_IN_PRICE_MASTER_TASK)
     assert task["assigned_role_code"] == "PC" and task["task_status"] != "VERIFIED_COMPLETE"
-    assert task["title"] == "SKU MAXX_CITY::MAXX CITY 1.5 LX BS6.2 is not in the price master for 2026-11-05 — set the SKU"
+    assert task["title"] == "SKU MAXX_CITY::MAXX CITY 1.5 LX BS6.2 is not in the price master for 2026-10-25 — set the SKU"
     standard = c.execute(text("SELECT standard_amount, price_list_item_id FROM auditcore.commercial_lines WHERE tenant_id=:t "
                               "AND journey_id=:j AND component_key='ex_showroom_price'"),
                          {"t": c.tenant_id, "j": c.journey_id}).one()
     assert tuple(standard) == (None, None)
 
-    _set(c, pricing_effective_on=date(2026, 10, 20))  # back on a date whose book lists it
+    _set(c, pricing_effective_on=date(2026, 10, 10))  # back on a date whose book lists it
     sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert _task(c, SKU_NOT_IN_PRICE_MASTER_TASK)["task_status"] == "VERIFIED_COMPLETE"
+
+
+def test_a_pinned_sku_the_new_months_book_does_not_print_keeps_last_months_price(journey) -> None:
+    """Standing rule, product owner 1-2 Nov 2026: what the current month's
+    list does not print is priced from the previous month's series. A
+    November book without the pinned vehicle keeps its October figure,
+    carried (not on sale): the deal is priced on it and no "not in the price
+    master" task is raised."""
+    from audit_core.uc03_deal_reconciliation import sync_deal_reconciliation
+
+    c = journey
+    oem_id = c.execute(text("SELECT oem_id FROM auditcore.projects WHERE tenant_id=:t"), {"t": c.tenant_id}).scalar_one()
+    c.execute(text("INSERT INTO auditcore.journey_products (tenant_id, journey_id, product_sku_id, selection_status) "
+                   "VALUES (:t, :j, :s, 'CONFIRMED')"), {"t": c.tenant_id, "j": c.journey_id, "s": c.sku_id})
+    from openpyxl import load_workbook
+
+    wb = load_workbook(BytesIO(_book(900_000.00)))
+    wb.active["C2"] = "MAXX HD"
+    buf = BytesIO()
+    wb.save(buf)
+    stats: dict = {}
+    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 11, 4),
+                      parsed=parse_price_list(buf.getvalue()), actor_id="admin", stats=stats)
+    assert stats["carriedNotOnSale"] == 1 and stats["withdrawn"] == 0
+    _set(c, pricing_effective_on=date(2026, 11, 10))
+    result = sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert "skuNotInPriceList" not in result and "error" not in result
+    assert _task(c, SKU_NOT_IN_PRICE_MASTER_TASK) is None
+    standard = c.execute(text("SELECT standard_amount FROM auditcore.commercial_lines WHERE tenant_id=:t "
+                              "AND journey_id=:j AND component_key='ex_showroom_price'"),
+                         {"t": c.tenant_id, "j": c.journey_id}).scalar_one()
+    assert standard == Decimal("852000.62")  # October's figure
 
 
 def test_a_page_view_never_raises_the_withdrawn_sku_task(journey) -> None:
@@ -273,9 +306,9 @@ def test_a_page_view_never_raises_the_withdrawn_sku_task(journey) -> None:
     wb.active["C2"] = "MAXX HD"
     buf = BytesIO()
     wb.save(buf)
-    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 11, 1),
+    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 10, 20),
                       parsed=parse_price_list(buf.getvalue()), actor_id="admin")
-    _set(c, pricing_effective_on=date(2026, 11, 5))
+    _set(c, pricing_effective_on=date(2026, 10, 25))
     sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="", raise_findings=False)
     assert _task(c, SKU_NOT_IN_PRICE_MASTER_TASK) is None
 
@@ -296,14 +329,14 @@ def test_the_publish_sweep_re_prices_the_deal(journey) -> None:
     wb.active["C2"] = "MAXX HD"
     buf = BytesIO()
     wb.save(buf)
-    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 11, 1),
+    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 10, 20),
                       parsed=parse_price_list(buf.getvalue()), actor_id="admin")
-    _set(c, pricing_effective_on=date(2026, 11, 5))
+    _set(c, pricing_effective_on=date(2026, 10, 25))
     sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     assert _task(c, SKU_NOT_IN_PRICE_MASTER_TASK)["task_status"] != "VERIFIED_COMPLETE"
 
-    # A corrected November book that lists MAXX CITY again.
-    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 11, 1),
+    # A corrected 20 Oct book that lists MAXX CITY again.
+    ingest_price_list(c, tenant_id=c.tenant_id, oem_id=oem_id, effective_from=date(2026, 10, 20),
                       parsed=parse_price_list(_book(860_000.00)), actor_id="admin")
     assert _task(c, SKU_NOT_IN_PRICE_MASTER_TASK)["task_status"] == "VERIFIED_COMPLETE"
     standard = c.execute(text("SELECT standard_amount FROM auditcore.commercial_lines WHERE tenant_id=:t AND journey_id=:j "
