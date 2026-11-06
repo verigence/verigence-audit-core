@@ -1,4 +1,4 @@
-"""0198_closure_closes_answered_tasks -- tasks a Reviewer's closure answered
+"""0198_closure_closes_tasks -- tasks a Reviewer's closure answered
 are closed with it (2026-11-06).
 
 SHI-SS-261027-013 was "Closed by Reviewer · awaiting TL" while its task "Fix
@@ -15,7 +15,7 @@ from __future__ import annotations
 from alembic import op
 from sqlalchemy import text
 
-revision = "0198_closure_closes_answered_tasks"
+revision = "0198_closure_closes_tasks"
 down_revision = "0197_p2_journey_exports"
 branch_labels = None
 depends_on = None
