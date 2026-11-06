@@ -14,6 +14,7 @@ from conftest import delete_tenant_data
 from fastapi.testclient import TestClient
 from p2_support import AllowAllAuthorization, create_p2_journey, database_engine
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError
 
 from audit_core import uc03_p2_access_locations as watch
 from audit_core.db import set_tenant_context
@@ -182,7 +183,7 @@ def test_the_log_is_append_only_and_kept_per_project(setup):
     with s.engine.connect() as connection:
         connection.execute(text("SET ROLE audit_core_runtime"))
         set_tenant_context(connection, s.journey.tenant_id)
-        with pytest.raises(Exception):
+        with pytest.raises(DBAPIError):
             connection.execute(text("UPDATE auditcore.p2_access_locations SET role_code='TL'"))
         connection.rollback()
         connection.execute(text("SET ROLE audit_core_runtime"))
