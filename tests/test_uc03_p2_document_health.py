@@ -75,7 +75,7 @@ def _unit(hours_old: float = 1.0, **fields):
         (_unit(queue_status="MERGED"), "CLASSIFIED", "HIDDEN", None),
         (_unit(queue_status="CANCELLED"), "CLASSIFIED", "HIDDEN", None),
         (_unit(queue_status="READY"), "SUPERSEDED", "SUPERSEDED", "RESTORE"),
-        (_unit(queue_status="FAILED", last_error="DI_QUALITY_BLUR"), "FAILED", "REJECTED", "UPLOAD_AGAIN"),
+        (_unit(queue_status="FAILED", last_error="DI_QUALITY_BLUR"), "FAILED", "REJECTED", "READ_AS_IS"),
         (_unit(queue_status="DEAD_LETTER", last_error="FILE_EMPTY"), None, "REJECTED", "UPLOAD_AGAIN"),
         (_unit(queue_status="DEAD_LETTER", last_error="boom"), None, "FAILED", "RETRY"),
         (_unit(queue_status="NEEDS_REVIEW"), "CLASSIFIED", "NOTHING_READ", "READ_AGAIN"),

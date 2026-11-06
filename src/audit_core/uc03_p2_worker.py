@@ -48,7 +48,7 @@ import structlog
 from httpx import HTTPStatusError, TransportError
 from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError
-from sqlalchemy import Engine, text
+from sqlalchemy import Connection, Engine, text
 
 from audit_core import uc03_p2_runtime as _runtime
 from audit_core.config import SettingsError, load_settings
@@ -185,6 +185,35 @@ def _ladder(work_type: str, payload: dict[str, Any] | None = None) -> tuple[tupl
     # Background recomputation (stage, task verification, controls) keeps
     # the spread-out ladder of 2026-10-01: the PC does not wait on it.
     return _RETRY_DELAYS_SECONDS, _MAX_ATTEMPTS
+
+
+# A page the PC uploads again after DI refused it for scan quality (faded,
+# blurred, small) is read: the PC has looked at it and sent it again
+# (product owner 2026-11-06: "I have seen pics being correct only ... we have
+# to take the same page and upload"). DI's verdict for the same bytes never
+# changes -- 26 such pages in 10 days, every one refused again -- so without
+# this a readable page could never get in. DI still measures and records the
+# page's scores; only the refusal is waived. Empty, corrupt or oversized files
+# are still refused.
+UPLOADER_CONFIRMED_QUALITY = "UPLOADER_CONFIRMED"
+
+
+def page_refused_for_scan_quality_before(connection: Connection, *, tenant_id: str, queue_id: Any) -> bool:
+    """True when this unit (a page, or any page merged into this document)
+    replaced a copy of itself that DI refused for scan quality
+    (``quality_confirmed``, set when the page was split)."""
+    return bool(connection.execute(
+        text(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM auditcore.p2_document_queue q
+                WHERE q.tenant_id=:t AND q.quality_confirmed
+                  AND (q.queue_id=:id OR q.merged_into_queue_id=:id)
+            )
+            """
+        ),
+        {"t": tenant_id, "id": queue_id},
+    ).scalar())
 
 
 def _max_attempts(work_type: str, payload: dict[str, Any] | None = None) -> int:
@@ -1023,6 +1052,14 @@ def _refuse_duplicate_upload(engine: Engine, work: WorkItem, *, batch_id: UUID, 
                 FROM auditcore.p2_upload_batches
                 WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND sha256=:sha256
                   AND batch_id<>:batch_id AND batch_status NOT IN ('FAILED','PARTIAL_FAILURE','CANCELLED')
+                  -- A file with a page refused for scan quality is not a duplicate even
+                  -- once that page was swept and the file reads COMPLETED (2026-11-06):
+                  -- the PC sends it again so that page is read (UPLOADER_CONFIRMED).
+                  AND NOT EXISTS (
+                      SELECT 1 FROM auditcore.p2_document_queue q
+                      WHERE q.tenant_id=p2_upload_batches.tenant_id AND q.batch_id=p2_upload_batches.batch_id
+                        AND q.unit_kind='PAGE' AND q.last_error LIKE 'DI\\_QUALITY\\_%'
+                  )
                 ORDER BY created_at_utc ASC LIMIT 1
                 """
             ),
@@ -1182,6 +1219,24 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
         # is processed.
         superseded_batches: set[str] = set()
         fresh_shas = [r["pageSha"] for r in page_records if r["pageSha"] not in already]
+        # Pages DI refused for scan quality that the PC is sending again: read
+        # this time (UPLOADER_CONFIRMED_QUALITY). Found before the old copy is
+        # superseded, which overwrites its refusal code.
+        quality_confirmed_shas = {
+            str(sha) for sha in connection.execute(
+                text(
+                    f"""
+                    SELECT DISTINCT q.page_sha256 FROM auditcore.p2_document_queue q
+                    WHERE q.tenant_id=:tenant_id AND q.journey_id=:journey_id AND q.batch_id<>:batch_id
+                      AND q.unit_kind='PAGE' AND q.page_sha256 = ANY(:shas)
+                      AND (q.queue_status IN ('FAILED','DEAD_LETTER') OR {swept_pending_sql("q")})
+                      AND (q.last_error LIKE 'DI_QUALITY\\_%' OR q.quality_confirmed)
+                    """
+                ),
+                {"tenant_id": work.tenant_id, "journey_id": work.journey_id, "batch_id": batch["batch_id"],
+                 "shas": fresh_shas},
+            ).scalars().all()
+        } if fresh_shas else set()
         for record in page_records:
             if record["pageSha"] in already:
                 continue
@@ -1251,16 +1306,20 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                     INSERT INTO auditcore.p2_document_queue (
                         tenant_id, queue_id, batch_id, journey_id, page_number,
                         page_sha256, page_object_key, client_upload_id,
-                        queue_status, status_reason, last_error, correlation_id, unit_kind, page_numbers
+                        queue_status, status_reason, last_error, correlation_id, unit_kind, page_numbers,
+                        quality_confirmed
                     ) VALUES (
                         :tenant_id, :queue_id, :batch_id, :journey_id, :page_number,
                         :page_sha, :object_key, :client_upload_id,
-                        :queue_status, :status_reason, :last_error, :correlation_id, 'PAGE', ARRAY[:page_number]
+                        :queue_status, :status_reason, :last_error, :correlation_id, 'PAGE', ARRAY[:page_number],
+                        :quality_confirmed
                     )
                     ON CONFLICT (tenant_id, batch_id, page_number) WHERE unit_kind='PAGE'
                     DO UPDATE SET page_sha256=EXCLUDED.page_sha256,
                                   page_object_key=EXCLUDED.page_object_key,
                                   client_upload_id=EXCLUDED.client_upload_id,
+                                  quality_confirmed=p2_document_queue.quality_confirmed
+                                                    OR EXCLUDED.quality_confirmed,
                                   updated_at_utc=now()
                     """
                 ),
@@ -1280,6 +1339,7 @@ def _split_batch(engine: Engine, work: WorkItem) -> None:
                     ),
                     "last_error": "DUPLICATE_PAGE" if duplicate_of else None,
                     "correlation_id": work.correlation_id,
+                    "quality_confirmed": record["pageSha"] in quality_confirmed_shas,
                 },
             )
             if duplicate_of:
@@ -1593,6 +1653,13 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
         # after grouping stands alone and is read in full.
         read_once = read_once_di_types(get_registry())
         requirement_refs = {k: v for k, v in requirement_refs.items() if k not in read_once}
+    with engine.begin() as connection:
+        set_tenant_context(connection, work.tenant_id)
+        quality_gate = (
+            UPLOADER_CONFIRMED_QUALITY
+            if page_refused_for_scan_quality_before(connection, tenant_id=work.tenant_id, queue_id=queue_id)
+            else None
+        )
     v2_client = get_di_capture_v2_client()
     content_type = "application/pdf" if str(row["page_object_key"]).endswith(".pdf") else str(row["original_content_type"] or "application/octet-stream")
     filename = (
@@ -1621,6 +1688,7 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
             {k: v for k, v in requirement_refs.items() if k in override} if override else requirement_refs
         ),
         classification_mode=classification_mode,
+        **({"quality_gate": quality_gate} if quality_gate else {}),
         # DI's capture contract takes the file's identity only; it measures
         # the bytes itself on upload and rejects any other field.
         files=[{

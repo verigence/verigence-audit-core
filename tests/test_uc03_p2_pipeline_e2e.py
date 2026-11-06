@@ -85,8 +85,10 @@ class FakeDI:
 
     def create_upload_intents(self, *, token, tenant_id, external_context_ref, phase, files,
                               candidate_document_type_keys, requirement_refs_by_document_type_key,
-                              classification_mode=None):
+                              classification_mode=None, quality_gate=None):
         self.intent_calls += 1
+        self.quality_gates = getattr(self, "quality_gates", [])
+        self.quality_gates.extend((f["filename"], quality_gate) for f in files)
         trusted = classification_mode == "TRUST_SINGLE_CANDIDATE"
         assert not trusted or len(candidate_document_type_keys) == 1
         uploads = []
@@ -492,3 +494,36 @@ def test_the_same_file_after_a_failed_or_removed_upload_is_a_new_upload(pipeline
         )
     [done] = client.post(f"{base}/uploads:init", json={"files": [file]}).json()["uploads"]
     assert done["batchId"] == first["batchId"] and done["alreadyAccepted"] is True
+
+
+def test_a_page_refused_for_scan_quality_and_uploaded_again_is_read_as_confirmed(pipeline):
+    """2026-11-06: the PC sends the same page again after DI refused it for scan
+    quality ("I have seen pics being correct only"). The new copy goes to DI with
+    the UPLOADER_CONFIRMED quality gate; the other pages of the file do not."""
+    journey, storage, di = pipeline
+    di.fail_next_finalize = False
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}"
+    pdf = _three_page_pdf()
+
+    def upload(client_upload_id: str) -> None:
+        [prepared] = client.post(f"{base}/uploads:init", json={"files": [{
+            "filename": "booking-packet.pdf", "contentType": "application/pdf", "sizeBytes": len(pdf),
+            "clientUploadId": client_upload_id}]}).json()["uploads"]
+        storage.objects[prepared["uploadUrl"].split("https://storage.test/", 1)[1]] = pdf
+        assert client.post(f"{base}/uploads/{prepared['batchId']}:finalize").status_code == 202
+        _drain(journey)
+
+    upload("e2e-quality-0001")
+    assert all(gate is None for _, gate in di.quality_gates)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET queue_status='FAILED', "
+                 "last_error='DI_QUALITY_IMAGE_CONTRAST' WHERE tenant_id=:t AND unit_kind='PAGE' AND page_number=2"),
+            {"t": journey.tenant_id},
+        )
+    di.quality_gates = []
+    upload("e2e-quality-0002")  # the same file, saved again
+    assert [name for name, gate in di.quality_gates if gate == "UPLOADER_CONFIRMED"] == ["booking-packet-page-002.pdf"]
+

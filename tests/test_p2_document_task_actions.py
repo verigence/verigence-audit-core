@@ -251,17 +251,25 @@ def test_set_type_and_send_on_a_swept_page_of_unknown_type(journey):
     assert [p["queueId"] for p in task["reference"]["pages"]] == [str(other["queue_id"])]
 
 
-def test_a_swept_quality_refused_page_is_not_sent_again(journey):
+@pytest.mark.parametrize("swept", [True, False])
+def test_a_quality_refused_page_is_sent_as_it_is_confirmed_by_the_pc(journey, swept):
+    """2026-11-06: "I have seen pics being correct only ... we have to take the
+    same page and upload." Send again (or setting its type) reads the stored
+    page with DI's UPLOADER_CONFIRMED quality gate instead of refusing."""
     _, [page] = add_batch_pages(journey, [(None, "FAILED")], grouping_status="NOT_NEEDED")
     _sql(journey, "UPDATE auditcore.p2_document_queue SET last_error='DI_QUALITY_IMAGE_BLUR_SCORE' WHERE queue_id=:q",
          q=page["queue_id"])
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        sweep_failed_pages(connection, tenant_id=journey.tenant_id)
-    for action in (lambda: _set_type(journey, page["queue_id"], "customer_kyc"), lambda: _retry(journey, page["queue_id"])):
-        with pytest.raises(HTTPException) as refused:
-            action()
-        assert refused.value.status_code == 409 and "scan quality" in refused.value.detail
+    if swept:
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            sweep_failed_pages(connection, tenant_id=journey.tenant_id)
+    sent = _retry(journey, page["queue_id"])
+    assert sent["qualityConfirmed"] is True
+    new_unit = _unit(journey, sent["queueId"])
+    assert new_unit["queue_status"] == "QUEUED" and new_unit["quality_confirmed"] is True
+    assert new_unit["candidate_override"] is None  # type unknown: DI classifies it
+    old = _unit(journey, page["queue_id"])
+    assert old["queue_status"] == "CANCELLED" and old["last_error"] == "SUPERSEDED_PAGE"
 
 
 def test_a_cancelled_page_that_was_not_swept_cannot_be_sent_again(journey):

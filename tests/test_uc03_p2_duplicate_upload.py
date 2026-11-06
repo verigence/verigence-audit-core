@@ -221,7 +221,7 @@ def test_a_page_already_on_the_journey_is_not_sent_again(journey, monkeypatch):
     assert units[0]["status_reason"].startswith("Same as page 2 of monday.pdf")
 
 
-def test_a_page_rejected_for_scan_quality_is_final(journey, monkeypatch):
+def test_a_page_rejected_for_scan_quality_is_not_retried_but_the_pc_can_send_it_as_it_is(journey, monkeypatch):
     storage = MemoryStorage()
     monkeypatch.setattr(worker, "get_p2_document_storage", lambda: storage)
     monkeypatch.setattr(worker, "_owned", lambda *args, **kwargs: None)
@@ -250,9 +250,11 @@ def test_a_page_rejected_for_scan_quality_is_final(journey, monkeypatch):
         ).scalar_one()
     client = TestClient(app, raise_server_exceptions=False)
     base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}"
+    # 2026-11-06: DI is not asked again on its own, but the PC who has looked
+    # at the page may send it as it is: read with the UPLOADER_CONFIRMED gate.
     response = client.post(f"{base}/pages/{queue_id}:retry")
-    assert response.status_code == 409
-    assert "Re-scan it" in response.json()["detail"]
+    assert response.status_code == 202, response.text
+    assert response.json()["qualityConfirmed"] is True
 
 
 def test_a_failed_page_uploaded_again_is_superseded_and_its_task_closes(journey, monkeypatch):

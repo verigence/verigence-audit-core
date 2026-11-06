@@ -2101,10 +2101,24 @@ def retry_page(
     if unit["queue_status"] not in _RETRYABLE_PAGE_STATES and not swept:
         raise HTTPException(status_code=409, detail="Only failed pages can be retried.")
     if str(unit.get("last_error") or "").startswith("DI_QUALITY_"):
-        raise HTTPException(
-            status_code=409,
-            detail="This page was rejected for scan quality; retrying will not help. Re-scan it and upload it again.",
+        # The PC has looked at the refused page and sends it as it is (product
+        # owner 2026-11-06: "I have seen pics being correct only"): read from
+        # its stored file with DI's UPLOADER_CONFIRMED quality gate, classified
+        # as any upload is unless its type is already known. Used to be refused
+        # here: "retrying will not help", and the same bytes were refused again.
+        known = get_registry().documents.get(str(unit.get("template_key") or ""))
+        if known is not None and (known.key == _OTHER_DOCUMENT_TEMPLATE or not known.di_types):
+            known = None
+        classified = str(unit.get("classified_document_type") or "")
+        new_id = _send_page_again(
+            connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit, template=known,
+            di_type=(classified if known is not None and classified in known.di_types
+                     else (known.di_types[0] if known is not None else None)),
+            actor_id=human_principal.subject, role=access.operating_role, swept=True,
+            event_type="PAGE_SENT_AGAIN_QUALITY_CONFIRMED", override_reason=None,
+            correlation_id=get_correlation_id(request), quality_confirmed=True,
         )
+        return {"queueId": str(new_id), "status": "QUEUED", "qualityConfirmed": True}
     if swept:
         template = get_registry().documents.get(str(unit.get("template_key") or ""))
         if template is None or template.key == _OTHER_DOCUMENT_TEMPLATE or not template.di_types:
@@ -2378,8 +2392,8 @@ def _guard_reviewed_stage(
 
 def _send_page_again(
     connection: Connection, *, tenant_id: str, journey_id: UUID, unit: dict[str, Any], template: Any,
-    di_type: str, actor_id: str, role: str | None, swept: bool, event_type: str, override_reason: str | None,
-    correlation_id: str | None,
+    di_type: str | None, actor_id: str, role: str | None, swept: bool, event_type: str,
+    override_reason: str | None, correlation_id: str | None, quality_confirmed: bool = False,
 ) -> UUID:
     """Read a page again from its stored file, as ``template`` (product owner
     2026-10-27). A new unit is queued with exactly that type (DI does not
@@ -2390,15 +2404,20 @@ def _send_page_again(
     other page is merged into the new unit, as re-typing always did."""
     queue_id = UUID(str(unit["queue_id"]))
     pages = list(unit["page_numbers"] or [unit["page_number"]])
-    client_upload_id = f"p2t-{unit['batch_id']}-{'-'.join(map(str, pages))}-{template.key}-{queue_id.hex[:8]}"
+    type_key = template.key if template is not None else "q"
+    client_upload_id = f"p2t-{unit['batch_id']}-{'-'.join(map(str, pages))}-{type_key}-{queue_id.hex[:8]}"
     new_id = uuid4()
-    words = f"{template.display_name} by {role or 'PC'}"
+    words = (f"{template.display_name} by {role or 'PC'}" if template is not None
+             else f"it is, confirmed by {role or 'PC'}")
     if swept:
+        # Replaced: CANCELLED (a FAILED page refused for scan quality too) and
+        # marked SUPERSEDED_PAGE, as a re-upload marks it.
         connection.execute(
             text(
                 """
                 UPDATE auditcore.p2_document_queue
-                SET last_error='SUPERSEDED_PAGE', status_reason=:reason, updated_at_utc=now()
+                SET queue_status='CANCELLED', last_error='SUPERSEDED_PAGE', status_reason=:reason,
+                    updated_at_utc=now()
                 WHERE tenant_id=:tenant_id AND queue_id=:queue_id
                 """
             ),
@@ -2424,11 +2443,11 @@ def _send_page_again(
                 tenant_id, queue_id, batch_id, journey_id, page_number, page_numbers, page_sha256,
                 page_object_key, client_upload_id, queue_status, unit_kind, group_source,
                 candidate_override, classified_document_type, template_key, business_stage,
-                type_overridden_by_actor_id, read_clock_started_at_utc
+                type_overridden_by_actor_id, read_clock_started_at_utc, quality_confirmed
             ) VALUES (
                 :tenant_id, :new_id, :batch_id, :journey_id, :page_number, :page_numbers, :sha,
                 :object_key, :client_upload_id, 'QUEUED', 'GROUP', 'PC',
-                CAST(:candidates AS jsonb), :di_type, :template_key, :stage, :actor, now()
+                CAST(:candidates AS jsonb), :di_type, :template_key, :stage, :actor, now(), :quality_confirmed
             )
             ON CONFLICT (tenant_id, client_upload_id) DO NOTHING
             RETURNING queue_id
@@ -2438,9 +2457,11 @@ def _send_page_again(
             "tenant_id": tenant_id, "new_id": new_id, "batch_id": unit["batch_id"], "journey_id": journey_id,
             "page_number": pages[0], "page_numbers": pages, "sha": unit["page_sha256"],
             "object_key": unit["page_object_key"], "client_upload_id": client_upload_id,
-            "candidates": json.dumps([di_type]), "di_type": di_type,
-            "template_key": template.key, "stage": template.stage if template.stage != "ANY" else None,
-            "actor": actor_id,
+            "candidates": json.dumps([di_type]) if di_type else None, "di_type": di_type,
+            "template_key": template.key if template is not None else None,
+            "stage": template.stage if template is not None and template.stage != "ANY" else None,
+            "actor": actor_id if template is not None else None,
+            "quality_confirmed": quality_confirmed,
         },
     ).scalar_one_or_none()
     if inserted is None:
@@ -2453,7 +2474,8 @@ def _send_page_again(
     _activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type=event_type,
         subject_type="DOCUMENT_PAGE", subject_id=str(queue_id),
-        details={"templateKey": template.key, "newQueueId": str(new_id), "by": actor_id,
+        details={"templateKey": template.key if template is not None else None, "newQueueId": str(new_id),
+                 "by": actor_id, "qualityConfirmed": quality_confirmed,
                  "previousStatus": "SWEPT" if swept else unit["queue_status"],
                  "previousCode": unit.get("last_error"),
                  **({"overrideReason": override_reason} if override_reason else {})},
@@ -2500,15 +2522,10 @@ def set_page_type(
     swept = unit["queue_status"] == "CANCELLED" and _is_swept(connection, tenant_id=tenant_id, queue_id=queue_id)
     if unit["queue_status"] not in _RETYPEABLE_PAGE_STATES and not swept:
         raise HTTPException(status_code=409, detail="This page is still being processed.")
-    if swept and str(unit.get("last_error") or "").startswith("DI_QUALITY_"):
-        # A swept page refused for scan quality is not sent again: DI's
-        # scan-quality check runs before the type is looked at, so the same
-        # scan is refused whatever its type (2026-10-27: quality-refused
-        # pages keep their own task, with no type option).
-        raise HTTPException(
-            status_code=409,
-            detail="This page was rejected for scan quality; setting its type will not help. Re-scan it and upload it again.",
-        )
+    # A page refused for scan quality, typed by the PC: sent as it is with DI's
+    # UPLOADER_CONFIRMED quality gate (2026-11-06; until then refused here,
+    # because DI refuses the same scan whatever its type).
+    quality_refused = str(unit.get("last_error") or "").startswith("DI_QUALITY_")
     if template.key == _OTHER_DOCUMENT_TEMPLATE:
         # "Others": the PC confirms the page is not a checklist document. It
         # stays on file as supporting evidence and is never sent for reading.
@@ -2548,8 +2565,9 @@ def set_page_type(
     )
     new_id = _send_page_again(
         connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit, template=template,
-        di_type=template.di_types[0], actor_id=human_principal.subject, role=access.operating_role, swept=swept,
-        event_type="PAGE_RETYPED", override_reason=override, correlation_id=get_correlation_id(request),
+        di_type=template.di_types[0], actor_id=human_principal.subject, role=access.operating_role,
+        swept=swept or quality_refused, event_type="PAGE_RETYPED", override_reason=override,
+        correlation_id=get_correlation_id(request), quality_confirmed=quality_refused,
     )
     return {"queueId": str(new_id), "status": "QUEUED", "templateKey": template.key}
 
