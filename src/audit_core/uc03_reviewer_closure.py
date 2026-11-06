@@ -236,6 +236,86 @@ def has_reviewer_closure(connection: Connection, *, tenant_id: str, journey_id: 
 
 # --------------------------------------------------------------------------- closing
 
+CLOSED_BY_CLOSURE = "CLOSED_BY_REVIEWER_CLOSURE"
+
+
+def close_answered_tasks(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, closure_id: UUID | str,
+    items: list[dict[str, Any]], actor_id: str,
+) -> list[str]:
+    """The open tasks the closure answered, closed with it (2026-11-06: a closed
+    journey still showed "Fix pages that could not be processed" to the PC).
+
+    - an open task item: that task;
+    - an open finding: the finding's own task(s);
+    - a missing document: its Document Missing task.
+
+    Each keeps the answer, the closure and its issue hash (``acceptedIssueHash``),
+    so the next sync does not reopen it for the same problem; a new problem (a
+    different hash) still raises it again. The closure's own follow-up tasks
+    are never touched. Returns the ids closed."""
+    from audit_core.uc03_p2_tasks import record_task_event
+
+    task_answers: dict[str, str] = {}
+    finding_answers: dict[str, str] = {}
+    document_answers: dict[str, str] = {}
+    for item in items:
+        kind, _, ref = str(item.get("key") or "").partition(":")
+        answer = str(item.get("answer") or "")
+        if kind == "task":
+            task_answers[ref] = answer
+        elif kind == "finding":
+            finding_answers[ref] = answer
+        elif kind == "document":
+            document_answers[ref] = answer
+    if not (task_answers or finding_answers or document_answers):
+        return []
+    rows = connection.execute(
+        text(
+            """
+            SELECT task_id, task_type, reference
+            FROM auditcore.p2_tasks
+            WHERE tenant_id=:t AND journey_id=:j AND task_status = ANY(CAST(:open AS varchar[]))
+              AND task_type <> ALL(CAST(:skip AS varchar[]))
+              AND (CAST(task_id AS text) = ANY(CAST(:tasks AS text[]))
+                   OR reference->>'findingId' = ANY(CAST(:findings AS text[]))
+                   OR (task_type = 'DOCUMENT_MISSING'
+                       AND reference->>'requirementKey' = ANY(CAST(:documents AS text[]))))
+            FOR UPDATE
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "open": list(_OPEN_TASK_STATUSES), "skip": list(_NOT_ITEMS),
+         "tasks": list(task_answers), "findings": list(finding_answers), "documents": list(document_answers)},
+    ).mappings().all()
+    closed: list[str] = []
+    for row in rows:
+        task_id = str(row["task_id"])
+        reference = dict(row["reference"] or {})
+        answer = (task_answers.get(task_id)
+                  or finding_answers.get(str(reference.get("findingId") or ""))
+                  or document_answers.get(str(reference.get("requirementKey") or "")) or "")
+        result = {"outcome": CLOSED_BY_CLOSURE, "closureId": str(closure_id), "answer": answer,
+                  "closedBy": actor_id, "closedRole": "REVIEWER",
+                  "acceptedIssueHash": reference.get("issueHash")}
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_tasks
+                SET task_status='VERIFIED_COMPLETE', verified_at_utc=now(), updated_at_utc=now(),
+                    completed_by_actor_id=:actor,
+                    completion_result=COALESCE(completion_result, '{}'::jsonb) || CAST(:result AS jsonb)
+                WHERE tenant_id=:t AND task_id=:id
+                """
+            ),
+            {"t": tenant_id, "id": row["task_id"], "actor": actor_id, "result": _json(result)},
+        )
+        record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id, task_id=row["task_id"],
+                          event_type=CLOSED_BY_CLOSURE, actor_id=actor_id, actor_role_code="REVIEWER",
+                          comment=answer or None, details={"closureId": str(closure_id)})
+        closed.append(task_id)
+    return closed
+
+
 def close_journey(
     connection: Connection, *, tenant_id: str, journey_id: UUID, actor_id: str, actor_role: str,
     comment: str, answers: dict[str, str], correlation_id: str | None = None,
@@ -317,6 +397,10 @@ def close_journey(
          "hours": ACCEPTANCE_WINDOW_HOURS},
     ).mappings().one()
     closure_id, due = row["closure_id"], row["acceptance_due_utc"]
+    # The tasks those answers cover are closed with the journey: nothing is
+    # left open for the PC or the Team Lead that the closure already answered.
+    close_answered_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, closure_id=closure_id,
+                         items=answered, actor_id=actor_id)
 
     # The Reviewer's closure is the journey's review (it replaces the Team Lead's).
     mark_delivery_reviewed(connection, tenant_id=tenant_id, journey_id=journey_id, actor_id=actor_id,
