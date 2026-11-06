@@ -120,6 +120,33 @@ class DependencyUnavailableError(AuditCoreError):
         )
 
 
+NIGHT_MODE_ERROR_CODE = "NIGHT_MODE"
+NIGHT_MODE_MESSAGE = "Night Mode On"
+
+
+class NightModeError(AuditCoreError):
+    """Security's night control closed this feature to the caller (product owner, 6 Nov 2026).
+
+    The problem body carries the feature and the window so the apps can show
+    "Night Mode On" with the hours, without a second call.
+    """
+
+    def __init__(
+        self,
+        *,
+        feature_key: str,
+        message: str | None = None,
+        starts_at: str | None = None,
+        ends_at: str | None = None,
+    ) -> None:
+        super().__init__(
+            NIGHT_MODE_ERROR_CODE, 403, NIGHT_MODE_MESSAGE, message or NIGHT_MODE_MESSAGE
+        )
+        self.feature_key = feature_key
+        self.starts_at = starts_at
+        self.ends_at = ends_at
+
+
 def security_admin_failure(exc: SecurityAdminError, *, action: str) -> AuditCoreError:
     """Translate a Security administrative failure by what Security answered: the caller's
     authentication/permission (401/403) or a business refusal (4xx) is not an outage."""
@@ -150,6 +177,7 @@ def _problem(
     detail: str,
     exc: BaseException | None = None,
     headers: dict[str, str] | None = None,
+    extensions: dict[str, object] | None = None,
 ) -> JSONResponse:
     correlation_id = get_correlation_id(request)
     category = error_category(status_code, error_code)
@@ -193,8 +221,15 @@ def _problem(
             "errorCategory": category,
             "retryable": retryable,
             "correlationId": correlation_id,
+            # Problem-details extension members; they never override the standard ones.
+            **{key: value for key, value in (extensions or {}).items() if key not in _PROBLEM_MEMBERS},
         },
     )
+
+
+_PROBLEM_MEMBERS = frozenset(
+    {"type", "title", "status", "detail", "errorCode", "errorCategory", "retryable", "correlationId"}
+)
 
 
 def _route_template(request: Request) -> str:
@@ -337,6 +372,22 @@ def install_error_handlers(app: FastAPI) -> None:
             status_code=exc.status_code,
             title=exc.title,
             detail=exc.title,
+        )
+
+    @app.exception_handler(NightModeError)
+    async def night_mode_error(request: Request, exc: NightModeError) -> JSONResponse:
+        return _problem(
+            request,
+            error_code=exc.error_code,
+            status_code=exc.status_code,
+            title=exc.title,
+            detail=exc.detail,
+            extensions={
+                "featureKey": exc.feature_key,
+                "reasonCode": NIGHT_MODE_ERROR_CODE,
+                "startsAt": exc.starts_at,
+                "endsAt": exc.ends_at,
+            },
         )
 
     @app.exception_handler(AuditCoreError)
