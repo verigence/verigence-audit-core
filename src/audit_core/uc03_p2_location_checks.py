@@ -57,8 +57,9 @@ router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-locat
 admin_router = APIRouter(prefix="/v1/admin/tenants/{tenant_id}", tags=["uc03-phase2-location-checks-admin"])
 
 _READ_PERMISSION = "audit.journey.read"
-_VIEWER_ROLES = frozenset({"TL", "PM", "EXECUTIVE"})
-_ADMIN_FUNCTIONAL_ROLES = frozenset({"SUPER_ADMIN", "TENANT_ADMIN"})
+# Product owner, 6 Nov 2026: the location report is for SuperAdmin and Executive only.
+_VIEWER_ROLES = frozenset({"EXECUTIVE"})
+_ADMIN_FUNCTIONAL_ROLES = frozenset({"SUPER_ADMIN"})
 
 # Within this distance of an assigned outlet a PC is at the outlet. It mirrors
 # the default of myHR's attendance geofence (hrmgmt ``attendance.geofence_radius_m``,
