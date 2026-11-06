@@ -113,6 +113,11 @@ _REPORT_SQL = """
     SELECT j.journey_id, j.journey_reference,
            COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
            j.created_by_display_name AS pc_name, o.outlet_name,
+           j.dealer_id, d.dealer_name, j.outlet_id,
+           -- For the date filter (2026-11-06): the booking's confirmation day
+           -- (as the Journey list shows it) and the delivery day.
+           COALESCE(bk.booking_confirm_date, bk.booking_confirmed_at_utc::date) AS booking_date,
+           dl.actual_delivered_at::date AS delivery_date,
            jp.model_name_snapshot AS model, jp.variant_name_snapshot AS variant,
            e.item->>'key' AS discount_key, e.item->>'label' AS discount_label,
            e.item->>'status' AS status, (e.item->>'entitled')::numeric AS entitled,
@@ -125,7 +130,12 @@ _REPORT_SQL = """
     LEFT JOIN auditcore.dealer_outlets o
       ON o.tenant_id = j.tenant_id AND o.dealer_id = j.dealer_id AND o.outlet_id = j.outlet_id
     LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
+    LEFT JOIN auditcore.dealers d ON d.tenant_id = j.tenant_id AND d.dealer_id = j.dealer_id
+    LEFT JOIN auditcore.journey_stage_states bk
+      ON bk.tenant_id = j.tenant_id AND bk.journey_id = j.journey_id AND bk.stage_code = 'BOOKING'
+    LEFT JOIN auditcore.deliveries dl ON dl.tenant_id = j.tenant_id AND dl.journey_id = j.journey_id
     WHERE r.tenant_id = :tenant_id
+      AND (CAST(:status AS text) IS NULL OR e.item->>'status' = CAST(:status AS text))
       AND (CAST(:dealer_id AS uuid) IS NULL OR j.dealer_id = CAST(:dealer_id AS uuid))
       AND (CAST(:outlet_id AS uuid) IS NULL OR j.outlet_id = CAST(:outlet_id AS uuid))
       -- 2026-10-31: a cancelled or duplicate booking, or one closed with no
@@ -146,15 +156,20 @@ _REPORT_SQL = """
 
 def discount_variance_report(
     connection: Connection, *, tenant_id: str, dealer_id: UUID | None = None, outlet_id: UUID | None = None,
-    limit: int = 500,
+    limit: int = 500, status: str | None = None,
 ) -> dict[str, Any]:
     rows = connection.execute(
         text(_REPORT_SQL),
-        {"tenant_id": tenant_id, "dealer_id": dealer_id, "outlet_id": outlet_id, "limit": limit},
+        {"tenant_id": tenant_id, "dealer_id": dealer_id, "outlet_id": outlet_id, "limit": limit,
+         "status": status},
     ).mappings().all()
     items = [{
         "journeyId": str(r["journey_id"]), "journeyReference": r["journey_reference"],
         "customer": r["customer"], "pc": r["pc_name"], "outlet": r["outlet_name"],
+        "dealerId": None if r["dealer_id"] is None else str(r["dealer_id"]), "dealer": r["dealer_name"],
+        "outletId": None if r["outlet_id"] is None else str(r["outlet_id"]),
+        "bookingDate": None if r["booking_date"] is None else r["booking_date"].isoformat(),
+        "deliveryDate": None if r["delivery_date"] is None else r["delivery_date"].isoformat(),
         "model": r["model"], "variant": r["variant"],
         "discountKey": r["discount_key"], "discount": r["discount_label"], "status": r["status"],
         "entitled": None if r["entitled"] is None else str(r["entitled"]),
@@ -196,7 +211,8 @@ def read_discount_variance(
     connection: Annotated[Connection, Depends(get_connection)],
     outlet_id: UUID | None = None,
     dealer_id: UUID | None = None,
-    limit: Annotated[int, Query(ge=1, le=1000)] = 500,
+    limit: Annotated[int, Query(ge=1, le=5000)] = 500,
+    status: Annotated[str | None, Query(pattern="^(OVER_ENTITLEMENT|UNDER_ENTITLEMENT|ENTITLEMENT_UNKNOWN)$")] = None,
 ) -> dict[str, Any]:
     """Discounts given above or below the entitlement, with the discount
     category, PC, outlet, customer and car model and the document each figure
@@ -210,4 +226,4 @@ def read_discount_variance(
         permission_key=_READ_PERMISSION,
     )
     return discount_variance_report(
-        connection, tenant_id=tenant_id, dealer_id=dealer_id, outlet_id=outlet_id, limit=limit)
+        connection, tenant_id=tenant_id, dealer_id=dealer_id, outlet_id=outlet_id, limit=limit, status=status)

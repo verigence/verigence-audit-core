@@ -170,6 +170,22 @@ def test_the_report_carries_category_pc_outlet_customer_and_model(journey):
     assert {"discount", "pc", "outlet", "customer", "model", "variant", "variance"} <= set(item)
     assert item["discountKey"] == "CORPORATE" and Decimal(item["variance"]) == 15000
     assert UNDER and report["toleranceRupees"] == 100
+    # For the screen's filters (2026-11-06): the dealership, the outlet and the dates.
+    assert {"dealer", "dealerId", "outletId", "bookingDate", "deliveryDate"} <= set(item)
+    assert item["dealerId"] and item["outletId"]
+
+
+def test_the_report_can_list_only_the_over_grants(journey):
+    rows = [{"key": "U1", "label": "Under", "status": UNDER, "entitled": "90000", "invoice": "0", "variance": "-90000"},
+            {"key": "CORPORATE", "label": "Corporate", "status": OVER, "entitled": "0", "invoice": "500",
+             "variance": "500"}]
+    _sql(journey, "INSERT INTO auditcore.p2_journey_runtime (tenant_id, journey_id, current_stage, discount_variance) "
+                  "VALUES (:t, :j, 'BOOKING_VERIFY_DOCUMENTS', CAST(:d AS jsonb)) ON CONFLICT (tenant_id, journey_id) "
+                  "DO UPDATE SET discount_variance = EXCLUDED.discount_variance", d=json.dumps(rows))
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        over = discount_variance_report(connection, tenant_id=journey.tenant_id, status=OVER)["items"]
+    assert [i["discountKey"] for i in over] == ["CORPORATE"]
 
 
 def _sql(journey, sql, **params):
