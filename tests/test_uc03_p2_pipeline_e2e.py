@@ -527,3 +527,31 @@ def test_a_page_refused_for_scan_quality_and_uploaded_again_is_read_as_confirmed
     upload("e2e-quality-0002")  # the same file, saved again
     assert [name for name, gate in di.quality_gates if gate == "UPLOADER_CONFIRMED"] == ["booking-packet-page-002.pdf"]
 
+
+
+def test_journey_360_lists_each_uploaded_file_and_opens_it_as_uploaded(pipeline):
+    """2026-11-06: the full file the PC uploaded can be downloaded from Journey 360."""
+    journey, storage, di = pipeline
+    di.fail_next_finalize = False
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}"
+    pdf = _three_page_pdf()
+    [prepared] = client.post(f"{base}/uploads:init", json={"files": [
+        {"filename": "booking-packet.pdf", "contentType": "application/pdf", "sizeBytes": len(pdf),
+         "clientUploadId": "e2e-list-0001"},
+        {"filename": "never-sent.pdf", "contentType": "application/pdf", "sizeBytes": 10,
+         "clientUploadId": "e2e-list-0002"}][:1]}).json()["uploads"]
+    client.post(f"{base}/uploads:init", json={"files": [
+        {"filename": "never-sent.pdf", "contentType": "application/pdf", "sizeBytes": 10,
+         "clientUploadId": "e2e-list-0002"}]})
+    storage.objects[prepared["uploadUrl"].split("https://storage.test/", 1)[1]] = pdf
+    assert client.post(f"{base}/uploads/{prepared['batchId']}:finalize").status_code == 202
+    _drain(journey)
+
+    listed = client.get(f"{base}/uploads")
+    assert listed.status_code == 200, listed.text
+    [file] = listed.json()["files"]  # the file never received is not listed
+    assert file["batchId"] == prepared["batchId"] and file["filename"] == "booking-packet.pdf"
+    assert file["pages"] == 3 and file["sizeBytes"] == len(pdf) and file["uploadedAtUtc"]
+    link = client.get(f"{base}/uploads/{file['batchId']}/file").json()
+    assert link["url"].startswith("https://storage.test/get/") and link["filename"] == "booking-packet.pdf"

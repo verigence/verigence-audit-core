@@ -2196,6 +2196,56 @@ def get_page_file(
     }
 
 
+@router.get("/journeys/{journey_id}/uploads")
+def list_uploaded_files(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Every file uploaded to the Journey, as it was uploaded (before it was
+    split into pages), newest first, for Journey 360's "Uploaded files"
+    (product owner 2026-11-06: "an option to download the full pdf which the PC
+    uploaded in each journey"). Each opens through
+    ``uploads/{batch}/file``. Files never received (AWAITING_UPLOAD) are left
+    out; a file refused as a duplicate or removed is listed with its status."""
+    _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_READ_PERMISSION,
+    )
+    rows = connection.execute(
+        text(
+            """
+            SELECT b.batch_id, b.original_filename, b.content_type, b.size_bytes, b.page_count,
+                   b.batch_status, b.created_at_utc, b.uploaded_by_actor_id, b.replaces_document_id,
+                   pn.display_name AS uploaded_by_name
+            FROM auditcore.p2_upload_batches b
+            LEFT JOIN auditcore.people_names pn ON pn.actor_id = b.uploaded_by_actor_id
+            WHERE b.tenant_id=:tenant_id AND b.journey_id=:journey_id
+              AND b.batch_status <> 'AWAITING_UPLOAD' AND b.original_object_key IS NOT NULL
+            ORDER BY b.created_at_utc DESC, b.batch_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    return {
+        "journeyId": str(journey_id),
+        "files": [
+            {
+                "batchId": str(r["batch_id"]), "filename": r["original_filename"],
+                "contentType": r["content_type"], "sizeBytes": int(r["size_bytes"] or 0),
+                "pages": int(r["page_count"] or 0), "status": r["batch_status"],
+                "uploadedAtUtc": r["created_at_utc"].isoformat() if r["created_at_utc"] else None,
+                "uploadedBy": r["uploaded_by_name"], "replacesDocument": r["replaces_document_id"] is not None,
+            }
+            for r in rows
+        ],
+    }
+
+
 @router.get("/journeys/{journey_id}/uploads/{batch_id}/file")
 def get_upload_file(
     tenant_id: str,
