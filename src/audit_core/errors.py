@@ -215,6 +215,22 @@ def system_error_response(request: Request, exc: BaseException) -> JSONResponse:
     )
 
 
+def http_detail_text(detail: object, fallback: str) -> str:
+    """The text a caller sees for an HTTPException detail. A structured detail
+    keeps its message and lists instead of being replaced by the bare title
+    ("Business validation failed" told the Reviewer nothing)."""
+    if isinstance(detail, str) and detail.strip():
+        return detail
+    if isinstance(detail, dict):
+        message = detail.get("message")
+        if isinstance(message, str) and message.strip():
+            lists = ["; ".join(str(v) for v in value) for key, value in detail.items()
+                     if key != "message" and isinstance(value, list) and value
+                     and all(isinstance(v, (str, int, float)) for v in value)]
+            return " ".join([message.strip(), *lists])
+    return fallback
+
+
 def install_error_handlers(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -242,7 +258,7 @@ def install_error_handlers(app: FastAPI) -> None:
             exc.status_code,
             ("VAC-SYS-001", "Internal error") if exc.status_code >= 500 else ("VAC-VAL-002", "Request rejected"),
         )
-        detail = exc.detail if isinstance(exc.detail, str) else title
+        detail = http_detail_text(exc.detail, title)
         return _problem(
             request,
             error_code=error_code,
