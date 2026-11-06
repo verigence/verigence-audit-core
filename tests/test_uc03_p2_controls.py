@@ -456,3 +456,59 @@ def test_a_duplicate_booking_task_names_the_other_booking_and_what_matched(journ
         assert got == (reference, expected)
         assert controls._duplicate_booking_description(connection, tenant_id=journey.tenant_id,
                                                        other_journey_id=None, matched=[]) is None
+
+
+def _quality_task(journey, queue_id, *, status: str, outcome: str | None) -> None:
+    import json
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.p2_tasks (tenant_id, journey_id, task_type, category, origin_kind, "
+                 "source_type, source_code, dedupe_key, title, description, reference, severity, priority, "
+                 "assigned_role_code, allowed_actions, completion_protocol, task_status, completion_result, "
+                 "verified_at_utc) VALUES (:t, :j, 'PC_PAGE_QUALITY_REJECTED', 'DOCUMENT_REUPLOAD', 'SYSTEM', "
+                 "'DOCUMENT', 'DOCUMENT_QUALITY_REJECTED', :k, 'insurance.png: 1 page refused', 'x', "
+                 "CAST(:ref AS jsonb), 'HIGH', 'HIGH', 'PC', '[]'::jsonb, 'MACHINE_VERIFIED', :s, "
+                 "CAST(:res AS jsonb), CASE WHEN :s = 'VERIFIED_COMPLETE' THEN now() END)"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "k": f"q:{uuid4()}", "s": status,
+             "ref": json.dumps({"pageQueues": [{"page": 1, "queueId": str(queue_id)}]}),
+             "res": json.dumps({"outcome": outcome} if outcome else {})},
+        )
+
+
+def test_a_failed_page_whose_task_a_person_closed_no_longer_needs_attention(journey):
+    """SHI-SS-261027-013 (2026-11-06): the Reviewer closed the image-quality
+    task of insurance.png ("already uploaded"); counting the refused page
+    reopened "Fix pages that could not be processed" 10 s later and blocked
+    the Reviewer's close."""
+    _, pages = add_batch_pages(journey, [("insurance_cover", "READY"), (None, "FAILED")], grouping_status="GROUPED")
+    refused = pages[1]["queue_id"]
+    _quality_task(journey, refused, status="READY", outcome=None)
+    _evaluate(journey, "P2:DERIVED")
+    assert _states(journey)["DL_V2_DOCUMENT_PROCESSING_FAILED"]["control_status"] == "FAIL"   # still open
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_tasks SET task_status='VERIFIED_COMPLETE', verified_at_utc=now(), "
+                                "completion_result='{\"outcome\": \"CLOSED_BY_PC\"}'::jsonb "
+                                "WHERE tenant_id=:t AND journey_id=:j"),
+                           {"t": journey.tenant_id, "j": journey.journey_id})
+    _evaluate(journey, "P2:DERIVED")
+    assert _states(journey)["DL_V2_DOCUMENT_PROCESSING_FAILED"]["control_status"] == "PASS"
+
+    # Asked to be read again afterwards (Retry / upload): it counts again.
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_document_queue SET read_clock_started_at_utc=now() + interval "
+                                "'1 second' WHERE tenant_id=:t AND queue_id=:q"),
+                           {"t": journey.tenant_id, "q": refused})
+    _evaluate(journey, "P2:DERIVED")
+    assert _states(journey)["DL_V2_DOCUMENT_PROCESSING_FAILED"]["control_status"] == "FAIL"
+
+
+def test_a_failed_page_closed_by_the_system_still_needs_attention(journey):
+    _, pages = add_batch_pages(journey, [("insurance_cover", "READY"), (None, "FAILED")], grouping_status="GROUPED")
+    _quality_task(journey, pages[1]["queue_id"], status="VERIFIED_COMPLETE", outcome="RESOLVED_BY_SYSTEM")
+    _evaluate(journey, "P2:DERIVED")
+    assert _states(journey)["DL_V2_DOCUMENT_PROCESSING_FAILED"]["control_status"] == "FAIL"

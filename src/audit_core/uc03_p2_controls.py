@@ -640,16 +640,28 @@ def _evaluate_derived(engine: Engine, *, tenant_id: str, journey_id: UUID, regis
             {"tenant_id": tenant_id, "journey_id": journey_id},
         ).mappings().all()
         gates = {f"{r['stage_code']}:{r['gate_key']}": r for r in gate_rows}
+        # A failed page a person already dealt with -- they closed its task
+        # ("already uploaded", accepted as exception) -- is no longer one that
+        # "needs attention": counted, it reopened "Fix pages that could not be
+        # processed" right after the Reviewer closed the image-quality task
+        # (SHI-SS-261027-013, 2026-11-06). Any later Retry / upload restarts
+        # the page's read clock, so it counts again.
+        from audit_core.uc03_p2_retry_stop import (
+            person_closed_page_task_sql,
+            person_closed_params,
+        )
+
         page_counts = dict(
             connection.execute(
                 text(
-                    """
-                    SELECT queue_status, COUNT(*) FROM auditcore.p2_document_queue
-                    WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND queue_status <> 'MERGED'
-                    GROUP BY queue_status
+                    f"""
+                    SELECT q.queue_status, COUNT(*) FROM auditcore.p2_document_queue q
+                    WHERE q.tenant_id=:t AND q.journey_id=:j AND q.queue_status <> 'MERGED'
+                      AND NOT (q.queue_status IN ('FAILED','DEAD_LETTER') AND {person_closed_page_task_sql("q")})
+                    GROUP BY q.queue_status
                     """
                 ),
-                {"tenant_id": tenant_id, "journey_id": journey_id},
+                {"t": tenant_id, "j": journey_id, **person_closed_params()},
             ).all()
         )
         sync_codes = [c.code for c in registry.controls.values() if c.mode in {"SYNC", "EVENT"}]
@@ -777,19 +789,27 @@ def _unit_fingerprint(connection: Connection, *, tenant_id: str, journey_id: UUI
     if unit != "P2:DERIVED":
         return facts
     # Derived controls also read gates, page outcomes and the execution log.
+    # A failed page a person closed the task of counts apart (PAGES controls).
+    from audit_core.uc03_p2_retry_stop import (
+        person_closed_page_task_sql,
+        person_closed_params,
+    )
+
     extra = connection.execute(
         text(
-            """
+            f"""
             SELECT concat_ws('|',
               (SELECT string_agg(gate_key || gate_status, ',' ORDER BY gate_key)
                  FROM auditcore.p2_stage_gate_state WHERE tenant_id=:t AND journey_id=:j),
-              (SELECT string_agg(queue_status, ',' ORDER BY queue_id)
-                 FROM auditcore.p2_document_queue WHERE tenant_id=:t AND journey_id=:j),
+              (SELECT string_agg(q.queue_status || CASE WHEN q.queue_status IN ('FAILED','DEAD_LETTER')
+                                                         AND {person_closed_page_task_sql("q")}
+                                                        THEN '#closed' ELSE '' END, ',' ORDER BY q.queue_id)
+                 FROM auditcore.p2_document_queue q WHERE q.tenant_id=:t AND q.journey_id=:j),
               (SELECT MAX(evaluated_at_utc)::text FROM auditcore.rule_executions
                  WHERE tenant_id=:t AND journey_id=:j))
             """
         ),
-        {"t": tenant_id, "j": journey_id},
+        {"t": tenant_id, "j": journey_id, **person_closed_params()},
     ).scalar_one()
     import hashlib
 
