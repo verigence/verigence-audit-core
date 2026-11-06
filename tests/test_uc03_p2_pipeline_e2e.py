@@ -449,3 +449,46 @@ def test_a_pc_upload_is_stored_per_outlet_and_ist_day_under_the_customer_s_name(
     assert stored, "the worker stored no pages"
     assert all(re.fullmatch(rf"{folder}/(pages|groups)/.+", k) for k in stored), stored
     assert any("/pages/" in k for k in stored)
+
+
+def test_the_same_file_after_a_failed_or_removed_upload_is_a_new_upload(pipeline):
+    """2026-11-06: the browser sends the same clientUploadId for the same file.
+    While the earlier upload is in flight or was read, that is the same upload;
+    once it FAILED or was CANCELLED, picking the file again starts a fresh upload
+    instead of being answered "already accepted" with nothing read."""
+    journey, _storage, _di = pipeline
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}"
+    file = {"filename": "invoice.pdf", "contentType": "application/pdf", "sizeBytes": 1234,
+            "clientUploadId": "web-p2-same-file-0001"}
+
+    [first] = client.post(f"{base}/uploads:init", json={"files": [file]}).json()["uploads"]
+    # Still waiting for the bytes: the same upload, the same batch.
+    [again] = client.post(f"{base}/uploads:init", json={"files": [file]}).json()["uploads"]
+    assert again["batchId"] == first["batchId"] and again["alreadyAccepted"] is False
+
+    for ended in ("FAILED", "CANCELLED"):
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            connection.execute(
+                text("UPDATE auditcore.p2_upload_batches SET batch_status=:s "
+                     "WHERE tenant_id=:t AND client_upload_id=:c"),
+                {"s": ended, "t": journey.tenant_id, "c": file["clientUploadId"]},
+            )
+        response = client.post(f"{base}/uploads:init", json={"files": [file]})
+        assert response.status_code == 200, response.text
+        [fresh] = response.json()["uploads"]
+        assert fresh["alreadyAccepted"] is False and fresh["uploadUrl"]
+        assert fresh["batchId"] != first["batchId"]
+        first = fresh
+
+    # A completed upload keeps its id: the same file is not read twice.
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_upload_batches SET batch_status='COMPLETED' "
+                 "WHERE tenant_id=:t AND client_upload_id=:c"),
+            {"t": journey.tenant_id, "c": file["clientUploadId"]},
+        )
+    [done] = client.post(f"{base}/uploads:init", json={"files": [file]}).json()["uploads"]
+    assert done["batchId"] == first["batchId"] and done["alreadyAccepted"] is True

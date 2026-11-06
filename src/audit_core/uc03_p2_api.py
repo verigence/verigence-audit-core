@@ -1058,6 +1058,34 @@ class UploadInitCommand(BaseModel):
     files: list[UploadInitFile] = Field(min_length=1, max_length=50)
 
 
+def release_ended_client_upload_id(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, client_upload_id: str,
+) -> None:
+    """Let the same file be uploaded again once its earlier upload ended without
+    being read (2026-11-06).
+
+    The browser derives ``clientUploadId`` from the file (name, size, modified
+    time), so picking the same file again sends the same id. An id stays claimed
+    while its upload is in flight or was read -- the same file is then the same
+    upload, never sent twice. But a FAILED upload (refused, or never finished)
+    or a CANCELLED one (removed from the Journey) used to keep the id, and
+    uploads:init answered the PC's new attempt with that dead batch as "already
+    accepted": the file showed as received and nothing was read. Such a batch
+    gives its id up here, so the attempt becomes a fresh upload (the worker
+    then supersedes the failed page, uc03_p2_worker)."""
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_upload_batches
+            SET client_upload_id = left(client_upload_id, 110) || ':ended:' || batch_id::text, updated_at_utc = now()
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND client_upload_id=:client_upload_id
+              AND batch_status IN ('FAILED', 'CANCELLED')
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "client_upload_id": client_upload_id},
+    )
+
+
 @router.post("/journeys/{journey_id}/uploads:init")
 def init_uploads(
     tenant_id: str,
@@ -1102,6 +1130,9 @@ def init_uploads(
                 status_code=413,
                 detail=f"{item.filename}: file exceeds the {max_bytes // (1024 * 1024)} MB limit.",
             )
+        release_ended_client_upload_id(
+            connection, tenant_id=tenant_id, journey_id=journey_id, client_upload_id=item.clientUploadId,
+        )
         candidate_batch_id = uuid4()
         candidate_object_key = original_key(
             tenant_id, journey_id, candidate_batch_id, filename=item.filename,
@@ -1295,6 +1326,9 @@ def replace_document(
             detail="Phase 2 document storage is not configured."
         ) from exc
 
+    release_ended_client_upload_id(
+        connection, tenant_id=tenant_id, journey_id=journey_id, client_upload_id=command.clientUploadId,
+    )
     candidate_batch_id = uuid4()
     outlet_name, pc_name, customer_name = _upload_labels(connection, tenant_id=tenant_id, journey_id=journey_id)
     candidate_key = original_key(
