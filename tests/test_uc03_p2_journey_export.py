@@ -185,6 +185,8 @@ def test_a_team_lead_exports_the_outlets_they_lead_and_no_other(journey, monkeyp
     base = f"/p2/v1/tenants/{journey.tenant_id}/reports/journey-exports"
     _assign(journey, "tl-of-the-outlet", "TL", outlet=True)
     client = _client("tl-of-the-outlet")
+    scope = client.get(f"{base}/scope").json()
+    assert scope["role"] == "TL" and len(scope["outlets"]) == 1 and scope["maxRangeDays"] == 92
     assert client.post(base, json={}).status_code == 202
     other_outlet = "00000000-0000-0000-0000-000000000001"
     assert client.post(base, json={"outletId": other_outlet}).status_code == 404

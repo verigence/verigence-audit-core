@@ -858,6 +858,26 @@ def list_exports(
     return {"exports": [_public(dict(r)) for r in rows]}
 
 
+@router.get("/reports/journey-exports/scope")
+def export_scope(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """The dealerships and outlets the caller can export, for the filter lists."""
+    from audit_core.uc03_p2_gate_pass import scope_outlets
+
+    actor_id, role, outlet_ids = _export_access(connection, tenant_id, human_principal, authorization_client)
+    allowed = set(outlet_ids)
+    outlets = [
+        {"dealerId": str(o["dealer_id"]), "dealerName": o["dealer_name"], "outletId": str(o["outlet_id"]),
+         "outletName": o["outlet_name"]}
+        for o in scope_outlets(connection, tenant_id, actor_id) if str(o["outlet_id"]) in allowed
+    ]
+    return {"role": role, "maxRangeDays": MAX_RANGE_DAYS, "outlets": outlets}
+
+
 @router.get("/reports/journey-exports/{export_id}/file")
 def export_file(
     tenant_id: str, export_id: UUID,
