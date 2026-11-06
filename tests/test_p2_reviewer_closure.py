@@ -366,7 +366,7 @@ def test_the_migration_closes_what_earlier_closures_answered(journey):
     pages = _task(journey, "DOCUMENT_REMEDIATION", "Fix pages that could not be processed", {"issueHash": "h2"})
     _sql(journey, "UPDATE auditcore.p2_journey_closures SET summary = jsonb_set(summary, '{items}', "
                   "COALESCE(summary->'items','[]'::jsonb) || jsonb_build_array(jsonb_build_object("
-                  "'key', :k, 'kind', 'OPEN_TASK', 'label', 'Fix pages', 'answer', 'Re-scan is on file already'))) "
+                  "'key', CAST(:k AS text), 'kind', 'OPEN_TASK', 'label', 'Fix pages', 'answer', 'Re-scan is on file already'))) "
                   "WHERE tenant_id=:t AND journey_id=:j", k=f"task:{pages}")
     path = Path(__file__).resolve().parents[1] / "migrations/versions/0198_closure_closes_tasks.py"
     spec = importlib.util.spec_from_file_location("m0198", path)
