@@ -1967,6 +1967,7 @@ def _discount_applications(connection: Connection, params: dict[str, Any]) -> li
             """
             SELECT da.discount_key, da.standard_eligible_amount, da.actual_discount_amount,
                    da.eligibility_result, da.evidence_status, da.actual_source_kind, da.discount_scheme_version_id,
+                   da.details->>'potentialAmount' AS potential_amount, da.details->'grid'->>'buffer' AS grid_buffer,
                    ds.scheme_code, ds.scheme_name, ds.scheme_category,
                    dsv.version_no AS scheme_version, dsv.effective_from, dsv.effective_to,
                    dsv.combinability_code
@@ -2524,6 +2525,13 @@ def _benefit_row(
             "combinability": row.get("combinability_code"),
         } if row.get("scheme_code") else None,
         "eligibility": row.get("eligibility_result"),
+        # What the master gives a benefit the reconciliation saw as unclaimed
+        # (the scheme's amount, the grid's buffer): its entitlement when the
+        # Deal finds it given on another document (2026-11-06,
+        # uc03_discount_given.entitled).
+        "potential": _money(row.get("potential_amount") if row.get("potential_amount") is not None
+                            else row.get("grid_buffer")) if row.get("eligibility_result") == "ELIGIBLE_UNCLAIMED"
+        else None,
         "evidenceStatus": row.get("evidence_status"),
         "proof": {
             "documentType": proof_type,

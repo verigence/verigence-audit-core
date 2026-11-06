@@ -1197,6 +1197,26 @@ controls:
     task:
       type: FINDING_REVIEW
       owner: TL
+  # Product owner 2026-11-06: an accessories kit the consumer scheme gives in
+  # kind, passed on as cash on the consumer offer -- a breach listed apart,
+  # never counted as excess discount.
+  KIT_GIVEN_AS_CASH:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
+    category: Pricing & Commercial Anomalies
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
+    task:
+      type: FINDING_REVIEW
+      owner: TL
   DELIVERED_ON_SHORT_PAYMENT:
     executor: NATIVE
     mode: RERUN

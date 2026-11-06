@@ -84,7 +84,7 @@ def test_run_all_rules_for_a_fresh_booking_journey_returns_all_expected_rule_cod
         "STATEMENT_ROWS_ADD_UP",
         "AUTOMATED_SYNC_FAILURE",
         # The deal-audit checks that run with the Booking stage.
-        "DEAL_UNDERCHARGED", "EXCESS_DISCOUNT",
+        "DEAL_UNDERCHARGED", "EXCESS_DISCOUNT", "KIT_GIVEN_AS_CASH",
         "THIRD_PARTY_PAYMENT_UNCONFIRMED", "THIRD_PARTY_PAYMENT_UNDECLARED",
         "CASH_ABOVE_LIMIT", "PAYMENT_BEFORE_BOOKING",
         "INSURANCE_INVOICE_MISSING", "SELF_INSURANCE_DECLARED",
@@ -97,7 +97,7 @@ def test_run_all_rules_for_a_fresh_booking_journey_returns_all_expected_rule_cod
     by_code = {r.ruleCode: r.outcome for r in results}
     assert by_code["AUTOMATED_SYNC_FAILURE"] == "PASS"
     passes = {"AUTOMATED_SYNC_FAILURE", "THIRD_PARTY_PAYMENT_UNCONFIRMED", "THIRD_PARTY_PAYMENT_UNDECLARED",
-              "EXCESS_DISCOUNT", "CASH_ABOVE_LIMIT",
+              "EXCESS_DISCOUNT", "KIT_GIVEN_AS_CASH", "CASH_ABOVE_LIMIT",
               "PAYMENT_BEFORE_BOOKING", "INSURANCE_INVOICE_MISSING", "SELF_INSURANCE_DECLARED"}  # nothing paid, given or invoiced yet
     assert all(outcome == ("PASS" if code in passes else "SKIPPED") for code, outcome in by_code.items())
     assert all(r.stage == "BOOKING" for r in results)
@@ -117,7 +117,7 @@ def test_run_all_rules_writes_execution_log_rows(run_all_rules_setup) -> None:
         ),
         {"t": tenant_id, "j": journey_id},
     ).mappings().all()
-    assert len(rows) == 20  # 8 sync rules + 12 deal-audit checks (TCS_EXCESS, FIGURE_IMPLAUSIBLE 2026-11-04) (cash intimation retired 2026-10-31)
+    assert len(rows) == 21  # 8 sync rules + 13 deal-audit checks (KIT_GIVEN_AS_CASH 2026-11-06; TCS_EXCESS, FIGURE_IMPLAUSIBLE 2026-11-04) (cash intimation retired 2026-10-31)
     assert all(row["triggering_event"] == "MANUAL_RUN_ALL_RULES" for row in rows)
 
 
