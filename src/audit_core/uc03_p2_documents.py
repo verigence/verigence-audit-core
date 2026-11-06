@@ -38,6 +38,7 @@ from audit_core.uc03_p2_access import (
     check_p2_permission,
     resolve_p2_scope,
 )
+from audit_core.uc03_p2_dates import future_date_verdict, programme_today
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_reviewer import (
     log_field_change,
@@ -911,6 +912,15 @@ def correct_p2_document_field(
         authorization_client=authorization_client,
         permission_keys=_FIELD_UPDATE_PERMISSIONS,
     )
+    if future_date_verdict(command.fieldKey, command.newValue):
+        # The same rule the review check applies to a reading: a date of something
+        # that has already happened cannot be after today (2026-11-06: a gate pass
+        # corrected to 2027-10-27 instead of 2026-10-27).
+        raise HTTPException(
+            status_code=422,
+            detail=(f"{command.newValue} is after today ({programme_today().isoformat()}). "
+                    "This date records something that has already happened; check the day and the year."),
+        )
     context = _document_context(
         connection,
         tenant_id=tenant_id,

@@ -79,7 +79,14 @@ def test_registry_date_floor_applies_to_document_dates_not_birth_dates():
         ("booking_date", "", None),
         ("booking_date", None, None),
         ("expected_delivery_date", "2026-11-30", None),  # may legitimately lie ahead
-        ("invoice_date", "2026-10-22", None),
+        ("invoice_date", "2026-10-22", "DATE_IN_FUTURE"),  # an invoice already happened
+        ("delivery_date", "2026-11-08", "DATE_IN_FUTURE"),  # the gate pass of 2026-11-06
+        ("delivery_date", "2026-10-21", None),
+        ("policy_end_date", "2027-10-20", None),
+        ("certificate_valid_until_date", "2027-10-20", None),
+        ("coverage_end_date", "2027-10-20", None),
+        ("tentative_delivery_date", "2026-11-30", None),
+        ("customer_name", "2026-10-22", None),  # not a date field
     ],
 )
 def test_future_date_verdict(field_key, value, expected):

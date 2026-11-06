@@ -177,11 +177,14 @@ def vehicle_gate_pass_deliveries(connection: Connection, tenant_id: str, outlet_
             FROM dated d
             JOIN auditcore.journeys j ON j.tenant_id = :t AND j.journey_id = d.journey_id
             WHERE d.v ~ '^\\d{4}-\\d{2}-\\d{2}$' AND j.outlet_id = ANY(CAST(:ids AS uuid[]))
-              AND CAST(d.v AS date) BETWEEN :a AND :b
+              AND CAST(d.v AS date) BETWEEN :a AND LEAST(CAST(:b AS date), CAST(:today AS date))
             GROUP BY 1, 2
             """
         ),
-        {"t": tenant_id, "ids": [str(i) for i in outlet_ids], "a": gate_pass_covers(first)[0], "b": last},
+        # A delivery dated after today has not happened: the gate pass date is misread
+        # (DATE_IN_FUTURE asks the PC to correct it) and counts on no day until it is.
+        {"t": tenant_id, "ids": [str(i) for i in outlet_ids], "a": gate_pass_covers(first)[0], "b": last,
+         "today": ist_day().date()},
     ).mappings().all():
         # Sunday's deliveries belong to Monday's Daily Gate Pass, which covers both days.
         day = r["day"] + timedelta(days=1) if r["day"].isoweekday() == 7 else r["day"]
