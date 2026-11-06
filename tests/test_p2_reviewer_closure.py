@@ -305,3 +305,85 @@ def test_a_structured_http_detail_keeps_its_message_and_lists():
         "Rejection incomplete. a; b"
     assert http_detail_text({"code": 1}, "Title") == "Title"
     assert http_detail_text(None, "Title") == "Title"
+
+
+def _task(journey, task_type, title, reference, status="IN_PROGRESS", role="PC"):
+    import json
+    from uuid import uuid4
+
+    return _sql(journey, "INSERT INTO auditcore.p2_tasks (tenant_id, journey_id, task_type, category, origin_kind, "
+                         "source_type, source_code, dedupe_key, title, description, reference, severity, priority, "
+                         "assigned_role_code, allowed_actions, completion_protocol, task_status, completion_result) "
+                         "VALUES (:t, :j, :tt, 'DOCUMENT', 'SYSTEM', 'RULE', :tt, :k, :title, 'x', "
+                         "CAST(:ref AS jsonb), 'MEDIUM', 'NORMAL', :role, '[]'::jsonb, 'MACHINE_VERIFIED', :s, "
+                         "'{}'::jsonb) RETURNING task_id",
+                tt=task_type, k=f"t:{uuid4()}", title=title, ref=json.dumps(reference), s=status,
+                role=role).scalar_one()
+
+
+def _status(journey, task_id):
+    return _row(journey, f"SELECT task_status, completion_result FROM auditcore.p2_tasks "
+                         f"WHERE tenant_id=:t AND journey_id=:j AND task_id='{task_id}'")
+
+
+def test_the_tasks_the_closure_answered_close_with_the_journey(journey):
+    """SHI-SS-261027-013 (2026-11-06): "Closed by Reviewer · awaiting TL" while
+    the answered "Fix pages that could not be processed" stayed open for the PC."""
+    _ready_for_delivery(journey)
+    _role(journey, "REVIEWER")
+    finding = _finding(journey)
+    pages = _task(journey, "DOCUMENT_REMEDIATION", "Fix pages that could not be processed",
+                  {"issueHash": "h-pages", "sourceCode": "DL_V2_DOCUMENT_PROCESSING_FAILED"})
+    finding_task = _task(journey, "FINDING_REVIEW", "Review the discount", {"findingId": str(finding)},
+                         status="READY", role="TL")
+    preview = _preview(journey)
+    keys = {i["key"] for i in preview["items"]}
+    assert f"task:{pages}" in keys and f"task:{finding_task}" not in keys   # answered with its finding
+    answers = {i["key"]: f"Specific answer for {i['label']}" for i in preview["items"]}
+    result = _close(journey, "Delivery confirmed with the outlet manager", answers)
+
+    for task_id in (pages, finding_task):
+        row = _status(journey, task_id)
+        assert row["task_status"] == "VERIFIED_COMPLETE"
+        assert row["completion_result"]["outcome"] == "CLOSED_BY_REVIEWER_CLOSURE"
+        assert row["completion_result"]["closureId"] == result["closureId"]
+    assert _status(journey, pages)["completion_result"]["acceptedIssueHash"] == "h-pages"
+    assert _status(journey, pages)["completion_result"]["answer"].startswith("Specific answer for Fix pages")
+    # The Team Lead's acceptance task is the one left open.
+    assert _status(journey, result["acceptanceTaskId"])["task_status"] == "READY"
+
+
+def test_the_migration_closes_what_earlier_closures_answered(journey):
+    import importlib.util
+    from pathlib import Path
+
+    _ready_for_delivery(journey)
+    _role(journey, "REVIEWER")
+    preview = _preview(journey)
+    answers = {i["key"]: f"Specific answer for {i['label']}" for i in preview["items"]}
+    result = _close(journey, "Delivery confirmed with the outlet manager", answers)
+    # As before 2026-11-06: an answered task left open.
+    pages = _task(journey, "DOCUMENT_REMEDIATION", "Fix pages that could not be processed", {"issueHash": "h2"})
+    _sql(journey, "UPDATE auditcore.p2_journey_closures SET summary = jsonb_set(summary, '{items}', "
+                  "COALESCE(summary->'items','[]'::jsonb) || jsonb_build_array(jsonb_build_object("
+                  "'key', CAST(:k AS text), 'kind', 'OPEN_TASK', 'label', 'Fix pages', 'answer', 'Re-scan is on file already'))) "
+                  "WHERE tenant_id=:t AND journey_id=:j", k=f"task:{pages}")
+    path = Path(__file__).resolve().parents[1] / "migrations/versions/0198_closure_closes_tasks.py"
+    spec = importlib.util.spec_from_file_location("m0198", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+
+        class _Op:
+            @staticmethod
+            def get_bind():
+                return connection
+
+        module.op = _Op
+        module.upgrade()
+    row = _status(journey, pages)
+    assert row["task_status"] == "VERIFIED_COMPLETE"
+    assert row["completion_result"]["closureId"] == result["closureId"]
+    assert row["completion_result"]["answer"] == "Re-scan is on file already"
+    assert _status(journey, result["acceptanceTaskId"])["task_status"] == "READY"
