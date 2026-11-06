@@ -40,16 +40,41 @@ STOPPED_CODE = "AUTO_RETRY_STOPPED"
 STOPPED_EVENT = "AUTOMATIC_RETRY_STOPPED"
 
 
-def task_names_page_sql(alias: str = "t") -> str:
-    """SQL condition: the p2_tasks row ``alias`` names the page ``:q`` (text)."""
+def task_names_page_sql(alias: str = "t", queue: str = "CAST(:q AS text)") -> str:
+    """SQL condition: the p2_tasks row ``alias`` names the page ``queue``
+    (a text expression; by default the ``:q`` parameter)."""
     return (
-        f"({alias}.reference->>'queueId' = CAST(:q AS text)"
+        f"({alias}.reference->>'queueId' = {queue}"
         f" OR (jsonb_typeof({alias}.reference->'pages') = 'array'"
-        f"     AND {alias}.reference->'pages' @> jsonb_build_array(jsonb_build_object('queueId', CAST(:q AS text))))"
+        f"     AND {alias}.reference->'pages' @> jsonb_build_array(jsonb_build_object('queueId', {queue})))"
         f" OR (jsonb_typeof({alias}.reference->'pageQueues') = 'array'"
-        f"     AND {alias}.reference->'pageQueues' @> jsonb_build_array(jsonb_build_object('queueId', CAST(:q AS text))))"
-        f" OR {alias}.completion_result->'removedPage'->>'queueId' = CAST(:q AS text))"
+        f"     AND {alias}.reference->'pageQueues' @> jsonb_build_array(jsonb_build_object('queueId', {queue})))"
+        f" OR {alias}.completion_result->'removedPage'->>'queueId' = {queue})"
     )
+
+
+def person_closed_page_task_sql(queue_alias: str = "q") -> str:
+    """SQL condition on the p2_document_queue row ``queue_alias``: a person
+    closed a task naming this page (Close task, Accept as exception) after the
+    page was last asked to be read, and no open task names it. The same
+    disposal that stops its automatic retries. Placeholders: ``:t``, ``:j``,
+    ``:person_outcomes``, ``:closed_statuses`` (bind ``person_closed_params()``)."""
+    queue = f"CAST({queue_alias}.queue_id AS text)"
+    return (
+        "(EXISTS (SELECT 1 FROM auditcore.p2_tasks pt"
+        "   WHERE pt.tenant_id=:t AND pt.journey_id=:j AND pt.task_status IN ('VERIFIED_COMPLETE','CANCELLED')"
+        f"    AND {task_names_page_sql('pt', queue)}"
+        "     AND pt.completion_result->>'outcome' = ANY(:person_outcomes)"
+        "     AND COALESCE(pt.verified_at_utc, pt.updated_at_utc)"
+        f"        >= COALESCE({queue_alias}.read_clock_started_at_utc, '-infinity'::timestamptz))"
+        " AND NOT EXISTS (SELECT 1 FROM auditcore.p2_tasks ot"
+        "   WHERE ot.tenant_id=:t AND ot.journey_id=:j AND ot.task_status <> ALL(:closed_statuses)"
+        f"    AND {task_names_page_sql('ot', queue)}))"
+    )
+
+
+def person_closed_params() -> dict[str, Any]:
+    return {"person_outcomes": list(PERSON_CLOSED_OUTCOMES), "closed_statuses": list(_OPEN_TASK_EXCLUDED)}
 
 
 def automatic_retry_stop_reason(
