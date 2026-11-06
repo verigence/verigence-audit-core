@@ -3761,7 +3761,10 @@ def _taken_addons(
     return out
 
 
-def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID,
+            deal_view: dict[str, Any] | None = None) -> dict[str, Any]:
+    """``deal_view``: the journey's Deal when the caller has it already (the
+    journey export, 2026-11-06), so it is not worked out twice."""
     params = {"t": tenant_id, "j": journey_id}
     product = connection.execute(
         text(
@@ -3801,7 +3804,8 @@ def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
     # Phase 1's Vehicle panel: what was taken with the car (accessories,
     # extended warranty, insurance) with the items bought -- the same answer
     # the Add-ons tab gives -- the booking facts and how the delivery went.
-    deal_view = deal(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if deal_view is None:
+        deal_view = deal(connection, tenant_id=tenant_id, journey_id=journey_id)
     addons = _taken_addons(connection, tenant_id=tenant_id, journey_id=journey_id, deal_view=deal_view)
 
     booking_doc = next(iter(_document_facts(

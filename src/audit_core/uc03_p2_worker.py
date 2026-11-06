@@ -5096,6 +5096,23 @@ def _watch_worker_jobs(engine: Engine) -> None:
         _stopping.wait(_JOB_POLL_SECONDS)
 
 
+_EXPORT_POLL_SECONDS = 15
+
+
+def _build_journey_exports(engine: Engine) -> None:
+    """Journey exports to Excel asked for by Team Leads and above (2026-11-06),
+    built one after another on their own thread, so the document work never
+    waits on them (uc03_p2_journey_export)."""
+    from audit_core.uc03_p2_journey_export import run_pending_exports
+
+    while not _stopping.is_set():
+        try:
+            run_pending_exports(engine, _active_tenants(engine), _WORKER_ID)
+        except Exception:  # e.g. the table not migrated yet; try again later
+            logger.warning("journey_exports_poll_failed", exc_info=True)
+        _stopping.wait(_EXPORT_POLL_SECONDS)
+
+
 _NAMES_REFRESH_SECONDS = 6 * 3600
 
 
@@ -5123,6 +5140,7 @@ def main() -> None:
             threading.Thread(target=target, args=args, name=kind.lower().replace("_", "-"), daemon=True).start()
     threading.Thread(target=_watch_worker_jobs, args=(engine,), name="worker-jobs", daemon=True).start()
     threading.Thread(target=_refresh_names_every, args=(engine,), name="people-names", daemon=True).start()
+    threading.Thread(target=_build_journey_exports, args=(engine,), name="journey-exports", daemon=True).start()
     logger.info(
         "p2_worker_started",
         worker_id=_WORKER_ID,
