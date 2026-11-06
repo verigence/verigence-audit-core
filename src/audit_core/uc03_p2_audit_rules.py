@@ -543,32 +543,31 @@ def excess_discount(facts: _Facts) -> RuleOutcome:
     # given, the entitlement and the line tolerance are read through
     # uc03_discount_given, which the Excess Discount tab reads too, so the tab
     # lists exactly the discounts this rule raises its task on.
+    # 2026-11-06 (product owner, re-evaluation of the list): a line with no
+    # master to compare with is not an over-grant (its reason is reported);
+    # the part of a consumer offer the unused accessories kit covers is the
+    # KIT_GIVEN_AS_CASH check's, not this one's. Per line, as before.
     from audit_core import uc03_discount_given as dg
 
     code = "EXCESS_DISCOUNT"
     # A line no document gives anything on (the Management Referral line
     # is always on the sheet, opted out by default) is no discount yet.
-    rows = [r for r in facts.sheet["discounts"] if dg.has_figure(r)]
-    if not rows:
+    if not any(dg.has_figure(r) for r in facts.sheet["discounts"]):
         return RuleOutcome(code, "PASS", "No discount on this deal.")
-    # 2026-10-20 (review of PR 472): a discount whose entitlement is not
-    # known (master not mapped, deal not reconciled, corporate category to
-    # be confirmed) is not an over-grant; its own task says why.
-    rows = [r for r in rows if not dg.entitlement_unknown(r)]
-    if not rows:
+    judged = [i for i in dg.assess(facts.sheet["discounts"]) if i["status"] != dg.UNKNOWN]
+    if not judged:
         return RuleOutcome(code, "SKIPPED", "The entitlement of the discounts given is not known yet.")
     if not dg.standards_known(facts.sheet):
         return RuleOutcome(code, "SKIPPED", _NO_STANDARD)
     over: list[dict[str, Any]] = []
     total_given = total_entitled = Decimal(0)
-    for row in rows:
-        given, _column = dg.given(row)
-        if given is None:
-            continue
-        entitled = dg.entitled(row)
+    for item in judged:
+        if item["status"] == dg.KIT_AS_CASH:
+            continue  # the same line's assessment after the kit follows
+        row, given, entitled = item["row"], item["given"], item["entitled"]
         total_given += given
         total_entitled += entitled
-        if dg.is_over(given, entitled):
+        if item["status"] == dg.OVER:
             over.append({"key": row["key"], "label": row["label"], "entitled": str(entitled),
                          "given": str(given), "extra": str(given - entitled)})
     extra_total = total_given - total_entitled
@@ -588,6 +587,33 @@ def excess_discount(facts: _Facts) -> RuleOutcome:
         "findingTitle": "Discount given beyond the entitlement",
         "discounts": over, "totalGiven": str(total_given), "totalEntitled": str(total_entitled),
         "extra": str(extra_total),
+    })
+
+
+def kit_given_as_cash(facts: _Facts) -> RuleOutcome:
+    """The consumer scheme gives an accessories kit (Scorpio Classic, Thar
+    Roxx), no accessories invoice uses it, and the consumer offer was given in
+    cash above its cash entitlement: the kit was given as cash. Product owner
+    2026-11-06: a breach listed apart, never counted as excess discount (the
+    EXCESS_DISCOUNT check counts the kit with the entitlement)."""
+    from audit_core import uc03_discount_given as dg
+
+    code = "KIT_GIVEN_AS_CASH"
+    if not dg.kit_available(facts.sheet["discounts"]):
+        return RuleOutcome(code, "PASS", "No unused accessories kit on this deal.")
+    if not dg.standards_known(facts.sheet):
+        return RuleOutcome(code, "SKIPPED", _NO_STANDARD)
+    kits = [i for i in dg.assess(facts.sheet["discounts"]) if i["status"] == dg.KIT_AS_CASH]
+    if not kits:
+        return RuleOutcome(code, "PASS", "The accessories kit was not given as cash.")
+    lines = [{"key": i["row"]["key"], "label": i["row"]["label"], "given": str(i["given"]),
+              "entitled": str(i["entitled"]), "kit": str(i["kit"])} for i in kits]
+    total = sum((i["kit"] for i in kits), Decimal(0))
+    return RuleOutcome(code, "FAIL", "; ".join(
+        f"{line['label']}: {_rupees(line['given'])} given in cash against a cash entitlement of "
+        f"{_rupees(line['entitled'])}; {_rupees(line['kit'])} of it is the accessories kit the scheme gives "
+        "in kind, not invoiced as accessories" for line in lines) + ".", {
+        "findingTitle": "Accessories kit given as cash", "discounts": lines, "kitAsCash": str(total),
     })
 
 
@@ -1452,7 +1478,7 @@ def self_insurance_declared(facts: _Facts) -> RuleOutcome:
 # that need a delivery run with the Delivery unit.
 _BOOKING_RULES = (
     booking_date_unusable,
-    deal_undercharged, excess_discount, tcs_short, tcs_excess, figure_implausible,
+    deal_undercharged, excess_discount, kit_given_as_cash, tcs_short, tcs_excess, figure_implausible,
     third_party_payment_unconfirmed, third_party_payment_undeclared,
     # Cash transactions raise no tasks (product owner, 2026-10-31): no cash
     # intimation question, so neither it nor its finding runs.
@@ -1476,6 +1502,7 @@ RULE_CODES = {
 _FINDING_TYPES = {
     "BOOKING_DATE_UNUSABLE": "PROCESS_NON_COMPLIANCE",
     "DEAL_UNDERCHARGED": "PRICING_ANOMALY", "TCS_SHORT": "PRICING_ANOMALY", "TCS_EXCESS": "PRICING_ANOMALY", "FIGURE_IMPLAUSIBLE": "PRICING_ANOMALY", "EXCESS_DISCOUNT": "DISCOUNT_ANOMALY",
+    "KIT_GIVEN_AS_CASH": "DISCOUNT_ANOMALY",
     "TRADE_IN_NOT_RESOLD": "COMMERCIAL_EXCEPTION", "TRADE_IN_SOLD_AT_LOSS": "COMMERCIAL_EXCEPTION",
     "DELIVERY_NOT_COMPLETED_IN_TIME": "DELIVERY_EXCEPTION",
     "ACCESSORY_FITTED_UNBILLED": "PROCESS_NON_COMPLIANCE",

@@ -12,6 +12,7 @@ from sqlalchemy import text
 
 from audit_core.db import set_tenant_context
 from audit_core.uc03_discount_variance import (
+    KIT_AS_CASH,
     OVER,
     UNDER,
     UNKNOWN,
@@ -84,10 +85,18 @@ def test_the_given_figure_is_the_billed_one_only():
 
 
 def test_no_entitlement_on_record_is_an_entitlement_of_zero():
-    # The rule's "given with no entitlement on record" (2026-10-31): the tab
-    # had these as "entitlement unknown" and the screen dropped them.
-    rows = discount_variance_rows(_view([_d("CORPORATE", None, "30000", billed_from="document")]))
+    # The rule's "given with no entitlement on record" (2026-10-31): the
+    # reconciliation found none (NOT_ELIGIBLE), so the whole amount is over.
+    rows = discount_variance_rows(_view([_d("CORPORATE_PRIVILEGE", None, "30000", billed_from="document",
+                                            eligibility="NOT_ELIGIBLE")]))
     assert (rows[0]["status"], rows[0]["entitled"], rows[0]["variance"]) == (OVER, "0", "30000")
+
+
+def test_a_line_nothing_reconciled_is_entitlement_unknown():
+    # 2026-11-06: no reconciliation row at all is no master compared, not zero.
+    rows = discount_variance_rows(_view([_d("CORPORATE_PRIVILEGE", None, "30000", billed_from="document")]))
+    assert (rows[0]["status"], rows[0]["entitled"], rows[0]["variance"]) == (UNKNOWN, None, None)
+    assert rows[0]["reason"] == "no reconciliation against the masters for this line"
 
 
 def test_an_unknown_entitlement_is_reported_not_taken_as_zero():
@@ -196,7 +205,8 @@ def _sql(journey, sql, **params):
 
 def _statement_deal_with_excess(journey):
     """A Mahindra Orissa deal: the NDC gives Rs 30,000 cash discount against an
-    entitlement of Rs 25,000, and Rs 13,000 corporate with none on record. The
+    entitlement of Rs 25,000, and Rs 13,000 corporate nothing reconciled (entitlement
+    unknown since 2026-11-06). The
     invoice (withheld from this Project's Deal) says otherwise."""
     _sql(journey, "UPDATE auditcore.projects SET deal_source_policy='ACCOUNT_STATEMENT' WHERE tenant_id=:t")
     _sql(journey, "INSERT INTO auditcore.commercial_lines (tenant_id, journey_id, component_key, standard_amount, "
@@ -281,4 +291,81 @@ def test_the_recompute_job_rebuilds_old_rows_only_on_commit(journey):
     run_discount_variance_recompute(journey.engine, "xd-1", [journey.tenant_id])
     assert cached() == stale
     run_discount_variance_recompute(journey.engine, "xd-1-commit", [journey.tenant_id])
-    assert {r["key"]: r["status"] for r in cached()} == {"ADDITIONAL_DISCOUNT": OVER, "CORPORATE_PRIVILEGE": OVER}
+    # The corporate line has no reconciliation row: entitlement unknown (2026-11-06).
+    assert {r["key"]: r["status"] for r in cached()} == {"ADDITIONAL_DISCOUNT": OVER, "CORPORATE_PRIVILEGE": UNKNOWN}
+
+
+# ---------------------------------------------------------------- 2026-11-06 re-evaluation
+
+def _kit(entitled="50000", billed=None, eligibility="ELIGIBLE_UNCLAIMED"):
+    return _d("ACCESSORIES_KIT", entitled, billed, billed_from="document" if billed else None,
+              eligibility=eligibility)
+
+
+def test_an_unused_accessories_kit_given_as_cash_is_listed_apart_not_as_excess():
+    """Scorpio Classic: the consumer scheme gives a Rs 50,000 accessories kit,
+    the NDC gives Rs 50,000 cash. The kit is given as cash -- not excess."""
+    cash = _d("CASH_DISCOUNT", "0", "50000", billed_from="document", eligibility="NOT_ELIGIBLE")
+    rows = discount_variance_rows(_view([cash, _kit()]))
+    assert [(r["status"], r["variance"], r["kit"]) for r in rows] == [(KIT_AS_CASH, "50000", "50000")]
+
+
+def test_only_what_is_above_the_cash_entitlement_and_the_kit_is_over():
+    cash = _d("CASH_DISCOUNT", "10000", "80000", billed_from="document", eligibility="ELIGIBLE")
+    rows = discount_variance_rows(_view([cash, _kit("50000")]))
+    assert [(r["status"], r["entitled"], r["variance"]) for r in rows] == [
+        (KIT_AS_CASH, "10000", "50000"), (OVER, "60000", "20000")]
+
+
+def test_a_kit_an_accessories_invoice_uses_is_not_given_as_cash():
+    cash = _d("CASH_DISCOUNT", "0", "50000", billed_from="document", eligibility="NOT_ELIGIBLE")
+    rows = discount_variance_rows(_view([cash, _kit("50000", billed="50000", eligibility="ELIGIBLE")]))
+    assert [(r["key"], r["status"], r["variance"]) for r in rows] == [("CASH_DISCOUNT", OVER, "50000")]
+
+
+def test_lines_with_no_master_to_compare_with_are_entitlement_unknown():
+    other = _d("OTHER_SCHEME", "0", "29000", billed_from="document", eligibility="NOT_ELIGIBLE")
+    untyped = _d("UNCLASSIFIED_DISCOUNT", None, "61399.18", eligibility=None)
+    exchange = {**_d("EXCHANGE_BONUS", "0", "10000", billed_from="document", eligibility="NOT_ELIGIBLE"),
+                "evidenceStatus": "MISSING", "proof": {"onFile": False}}
+    rows = discount_variance_rows(_view([other, untyped, exchange]))
+    assert {r["key"]: r["status"] for r in rows} == {"OTHER_SCHEME": UNKNOWN, "UNCLASSIFIED_DISCOUNT": UNKNOWN,
+                                                    "EXCHANGE_BONUS": UNKNOWN}
+    assert all(r["reason"] for r in rows)
+    # With a scheme behind it, "Other scheme" is judged as any line; a proven
+    # exchange the reconciliation found none for is still an over-grant.
+    other_scheme = {**other, "entitled": "20000", "scheme": {"code": "S"}}
+    proven = {**exchange, "evidenceStatus": "VERIFIED", "proof": {"onFile": True}}
+    rows = discount_variance_rows(_view([other_scheme, proven]))
+    assert {r["key"]: r["status"] for r in rows} == {"OTHER_SCHEME": OVER, "EXCHANGE_BONUS": OVER}
+
+
+def test_an_eligible_benefit_the_reconciliation_saw_unclaimed_keeps_the_masters_amount():
+    """SHI-SS-261031-008: the NDC's Rs 20,000 is the scrappage bonus the
+    ledger's credit note names; the reconciliation saw it unclaimed (no
+    standard, the scheme's Rs 20,000 kept as potential), so it read as Rs 0."""
+    scrappage = {**_d("SCRAPPAGE_BONUS_DEALER", None, "20000", billed_from="document",
+                      eligibility="ELIGIBLE_UNCLAIMED"), "potential": "20000", "evidenceStatus": "VERIFIED",
+                 "scheme": {"code": "MAH_SCRAPPAGE"}}
+    assert discount_variance_rows(_view([scrappage])) == []
+    unproven = {**scrappage, "evidenceStatus": "PENDING", "proof": {"onFile": False}}
+    assert discount_variance_rows(_view([unproven]))[0]["status"] == UNKNOWN
+    dealer = {**_d("ADDITIONAL_DISCOUNT", "0", "7000", billed_from="document", eligibility="ELIGIBLE_UNCLAIMED"),
+              "potential": "5000"}
+    row = discount_variance_rows(_view([dealer]))[0]
+    assert (row["status"], row["entitled"], row["variance"]) == (OVER, "5000", "2000")
+
+
+def test_the_statement_is_named_first_as_the_source_of_a_figure():
+    paired = [{"document": "Customer ledger (Tally)", "documentType": "customer_ledger_tally", "amount": "20000"},
+              {"document": "NDC (Account Statement)", "documentType": "account_statement", "amount": "20000",
+               "checks": True}]
+    row = discount_variance_rows(_view([_d("CORPORATE_PRIVILEGE", "0", "20000", billed_from="document",
+                                           eligibility="NOT_ELIGIBLE", sources=paired)]))[0]
+    assert row["givenDocument"] == "NDC (Account Statement)"
+    named = [{"document": "Customer Invoice (DMS)", "documentType": "customer_invoice_dms", "amount": "17999.72"},
+             {"document": "Cost sheet (no NDC on file)", "documentType": "cost_sheet_in_place_of_ndc",
+              "amount": "24999.72", "checks": True}]
+    row = discount_variance_rows(_view([{**_d("CORPORATE_PRIVILEGE", "0", "17999.72", eligibility="NOT_ELIGIBLE",
+                                              sources=named), "fromStatement": True}]))[0]
+    assert row["givenDocument"] == "Cost sheet (no NDC on file)"

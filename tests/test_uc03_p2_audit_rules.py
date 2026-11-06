@@ -182,6 +182,53 @@ def test_deal_undercharged_and_excess_discount_name_each_line(journey):
     assert _finding(journey, "DEAL_UNDERCHARGED")[0] == "RESOLVED"
 
 
+def _application(journey, key: str, entitled: str | None, eligibility: str) -> None:
+    _sql(journey, "INSERT INTO auditcore.discount_applications (tenant_id, journey_id, discount_key, "
+                  "standard_eligible_amount, eligibility_result, actual_source_kind) "
+                  "VALUES (:t, :j, :k, :e, :r, 'EVIDENCE')", k=key, e=entitled, r=eligibility)
+
+
+def test_an_unused_accessories_kit_given_as_cash_is_its_own_finding_not_excess_discount(journey):
+    """Product owner 2026-11-06: the consumer scheme gives a Rs 50,000
+    accessories kit (no accessories invoice uses it) and the consumer offer
+    was given as Rs 50,000 cash: KIT_GIVEN_AS_CASH, never EXCESS_DISCOUNT."""
+    _line(journey, "ex_showroom_price", "1000000", "1000000")
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "1000000")
+    _application(journey, "CASH_DISCOUNT", None, "NOT_ELIGIBLE")
+    _source(journey, "DISCOUNT", "CASH_DISCOUNT", "tax_invoice_tally", "50000")
+    _application(journey, "ACCESSORIES_KIT", "50000", "ELIGIBLE_UNCLAIMED")
+
+    result = _run(journey, "BOOKING")
+    assert result["EXCESS_DISCOUNT"].outcome == "PASS"
+    kit = result["KIT_GIVEN_AS_CASH"]
+    assert kit.outcome == "FAIL" and kit.details["kitAsCash"] == "50000.00"
+    assert "₹50,000 of it is the accessories kit" in kit.reason
+    assert _finding(journey, "KIT_GIVEN_AS_CASH")[:3] == ("OPEN", "MEDIUM", "Accessories kit given as cash")
+    assert _finding(journey, "EXCESS_DISCOUNT")[0] is None
+
+    # Cash above the kit too: the rest is an excess discount, with the kit counted.
+    _sql(journey, "UPDATE auditcore.commercial_line_source_values SET amount=70000 WHERE tenant_id=:t "
+                  "AND component_key='CASH_DISCOUNT'")
+    result = _run(journey, "BOOKING")
+    excess = result["EXCESS_DISCOUNT"]
+    assert excess.outcome == "FAIL"
+    assert excess.details["discounts"] == [{"key": "CASH_DISCOUNT", "label": "Consumer offer / scheme discount",
+                                            "entitled": "50000.00", "given": "70000.00", "extra": "20000.00"}]
+    assert result["KIT_GIVEN_AS_CASH"].outcome == "FAIL"
+
+
+def test_a_discount_with_no_master_behind_it_raises_no_excess_discount(journey):
+    """Product owner 2026-11-06: "Other scheme" with no scheme behind it is
+    entitlement unknown, not an over-grant of the whole amount."""
+    _line(journey, "ex_showroom_price", "1000000", "1000000")
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "1000000")
+    _application(journey, "OTHER_SCHEME", None, "NOT_ELIGIBLE")
+    _source(journey, "DISCOUNT", "OTHER_SCHEME", "tax_invoice_tally", "29000")
+    result = _run(journey, "BOOKING")
+    assert result["EXCESS_DISCOUNT"].outcome == "SKIPPED"
+    assert result["KIT_GIVEN_AS_CASH"].outcome == "PASS"
+
+
 def test_a_line_awaiting_its_own_document_is_not_undercharged(journey):
     """2026-10-20 (R2): an accessory invoice on file says nothing about the
     RTO charges; the road tax + registration line awaits the RTO challan (at

@@ -1856,3 +1856,50 @@ def test_n2_an_unverified_old_vehicle_never_hides_the_excess_above_the_best_offe
     assert _details(c, "EXCHANGE_BONUS")["excessAboveBestConditional"] == "80000.00"
     sheet = _sheet_discount(c, "EXCHANGE_BONUS")
     assert sheet["entitled"] == "70000.00" and sheet["takenAsGiven"] is False
+
+
+def test_an_empty_scheme_version_in_force_is_master_not_matched_not_not_eligible(journey) -> None:
+    """Product owner 2026-11-06: the October reload published an empty version
+    (no benefit, no vehicle row) for schemes such as XUV3XO AX5 PM MT's
+    consumer offer. A cash discount given then was NOT_ELIGIBLE -- the whole
+    amount an excess. It is master not matched: the entitlement is not known."""
+    c = journey
+    seeded = _seed_pinned_sku(c, model="XUV 3XO", variant="AX5 PM MT", effective_from=date(2026, 9, 1),
+                              components={"EX_SHOWROOM": "1029900.54"})
+    model = seeded["model_id"]
+    eligibility = [{"model_id": model, "criteria": {"scope": "MODEL"}}]
+    consumer, _ = _scheme(c, category="CONSUMER", effective_from=_SEPT_SCHEMES,
+                          benefits={"CASH_DISCOUNT": "25000"}, eligibility=eligibility)
+    _scheme(c, category="CONSUMER", effective_from=date(2026, 10, 3), benefits={}, eligibility=[],
+            version_no=2, scheme_id=consumer, created_at="2026-10-04T00:00:00Z")
+    # Another October consumer scheme covers the model (not this variant), so a
+    # consumer bulletin is in force for it: without the empty-version reading
+    # the cash discount is NOT_ELIGIBLE.
+    _scheme(c, category="CONSUMER", effective_from=date(2026, 10, 3), benefits={"CASH_DISCOUNT": "10000"},
+            eligibility=[{"model_id": model, "criteria": {"scope": "MODEL", "excludedVariantTexts": ["AX5 PM MT"]}}])
+    _seed_reviewed_booking(c, sales_discount_amount="20000")
+    _price_on(c, date(2026, 10, 10))
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    row = _discount(c, "CASH_DISCOUNT")
+    assert row["eligibility_result"] == "MASTER_UNMATCHED" and row["standard_eligible_amount"] is None
+    assert _details(c, "CASH_DISCOUNT")["emptySchemeVersion"] is True
+
+
+def test_the_newest_version_by_date_answers_an_open_ended_older_one_never_shadows_it(journey) -> None:
+    """2026-11-06 (decision 6): versions are chosen by their effective date.
+    September's open-ended version (no end date) does not answer an October
+    date once October's version stands."""
+    c = journey
+    seeded = _seed_pinned_sku(c, model="XUV 3XO", variant="AX5 PM MT", effective_from=date(2026, 9, 1),
+                              components={"EX_SHOWROOM": "1029900.54"})
+    eligibility = [{"model_id": seeded["model_id"], "criteria": {"scope": "MODEL"}}]
+    scheme, _ = _scheme(c, category="CONSUMER", effective_from=date(2026, 9, 8),
+                        benefits={"CASH_DISCOUNT": "25000"}, eligibility=eligibility,
+                        created_at="2026-11-05T00:00:00Z")  # loaded last, still open-ended
+    _scheme(c, category="CONSUMER", effective_from=date(2026, 10, 3), effective_to=date(2026, 11, 30),
+            benefits={"CASH_DISCOUNT": "30000"}, eligibility=eligibility, version_no=2, scheme_id=scheme,
+            created_at="2026-10-04T00:00:00Z")
+    benefits = {b["canonical_key"]: str(b["amount_value"]) for b in dr._applicable_benefits(
+        c, tenant_id=c.tenant_id, model_id=seeded["model_id"], variant_id=seeded["variant_id"],
+        effective_on=date(2026, 10, 20), basis="INDIVIDUAL")}
+    assert benefits == {"CASH_DISCOUNT": "30000.00"}

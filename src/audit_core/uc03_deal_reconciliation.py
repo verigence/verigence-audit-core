@@ -1125,6 +1125,46 @@ def _bulletins_covering(
     }
 
 
+def _withdrawn_categories(
+    connection: Connection, *, tenant_id: str, model_id: UUID, variant_id: UUID | None, effective_on: date,
+) -> set[str]:
+    """The scheme categories in which a scheme that offered this vehicle has,
+    on the date, an empty version standing: published with no benefit and no
+    vehicle row (the October reload wrote such versions for XUV3XO AX5 PM MT,
+    the Thar Roxx variants, Maxx HD 2.0, ...). Product owner 2026-11-06: an
+    empty published version is "master not matched" -- the entitlement is not
+    known --, never "not eligible" (which made the whole discount an excess)."""
+    return {
+        str(r[0]) for r in connection.execute(
+            text(
+                """
+                WITH standing AS (
+                    SELECT DISTINCT ON (v.discount_scheme_id) v.discount_scheme_id, v.discount_scheme_version_id,
+                           v.effective_from, ds.scheme_category
+                    FROM auditcore.discount_scheme_versions v
+                    JOIN auditcore.discount_schemes ds
+                      ON ds.tenant_id = v.tenant_id AND ds.discount_scheme_id = v.discount_scheme_id
+                    WHERE v.tenant_id = :t AND v.lifecycle_status = 'PUBLISHED' AND v.effective_from <= :on
+                      AND (v.effective_to IS NULL OR v.effective_to >= :on)
+                    ORDER BY v.discount_scheme_id, v.effective_from DESC, v.created_at_utc DESC
+                )
+                SELECT DISTINCT s.scheme_category FROM standing s
+                WHERE NOT EXISTS (SELECT 1 FROM auditcore.discount_scheme_benefits b
+                                  WHERE b.tenant_id = :t AND b.discount_scheme_version_id = s.discount_scheme_version_id)
+                  AND EXISTS (
+                    SELECT 1 FROM auditcore.discount_scheme_versions p
+                    JOIN auditcore.discount_scheme_eligibility e
+                      ON e.tenant_id = p.tenant_id AND e.discount_scheme_version_id = p.discount_scheme_version_id
+                    WHERE p.tenant_id = :t AND p.discount_scheme_id = s.discount_scheme_id
+                      AND p.effective_from < s.effective_from AND e.model_id = :m
+                      AND (e.variant_id IS NULL OR e.variant_id = :variant))
+                """
+            ),
+            {"t": tenant_id, "on": effective_on, "m": model_id, "variant": variant_id},
+        ).all()
+    }
+
+
 def _unmatched_detail(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -1158,6 +1198,7 @@ def _materialize_discount_standards(
     model_name: str | None = None,
     grid_gap: str | None = None,
     effective_on: date | None = None,
+    withdrawn: set[str] | None = None,
 ) -> dict[str, Any]:
     """Write the entitlement side of every discount key, then clear the keys
     this run no longer produces (their actuals stay).
@@ -1390,6 +1431,11 @@ def _materialize_discount_standards(
                     f"no {'EV ' if ev else ''}{categories[0].lower()} scheme in force on "
                     f"{effective_on.isoformat() if effective_on else 'the pricing date'} covers "
                     f"{model_name or 'this model'}", ev=ev)
+            continue
+        if categories and withdrawn and set(categories) & withdrawn:
+            unknown(key, "MASTER_UNMATCHED",
+                    "the scheme version in force for this vehicle publishes no benefit (an empty master version)",
+                    emptySchemeVersion=True)
             continue
         write(key, standard=None, result="NOT_ELIGIBLE", dsv=None, details={"benefitKey": key})
         counts["overGranted"] += 1
@@ -2231,6 +2277,10 @@ def _reconcile(
         model_name=ctx.get("model_name"),
         grid_gap=grid_gap["reason"] if grid_gap else None,
         effective_on=effective_on,
+        withdrawn=_withdrawn_categories(
+            connection, tenant_id=tenant_id, model_id=ctx["model_id"], variant_id=ctx["variant_id"],
+            effective_on=effective_on,
+        ),
     )
     discount["pricingDate"] = effective_on.isoformat()
     discount["declaredTotals"] = _declared_totals_check(reviewed, actuals)

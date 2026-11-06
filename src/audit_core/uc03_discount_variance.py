@@ -50,7 +50,7 @@ router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-disco
 
 _READ_PERMISSION = "audit.journey.read"
 TOLERANCE = dg.LINE_TOLERANCE
-OVER, UNDER, UNKNOWN = "OVER_ENTITLEMENT", "UNDER_ENTITLEMENT", "ENTITLEMENT_UNKNOWN"
+OVER, UNDER, UNKNOWN, KIT_AS_CASH = dg.OVER, dg.UNDER, dg.UNKNOWN, dg.KIT_AS_CASH
 
 
 def _vehicle_price_read(view: dict[str, Any]) -> bool:
@@ -73,38 +73,29 @@ def _tallied(view: dict[str, Any]) -> bool:
 def discount_variance_rows(view: dict[str, Any]) -> list[dict[str, Any]]:
     """The discounts of this Deal given above or below their entitlement.
 
-    Read exactly as the EXCESS_DISCOUNT rule reads them (``uc03_discount_given``):
-    a line nothing gives a figure on is not a discount; an entitlement that is
-    not known is reported as such, never as zero; no entitlement on record is
-    an entitlement of zero. ``invoice`` keeps its name for the screens and is
-    the amount given; ``givenDocument`` says which document it came from."""
+    Read exactly as the EXCESS_DISCOUNT and KIT_GIVEN_AS_CASH rules read them
+    (``uc03_discount_given.assess``): a line nothing gives a figure on is not
+    a discount; a line with no master to compare with is ENTITLEMENT_UNKNOWN
+    with the reason, never zero; the part of a consumer offer the unused
+    accessories kit covers is KIT_AS_CASH, and only what is above the
+    entitlement and the kit is OVER_ENTITLEMENT (product owner 2026-11-06).
+    ``invoice`` keeps its name for the screens and is the amount given;
+    ``givenDocument`` says which document it came from."""
     if not _tallied(view) or not dg.standards_known(view):
         return []
     rows: list[dict[str, Any]] = []
-    for row in view.get("discounts") or []:
-        if not dg.has_figure(row):
+    for item in dg.assess(view.get("discounts") or []):
+        if item["status"] == "WITHIN" or (item["status"] == UNKNOWN and item["given"] <= 0):
             continue
-        given, column = dg.given(row)
-        if given is None:
-            continue
-        if dg.entitlement_unknown(row):
-            if given <= 0:
-                continue
-            status, entitled, variance = UNKNOWN, None, None
-        else:
-            entitled = dg.entitled(row)
-            variance = given - entitled
-            if dg.is_over(given, entitled):
-                status = OVER
-            elif -variance > dg.LINE_TOLERANCE:
-                status = UNDER
-            else:
-                continue
+        row = item["row"]
         rows.append({
-            "key": row.get("key"), "label": row.get("label"), "status": status,
-            "entitled": None if entitled is None else str(entitled), "invoice": str(given),
-            "variance": None if variance is None else str(variance),
-            "givenFrom": column, "givenDocument": dg.given_document(row, column),
+            "key": row.get("key"), "label": row.get("label"), "status": item["status"],
+            "entitled": None if item["entitled"] is None else str(item["entitled"]),
+            "invoice": str(item["given"]),
+            "variance": None if item["variance"] is None else str(item["variance"]),
+            "givenFrom": item["column"], "givenDocument": dg.given_document(row, item["column"]),
+            **({"kit": str(item["kit"])} if item["kit"] is not None else {}),
+            **({"reason": item["reason"]} if item["status"] == UNKNOWN else {}),
         })
     return rows
 
@@ -122,7 +113,8 @@ _REPORT_SQL = """
            e.item->>'key' AS discount_key, e.item->>'label' AS discount_label,
            e.item->>'status' AS status, (e.item->>'entitled')::numeric AS entitled,
            (e.item->>'invoice')::numeric AS invoice, (e.item->>'variance')::numeric AS variance,
-           e.item->>'givenFrom' AS given_from, e.item->>'givenDocument' AS given_document
+           e.item->>'givenFrom' AS given_from, e.item->>'givenDocument' AS given_document,
+           (e.item->>'kit')::numeric AS kit, e.item->>'reason' AS reason
     FROM auditcore.p2_journey_runtime r
     JOIN auditcore.journeys j ON j.tenant_id = r.tenant_id AND j.journey_id = r.journey_id
     CROSS JOIN LATERAL jsonb_array_elements(COALESCE(r.discount_variance, '[]'::jsonb)) AS e(item)
@@ -148,7 +140,8 @@ _REPORT_SQL = """
                OR bs.closure_disposition = 'NO_DELIVERY'))
     -- Over-grants first, so a long list of under-grants never crowds them out
     -- of the limit (2026-10-31); then under, then entitlement unknown.
-    ORDER BY CASE e.item->>'status' WHEN 'OVER_ENTITLEMENT' THEN 0 WHEN 'UNDER_ENTITLEMENT' THEN 1 ELSE 2 END,
+    ORDER BY CASE e.item->>'status' WHEN 'OVER_ENTITLEMENT' THEN 0 WHEN 'KIT_AS_CASH' THEN 1
+                                    WHEN 'UNDER_ENTITLEMENT' THEN 2 ELSE 3 END,
              abs(COALESCE((e.item->>'variance')::numeric, 0)) DESC, j.journey_reference, e.item->>'key'
     LIMIT :limit
 """
@@ -176,6 +169,7 @@ def discount_variance_report(
         "invoice": None if r["invoice"] is None else str(r["invoice"]),
         "variance": None if r["variance"] is None else str(r["variance"]),
         "givenFrom": r["given_from"], "givenDocument": r["given_document"],
+        "kit": None if r["kit"] is None else str(r["kit"]), "reason": r["reason"],
     } for r in rows]
     pending = connection.execute(
         text(
@@ -194,6 +188,7 @@ def discount_variance_report(
             "over": sum(1 for i in items if i["status"] == OVER),
             "under": sum(1 for i in items if i["status"] == UNDER),
             "unknown": sum(1 for i in items if i["status"] == UNKNOWN),
+            "kitAsCash": sum(1 for i in items if i["status"] == KIT_AS_CASH),
             "journeys": len({i["journeyId"] for i in items}),
         },
         "notYetCalculated": int(pending),
