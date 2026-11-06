@@ -1,0 +1,118 @@
+name: Data archive (DEV)
+
+# Moves rows nothing reads any more to R2, verifies them, then removes them
+# (audit_core.data_archive). Manual only for now: no schedule until the product
+# owner has approved the first dry-run numbers.
+#
+# dry-run (default): counts candidates per Project and records them in
+#   auditcore.archive_runs. Writes nothing to R2 and deletes nothing.
+# live: additionally needs AUDIT_CORE_ARCHIVE_BUCKET and the table's
+#   AUDIT_CORE_ARCHIVE_<TABLE>_ENABLED=true on the DEV Audit Core service;
+#   without them the job refuses (exit code 2) and records REFUSED.
+#
+# Connection and R2 credentials come from the DEV verigence-audit-core service's
+# Railway variables, read with the existing RAILWAY_API_TOKEN secret (as the
+# other DEV workflows do). No new GitHub secret.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry-run counts only; live archives and deletes"
+        type: choice
+        options: [dry-run, live]
+        default: dry-run
+      table:
+        description: "Archive rule (all: every rule)"
+        type: choice
+        options: [all, rule_executions]
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-data-archive-dev
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          npm install --global @railway/cli
+
+      - name: Resolve DEV database and archive settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+
+          variables = json.loads(Path('/tmp/audit-vars.json').read_text())
+          Path('/tmp/audit-vars.json').unlink()
+          raw = variables.get('DATABASE_PUBLIC_URL') or variables.get('DATABASE_URL') or ''
+          for prefix, scheme in (('postgresql+psycopg://', 'postgresql+psycopg://'),
+                                 ('postgresql+asyncpg://', 'postgresql+psycopg://'),
+                                 ('postgresql://', 'postgresql+psycopg://'),
+                                 ('postgres://', 'postgresql+psycopg://')):
+              if raw.startswith(prefix):
+                  url = scheme + raw[len(prefix):]
+                  break
+          else:
+              raise SystemExit('::error::no PostgreSQL DATABASE_URL on the DEV Audit Core service.')
+          wanted = {'DATABASE_URL': url}
+          for name, value in variables.items():
+              if name.startswith(('AUDIT_CORE_ARCHIVE_', 'AUDIT_CORE_P2_STORAGE_', 'AUDIT_CORE_PHOTO_STORAGE_')):
+                  wanted[name] = str(value)
+          secret_like = ('DATABASE_URL', 'ACCESS_KEY', 'SECRET', 'ENDPOINT')
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              for name, value in wanted.items():
+                  if '\n' in value:
+                      raise SystemExit(f'::error::{name} spans several lines.')
+                  if any(part in name for part in secret_like):
+                      print(f'::add-mask::{value}')
+                  env.write(f'{name}={value}\n')
+          shown = sorted(n for n in wanted if n.startswith('AUDIT_CORE_ARCHIVE_') and 'SECRET' not in n
+                         and 'ACCESS_KEY' not in n)
+          print('archive settings present:', ', '.join(shown) or 'none')
+          PY
+
+      - name: Run the archive job (${{ inputs.mode }})
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(--mode "${{ inputs.mode }}")
+          if [ "${{ inputs.table }}" != "all" ]; then args+=(--table "${{ inputs.table }}"); fi
+          set +e
+          python -m audit_core.data_archive "${args[@]}" | tee /tmp/archive.out
+          status=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "### Data archive (${{ inputs.mode }})"
+            echo
+            echo '```json'
+            python - <<'PY'
+          from pathlib import Path
+          out = Path('/tmp/archive.out').read_text()
+          start = out.find('[\n  {')
+          print(out[start:] if start >= 0 else out[-4000:])
+          PY
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

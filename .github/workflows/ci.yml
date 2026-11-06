@@ -208,6 +208,17 @@ jobs:
                       'audit_core_runtime', 'auditcore.journey_delivery_audit_facts', 'DELETE'
                   )
               """)).scalar_one() is False
+              # Data archive: rows leave only through the allow-listed definer function.
+              assert connection.execute(text("""
+                  select has_table_privilege('audit_core_runtime', 'auditcore.rule_executions', 'DELETE')
+                      or has_table_privilege('audit_core_runtime', 'auditcore.archive_runs', 'DELETE')
+                      or has_table_privilege('audit_core_runtime', 'auditcore.archive_runs', 'UPDATE')
+              """)).scalar_one() is False
+              assert connection.execute(text("""
+                  select has_function_privilege(
+                      'audit_core_runtime', 'auditcore.archive_delete_rows(varchar, text, uuid[])', 'EXECUTE'
+                  )
+              """)).scalar_one() is True
           PY
 
       - name: Unit tests
