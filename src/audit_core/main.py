@@ -3,7 +3,7 @@ import os
 from contextlib import asynccontextmanager
 
 import anyio.to_thread
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from audit_core import mahindra_masters, role_mappings
@@ -24,6 +24,7 @@ from audit_core.mahindra_dealer_policy_scope import install_dealer_policy_scope
 from audit_core.mahindra_native_effective_date import install_native_effective_date
 from audit_core.mahindra_native_workbooks import install_native_workbook_parser
 from audit_core.mahindra_upload_state import router as mahindra_upload_state_router
+from audit_core.night_control import enforce_night_control
 from audit_core.observability import install_observability
 from audit_core.oem_price_masters import router as oem_price_masters_router
 from audit_core.onboarding_imports import router as onboarding_router
@@ -275,6 +276,9 @@ def create_app() -> FastAPI:
         redoc_url=None,
         openapi_url=None,
         lifespan=_lifespan,
+        # Night control (product owner, 6 Nov 2026): one application-wide check;
+        # which routes it covers is the table in audit_core.night_control.
+        dependencies=[Depends(enforce_night_control)],
     )
     configure_otlp(application, settings)
     configure_logging(settings)

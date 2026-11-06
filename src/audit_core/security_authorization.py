@@ -36,6 +36,17 @@ _SERVICE_TOKEN_FALLBACK_REUSE_SECONDS = 60.0
 # minute to up to 5.
 _AUTHORIZATION_ALLOW_REUSE_SECONDS = 300.0
 
+# Night control (product owner, 6 Nov 2026): Security owns the policy and answers
+# per USER and feature. Both answers (blocked and not blocked) are reused for one
+# minute, so a Journey 360 burst asks once and the window edges move within a
+# minute. When Security cannot answer, the request is allowed (the regular
+# authorization check needs Security anyway, so a second refusal adds nothing);
+# that fallback is reused for a shorter time so an outage does not add a Security
+# round trip to every request, and recovery is picked up quickly.
+_NIGHT_CONTROL_REUSE_SECONDS = 60.0
+_NIGHT_CONTROL_FALLBACK_REUSE_SECONDS = 30.0
+_NIGHT_CONTROL_TIMEOUT_SECONDS = 3.0
+
 
 def _service_token_reuse_seconds(token: str) -> float:
     parts = token.split(".")
@@ -76,6 +87,33 @@ class SecurityAuthorizationDecision:
     tenant_id: str
     permission_key: str
     role_key: str | None
+
+
+@dataclass(frozen=True)
+class NightControlDecision:
+    """Security's night-control answer for one USER and feature.
+
+    ``fallback`` marks an ALLOW that Audit Core assumed because Security could not
+    answer; it is never a Security decision.
+    """
+
+    feature_key: str
+    blocked: bool
+    reason_code: str | None = None
+    message: str | None = None
+    starts_at: str | None = None
+    ends_at: str | None = None
+    allowed_by: str | None = None
+    fallback: bool = False
+
+
+def _optional_str(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SecurityAuthorizationError(f"Security night-control {key} has invalid shape")
+    return value
 
 
 class SecurityAuthorizationClient:
@@ -125,6 +163,9 @@ class SecurityAuthorizationClient:
         self._allow_cache_lock = threading.Lock()
         self._decision_locks: dict[tuple[str, str, str], threading.Lock] = {}
         self._decision_locks_lock = threading.Lock()
+        self._night_cache: dict[tuple[str, str], tuple[float, NightControlDecision]] = {}
+        self._night_cache_lock = threading.Lock()
+        self._night_locks: dict[tuple[str, str], threading.Lock] = {}
 
     def close(self) -> None:
         self._oauth.close()
@@ -301,6 +342,102 @@ class SecurityAuthorizationClient:
             tenant_id=tenant_id,
             permission_key=permission_key,
             role_key=role_key,
+        )
+
+    def check_night_control(self, *, user_id: str, feature_key: str) -> NightControlDecision:
+        """Ask Security whether ``feature_key`` is closed to this USER right now.
+
+        Security owns the window, the SuperAdmin/Executive exemptions and the
+        grants; Audit Core only enforces the answer. Never raises: when Security
+        cannot answer, the request is allowed and a warning is logged.
+        """
+        if not user_id or not feature_key:
+            raise ValueError("user_id and feature_key are required")
+        key = (user_id, feature_key)
+        cached = self._cached_night_decision(key)
+        if cached is not None:
+            return cached
+        with self._night_lock(key):
+            cached = self._cached_night_decision(key)
+            if cached is not None:
+                return cached
+            try:
+                decision = self._request_night_control(user_id=user_id, feature_key=feature_key)
+                reuse_seconds = _NIGHT_CONTROL_REUSE_SECONDS
+            except SecurityAuthorizationError as exc:
+                logger.warning(
+                    "night_control_check_failed",
+                    reason=str(exc),
+                    http_status=exc.http_status,
+                    feature_key=feature_key,
+                    outcome="allowed",
+                )
+                decision = NightControlDecision(feature_key=feature_key, blocked=False, fallback=True)
+                reuse_seconds = _NIGHT_CONTROL_FALLBACK_REUSE_SECONDS
+            with self._night_cache_lock:
+                self._night_cache[key] = (time.monotonic() + reuse_seconds, decision)
+            return decision
+
+    def _cached_night_decision(self, key: tuple[str, str]) -> NightControlDecision | None:
+        now = time.monotonic()
+        with self._night_cache_lock:
+            cached = self._night_cache.get(key)
+            if cached is None:
+                return None
+            expires_at, decision = cached
+            if expires_at <= now:
+                self._night_cache.pop(key, None)
+                return None
+            return decision
+
+    def _night_lock(self, key: tuple[str, str]) -> threading.Lock:
+        with self._night_cache_lock:
+            lock = self._night_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._night_locks[key] = lock
+            return lock
+
+    def _request_night_control(self, *, user_id: str, feature_key: str) -> NightControlDecision:
+        service_token = self._service_token_for_security()
+        try:
+            response = self._client.post(
+                "/security/v1/service/night-control/check",
+                headers={"Authorization": f"Bearer {service_token}"},
+                json={"userId": user_id, "featureKey": feature_key},
+                timeout=_NIGHT_CONTROL_TIMEOUT_SECONDS,
+            )
+        except httpx.HTTPError as exc:
+            raise SecurityAuthorizationError(
+                "Security night-control endpoint is unavailable"
+            ) from exc
+        if response.status_code != 200:
+            raise SecurityAuthorizationError(
+                f"Security night-control request failed with HTTP {response.status_code}",
+                http_status=response.status_code,
+            )
+        try:
+            payload: Any = response.json()
+        except ValueError as exc:
+            raise SecurityAuthorizationError(
+                "Security night-control response is not valid JSON"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("featureKey") != feature_key
+            or not isinstance(payload.get("blocked"), bool)
+        ):
+            raise SecurityAuthorizationError(
+                "Security night-control response does not match the requested feature"
+            )
+        return NightControlDecision(
+            feature_key=feature_key,
+            blocked=payload["blocked"],
+            reason_code=_optional_str(payload, "reasonCode"),
+            message=_optional_str(payload, "message"),
+            starts_at=_optional_str(payload, "startsAt"),
+            ends_at=_optional_str(payload, "endsAt"),
+            allowed_by=_optional_str(payload, "allowedBy"),
         )
 
 
