@@ -38,7 +38,7 @@ _refuse_non_local_database()
 _TENANT_DATA_DELETE_ORDER = (
     "p2_bulk_files", "p2_bulk_uploads", "p2_journey_exports",
     "p2_task_events", "p2_tasks", "p2_task_schedules", "p2_user_activity_daily", "p2_daily_tasks",
-    "p2_gate_pass_pages", "p2_gate_passes", "p2_location_checks",
+    "p2_gate_pass_pages", "p2_gate_passes", "p2_location_checks", "p2_access_locations", "p2_place_addresses",
     "sku_resolution_run_items", "sku_resolution_runs", "delivery_vehicle_photos", "activity_records", "administrative_operations", "audit_chain_heads", "audit_events",
     "audit_finding_events", "audit_state_events", "booking_form_review_values", "business_assignments",
     "commercial_line_source_values", "commercial_lines", "deal_source_snapshots", "crm_interactions", "customer_identity_index",

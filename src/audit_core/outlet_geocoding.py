@@ -152,6 +152,33 @@ class OutletGeocoder:
         )
 
 
+    def address_for(self, latitude: float, longitude: float) -> str | None:
+        """The readable address of a place (reverse geocoding). Best effort: None when Google does
+        not answer, finds nothing, or the per-minute limit is used up; never raises."""
+        try:
+            self._take_slot()
+        except AuditCoreError:
+            return None
+        try:
+            response = self._client.get(
+                _GEOCODE_URL,
+                params={"latlng": f"{latitude:.6f},{longitude:.6f}", "region": "in", "key": self._api_key},
+            )
+            if response.status_code != 200:
+                logger.warning("place_reverse_geocode_failed", http_status=response.status_code)
+                return None
+            body = response.json()
+        except (httpx.HTTPError, ValueError):
+            logger.warning("place_reverse_geocode_failed", reason="endpoint_unavailable")
+            return None
+        if not isinstance(body, dict) or body.get("status") != "OK" or not body.get("results"):
+            logger.warning("place_reverse_geocode_failed",
+                           google_status=body.get("status") if isinstance(body, dict) else None)
+            return None
+        value = body["results"][0].get("formatted_address")
+        return value.strip()[:500] if isinstance(value, str) and value.strip() else None
+
+
 @lru_cache
 def _shared_geocoder() -> OutletGeocoder:
     key = os.environ.get("GOOGLE_MAPS_API_KEY", "").strip()
