@@ -470,10 +470,11 @@ def _quality_task(journey, queue_id, *, status: str, outcome: str | None) -> Non
                  "verified_at_utc) VALUES (:t, :j, 'PC_PAGE_QUALITY_REJECTED', 'DOCUMENT_REUPLOAD', 'SYSTEM', "
                  "'DOCUMENT', 'DOCUMENT_QUALITY_REJECTED', :k, 'insurance.png: 1 page refused', 'x', "
                  "CAST(:ref AS jsonb), 'HIGH', 'HIGH', 'PC', '[]'::jsonb, 'MACHINE_VERIFIED', :s, "
-                 "CAST(:res AS jsonb), CASE WHEN :s = 'VERIFIED_COMPLETE' THEN now() END)"),
+                 "CAST(:res AS jsonb), CAST(:verified AS timestamptz))"),
             {"t": journey.tenant_id, "j": journey.journey_id, "k": f"q:{uuid4()}", "s": status,
              "ref": json.dumps({"pageQueues": [{"page": 1, "queueId": str(queue_id)}]}),
-             "res": json.dumps({"outcome": outcome} if outcome else {})},
+             "res": json.dumps({"outcome": outcome} if outcome else {}),
+             "verified": "now" if status == "VERIFIED_COMPLETE" else None},
         )
 
 
