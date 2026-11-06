@@ -82,7 +82,9 @@ def test_the_closure_lists_every_open_item_and_needs_an_answer_for_each(journey)
     with pytest.raises(HTTPException) as unanswered:
         _close(journey, "Delivery confirmed with the outlet manager", one_missing)
     assert unanswered.value.status_code == 422
-    assert unanswered.value.detail["unanswered"] == ["Discount exceeds policy by Rs 25,000"]
+    # The item is named in plain text: the caller sees which one, not just "Business validation failed".
+    assert isinstance(unanswered.value.detail, str)
+    assert unanswered.value.detail.endswith("Still without one: Discount exceeds policy by Rs 25,000.")
     assert _row(journey, "SELECT count(*) AS n FROM auditcore.p2_journey_closures "
                          "WHERE tenant_id=:t AND journey_id=:j")["n"] == 0
 
@@ -278,3 +280,28 @@ def _close_ready(journey):
     preview = _preview(journey)
     return _close(journey, "Delivery confirmed with the outlet manager",
                   {item["key"]: f"Specific answer for {item['label']}" for item in preview["items"]})
+
+
+def test_an_item_that_opens_after_the_form_was_loaded_is_named_in_the_refusal(journey):
+    """SHI-SS-261027-013 (2026-11-06): a task reopened by a re-check 3 seconds
+    after the Reviewer opened the form; the close was refused with only
+    "Business validation failed". The refusal names the new item."""
+    _ready_for_delivery(journey)
+    _role(journey, "REVIEWER")
+    preview = _preview(journey)
+    answers = {item["key"]: f"Specific answer for {item['label']}" for item in preview["items"]}
+    _finding(journey)   # opens after the preview was read
+    with pytest.raises(HTTPException) as refused:
+        _close(journey, "Delivery confirmed with the outlet manager", answers)
+    assert refused.value.status_code == 422
+    assert "Discount exceeds policy by Rs 25,000" in refused.value.detail
+
+
+def test_a_structured_http_detail_keeps_its_message_and_lists():
+    from audit_core.errors import http_detail_text
+
+    assert http_detail_text("Plain reason.", "Title") == "Plain reason."
+    assert http_detail_text({"message": "Rejection incomplete.", "problems": ["a", "b"]}, "Title") == \
+        "Rejection incomplete. a; b"
+    assert http_detail_text({"code": 1}, "Title") == "Title"
+    assert http_detail_text(None, "Title") == "Title"

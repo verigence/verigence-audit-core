@@ -278,10 +278,12 @@ def close_journey(
         source = "REVIEWER" if typed else ("PREVIOUS_CLOSURE" if item.get("carried") else "ACCEPTED_CLAIM")
         answered.append({**item, "answer": answer, "answerSource": source})
     if unanswered:
+        # Named, so the Reviewer sees which item -- usually one that opened after
+        # the form was loaded (a task reopened by a re-check, a new finding).
         raise HTTPException(
             status_code=422,
-            detail={"message": "Give a specific reason (at least 10 characters) for every open item.",
-                    "unanswered": unanswered},
+            detail=(f"Give a specific reason (at least {MIN_ANSWER} characters) for every open item. "
+                    f"Still without one: {'; '.join(unanswered)}."),
         )
 
     delivery = complete_delivery_by_reviewer(
@@ -446,7 +448,7 @@ def decide_closure(
     if not chosen and not problems:
         problems.append("Choose the items to reject, each with a reason")
     if problems:
-        raise HTTPException(status_code=422, detail={"message": "The rejection is incomplete.", "problems": problems})
+        raise HTTPException(status_code=422, detail=f"The rejection is incomplete: {'; '.join(problems)}.")
 
     connection.execute(
         text("UPDATE auditcore.p2_journey_closures SET acceptance_status='REJECTED', decided_by_actor_id=:a, "
