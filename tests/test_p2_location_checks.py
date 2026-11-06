@@ -1,6 +1,6 @@
 """DealGuard location checks (product owner, 2026-11-05): the distance is worked
 out on the server against the PC's own outlets, the result is classified and
-logged, and TL / PM / Executive read the day's log. Real Postgres (the API runs
+logged, and only Executive and SuperAdmin read the day's log. Real Postgres (the API runs
 as the runtime role, so row security and the append-only grant are exercised);
 Security is a double."""
 from __future__ import annotations
@@ -82,7 +82,7 @@ def setup(monkeypatch):
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
             text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code) "
-                 "VALUES (:t, :a, 'TL')"),
+                 "VALUES (:t, :a, 'EXECUTIVE')"),
             {"t": journey.tenant_id, "a": tl},
         )
     acting = {"subject": journey.actor_id}
@@ -198,7 +198,7 @@ def test_late_evening_check_is_not_recorded(setup, monkeypatch):
     assert _rows(s) == []
 
 
-def test_team_lead_reads_the_days_log(setup):
+def test_executive_reads_the_days_log(setup):
     s = setup
     s.client.post(s.base, json=_located(NEARBY))
     s.client.post(s.base, json=_located(FAR))
@@ -228,7 +228,7 @@ def test_team_lead_reads_the_days_log(setup):
     assert other_day["people"] == [] and other_day["day"] == "2026-01-01"
 
 
-def test_dealer_scoped_team_lead_sees_only_their_pcs(setup):
+def test_dealer_scoped_executive_sees_only_their_pcs(setup):
     s = setup
     s.client.post(s.base, json=_located(FAR))
     with s.engine.begin() as connection:
@@ -251,6 +251,23 @@ def test_dealer_scoped_team_lead_sees_only_their_pcs(setup):
             {"d": s.journey.dealer_id, "t": s.journey.tenant_id, "a": s.tl},
         )
     assert len(s.client.get(s.base).json()["people"]) == 1
+
+
+def test_team_leads_and_project_managers_do_not_read_the_log(setup):
+    """Product owner, 6 Nov 2026: the location report is for SuperAdmin and Executive only."""
+    s = setup
+    s.client.post(s.base, json=_located(FAR))
+    for role in ("TL", "PM"):
+        viewer = f"loc-{role.lower()}-{uuid4().hex[:8]}"
+        with s.engine.begin() as connection:
+            set_tenant_context(connection, s.journey.tenant_id)
+            connection.execute(
+                text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code) "
+                     "VALUES (:t, :a, :r)"),
+                {"t": s.journey.tenant_id, "a": viewer, "r": role},
+            )
+        s.acting["subject"] = viewer
+        assert s.client.get(s.base).status_code == 403, role
 
 
 def test_log_is_append_only_and_tenant_isolated(setup):
