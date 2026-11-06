@@ -52,6 +52,7 @@ class DiCaptureV2Client:
         files: list[dict[str, Any]],
         requirement_refs_by_document_type_key: dict[str, str] | None = None,
         classification_mode: str | None = None,
+        quality_gate: str | None = None,
     ) -> dict[str, Any]:
         """``classification_mode="TRUST_SINGLE_CANDIDATE"`` (exactly one
         candidate): the type is already known, DI skips its paid
@@ -66,6 +67,10 @@ class DiCaptureV2Client:
         }
         if classification_mode:
             body["classificationMode"] = classification_mode
+        if quality_gate:
+            # UPLOADER_CONFIRMED: the person sent this refused scan again; DI
+            # records its scan-quality scores but does not refuse it.
+            body["qualityGate"] = quality_gate
         return self._request(
             "POST",
             f"/v2/tenants/{tenant_id}/audit-storage-contexts/"

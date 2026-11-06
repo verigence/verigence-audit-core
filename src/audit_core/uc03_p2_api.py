@@ -1058,6 +1058,34 @@ class UploadInitCommand(BaseModel):
     files: list[UploadInitFile] = Field(min_length=1, max_length=50)
 
 
+def release_ended_client_upload_id(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, client_upload_id: str,
+) -> None:
+    """Let the same file be uploaded again once its earlier upload ended without
+    being read (2026-11-06).
+
+    The browser derives ``clientUploadId`` from the file (name, size, modified
+    time), so picking the same file again sends the same id. An id stays claimed
+    while its upload is in flight or was read -- the same file is then the same
+    upload, never sent twice. But a FAILED upload (refused, or never finished)
+    or a CANCELLED one (removed from the Journey) used to keep the id, and
+    uploads:init answered the PC's new attempt with that dead batch as "already
+    accepted": the file showed as received and nothing was read. Such a batch
+    gives its id up here, so the attempt becomes a fresh upload (the worker
+    then supersedes the failed page, uc03_p2_worker)."""
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_upload_batches
+            SET client_upload_id = left(client_upload_id, 110) || ':ended:' || batch_id::text, updated_at_utc = now()
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND client_upload_id=:client_upload_id
+              AND batch_status IN ('FAILED', 'CANCELLED')
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "client_upload_id": client_upload_id},
+    )
+
+
 @router.post("/journeys/{journey_id}/uploads:init")
 def init_uploads(
     tenant_id: str,
@@ -1102,6 +1130,9 @@ def init_uploads(
                 status_code=413,
                 detail=f"{item.filename}: file exceeds the {max_bytes // (1024 * 1024)} MB limit.",
             )
+        release_ended_client_upload_id(
+            connection, tenant_id=tenant_id, journey_id=journey_id, client_upload_id=item.clientUploadId,
+        )
         candidate_batch_id = uuid4()
         candidate_object_key = original_key(
             tenant_id, journey_id, candidate_batch_id, filename=item.filename,
@@ -1295,6 +1326,9 @@ def replace_document(
             detail="Phase 2 document storage is not configured."
         ) from exc
 
+    release_ended_client_upload_id(
+        connection, tenant_id=tenant_id, journey_id=journey_id, client_upload_id=command.clientUploadId,
+    )
     candidate_batch_id = uuid4()
     outlet_name, pc_name, customer_name = _upload_labels(connection, tenant_id=tenant_id, journey_id=journey_id)
     candidate_key = original_key(
@@ -2067,10 +2101,24 @@ def retry_page(
     if unit["queue_status"] not in _RETRYABLE_PAGE_STATES and not swept:
         raise HTTPException(status_code=409, detail="Only failed pages can be retried.")
     if str(unit.get("last_error") or "").startswith("DI_QUALITY_"):
-        raise HTTPException(
-            status_code=409,
-            detail="This page was rejected for scan quality; retrying will not help. Re-scan it and upload it again.",
+        # The PC has looked at the refused page and sends it as it is (product
+        # owner 2026-11-06: "I have seen pics being correct only"): read from
+        # its stored file with DI's UPLOADER_CONFIRMED quality gate, classified
+        # as any upload is unless its type is already known. Used to be refused
+        # here: "retrying will not help", and the same bytes were refused again.
+        known = get_registry().documents.get(str(unit.get("template_key") or ""))
+        if known is not None and (known.key == _OTHER_DOCUMENT_TEMPLATE or not known.di_types):
+            known = None
+        classified = str(unit.get("classified_document_type") or "")
+        new_id = _send_page_again(
+            connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit, template=known,
+            di_type=(classified if known is not None and classified in known.di_types
+                     else (known.di_types[0] if known is not None else None)),
+            actor_id=human_principal.subject, role=access.operating_role, swept=True,
+            event_type="PAGE_SENT_AGAIN_QUALITY_CONFIRMED", override_reason=None,
+            correlation_id=get_correlation_id(request), quality_confirmed=True,
         )
+        return {"queueId": str(new_id), "status": "QUEUED", "qualityConfirmed": True}
     if swept:
         template = get_registry().documents.get(str(unit.get("template_key") or ""))
         if template is None or template.key == _OTHER_DOCUMENT_TEMPLATE or not template.di_types:
@@ -2145,6 +2193,56 @@ def get_page_file(
         "status": row["queue_status"],
         "url": url,
         "expiresInSeconds": _PAGE_LINK_SECONDS,
+    }
+
+
+@router.get("/journeys/{journey_id}/uploads")
+def list_uploaded_files(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Every file uploaded to the Journey, as it was uploaded (before it was
+    split into pages), newest first, for Journey 360's "Uploaded files"
+    (product owner 2026-11-06: "an option to download the full pdf which the PC
+    uploaded in each journey"). Each opens through
+    ``uploads/{batch}/file``. Files never received (AWAITING_UPLOAD) are left
+    out; a file refused as a duplicate or removed is listed with its status."""
+    _authorize(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_READ_PERMISSION,
+    )
+    rows = connection.execute(
+        text(
+            """
+            SELECT b.batch_id, b.original_filename, b.content_type, b.size_bytes, b.page_count,
+                   b.batch_status, b.created_at_utc, b.uploaded_by_actor_id, b.replaces_document_id,
+                   pn.display_name AS uploaded_by_name
+            FROM auditcore.p2_upload_batches b
+            LEFT JOIN auditcore.people_names pn ON pn.actor_id = b.uploaded_by_actor_id
+            WHERE b.tenant_id=:tenant_id AND b.journey_id=:journey_id
+              AND b.batch_status <> 'AWAITING_UPLOAD' AND b.original_object_key IS NOT NULL
+            ORDER BY b.created_at_utc DESC, b.batch_id
+            """
+        ),
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ).mappings().all()
+    return {
+        "journeyId": str(journey_id),
+        "files": [
+            {
+                "batchId": str(r["batch_id"]), "filename": r["original_filename"],
+                "contentType": r["content_type"], "sizeBytes": int(r["size_bytes"] or 0),
+                "pages": int(r["page_count"] or 0), "status": r["batch_status"],
+                "uploadedAtUtc": r["created_at_utc"].isoformat() if r["created_at_utc"] else None,
+                "uploadedBy": r["uploaded_by_name"], "replacesDocument": r["replaces_document_id"] is not None,
+            }
+            for r in rows
+        ],
     }
 
 
@@ -2344,8 +2442,8 @@ def _guard_reviewed_stage(
 
 def _send_page_again(
     connection: Connection, *, tenant_id: str, journey_id: UUID, unit: dict[str, Any], template: Any,
-    di_type: str, actor_id: str, role: str | None, swept: bool, event_type: str, override_reason: str | None,
-    correlation_id: str | None,
+    di_type: str | None, actor_id: str, role: str | None, swept: bool, event_type: str,
+    override_reason: str | None, correlation_id: str | None, quality_confirmed: bool = False,
 ) -> UUID:
     """Read a page again from its stored file, as ``template`` (product owner
     2026-10-27). A new unit is queued with exactly that type (DI does not
@@ -2356,15 +2454,20 @@ def _send_page_again(
     other page is merged into the new unit, as re-typing always did."""
     queue_id = UUID(str(unit["queue_id"]))
     pages = list(unit["page_numbers"] or [unit["page_number"]])
-    client_upload_id = f"p2t-{unit['batch_id']}-{'-'.join(map(str, pages))}-{template.key}-{queue_id.hex[:8]}"
+    type_key = template.key if template is not None else "q"
+    client_upload_id = f"p2t-{unit['batch_id']}-{'-'.join(map(str, pages))}-{type_key}-{queue_id.hex[:8]}"
     new_id = uuid4()
-    words = f"{template.display_name} by {role or 'PC'}"
+    words = (f"{template.display_name} by {role or 'PC'}" if template is not None
+             else f"it is, confirmed by {role or 'PC'}")
     if swept:
+        # Replaced: CANCELLED (a FAILED page refused for scan quality too) and
+        # marked SUPERSEDED_PAGE, as a re-upload marks it.
         connection.execute(
             text(
                 """
                 UPDATE auditcore.p2_document_queue
-                SET last_error='SUPERSEDED_PAGE', status_reason=:reason, updated_at_utc=now()
+                SET queue_status='CANCELLED', last_error='SUPERSEDED_PAGE', status_reason=:reason,
+                    updated_at_utc=now()
                 WHERE tenant_id=:tenant_id AND queue_id=:queue_id
                 """
             ),
@@ -2390,11 +2493,11 @@ def _send_page_again(
                 tenant_id, queue_id, batch_id, journey_id, page_number, page_numbers, page_sha256,
                 page_object_key, client_upload_id, queue_status, unit_kind, group_source,
                 candidate_override, classified_document_type, template_key, business_stage,
-                type_overridden_by_actor_id, read_clock_started_at_utc
+                type_overridden_by_actor_id, read_clock_started_at_utc, quality_confirmed
             ) VALUES (
                 :tenant_id, :new_id, :batch_id, :journey_id, :page_number, :page_numbers, :sha,
                 :object_key, :client_upload_id, 'QUEUED', 'GROUP', 'PC',
-                CAST(:candidates AS jsonb), :di_type, :template_key, :stage, :actor, now()
+                CAST(:candidates AS jsonb), :di_type, :template_key, :stage, :actor, now(), :quality_confirmed
             )
             ON CONFLICT (tenant_id, client_upload_id) DO NOTHING
             RETURNING queue_id
@@ -2404,9 +2507,11 @@ def _send_page_again(
             "tenant_id": tenant_id, "new_id": new_id, "batch_id": unit["batch_id"], "journey_id": journey_id,
             "page_number": pages[0], "page_numbers": pages, "sha": unit["page_sha256"],
             "object_key": unit["page_object_key"], "client_upload_id": client_upload_id,
-            "candidates": json.dumps([di_type]), "di_type": di_type,
-            "template_key": template.key, "stage": template.stage if template.stage != "ANY" else None,
-            "actor": actor_id,
+            "candidates": json.dumps([di_type]) if di_type else None, "di_type": di_type,
+            "template_key": template.key if template is not None else None,
+            "stage": template.stage if template is not None and template.stage != "ANY" else None,
+            "actor": actor_id if template is not None else None,
+            "quality_confirmed": quality_confirmed,
         },
     ).scalar_one_or_none()
     if inserted is None:
@@ -2419,7 +2524,8 @@ def _send_page_again(
     _activity(
         connection, tenant_id=tenant_id, journey_id=journey_id, event_type=event_type,
         subject_type="DOCUMENT_PAGE", subject_id=str(queue_id),
-        details={"templateKey": template.key, "newQueueId": str(new_id), "by": actor_id,
+        details={"templateKey": template.key if template is not None else None, "newQueueId": str(new_id),
+                 "by": actor_id, "qualityConfirmed": quality_confirmed,
                  "previousStatus": "SWEPT" if swept else unit["queue_status"],
                  "previousCode": unit.get("last_error"),
                  **({"overrideReason": override_reason} if override_reason else {})},
@@ -2466,15 +2572,10 @@ def set_page_type(
     swept = unit["queue_status"] == "CANCELLED" and _is_swept(connection, tenant_id=tenant_id, queue_id=queue_id)
     if unit["queue_status"] not in _RETYPEABLE_PAGE_STATES and not swept:
         raise HTTPException(status_code=409, detail="This page is still being processed.")
-    if swept and str(unit.get("last_error") or "").startswith("DI_QUALITY_"):
-        # A swept page refused for scan quality is not sent again: DI's
-        # scan-quality check runs before the type is looked at, so the same
-        # scan is refused whatever its type (2026-10-27: quality-refused
-        # pages keep their own task, with no type option).
-        raise HTTPException(
-            status_code=409,
-            detail="This page was rejected for scan quality; setting its type will not help. Re-scan it and upload it again.",
-        )
+    # A page refused for scan quality, typed by the PC: sent as it is with DI's
+    # UPLOADER_CONFIRMED quality gate (2026-11-06; until then refused here,
+    # because DI refuses the same scan whatever its type).
+    quality_refused = str(unit.get("last_error") or "").startswith("DI_QUALITY_")
     if template.key == _OTHER_DOCUMENT_TEMPLATE:
         # "Others": the PC confirms the page is not a checklist document. It
         # stays on file as supporting evidence and is never sent for reading.
@@ -2514,8 +2615,9 @@ def set_page_type(
     )
     new_id = _send_page_again(
         connection, tenant_id=tenant_id, journey_id=journey_id, unit=unit, template=template,
-        di_type=template.di_types[0], actor_id=human_principal.subject, role=access.operating_role, swept=swept,
-        event_type="PAGE_RETYPED", override_reason=override, correlation_id=get_correlation_id(request),
+        di_type=template.di_types[0], actor_id=human_principal.subject, role=access.operating_role,
+        swept=swept or quality_refused, event_type="PAGE_RETYPED", override_reason=override,
+        correlation_id=get_correlation_id(request), quality_confirmed=quality_refused,
     )
     return {"queueId": str(new_id), "status": "QUEUED", "templateKey": template.key}
 

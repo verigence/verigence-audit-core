@@ -85,8 +85,10 @@ class FakeDI:
 
     def create_upload_intents(self, *, token, tenant_id, external_context_ref, phase, files,
                               candidate_document_type_keys, requirement_refs_by_document_type_key,
-                              classification_mode=None):
+                              classification_mode=None, quality_gate=None):
         self.intent_calls += 1
+        self.quality_gates = getattr(self, "quality_gates", [])
+        self.quality_gates.extend((f["filename"], quality_gate) for f in files)
         trusted = classification_mode == "TRUST_SINGLE_CANDIDATE"
         assert not trusted or len(candidate_document_type_keys) == 1
         uploads = []
@@ -449,3 +451,107 @@ def test_a_pc_upload_is_stored_per_outlet_and_ist_day_under_the_customer_s_name(
     assert stored, "the worker stored no pages"
     assert all(re.fullmatch(rf"{folder}/(pages|groups)/.+", k) for k in stored), stored
     assert any("/pages/" in k for k in stored)
+
+
+def test_the_same_file_after_a_failed_or_removed_upload_is_a_new_upload(pipeline):
+    """2026-11-06: the browser sends the same clientUploadId for the same file.
+    While the earlier upload is in flight or was read, that is the same upload;
+    once it FAILED or was CANCELLED, picking the file again starts a fresh upload
+    instead of being answered "already accepted" with nothing read."""
+    journey, _storage, _di = pipeline
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}"
+    file = {"filename": "invoice.pdf", "contentType": "application/pdf", "sizeBytes": 1234,
+            "clientUploadId": "web-p2-same-file-0001"}
+
+    [first] = client.post(f"{base}/uploads:init", json={"files": [file]}).json()["uploads"]
+    # Still waiting for the bytes: the same upload, the same batch.
+    [again] = client.post(f"{base}/uploads:init", json={"files": [file]}).json()["uploads"]
+    assert again["batchId"] == first["batchId"] and again["alreadyAccepted"] is False
+
+    for ended in ("FAILED", "CANCELLED"):
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            connection.execute(
+                text("UPDATE auditcore.p2_upload_batches SET batch_status=:s "
+                     "WHERE tenant_id=:t AND client_upload_id=:c"),
+                {"s": ended, "t": journey.tenant_id, "c": file["clientUploadId"]},
+            )
+        response = client.post(f"{base}/uploads:init", json={"files": [file]})
+        assert response.status_code == 200, response.text
+        [fresh] = response.json()["uploads"]
+        assert fresh["alreadyAccepted"] is False and fresh["uploadUrl"]
+        assert fresh["batchId"] != first["batchId"]
+        first = fresh
+
+    # A completed upload keeps its id: the same file is not read twice.
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_upload_batches SET batch_status='COMPLETED' "
+                 "WHERE tenant_id=:t AND client_upload_id=:c"),
+            {"t": journey.tenant_id, "c": file["clientUploadId"]},
+        )
+    [done] = client.post(f"{base}/uploads:init", json={"files": [file]}).json()["uploads"]
+    assert done["batchId"] == first["batchId"] and done["alreadyAccepted"] is True
+
+
+def test_a_page_refused_for_scan_quality_and_uploaded_again_is_read_as_confirmed(pipeline):
+    """2026-11-06: the PC sends the same page again after DI refused it for scan
+    quality ("I have seen pics being correct only"). The new copy goes to DI with
+    the UPLOADER_CONFIRMED quality gate; the other pages of the file do not."""
+    journey, storage, di = pipeline
+    di.fail_next_finalize = False
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}"
+    pdf = _three_page_pdf()
+
+    def upload(client_upload_id: str) -> None:
+        [prepared] = client.post(f"{base}/uploads:init", json={"files": [{
+            "filename": "booking-packet.pdf", "contentType": "application/pdf", "sizeBytes": len(pdf),
+            "clientUploadId": client_upload_id}]}).json()["uploads"]
+        storage.objects[prepared["uploadUrl"].split("https://storage.test/", 1)[1]] = pdf
+        assert client.post(f"{base}/uploads/{prepared['batchId']}:finalize").status_code == 202
+        _drain(journey)
+
+    upload("e2e-quality-0001")
+    assert all(gate is None for _, gate in di.quality_gates)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET queue_status='FAILED', "
+                 "last_error='DI_QUALITY_IMAGE_CONTRAST' WHERE tenant_id=:t AND unit_kind='PAGE' AND page_number=2"),
+            {"t": journey.tenant_id},
+        )
+    di.quality_gates = []
+    upload("e2e-quality-0002")  # the same file, saved again
+    assert [name for name, gate in di.quality_gates if gate == "UPLOADER_CONFIRMED"] == ["booking-packet-page-002.pdf"]
+
+
+
+def test_journey_360_lists_each_uploaded_file_and_opens_it_as_uploaded(pipeline):
+    """2026-11-06: the full file the PC uploaded can be downloaded from Journey 360."""
+    journey, storage, di = pipeline
+    di.fail_next_finalize = False
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}"
+    pdf = _three_page_pdf()
+    [prepared] = client.post(f"{base}/uploads:init", json={"files": [
+        {"filename": "booking-packet.pdf", "contentType": "application/pdf", "sizeBytes": len(pdf),
+         "clientUploadId": "e2e-list-0001"},
+        {"filename": "never-sent.pdf", "contentType": "application/pdf", "sizeBytes": 10,
+         "clientUploadId": "e2e-list-0002"}][:1]}).json()["uploads"]
+    client.post(f"{base}/uploads:init", json={"files": [
+        {"filename": "never-sent.pdf", "contentType": "application/pdf", "sizeBytes": 10,
+         "clientUploadId": "e2e-list-0002"}]})
+    storage.objects[prepared["uploadUrl"].split("https://storage.test/", 1)[1]] = pdf
+    assert client.post(f"{base}/uploads/{prepared['batchId']}:finalize").status_code == 202
+    _drain(journey)
+
+    listed = client.get(f"{base}/uploads")
+    assert listed.status_code == 200, listed.text
+    [file] = listed.json()["files"]  # the file never received is not listed
+    assert file["batchId"] == prepared["batchId"] and file["filename"] == "booking-packet.pdf"
+    assert file["pages"] == 3 and file["sizeBytes"] == len(pdf) and file["uploadedAtUtc"]
+    link = client.get(f"{base}/uploads/{file['batchId']}/file").json()
+    assert link["url"].startswith("https://storage.test/get/") and link["filename"] == "booking-packet.pdf"

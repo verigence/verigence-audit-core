@@ -252,7 +252,8 @@ def test_refused_pages_get_their_own_task_per_file(journey):
     assert quality["title"] == "packet.pdf: 3 pages refused for image quality"
     assert quality["description"].startswith(
         "Refused by the scan-quality check and not read: Page 2 is too faded (low contrast); Page 3 is blurred; "
-        "Page 4 is too small. A retry will not help.")
+        "Page 4 is too small. ")
+    assert "is fine — read it" in quality["description"]
     assert quality["reference"]["pageNumbers"] == [2, 3, 4]
     assert [r["reason"] for r in quality["reference"]["rejections"]] == ["faded", "blurred", "tooSmall"]
 

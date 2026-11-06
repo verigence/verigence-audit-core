@@ -103,6 +103,27 @@ _PROGRAMME_TIMEZONE = ZoneInfo("Asia/Kolkata")
 # Fields whose date can never lie after today: a booking is made on or
 # before the day its form is read.
 NO_FUTURE_DATE_FIELDS = frozenset({"booking_date"})
+# Dates that may legitimately lie ahead: what is promised or covered, not what
+# has happened. Every other ``*_date`` field records an event that already took
+# place (a delivery, an invoice, a receipt, a gate pass), so a day after today
+# is a misread digit or year (2026-11-06: a vehicle gate pass read as 8 Nov was
+# counted on Monday 9 Nov's gate register).
+FORWARD_LOOKING_DATE_FIELDS = frozenset({
+    "expected_delivery_date", "tentative_delivery_date", "policy_start_date", "policy_end_date",
+    "coverage_start_date", "coverage_end_date", "certificate_valid_until_date",
+})
+_FORWARD_LOOKING_MARKERS = ("expected", "tentative", "valid", "until", "expiry", "expires", "due",
+                            "_end_", "_start_", "renewal", "next_")
+
+
+def cannot_be_future(field_key: str) -> bool:
+    """True for a date field that records an event that has already happened."""
+    key = (field_key or "").strip().lower()
+    if key in NO_FUTURE_DATE_FIELDS:
+        return True
+    if not key.endswith("date") or key in FORWARD_LOOKING_DATE_FIELDS:
+        return False
+    return not any(marker in f"_{key}_" for marker in _FORWARD_LOOKING_MARKERS)
 
 
 def programme_today() -> date:
@@ -111,10 +132,10 @@ def programme_today() -> date:
 
 
 def future_date_verdict(field_key: str, value: Any, today: date | None = None) -> str | None:
-    """``DATE_IN_FUTURE`` when a field that cannot lie in the future (the
-    booking date) was read as a day after today: a digit or the year was
+    """``DATE_IN_FUTURE`` when a field that cannot lie in the future (see
+    ``cannot_be_future``: a booking, delivery, invoice, receipt date ...) was read as a day after today: a digit or the year was
     misread. None otherwise, including when the value is not a date."""
-    if field_key not in NO_FUTURE_DATE_FIELDS or value is None or str(value).strip() == "":
+    if not cannot_be_future(field_key) or value is None or str(value).strip() == "":
         return None
     parsed = parse_extracted_date(value)
     if parsed is None:

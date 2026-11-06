@@ -17,7 +17,10 @@ States and the one action each offers:
   STUCK         in hand for 8h or more                          READ_AGAIN
   NOT_READ      classified, settled without being read          READ_AGAIN
   NOTHING_READ  read, but no values came back                   READ_AGAIN
-  REJECTED      quality or unreadable: the file is at fault     UPLOAD_AGAIN
+  REJECTED      unreadable: the file is at fault                UPLOAD_AGAIN
+  REJECTED      refused for scan quality                        READ_AS_IS (2026-11-06: the
+                PC sends the stored page as it is -- DI reads it, scores kept --
+                or uploads a better scan)
   FAILED        a technical failure after every attempt         RETRY
   UNCLASSIFIED  DI could not tell what the page is              SET_TYPE
   OTHERS        the PC kept it as Others                        -
@@ -73,7 +76,9 @@ def page_health(
         return result("READ", None)
     if status in ("FAILED", "DEAD_LETTER"):
         code = str(unit.get("last_error") or "").upper()
-        if code.startswith(_QUALITY_PREFIX) or code in _UNREADABLE_CODES:
+        if code.startswith(_QUALITY_PREFIX):
+            return result("REJECTED", "READ_AS_IS")
+        if code in _UNREADABLE_CODES:
             return result("REJECTED", "UPLOAD_AGAIN")
         return result("FAILED", "RETRY")
     if status == "NEEDS_REVIEW":

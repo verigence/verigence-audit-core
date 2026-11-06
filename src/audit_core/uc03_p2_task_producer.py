@@ -930,10 +930,11 @@ def _sync_quality_task(
                     f"{rejection_words(reason)}" for reason, group in by_reason.items())
     count = len(pages)
     title = f"{filename}: {count} page{'' if count == 1 else 's'} refused for image quality"
-    description = (f"Refused by the scan-quality check and not read: {why}. A retry will not help. "
-                   f"{dayend_removal_notice(count)} Scan "
-                   f"{'it' if count == 1 else 'them'} again in good light, flat and in focus, and upload from "
-                   f"Upload / Edit Documents. {QUALITY_CLOSE_INSTRUCTION} This task also closes itself once "
+    description = (f"Refused by the scan-quality check and not read: {why}. "
+                   f"{dayend_removal_notice(count)} If you can read the page, press “is fine — read it” "
+                   "here (or upload the same page again): it is read as it is and its scan scores are kept. "
+                   f"Otherwise scan {'it' if count == 1 else 'them'} again in good light, flat and in focus, "
+                   f"and upload from Upload / Edit Documents. {QUALITY_CLOSE_INSTRUCTION} This task also closes itself once "
                    "the refused pages are processed or removed (the day-end clean-up only takes them off the "
                    "journey; it does not close this task). Delete this booking if nothing on it can be used.")
     _, outcome = raise_or_refresh(

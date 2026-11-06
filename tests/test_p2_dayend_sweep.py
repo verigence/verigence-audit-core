@@ -641,7 +641,7 @@ def test_a_swept_image_quality_page_keeps_its_task_open_and_says_the_system_remo
     assert INSTRUCTION in before["description"]
     assert before["description"].count('"') == 4
     assert before["description"].startswith("Refused by the scan-quality check and not read: Page 2 is blurred. "
-                                            "A retry will not help. " + NOTICE)
+                                            + NOTICE)
 
     result = _sweep(journey)
 
