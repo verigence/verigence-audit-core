@@ -14,6 +14,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import create_engine, text
 
+from audit_core.db import set_tenant_context
 from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_attribute_resolution import record_attribute_resolution
 
@@ -52,7 +53,11 @@ def _journey(connection, tenant_id: str, suffix: str):
     ).scalar_one()
 
 
-def test_second_correction_of_an_attribute_replaces_the_resolution() -> None:
+def test_corrections_record_their_resolution_as_the_runtime_role_and_never_fail() -> None:
+    """2026-11-06: ON CONFLICT DO UPDATE needs UPDATE, which the runtime role
+    does not have on this insert-only ledger (migration 0037), so every field
+    correction failed with VAC-SYS-001. Run as the runtime role: the first and
+    a second correction both go through; the first resolution is kept."""
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         pytest.skip("DATABASE_URL is required for this integration test")
@@ -63,8 +68,11 @@ def test_second_correction_of_an_attribute_replaces_the_resolution() -> None:
     tenant_id = f"tenant-recorrect-{suffix}"
     with engine.begin() as connection:
         journey_id = _journey(connection, tenant_id, suffix)
-        first_document, second_document = uuid4(), uuid4()
-        for document_id, actor in ((first_document, "pc-1"), (second_document, "reviewer-1")):
+    first_document, second_document = uuid4(), uuid4()
+    for document_id, actor in ((first_document, "pc-1"), (second_document, "reviewer-1")):
+        with engine.begin() as connection:
+            connection.execute(text("SET LOCAL ROLE audit_core_runtime"))
+            set_tenant_context(connection, tenant_id)
             record_attribute_resolution(
                 connection, tenant_id=tenant_id, journey_id=journey_id, stage_code="BOOKING", spec=spec,
                 source_di_document_id=document_id, source_evidence_id=None,
@@ -72,11 +80,11 @@ def test_second_correction_of_an_attribute_replaces_the_resolution() -> None:
                 source_fact_version=1, source_document_type_key="booking_form", actor_id=actor,
                 owning_domain_key=None, owning_record_reference=None,
             )
+    with engine.begin() as connection:
         rows = connection.execute(
             text("SELECT source_di_document_id, resolved_by_actor_id FROM auditcore.journey_attribute_resolutions "
                  "WHERE tenant_id=:t AND journey_id=:j AND attribute_key=:a"),
             {"t": tenant_id, "j": journey_id, "a": spec.attribute_key},
         ).all()
     assert len(rows) == 1
-    assert rows[0].source_di_document_id == second_document
-    assert rows[0].resolved_by_actor_id == "reviewer-1"
+    assert rows[0].source_di_document_id == first_document

@@ -304,26 +304,15 @@ def record_attribute_resolution(
                 :source_document_type_key, 'SOURCE_PRIORITY_THEN_CONFIDENCE', :mapping_version,
                 :owning_domain_key, :owning_record_reference, :actor_id
             )
-            -- One resolution per (journey, stage, attribute): the latest
-            -- reviewed value is the source. A second correction of the same
-            -- attribute (same or another document) used to hit the unique key
-            -- and every edit after the first failed with VAC-CONFLICT-000.
-            ON CONFLICT (tenant_id, journey_id, stage_code, attribute_key)
-            DO UPDATE SET
-                excel_field_no = EXCLUDED.excel_field_no,
-                mapping_status = EXCLUDED.mapping_status,
-                source_di_document_id = EXCLUDED.source_di_document_id,
-                source_evidence_id = EXCLUDED.source_evidence_id,
-                source_canonical_field_id = EXCLUDED.source_canonical_field_id,
-                source_field_key = EXCLUDED.source_field_key,
-                source_fact_version = EXCLUDED.source_fact_version,
-                source_document_type_key = EXCLUDED.source_document_type_key,
-                resolution_rule = EXCLUDED.resolution_rule,
-                mapping_version = EXCLUDED.mapping_version,
-                owning_domain_key = EXCLUDED.owning_domain_key,
-                owning_record_reference = EXCLUDED.owning_record_reference,
-                resolved_by_actor_id = EXCLUDED.resolved_by_actor_id,
-                resolved_at_utc = now()
+            -- One resolution per (journey, stage, attribute), and the ledger is
+            -- insert-only: the runtime role has no UPDATE on it (migration
+            -- 0037), and ON CONFLICT DO UPDATE needs UPDATE even when nothing
+            -- conflicts -- every correction failed with VAC-SYS-001 on
+            -- 2026-11-06. The first resolution stays as the provenance; the
+            -- corrected value itself lives in its owning record and the
+            -- correction ledger. Before, a second correction hit the unique key
+            -- (VAC-CONFLICT-000).
+            ON CONFLICT (tenant_id, journey_id, stage_code, attribute_key) DO NOTHING
             """
         ),
         {
