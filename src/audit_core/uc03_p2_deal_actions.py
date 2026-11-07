@@ -34,7 +34,6 @@ from audit_core.security_authorization import (
 )
 from audit_core.uc03_p2_access import authorize_p2
 from audit_core.uc03_p2_controls import request_control_evaluation
-from audit_core.uc03_p2_dates import booking_form_date
 from audit_core.uc03_p2_document_health import journey_document_health
 from audit_core.uc03_p2_runtime import (
     enqueue_work,
@@ -128,14 +127,19 @@ def _pricing_row(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
 
 def booking_date_for_pricing(connection: Connection, *, tenant_id: str, journey_id: UUID,
                              row: dict[str, Any] | None = None) -> date | None:
-    """The date the deal is priced on by default: the booking date on the
-    booking form (as read, or as the PC corrected it), else the booking
-    date entered by hand on the booking. Never today."""
-    form = booking_form_date(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if form and form["date"]:
-        return form["date"]
+    """The date the deal is priced on by default: the Journey's booking date
+    (``uc03_booking_date.journey_booking_date``) -- the booking date on the
+    booking form (as read, or as the PC corrected it) when it can be right,
+    else the booking date entered by hand on the booking. Never today."""
+    from audit_core.uc03_booking_date import read_booking_date
+    from audit_core.uc03_p2_dates import before_floor
+
+    read = read_booking_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if read is not None:
+        return read
     row = row or _pricing_row(connection, tenant_id=tenant_id, journey_id=journey_id)
-    return row["booking_date"]
+    held = row["booking_date"]
+    return None if held is None or before_floor(held) else held
 
 
 def pricing_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:

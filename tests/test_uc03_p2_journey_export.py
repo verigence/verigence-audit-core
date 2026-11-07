@@ -26,7 +26,10 @@ from audit_core.uc03_p2_journey_export import (
 
 def test_the_columns_are_the_deal_audit_export_s_in_its_order() -> None:
     cols = columns()
-    assert len(cols) == 192
+    # The Deal Audit export's 192 columns in its order, then the Booking Date
+    # Note (2026-11-07) after them so that layout is unchanged.
+    assert len(cols) == 193 and cols[-1] == "Booking Date Note"
+    cols = cols[:192]
     assert cols[:4] == ["Dealership", "Location", "Booking No", "Booking Date"]
     assert cols[34] == "Pincode" and cols[35] == "Std: Ex Showroom"
     assert cols[62] == "Total Standard Deal" and cols[63] == "Std Disc: Sales Discount"
