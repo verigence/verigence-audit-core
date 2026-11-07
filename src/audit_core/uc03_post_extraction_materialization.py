@@ -23,6 +23,7 @@ from audit_core import uc03_v2_review_materialization as materialization
 from audit_core.errors import AuditCoreError
 from audit_core.uc03_attribute_mapping import spec_for_field
 from audit_core.uc03_attribute_resolution import apply_supported_operational_attribute
+from audit_core.uc03_booking_date import BOOKING_DATE_ATTRIBUTE, sync_booking_date
 from audit_core.uc03_deal_source_history import upsert_commercial_actual
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,24 @@ def _receipt_documents(annotated: list[dict[str, Any]]) -> list[Any]:
     return [SimpleNamespace(**item) for item in grouped.values()]
 
 
+def _sync_booking_date(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str:
+    """The booking record's date from the booking form / docket on file. A
+    failure is logged and leaves the rest of the pass untouched."""
+    try:
+        with connection.begin_nested():
+            return sync_booking_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    except Exception as exc:
+        from audit_core.uc03_db_transient import is_transient_db_error
+
+        if is_transient_db_error(exc):
+            raise
+        logger.warning(
+            "uc03_booking_date_sync_skipped",
+            extra={"tenant_id": tenant_id, "journey_id": str(journey_id), "reason": str(exc)},
+        )
+        return "FAILED"
+
+
 def materialize_machine_booking_values(
     connection: Connection,
     *,
@@ -237,6 +256,13 @@ def materialize_machine_booking_values(
             spec = spec_for_field(field_key)
             if spec is None or spec.mapping_status != "SUPPORTED":
                 continue
+            # The booking date has its own rule and writer (uc03_booking_date,
+            # 2026-11-07): the winner across every copy ever read could be a
+            # superseded docket (refused as not ACTIVE) or a Delivery-stage
+            # ledger (never written here), and the active docket's date was
+            # then never stored.
+            if spec.attribute_key == BOOKING_DATE_ATTRIBUTE:
+                continue
 
             # PAN/Aadhaar remain the selected customer source of truth. If that
             # selected identity value is <90%, keep it visible/durable in Core and
@@ -277,6 +303,10 @@ def materialize_machine_booking_values(
                     "reason": str(exc),
                 },
             )
+
+    booking_date = _sync_booking_date(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if booking_date in ("FILLED", "UPDATED"):
+        operational += 1
 
     product = _materialize_product(
         connection,
