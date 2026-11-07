@@ -11,6 +11,7 @@ import gzip
 import json
 import os
 from datetime import UTC, datetime, timedelta
+from typing import ClassVar
 from uuid import UUID, uuid4
 
 import pytest
@@ -550,3 +551,54 @@ def test_archive_files_are_kept_twelve_months_by_a_bucket_lifecycle_rule():
 
     da.apply_retention(_Store(), 365)
     assert calls == [{"Bucket": "deal-guard-archive", "LifecycleConfiguration": da.retention_lifecycle(365)}]
+
+def test_the_nightly_pass_dry_runs_until_switched_on_then_archives(setup):
+    """Product owner, 7 Nov 2026: the archive runs nightly from the worker; a table is archived for
+    real only when its switch and the bucket are set, otherwise its counts are recorded."""
+    engine, tenant = setup["engine"], setup["tenant"]
+    before = _ids(engine, tenant)
+    [dry] = archive.nightly_archive(setup["job"], tenant_id=tenant, started_by="test", environ={})
+    assert dry.mode == archive.MODE_DRY_RUN and _ids(engine, tenant) == before
+
+    class _Lifecycle(FakeStore):
+        bucket = "deal-guard-archive"
+        rules: ClassVar[list] = []
+
+        def _client(self):
+            store = self
+
+            class _C:
+                def put_bucket_lifecycle_configuration(self, **kwargs):
+                    store.rules.append(kwargs)
+
+            return _C()
+
+    store = _Lifecycle()
+    env = {"AUDIT_CORE_ARCHIVE_BUCKET": "deal-guard-archive", "AUDIT_CORE_ARCHIVE_RULE_EXECUTIONS_ENABLED": "true",
+           "AUDIT_CORE_ARCHIVE_RULE_EXECUTIONS_AGE_DAYS": "7"}
+    [live] = archive.nightly_archive(setup["job"], tenant_id=tenant, started_by="test", environ=env,
+                                     store_factory=lambda b: store)
+    assert live.mode == archive.MODE_LIVE and live.status == "SUCCEEDED"
+    assert store.rules and store.rules[0]["LifecycleConfiguration"]["Rules"][0]["Expiration"] == {"Days": 365}
+
+
+def test_the_worker_runs_the_archive_once_a_night(setup, monkeypatch):
+    from datetime import UTC, datetime
+
+    from audit_core import uc03_p2_worker as worker
+
+    calls = []
+    monkeypatch.setattr(archive, "nightly_archive", lambda engine, **kw: calls.append(kw) or [])
+    monkeypatch.setattr(worker, "_DATA_ARCHIVE_UTC", "21:30")
+    worker._last_data_archive.clear()
+    tenant = setup["tenant"]
+    assert worker.run_data_archive(setup["engine"], tenant, now=datetime(2026, 11, 7, 21, 0, tzinfo=UTC)) is None
+    night = datetime(2026, 11, 7, 21, 45, tzinfo=UTC)
+    assert worker.run_data_archive(setup["engine"], tenant, now=night) == []
+    assert worker.run_data_archive(setup["engine"], tenant, now=night) is None  # this worker, same night
+    worker._last_data_archive.clear()  # a restart: the durable claim still holds
+    assert worker.run_data_archive(setup["engine"], tenant, now=night) is None
+    assert len(calls) == 1 and calls[0]["tenant_id"] == tenant
+    monkeypatch.setattr(worker, "_DATA_ARCHIVE_UTC", "off")
+    worker._last_data_archive.clear()
+    assert worker._data_archive_due(tenant, datetime(2026, 11, 8, 22, 0, tzinfo=UTC)) is None

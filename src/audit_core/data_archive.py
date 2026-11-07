@@ -753,6 +753,33 @@ def run_archive(engine: Engine, *, mode: str, settings: ArchiveSettings, started
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
+NIGHTLY_RUN_NAME = "P2_DATA_ARCHIVE"
+
+
+def nightly_archive(engine: Engine, *, tenant_id: str, started_by: str,
+                    environ: Mapping[str, str] | None = None,
+                    store_factory: StoreFactory | None = None) -> list[TableResult]:
+    """The worker's nightly pass for one Project (03:00 IST, product owner 7 Nov 2026): tables whose
+    LIVE switch is on are archived for real (the archive bucket's 12-month lifecycle rule is applied
+    first); every other table gets a dry run, so the counts are recorded each night."""
+    settings = ArchiveSettings.from_env(environ)
+    live = [r.key for r in ARCHIVE_RULES if settings.bucket and r.key in settings.enabled_tables]
+    dry = [r.key for r in ARCHIVE_RULES if r.key not in live]
+    results: list[TableResult] = []
+    if live:
+        try:
+            store = (store_factory or (lambda b: archive_store_from_env(b, environ)))(settings.bucket or "")
+            apply_retention(store, retention_days(environ))
+        except Exception:
+            logger.warning("data_archive_retention_not_applied", exc_info=True)
+        results += run_archive(engine, mode=MODE_LIVE, settings=settings, started_by=started_by,
+                               tables=live, tenant_ids=[tenant_id], store_factory=store_factory)
+    if dry:
+        results += run_archive(engine, mode=MODE_DRY_RUN, settings=settings, started_by=started_by,
+                               tables=dry, tenant_ids=[tenant_id])
+    return results
+
+
 def job_engine(database_url: str) -> Engine:
     """The job runs as the runtime role, like the API: it can delete only
     through archive_delete_rows. Statements get more time than an API call."""

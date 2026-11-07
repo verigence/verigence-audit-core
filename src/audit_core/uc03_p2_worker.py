@@ -4247,6 +4247,51 @@ def run_dayend_sweep(engine: Engine, tenant_id: str, now: datetime | None = None
         return None
 
 
+# The nightly data archive (product owner 7 Nov 2026): 21:30 UTC = 03:00 IST, after the day-end
+# sweep and the Analytics copy. Off with P2_DATA_ARCHIVE_UTC=off.
+_DATA_ARCHIVE_UTC = os.environ.get("P2_DATA_ARCHIVE_UTC", "21:30")
+_last_data_archive: dict[str, str] = {}
+
+
+def _data_archive_due(tenant_id: str, now: datetime | None = None) -> str | None:
+    """The UTC date whose archive pass this worker still owes, once the configured time has passed."""
+    if _DATA_ARCHIVE_UTC.strip().lower() in {"", "off", "none"}:
+        return None
+    now = now or datetime.now(UTC)
+    hour, _, minute = _DATA_ARCHIVE_UTC.partition(":")
+    due_at = now.replace(hour=int(hour), minute=int(minute or 0), second=0, microsecond=0)
+    if now < due_at:
+        return None
+    today = now.date().isoformat()
+    return None if _last_data_archive.get(tenant_id) == today else today
+
+
+def run_data_archive(engine: Engine, tenant_id: str, now: datetime | None = None) -> list | None:
+    """Run the night's archive pass once per Project. The night is claimed durably first
+    (p2_scheduled_runs, run P2_DATA_ARCHIVE), so two workers or a restart never run it twice; the
+    archive itself runs in its own transactions (each batch is verified before its rows go)."""
+    from audit_core.data_archive import NIGHTLY_RUN_NAME, nightly_archive
+
+    due = _data_archive_due(tenant_id, now)
+    if due is None:
+        return None
+    try:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            claimed = claim_scheduled_run(connection, tenant_id=tenant_id, run_name=NIGHTLY_RUN_NAME,
+                                          run_key=due, claimed_by=_WORKER_ID)
+        _last_data_archive[tenant_id] = due
+        if not claimed:
+            return None
+        results = nightly_archive(engine, tenant_id=tenant_id, started_by=f"p2-worker:{_WORKER_ID}")
+        logger.info("p2_data_archive", tenant_id=tenant_id, night=due,
+                    results=[{"table": r.table_key, "mode": r.mode, "status": r.status} for r in results])
+        return results
+    except Exception:
+        logger.warning("p2_data_archive_failed", tenant_id=tenant_id, night=due, exc_info=True)
+        return None
+
+
 def run_task_manager(engine: Engine, tenant_id: str, now: datetime | None = None) -> dict[str, int] | None:
     """The Task Manager's pass for one Project (docs/TASK_MANAGER_DESIGN_v1.0.md):
     raise today's recurring occurrences (each claimed once in
@@ -4314,6 +4359,7 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
         except Exception:
             logger.warning("p2_watchdog_failed", tenant_id=tenant_id, exc_info=True)
     run_dayend_sweep(engine, tenant_id)
+    run_data_archive(engine, tenant_id)
     if now - _last_task_manager_at.get(tenant_id, 0.0) >= _TASK_MANAGER_SECONDS:
         _last_task_manager_at[tenant_id] = now
         run_task_manager(engine, tenant_id)
