@@ -325,13 +325,17 @@ def test_a_verification_mismatch_deletes_nothing(setup):
 
 
 def test_a_failure_part_way_keeps_every_row_not_yet_verified(setup):
-    engine, tenant = setup["engine"], setup["tenant"]
-    before = _ids(engine, tenant)
+    engine = setup["engine"]
+    # Projects run in the job's own order, which depends on their (random) ids in this test.
+    befores = {t: _ids(engine, t) for t in (setup["tenant"], setup["other_tenant"])}
     store = FakeStore(fail_put_from=2)
     [result] = archive.run_archive(setup["job"], mode=archive.MODE_LIVE, settings=_settings(batch_size=3),
                                    started_by="test", store_factory=lambda b: store, now=NOW,
-                                   tenant_ids=[tenant, setup["other_tenant"]])
+                                   tenant_ids=list(befores))
     assert result.status == "FAILED"
+    tenant = result.tenants[0].tenant_id
+    [untouched] = [t for t in befores if t != tenant]
+    before = befores[tenant]
     [first_key] = [k for k in store.objects if k.endswith(".jsonl.gz")]
     first_batch = {json.loads(line)["rule_execution_id"]
                    for line in gzip.decompress(store.objects[first_key]).decode().splitlines()}
@@ -342,7 +346,7 @@ def test_a_failure_part_way_keeps_every_row_not_yet_verified(setup):
         (1, "BATCH_ARCHIVED", 3), (None, "FAILED", 3)]
     # The failure stops the table's run: the next Project is not started.
     assert len(result.tenants) == 1
-    assert _ids(engine, setup["other_tenant"]) >= setup["other_rows"]["c30"]
+    assert _ids(engine, untouched) == befores[untouched]
 
 
 def test_live_is_refused_without_the_bucket_or_the_table_switch(setup):
