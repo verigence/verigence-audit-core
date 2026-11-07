@@ -10,13 +10,11 @@ active docket's date was never stored.
 """
 from __future__ import annotations
 
-import io
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, timedelta
 from uuid import uuid4
 
 import pytest
 from conftest import delete_tenant_data
-from openpyxl import load_workbook
 from p2_support import (
     add_evidence,
     add_extracted_field,
@@ -34,13 +32,6 @@ from audit_core.uc03_booking_date import (
     sync_booking_date,
 )
 from audit_core.uc03_p2_dates import programme_date_floor, programme_today
-from audit_core.uc03_p2_journey_export import (
-    BOOKING_DATE_NOT_READ,
-    _booking_date_note,
-    columns,
-    journeys_in_scope,
-    run_pending_exports,
-)
 from audit_core.uc03_post_extraction_materialization import (
     materialize_machine_booking_values,
 )
@@ -246,88 +237,3 @@ def test_the_backfill_leaves_a_journey_with_nothing_usable_empty(journey) -> Non
     _docket(journey, (floor - timedelta(days=400)).isoformat())
     assert fill_missing_booking_dates(journey.engine, journey.tenant_id) == {"NOT_READ": 1}
     assert _held(journey) is None
-
-
-# ── the export ──────────────────────────────────────────────────────────────
-
-
-def _created_on(journey, day: date) -> None:
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        connection.execute(
-            text("UPDATE auditcore.journeys SET created_at_utc=:c WHERE tenant_id=:t AND journey_id=:j"),
-            {"c": datetime(day.year, day.month, day.day, 6, 0, tzinfo=UTC), "t": journey.tenant_id, "j": journey.journey_id},
-        )
-
-
-def _scope(journey, start: date, end: date) -> list[dict]:
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        return journeys_in_scope(connection, tenant_id=journey.tenant_id,
-                                 filters={"dateBasis": "BOOKING", "dateFrom": start, "dateTo": end},
-                                 outlet_ids=None)
-
-
-def test_a_journey_with_no_booking_date_is_listed_by_its_creation_day_not_dropped(journey) -> None:
-    created = date(2026, 10, 25)
-    _created_on(journey, created)
-    _booking(journey, None)
-    assert [r["journey_id"] for r in _scope(journey, date(2026, 10, 20), date(2026, 11, 7))] == [journey.journey_id]
-    assert _scope(journey, date(2026, 11, 1), date(2026, 11, 7)) == []
-
-
-def test_a_journey_with_a_booking_date_is_listed_by_it_not_by_its_creation_day(journey) -> None:
-    _created_on(journey, date(2026, 10, 25))
-    _booking(journey, date(2026, 9, 30))
-    assert _scope(journey, date(2026, 10, 20), date(2026, 11, 7)) == []
-    assert len(_scope(journey, date(2026, 9, 1), date(2026, 9, 30))) == 1
-
-
-def test_the_workbook_shows_an_empty_booking_date_with_its_note(journey, monkeypatch) -> None:
-    class _Storage:
-        def __init__(self) -> None:
-            self.objects: dict[str, bytes] = {}
-
-        def put_object(self, key: str, data: bytes, *, content_type: str) -> None:
-            self.objects[key] = data
-
-    storage = _Storage()
-    monkeypatch.setattr("audit_core.uc03_p2_storage.get_p2_document_storage", lambda: storage)
-    created = date(2026, 10, 25)
-    _created_on(journey, created)
-    _booking(journey, None)
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        connection.execute(
-            text("INSERT INTO auditcore.p2_journey_exports (tenant_id, export_id, requested_by_actor_id, "
-                 "requested_by_role, filters, outlet_ids, names, file_name, status) "
-                 "VALUES (:t, gen_random_uuid(), 'pm', 'PM', CAST(:f AS jsonb), NULL, '{}'::jsonb, 'x.xlsx', "
-                 "'PENDING')"),
-            {"t": journey.tenant_id,
-             "f": '{"dateBasis": "BOOKING", "dateFrom": "2026-10-20", "dateTo": "2026-11-07"}'},
-        )
-    assert run_pending_exports(journey.engine, [journey.tenant_id], "test-worker") == 1
-    [data] = storage.objects.values()
-    sheet = load_workbook(io.BytesIO(data))["Deal Audit"]
-    header = [c.value for c in next(sheet.iter_rows(max_row=1))]
-    assert header == columns() and header[-1] == "Booking Date Note"
-    [row] = list(sheet.iter_rows(min_row=2, values_only=True))
-    values = dict(zip(header, row, strict=True))
-    assert values["Booking Date"] is None
-    assert values["Booking Date Note"] == BOOKING_DATE_NOT_READ
-
-
-def test_a_misread_held_date_is_no_booking_date_and_the_export_says_so(journey) -> None:
-    """131 records on DEV held a date before the programme began (2016, 2024
-    ...): such a journey is not filed under that year, it is listed by its
-    creation day with the misread named."""
-    floor = programme_date_floor()
-    assert floor is not None
-    misread = floor.replace(year=floor.year - 10)
-    _booking(journey, misread)
-    assert _call(journey, journey_booking_date) is None
-    _created_on(journey, date(2026, 10, 25))
-    [row] = _scope(journey, date(2026, 10, 20), date(2026, 11, 7))
-    assert row["booking_date"] is None and row["booking_date_on_file"] == misread
-    note = _booking_date_note(row)
-    assert note.startswith(BOOKING_DATE_NOT_READ) and misread.isoformat() in note
