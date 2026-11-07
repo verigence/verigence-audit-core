@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import os
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
@@ -1189,7 +1190,8 @@ def generate_occurrence(connection: Connection, *, tenant_id: str, schedule: dic
             description = (
                 f"Photograph the gate pass of {outlet_name} for {covers} and enter its counts on the Daily Gate "
                 "Pass screen. The system closes this task when the gate pass is finished; if it is not finished "
-                f"by 23:59 on {deadline} it is marked incomplete."
+                f"by 23:59 on {deadline} it is marked incomplete. A register can still be uploaded up to 7 days "
+                "after its date; the task then closes as done late."
             )
         else:
             protocol, reviewer_role = _reviewer_for_recurring(connection, tenant_id=tenant_id,
@@ -1246,31 +1248,46 @@ def ensure_system_schedules(connection: Connection, *, tenant_id: str, now: date
 
 
 def close_gate_pass_tasks(connection: Connection, *, tenant_id: str, outlet_id: str | UUID | None = None,
-                          business_date: date | None = None) -> int:
+                          business_date: date | None = None, include_incomplete: bool = False) -> int:
     """Close the gate pass task of every outlet and day whose ACTIVE gate pass
-    is finished (photo and counts, any explanation given)."""
+    is finished (photo and counts, any explanation given).
+
+    ``include_incomplete``: a register of an earlier day can be uploaded up to N-7
+    (product owner 2026-11-07), after its task was marked incomplete. When that
+    register is finished its task closes too, as done late: outcome DONE_LATE,
+    completed at the time the register was finished (so closedLate / CLOSED_LATE
+    show it), the time it was marked incomplete kept. Passed by the PC's own
+    finishing of a register (one outlet and day), not by the worker's sweep."""
     rows = connection.execute(
         text("""
             UPDATE auditcore.p2_tasks t
             SET task_status = 'VERIFIED_COMPLETE', verified_at_utc = g.completed_at_utc,
                 action_completed_at_utc = g.completed_at_utc, completed_by_actor_id = g.pc_actor_id,
                 completion_result = t.completion_result
-                    || jsonb_build_object('outcome', 'DONE', 'gatePassId', g.gate_pass_id::text),
+                    || jsonb_build_object('outcome', CASE WHEN t.task_status = 'FAILED' THEN 'DONE_LATE'
+                                                          ELSE 'DONE' END,
+                                          'gatePassId', g.gate_pass_id::text)
+                    || CASE WHEN t.task_status = 'FAILED'
+                            THEN jsonb_build_object('markedIncompleteAtUtc', t.updated_at_utc)
+                            ELSE '{}'::jsonb END,
                 updated_at_utc = now()
             FROM auditcore.p2_gate_passes g
-            WHERE t.tenant_id = :t AND t.task_type = :type AND t.task_status IN ('READY','IN_PROGRESS')
+            WHERE t.tenant_id = :t AND t.task_type = :type
+              AND (t.task_status IN ('READY','IN_PROGRESS')
+                   OR (:late AND t.task_status = 'FAILED' AND t.completion_result->>'outcome' = 'INCOMPLETE'))
               AND g.tenant_id = t.tenant_id AND g.outlet_id = t.outlet_id AND g.business_date = t.occurrence_date
               AND g.status = 'ACTIVE' AND g.completed_at_utc IS NOT NULL
               AND (CAST(:outlet AS uuid) IS NULL OR t.outlet_id = CAST(:outlet AS uuid))
               AND (CAST(:day AS date) IS NULL OR t.occurrence_date = CAST(:day AS date))
-            RETURNING t.task_id, g.gate_pass_id
+            RETURNING t.task_id, g.gate_pass_id, t.completion_result->>'outcome' AS outcome
         """),
         {"t": tenant_id, "type": GATE_PASS_TASK, "outlet": str(outlet_id) if outlet_id else None,
-         "day": business_date},
+         "day": business_date, "late": include_incomplete},
     ).mappings().all()
     for row in rows:
         _event(connection, tenant_id=tenant_id, task_id=row["task_id"], event_type="COMPLETED", caller=None,
-               details={"gatePassId": str(row["gate_pass_id"]), "by": "SYSTEM"})
+               details={"gatePassId": str(row["gate_pass_id"]), "by": "SYSTEM",
+                        **({"late": True} if row["outcome"] == "DONE_LATE" else {})})
     return len(rows)
 
 
@@ -1300,6 +1317,73 @@ def fail_unfinished_gate_passes(connection: Connection, *, tenant_id: str, now: 
     return len(rows)
 
 
+# --------------------------------------------------------------------------- gate pass Team Lead tasks
+# Suspended for the time being (product owner 2026-11-07): the "Delivery not notified to
+# the PC" tasks the gate register raises for Team Leads. The register's comparison still
+# runs and its figures are kept (calendar, consolidated view, My Work); only the TL task is
+# not raised. AUDIT_CORE_GATE_PASS_TL_TASKS=on (API and worker) raises them again; unset or
+# anything else keeps them suspended. Every other TL task is untouched.
+GATE_PASS_TL_TASKS_SETTING = "AUDIT_CORE_GATE_PASS_TL_TASKS"
+SUSPENDED_OUTCOME = "SUSPENDED"
+SUSPENDED_REASON = ("Suspended for the time being by the product owner (7 Nov 2026): gate pass tasks for Team "
+                    "Leads are not raised.")
+
+
+def gate_pass_tl_tasks_enabled(environ: Any = None) -> bool:
+    value = str((os.environ if environ is None else environ).get(GATE_PASS_TL_TASKS_SETTING, "off"))
+    return value.strip().lower() in {"on", "true", "1", "yes", "enabled"}
+
+
+def suspend_gate_pass_tl_tasks(connection: Connection, *, tenant_id: str, now: datetime | None = None) -> int:
+    """While suspended: take every open "Delivery not notified" task out of the Team Lead's
+    queue. CANCELLED (the status for a system-withdrawn task), marked outcome SUSPENDED with
+    the status it had, so restore_suspended_gate_pass_tl_tasks can put it back; a later
+    comparison for the same register reopens it (uc03_p2_gate_pass). Idempotent: run on every
+    worker pass, it touches only tasks still open."""
+    now = now or datetime.now(UTC)
+    rows = connection.execute(
+        text("""
+            UPDATE auditcore.p2_tasks t
+            SET task_status = 'CANCELLED', updated_at_utc = :now,
+                completion_result = t.completion_result || jsonb_build_object(
+                  'outcome', 'SUSPENDED', 'reason', CAST(:reason AS text), 'suspendedAtUtc', CAST(:now AS timestamptz),
+                  'statusBeforeSuspension', t.task_status, 'setting', CAST(:setting AS text))
+            WHERE t.tenant_id = :t AND t.task_type = :type
+              AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')
+            RETURNING t.task_id
+        """),
+        {"t": tenant_id, "type": GATE_PASS_MISMATCH_TASK, "now": now, "reason": SUSPENDED_REASON,
+         "setting": GATE_PASS_TL_TASKS_SETTING},
+    ).scalars().all()
+    for task_id in rows:
+        _event(connection, tenant_id=tenant_id, task_id=task_id, event_type="CANCELLED", caller=None,
+               comment=SUSPENDED_REASON, details={"suspended": True, "by": "SYSTEM",
+                                                  "setting": GATE_PASS_TL_TASKS_SETTING})
+    return len(rows)
+
+
+def restore_suspended_gate_pass_tl_tasks(connection: Connection, *, tenant_id: str) -> int:
+    """Undo suspend_gate_pass_tl_tasks: the withdrawn tasks back in the Team Lead's queue
+    with the status they had. Not run on its own when the setting is turned on again (old
+    tasks coming back is the product owner's call); a one-off step can call it."""
+    rows = connection.execute(
+        text("""
+            UPDATE auditcore.p2_tasks t
+            SET task_status = COALESCE(t.completion_result->>'statusBeforeSuspension', 'READY'), updated_at_utc = now(),
+                completion_result = (t.completion_result - 'outcome' - 'reason' - 'statusBeforeSuspension')
+                    || jsonb_build_object('restoredAtUtc', now())
+            WHERE t.tenant_id = :t AND t.task_type = :type AND t.task_status = 'CANCELLED'
+              AND t.completion_result->>'outcome' = 'SUSPENDED'
+            RETURNING t.task_id
+        """),
+        {"t": tenant_id, "type": GATE_PASS_MISMATCH_TASK},
+    ).scalars().all()
+    for task_id in rows:
+        _event(connection, tenant_id=tenant_id, task_id=task_id, event_type="REOPENED", caller=None,
+               details={"restoredFromSuspension": True, "by": "SYSTEM"})
+    return len(rows)
+
+
 def run_tick(connection: Connection, *, tenant_id: str, now: datetime | None = None,
              claimed_by: str | None = None) -> dict[str, int]:
     """The worker's Task Manager pass for one Project: seed the gate pass
@@ -1321,4 +1405,7 @@ def run_tick(connection: Connection, *, tenant_id: str, now: datetime | None = N
                                           claimed_by=claimed_by)
     closed = close_gate_pass_tasks(connection, tenant_id=tenant_id)
     failed = fail_unfinished_gate_passes(connection, tenant_id=tenant_id, now=now)
-    return {"raised": raised, "gatePassClosed": closed, "gatePassIncomplete": failed}
+    result = {"raised": raised, "gatePassClosed": closed, "gatePassIncomplete": failed}
+    if not gate_pass_tl_tasks_enabled():
+        result["gatePassTlTasksSuspended"] = suspend_gate_pass_tl_tasks(connection, tenant_id=tenant_id, now=now)
+    return result

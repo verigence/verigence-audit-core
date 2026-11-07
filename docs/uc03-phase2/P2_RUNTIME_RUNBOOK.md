@@ -43,6 +43,13 @@ Operational tuning:
 - `P2_MAX_UPLOAD_BYTES` default 50 MiB
 - `P2_MAX_PDF_PAGES` default 100
 
+Product switches:
+
+- `AUDIT_CORE_GATE_PASS_TL_TASKS` default off (suspended, product owner 2026-11-07): the
+  gate register's "Delivery not notified to the PC" tasks for Team Leads are not raised,
+  and the worker's Task Manager pass withdraws any still open (CANCELLED, outcome
+  SUSPENDED). Set `on` on both the API and the worker to raise them again.
+
 Deal-audit time windows (days), each checked again every night for deliveries in
 progress (`P2_NIGHTLY_REVIEW_UTC`, default `20:30` UTC = 02:00 IST; one
 `CONTROL_EVALUATE` work item per Journey per night, idempotent):

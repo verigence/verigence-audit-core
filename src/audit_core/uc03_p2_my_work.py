@@ -138,7 +138,8 @@ def gate_register(connection: Connection, tenant_id: str, outlets: list[dict[str
             SELECT gp.business_date, gp.outlet_id, gp.gate_pass_id, gp.new_deliveries, gp.not_notified_count,
                    gp.files_held, gp.counts_submitted_at_utc, gp.completed_at_utc, gp.created_at_utc,
                    (SELECT count(*) FROM auditcore.p2_gate_pass_pages pg
-                    WHERE pg.tenant_id = gp.tenant_id AND pg.gate_pass_id = gp.gate_pass_id) AS pages
+                    WHERE pg.tenant_id = gp.tenant_id AND pg.gate_pass_id = gp.gate_pass_id
+                      AND pg.removed_at_utc IS NULL) AS pages
             FROM auditcore.p2_gate_passes gp
             WHERE gp.tenant_id = :t AND gp.status = 'ACTIVE' AND gp.outlet_id = ANY(CAST(:ids AS uuid[]))
               AND gp.business_date BETWEEN :a AND :b
