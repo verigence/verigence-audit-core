@@ -520,3 +520,29 @@ def test_only_a_super_admin_may_list_archive_runs(setup):
     app.dependency_overrides.pop(require_super_admin_request, None)
     client = TestClient(app, raise_server_exceptions=False)
     assert client.get("/v1/admin/archive-runs").status_code in (401, 403)
+
+
+def test_archive_files_are_kept_twelve_months_by_a_bucket_lifecycle_rule():
+    """Product owner, 7 Nov 2026: archives are kept for 12 months."""
+    from audit_core import data_archive as da
+
+    assert da.retention_days({}) == 365
+    assert da.retention_days({"AUDIT_CORE_ARCHIVE_RETENTION_DAYS": "400"}) == 400
+    rule = da.retention_lifecycle(365)["Rules"][0]
+    assert rule["Expiration"] == {"Days": 365} and rule["Filter"] == {"Prefix": "archive/"}
+    assert rule["Status"] == "Enabled" and rule["ID"] == da.RETENTION_RULE_ID
+
+    calls = []
+
+    class _Client:
+        def put_bucket_lifecycle_configuration(self, **kwargs):
+            calls.append(kwargs)
+
+    class _Store:
+        bucket = "deal-guard-archive"
+
+        def _client(self):
+            return _Client()
+
+    da.apply_retention(_Store(), 365)
+    assert calls == [{"Bucket": "deal-guard-archive", "LifecycleConfiguration": da.retention_lifecycle(365)}]
