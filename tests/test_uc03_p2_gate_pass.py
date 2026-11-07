@@ -6,7 +6,7 @@ from __future__ import annotations
 import io
 import json
 import random
-from datetime import date
+from datetime import UTC, date, datetime, time, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -58,6 +58,13 @@ def _page(width=4000, height=3000, blur=0):
 
 
 SHARP, BLURRED = _page(), _page(blur=6)
+REAL_WINDOW = gate_pass.gate_pass_window
+
+
+def _window_on(monkeypatch, day: date) -> None:
+    """The dates a PC can choose as on ``day`` (10:00 India time)."""
+    at = datetime.combine(day, time(10, 0), tzinfo=gate_pass.ist_day().tzinfo).astimezone(UTC)
+    monkeypatch.setattr(gate_pass, "gate_pass_window", lambda now=None: REAL_WINDOW(at))
 
 
 @pytest.fixture
@@ -70,6 +77,11 @@ def setup(monkeypatch):
     # Sunday is the off day (no gate pass of its own); keep these same-day tests independent of when they run.
     monkeypatch.setattr(gate_pass, "gate_pass_days",
                         lambda now=None: {**real_days(now), "current": gate_pass.ist_day(now).date()})
+
+    def window(now=None):
+        w = REAL_WINDOW(now)
+        return w if w["today"] in w["days"] else {**w, "days": [w["today"], *w["days"]]}
+    monkeypatch.setattr(gate_pass, "gate_pass_window", window)
     acting = {"subject": journey.actor_id}
     app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=acting["subject"])
     app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization()
@@ -90,8 +102,13 @@ def setup(monkeypatch):
         engine.dispose()
 
 
-def _upload(s, data=SHARP, name="Pc One"):
-    return s.client.post(s.base, data={"outletId": str(s.journey.outlet_id), "pcName": name},
+def _today() -> str:
+    return gate_pass.ist_day().date().isoformat()
+
+
+def _upload(s, data=SHARP, name="Pc One", day=None):
+    return s.client.post(s.base, data={"outletId": str(s.journey.outlet_id), "pcName": name,
+                                       "businessDate": day or _today()},
                          files={"file": ("gatepass.jpg", data, "image/jpeg")})
 
 
@@ -175,7 +192,7 @@ def test_the_onsite_outlet_is_the_default_and_the_photo_is_checked_and_named(set
     assert blurred.status_code == 201 and blurred.json()["photoQuality"] == "BLURRED"
     small = _upload(s, _page(1000, 750))
     assert small.status_code == 201
-    assert s.client.post(s.base, data={"outletId": str(s.journey.outlet_id)},
+    assert s.client.post(s.base, data={"outletId": str(s.journey.outlet_id), "businessDate": _today()},
                          files={"file": ("x.jpg", b"not a photo", "image/jpeg")}).status_code == 422
     s.storage.objects.clear()
     with s.journey.engine.begin() as connection:
@@ -305,45 +322,240 @@ def test_calendar_shows_outlet_photo_but_no_photo_for_a_dealership_view_and_tl_r
     assert s.client.get(tasks_url).json()["items"] == []
 
 
-def test_a_late_gate_pass_is_filed_under_its_own_day_and_the_screen_asks(setup, monkeypatch):
-    """Product owner 2026-10-27: the previous day's gate pass can still be
-    uploaded the next day; the screen asks which day the photo is for."""
-    from datetime import date, timedelta
-
+def test_older_clients_still_get_today_and_the_previous_day(setup, monkeypatch):
+    """GET /gate-passes/outlets keeps today / previous / previousOpenOutletIds for older
+    clients (product owner 2026-10-27); the PC now chooses the date (2026-11-07)."""
     s = setup
     tuesday, monday = date(2026, 10, 27), date(2026, 10, 26)
     monkeypatch.setattr(gate_pass, "gate_pass_days",
                         lambda now=None: {"today": tuesday, "current": tuesday, "previous": monday})
+    _window_on(monkeypatch, tuesday)
     outlets = s.client.get(f"{s.base}/outlets").json()
     assert outlets["today"]["label"] == "Tue 27 Oct"
     assert outlets["previous"] == {"date": "2026-10-26", "label": "Sun 25 + Mon 26 Oct",
                                    "coversDates": ["2026-10-25", "2026-10-26"],
                                    "dueAtUtc": "2026-10-27T18:29:59+00:00"}
     assert outlets["previousOpenOutletIds"] == [str(s.journey.outlet_id)]
+    # Tue 27 back to Tue 20 Oct, Sunday 25 left out.
+    assert [d["date"] for d in outlets["window"]["days"]] == [
+        "2026-10-27", "2026-10-26", "2026-10-24", "2026-10-23", "2026-10-22", "2026-10-21", "2026-10-20"]
+    assert (outlets["window"]["uploadFrom"], outlets["window"]["editFrom"]) == ("2026-10-20", "2026-10-24")
 
     late = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id), "businessDate": "2026-10-26"},
                          files={"file": ("gatepass.jpg", SHARP, "image/jpeg")})
     assert late.status_code == 201, late.text
     assert late.json()["businessDate"] == "2026-10-26" and late.json()["dayLabel"] == "Sun 25 + Mon 26 Oct"
-    too_old = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id),
-                                          "businessDate": (monday - timedelta(days=2)).isoformat()},
+
+
+def test_the_pc_must_choose_the_date(setup):
+    """Product owner 2026-11-07: the PC is asked which date the register is for; no default."""
+    s = setup
+    refused = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id)},
                             files={"file": ("gatepass.jpg", SHARP, "image/jpeg")})
-    assert too_old.status_code == 422 and "Tue 27 Oct or Sun 25 + Mon 26 Oct" in too_old.json()["detail"]
+    assert refused.status_code == 422 and "Choose the date" in refused.json()["detail"]
+
+
+def test_a_new_register_for_any_day_from_today_back_to_n_minus_7(setup, monkeypatch):
+    s = setup
+    wednesday = date(2026, 11, 4)
+    _window_on(monkeypatch, wednesday)
+    # N-7 (Wed 28 Oct) to N, Sunday 1 Nov left out: each can take a new register.
+    for back in (0, 1, 2, 4, 5, 6, 7):
+        day = wednesday - timedelta(days=back)
+        made = _upload(s, day=day.isoformat())
+        assert made.status_code == 201, (day, made.text)
+        assert made.json()["businessDate"] == day.isoformat()
+    locked = _upload(s, day=(wednesday - timedelta(days=4)).isoformat())
+    assert locked.status_code == 409 and locked.json()["detail"] == (
+        "The gate register for Sat 31 Oct is locked: a register already uploaded can be changed only up "
+        "to 3 days after its date.")
+    too_old = _upload(s, day=(wednesday - timedelta(days=8)).isoformat())
+    assert too_old.status_code == 422
+    assert too_old.json()["detail"] == ("A gate register can be uploaded only for Wed 28 Oct to Wed 4 Nov "
+                                        "(today back to 7 days ago).")
+    assert _upload(s, day=(wednesday + timedelta(days=1)).isoformat()).status_code == 422   # not come yet
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        assert connection.execute(text("SELECT count(*) FROM auditcore.p2_gate_passes WHERE tenant_id=:t "
+                                       "AND status='ACTIVE'"), {"t": s.journey.tenant_id}).scalar_one() == 7
 
 
 def test_sunday_goes_with_monday(setup, monkeypatch):
-    from datetime import date
-
     s = setup
     sunday = date(2026, 11, 1)
-    monkeypatch.setattr(gate_pass, "gate_pass_days",
-                        lambda now=None: {"today": sunday, "current": None, "previous": date(2026, 10, 31)})
-    refused = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id), "businessDate": "2026-11-01"},
-                            files={"file": ("gatepass.jpg", SHARP, "image/jpeg")})
+    _window_on(monkeypatch, sunday)
+    refused = _upload(s, day="2026-11-01")
     assert refused.status_code == 422 and "Monday" in refused.json()["detail"]
-    saturday = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id)},
-                             files={"file": ("gatepass.jpg", SHARP, "image/jpeg")})
+    # Last Sunday, within the 7 days, is not a date of its own either.
+    assert "Monday" in _upload(s, day="2026-10-25").json()["detail"]
+    saturday = _upload(s, day="2026-10-31")
     assert saturday.status_code == 201 and saturday.json()["businessDate"] == "2026-10-31"
+    days = s.client.get(f"{s.base}/days", params={"outletId": str(s.journey.outlet_id)}).json()
+    assert "2026-11-01" not in [d["date"] for d in days["days"]] and "2026-10-25" not in [d["date"] for d in days["days"]]
+    # On Monday, Monday's register covers the Sunday.
+    _window_on(monkeypatch, date(2026, 11, 2))
+    monday = _upload(s, day="2026-11-02").json()
+    assert monday["coversDates"] == ["2026-11-01", "2026-11-02"]
+
+
+def test_the_days_say_new_editable_or_locked(setup, monkeypatch):
+    s = setup
+    wednesday = date(2026, 11, 4)
+    _window_on(monkeypatch, wednesday)
+    for day in ("2026-11-04", "2026-11-02", "2026-10-30"):
+        assert _upload(s, day=day).status_code == 201
+    days = s.client.get(f"{s.base}/days", params={"outletId": str(s.journey.outlet_id)}).json()
+    by_date = {d["date"]: d for d in days["days"]}
+    assert list(by_date) == ["2026-11-04", "2026-11-03", "2026-11-02", "2026-10-31", "2026-10-30", "2026-10-29",
+                             "2026-10-28"]
+    assert (days["today"], days["uploadFrom"], days["editFrom"]) == ("2026-11-04", "2026-10-28", "2026-11-01")
+    assert by_date["2026-11-04"]["state"] == "EDITABLE" and by_date["2026-11-04"]["isToday"] is True
+    assert by_date["2026-11-03"]["state"] == "NEW" and by_date["2026-11-03"]["register"] is None
+    assert by_date["2026-11-02"]["state"] == "EDITABLE" and by_date["2026-11-02"]["label"] == "Sun 1 + Mon 2 Nov"
+    assert by_date["2026-11-02"]["register"]["photosEditable"] is True
+    assert by_date["2026-11-02"]["register"]["editableUntil"] == "2026-11-05"
+    locked = by_date["2026-10-30"]
+    assert (locked["state"], locked["canUpload"], locked["canEdit"]) == ("LOCKED", False, False)
+    assert locked["register"]["photosEditable"] is False and "locked" in locked["note"]
+    assert by_date["2026-10-29"]["state"] == "NEW" and by_date["2026-10-29"]["canUpload"] is True
+
+
+def _add(s, gp, n=1, page_date=None):
+    data = {"pageDate": page_date} if page_date else {}
+    return s.client.post(f"{s.base}/{gp}/pages", data=data,
+                         files=[("files", (f"a{i}.jpg", SHARP, "image/jpeg")) for i in range(n)])
+
+
+def test_photos_are_added_replaced_and_removed_up_to_n_minus_3(setup, monkeypatch):
+    s = setup
+    wednesday = date(2026, 11, 4)
+    _window_on(monkeypatch, wednesday)
+    gp = _upload(s, day="2026-11-02").json()["gatePassId"]   # Monday 2 Nov: N-2
+    assert _register(s, gp, 2, 2).status_code == 200
+    added = _add(s, gp, 2)
+    assert added.status_code == 201, added.text
+    body = added.json()
+    assert [p["position"] for p in body["pages"]] == [1, 2, 3] and [p["pageNo"] for p in body["pages"]] == [1, 2, 3]
+    assert body["newDeliveries"] == 2 and body["completed"] is True and body["pagesEditCount"] == 1  # counts kept
+    # MAX_PAGES: four photos at most.
+    over = _add(s, gp, 2)
+    assert over.status_code == 422 and "at most 4 photos and this one has 3" in over.json()["detail"]
+    assert _add(s, gp, 1).status_code == 201
+    assert "Remove a photo first" in _add(s, gp, 1).json()["detail"]
+    # Remove photo 2: kept, marked removed; the rest renumber by position, not by id.
+    removed = s.client.delete(f"{s.base}/{gp}/pages/2")
+    assert removed.status_code == 200, removed.text
+    pages = removed.json()["pages"]
+    assert [p["pageNo"] for p in pages] == [1, 3, 4] and [p["position"] for p in pages] == [1, 2, 3]
+    assert s.client.delete(f"{s.base}/{gp}/pages/2").status_code == 404
+    assert s.client.get(f"{s.base}/{gp}/image-url", params={"page": 2}).json()["filename"].endswith("__p3.jpg")
+    assert s.client.get(f"{s.base}/{gp}/image-url", params={"page": 4}).status_code == 404
+    added_again = _add(s, gp, 1).json()
+    assert [p["pageNo"] for p in added_again["pages"]] == [1, 3, 4, 5]
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        kept = connection.execute(text("SELECT page_no, removed_by_actor_id FROM auditcore.p2_gate_pass_pages "
+                                       "WHERE tenant_id=:t AND gate_pass_id=:g AND removed_at_utc IS NOT NULL"),
+                                  {"t": s.journey.tenant_id, "g": gp}).all()
+    assert [tuple(r) for r in kept] == [(2, s.journey.actor_id)]
+    assert len(s.storage.objects) == 5     # nothing is deleted from storage
+    # The last photo stays.
+    for page_no in (1, 3, 4):
+        assert s.client.delete(f"{s.base}/{gp}/pages/{page_no}").status_code == 200
+    last = s.client.delete(f"{s.base}/{gp}/pages/5")
+    assert last.status_code == 409 and "at least one photo" in last.json()["detail"]
+    summary = s.client.get(f"{s.base}/summary", params={"from": "2026-11-02", "to": "2026-11-02"}).json()
+    assert summary["outlets"][0]["days"][0]["pages"] == 1
+    # Replace all: a new register for the date; the old one is kept, superseded.
+    replaced = _upload(s, day="2026-11-02")
+    assert replaced.status_code == 201 and replaced.json()["gatePassId"] != gp
+    assert _add(s, gp, 1).status_code == 409          # the old register is no longer the date's
+
+
+def test_a_register_older_than_n_minus_3_is_locked(setup, monkeypatch):
+    s = setup
+    saturday = date(2026, 10, 31)
+    _window_on(monkeypatch, saturday)
+    gp = _upload(s, day="2026-10-31").json()["gatePassId"]
+    two = _add(s, gp, 1).json()
+    # Four days later (Wed 4 Nov) the Saturday register is N-4: locked for add, remove and replace.
+    _window_on(monkeypatch, date(2026, 11, 4))
+    for response in (_add(s, gp, 1), s.client.delete(f"{s.base}/{gp}/pages/{two['pages'][1]['pageNo']}"),
+                     _upload(s, day="2026-10-31")):
+        assert response.status_code == 409 and "locked" in response.json()["detail"], response.text
+    # On Tue 3 Nov it was N-3: still editable.
+    _window_on(monkeypatch, date(2026, 11, 3))
+    assert s.client.delete(f"{s.base}/{gp}/pages/{two['pages'][1]['pageNo']}").status_code == 200
+
+
+def test_monday_photographed_apart_keeps_a_photo_per_day(setup, monkeypatch):
+    s = setup
+    _window_on(monkeypatch, date(2026, 11, 3))
+    files = [("files", ("sun.jpg", SHARP, "image/jpeg")), ("files", ("mon.jpg", SHARP, "image/jpeg"))]
+    gp = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id), "businessDate": "2026-11-02",
+                                     "fileDates": ["2026-11-01", "2026-11-02"]}, files=files).json()
+    assert _add(s, gp["gatePassId"], 1).status_code == 422                        # which day?
+    added = _add(s, gp["gatePassId"], 1, page_date="2026-11-01").json()
+    assert [p["date"] for p in added["pages"]] == ["2026-11-01", "2026-11-01", "2026-11-02"]
+    monday_page = next(p["pageNo"] for p in added["pages"] if p["date"] == "2026-11-02")
+    refused = s.client.delete(f"{s.base}/{gp['gatePassId']}/pages/{monday_page}")
+    assert refused.status_code == 409 and "Monday" in refused.json()["detail"]
+    assert s.client.delete(f"{s.base}/{gp['gatePassId']}/pages/1").status_code == 200   # a Sunday one: fine
+
+
+def test_a_late_register_closes_its_days_gate_pass_task_as_done_late(setup):
+    """A register of an earlier day (up to N-7, 2026-11-07) finishes that day's Daily Gate Pass
+    task the way an on-time one does, even after the task was marked incomplete."""
+    from audit_core import task_manager as tm
+
+    s = setup
+    window = gate_pass.gate_pass_window()
+    day = next(d for d in window["days"] if d < window["editFrom"])       # N-4 .. N-7
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        task_id = tm._insert_task(connection, tenant_id=s.journey.tenant_id, values={
+            "scope": "OUTLET", "dealer_id": str(s.journey.dealer_id), "outlet_id": str(s.journey.outlet_id),
+            "task_type": tm.GATE_PASS_TASK, "category": "DAILY_GATE_PASS", "origin": "SYSTEM",
+            "source_type": "SCHEDULE", "dedupe_key": f"test-gate:{day}", "title": "Gate pass", "description": "",
+            "priority": "HIGH", "assigned_role": "PC", "protocol": "SYSTEM_VERIFIED", "expected_close_minutes": 2340,
+            "due": tm.gate_pass_due(day), "occurrence_date": day,
+            "reference": {"businessDate": day.isoformat()},
+        })
+        assert tm.fail_unfinished_gate_passes(connection, tenant_id=s.journey.tenant_id) == 1
+    # The worker's sweep does not reopen history; the PC finishing the register does.
+    gp = _upload(s, day=day.isoformat()).json()
+    assert gp["uploadedLate"] is True and gp["photosEditable"] is False
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        assert tm.close_gate_pass_tasks(connection, tenant_id=s.journey.tenant_id) == 0
+    result = _register(s, gp["gatePassId"], 0, 0).json()
+    assert result["nextStep"] == "DONE"
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        task = connection.execute(text("SELECT task_status, completion_result, action_completed_at_utc, due_at_utc, "
+                                       "missed_at_utc FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_id=:i"),
+                                  {"t": s.journey.tenant_id, "i": str(task_id)}).mappings().one()
+        event = connection.execute(text("SELECT details FROM auditcore.p2_task_events WHERE tenant_id=:t "
+                                        "AND task_id=:i AND event_type='COMPLETED'"),
+                                   {"t": s.journey.tenant_id, "i": str(task_id)}).scalar_one()
+    assert task["task_status"] == "VERIFIED_COMPLETE"
+    assert task["completion_result"]["outcome"] == "DONE_LATE"
+    assert task["completion_result"]["gatePassId"] == gp["gatePassId"]
+    assert task["action_completed_at_utc"] > task["due_at_utc"] and task["missed_at_utc"] is not None
+    assert event["late"] is True
+    # The counts of the late register are checked against that day's deliveries.
+    assert result["deliveryFiles"] == 0 and result["divergence"] == "NONE"
+
+
+def test_a_late_register_is_checked_against_its_own_days_deliveries(setup):
+    s = setup
+    window = gate_pass.gate_pass_window()
+    day = next(d for d in window["days"] if d < window["today"] and d.isoweekday() != 1)
+    _delivery_file(s, journeys=2, gate_pass_dated=day)
+    _delivery_file(s, journeys=1, fresh=True)                   # today's delivery: not that day's
+    gp = _upload(s, day=day.isoformat()).json()["gatePassId"]
+    result = _register(s, gp, 3, 2).json()
+    assert (result["deliveryFiles"], result["notIntimatedToPc"], result["taskRaised"]) == (2, 1, True)
 
 
 def test_consolidated_view_register_tool_and_pending(setup):
@@ -430,9 +642,10 @@ def test_up_to_four_pages_and_each_page_opens(setup):
     """The gate-out register can run over pages: 1 to 4 photos (product owner 2026-10-27)."""
     s = setup
     many = [("files", (f"p{n}.jpg", SHARP, "image/jpeg")) for n in range(5)]
-    refused = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id)}, files=many)
+    refused = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id), "businessDate": _today()}, files=many)
     assert refused.status_code == 422 and "at most 4" in refused.json()["detail"]
-    made = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id)}, files=many[:3])
+    made = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id), "businessDate": _today()},
+                         files=many[:3])
     assert made.status_code == 201, made.text
     gp = made.json()
     assert [p["pageNo"] for p in gp["pages"]] == [1, 2, 3] and len(s.storage.objects) == 3
@@ -447,14 +660,13 @@ def test_sunday_and_monday_photographed_apart(setup, monkeypatch):
 
     s = setup
     monday, sunday = date(2026, 11, 2), date(2026, 11, 1)
-    monkeypatch.setattr(gate_pass, "gate_pass_days",
-                        lambda now=None: {"today": monday, "current": monday, "previous": date(2026, 10, 31)})
+    _window_on(monkeypatch, monday)
     files = [("files", ("sun.jpg", SHARP, "image/jpeg")), ("files", ("mon1.jpg", SHARP, "image/jpeg")),
              ("files", ("mon2.jpg", SHARP, "image/jpeg"))]
-    one_day = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id),
+    one_day = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id), "businessDate": "2026-11-02",
                                           "fileDates": ["2026-11-02", "2026-11-02", "2026-11-02"]}, files=files)
     assert one_day.status_code == 422 and "Sunday" in one_day.json()["detail"]
-    made = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id),
+    made = s.client.post(s.base, data={"outletId": str(s.journey.outlet_id), "businessDate": "2026-11-02",
                                        "fileDates": ["2026-11-01", "2026-11-02", "2026-11-02"]}, files=files)
     assert made.status_code == 201, made.text
     gp = made.json()

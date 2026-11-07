@@ -18,6 +18,17 @@ dated that day, has been uploaded (product owner 2026-10-27):
     4. GET   /gate-passes/calendar    declared / uploaded / missing per day
     5. GET   /gate-passes/{id}/image-url  the photo, one outlet at a time
     6. GET   /daily-tasks, POST /daily-tasks/{id}/resolve   the TL's Daily Tasks
+    7. GET   /gate-passes/days?outletId  the dates the PC can choose, and what each allows
+    8. POST  /gate-passes/{id}/pages, DELETE /gate-passes/{id}/pages/{pageNo}
+                                      add a photo to a register, or remove one
+
+The date of a register (product owner 2026-11-07): the PC chooses it, there is
+no default. A new register can be uploaded for any day from today back to 7
+days ago (N to N-7, India time); a register already on file can be edited --
+photos added, replaced or removed -- while its date is within N to N-3, and is
+locked after that. Sunday is the off day and goes with Monday, so Sunday itself
+is never chosen. A register finished after its day's Daily Gate Pass task was
+marked incomplete closes that task as done late.
 
 Every outlet a PC is mapped to has a gate register, satellite outlets included
 (product owner 2026-11-02; until then onsite outlets only).
@@ -126,10 +137,62 @@ def _public_outlet(outlet: dict[str, Any], *, default_id: str | None = None) -> 
     }
 
 
+# How far back a PC may go (product owner 2026-11-07): a new register for any day
+# from today back to N-7; an existing register edited only from today back to N-3.
+UPLOAD_BACK_DAYS = 7
+EDIT_BACK_DAYS = 3
+
+
+def gate_pass_window(now: datetime | None = None) -> dict[str, Any]:
+    """The dates a PC can choose for a gate register now: today back to 7 days ago,
+    India time, newest first, Sunday left out (Sunday goes with Monday: Monday's
+    register covers both). ``editFrom``: the oldest date whose register can still
+    be edited (N-3); older registers are locked."""
+    today = ist_day(now).date()
+    back = [today - timedelta(days=i) for i in range(UPLOAD_BACK_DAYS + 1)]
+    return {"today": today, "uploadFrom": back[-1], "editFrom": today - timedelta(days=EDIT_BACK_DAYS),
+            "days": [d for d in back if d.isoweekday() != 7]}
+
+
+def _range_words(window: dict[str, Any]) -> str:
+    return (f"{gate_pass_day_label(window['uploadFrom'])} to {gate_pass_day_label(window['today'])} "
+            f"(today back to {UPLOAD_BACK_DAYS} days ago)")
+
+
+def check_register_date(day: date | None, window: dict[str, Any]) -> date:
+    """The date the PC chose, refused when it is not one they may choose (2026-11-07)."""
+    if day is None:
+        raise HTTPException(status_code=422, detail="Choose the date this gate register is for.")
+    if day in window["days"]:
+        return day
+    if day.isoweekday() == 7 and window["uploadFrom"] <= day <= window["today"] + timedelta(days=1):
+        raise HTTPException(status_code=422, detail="Sunday is the off day: upload Sunday's gate pass with "
+                                                    "Monday's, one register for both days.")
+    if day > window["today"]:
+        raise HTTPException(status_code=422, detail="A gate register cannot be uploaded for a day that has not "
+                                                    "come yet.")
+    raise HTTPException(status_code=422, detail="A gate register can be uploaded only for "
+                                                + _range_words(window) + ".")
+
+
+def register_editable(day: date, window: dict[str, Any]) -> bool:
+    """An existing register can be edited while its date is within today back to N-3 (2026-11-07)."""
+    return window["editFrom"] <= day <= window["today"]
+
+
+def check_register_editable(day: date, window: dict[str, Any]) -> None:
+    if not register_editable(day, window):
+        raise HTTPException(status_code=409, detail=(
+            f"The gate register for {gate_pass_day_label(day)} is locked: a register already uploaded can be "
+            f"changed only up to {EDIT_BACK_DAYS} days after its date."))
+
+
 def gate_pass_days(now: datetime | None = None) -> dict[str, Any]:
-    """The days a gate pass can be uploaded for now: today's (none on a
-    Sunday, the off day: Sunday goes with Monday) and the previous gate pass
-    day's, which stays open until 23:59 of the next gate pass day."""
+    """Today's gate pass day (none on a Sunday, the off day: Sunday goes with
+    Monday) and the previous gate pass day's while its task is open (until 23:59
+    of the next gate pass day). Kept for the ``today`` / ``previous`` fields of
+    GET /gate-passes/outlets that older clients read; which dates can be chosen
+    is gate_pass_window (2026-11-07)."""
     today = ist_day(now).date()
     current = None if today.isoweekday() == 7 else today
     previous = previous_gate_pass_day(today) if current else today - timedelta(days=1)
@@ -200,18 +263,30 @@ def delivery_file_count(connection: Connection, tenant_id: str, outlet_id: UUID 
     return vehicle_gate_pass_deliveries(connection, tenant_id, [str(outlet_id)], day, day).get((day, str(outlet_id)), 0)
 
 
-def _gate_pass_row(connection: Connection, tenant_id: str, gate_pass_id: UUID) -> dict[str, Any]:
+# The live photos of a register, in the order they are shown and opened (?page=n is the
+# n-th of these): by day (Sunday's before Monday's), then as they were added. A removed
+# photo is kept, with who removed it, and left out (2026-11-07).
+_LIVE_PAGES_SQL = """
+    SELECT page_no, page_date, object_key, content_type, size_bytes, width_px, height_px, sharpness, brightness,
+           quality_flag
+    FROM auditcore.p2_gate_pass_pages
+    WHERE tenant_id = :t AND gate_pass_id = :i AND removed_at_utc IS NULL
+    ORDER BY page_date, page_no
+"""
+
+
+def _gate_pass_row(connection: Connection, tenant_id: str, gate_pass_id: UUID | str, *,
+                   lock: bool = False) -> dict[str, Any]:
     row = connection.execute(
-        text("SELECT * FROM auditcore.p2_gate_passes WHERE tenant_id = :t AND gate_pass_id = :i"),
+        text("SELECT * FROM auditcore.p2_gate_passes WHERE tenant_id = :t AND gate_pass_id = :i"
+             + (" FOR UPDATE" if lock else "")),
         {"t": tenant_id, "i": str(gate_pass_id)},
     ).mappings().one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="Gate pass not found.")
     out = dict(row)
     out["pages"] = [dict(p) for p in connection.execute(
-        text("SELECT page_no, page_date, object_key, content_type, quality_flag FROM auditcore.p2_gate_pass_pages "
-             "WHERE tenant_id = :t AND gate_pass_id = :i ORDER BY page_no"),
-        {"t": tenant_id, "i": str(gate_pass_id)},
+        text(_LIVE_PAGES_SQL), {"t": tenant_id, "i": str(gate_pass_id)},
     ).mappings().all()]
     return out
 
@@ -250,9 +325,17 @@ def _public_gate_pass(row: dict[str, Any]) -> dict[str, Any]:
         "countsEditCount": int(row.get("counts_edit_count") or 0),
         "countsEditedAtUtc": row["counts_edited_at_utc"].isoformat() if row.get("counts_edited_at_utc") else None,
         "countsHistory": row.get("counts_history") or [],
-        "pages": [{"pageNo": p["page_no"], "date": p["page_date"].isoformat(),
-                   "photoQuality": p["quality_flag"] or "GOOD"} for p in row.get("pages", [])],
+        # pageNo is the photo's id within the register (to remove it); position is what
+        # GET .../image-url?page= opens (2026-11-07: photos can be added and removed).
+        "pages": [{"pageNo": p["page_no"], "position": n, "date": p["page_date"].isoformat(),
+                   "photoQuality": p["quality_flag"] or "GOOD"} for n, p in enumerate(row.get("pages", []), start=1)],
         "photoQualityNote": _QUALITY_NOTES.get(row.get("quality_flag") or "GOOD"),
+        # Its photos can be added, replaced or removed until N+3 (2026-11-07).
+        "photosEditable": row["status"] == "ACTIVE" and register_editable(row["business_date"], gate_pass_window()),
+        "editableUntil": (row["business_date"] + timedelta(days=EDIT_BACK_DAYS)).isoformat(),
+        "pagesEditCount": int(row.get("pages_edit_count") or 0),
+        # Uploaded after its Daily Gate Pass task was due (a register of an earlier day).
+        "uploadedLate": bool(row.get("created_at_utc")) and row["created_at_utc"] > gate_pass_due(row["business_date"]),
     }
 
 
@@ -300,9 +383,10 @@ def gate_pass_outlets(
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
     """The outlets the caller may upload for -- every mapped outlet, satellites included (2026-11-02) --
-    the first ONSITE outlet marked as the default, and the days a gate pass can be uploaded for.
-    ``previousOpenOutletIds``: outlets whose gate pass of the previous day is not finished yet, so the
-    screen asks which day the photo is for."""
+    the first ONSITE outlet marked as the default, and the dates a register can be chosen for
+    (``window``, 2026-11-07; per outlet, GET /gate-passes/days says what each date allows).
+    ``businessDate``, ``today``, ``previous`` and ``previousOpenOutletIds`` are kept for older
+    clients; the PC now always chooses the date."""
     _authorize(connection, tenant_id, principal, client, _UPDATE)
     outlets = scope_outlets(connection, tenant_id, principal.subject)
     onsite = [o for o in outlets if o["outlet_classification"] == "ONSITE"]
@@ -322,12 +406,60 @@ def gate_pass_outlets(
         "today": _day_info(days["current"]),
         "previous": _day_info(days["previous"]),
         "previousOpenOutletIds": previous_open,
+        "window": _public_window(gate_pass_window()),
         "outlets": [_public_outlet(o, default_id=default_id) for o in outlets],
         "defaultOutletId": default_id,
         "editableToday": editable_today(connection, tenant_id, principal.subject),
         # Kept for older clients: a satellite outlet has a gate register too now.
         "satelliteOnly": False,
     }
+
+
+def _public_window(window: dict[str, Any]) -> dict[str, Any]:
+    return {"today": window["today"].isoformat(), "uploadFrom": window["uploadFrom"].isoformat(),
+            "editFrom": window["editFrom"].isoformat(), "uploadBackDays": UPLOAD_BACK_DAYS,
+            "editBackDays": EDIT_BACK_DAYS, "maxPages": MAX_PAGES,
+            "days": [_day_info(d) for d in window["days"]]}
+
+
+@router.get("/gate-passes/days")
+def gate_pass_choosable_days(
+    tenant_id: str,
+    outletId: UUID,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """The dates the PC can choose for the outlet's gate register (product owner 2026-11-07),
+    newest first, and what each allows:
+
+        NEW        no register yet: a new one can be uploaded (N to N-7)
+        EDITABLE   a register is on file and can be edited: add, replace or remove photos (N to N-3)
+        LOCKED     a register is on file and can no longer be changed (N-4 to N-7)
+    """
+    _authorize(connection, tenant_id, principal, client, _UPDATE)
+    outlet = _outlet_in_scope(scope_outlets(connection, tenant_id, principal.subject), outletId)
+    window = gate_pass_window()
+    ids = connection.execute(
+        text("SELECT business_date, gate_pass_id FROM auditcore.p2_gate_passes WHERE tenant_id = :t "
+             "AND outlet_id = :o AND status = 'ACTIVE' AND business_date BETWEEN :a AND :b"),
+        {"t": tenant_id, "o": str(outlet["outlet_id"]), "a": window["uploadFrom"], "b": window["today"]},
+    ).all()
+    registers = {r[0]: _public_gate_pass(_gate_pass_row(connection, tenant_id, r[1])) for r in ids}
+    days = []
+    for d in window["days"]:
+        register = registers.get(d)
+        state = "NEW" if register is None else ("EDITABLE" if register_editable(d, window) else "LOCKED")
+        days.append({
+            **(_day_info(d) or {}), "isToday": d == window["today"], "state": state,
+            "canUpload": state != "LOCKED", "canEdit": state == "EDITABLE", "register": register,
+            "note": {"NEW": "No gate register uploaded yet.",
+                     "EDITABLE": (f"Uploaded. You can add, replace or remove photos until "
+                                  f"{gate_pass_day_label(d + timedelta(days=EDIT_BACK_DAYS))}."),
+                     "LOCKED": (f"Uploaded and locked: a register can be changed only up to {EDIT_BACK_DAYS} "
+                                "days after its date.")}[state],
+        })
+    return {"outlet": _public_outlet(outlet), **_public_window(window), "days": days}
 
 
 @router.post("/gate-passes", status_code=201)
@@ -343,20 +475,24 @@ def upload_gate_pass(
     businessDate: Annotated[date | None, Form()] = None,
     fileDates: Annotated[list[date] | None, Form()] = None,
 ) -> dict[str, Any]:
-    """Up to four photos of the day's gate-out register (it can run over pages).
+    """Up to four photos of the gate-out register of ``businessDate`` (it can run over pages).
     For Monday, which covers Sunday too, ``fileDates`` (one per photo, Sunday or
-    Monday) says the PC photographed the two days apart (product owner 2026-10-27)."""
+    Monday) says the PC photographed the two days apart (product owner 2026-10-27).
+
+    ``businessDate`` is required: the PC chooses it, today back to N-7 (2026-11-07). A date
+    whose register is on file is a replacement (the old register is kept, SUPERSEDED), allowed
+    only while that date is within N to N-3."""
     _authorize(connection, tenant_id, principal, client, _UPDATE)
     outlet = _outlet_in_scope(scope_outlets(connection, tenant_id, principal.subject), outletId)
-    days = gate_pass_days()
-    allowed = [d for d in (days["current"], days["previous"]) if d is not None]
-    business_date = businessDate or (days["current"] or days["previous"])
-    if business_date not in allowed:
-        if days["current"] is None and businessDate == days["today"]:
-            raise HTTPException(status_code=422, detail="Sunday is the off day: upload Sunday's gate pass with "
-                                                        "Monday's, one photo for both days.")
-        raise HTTPException(status_code=422, detail="A gate pass can be uploaded only for "
-                                                    + " or ".join(gate_pass_day_label(d) for d in allowed) + ".")
+    window = gate_pass_window()
+    business_date = check_register_date(businessDate, window)
+    existing = connection.execute(
+        text("SELECT 1 FROM auditcore.p2_gate_passes WHERE tenant_id = :t AND outlet_id = :o "
+             "AND business_date = :d AND status = 'ACTIVE'"),
+        {"t": tenant_id, "o": str(outlet["outlet_id"]), "d": business_date},
+    ).first()
+    if existing is not None:
+        check_register_editable(business_date, window)
     uploads = [f for f in (files or []) + (file or []) if f is not None]
     if not uploads:
         raise HTTPException(status_code=422, detail="Add a photo of the gate pass.")
@@ -432,6 +568,146 @@ def upload_gate_pass(
              "ct": a.content_type, "size": len(data), "w": a.width, "h": a.height, "sharp": a.sharpness,
              "bright": a.brightness, "quality": a.quality},
         )
+    return _public_gate_pass(_gate_pass_row(connection, tenant_id, gate_pass_id))
+
+
+def _editable_register(connection: Connection, tenant_id: str, gate_pass_id: UUID,
+                       principal: HumanPrincipal) -> dict[str, Any]:
+    """A register on file whose photos the caller may change now (2026-11-07): an outlet of
+    theirs, the date's current register, and its date within N to N-3. Locked for the edit."""
+    row = _gate_pass_row(connection, tenant_id, gate_pass_id, lock=True)
+    _outlet_in_scope(scope_outlets(connection, tenant_id, principal.subject), row["outlet_id"])
+    if row["status"] != "ACTIVE":
+        raise HTTPException(status_code=409, detail="A newer gate register was uploaded for this day. Use that one.")
+    check_register_editable(row["business_date"], gate_pass_window())
+    return row
+
+
+def _refresh_cover(connection: Connection, tenant_id: str, gate_pass_id: UUID | str) -> None:
+    """After a photo is added or removed: page 1 on the register row is its first live photo,
+    and the register is as good as its worst live photo (as at upload)."""
+    pages = connection.execute(text(_LIVE_PAGES_SQL), {"t": tenant_id, "i": str(gate_pass_id)}).mappings().all()
+    first = pages[0]
+    worst = next((p["quality_flag"] for p in pages if (p["quality_flag"] or "GOOD") != "GOOD"), "GOOD")
+    connection.execute(
+        text("""
+            UPDATE auditcore.p2_gate_passes
+            SET object_key = :key, content_type = :ct, size_bytes = :size, width_px = :w, height_px = :h,
+                sharpness = :sharp, brightness = :bright, quality_flag = :quality,
+                pages_edit_count = pages_edit_count + 1, pages_edited_at_utc = now()
+            WHERE tenant_id = :t AND gate_pass_id = :i
+        """),
+        {"key": first["object_key"], "ct": first["content_type"], "size": first["size_bytes"], "w": first["width_px"],
+         "h": first["height_px"], "sharp": first["sharpness"], "bright": first["brightness"], "quality": worst,
+         "t": tenant_id, "i": str(gate_pass_id)},
+    )
+
+
+@router.post("/gate-passes/{gate_pass_id}/pages", status_code=201)
+def add_gate_pass_pages(
+    tenant_id: str,
+    gate_pass_id: UUID,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    file: Annotated[list[UploadFile] | None, File()] = None,
+    files: Annotated[list[UploadFile] | None, File()] = None,
+    pageDate: Annotated[date | None, Form()] = None,
+) -> dict[str, Any]:
+    """Add photos to a register on file (product owner 2026-11-07), while its date is within
+    N to N-3; the register holds at most MAX_PAGES photos. Its counts are kept. A Monday
+    register with Sunday and Monday photographed apart needs ``pageDate`` (Sunday or Monday)."""
+    _authorize(connection, tenant_id, principal, client, _UPDATE)
+    row = _editable_register(connection, tenant_id, gate_pass_id, principal)
+    uploads = [f for f in (files or []) + (file or []) if f is not None]
+    if not uploads:
+        raise HTTPException(status_code=422, detail="Add a photo of the gate pass.")
+    have = len(row["pages"])
+    if have + len(uploads) > MAX_PAGES:
+        raise HTTPException(status_code=422, detail=(
+            f"A gate register holds at most {MAX_PAGES} photos and this one has {have}. "
+            + (f"Add at most {MAX_PAGES - have}." if have < MAX_PAGES else "Remove a photo first.")))
+    business_date = row["business_date"]
+    covers = gate_pass_covers(business_date)
+    if row.get("photo_mode") == "SEPARATE":
+        if pageDate not in covers:
+            raise HTTPException(status_code=422, detail="Say which day the photo is for: "
+                                + " or ".join(f"{d:%A}" for d in covers) + ".")
+        page_date = pageDate
+    else:
+        if pageDate is not None and pageDate not in covers:
+            raise HTTPException(status_code=422, detail="A photo is for a day this gate pass does not cover.")
+        page_date = business_date
+    pages = []
+    for n, upload in enumerate(uploads, start=1):
+        data = upload.file.read(MAX_BYTES + 1)
+        assessment = assess_gate_pass_image(data)
+        if not assessment.ok:
+            raise HTTPException(status_code=422, detail=f"Photo {n}: {assessment.message}"
+                                if len(uploads) > 1 else assessment.message)
+        pages.append((data, assessment))
+    next_no = int(connection.execute(
+        text("SELECT COALESCE(max(page_no), 0) FROM auditcore.p2_gate_pass_pages WHERE tenant_id = :t "
+             "AND gate_pass_id = :i"), {"t": tenant_id, "i": str(gate_pass_id)},
+    ).scalar_one()) + 1
+    day = datetime.combine(business_date, datetime.min.time())
+    label = (f"{safe_part(row['outlet_name'], fallback='outlet')}__{safe_part(row['pc_name'], fallback='pc')}"
+             f"__{day:%d-%m-%y}")
+    stored = []
+    try:
+        for offset, (data, assessment) in enumerate(pages):
+            page_no = next_no + offset
+            key = (f"daily-gate-passes/{tenant_id}/{day:%Y-%m-%d}/{gate_pass_id}/"
+                   f"{safe_filename(f'{label}__p{page_no}')}.{assessment.extension}")
+            get_p2_document_storage().put_object(key, data, content_type=str(assessment.content_type))
+            stored.append((page_no, key, data, assessment))
+    except (P2DocumentStorageError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail="The photo could not be stored just now. Please try again.") from exc
+    for page_no, key, data, a in stored:
+        connection.execute(
+            text("""
+                INSERT INTO auditcore.p2_gate_pass_pages (tenant_id, gate_pass_id, page_no, page_date, object_key,
+                  content_type, size_bytes, width_px, height_px, sharpness, brightness, quality_flag, added_by_actor_id)
+                VALUES (:t, :id, :n, :d, :key, :ct, :size, :w, :h, :sharp, :bright, :quality, :actor)
+            """),
+            {"t": tenant_id, "id": str(gate_pass_id), "n": page_no, "d": page_date, "key": key,
+             "ct": a.content_type, "size": len(data), "w": a.width, "h": a.height, "sharp": a.sharpness,
+             "bright": a.brightness, "quality": a.quality, "actor": principal.subject},
+        )
+    _refresh_cover(connection, tenant_id, gate_pass_id)
+    return _public_gate_pass(_gate_pass_row(connection, tenant_id, gate_pass_id))
+
+
+@router.delete("/gate-passes/{gate_pass_id}/pages/{page_no}")
+def remove_gate_pass_page(
+    tenant_id: str,
+    gate_pass_id: UUID,
+    page_no: int,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Remove one photo from a register on file (product owner 2026-11-07), while its date is
+    within N to N-3. The photo is kept, marked removed with who removed it; a register keeps at
+    least one photo (one per day when Sunday and Monday were photographed apart)."""
+    _authorize(connection, tenant_id, principal, client, _UPDATE)
+    row = _editable_register(connection, tenant_id, gate_pass_id, principal)
+    page = next((p for p in row["pages"] if p["page_no"] == page_no), None)
+    if page is None:
+        raise HTTPException(status_code=404, detail="This photo is not on the gate register.")
+    rest = [p for p in row["pages"] if p["page_no"] != page_no]
+    if not rest:
+        raise HTTPException(status_code=409, detail="A gate register needs at least one photo. Add the new photo "
+                                                    "first, or replace all the photos.")
+    if row.get("photo_mode") == "SEPARATE" and not any(p["page_date"] == page["page_date"] for p in rest):
+        raise HTTPException(status_code=409, detail=f"Keep at least one photo for {page['page_date']:%A}: add "
+                                                    "the new photo first, or replace all the photos.")
+    connection.execute(
+        text("UPDATE auditcore.p2_gate_pass_pages SET removed_at_utc = now(), removed_by_actor_id = :a "
+             "WHERE tenant_id = :t AND gate_pass_id = :i AND page_no = :n"),
+        {"a": principal.subject, "t": tenant_id, "i": str(gate_pass_id), "n": page_no},
+    )
+    _refresh_cover(connection, tenant_id, gate_pass_id)
     return _public_gate_pass(_gate_pass_row(connection, tenant_id, gate_pass_id))
 
 
@@ -551,7 +827,7 @@ def submit_counts(
     )
     if settled:
         close_gate_pass_tasks(connection, tenant_id=tenant_id, outlet_id=row["outlet_id"],
-                              business_date=row["business_date"])
+                              business_date=row["business_date"], include_incomplete=True)
     task_raised = False
     if editing:
         # The Team Lead's task follows the corrected numbers.
@@ -696,7 +972,7 @@ def answer_divergence(
             {"n": note, "t": tenant_id, "i": str(gate_pass_id)},
         )
         close_gate_pass_tasks(connection, tenant_id=tenant_id, outlet_id=row["outlet_id"],
-                              business_date=row["business_date"])
+                              business_date=row["business_date"], include_incomplete=True)
     elif row["divergence"] == "MISSING_FILES":
         missing = max(int(row["new_deliveries"] or 0) - int(row["delivery_files"] or 0), 0)
         not_notified = command.notNotified
@@ -713,7 +989,7 @@ def answer_divergence(
             {"n": not_notified, "h": not_uploaded > 0, "t": tenant_id, "i": str(gate_pass_id)},
         )
         close_gate_pass_tasks(connection, tenant_id=tenant_id, outlet_id=row["outlet_id"],
-                              business_date=row["business_date"])
+                              business_date=row["business_date"], include_incomplete=True)
         if not_notified:
             _raise_delivery_not_notified(connection, tenant_id, row, principal.subject, not_notified=not_notified,
                                          not_uploaded=not_uploaded)
@@ -871,7 +1147,8 @@ def gate_pass_summary(
                    g.not_notified_count, g.stock_transfers,
                    g.divergence, g.counts_submitted_at_utc, g.completed_at_utc, g.quality_flag, g.photo_mode,
                    (SELECT count(*) FROM auditcore.p2_gate_pass_pages pp
-                    WHERE pp.tenant_id = g.tenant_id AND pp.gate_pass_id = g.gate_pass_id) AS pages
+                    WHERE pp.tenant_id = g.tenant_id AND pp.gate_pass_id = g.gate_pass_id
+                      AND pp.removed_at_utc IS NULL) AS pages
             FROM auditcore.p2_gate_passes g
             WHERE tenant_id = :t AND status = 'ACTIVE' AND outlet_id = ANY(CAST(:ids AS uuid[]))
               AND business_date BETWEEN :a AND :b
@@ -991,7 +1268,8 @@ def gate_pass_image_url(
     _authorize(connection, tenant_id, principal, client, _READ)
     row = _gate_pass_row(connection, tenant_id, gate_pass_id)
     _outlet_in_scope(scope_outlets(connection, tenant_id, principal.subject), row["outlet_id"])
-    chosen = next((p for p in row["pages"] if p["page_no"] == page), None)
+    # ?page=n opens the n-th live photo (pages[].position): a removed photo is not opened (2026-11-07).
+    chosen = row["pages"][page - 1] if page <= len(row["pages"]) else None
     if chosen is None and page != 1:
         raise HTTPException(status_code=404, detail="This gate pass has no such page.")
     key = chosen["object_key"] if chosen else row["object_key"]
