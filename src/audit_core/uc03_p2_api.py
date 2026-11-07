@@ -566,11 +566,14 @@ def list_p2_journeys(
     outlet_id: UUID | None = None,
     pc_actor_id: str | None = None,
     sort: str | None = None,
+    month_basis: str | None = None,
 ) -> dict[str, Any]:
     """Bookings / Journey 360 list, one page of one tab (uc03_p2_journey_views):
     ``view`` names the tab (``state`` open / closed / all is the older
     spelling), ``offset`` / ``limit`` the page (50 by default), and ``month``
-    (YYYY-MM, the month the journey was started), ``outlet_id`` and
+    (YYYY-MM, the month the journey was started; with ``month_basis=business``
+    the month of its booking date or delivery date, the Team Lead dashboard's
+    calendar month), ``outlet_id`` and
     ``pc_actor_id`` narrow it. ``sort=outlet`` lists Outlet by Outlet, the
     tab's own order inside each. ``nextOffset`` is set when there is more."""
     _authorize(
@@ -817,6 +820,7 @@ def list_p2_journeys(
             "outlet_id": str(outlet_id) if outlet_id else None,
             "pc_actor_id": (pc_actor_id or "").strip() or None,
             "month": month if month and re.fullmatch(r"\d{4}-\d{2}", month) else None,
+            "month_basis": _month_basis(month_basis),
             "timezone": _project_timezone(connection, tenant_id),
         },
     ).mappings().all()
@@ -860,6 +864,12 @@ def list_p2_journeys(
             "nextOffset": max(offset, 0) + page_size if more else None}
 
 
+def _month_basis(value: str | None) -> str | None:
+    """``business``: a journey's month is that of its booking date or delivery date (the Team
+    Lead dashboard, 2026-11-07); anything else: the month it was started."""
+    return "business" if (value or "").strip().lower() == "business" else None
+
+
 @router.get("/journeys:counts")
 def journey_view_counts(
     tenant_id: str,
@@ -873,10 +883,13 @@ def journey_view_counts(
     outlet_id: UUID | None = None,
     pc_actor_id: str | None = None,
     breakdown: bool = False,
+    month_basis: str | None = None,
 ) -> dict[str, Any]:
     """How many journeys each list tab holds, under the same filters as the
     list. ``breakdown`` adds open / needs TL / overdue / high-risk / stuck
-    per outlet and per PC (the TL / PM strip)."""
+    per outlet and per PC (the TL / PM strip). With ``month`` and
+    ``month_basis=business``, ``bookings_in_month`` / ``deliveries_in_month``
+    count the journeys whose booking / delivery date is in that month."""
     _authorize(
         connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,
         authorization_client=authorization_client, permission_key=_READ_PERMISSION,
@@ -888,6 +901,8 @@ def journey_view_counts(
         "outlet_id": str(outlet_id) if outlet_id else None,
         "pc_actor_id": (pc_actor_id or "").strip() or None,
         "month": month if month and re.fullmatch(r"\d{4}-\d{2}", month) else None,
+        "month_basis": _month_basis(month_basis),
+        "date_floor": programme_date_floor() or date(1900, 1, 1),
         "timezone": _project_timezone(connection, tenant_id),
     }
     counts = counts_from_row(connection.execute(text(COUNTS_SQL), params).mappings().one())
@@ -899,7 +914,7 @@ def journey_view_counts(
             for row in connection.execute(text(sql), params).mappings().all():
                 item = dict(row)
                 for key in ("total", "open", "booking_open", "delivery_open", "needs_tl", "overdue",
-                            "high_risk", "stuck", "closed"):
+                            "high_risk", "stuck", "closed", "bookings_in_month", "deliveries_in_month"):
                     item[key] = int(item[key] or 0)
                 out.append(item)
             return out

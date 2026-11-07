@@ -887,7 +887,7 @@ _CLOSED_TASK_STATUSES = ("VERIFIED_COMPLETE", "CANCELLED", "FAILED", "DEAD_LETTE
 
 def delivery_files_closed(
     connection: Connection, *, tenant_id: str, actor_id: str, start: datetime, end: datetime,
-    names: dict[str, str],
+    names: dict[str, str], whole_project: bool = False,
 ) -> dict[str, Any]:
     """The delivery files (Journeys) that closed in [start, end), per PC, with
     the list of files (product owner 2026-11-02: "a delivery file is closed
@@ -897,7 +897,9 @@ def delivery_files_closed(
     outlets; a file counts on the day it last closed, so a file whose task
     is reopened drops out and counts again on the day it closes again. A
     Journey the stage engine has not evaluated yet (no stored DELIVERY
-    REQUIRED_DOCUMENTS gate) is not counted."""
+    REQUIRED_DOCUMENTS gate) is not counted. ``whole_project``: every outlet of the
+    Project (an administrator, who holds no business assignment; the Project
+    Tracker, 2026-11-07)."""
     # The Task Queue's Documents tab (uc03_p2_tasks.task_queue_tab), in SQL.
     from audit_core.uc03_p2_tasks import (
         _DOCUMENT_CATEGORIES,
@@ -956,7 +958,7 @@ def delivery_files_closed(
                   WHERE mt.tenant_id=j.tenant_id AND mt.journey_id=j.journey_id
                     AND mt.task_type='DOCUMENT_MISSING' AND mt.task_status='VERIFIED_COMPLETE'
                     AND mt.reference->>'requirementKey' = m->>'key'))
-              AND {_SCOPE}
+              AND {"true" if whole_project else _SCOPE}
             ORDER BY closed_at
             """
         ),
