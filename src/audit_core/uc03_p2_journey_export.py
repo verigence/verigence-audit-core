@@ -9,10 +9,10 @@ The columns are the ones of his Deal Audit export (``Deal-Audit-Export_*.xlsx``,
 192 columns, in that order): who and what the journey is, then the deal at the
 Standard (price masters), Actual (the documents) and the Variance between them,
 charge by charge and discount by discount, then what was to be received and
-what was received. One column follows them, "Booking Date Note" (2026-11-07):
-a journey with no booking date (none entered, none read) is not dropped from a
-booking-date export -- it is listed by the day it was created and marked
-"Booking date not read".
+what was received. One column follows them, "Booking Date Source" (2026-11-07):
+every journey has a booking date in the export -- the booking date on file
+when it can be right, else the day the PC first uploaded booking documents,
+else the day the journey was started -- and this column says which.
 
 One source per figure. Every amount is the Deal's own (``uc03_p2_journey360.deal``,
 what Journey 360's Deal tab shows): the export never computes a figure the Deal
@@ -139,10 +139,14 @@ DISCOUNT_HEADS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 PAYMENT_COLUMNS = ("Total Amt To Be Received", "Total Amt Received", "Payment Variance", "Payment Status")
 
-# After the Deal Audit export's own columns, so its layout is unchanged: why a
-# journey's Booking Date is blank (2026-11-07).
-BOOKING_DATE_NOT_READ = "Booking date not read"
-NOTE_COLUMNS = ("Booking Date Note",)
+# After the Deal Audit export's own columns, so its layout is unchanged: where
+# a journey's Booking Date came from (product owner 2026-11-07).
+NOTE_COLUMNS = ("Booking Date Source",)
+BOOKING_DATE_SOURCES = {
+    "BOOKING_DOCKET": "Booking docket",
+    "BOOKING_DOCS_UPLOADED": "Day booking documents were uploaded",
+    "JOURNEY_CREATED": "Day the journey was started",
+}
 
 
 def columns() -> list[str]:
@@ -169,9 +173,10 @@ IDENTITY_SOURCES: dict[str, str | None] = {
     "Dealership": "The journey's dealership",
     "Location": "The outlet's name and address",
     "Booking No": "Booking form / docket (booking reference number)",
-    "Booking Date": ("The journey's booking date (uc03_booking_date): the booking form / docket's booking date "
-                     "as read or corrected, when it can be right, else the date entered on the booking. Blank "
-                     "when there is none; see Booking Date Note"),
+    "Booking Date": ("The booking date on file (booking form / docket as read or corrected, or entered) when "
+                     "it is on or after the programme's start and not after today; else the day (IST) the PC "
+                     "first uploaded booking documents; else the day the journey was started. See Booking "
+                     "Date Source"),
     "Booking Intimation": "Booking stage intimation date, when recorded",
     "Delivery Date": "Delivery recorded on the journey, else the vehicle gate pass date",
     "DMS Invoice Date": "Customer invoice (DMS) date",
@@ -231,10 +236,10 @@ def column_notes() -> list[tuple[str, str]]:
         ("Total Amt Received", "Receipts, the loan disbursed and the old vehicle taken in, less refunds"),
         ("Payment Variance", "Received less to be received"),
         ("Payment Status", "Matched (within Rs 10), Excess, Short, Loan not on file, or No amount data"),
-        ("Booking Date Note", (f"'{BOOKING_DATE_NOT_READ}' when the journey has no booking date (none entered, "
-                               "none read from its booking form / docket, or only a misread from before the "
-                               "programme began on file, which the note names). Such a journey is listed "
-                               "under 'Dates by: Booking date' by the day it was created (IST), not left out")),
+        ("Booking Date Source", ("Where the Booking Date came from: 'Booking docket' (the booking date on file), "
+                                 "'Day booking documents were uploaded' (no usable booking date on file: the "
+                                 "day, IST, of the PC's first upload holding a booking page), or 'Day the "
+                                 "journey was started' (no booking documents uploaded either)")),
     ]
     return notes
 
@@ -386,16 +391,6 @@ def _date_text(value: Any) -> str | None:
     return text_ or None
 
 
-def _booking_date_note(base: dict[str, Any]) -> str | None:
-    """Why the Booking Date is blank, or None when it is not."""
-    if base.get("booking_date") is not None:
-        return None
-    on_file = base.get("booking_date_on_file")
-    if on_file is not None:
-        return f"{BOOKING_DATE_NOT_READ} ({_date_text(on_file)} on file is before the programme began: a misread)"
-    return BOOKING_DATE_NOT_READ
-
-
 _DMS_INVOICE_TYPES = ("customer_invoice_dms", "customer_invoice_dms_v2", "tax_invoice_dms")
 _CLOSURE_STATUS = {"PENDING": "Closed by Reviewer (awaiting TL)", "ACCEPTED": "Closed and accepted by TL",
                    "AUTO_ACCEPTED": "Closed, auto-accepted", "REJECTED": "Closure rejected by TL"}
@@ -457,7 +452,7 @@ def identity_row(base: dict[str, Any], *, deal: dict[str, Any], vehicle: dict[st
         "PAN No": fields.get("pan"),
         "GST No": base.get("gst_no"),
         "Pincode": fields.get("pincode"),
-        "Booking Date Note": _booking_date_note(base),
+        "Booking Date Source": BOOKING_DATE_SOURCES.get(str(base.get("booking_date_source") or "")),
     }
 
 
@@ -506,18 +501,43 @@ _SCOPE_SQL = """
 WITH base AS (
     SELECT j.journey_id, j.journey_reference, j.created_at_utc, d.dealer_name, o.outlet_name,
            o.address_text AS outlet_address, b.booking_reference,
-           -- The journey's booking date (uc03_booking_date): the booking record's
-           -- copy, which follows the booking form / docket, unless it is a
-           -- misread from before the programme began.
-           CASE WHEN CAST(:floor AS date) IS NULL OR b.booking_date >= CAST(:floor AS date)
-                THEN b.booking_date END AS booking_date,
-           b.booking_date AS booking_date_on_file,
+           -- The export's booking date (product owner 2026-11-07): the one on file
+           -- when it can be right (on or after the floor, not after today), else
+           -- the day the PC first uploaded booking documents, else the day the
+           -- journey was started -- so every journey has one.
+           CASE WHEN b.booking_date IS NOT NULL
+                 AND (CAST(:floor AS date) IS NULL OR b.booking_date >= CAST(:floor AS date))
+                 AND b.booking_date <= CAST(now() AT TIME ZONE 'Asia/Kolkata' AS date)
+                THEN b.booking_date
+                ELSE COALESCE(up.first_booking_upload_day,
+                              CAST(j.created_at_utc AT TIME ZONE 'Asia/Kolkata' AS date))
+           END AS booking_date,
+           CASE WHEN b.booking_date IS NOT NULL
+                 AND (CAST(:floor AS date) IS NULL OR b.booking_date >= CAST(:floor AS date))
+                 AND b.booking_date <= CAST(now() AT TIME ZONE 'Asia/Kolkata' AS date)
+                THEN 'BOOKING_DOCKET'
+                WHEN up.first_booking_upload_day IS NOT NULL THEN 'BOOKING_DOCS_UPLOADED'
+                ELSE 'JOURNEY_CREATED'
+           END AS booking_date_source,
            COALESCE(dv.actual_delivered_at::date, gp.delivery_date) AS delivery_day
     FROM auditcore.journeys j
     JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
     JOIN auditcore.dealer_outlets o ON o.tenant_id=j.tenant_id AND o.outlet_id=j.outlet_id
     LEFT JOIN auditcore.bookings b ON b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
     LEFT JOIN auditcore.deliveries dv ON dv.tenant_id=j.tenant_id AND dv.journey_id=j.journey_id
+    -- The PC's first upload holding a booking page, as the Project Tracker
+    -- counts an upload: not one still awaiting its file, not a duplicate
+    -- cancelled on arrival with no pages; a page cancelled since is no upload.
+    LEFT JOIN LATERAL (
+        SELECT MIN(CAST(ub.created_at_utc AT TIME ZONE 'Asia/Kolkata' AS date)) AS first_booking_upload_day
+        FROM auditcore.p2_upload_batches ub
+        WHERE ub.tenant_id=j.tenant_id AND ub.journey_id=j.journey_id
+          AND ub.batch_status <> 'AWAITING_UPLOAD'
+          AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
+          AND EXISTS (SELECT 1 FROM auditcore.p2_document_queue q
+                      WHERE q.tenant_id=ub.tenant_id AND q.batch_id=ub.batch_id
+                        AND q.business_stage='BOOKING' AND q.queue_status <> 'CANCELLED')
+    ) up ON true
     LEFT JOIN LATERAL (
         SELECT CAST(f.effective_value #>> '{}' AS date) AS delivery_date
         FROM auditcore.journey_document_extracted_fields f
@@ -536,9 +556,7 @@ WITH base AS (
 SELECT base.* FROM base
 WHERE CAST(:date_from AS date) IS NULL OR (
     CASE :basis
-        -- A journey with no booking date at all is listed by the day it was
-        -- created instead of silently left out; its Booking Date Note says so.
-        WHEN 'BOOKING' THEN COALESCE(base.booking_date, (base.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date)
+        WHEN 'BOOKING' THEN base.booking_date
         WHEN 'DELIVERY' THEN base.delivery_day
         ELSE (base.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date
     END BETWEEN CAST(:date_from AS date) AND CAST(:date_to AS date))
@@ -699,8 +717,9 @@ def _filters_text(filters: dict[str, Any], names: dict[str, str]) -> str:
     when = (f"{basis} {filters['dateFrom']} to {filters['dateTo']}" if filters.get("dateFrom")
             else f"every {basis}")
     where = names.get("outlet") or names.get("dealer") or "every dealership and outlet in scope"
-    note = (" A journey with no booking date is listed by the day it was created (Booking Date Note)."
-            if (filters.get("dateBasis") or "BOOKING") == "BOOKING" and filters.get("dateFrom") else "")
+    note = (" Booking date: the one on file when it can be right, else the day booking documents were first "
+            "uploaded, else the day the journey was started (Booking Date Source)."
+            if (filters.get("dateBasis") or "BOOKING") == "BOOKING" else "")
     return f"Journeys by {when}; {where}.{note}"
 
 
