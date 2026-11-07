@@ -1097,7 +1097,8 @@ def _deal_price_point_options(
     row = connection.execute(
         text(
             """
-            SELECT s.model_id, s.variant_id, b.booking_date, cu.customer_type_code,
+            SELECT s.model_id, s.variant_id,
+                   CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END AS booking_date, cu.customer_type_code,
                    rr.registration_type_code
             FROM auditcore.journey_products jp
             JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id

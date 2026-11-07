@@ -104,7 +104,7 @@ def _pricing_row(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
     row = connection.execute(
         text(
             """
-            SELECT b.booking_date, b.pricing_effective_on, b.pricing_basis, b.pricing_reason,
+            SELECT b.booking_date, b.booking_date_source, b.pricing_effective_on, b.pricing_basis, b.pricing_reason,
                    b.pricing_set_by_actor_id, b.pricing_set_at_utc,
                    jp.product_sku_id, jp.selection_status, jp.match_basis, jp.model_name_snapshot,
                    jp.variant_name_snapshot,
@@ -127,19 +127,20 @@ def _pricing_row(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
 
 def booking_date_for_pricing(connection: Connection, *, tenant_id: str, journey_id: UUID,
                              row: dict[str, Any] | None = None) -> date | None:
-    """The date the deal is priced on by default: the Journey's booking date
-    (``uc03_booking_date.journey_booking_date``) -- the booking date on the
+    """The date the deal is priced on by default: the booking date on the
     booking form (as read, or as the PC corrected it) when it can be right,
-    else the booking date entered by hand on the booking. Never today."""
-    from audit_core.uc03_booking_date import read_booking_date
-    from audit_core.uc03_p2_dates import before_floor
+    else a booking date a person entered (``uc03_booking_date.pricing_booking_date``).
+    Never today, and never the fallback booking date (the day the booking
+    documents were uploaded or the journey started)."""
+    from audit_core.uc03_booking_date import entered_booking_date, read_booking_date
 
     read = read_booking_date(connection, tenant_id=tenant_id, journey_id=journey_id)
     if read is not None:
         return read
     row = row or _pricing_row(connection, tenant_id=tenant_id, journey_id=journey_id)
-    held = row["booking_date"]
-    return None if held is None or before_floor(held) else held
+    return entered_booking_date(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                held={"booking_date": row["booking_date"],
+                                      "booking_date_source": row.get("booking_date_source")})
 
 
 def pricing_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:

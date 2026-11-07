@@ -454,7 +454,7 @@ def _business_date_aware_completion_summary(
     row = connection.execute(
         text(
             """
-            SELECT b.booking_date,
+            SELECT CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END AS booking_date,
                    j.document_requirement_profile_version_id AS document_profile_version_id,
                    j.policy_version_id, j.price_list_version_id
             FROM auditcore.journeys j

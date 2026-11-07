@@ -1,12 +1,15 @@
-"""The booking date of a Journey: one rule, one stored copy (2026-11-07).
+"""The booking date of a Journey: one rule, one stored copy, its source.
 
-Found on Mahindra Orissa: 208 of 1,204 Journeys had no booking date on their
-booking record although 184 had documents and most an active booking docket
-carrying one, so "Export to Excel" by booking date dropped them (223 listed
-where about 430 were expected). The generic machine pass wrote the ONE
-winning reading across every copy ever read; a superseded copy (refused as no
-longer ACTIVE) or a Delivery-stage ledger (never written) could win, and the
-active docket's date was never stored.
+Product owner 2026-11-07 20:47 IST: every journey carries a booking date --
+the booking form's, else the docket's, else one a person entered, else the
+day the PC uploaded the booking documents, else the day the journey was
+started. The last two are for lists and reports only: no deal is priced on
+them and no check reads them.
+
+History: the column used to be written only by the generic machine pass,
+whose one winning reading could be a superseded copy (refused) or a
+Delivery-stage ledger (never written); 208 of 1,204 Mahindra Orissa journeys
+had no booking date.
 """
 from __future__ import annotations
 
@@ -20,6 +23,7 @@ from openpyxl import load_workbook
 from p2_support import (
     add_evidence,
     add_extracted_field,
+    add_page,
     add_ready_document,
     create_p2_journey,
     database_engine,
@@ -28,15 +32,19 @@ from sqlalchemy import text
 
 from audit_core.db import set_tenant_context
 from audit_core.uc03_booking_date import (
+    BOOKING_DOCKET,
+    BOOKING_DOCS_UPLOADED,
+    BOOKING_FORM,
+    ENTERED,
+    JOURNEY_CREATED,
     fill_missing_booking_dates,
     journey_booking_date,
-    read_booking_date,
+    pricing_booking_date,
     sync_booking_date,
 )
 from audit_core.uc03_p2_dates import programme_date_floor, programme_today
+from audit_core.uc03_p2_deal_actions import booking_date_for_pricing
 from audit_core.uc03_p2_journey_export import (
-    BOOKING_DATE_NOT_READ,
-    _booking_date_note,
     columns,
     journeys_in_scope,
     run_pending_exports,
@@ -44,12 +52,22 @@ from audit_core.uc03_p2_journey_export import (
 from audit_core.uc03_post_extraction_materialization import (
     materialize_machine_booking_values,
 )
+from audit_core.uc03_sku_candidates import journey_pricing_date
+
+STARTED = date(2026, 10, 25)
 
 
 @pytest.fixture
 def journey():
     engine = database_engine()
     created = create_p2_journey(engine, prefix="bkdt")
+    with engine.begin() as connection:
+        set_tenant_context(connection, created.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.journeys SET created_at_utc=:c WHERE tenant_id=:t AND journey_id=:j"),
+            {"c": datetime(STARTED.year, STARTED.month, STARTED.day, 6, 0, tzinfo=UTC),
+             "t": created.tenant_id, "j": created.journey_id},
+        )
     try:
         yield created
     finally:
@@ -58,34 +76,42 @@ def journey():
 
 
 def _a_good_day() -> date:
-    """A day the rule accepts: on or after the floor, not after today."""
+    """A day the rule accepts on a form: on or after the floor, not after today."""
     floor = programme_date_floor() or date(2026, 7, 1)
     return max(floor, programme_today() - timedelta(days=5))
 
 
-def _booking(journey, booking_date: date | None = None) -> None:
+def _booking(journey, booking_date: date | None = None, source: str | None = None) -> None:
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
-            text("INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date) VALUES (:t, :j, :b) "
-                 "ON CONFLICT (tenant_id, journey_id) DO UPDATE SET booking_date=:b"),
-            {"t": journey.tenant_id, "j": journey.journey_id, "b": booking_date},
+            text("INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date, booking_date_source) "
+                 "VALUES (:t, :j, :b, :s) ON CONFLICT (tenant_id, journey_id) DO UPDATE "
+                 "SET booking_date=:b, booking_date_source=:s"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "b": booking_date, "s": source},
         )
 
 
-def _held(journey) -> date | None:
+def _held(journey) -> tuple[date | None, str | None]:
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        return connection.execute(
-            text("SELECT booking_date FROM auditcore.bookings WHERE tenant_id=:t AND journey_id=:j"),
+        row = connection.execute(
+            text("SELECT booking_date, booking_date_source FROM auditcore.bookings "
+                 "WHERE tenant_id=:t AND journey_id=:j"),
             {"t": journey.tenant_id, "j": journey.journey_id},
-        ).scalar_one_or_none()
+        ).one_or_none()
+    return (row[0], row[1]) if row else (None, None)
 
 
 def _call(journey, fn, **kwargs):
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         return fn(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, **kwargs)
+
+
+def _rule(journey) -> tuple[date, str]:
+    found = _call(journey, journey_booking_date)
+    return found.day, found.source
 
 
 def _docket(journey, booking_date: str | None, *, status: str = "ACTIVE", doc_type: str = "booking_docket"):
@@ -103,161 +129,180 @@ def _docket(journey, booking_date: str | None, *, status: str = "ACTIVE", doc_ty
     return di_document_id
 
 
-# ── the rule ────────────────────────────────────────────────────────────────
+def _upload(journey, on: date, *, stage: str = "BOOKING", page_status: str = "READY") -> None:
+    batch_id, queue_id, _ = add_page(journey)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_upload_batches SET created_at_utc=:c WHERE tenant_id=:t AND batch_id=:b"),
+            {"c": datetime(on.year, on.month, on.day, 5, 0, tzinfo=UTC), "t": journey.tenant_id, "b": batch_id},
+        )
+        connection.execute(
+            text("UPDATE auditcore.p2_document_queue SET business_stage=:s, queue_status=:q "
+                 "WHERE tenant_id=:t AND queue_id=:id"),
+            {"s": stage, "q": page_status, "t": journey.tenant_id, "id": queue_id},
+        )
 
 
-def test_the_booking_date_is_the_one_on_the_booking_form_else_the_one_entered(journey) -> None:
-    day = _a_good_day()
-    _booking(journey, day - timedelta(days=1))
-    # Nothing read yet: the entered date.
-    assert _call(journey, read_booking_date) is None
-    assert _call(journey, journey_booking_date) == day - timedelta(days=1)
-    # The booking form's date, as read, is the Journey's booking date (R5).
-    add_ready_document(journey, "booking_form", booking_date=day.strftime("%d/%m/%Y"))
-    assert _call(journey, read_booking_date) == day
-    assert _call(journey, journey_booking_date) == day
+# ── the rule, step by step ──────────────────────────────────────────────────
 
 
-def test_a_misread_date_on_the_form_is_not_the_booking_date(journey) -> None:
+def test_with_nothing_on_file_the_booking_date_is_the_day_the_journey_was_started(journey) -> None:
+    assert _rule(journey) == (STARTED, JOURNEY_CREATED)
+
+
+def test_the_first_booking_upload_day_comes_before_the_start_day(journey) -> None:
+    _upload(journey, STARTED + timedelta(days=4), stage="DELIVERY")  # not a booking upload
+    _upload(journey, STARTED + timedelta(days=3), stage="BOOKING", page_status="CANCELLED")  # dropped
+    assert _rule(journey) == (STARTED, JOURNEY_CREATED)
+    _upload(journey, STARTED + timedelta(days=2))
+    _upload(journey, STARTED + timedelta(days=1))
+    assert _rule(journey) == (STARTED + timedelta(days=1), BOOKING_DOCS_UPLOADED)
+
+
+def test_an_entered_date_comes_before_the_upload_day(journey) -> None:
+    _upload(journey, STARTED + timedelta(days=1))
+    entered = _a_good_day() - timedelta(days=2)
+    _booking(journey, entered, ENTERED)
+    assert _rule(journey) == (entered, ENTERED)
+
+
+def test_an_entered_date_before_the_floor_is_not_a_booking_date(journey) -> None:
     floor = programme_date_floor()
     assert floor is not None
-    _booking(journey, None)
-    add_ready_document(journey, "booking_form", booking_date=(floor - timedelta(days=730)).isoformat())
-    assert _call(journey, read_booking_date) is None
-    assert _call(journey, journey_booking_date) is None
+    _booking(journey, floor - timedelta(days=700), ENTERED)
+    assert _rule(journey) == (STARTED, JOURNEY_CREATED)
 
 
-def test_only_an_active_copy_counts(journey) -> None:
-    """A superseded or voided copy of the docket never sets the booking date."""
+def test_the_booking_form_comes_first_and_the_docket_without_one(journey) -> None:
     day = _a_good_day()
-    _booking(journey, None)
-    _docket(journey, (day - timedelta(days=3)).isoformat(), status="SUPERSEDED")
-    _docket(journey, (day - timedelta(days=4)).isoformat(), status="VOIDED")
-    assert _call(journey, read_booking_date) is None
-    _docket(journey, day.isoformat())
-    assert _call(journey, read_booking_date) == day
+    _upload(journey, STARTED + timedelta(days=1))
+    _booking(journey, day - timedelta(days=3), ENTERED)
+    _docket(journey, (day - timedelta(days=1)).isoformat())
+    assert _rule(journey) == (day - timedelta(days=1), BOOKING_DOCKET)
+    add_ready_document(journey, "booking_form", booking_date=day.strftime("%d/%m/%Y"))
+    assert _rule(journey) == (day, BOOKING_FORM)
+
+
+def test_a_misread_or_inactive_form_counts_as_missing(journey) -> None:
+    floor = programme_date_floor()
+    assert floor is not None
+    _upload(journey, STARTED + timedelta(days=1))
+    _docket(journey, _a_good_day().isoformat(), status="SUPERSEDED")
+    _docket(journey, (floor - timedelta(days=730)).isoformat())
+    assert _rule(journey) == (STARTED + timedelta(days=1), BOOKING_DOCS_UPLOADED)
+
+
+def test_a_record_written_before_sources_were_kept_is_entered_only_when_no_document_carries_it(journey) -> None:
+    day = _a_good_day()
+    _booking(journey, day - timedelta(days=2), None)
+    assert _rule(journey) == (day - timedelta(days=2), ENTERED)
+    # A copy of a superseded docket's reading is no entered date.
+    _docket(journey, (day - timedelta(days=2)).isoformat(), status="SUPERSEDED")
+    assert _rule(journey) == (STARTED, JOURNEY_CREATED)
 
 
 # ── the stored copy ─────────────────────────────────────────────────────────
 
 
-def test_the_machine_pass_stores_the_active_docket_s_date_whatever_wins_the_tie_break(journey) -> None:
-    """The DEV case: a superseded copy and a Delivery-stage ledger next to the
-    active docket. Before, the pass skipped ("Unsupported evidence" / not a
-    Booking-stage winner) and the record stayed empty."""
+def test_the_machine_pass_stores_the_rule_s_date_and_source(journey) -> None:
     day = _a_good_day()
     _booking(journey, None)
     _docket(journey, (day - timedelta(days=2)).isoformat(), status="SUPERSEDED")
     _docket(journey, day.isoformat())
-    ledger = uuid4()
-    add_evidence(journey, di_document_id=ledger, document_type_key="customer_ledger", process_area="DELIVERY")
-    add_extracted_field(journey, di_document_id=ledger, field_key="booking_date", value=None,
-                        document_type="customer_ledger")
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        connection.execute(
-            text("UPDATE auditcore.journey_document_extracted_fields SET stage_code='DELIVERY' "
-                 "WHERE tenant_id=:t AND di_document_id=:d"),
-            {"t": journey.tenant_id, "d": ledger},
-        )
     _call(journey, materialize_machine_booking_values)
-    assert _held(journey) == day
-    # Running it again changes nothing.
+    assert _held(journey) == (day, BOOKING_DOCKET)
     assert _call(journey, sync_booking_date) == "UNCHANGED"
 
 
-def test_the_record_follows_a_corrected_reading_and_is_never_cleared(journey) -> None:
-    day = _a_good_day()
-    _booking(journey, None)
-    document = _docket(journey, (day - timedelta(days=1)).isoformat())
+def test_a_form_date_that_arrives_later_replaces_the_fallback(journey) -> None:
+    _upload(journey, STARTED + timedelta(days=1))
     assert _call(journey, sync_booking_date) == "FILLED"
-    # The PC corrects the date on the docket: the record follows.
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        connection.execute(
-            text("UPDATE auditcore.journey_document_extracted_fields SET effective_value=to_jsonb(CAST(:v AS text)) "
-                 "WHERE tenant_id=:t AND di_document_id=:d"),
-            {"v": day.isoformat(), "t": journey.tenant_id, "d": document},
-        )
+    assert _held(journey) == (STARTED + timedelta(days=1), BOOKING_DOCS_UPLOADED)
+    day = _a_good_day()
+    _docket(journey, day.isoformat())
     assert _call(journey, sync_booking_date) == "UPDATED"
-    assert _held(journey) == day
-    # The docket is removed: nothing usable is read, the held date stays.
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        connection.execute(
-            text("UPDATE auditcore.evidence SET association_status='VOIDED' WHERE tenant_id=:t AND di_document_id=:d"),
-            {"t": journey.tenant_id, "d": document},
-        )
-    assert _call(journey, sync_booking_date) == "NOT_READ"
-    assert _held(journey) == day
+    assert _held(journey) == (day, BOOKING_DOCKET)
 
 
-def test_the_backfill_fills_empty_records_only_and_is_idempotent(journey) -> None:
-    day = _a_good_day()
-    _booking(journey, None)
-    _docket(journey, day.isoformat())
-    assert fill_missing_booking_dates(journey.engine, journey.tenant_id) == {"FILLED": 1}
-    assert _held(journey) == day
-    # Again: nothing left to fill.
-    assert fill_missing_booking_dates(journey.engine, journey.tenant_id) == {}
-    assert _held(journey) == day
+def test_a_person_entering_a_date_records_it_as_entered(journey) -> None:
+    from audit_core import uc03_booking_capture as booking_capture
+
+    entered = _a_good_day() - timedelta(days=1)
+    _call(journey, booking_capture._write_typed_capture, field_key="BOOKING_DATE", value=entered,
+          source_evidence_id=None)
+    assert _held(journey) == (entered, ENTERED)
+    assert _call(journey, sync_booking_date) == "UNCHANGED"
 
 
-def test_the_backfill_never_replaces_a_date_a_person_entered(journey) -> None:
-    day = _a_good_day()
-    entered = day - timedelta(days=3)
-    _booking(journey, entered)
-    _docket(journey, day.isoformat())
-    assert fill_missing_booking_dates(journey.engine, journey.tenant_id) == {"KEPT": 1}
-    assert _call(journey, sync_booking_date, replace="NONE") == "KEPT"
-    assert _held(journey) == entered
-
-
-def test_the_backfill_replaces_a_date_only_a_superseded_copy_carries(journey) -> None:
-    """The other face of the bug on DEV: 58 records held a reading of a copy
-    since superseded or voided -- often a misread year (2016-10-10 held while
-    the active docket reads 2026-10-18)."""
-    day = _a_good_day()
-    misread = day.replace(year=day.year - 10)
-    _docket(journey, misread.isoformat(), status="SUPERSEDED")
-    _booking(journey, misread)
-    _docket(journey, day.isoformat())
-    assert fill_missing_booking_dates(journey.engine, journey.tenant_id) == {"UPDATED": 1}
-    assert _held(journey) == day
-    assert fill_missing_booking_dates(journey.engine, journey.tenant_id) == {}
-
-
-def test_a_date_an_active_document_carries_is_not_a_stale_copy(journey) -> None:
-    day = _a_good_day()
-    other = day - timedelta(days=2)
-    # Two active booking documents: the form (which the rule reads) and a
-    # docket carrying the held date. The held date is no stale copy.
-    add_ready_document(journey, "booking_form", booking_date=day.isoformat())
-    _docket(journey, other.isoformat())
-    _booking(journey, other)
-    assert _call(journey, sync_booking_date, replace="STALE_COPY") == "KEPT"
-    assert _held(journey) == other
-
-
-def test_the_backfill_leaves_a_journey_with_nothing_usable_empty(journey) -> None:
+def test_the_backfill_brings_every_record_to_the_rule_and_is_idempotent(journey) -> None:
     floor = programme_date_floor()
     assert floor is not None
-    _booking(journey, None)
-    _docket(journey, (floor - timedelta(days=400)).isoformat())
-    assert fill_missing_booking_dates(journey.engine, journey.tenant_id) == {"NOT_READ": 1}
-    assert _held(journey) is None
+    # A pre-floor misread held from an old copy; booking documents uploaded.
+    misread = floor - timedelta(days=3650)
+    _docket(journey, misread.isoformat(), status="VOIDED")
+    _booking(journey, misread, None)
+    _upload(journey, STARTED + timedelta(days=2))
+    assert fill_missing_booking_dates(journey.engine, journey.tenant_id) == {"UPDATED": 1}
+    assert _held(journey) == (STARTED + timedelta(days=2), BOOKING_DOCS_UPLOADED)
+    # Again: the fallback is re-checked and stays.
+    assert fill_missing_booking_dates(journey.engine, journey.tenant_id) == {"UNCHANGED": 1}
+    assert _held(journey) == (STARTED + timedelta(days=2), BOOKING_DOCS_UPLOADED)
+
+
+def test_the_backfill_gives_a_journey_with_no_booking_record_its_start_day(journey) -> None:
+    assert _held(journey) == (None, None)
+    assert fill_missing_booking_dates(journey.engine, journey.tenant_id) == {"FILLED": 1}
+    assert _held(journey) == (STARTED, JOURNEY_CREATED)
+
+
+def test_the_backfill_keeps_an_entered_date_and_only_names_its_source(journey) -> None:
+    entered = _a_good_day() - timedelta(days=4)
+    _booking(journey, entered, None)
+    _upload(journey, STARTED + timedelta(days=1))
+    assert fill_missing_booking_dates(journey.engine, journey.tenant_id) == {"UPDATED": 1}
+    assert _held(journey) == (entered, ENTERED)
+    assert fill_missing_booking_dates(journey.engine, journey.tenant_id) == {}
+
+
+# ── pricing and checks never use a fallback ─────────────────────────────────
+
+
+def test_the_deal_is_never_priced_on_a_fallback_date(journey) -> None:
+    _upload(journey, STARTED + timedelta(days=1))
+    _call(journey, sync_booking_date)
+    assert _held(journey)[1] == BOOKING_DOCS_UPLOADED
+    assert _call(journey, pricing_booking_date) is None
+    assert _call(journey, journey_pricing_date) is None
+    assert _call(journey, booking_date_for_pricing) is None
+    # A booking form date prices it, exactly as before.
+    day = _a_good_day()
+    add_ready_document(journey, "booking_form", booking_date=day.isoformat())
+    assert _call(journey, journey_pricing_date) == day
+    assert _call(journey, booking_date_for_pricing) == day
+
+
+def test_an_entered_date_still_prices_the_deal(journey) -> None:
+    entered = _a_good_day() - timedelta(days=1)
+    _booking(journey, entered, ENTERED)
+    assert _call(journey, journey_pricing_date) == entered
+    assert _call(journey, booking_date_for_pricing) == entered
+
+
+def test_a_delivery_before_a_fallback_booking_date_is_no_finding(journey) -> None:
+    from audit_core.uc03_delivery_review_materialization import (
+        _sync_delivery_date_sanity_finding,
+    )
+
+    delivered = datetime(2026, 10, 26, 6, 0, tzinfo=UTC)
+    _booking(journey, STARTED + timedelta(days=5), BOOKING_DOCS_UPLOADED)
+    assert _call(journey, _sync_delivery_date_sanity_finding, actual_delivered_at=delivered)["raised"] == 0
+    # The same date entered by a person is a booking date, and the check runs.
+    _booking(journey, STARTED + timedelta(days=5), ENTERED)
+    assert _call(journey, _sync_delivery_date_sanity_finding, actual_delivered_at=delivered)["raised"] == 1
 
 
 # ── the export ──────────────────────────────────────────────────────────────
-
-
-def _created_on(journey, day: date) -> None:
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        connection.execute(
-            text("UPDATE auditcore.journeys SET created_at_utc=:c WHERE tenant_id=:t AND journey_id=:j"),
-            {"c": datetime(day.year, day.month, day.day, 6, 0, tzinfo=UTC), "t": journey.tenant_id, "j": journey.journey_id},
-        )
 
 
 def _scope(journey, start: date, end: date) -> list[dict]:
@@ -268,22 +313,14 @@ def _scope(journey, start: date, end: date) -> list[dict]:
                                  outlet_ids=None)
 
 
-def test_a_journey_with_no_booking_date_is_listed_by_its_creation_day_not_dropped(journey) -> None:
-    created = date(2026, 10, 25)
-    _created_on(journey, created)
-    _booking(journey, None)
-    assert [r["journey_id"] for r in _scope(journey, date(2026, 10, 20), date(2026, 11, 7))] == [journey.journey_id]
-    assert _scope(journey, date(2026, 11, 1), date(2026, 11, 7)) == []
-
-
-def test_a_journey_with_a_booking_date_is_listed_by_it_not_by_its_creation_day(journey) -> None:
-    _created_on(journey, date(2026, 10, 25))
-    _booking(journey, date(2026, 9, 30))
+def test_the_export_filters_on_the_stored_booking_date(journey) -> None:
+    _booking(journey, date(2026, 9, 30), ENTERED)
     assert _scope(journey, date(2026, 10, 20), date(2026, 11, 7)) == []
-    assert len(_scope(journey, date(2026, 9, 1), date(2026, 9, 30))) == 1
+    [row] = _scope(journey, date(2026, 9, 1), date(2026, 9, 30))
+    assert row["booking_date_source"] == ENTERED
 
 
-def test_the_workbook_shows_an_empty_booking_date_with_its_note(journey, monkeypatch) -> None:
+def test_the_workbook_shows_the_booking_date_and_its_source(journey, monkeypatch) -> None:
     class _Storage:
         def __init__(self) -> None:
             self.objects: dict[str, bytes] = {}
@@ -293,9 +330,8 @@ def test_the_workbook_shows_an_empty_booking_date_with_its_note(journey, monkeyp
 
     storage = _Storage()
     monkeypatch.setattr("audit_core.uc03_p2_storage.get_p2_document_storage", lambda: storage)
-    created = date(2026, 10, 25)
-    _created_on(journey, created)
-    _booking(journey, None)
+    _upload(journey, STARTED + timedelta(days=1))
+    _call(journey, sync_booking_date)
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
@@ -310,24 +346,8 @@ def test_the_workbook_shows_an_empty_booking_date_with_its_note(journey, monkeyp
     [data] = storage.objects.values()
     sheet = load_workbook(io.BytesIO(data))["Deal Audit"]
     header = [c.value for c in next(sheet.iter_rows(max_row=1))]
-    assert header == columns() and header[-1] == "Booking Date Note"
+    assert header == columns() and header[-1] == "Booking Date Source"
     [row] = list(sheet.iter_rows(min_row=2, values_only=True))
     values = dict(zip(header, row, strict=True))
-    assert values["Booking Date"] is None
-    assert values["Booking Date Note"] == BOOKING_DATE_NOT_READ
-
-
-def test_a_misread_held_date_is_no_booking_date_and_the_export_says_so(journey) -> None:
-    """131 records on DEV held a date before the programme began (2016, 2024
-    ...): such a journey is not filed under that year, it is listed by its
-    creation day with the misread named."""
-    floor = programme_date_floor()
-    assert floor is not None
-    misread = floor.replace(year=floor.year - 10)
-    _booking(journey, misread)
-    assert _call(journey, journey_booking_date) is None
-    _created_on(journey, date(2026, 10, 25))
-    [row] = _scope(journey, date(2026, 10, 20), date(2026, 11, 7))
-    assert row["booking_date"] is None and row["booking_date_on_file"] == misread
-    note = _booking_date_note(row)
-    assert note.startswith(BOOKING_DATE_NOT_READ) and misread.isoformat() in note
+    assert values["Booking Date"] == (STARTED + timedelta(days=1)).isoformat()
+    assert values["Booking Date Source"] == "Day booking documents were uploaded"

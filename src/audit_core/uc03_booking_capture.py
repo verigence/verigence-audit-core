@@ -404,6 +404,27 @@ def _write_typed_capture(
             ),
             {"tenant_id": tenant_id, "journey_id": journey_id, "value": normalized},
         )
+        if key == "BOOKING_DATE":
+            # Where the date came from (uc03_booking_date, 2026-11-07): typed by
+            # a person, or the booking form / docket it was corrected on. Any
+            # other document is not a booking-date source; the next recompute
+            # puts the record back to the rule.
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.bookings b
+                    SET booking_date_source = CASE
+                        WHEN CAST(:evidence_id AS uuid) IS NULL THEN 'ENTERED'
+                        ELSE (SELECT CASE e.document_type_key WHEN 'booking_form' THEN 'BOOKING_FORM'
+                                                              WHEN 'booking_docket' THEN 'BOOKING_DOCKET' END
+                              FROM auditcore.evidence e
+                              WHERE e.tenant_id=b.tenant_id AND e.evidence_id=CAST(:evidence_id AS uuid))
+                    END
+                    WHERE b.tenant_id=:tenant_id AND b.journey_id=:journey_id
+                    """
+                ),
+                {"tenant_id": tenant_id, "journey_id": journey_id, "evidence_id": source_evidence_id},
+            )
         booking_id = connection.execute(
             text(
                 "SELECT booking_id FROM auditcore.bookings WHERE tenant_id=:tenant_id AND journey_id=:journey_id"
