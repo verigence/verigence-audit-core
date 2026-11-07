@@ -30,6 +30,9 @@ Settings (environment):
   AUDIT_CORE_ARCHIVE_MAX_ROWS_PER_TABLE        rows one run archives per table, default 500000
   AUDIT_CORE_ARCHIVE_<TABLE>_ENABLED           per-table LIVE switch, default off
   AUDIT_CORE_ARCHIVE_<TABLE>_AGE_DAYS          per-table age limit (rule_executions: 30)
+  AUDIT_CORE_ARCHIVE_RETENTION_DAYS            how long archive files are kept in R2, default 365
+                                               (product owner, 7 Nov 2026: 12 months); applied as
+                                               the bucket's lifecycle rule before every LIVE run
   AUDIT_CORE_ARCHIVE_STORAGE_ENDPOINT / _ACCESS_KEY_ID / _SECRET_ACCESS_KEY / _REGION
       R2 credentials; each falls back to the Phase 2 storage setting, then the
       photo storage setting (the same R2 account the app already uses).
@@ -273,6 +276,37 @@ def archive_store_from_env(bucket: str, environ: Mapping[str, str] | None = None
             endpoint_url=endpoint, access_key_id=key_id, secret_access_key=secret,
             bucket=bucket, region=pick("REGION", "auto"),
         )
+    )
+
+
+DEFAULT_RETENTION_DAYS = 365
+RETENTION_RULE_ID = "verigence-archive-retention"
+
+
+def retention_days(environ: Mapping[str, str] | None = None) -> int:
+    env = os.environ if environ is None else environ
+    return _int_setting(env, "AUDIT_CORE_ARCHIVE_RETENTION_DAYS", DEFAULT_RETENTION_DAYS, low=30, high=3650)
+
+
+def retention_lifecycle(days: int) -> dict[str, Any]:
+    """The bucket lifecycle rule that removes archive files once they are `days` old."""
+    return {
+        "Rules": [
+            {
+                "ID": RETENTION_RULE_ID,
+                "Status": "Enabled",
+                "Filter": {"Prefix": "archive/"},
+                "Expiration": {"Days": days},
+            }
+        ]
+    }
+
+
+def apply_retention(store: Any, days: int) -> None:
+    """Sets the archive bucket's lifecycle so archive files are deleted after `days` days. Idempotent;
+    called before every LIVE run so the rule cannot drift from the setting."""
+    store._client().put_bucket_lifecycle_configuration(
+        Bucket=store.bucket, LifecycleConfiguration=retention_lifecycle(days)
     )
 
 
@@ -758,13 +792,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     mode = MODE_LIVE if args.mode == "live" else MODE_DRY_RUN
+    retention: dict[str, Any] = {"days": retention_days(), "applied": False}
+    if mode == MODE_LIVE and settings.bucket:
+        # Archives are kept 12 months (product owner, 7 Nov 2026): the bucket's own lifecycle rule
+        # removes older files, re-applied on every LIVE run. A failure here never blocks archiving.
+        try:
+            apply_retention(archive_store_from_env(settings.bucket), retention["days"])
+            retention["applied"] = True
+        except Exception as exc:  # noqa: BLE001 - reported in the summary, archiving goes on
+            retention["error"] = f"{type(exc).__name__}: {exc}"
+            print(f"archive retention rule not applied: {retention['error']}", file=sys.stderr)
     engine = job_engine(database_url)
     try:
         results = run_archive(engine, mode=mode, settings=settings, tables=args.table,
                               tenant_ids=args.tenant, started_by=args.started_by or _default_started_by())
     finally:
         engine.dispose()
-    print(json.dumps([r.as_dict() for r in results], indent=2))
+    print(json.dumps([{**r.as_dict(), "retention": retention} for r in results], indent=2))
     if any(r.status == "FAILED" for r in results):
         return 1
     if any(r.status == "REFUSED" for r in results):

@@ -325,13 +325,17 @@ def test_a_verification_mismatch_deletes_nothing(setup):
 
 
 def test_a_failure_part_way_keeps_every_row_not_yet_verified(setup):
-    engine, tenant = setup["engine"], setup["tenant"]
-    before = _ids(engine, tenant)
+    engine = setup["engine"]
+    # Projects run in the job's own order, which depends on their (random) ids in this test.
+    befores = {t: _ids(engine, t) for t in (setup["tenant"], setup["other_tenant"])}
     store = FakeStore(fail_put_from=2)
     [result] = archive.run_archive(setup["job"], mode=archive.MODE_LIVE, settings=_settings(batch_size=3),
                                    started_by="test", store_factory=lambda b: store, now=NOW,
-                                   tenant_ids=[tenant, setup["other_tenant"]])
+                                   tenant_ids=list(befores))
     assert result.status == "FAILED"
+    tenant = result.tenants[0].tenant_id
+    [untouched] = [t for t in befores if t != tenant]
+    before = befores[tenant]
     [first_key] = [k for k in store.objects if k.endswith(".jsonl.gz")]
     first_batch = {json.loads(line)["rule_execution_id"]
                    for line in gzip.decompress(store.objects[first_key]).decode().splitlines()}
@@ -342,7 +346,7 @@ def test_a_failure_part_way_keeps_every_row_not_yet_verified(setup):
         (1, "BATCH_ARCHIVED", 3), (None, "FAILED", 3)]
     # The failure stops the table's run: the next Project is not started.
     assert len(result.tenants) == 1
-    assert _ids(engine, setup["other_tenant"]) >= setup["other_rows"]["c30"]
+    assert _ids(engine, untouched) == befores[untouched]
 
 
 def test_live_is_refused_without_the_bucket_or_the_table_switch(setup):
@@ -520,3 +524,29 @@ def test_only_a_super_admin_may_list_archive_runs(setup):
     app.dependency_overrides.pop(require_super_admin_request, None)
     client = TestClient(app, raise_server_exceptions=False)
     assert client.get("/v1/admin/archive-runs").status_code in (401, 403)
+
+
+def test_archive_files_are_kept_twelve_months_by_a_bucket_lifecycle_rule():
+    """Product owner, 7 Nov 2026: archives are kept for 12 months."""
+    from audit_core import data_archive as da
+
+    assert da.retention_days({}) == 365
+    assert da.retention_days({"AUDIT_CORE_ARCHIVE_RETENTION_DAYS": "400"}) == 400
+    rule = da.retention_lifecycle(365)["Rules"][0]
+    assert rule["Expiration"] == {"Days": 365} and rule["Filter"] == {"Prefix": "archive/"}
+    assert rule["Status"] == "Enabled" and rule["ID"] == da.RETENTION_RULE_ID
+
+    calls = []
+
+    class _Client:
+        def put_bucket_lifecycle_configuration(self, **kwargs):
+            calls.append(kwargs)
+
+    class _Store:
+        bucket = "deal-guard-archive"
+
+        def _client(self):
+            return _Client()
+
+    da.apply_retention(_Store(), 365)
+    assert calls == [{"Bucket": "deal-guard-archive", "LifecycleConfiguration": da.retention_lifecycle(365)}]
