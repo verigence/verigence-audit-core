@@ -4791,8 +4791,9 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
 
 
 def refresh_journey_dates(engine: Engine) -> None:
-    """On every worker start: recompute each Journey's booking date from the
-    receipts on file, and take back a gate-pass delivery date before the
+    """On every worker start: fill each empty booking record's booking date
+    from its booking form (uc03_booking_date), recompute each Journey's
+    booking confirmation date from the receipts on file, and take back a gate-pass delivery date before the
     programme's floor. Idempotent. Each change is logged with the before and
     after and the receipts it was decided on (2026-10-20: Subrat Kumar
     Mallick showed "Booking 07 Oct 2026" while 21,000 was received on 05 Oct;
@@ -4802,12 +4803,19 @@ def refresh_journey_dates(engine: Engine) -> None:
         _minimum_booking_amount,
         evaluate_minimum_booking_payment,
     )
+    from audit_core.uc03_booking_date import fill_missing_booking_dates
     from audit_core.uc03_p2_dates import programme_date_floor
 
     floor = programme_date_floor()
     for tenant_id in _active_tenants(engine):
         changed = 0
         try:
+            # A booking record left without the booking date its booking form
+            # carries gets it (2026-11-07: 208 Journeys on Mahindra Orissa
+            # dropped from a booking-date export). Fills empty records and
+            # repairs a date only a superseded / voided copy carries; never
+            # replaces a date a person entered.
+            fill_missing_booking_dates(engine, tenant_id)
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
                 journeys = connection.execute(

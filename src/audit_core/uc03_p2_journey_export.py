@@ -9,7 +9,10 @@ The columns are the ones of his Deal Audit export (``Deal-Audit-Export_*.xlsx``,
 192 columns, in that order): who and what the journey is, then the deal at the
 Standard (price masters), Actual (the documents) and the Variance between them,
 charge by charge and discount by discount, then what was to be received and
-what was received.
+what was received. One column follows them, "Booking Date Note" (2026-11-07):
+a journey with no booking date (none entered, none read) is not dropped from a
+booking-date export -- it is listed by the day it was created and marked
+"Booking date not read".
 
 One source per figure. Every amount is the Deal's own (``uc03_p2_journey360.deal``,
 what Journey 360's Deal tab shows): the export never computes a figure the Deal
@@ -136,6 +139,11 @@ DISCOUNT_HEADS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 PAYMENT_COLUMNS = ("Total Amt To Be Received", "Total Amt Received", "Payment Variance", "Payment Status")
 
+# After the Deal Audit export's own columns, so its layout is unchanged: why a
+# journey's Booking Date is blank (2026-11-07).
+BOOKING_DATE_NOT_READ = "Booking date not read"
+NOTE_COLUMNS = ("Booking Date Note",)
+
 
 def columns() -> list[str]:
     """Every column, in the order of the Deal Audit export."""
@@ -151,6 +159,7 @@ def columns() -> list[str]:
         *(f"Var Disc: {d}" for d in discounts),
         "Deal Variance", "Discount Variance", "Net Variance",
         *PAYMENT_COLUMNS,
+        *NOTE_COLUMNS,
     ]
 
 
@@ -160,7 +169,9 @@ IDENTITY_SOURCES: dict[str, str | None] = {
     "Dealership": "The journey's dealership",
     "Location": "The outlet's name and address",
     "Booking No": "Booking form / docket (booking reference number)",
-    "Booking Date": "Booking form / docket (booking date)",
+    "Booking Date": ("The journey's booking date (uc03_booking_date): the booking form / docket's booking date "
+                     "as read or corrected, when it can be right, else the date entered on the booking. Blank "
+                     "when there is none; see Booking Date Note"),
     "Booking Intimation": "Booking stage intimation date, when recorded",
     "Delivery Date": "Delivery recorded on the journey, else the vehicle gate pass date",
     "DMS Invoice Date": "Customer invoice (DMS) date",
@@ -220,6 +231,10 @@ def column_notes() -> list[tuple[str, str]]:
         ("Total Amt Received", "Receipts, the loan disbursed and the old vehicle taken in, less refunds"),
         ("Payment Variance", "Received less to be received"),
         ("Payment Status", "Matched (within Rs 10), Excess, Short, Loan not on file, or No amount data"),
+        ("Booking Date Note", (f"'{BOOKING_DATE_NOT_READ}' when the journey has no booking date (none entered, "
+                               "none read from its booking form / docket, or only a misread from before the "
+                               "programme began on file, which the note names). Such a journey is listed "
+                               "under 'Dates by: Booking date' by the day it was created (IST), not left out")),
     ]
     return notes
 
@@ -371,6 +386,16 @@ def _date_text(value: Any) -> str | None:
     return text_ or None
 
 
+def _booking_date_note(base: dict[str, Any]) -> str | None:
+    """Why the Booking Date is blank, or None when it is not."""
+    if base.get("booking_date") is not None:
+        return None
+    on_file = base.get("booking_date_on_file")
+    if on_file is not None:
+        return f"{BOOKING_DATE_NOT_READ} ({_date_text(on_file)} on file is before the programme began: a misread)"
+    return BOOKING_DATE_NOT_READ
+
+
 _DMS_INVOICE_TYPES = ("customer_invoice_dms", "customer_invoice_dms_v2", "tax_invoice_dms")
 _CLOSURE_STATUS = {"PENDING": "Closed by Reviewer (awaiting TL)", "ACCEPTED": "Closed and accepted by TL",
                    "AUTO_ACCEPTED": "Closed, auto-accepted", "REJECTED": "Closure rejected by TL"}
@@ -398,7 +423,9 @@ def identity_row(base: dict[str, Any], *, deal: dict[str, Any], vehicle: dict[st
         "Dealership": base.get("dealer_name"),
         "Location": location or None,
         "Booking No": booking.get("bookingReference") or base.get("booking_reference") or base.get("journey_reference"),
-        "Booking Date": _date_text(booking.get("bookingDate") or base.get("booking_date")),
+        # The journey's booking date, the same one the date filter used: never
+        # a raw reading the rule passed over as a misread.
+        "Booking Date": _date_text(base.get("booking_date")),
         "Booking Intimation": _date_text(base.get("intimation_date")),
         "Delivery Date": _date_text(delivered or base.get("gate_pass_delivery_date")),
         "DMS Invoice Date": _date_text(dms.get("date")),
@@ -430,6 +457,7 @@ def identity_row(base: dict[str, Any], *, deal: dict[str, Any], vehicle: dict[st
         "PAN No": fields.get("pan"),
         "GST No": base.get("gst_no"),
         "Pincode": fields.get("pincode"),
+        "Booking Date Note": _booking_date_note(base),
     }
 
 
@@ -477,7 +505,13 @@ def supervised_outlets(connection: Connection, *, tenant_id: str, actor_id: str)
 _SCOPE_SQL = """
 WITH base AS (
     SELECT j.journey_id, j.journey_reference, j.created_at_utc, d.dealer_name, o.outlet_name,
-           o.address_text AS outlet_address, b.booking_reference, b.booking_date,
+           o.address_text AS outlet_address, b.booking_reference,
+           -- The journey's booking date (uc03_booking_date): the booking record's
+           -- copy, which follows the booking form / docket, unless it is a
+           -- misread from before the programme began.
+           CASE WHEN CAST(:floor AS date) IS NULL OR b.booking_date >= CAST(:floor AS date)
+                THEN b.booking_date END AS booking_date,
+           b.booking_date AS booking_date_on_file,
            COALESCE(dv.actual_delivered_at::date, gp.delivery_date) AS delivery_day
     FROM auditcore.journeys j
     JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
@@ -502,7 +536,9 @@ WITH base AS (
 SELECT base.* FROM base
 WHERE CAST(:date_from AS date) IS NULL OR (
     CASE :basis
-        WHEN 'BOOKING' THEN base.booking_date
+        -- A journey with no booking date at all is listed by the day it was
+        -- created instead of silently left out; its Booking Date Note says so.
+        WHEN 'BOOKING' THEN COALESCE(base.booking_date, (base.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date)
         WHEN 'DELIVERY' THEN base.delivery_day
         ELSE (base.created_at_utc AT TIME ZONE 'Asia/Kolkata')::date
     END BETWEEN CAST(:date_from AS date) AND CAST(:date_to AS date))
@@ -514,9 +550,12 @@ def journeys_in_scope(connection: Connection, *, tenant_id: str, filters: dict[s
                       outlet_ids: list[str] | None) -> list[dict[str, Any]]:
     if outlet_ids is not None and not outlet_ids:
         return []
+    from audit_core.uc03_p2_dates import programme_date_floor
+
     rows = connection.execute(
         text(_SCOPE_SQL),
-        {"t": tenant_id, "dealer": filters.get("dealerId"), "outlet": filters.get("outletId"),
+        {"t": tenant_id, "floor": programme_date_floor(),
+         "dealer": filters.get("dealerId"), "outlet": filters.get("outletId"),
          "outlets": outlet_ids, "basis": filters.get("dateBasis") or "BOOKING",
          "date_from": filters.get("dateFrom"), "date_to": filters.get("dateTo")},
     ).mappings().all()
@@ -660,7 +699,9 @@ def _filters_text(filters: dict[str, Any], names: dict[str, str]) -> str:
     when = (f"{basis} {filters['dateFrom']} to {filters['dateTo']}" if filters.get("dateFrom")
             else f"every {basis}")
     where = names.get("outlet") or names.get("dealer") or "every dealership and outlet in scope"
-    return f"Journeys by {when}; {where}."
+    note = (" A journey with no booking date is listed by the day it was created (Booking Date Note)."
+            if (filters.get("dateBasis") or "BOOKING") == "BOOKING" and filters.get("dateFrom") else "")
+    return f"Journeys by {when}; {where}.{note}"
 
 
 def _file_name(filters: dict[str, Any], names: dict[str, str]) -> str:
