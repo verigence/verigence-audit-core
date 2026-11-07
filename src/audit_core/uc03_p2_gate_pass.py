@@ -30,6 +30,10 @@ locked after that. Sunday is the off day and goes with Monday, so Sunday itself
 is never chosen. A register finished after its day's Daily Gate Pass task was
 marked incomplete closes that task as done late.
 
+The Team Lead's "Delivery not notified to the PC" task is suspended for the time
+being (product owner 2026-11-07): the counts are still compared and kept, no TL
+task is raised unless AUDIT_CORE_GATE_PASS_TL_TASKS=on (task_manager).
+
 Every outlet a PC is mapped to has a gate register, satellite outlets included
 (product owner 2026-11-02; until then onsite outlets only).
 
@@ -70,7 +74,9 @@ from audit_core.task_manager import (
     gate_pass_covers,
     gate_pass_day_label,
     gate_pass_due,
+    gate_pass_tl_tasks_enabled,
     previous_gate_pass_day,
+    suspend_gate_pass_tl_tasks,
 )
 from audit_core.uc03_p2_access import authorize_p2
 from audit_core.uc03_p2_object_keys import ist_day, safe_filename, safe_part
@@ -836,9 +842,8 @@ def submit_counts(
                                               not_notified=not_notified or 0, not_uploaded=pending or 0)
     elif not_notified:
         fresh = _gate_pass_row(connection, tenant_id, gate_pass_id)
-        _raise_delivery_not_notified(connection, tenant_id, fresh, principal.subject, not_notified=not_notified,
-                                     not_uploaded=pending or 0)
-        task_raised = True
+        task_raised = _raise_delivery_not_notified(connection, tenant_id, fresh, principal.subject,
+                                                   not_notified=not_notified, not_uploaded=pending or 0)
     return {
         "gatePass": _public_gate_pass(_gate_pass_row(connection, tenant_id, gate_pass_id)),
         "divergence": divergence, "declared": declared, "deliveryFiles": files,
@@ -858,7 +863,13 @@ class AnswerCommand(BaseModel):
 
 
 def _raise_delivery_not_notified(connection: Connection, tenant_id: str, row: dict[str, Any], actor_id: str, *,
-                                 not_notified: int, not_uploaded: int = 0) -> None:
+                                 not_notified: int, not_uploaded: int = 0) -> bool:
+    """Raise the Team Lead's "Delivery not notified to the PC" task of the register. Not
+    while those tasks are suspended (product owner 2026-11-07, task_manager.
+    gate_pass_tl_tasks_enabled): the comparison is kept on the register, no task is raised.
+    True when a task is open for the Team Lead afterwards."""
+    if not gate_pass_tl_tasks_enabled():
+        return False
     missing = not_notified
     day = row["business_date"]
     title = f"Delivery not notified to the PC: {row['outlet_name']}, {gate_pass_day_label(day)}"
@@ -890,6 +901,47 @@ def _raise_delivery_not_notified(connection: Connection, tenant_id: str, row: di
                  "actor_role_code, details) VALUES (:t, :id, NULL, 'RAISED', :a, 'PC', CAST(:d AS jsonb))"),
             {"t": tenant_id, "id": str(task_id), "a": actor_id, "d": json.dumps({"gatePassId": str(row["gate_pass_id"])})},
         )
+        return True
+    # The register's task exists already (one per register, by its dedupe key). One withdrawn
+    # while these tasks were suspended does not block raising it again: it is reopened.
+    existing = connection.execute(
+        text("SELECT task_id, task_status, completion_result->>'outcome' AS outcome FROM auditcore.p2_tasks "
+             "WHERE tenant_id = :t AND dedupe_key = :k"),
+        {"t": tenant_id, "k": f"gatepass:{row['gate_pass_id']}:{TASK_DELIVERY_NOT_NOTIFIED}"},
+    ).mappings().one_or_none()
+    if existing is None:
+        return False
+    if existing["task_status"] == "CANCELLED" and existing["outcome"] == "SUSPENDED":
+        _reopen_not_notified_task(connection, tenant_id, existing["task_id"], description=description,
+                                  reference={"declared": row["new_deliveries"], "deliveryFiles": row["delivery_files"],
+                                             "missing": missing, "notUploadedByPc": not_uploaded})
+        return True
+    return existing["task_status"] not in ("VERIFIED_COMPLETE", "CANCELLED", "FAILED", "DEAD_LETTER")
+
+
+def _reopen_not_notified_task(connection: Connection, tenant_id: str, task_id: Any, *, description: str,
+                              reference: dict[str, Any]) -> None:
+    """The register's Team Lead task with the latest numbers, open again if it was closed or
+    withdrawn (a suspension's mark is cleared)."""
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_tasks
+            SET description = :d, updated_at_utc = now(),
+                reference = reference || CAST(:ref AS jsonb),
+                completion_result = CASE WHEN completion_result->>'outcome' = 'SUSPENDED'
+                                         THEN (completion_result - 'outcome' - 'reason' - 'statusBeforeSuspension')
+                                              || jsonb_build_object('reraisedAtUtc', now())
+                                         ELSE completion_result END,
+                verified_at_utc = CASE WHEN task_status IN ('VERIFIED_COMPLETE','CANCELLED') THEN NULL
+                                       ELSE verified_at_utc END,
+                task_status = CASE WHEN task_status IN ('VERIFIED_COMPLETE','CANCELLED') THEN 'READY'
+                                   ELSE task_status END
+            WHERE tenant_id = :t AND task_id = :id
+            """
+        ),
+        {"d": description, "t": tenant_id, "id": str(task_id), "ref": json.dumps(reference)},
+    )
 
 
 def _sync_not_notified_task(connection: Connection, tenant_id: str, row: dict[str, Any], actor_id: str, *,
@@ -899,15 +951,18 @@ def _sync_not_notified_task(connection: Connection, tenant_id: str, row: dict[st
     Team Lead had closed it, cancelled when nothing is left not intimated. True when a task
     is open for the Team Lead afterwards."""
     key = f"gatepass:{row['gate_pass_id']}:{TASK_DELIVERY_NOT_NOTIFIED}"
+    if not gate_pass_tl_tasks_enabled():
+        # Suspended (2026-11-07): nothing raised or reopened; one still open is withdrawn now.
+        suspend_gate_pass_tl_tasks(connection, tenant_id=tenant_id)
+        return False
     task = connection.execute(
         text("SELECT task_id, task_status FROM auditcore.p2_tasks WHERE tenant_id = :t AND dedupe_key = :k"),
         {"t": tenant_id, "k": key},
     ).mappings().one_or_none()
     if task is None:
         if not_notified:
-            _raise_delivery_not_notified(connection, tenant_id, row, actor_id, not_notified=not_notified,
-                                         not_uploaded=not_uploaded)
-            return True
+            return _raise_delivery_not_notified(connection, tenant_id, row, actor_id, not_notified=not_notified,
+                                                not_uploaded=not_uploaded)
         return False
     open_ = task["task_status"] not in ("VERIFIED_COMPLETE", "CANCELLED", "FAILED", "DEAD_LETTER")
     if not not_notified:
@@ -927,23 +982,10 @@ def _sync_not_notified_task(connection: Connection, tenant_id: str, row: dict[st
                    + (f", and {not_uploaded} {'is' if not_uploaded == 1 else 'are'} still to be uploaded by them."
                       if not_uploaded else ".")
                    + f" (Counts corrected by the PC, {int(row.get('counts_edit_count') or 0)}x.)")
-    connection.execute(
-        text(
-            """
-            UPDATE auditcore.p2_tasks
-            SET description = :d, updated_at_utc = now(),
-                reference = reference || CAST(:ref AS jsonb),
-                verified_at_utc = CASE WHEN task_status IN ('VERIFIED_COMPLETE','CANCELLED') THEN NULL
-                                       ELSE verified_at_utc END,
-                task_status = CASE WHEN task_status IN ('VERIFIED_COMPLETE','CANCELLED') THEN 'READY'
-                                   ELSE task_status END
-            WHERE tenant_id = :t AND task_id = :id
-            """
-        ),
-        {"d": description, "t": tenant_id, "id": task["task_id"],
-         "ref": json.dumps({"declared": row["new_deliveries"], "deliveryFiles": row["delivery_files"],
-                            "missing": not_notified, "notUploadedByPc": not_uploaded, "countsCorrected": True})},
-    )
+    _reopen_not_notified_task(connection, tenant_id, task["task_id"], description=description,
+                              reference={"declared": row["new_deliveries"], "deliveryFiles": row["delivery_files"],
+                                         "missing": not_notified, "notUploadedByPc": not_uploaded,
+                                         "countsCorrected": True})
     return True
 
 
@@ -990,11 +1032,10 @@ def answer_divergence(
         )
         close_gate_pass_tasks(connection, tenant_id=tenant_id, outlet_id=row["outlet_id"],
                               business_date=row["business_date"], include_incomplete=True)
-        if not_notified:
-            _raise_delivery_not_notified(connection, tenant_id, row, principal.subject, not_notified=not_notified,
-                                         not_uploaded=not_uploaded)
+        raised = bool(not_notified) and _raise_delivery_not_notified(
+            connection, tenant_id, row, principal.subject, not_notified=not_notified, not_uploaded=not_uploaded)
         return {"gatePass": _public_gate_pass(_gate_pass_row(connection, tenant_id, gate_pass_id)),
-                "taskRaised": not_notified > 0, "notNotified": not_notified, "notUploadedByPc": not_uploaded}
+                "taskRaised": raised, "notNotified": not_notified, "notUploadedByPc": not_uploaded}
     else:
         raise HTTPException(status_code=409, detail="There is no difference to answer.")
     return {"gatePass": _public_gate_pass(_gate_pass_row(connection, tenant_id, gate_pass_id)),

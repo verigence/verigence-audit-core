@@ -82,6 +82,9 @@ def setup(monkeypatch):
         w = REAL_WINDOW(now)
         return w if w["today"] in w["days"] else {**w, "days": [w["today"], *w["days"]]}
     monkeypatch.setattr(gate_pass, "gate_pass_window", window)
+    # The Team Lead's gate pass tasks are suspended by default (2026-11-07); these tests are
+    # about raising them, so the switch is on unless a test turns it off.
+    monkeypatch.setenv("AUDIT_CORE_GATE_PASS_TL_TASKS", "on")
     acting = {"subject": journey.actor_id}
     app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=acting["subject"])
     app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization()
@@ -852,3 +855,136 @@ def test_stock_transfers_on_the_register_are_kept_apart_from_deliveries(setup):
     view = s.client.get(f"{s.base}/summary").json()
     assert view["totals"]["stockTransfers"] == 3 and view["outlets"][0]["days"][-1]["stockTransfers"] == 3
     assert (view["totals"]["asPerRegister"], view["totals"]["pendingDueToPc"]) == (2, 0)
+
+
+# ── Team Lead gate pass tasks suspended for the time being (product owner 2026-11-07) ──
+def _tasks(s, task_type):
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        return [dict(r) for r in connection.execute(
+            text("SELECT task_id, task_status, completion_result, dedupe_key FROM auditcore.p2_tasks "
+                 "WHERE tenant_id=:t AND task_type=:k ORDER BY created_at_utc"),
+            {"t": s.journey.tenant_id, "k": task_type}).mappings().all()]
+
+
+def test_suspended_no_team_lead_task_is_raised_but_the_comparison_is_kept(setup, monkeypatch):
+    s = setup
+    monkeypatch.delenv("AUDIT_CORE_GATE_PASS_TL_TASKS")          # the default: suspended
+    _delivery_file(s, journeys=1)
+    gp = _upload(s).json()["gatePassId"]
+    result = _register(s, gp, 4, 2).json()
+    assert (result["notIntimatedToPc"], result["pendingWithPc"], result["taskRaised"]) == (2, 1, False)
+    assert result["gatePass"]["notNotifiedToPc"] == 2 and result["gatePass"]["completed"] is True
+    assert s.client.get(f"{s.base}/summary").json()["totals"]["notNotifiedToPc"] == 2
+    # A correction does not raise it either; nor does the older clients' answer.
+    assert _register(s, gp, 5, 2).json()["taskRaised"] is False
+    gp2 = _upload(s).json()["gatePassId"]
+    _counts(s, gp2, 3)
+    assert s.client.post(f"{s.base}/{gp2}/answer", json={"notNotified": 2}).json()["taskRaised"] is False
+    assert _tasks(s, "GATE_PASS_DELIVERY_NOT_NOTIFIED") == []
+    monkeypatch.setenv("AUDIT_CORE_GATE_PASS_TL_TASKS", "off")
+    assert _register(s, gp2, 6, 2).json()["taskRaised"] is False
+    assert _tasks(s, "GATE_PASS_DELIVERY_NOT_NOTIFIED") == []
+
+
+def test_open_team_lead_gate_pass_tasks_are_withdrawn_and_others_stay(setup, monkeypatch):
+    from audit_core import task_manager as tm
+
+    s = setup
+    gp = _upload(s).json()["gatePassId"]
+    assert _register(s, gp, 3, 1).json()["taskRaised"] is True       # switch on: raised
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        common = {"scope": "OUTLET", "dealer_id": str(s.journey.dealer_id), "outlet_id": str(s.journey.outlet_id),
+                  "origin": "SYSTEM", "title": "t", "description": "d", "priority": "HIGH"}
+        tm._insert_task(connection, tenant_id=s.journey.tenant_id, values={
+            **common, "task_type": "TASK", "category": "DAILY_TASK", "dedupe_key": f"other-tl:{uuid4()}",
+            "assigned_role": "TL", "protocol": "SELF_CLOSING"})
+        tm._insert_task(connection, tenant_id=s.journey.tenant_id, values={
+            **common, "task_type": tm.GATE_PASS_TASK, "category": "DAILY_GATE_PASS",
+            "dedupe_key": f"pc-gate:{uuid4()}", "assigned_role": "PC", "protocol": "SYSTEM_VERIFIED",
+            "due": datetime.now(UTC) + timedelta(days=1),
+            # a day with no register yet, so the sweep has nothing to close it with
+            "occurrence_date": gate_pass.ist_day().date() - timedelta(days=1)})
+    monkeypatch.setenv("AUDIT_CORE_GATE_PASS_TL_TASKS", "off")
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        assert tm.run_tick(connection, tenant_id=s.journey.tenant_id)["gatePassTlTasksSuspended"] == 1
+        assert tm.run_tick(connection, tenant_id=s.journey.tenant_id)["gatePassTlTasksSuspended"] == 0  # idempotent
+    [task] = _tasks(s, "GATE_PASS_DELIVERY_NOT_NOTIFIED")
+    assert task["task_status"] == "CANCELLED"
+    assert task["completion_result"]["outcome"] == "SUSPENDED"
+    assert task["completion_result"]["statusBeforeSuspension"] == "READY"
+    assert "product owner" in task["completion_result"]["reason"]
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        event = connection.execute(text("SELECT event_type, comment, details FROM auditcore.p2_task_events "
+                                        "WHERE tenant_id=:t AND task_id=:i AND event_type='CANCELLED'"),
+                                   {"t": s.journey.tenant_id, "i": task["task_id"]}).mappings().one()
+    assert event["details"]["suspended"] is True and "product owner" in event["comment"]
+    # Off the Team Lead's Daily Tasks list; every other task as it was.
+    tl = f"gatepass-tl-{uuid4().hex[:8]}"
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, "
+                                "business_role_code, dealer_id) VALUES (:t, :a, 'TL', :d)"),
+                           {"t": s.journey.tenant_id, "a": tl, "d": s.journey.dealer_id})
+    s.acting["subject"] = tl
+    listed = s.client.get(s.base.replace("gate-passes", "daily-tasks")).json()["items"]
+    assert [t["taskType"] for t in listed] == ["TASK"]
+    assert [t["task_status"] for t in _tasks(s, "TASK")] == ["READY"]
+    assert [t["task_status"] for t in _tasks(s, "GATE_PASS_DAILY")] == ["READY"]
+
+
+def test_turned_on_again_the_task_is_raised_again(setup, monkeypatch):
+    from audit_core import task_manager as tm
+
+    s = setup
+    gp = _upload(s).json()["gatePassId"]
+    _register(s, gp, 3, 1)
+    monkeypatch.setenv("AUDIT_CORE_GATE_PASS_TL_TASKS", "off")
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        tm.run_tick(connection, tenant_id=s.journey.tenant_id)
+    [withdrawn] = _tasks(s, "GATE_PASS_DELIVERY_NOT_NOTIFIED")
+    assert withdrawn["task_status"] == "CANCELLED"
+    # On again: the same register's comparison raises it again; its dedupe key does not block it.
+    monkeypatch.setenv("AUDIT_CORE_GATE_PASS_TL_TASKS", "on")
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        assert "gatePassTlTasksSuspended" not in tm.run_tick(connection, tenant_id=s.journey.tenant_id)
+        row = gate_pass._gate_pass_row(connection, s.journey.tenant_id, gp)
+        assert gate_pass._raise_delivery_not_notified(connection, s.journey.tenant_id, row, s.journey.actor_id,
+                                                      not_notified=2) is True
+    [again] = _tasks(s, "GATE_PASS_DELIVERY_NOT_NOTIFIED")
+    assert again["task_id"] == withdrawn["task_id"] and again["task_status"] == "READY"
+    assert "outcome" not in again["completion_result"] and "reraisedAtUtc" in again["completion_result"]
+    # ... and a correction of the counts keeps it in step, as before.
+    assert _register(s, gp, 4, 1).json()["taskRaised"] is True
+    # A register compared for the first time after the switch: a new task.
+    gp2 = _upload(s).json()["gatePassId"]
+    assert _register(s, gp2, 5, 1).json()["taskRaised"] is True
+    assert [t["task_status"] for t in _tasks(s, "GATE_PASS_DELIVERY_NOT_NOTIFIED")] == ["READY", "READY"]
+
+
+def test_withdrawn_tasks_can_be_put_back(setup, monkeypatch):
+    from audit_core import task_manager as tm
+
+    s = setup
+    gp = _upload(s).json()["gatePassId"]
+    _register(s, gp, 3, 1)
+    monkeypatch.setenv("AUDIT_CORE_GATE_PASS_TL_TASKS", "off")
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        tm.run_tick(connection, tenant_id=s.journey.tenant_id)
+        assert tm.restore_suspended_gate_pass_tl_tasks(connection, tenant_id=s.journey.tenant_id) == 1
+    [task] = _tasks(s, "GATE_PASS_DELIVERY_NOT_NOTIFIED")
+    assert task["task_status"] == "READY" and "restoredAtUtc" in task["completion_result"]
+
+
+def test_the_switch_reads_on_only_when_said():
+    from audit_core import task_manager as tm
+
+    assert tm.gate_pass_tl_tasks_enabled({}) is False
+    assert tm.gate_pass_tl_tasks_enabled({"AUDIT_CORE_GATE_PASS_TL_TASKS": "off"}) is False
+    assert tm.gate_pass_tl_tasks_enabled({"AUDIT_CORE_GATE_PASS_TL_TASKS": " On "}) is True
