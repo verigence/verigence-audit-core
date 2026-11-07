@@ -21,6 +21,22 @@ TL / PM (exceptions first):
 Every flag comes from a small set (open tasks, pages in flight or failed,
 open serious findings, closed stages) joined to the journeys in scope -- no
 per-journey tenant-wide aggregation.
+
+``month`` narrows the list to a month. By default it is the month the journey
+was started. With ``month_basis`` = ``business`` (the Team Lead dashboard's
+calendar month, product owner 2026-11-07: "all bookings/deliveries needs to be
+handled on calendar month") a journey is in the month when its booking date or
+its delivery date falls in it (India time):
+
+  booking date   auditcore.bookings.booking_date; a date before the programme's
+                 date floor is a misread and, like a missing one, gives way to
+                 the day the journey was started
+  delivery date  the delivery date on the vehicle's gate pass (the date the
+                 list shows), else the recorded delivery date, else the day the
+                 delivery was started; none while the journey is at booking
+
+``bookings_in_month`` / ``deliveries_in_month`` count the journeys whose
+booking / delivery date is in the month.
 """
 from __future__ import annotations
 
@@ -37,7 +53,8 @@ _IN_FLIGHT = ("QUEUED", "PREPARING_PAGE", "DI_UPLOAD_PREPARING", "DI_UPLOADING",
 _IN_FLIGHT_SQL = ", ".join(f"'{s}'" for s in _IN_FLIGHT)
 
 # The journeys in the caller's scope with every flag a tab is decided on.
-# Parameters: tenant_id, actor_id, search, outlet_id, pc_actor_id, month, timezone.
+# Parameters: tenant_id, actor_id, search, outlet_id, pc_actor_id, month, month_basis, date_floor, timezone.
+# No literal braces below: BREAKDOWN_SQL is filled in with str.format.
 SCOPED_SQL = f"""
     open_tasks AS (
         SELECT t.journey_id,
@@ -90,6 +107,7 @@ SCOPED_SQL = f"""
                  NULLIF(jp.colour_name_snapshot,'')
                ), '') AS vehicle,
                j.created_by_display_name AS pc_name,
+               bm.booking_month, bm.delivery_month,
                (fin.journey_id IS NOT NULL) AS is_closed,
                COALESCE(ot.pc_task, false) AS pc_task,
                COALESCE(ot.tl_task, false) AS tl_task,
@@ -120,6 +138,35 @@ SCOPED_SQL = f"""
         LEFT JOIN (SELECT journey_id, bool_or(processing) AS processing, bool_or(stuck) AS stuck
                    FROM pages GROUP BY journey_id) pg ON pg.journey_id = j.journey_id
         LEFT JOIN risky rk ON rk.journey_id = j.journey_id
+        -- The calendar month of the booking and of the delivery; only worked out
+        -- when the month is read on that basis (the WHERE is a one-time filter).
+        LEFT JOIN LATERAL (
+            SELECT to_char(COALESCE(
+                     CASE WHEN bk.booking_date >= CAST(:date_floor AS date) THEN bk.booking_date END,
+                     CAST(j.created_at_utc AT TIME ZONE :timezone AS date)), 'YYYY-MM') AS booking_month,
+                   to_char(COALESCE(
+                     (SELECT CAST(btrim(f.effective_value::text, '"') AS date)
+                      FROM auditcore.evidence e
+                      JOIN auditcore.journey_document_extracted_fields f
+                        ON f.tenant_id = e.tenant_id AND f.journey_id = e.journey_id
+                       AND f.di_document_id = e.di_document_id
+                      WHERE e.tenant_id = j.tenant_id AND e.journey_id = j.journey_id
+                        AND e.association_status = 'ACTIVE' AND e.document_type_key = 'gate_pass'
+                        AND f.field_key = 'delivery_date'
+                        AND btrim(f.effective_value::text, '"') ~ '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$'
+                        AND CAST(btrim(f.effective_value::text, '"') AS date) >= CAST(:date_floor AS date)
+                      ORDER BY e.linked_at_utc DESC LIMIT 1),
+                     CASE WHEN CAST(dl.actual_delivered_at AS date) >= CAST(:date_floor AS date)
+                          THEN CAST(dl.actual_delivered_at AS date) END,
+                     CAST(dst.first_started_at_utc AT TIME ZONE :timezone AS date)), 'YYYY-MM') AS delivery_month
+            FROM (SELECT 1) one
+            LEFT JOIN auditcore.bookings bk ON bk.tenant_id = j.tenant_id AND bk.journey_id = j.journey_id
+            LEFT JOIN auditcore.deliveries dl ON dl.tenant_id = j.tenant_id AND dl.journey_id = j.journey_id
+            LEFT JOIN auditcore.journey_stage_states dst
+              ON dst.tenant_id = j.tenant_id AND dst.journey_id = j.journey_id AND dst.stage_code = 'DELIVERY'
+            WHERE CAST(:month_basis AS varchar) = 'business'
+            LIMIT 1
+        ) bm ON true
         WHERE j.tenant_id = :tenant_id
           AND EXISTS (
             SELECT 1 FROM auditcore.business_assignments ba
@@ -132,7 +179,10 @@ SCOPED_SQL = f"""
           AND (CAST(:outlet_id AS uuid) IS NULL OR j.outlet_id = CAST(:outlet_id AS uuid))
           AND (CAST(:pc_actor_id AS varchar) IS NULL OR j.created_by_actor_id = CAST(:pc_actor_id AS varchar))
           AND (CAST(:month AS varchar) IS NULL
-               OR to_char(j.created_at_utc AT TIME ZONE :timezone, 'YYYY-MM') = CAST(:month AS varchar))
+               OR (COALESCE(CAST(:month_basis AS varchar), '') <> 'business'
+                   AND to_char(j.created_at_utc AT TIME ZONE :timezone, 'YYYY-MM') = CAST(:month AS varchar))
+               OR (CAST(:month_basis AS varchar) = 'business'
+                   AND (bm.booking_month = CAST(:month AS varchar) OR bm.delivery_month = CAST(:month AS varchar))))
           AND (
             :search = ''
             OR c.display_name ILIKE '%' || :search || '%'
@@ -199,7 +249,9 @@ COUNTS_SQL = "WITH " + SCOPED_SQL + """
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.tl_task) AS needs_tl,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.high_risk) AS high_risk,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.overdue) AS overdue,
-      COUNT(*) FILTER (WHERE NOT s.is_closed AND s.stuck) AS stuck
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND s.stuck) AS stuck,
+      COUNT(*) FILTER (WHERE s.booking_month = CAST(:month AS varchar)) AS bookings_in_month,
+      COUNT(*) FILTER (WHERE s.delivery_month = CAST(:month AS varchar)) AS deliveries_in_month
     FROM scoped s
 """
 
@@ -213,7 +265,9 @@ BREAKDOWN_SQL = "WITH " + SCOPED_SQL + """
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.overdue) AS overdue,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.high_risk) AS high_risk,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.stuck) AS stuck,
-      COUNT(*) FILTER (WHERE s.is_closed) AS closed
+      COUNT(*) FILTER (WHERE s.is_closed) AS closed,
+      COUNT(*) FILTER (WHERE s.booking_month = CAST(:month AS varchar)) AS bookings_in_month,
+      COUNT(*) FILTER (WHERE s.delivery_month = CAST(:month AS varchar)) AS deliveries_in_month
     FROM scoped s
     GROUP BY {group_by}
     ORDER BY COUNT(*) FILTER (WHERE NOT s.is_closed AND (s.overdue OR s.high_risk)) DESC,

@@ -137,6 +137,7 @@ def gate_register(connection: Connection, tenant_id: str, outlets: list[dict[str
         text("""
             SELECT gp.business_date, gp.outlet_id, gp.gate_pass_id, gp.new_deliveries, gp.not_notified_count,
                    gp.files_held, gp.counts_submitted_at_utc, gp.completed_at_utc, gp.created_at_utc,
+                   gp.pc_actor_id, gp.stock_transfers,
                    (SELECT count(*) FROM auditcore.p2_gate_pass_pages pg
                     WHERE pg.tenant_id = gp.tenant_id AND pg.gate_pass_id = gp.gate_pass_id
                       AND pg.removed_at_utc IS NULL) AS pages
@@ -156,6 +157,9 @@ def gate_register(connection: Connection, tenant_id: str, outlets: list[dict[str
                 "date": d.isoformat(), "label": gate_pass_day_label(d), "dueAtUtc": gate_pass_due(d).isoformat(),
                 "uploadedInTool": files, "total": None, "intimated": None, "pendingWithPc": None,
                 "notIntimated": None, "gatePassId": None, "pages": 0, "uploadedAtUtc": None,
+                # Who uploaded it, and whether after its Daily Gate Pass task was due (the
+                # Project Tracker's on time / late, 2026-11-07).
+                "pcActorId": None, "uploadedLate": False, "stockTransfers": None,
             }
             if gp is None:
                 entry["status"] = "MISSED" if now > gate_pass_due(d) else "NOT_UPLOADED"
@@ -164,6 +168,8 @@ def gate_register(connection: Connection, tenant_id: str, outlets: list[dict[str
                 # The register's photo opens through GET .../gate-passes/{id}/image-url?page=n.
                 entry["pages"] = max(int(gp["pages"] or 0), 1)
                 entry["uploadedAtUtc"] = gp["created_at_utc"].isoformat() if gp["created_at_utc"] else None
+                entry["pcActorId"] = gp["pc_actor_id"]
+                entry["uploadedLate"] = bool(gp["created_at_utc"]) and gp["created_at_utc"] > gate_pass_due(d)
                 if gp["counts_submitted_at_utc"] is None:
                     entry["status"] = "COUNTS_PENDING"
                 else:
@@ -175,6 +181,7 @@ def gate_register(connection: Connection, tenant_id: str, outlets: list[dict[str
                     # Not intimated as the PC entered it; the pending part is what of the
                     # intimated deliveries is not in the tool yet (live, not as at entry).
                     not_intimated = min(int(not_notified), total)
+                    entry["stockTransfers"] = int(gp["stock_transfers"] or 0)
                     entry.update(total=total, intimated=total - not_intimated, notIntimated=not_intimated,
                                  pendingWithPc=max(total - not_intimated - files, 0),
                                  status="DONE" if gp["completed_at_utc"] is not None else "ANSWER_PENDING")
