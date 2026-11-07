@@ -290,7 +290,7 @@ REPORTS: dict[str, str] = {
                COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
                j.created_at_utc::date AS journey_created,
                b.pricing_effective_on AS applied_date,
-               b.booking_date,
+               (CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) AS booking_date,
                (SELECT f.effective_value #>> '{}'
                   FROM auditcore.journey_document_extracted_fields f
                  WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
@@ -298,10 +298,10 @@ REPORTS: dict[str, str] = {
                  ORDER BY f.updated_at_utc DESC LIMIT 1) AS booking_date_as_read,
                CASE
                  WHEN b.pricing_effective_on IS NOT NULL THEN 'applied by a person'
-                 WHEN COALESCE(b.booking_date, '9999-12-31'::date) < :floor
+                 WHEN COALESCE((CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END), '9999-12-31'::date) < :floor
                    THEN 'read before the programme started'
-                 WHEN b.booking_date > CURRENT_DATE THEN 'read as a day after today'
-                 WHEN b.booking_date IS NULL THEN 'no booking date at all'
+                 WHEN (CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) > CURRENT_DATE THEN 'read as a day after today'
+                 WHEN (CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) IS NULL THEN 'no booking date at all'
                  ELSE 'usable'
                END AS verdict,
                (jp.product_sku_id IS NOT NULL) AS has_sku
@@ -312,9 +312,9 @@ REPORTS: dict[str, str] = {
           ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
         WHERE j.tenant_id = :t
           AND b.pricing_effective_on IS NULL
-          AND (b.booking_date IS NULL
-               OR b.booking_date < :floor
-               OR b.booking_date > CURRENT_DATE)
+          AND ((CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) IS NULL
+               OR (CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) < :floor
+               OR (CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) > CURRENT_DATE)
         ORDER BY verdict, j.journey_reference
     """,
     # And the same thing counted, one row, so the size is unarguable.
@@ -322,15 +322,15 @@ REPORTS: dict[str, str] = {
         SELECT COUNT(*) AS journeys,
                COUNT(*) FILTER (WHERE b.pricing_effective_on IS NOT NULL) AS applied_by_a_person,
                COUNT(*) FILTER (WHERE b.pricing_effective_on IS NULL
-                                  AND b.booking_date IS NOT NULL
-                                  AND b.booking_date >= :floor
-                                  AND b.booking_date <= CURRENT_DATE) AS read_and_usable,
+                                  AND (CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) IS NOT NULL
+                                  AND (CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) >= :floor
+                                  AND (CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) <= CURRENT_DATE) AS read_and_usable,
                COUNT(*) FILTER (WHERE b.pricing_effective_on IS NULL
-                                  AND b.booking_date < :floor) AS read_before_the_programme,
+                                  AND (CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) < :floor) AS read_before_the_programme,
                COUNT(*) FILTER (WHERE b.pricing_effective_on IS NULL
-                                  AND b.booking_date > CURRENT_DATE) AS read_after_today,
+                                  AND (CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) > CURRENT_DATE) AS read_after_today,
                COUNT(*) FILTER (WHERE b.pricing_effective_on IS NULL
-                                  AND b.booking_date IS NULL) AS no_booking_date,
+                                  AND (CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) IS NULL) AS no_booking_date,
                COUNT(*) FILTER (WHERE b.journey_id IS NULL) AS no_booking_row_at_all
         FROM auditcore.journeys j
         LEFT JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
@@ -369,7 +369,7 @@ REPORTS: dict[str, str] = {
         SELECT j.journey_reference, j.created_by_display_name AS pc_name,
                COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
                jp.model_name_snapshot AS booked_model, jp.variant_name_snapshot AS booked_variant,
-               COALESCE(b.pricing_effective_on, b.booking_date) AS priced_on,
+               COALESCE(b.pricing_effective_on, CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) AS priced_on,
                (SELECT string_agg(DISTINCT f.field_key, ', ' ORDER BY f.field_key)
                   FROM auditcore.journey_document_extracted_fields f
                  WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
@@ -403,7 +403,7 @@ REPORTS: dict[str, str] = {
             SELECT j.journey_id, j.journey_reference, j.created_by_display_name AS pc_name,
                    o.outlet_name,
                    COALESCE(NULLIF(cu.display_name, ''), j.journey_reference) AS customer,
-                   COALESCE(b.pricing_effective_on, b.booking_date) AS priced_on,
+                   COALESCE(b.pricing_effective_on, CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) AS priced_on,
                    jp.product_sku_id, jp.selection_method, jp.match_basis,
                    pm.model_name || ' ~ ' || pv.variant_name AS pinned_name
             FROM auditcore.journeys j
@@ -484,7 +484,7 @@ REPORTS: dict[str, str] = {
     # words cannot, and does it agree where the words already succeed?
     "price_key_verdict": """
         WITH j AS (
-            SELECT j.journey_id, COALESCE(b.pricing_effective_on, b.booking_date) AS priced_on,
+            SELECT j.journey_id, COALESCE(b.pricing_effective_on, CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) AS priced_on,
                    jp.product_sku_id
             FROM auditcore.journeys j
             LEFT JOIN auditcore.journey_products jp
@@ -641,7 +641,7 @@ REPORTS: dict[str, str] = {
             SELECT j.journey_id, j.journey_reference, j.created_by_display_name AS pc_name,
                    o.outlet_name,
                    COALESCE(NULLIF(cu.display_name, ''), j.journey_reference) AS customer,
-                   COALESCE(b.pricing_effective_on, b.booking_date) AS priced_on,
+                   COALESCE(b.pricing_effective_on, CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) AS priced_on,
                    jp.product_sku_id, jp.model_name_snapshot AS pinned_model,
                    jp.variant_name_snapshot AS pinned_variant, jp.selection_method
             FROM auditcore.journeys j
@@ -842,16 +842,16 @@ REPORTS: dict[str, str] = {
         GROUP BY source_document_type
         UNION ALL
         SELECT 'BOOKING_BEFORE_FIRST_BOOK', b.journey_id::text,
-               coalesce(b.pricing_effective_on, b.booking_date)::text, NULL, NULL
+               COALESCE(b.pricing_effective_on, CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END)::text, NULL, NULL
         FROM auditcore.bookings b
-        WHERE b.tenant_id = :t AND coalesce(b.pricing_effective_on, b.booking_date) < (
+        WHERE b.tenant_id = :t AND COALESCE(b.pricing_effective_on, CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) < (
             SELECT min(v.effective_from) FROM auditcore.price_lists pl
             JOIN auditcore.price_list_versions v ON v.tenant_id = pl.tenant_id AND v.price_list_id = pl.price_list_id
             WHERE pl.tenant_id = :t AND pl.price_list_code = 'OEM_NATIVE_PRICE_LIST'
               AND v.lifecycle_status IN ('PUBLISHED', 'RETIRED'))
         UNION ALL
         SELECT 'PINNED_SKU', s.sku_code, jp.selection_status || ' ' || coalesce(jp.selection_method, ''),
-               coalesce(b.pricing_effective_on, b.booking_date)::text, pm.model_name
+               COALESCE(b.pricing_effective_on, CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END)::text, pm.model_name
         FROM auditcore.journey_products jp
         JOIN auditcore.product_skus s ON s.product_sku_id = jp.product_sku_id
         JOIN auditcore.product_models pm ON pm.model_id = s.model_id
@@ -888,8 +888,8 @@ REPORTS: dict[str, str] = {
                 FROM auditcore.price_list_versions v2
                 JOIN auditcore.price_lists pl2 ON pl2.tenant_id = v2.tenant_id AND pl2.price_list_id = v2.price_list_id
                 WHERE v2.tenant_id = j.tenant_id AND v2.lifecycle_status = 'PUBLISHED'
-                  AND v2.effective_from <= coalesce(b.pricing_effective_on, b.booking_date)
-                  AND (v2.effective_to IS NULL OR v2.effective_to >= coalesce(b.pricing_effective_on, b.booking_date))
+                  AND v2.effective_from <= COALESCE(b.pricing_effective_on, CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END)
+                  AND (v2.effective_to IS NULL OR v2.effective_to >= COALESCE(b.pricing_effective_on, CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END))
                ) AS in_force_on_date,
                (SELECT pli.standard_amount::text FROM auditcore.price_list_items pli
                 WHERE pli.tenant_id = j.tenant_id AND pli.price_list_version_id = j.price_list_version_id

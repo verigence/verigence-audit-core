@@ -195,8 +195,9 @@ def _receipt_documents(annotated: list[dict[str, Any]]) -> list[Any]:
 
 
 def _sync_booking_date(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str:
-    """The booking record's date from the booking form / docket on file. A
-    failure is logged and leaves the rest of the pass untouched."""
+    """The booking record's date and its source, by the booking-date rule
+    (uc03_booking_date). A failure is logged and leaves the rest of the pass
+    untouched."""
     try:
         with connection.begin_nested():
             return sync_booking_date(connection, tenant_id=tenant_id, journey_id=journey_id)

@@ -264,7 +264,10 @@ def _sync_delivery_date_sanity_finding(
         booking_date = connection.execute(
             text(
                 """
-                SELECT booking_date FROM auditcore.bookings
+                -- Only a booking date read or entered: the fallback (the day the
+                -- booking documents were uploaded or the journey started,
+                -- uc03_booking_date) is no evidence of when the car was booked.
+                SELECT CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END FROM auditcore.bookings b
                 WHERE tenant_id=:tenant_id AND journey_id=:journey_id
                 """
             ),

@@ -85,8 +85,10 @@ def journey_pricing_date(connection: Connection, *, tenant_id: str, journey_id: 
     rules, R5): the date applied to it (``bookings.pricing_effective_on``:
     the PC's booking/invoice choice or a Team Lead's other-month approval),
     else the booking date on the booking form (as read, or as the PC
-    corrected it), else the booking date entered by hand. Never today: with
-    none of them the deal is not priced yet.
+    corrected it), else the booking date entered by hand. Never today, and
+    never the Journey's fallback booking date (the day its booking documents
+    were uploaded or it was started, ``uc03_booking_date``): with none of
+    them the deal is not priced yet.
 
     The two read sources are checked against the programme's date floor and
     against today (see ``_priceable``); a date that fails is passed over as
@@ -101,7 +103,7 @@ def journey_pricing_date(connection: Connection, *, tenant_id: str, journey_id: 
     row = connection.execute(
         text(
             """
-            SELECT pricing_effective_on, booking_date
+            SELECT pricing_effective_on, booking_date, booking_date_source
             FROM auditcore.bookings
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id
             """
@@ -117,8 +119,10 @@ def journey_pricing_date(connection: Connection, *, tenant_id: str, journey_id: 
         return read
     if row is None:
         return None
-    return _priceable(row["booking_date"], source="booking_date",
-                      tenant_id=tenant_id, journey_id=journey_id)
+    from audit_core.uc03_booking_date import entered_booking_date
+
+    entered = entered_booking_date(connection, tenant_id=tenant_id, journey_id=journey_id, held=dict(row))
+    return _priceable(entered, source="booking_date", tenant_id=tenant_id, journey_id=journey_id)
 
 
 def journey_price_plan(

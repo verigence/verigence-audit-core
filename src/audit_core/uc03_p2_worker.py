@@ -4791,8 +4791,8 @@ def _sku_run_once(engine: Engine, tag: str) -> None:
 
 
 def refresh_journey_dates(engine: Engine) -> None:
-    """On every worker start: fill each empty booking record's booking date
-    from its booking form (uc03_booking_date), recompute each Journey's
+    """On every worker start: bring every booking record's booking date and
+    its source to the rule (uc03_booking_date), recompute each Journey's
     booking confirmation date from the receipts on file, and take back a gate-pass delivery date before the
     programme's floor. Idempotent. Each change is logged with the before and
     after and the receipts it was decided on (2026-10-20: Subrat Kumar
@@ -4810,11 +4810,12 @@ def refresh_journey_dates(engine: Engine) -> None:
     for tenant_id in _active_tenants(engine):
         changed = 0
         try:
-            # A booking record left without the booking date its booking form
-            # carries gets it (2026-11-07: 208 Journeys on Mahindra Orissa
-            # dropped from a booking-date export). Fills empty records and
-            # repairs a date only a superseded / voided copy carries; never
-            # replaces a date a person entered.
+            # Every Journey has a booking date (product owner 2026-11-07): the
+            # booking form's, else the docket's, else one entered, else the day
+            # the booking documents were uploaded, else the day it was started.
+            # Records with no date, no source yet, a pre-floor misread or only a
+            # fallback are brought to the rule; a later form date replaces a
+            # fallback.
             fill_missing_booking_dates(engine, tenant_id)
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)

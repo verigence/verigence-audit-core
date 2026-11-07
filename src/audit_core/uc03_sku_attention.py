@@ -84,7 +84,7 @@ WITH scoped AS (
            j.created_by_display_name AS pc_name, j.created_at_utc,
            COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
            d.dealer_name, o.outlet_name, o.outlet_id, d.dealer_id,
-           COALESCE(b.pricing_effective_on, b.booking_date) AS priced_on,
+           COALESCE(b.pricing_effective_on, CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) AS priced_on,
            b.pricing_effective_on IS NOT NULL AS date_applied_by_a_person,
            b.booking_date,
            jp.product_sku_id, jp.model_name_snapshot, jp.variant_name_snapshot,

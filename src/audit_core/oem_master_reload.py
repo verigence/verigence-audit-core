@@ -1267,7 +1267,7 @@ def reprice_deals(engine: Engine, *, tenant_id: str, start: date, tag: str) -> d
             """
             SELECT j.journey_id, j.journey_reference FROM auditcore.journeys j
             JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
-            WHERE j.tenant_id = :t AND coalesce(b.pricing_effective_on, b.booking_date) >= :start
+            WHERE j.tenant_id = :t AND coalesce(b.pricing_effective_on, CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) >= :start
             ORDER BY j.created_at_utc, j.journey_id
             """
         ), {"t": tenant_id, "start": start}).all()
@@ -1326,7 +1326,7 @@ def _run_reprice_only(engine: Engine, tag: str, *, commit: bool,
                     journeys = connection.execute(text(
                         "SELECT count(*) FROM auditcore.journeys j JOIN auditcore.bookings b "
                         "ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id "
-                        "WHERE j.tenant_id = :t AND coalesce(b.pricing_effective_on, b.booking_date) >= :start"),
+                        "WHERE j.tenant_id = :t AND coalesce(b.pricing_effective_on, CASE WHEN b.booking_date_source IN ('BOOKING_DOCS_UPLOADED', 'JOURNEY_CREATED') THEN NULL ELSE b.booking_date END) >= :start"),
                         {"t": tenant_id, "start": REPRICE_FROM}).scalar_one()
                 outcome = {"passed": True, "reprice": {"from": str(REPRICE_FROM), "journeys": int(journeys)}}
                 status = "DRY_RUN_PASSED"
