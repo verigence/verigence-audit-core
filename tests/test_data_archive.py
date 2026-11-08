@@ -602,3 +602,22 @@ def test_the_worker_runs_the_archive_once_a_night(setup, monkeypatch):
     monkeypatch.setattr(worker, "_DATA_ARCHIVE_UTC", "off")
     worker._last_data_archive.clear()
     assert worker._data_archive_due(tenant, datetime(2026, 11, 8, 22, 0, tzinfo=UTC)) is None
+
+
+def test_archive_statements_get_the_job_time_limit_on_a_short_timeout_engine():
+    """8 Nov 2026: the worker's nightly pass ran on its 10-second engine and Mahindra Orissa's
+    candidate count was cancelled. Every archive transaction sets its own limit."""
+    from sqlalchemy import create_engine
+
+    url = database_engine().url
+    short = create_engine(url, connect_args={"options": "-c statement_timeout=10000"})
+    try:
+        with short.begin() as connection:
+            assert connection.execute(text("SHOW statement_timeout")).scalar_one() == "10s"
+            archive._allow_long(connection)
+            assert connection.execute(text("SHOW statement_timeout")).scalar_one() == "10min"
+        with short.begin() as connection:
+            # SET LOCAL ends with the transaction: the API engine keeps its own limit.
+            assert connection.execute(text("SHOW statement_timeout")).scalar_one() == "10s"
+    finally:
+        short.dispose()

@@ -509,9 +509,22 @@ def _record(connection: Connection, *, run_id: UUID, tenant_id: str | None, rule
     )
 
 
+ARCHIVE_STATEMENT_TIMEOUT_MS = 600_000
+
+
+def _allow_long(connection: Connection) -> None:
+    """The archive's own statements get the job's 10 minutes, whichever engine runs them. The worker
+    shares its 10-second API engine with the nightly pass (8 Nov 2026: Mahindra Orissa's candidate
+    count was cancelled after 10 s and nothing was archived); SET LOCAL ends with the transaction."""
+    ms = os.environ.get("AUDIT_CORE_ARCHIVE_STATEMENT_TIMEOUT_MS", "").strip()
+    value = int(ms) if ms.isdigit() and int(ms) > 0 else ARCHIVE_STATEMENT_TIMEOUT_MS
+    connection.execute(text(f"SET LOCAL statement_timeout = {value}"))
+
+
 def _record_tenant(engine: Engine, tenant_id: str, **kwargs: Any) -> None:
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
+        _allow_long(connection)
         _record(connection, tenant_id=tenant_id, **kwargs)
 
 
@@ -595,6 +608,7 @@ def _archive_tenant(engine: Engine, store: ArchiveStore, *, rule: ArchiveRule, c
     try:
         with engine.begin() as connection:
             set_tenant_context(connection, tenant_id)
+            _allow_long(connection)
             result.candidate_count = int(
                 connection.execute(text(count_candidates_sql(rule)),
                                    {"tenant_id": tenant_id, "cutoff": cutoff}).scalar_one()
@@ -608,6 +622,7 @@ def _archive_tenant(engine: Engine, store: ArchiveStore, *, rule: ArchiveRule, c
                 params.update({f"resume_{i}": resume[c] for i, c in enumerate(rule.resume_columns)})
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
+                _allow_long(connection)
                 rows = connection.execute(
                     text(select_batch_sql(rule, columns, resume=resume is not None)), params
                 ).mappings().all()
@@ -620,6 +635,7 @@ def _archive_tenant(engine: Engine, store: ArchiveStore, *, rule: ArchiveRule, c
                                        cutoff=cutoff)
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
+                _allow_long(connection)
                 deleted = int(
                     connection.execute(
                         text(_DELETE_FUNCTION_SQL),
@@ -698,6 +714,7 @@ def archive_table(engine: Engine, rule: ArchiveRule, *, mode: str, settings: Arc
                            started_by=started_by, started_at=started_at)
         try:
             with engine.begin() as connection:
+                _allow_long(connection)
                 tenants = _tenants(connection, rule)
                 columns = _columns(connection, rule)
             if tenant_ids is not None:
@@ -708,6 +725,7 @@ def archive_table(engine: Engine, rule: ArchiveRule, *, mode: str, settings: Arc
                 if mode == MODE_DRY_RUN:
                     with engine.begin() as connection:
                         set_tenant_context(connection, tenant_id)
+                        _allow_long(connection)
                         count = int(connection.execute(text(count_candidates_sql(rule)),
                                                        {"tenant_id": tenant_id, "cutoff": cutoff}).scalar_one())
                         _record(connection, run_id=result.run_id, tenant_id=tenant_id, rule=rule, mode=mode,
