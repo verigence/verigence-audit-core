@@ -44,6 +44,7 @@ from audit_core.projects import router as project_router
 from audit_core.readiness import router as readiness_router
 from audit_core.role_mapping_policy import install_role_mapping_policy
 from audit_core.runtime_warmup import warm_runtime_dependencies
+from audit_core.sevasutra_feed import router as sevasutra_feed_router
 from audit_core.system_health_api import router as system_health_router
 from audit_core.system_health_cloud import router as system_health_cloud_router
 from audit_core.system_health_trends import router as system_health_trends_router
@@ -401,6 +402,7 @@ def create_app() -> FastAPI:
     application.include_router(daily_operations_router)
     application.include_router(feedback_router)
     application.include_router(hr_work_context_router)
+    application.include_router(sevasutra_feed_router)
     application.include_router(user_project_history_router)
     application.include_router(oem_price_masters_router)
     application.include_router(system_health_router)

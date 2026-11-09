@@ -8,7 +8,10 @@ from sqlalchemy import text
 from audit_core.db import set_tenant_context
 from audit_core.errors import BusinessValidationError
 
-_PROJECT_WIDE_ONLY_ROLES = frozenset({"TL", "PM", "Executive"})
+_PROJECT_WIDE_ONLY_ROLES = frozenset({"TL", "PM", "Executive", "CLIENT"})
+# Outlet-scoped roles: one or more Dealer Outlets, no Dealer-only scope. ANALYST is SevaSutra's on-site
+# auditor and is scoped to Outlets exactly as a PC is (product owner, 9 Nov 2026).
+_OUTLET_SCOPED_ROLES = frozenset({"PC", "ANALYST"})
 # CRM and REVIEWER share one scope shape: Project-wide, Dealer-scoped,
 # Outlet-scoped, or a union of selected Dealers and Outlets. A Reviewer sits at
 # one physical location and covers several Outlets at once, so the union is the
@@ -16,7 +19,10 @@ _PROJECT_WIDE_ONLY_ROLES = frozenset({"TL", "PM", "Executive"})
 # permission bundle Security resolves -- `audit.journey.update` -- not the
 # business scope (AUDIT_CORE_DEFAULT_ROLE_BUNDLES_v1.1 section 8).
 _FLEXIBLE_SCOPE_ROLES = frozenset({"CRM", "REVIEWER"})
-_SUPPORTED_ROLES = frozenset({"PC", "TL", "PM", "CRM", "Executive", "REVIEWER"})
+# ANALYST and CLIENT are SevaSutra's (workshop audit) operating roles, held in Security like the others:
+# ANALYST captures and audits at its Outlets; CLIENT is for people who are not JBR employees and sees
+# SevaSutra's analytics only, Project-wide (Security migrations 0052 and 0056).
+_SUPPORTED_ROLES = frozenset({"PC", "TL", "PM", "CRM", "Executive", "REVIEWER", "ANALYST", "CLIENT"})
 
 
 def install_role_mapping_policy(role_mappings: Any) -> None:
@@ -55,11 +61,11 @@ def install_role_mapping_policy(role_mappings: Any) -> None:
             key=str,
         )
 
-        if role == "PC":
+        if role in _OUTLET_SCOPED_ROLES:
             if not outlet_ids or any(
                 row["dealer_id"] is None or row["outlet_id"] is None for row in rows
             ):
-                raise RuntimeError("PC business assignment scope is inconsistent")
+                raise RuntimeError(f"{role} business assignment scope is inconsistent")
             response_dealers: list[UUID] = []
             response_outlets = outlet_ids
         elif role in _PROJECT_WIDE_ONLY_ROLES:
@@ -104,14 +110,14 @@ def install_role_mapping_policy(role_mappings: Any) -> None:
         dealer_ids = sorted(set(body.dealerIds), key=str)
         outlet_ids = sorted(set(body.outletIds), key=str)
 
-        if body.operatingRole == "PC":
+        if body.operatingRole in _OUTLET_SCOPED_ROLES:
             if dealer_ids:
                 raise BusinessValidationError(
-                    detail="PC Role Mapping is Outlet-scoped; Dealer IDs must be empty."
+                    detail=f"{body.operatingRole} Role Mapping is Outlet-scoped; Dealer IDs must be empty."
                 )
             if not outlet_ids:
                 raise BusinessValidationError(
-                    detail="PC Role Mapping requires at least one Dealer Outlet."
+                    detail=f"{body.operatingRole} Role Mapping requires at least one Dealer Outlet."
                 )
         elif body.operatingRole in _PROJECT_WIDE_ONLY_ROLES:
             if dealer_ids or outlet_ids:
@@ -165,7 +171,7 @@ def install_role_mapping_policy(role_mappings: Any) -> None:
                     )
                 outlet_scopes.append((UUID(str(dealer_id)), outlet_id))
 
-            if body.operatingRole == "PC":
+            if body.operatingRole in _OUTLET_SCOPED_ROLES:
                 return [], outlet_ids, outlet_scopes
 
             scopes: list[tuple[UUID | None, UUID | None]] = [
