@@ -54,8 +54,11 @@ REVIEWER_CORRECTIONS_TASK = "REVIEWER_CORRECTIONS_INFO"
 KEY_FIGURES_TASK = "DOCUMENT_KEY_FIGURES_NOT_READ"
 # An NDC / cost sheet whose rows do not add up (2026-11-05): the PC closes it when the dealer's sum is wrong.
 ADDS_UP_TASK = "STATEMENT_ROWS_DO_NOT_ADD_UP"
+# The registration taken as lower by the scrappage concession (2026-11-09): for information.
+SCRAPPAGE_REGISTRATION_TASK = "SCRAPPAGE_REGISTRATION_CONCESSION"
 CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK, COST_SHEET_DIFFERENCE_TASK, COPIES_DIFFERENCE_TASK,
-                              REVIEWER_CORRECTIONS_TASK, KEY_FIGURES_TASK, ADDS_UP_TASK})
+                              REVIEWER_CORRECTIONS_TASK, KEY_FIGURES_TASK, ADDS_UP_TASK,
+                              SCRAPPAGE_REGISTRATION_TASK})
 # "Upload the ..." tasks (a conditional document, or the booking docket) close
 # by hand too (product owner 2026-11-02): a single page uploaded for them is
 # often refused for scan quality and never read, so the machine check cannot

@@ -21,7 +21,7 @@ actions:
 - CONFIRM_BREACH
 - MARK_FALSE_POSITIVE
 # The PC closes a task by hand, with a comment (PC_PAGE_QUALITY_REJECTED,
-# PC_LARGE_UPLOAD_REVIEW, COST_SHEET_NDC_DIFFERENCE and NDC_COPIES_DIFFERENCE,
+# PC_LARGE_UPLOAD_REVIEW, COST_SHEET_NDC_DIFFERENCE, NDC_COPIES_DIFFERENCE, SCRAPPAGE_REGISTRATION_CONCESSION,
 # and DOCUMENT_MISSING raised as DOCUMENT_MISSING / BOOKING_FORM_MISSING only).
 - CLOSE_TASK
 exception_roles:
@@ -514,6 +514,18 @@ task_types:
   # Two copies of the NDC, or of the cost sheet, give a figure differently by
   # more than Rs 100, or the latest copy no longer prints one an older copy
   # did (2026-11-02): HIGH, for information; the PC closes it with a comment.
+  # The registration taken as lower by the scrappage concession (2026-11-09,
+  # uc03_scrappage_registration): for information, the PC closes it with a comment.
+  SCRAPPAGE_REGISTRATION_CONCESSION:
+    category: CROSS_DOCUMENT_REVIEW
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - CLOSE_TASK
+    - ADD_COMMENT
   NDC_COPIES_DIFFERENCE:
     category: CROSS_DOCUMENT_REVIEW
     owner: PC
