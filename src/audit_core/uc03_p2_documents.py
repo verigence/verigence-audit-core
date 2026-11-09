@@ -9,7 +9,7 @@ The UI is new, but the evidence contracts are not duplicated:
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -33,6 +33,14 @@ from audit_core.uc03_document_capture_v2 import (
     get_security_oauth_client,
 )
 from audit_core.uc03_document_field_corrections import _apply_field_value
+from audit_core.uc03_line_item_rows import (
+    MAX_ROWS,
+    RowChangeError,
+    RowConflictError,
+    apply_row_change,
+    is_table_field,
+    parse_rows,
+)
 from audit_core.uc03_p2_access import (
     authorize_p2_any,
     check_p2_permission,
@@ -489,6 +497,14 @@ def get_p2_document_review(
              "proposedAtUtc": proposal["proposedAtUtc"]}
             if proposal else None
         )
+        # A table field comes with its lines, so each line is shown and
+        # corrected on its own (2026-11-09); None for any other field.
+        if is_table_field(_table_field_type(di_type, str(item["fieldKey"])), value):
+            item["rows"] = parse_rows(value) or []
+            item["extractedRows"] = parse_rows(item.get("extractedValue")) or []
+        else:
+            item["rows"] = None
+            item["extractedRows"] = None
 
     correction_history = [
         {
@@ -1080,4 +1096,132 @@ def correct_p2_document_field(
         "applied": True,
         "taskId": None,
     }
+
+
+class P2LineItemChangeCommand(BaseModel):
+    """One line of a table field changed, added or removed (2026-11-09)."""
+
+    canonicalFieldId: str = Field(min_length=1, max_length=160)
+    sourceFactVersion: int = Field(gt=0)
+    operation: Literal["UPDATE", "ADD", "REMOVE"]
+    # The line's position as the person saw it; for ADD, where to insert
+    # (none: at the end).
+    rowIndex: int | None = Field(default=None, ge=0, le=MAX_ROWS)
+    # The line as the person saw it (UPDATE / REMOVE): the change is refused
+    # when the line at rowIndex is no longer this one.
+    expectedRow: dict[str, Any] | None = None
+    # The new line (UPDATE / ADD).
+    row: dict[str, Any] | None = None
+    remarks: str | None = Field(default=None, max_length=2000)
+
+
+def _table_field_type(di_type: str | None, field_key: str) -> str | None:
+    for meta in get_registry().di_fields(str(di_type or "")):
+        if str(meta.get("key")) == field_key:
+            return str(meta.get("type") or "") or None
+    return None
+
+
+@router.post("/documents/{document_id}/fields/{field_key}/rows")
+def change_p2_document_line_item(
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    field_key: str,
+    command: P2LineItemChangeCommand,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Correct one line of a table field (an NDC's charges and payments, a
+    ledger's vouchers, an invoice's lines) without retyping the table. The new
+    table is written through the ordinary correction, so who may do it, the
+    change log, the TL / Reviewer information and the re-check are the same as
+    for any other field."""
+    authorize_p2_any(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_keys=_FIELD_UPDATE_PERMISSIONS,
+    )
+    context = _document_context(connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id)
+    field = connection.execute(
+        text(
+            """
+            SELECT source_document_type_key, extracted_value, effective_value
+            FROM auditcore.journey_document_extracted_fields
+            WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND di_document_id=:document_id
+              AND source_canonical_field_id=:canonical_field_id
+              AND source_fact_version=:source_fact_version AND field_key=:field_key
+            ORDER BY updated_at_utc DESC
+            LIMIT 1
+            """
+        ),
+        {
+            "tenant_id": tenant_id,
+            "journey_id": journey_id,
+            "document_id": document_id,
+            "canonical_field_id": command.canonicalFieldId,
+            "source_fact_version": command.sourceFactVersion,
+            "field_key": field_key,
+        },
+    ).mappings().one_or_none()
+    if field is None:
+        raise HTTPException(status_code=409, detail=_field_missing_detail(
+            connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id))
+    di_type = field["source_document_type_key"] or context["document_type_key"]
+    current = field["effective_value"] if field["effective_value"] is not None else field["extracted_value"]
+    if not is_table_field(_table_field_type(di_type, field_key), current):
+        raise HTTPException(status_code=422, detail="This value is not a table; correct it as a whole.")
+    rows = parse_rows(current) or []
+    try:
+        new_rows, before, after = apply_row_change(
+            rows,
+            operation=command.operation,
+            row_index=command.rowIndex,
+            expected_row=command.expectedRow,
+            row=command.row,
+        )
+    except RowConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RowChangeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    for key, cell in (after or {}).items():
+        if future_date_verdict(key, cell):
+            raise HTTPException(
+                status_code=422,
+                detail=(f"{cell} is after today ({programme_today().isoformat()}). "
+                        "This date records something that has already happened; check the day and the year."),
+            )
+
+    position =(command.rowIndex if command.rowIndex is not None else len(rows)) + 1
+    what = {"UPDATE": "corrected", "ADD": "added", "REMOVE": "removed"}[command.operation]
+    note = (command.remarks or "").strip()
+    result = correct_p2_document_field(
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        document_id=document_id,
+        command=P2FieldCorrectionCommand(
+            canonicalFieldId=command.canonicalFieldId,
+            fieldKey=field_key,
+            sourceFactVersion=command.sourceFactVersion,
+            newValue=new_rows,
+            remarks=f"Line {position} {what}" + (f": {note}" if note else ""),
+        ),
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        connection=connection,
+    )
+    record_activity(
+        connection, tenant_id=tenant_id, journey_id=journey_id, event_type="LINE_ITEM_CHANGED",
+        subject_type="DOCUMENT", subject_id=str(document_id),
+        details={"fieldKey": field_key, "documentTypeKey": di_type, "operation": command.operation,
+                 "line": position, "before": before, "after": after,
+                 "actorId": human_principal.subject, "remarks": note or None},
+    )
+    return {**result, "operation": command.operation, "line": position, "rows": new_rows}
 
