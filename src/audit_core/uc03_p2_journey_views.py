@@ -37,9 +37,22 @@ its delivery date falls in it (India time):
 
 ``bookings_in_month`` / ``deliveries_in_month`` count the journeys whose
 booking / delivery date is in the month.
+
+``dealer_id``, ``outlet_id`` and ``pc_actor_id`` narrow the journeys in scope
+(an Executive or Project Manager sees every Dealership of the Project and picks
+one, 2026-11-09).
+
+The search box matches the customer's name, the Dealership, the Outlet, the
+vehicle model and the Journey reference / id as text, and a mobile number by
+its digits (product owner 2026-11-09: "search by customer name, mobile
+number"). A mobile search ignores spaces, dashes, a +91 country code and a
+leading 0; four digits match the number's last four (as before), five or more
+match anywhere in the number -- on the customer record or on a customer phone
+read from one of the Journey's own documents (mobile_search_pattern).
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from audit_core.uc03_p2_runtime import swept_pending_sql
@@ -53,7 +66,8 @@ _IN_FLIGHT = ("QUEUED", "PREPARING_PAGE", "DI_UPLOAD_PREPARING", "DI_UPLOADING",
 _IN_FLIGHT_SQL = ", ".join(f"'{s}'" for s in _IN_FLIGHT)
 
 # The journeys in the caller's scope with every flag a tab is decided on.
-# Parameters: tenant_id, actor_id, search, outlet_id, pc_actor_id, month, month_basis, date_floor, timezone.
+# Parameters: tenant_id, actor_id, search, mobile_pattern, dealer_id, outlet_id, pc_actor_id, month,
+# month_basis, date_floor, timezone (scope_params builds the filter ones).
 # No literal braces below: BREAKDOWN_SQL is filled in with str.format.
 SCOPED_SQL = f"""
     open_tasks AS (
@@ -95,6 +109,19 @@ SCOPED_SQL = f"""
                OR (st.stage_code = 'BOOKING'
                    AND (st.business_status IN ('BOOKING_CANCELLED', 'DUPLICATE_BOOKING')
                         OR st.closure_disposition = 'NO_DELIVERY')))
+    ),
+    -- Journeys with a customer phone read from one of their own documents that
+    -- matches the searched mobile number; nothing is read without one.
+    phone_hits AS (
+        SELECT DISTINCT f.journey_id
+        FROM auditcore.journey_document_extracted_fields f
+        JOIN auditcore.evidence e
+          ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+         AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
+        WHERE CAST(:mobile_pattern AS varchar) IS NOT NULL
+          AND f.tenant_id = :tenant_id AND f.field_key = 'customer_phone'
+          AND regexp_replace(COALESCE(f.effective_value::text, ''), '[^0-9]', '', 'g')
+              LIKE CAST(:mobile_pattern AS varchar)
     ),
     scoped AS (
         SELECT j.tenant_id, j.journey_id, j.journey_reference, j.customer_id, j.dealer_id,
@@ -176,6 +203,7 @@ SCOPED_SQL = f"""
               AND (ba.dealer_id IS NULL
                    OR (ba.dealer_id = j.dealer_id AND (ba.outlet_id IS NULL OR ba.outlet_id = j.outlet_id)))
           )
+          AND (CAST(:dealer_id AS uuid) IS NULL OR j.dealer_id = CAST(:dealer_id AS uuid))
           AND (CAST(:outlet_id AS uuid) IS NULL OR j.outlet_id = CAST(:outlet_id AS uuid))
           AND (CAST(:pc_actor_id AS varchar) IS NULL OR j.created_by_actor_id = CAST(:pc_actor_id AS varchar))
           AND (CAST(:month AS varchar) IS NULL
@@ -193,6 +221,12 @@ SCOPED_SQL = f"""
             OR COALESCE(j.journey_reference,'') ILIKE '%' || :search || '%'
             OR j.journey_id::text ILIKE '%' || :search || '%'
             OR COALESCE(c.mobile_last4,'') = :search
+            OR (CAST(:mobile_pattern AS varchar) IS NOT NULL
+                AND (regexp_replace(COALESCE(c.mobile_number,''), '[^0-9]', '', 'g')
+                       LIKE CAST(:mobile_pattern AS varchar)
+                     OR (char_length(CAST(:mobile_pattern AS varchar)) = 5
+                         AND COALESCE(c.mobile_last4,'') = substr(CAST(:mobile_pattern AS varchar), 2))
+                     OR j.journey_id IN (SELECT ph.journey_id FROM phone_hits ph)))
           )
     )
 """
@@ -273,6 +307,49 @@ BREAKDOWN_SQL = "WITH " + SCOPED_SQL + """
     ORDER BY COUNT(*) FILTER (WHERE NOT s.is_closed AND (s.overdue OR s.high_risk)) DESC,
              COUNT(*) FILTER (WHERE NOT s.is_closed) DESC
 """
+
+
+_MOBILE_CHARACTERS = re.compile(r"^[0-9+\-\s().]+$")
+
+
+def mobile_search_pattern(search: str | None) -> str | None:
+    """The LIKE pattern a search text matches a mobile number's digits with,
+    or None when the text is not a mobile number (letters, or under four digits).
+
+    Spaces, dashes, brackets and dots are ignored; a +91 / 91 country code and a
+    leading 0 are dropped. Four digits are the number's last four ("%1234"),
+    five or more may be any part of it ("%98765%")."""
+    text_ = (search or "").strip()
+    if not text_ or not _MOBILE_CHARACTERS.match(text_):
+        return None
+    digits = "".join(ch for ch in text_ if ch.isdigit())
+    # +91 typed with the number, or a full 12-digit number beginning 91.
+    country_code = text_.startswith("+") and len(digits) > 6 or len(digits) == 12
+    if country_code and digits.startswith("91"):
+        digits = digits[2:]
+    if len(digits) >= 6 and digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) < 4:
+        return None
+    return f"%{digits}" if len(digits) == 4 else f"%{digits}%"
+
+
+def scope_params(
+    *,
+    search: str | None,
+    dealer_id: Any = None,
+    outlet_id: Any = None,
+    pc_actor_id: str | None = None,
+) -> dict[str, Any]:
+    """The search and filter parameters SCOPED_SQL reads, from the request's own."""
+    text_ = (search or "").strip()
+    return {
+        "search": text_,
+        "mobile_pattern": mobile_search_pattern(text_),
+        "dealer_id": str(dealer_id) if dealer_id else None,
+        "outlet_id": str(outlet_id) if outlet_id else None,
+        "pc_actor_id": (pc_actor_id or "").strip() or None,
+    }
 
 
 def counts_from_row(row: Any) -> dict[str, int]:
