@@ -233,10 +233,10 @@ def test_the_live_probes(monkeypatch):
 def test_the_web_url_comes_from_settings(monkeypatch):
     monkeypatch.setenv("APP_ENV", "test")
     assert system_health_cloud.web_url() is None
-    monkeypatch.setenv("APP_ENV", "dev")
-    assert system_health_cloud.web_url() == "https://verigence-web-dev.jbrconsulting-it.workers.dev"
     monkeypatch.setenv("AUDIT_CORE_CORS_ALLOWED_ORIGINS", "https://a.example, https://b.example")
     assert system_health_cloud.web_url() == "https://a.example"
+    monkeypatch.setenv("APP_ENV", "dev")
+    assert system_health_cloud.web_url() == "https://verigence.jbrconsulting.in"
     monkeypatch.setenv("VERIGENCE_WEB_URL", "https://web.example")
     assert system_health_cloud.web_url() == "https://web.example"
 
