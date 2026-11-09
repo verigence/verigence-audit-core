@@ -194,3 +194,102 @@ def test_the_workbook_shows_the_booking_date_and_its_source(journey, monkeypatch
     assert values["Booking Date Source"] == "Day booking documents were uploaded"
     notes = {r[0]: r[1] for r in book["Columns"].iter_rows(min_row=2, values_only=True)}
     assert "Day booking documents were uploaded" in notes["Booking Date Source"]
+
+
+# ── the job's statement limit (9 Nov 2026) ──────────────────────────────────
+
+
+def test_export_statements_get_the_job_time_limit_on_a_short_timeout_engine(monkeypatch) -> None:
+    """9 Nov 2026: the export ran on the P2 worker's 10-second engine and the
+    Mahindra Orissa scope query was cancelled. Every export job transaction
+    sets its own limit; SET LOCAL ends with it."""
+    from sqlalchemy import create_engine
+
+    from audit_core import uc03_p2_journey_export as export
+
+    short = create_engine(database_engine().url, connect_args={"options": "-c statement_timeout=10000"})
+    try:
+        with short.begin() as connection:
+            assert connection.execute(text("SHOW statement_timeout")).scalar_one() == "10s"
+            export._allow_long(connection)
+            assert connection.execute(text("SHOW statement_timeout")).scalar_one() == "5min"
+        with short.begin() as connection:
+            assert connection.execute(text("SHOW statement_timeout")).scalar_one() == "10s"
+        monkeypatch.setenv("AUDIT_CORE_EXPORT_STATEMENT_TIMEOUT_MS", "120000")
+        with short.begin() as connection:
+            export._allow_long(connection)
+            assert connection.execute(text("SHOW statement_timeout")).scalar_one() == "2min"
+    finally:
+        short.dispose()
+
+
+def test_the_export_job_runs_its_scope_query_under_the_job_limit(journey, monkeypatch) -> None:
+    from sqlalchemy import create_engine
+
+    from audit_core import uc03_p2_journey_export as export
+
+    seen: list[str] = []
+    real_scope = export.journeys_in_scope
+
+    def spy(connection, **kwargs):
+        seen.append(connection.execute(text("SHOW statement_timeout")).scalar_one())
+        return real_scope(connection, **kwargs)
+
+    class _Storage:
+        def put_object(self, key: str, data: bytes, *, content_type: str) -> None:
+            pass
+
+    monkeypatch.setattr(export, "journeys_in_scope", spy)
+    short = create_engine(database_engine().url, connect_args={"options": "-c statement_timeout=10000"})
+    try:
+        with short.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            connection.execute(
+                text("INSERT INTO auditcore.p2_journey_exports (tenant_id, export_id, requested_by_actor_id, "
+                     "requested_by_role, filters, outlet_ids, names, file_name, status) "
+                     "VALUES (:t, gen_random_uuid(), 'pm', 'PM', CAST(:f AS jsonb), NULL, '{}'::jsonb, 'x.xlsx', "
+                     "'PENDING')"),
+                {"t": journey.tenant_id, "f": '{"dateBasis": "BOOKING"}'},
+            )
+        job = export.claim_export(short, journey.tenant_id, "test-worker")
+        export.run_export(short, job, storage=_Storage())
+        with short.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            status = connection.execute(
+                text("SELECT status FROM auditcore.p2_journey_exports WHERE tenant_id=:t"),
+                {"t": journey.tenant_id}).scalar_one()
+    finally:
+        short.dispose()
+    assert seen == ["5min"] and status == "READY"
+
+
+def test_first_booking_uploads_are_worked_out_per_journey_across_many(journey) -> None:
+    """The grouped pass gives each journey its own first booking upload, with
+    other journeys' uploads and pages around it."""
+    others = []
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        for n in range(30):
+            others.append(connection.execute(
+                text("INSERT INTO auditcore.journeys (tenant_id, dealer_id, outlet_id, customer_id, journey_reference, "
+                     "created_at_utc) VALUES (:t, :d, :o, :c, :r, :at) RETURNING journey_id"),
+                {"t": journey.tenant_id, "d": journey.dealer_id, "o": journey.outlet_id, "c": journey.customer_id,
+                 "r": f"EXBD-MANY-{n:02d}", "at": datetime(2026, 10, 1, 6, 0, tzinfo=UTC)},
+            ).scalar_one())
+    from p2_support import P2Journey
+
+    for n, journey_id in enumerate(others):
+        other = P2Journey(engine=journey.engine, tenant_id=journey.tenant_id, journey_id=journey_id,
+                          actor_id=journey.actor_id, dealer_id=journey.dealer_id, outlet_id=journey.outlet_id,
+                          customer_id=journey.customer_id)
+        if n % 3 == 0:
+            continue  # no upload: the day it was started
+        _upload(other, date(2026, 10, 10) + timedelta(days=n % 7))
+        _upload(other, date(2026, 10, 20) + timedelta(days=n % 5))
+        if n % 3 == 2:
+            _upload(other, date(2026, 10, 2), stage="DELIVERY")
+    rows = {r["journey_id"]: (r["booking_date"], r["booking_date_source"]) for r in _scope(journey)}
+    for n, journey_id in enumerate(others):
+        expected = ((date(2026, 10, 1), "JOURNEY_CREATED") if n % 3 == 0
+                    else (date(2026, 10, 10) + timedelta(days=n % 7), "BOOKING_DOCS_UPLOADED"))
+        assert rows[journey_id] == expected, n

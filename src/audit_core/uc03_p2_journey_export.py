@@ -33,8 +33,10 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Annotated, Any, Literal
@@ -498,7 +500,34 @@ def supervised_outlets(connection: Connection, *, tenant_id: str, actor_id: str)
 
 
 _SCOPE_SQL = """
-WITH base AS (
+-- The journeys in scope, once.
+WITH scoped AS (
+    SELECT j.* FROM auditcore.journeys j
+    WHERE j.tenant_id=:t
+      AND (CAST(:dealer AS uuid) IS NULL OR j.dealer_id=CAST(:dealer AS uuid))
+      AND (CAST(:outlet AS uuid) IS NULL OR j.outlet_id=CAST(:outlet AS uuid))
+      AND (CAST(:outlets AS uuid[]) IS NULL OR j.outlet_id = ANY(CAST(:outlets AS uuid[])))
+),
+-- The PC's first upload holding a booking page, per journey, in one grouped
+-- pass (9 Nov 2026: a per-journey lookup re-scanned the tenant's page queue
+-- for every upload -- 10.9 s on Mahindra Orissa, cancelled by the worker's
+-- 10 s limit; grouped, 33 ms). An upload as the Project Tracker counts one:
+-- not one still awaiting its file, not a duplicate cancelled on arrival with
+-- no pages; a page cancelled since is no upload.
+first_booking_upload AS (
+    SELECT ub.journey_id,
+           MIN(CAST(ub.created_at_utc AT TIME ZONE 'Asia/Kolkata' AS date)) AS first_booking_upload_day
+    FROM auditcore.p2_upload_batches ub
+    JOIN (SELECT DISTINCT q.batch_id FROM auditcore.p2_document_queue q
+          WHERE q.tenant_id=:t AND q.business_stage='BOOKING' AND q.queue_status <> 'CANCELLED') qb
+      ON qb.batch_id=ub.batch_id
+    WHERE ub.tenant_id=:t
+      AND ub.journey_id IN (SELECT journey_id FROM scoped)
+      AND ub.batch_status <> 'AWAITING_UPLOAD'
+      AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
+    GROUP BY ub.journey_id
+),
+base AS (
     SELECT j.journey_id, j.journey_reference, j.created_at_utc, d.dealer_name, o.outlet_name,
            o.address_text AS outlet_address, b.booking_reference,
            -- The export's booking date (product owner 2026-11-07): the one on file
@@ -520,24 +549,12 @@ WITH base AS (
                 ELSE 'JOURNEY_CREATED'
            END AS booking_date_source,
            COALESCE(dv.actual_delivered_at::date, gp.delivery_date) AS delivery_day
-    FROM auditcore.journeys j
+    FROM scoped j
     JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
     JOIN auditcore.dealer_outlets o ON o.tenant_id=j.tenant_id AND o.outlet_id=j.outlet_id
     LEFT JOIN auditcore.bookings b ON b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
     LEFT JOIN auditcore.deliveries dv ON dv.tenant_id=j.tenant_id AND dv.journey_id=j.journey_id
-    -- The PC's first upload holding a booking page, as the Project Tracker
-    -- counts an upload: not one still awaiting its file, not a duplicate
-    -- cancelled on arrival with no pages; a page cancelled since is no upload.
-    LEFT JOIN LATERAL (
-        SELECT MIN(CAST(ub.created_at_utc AT TIME ZONE 'Asia/Kolkata' AS date)) AS first_booking_upload_day
-        FROM auditcore.p2_upload_batches ub
-        WHERE ub.tenant_id=j.tenant_id AND ub.journey_id=j.journey_id
-          AND ub.batch_status <> 'AWAITING_UPLOAD'
-          AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
-          AND EXISTS (SELECT 1 FROM auditcore.p2_document_queue q
-                      WHERE q.tenant_id=ub.tenant_id AND q.batch_id=ub.batch_id
-                        AND q.business_stage='BOOKING' AND q.queue_status <> 'CANCELLED')
-    ) up ON true
+    LEFT JOIN first_booking_upload up ON up.journey_id=j.journey_id
     LEFT JOIN LATERAL (
         SELECT CAST(f.effective_value #>> '{}' AS date) AS delivery_date
         FROM auditcore.journey_document_extracted_fields f
@@ -548,10 +565,6 @@ WITH base AS (
           AND (f.effective_value #>> '{}') ~ '^\\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\\d|3[01])$'
         ORDER BY f.updated_at_utc DESC LIMIT 1
     ) gp ON true
-    WHERE j.tenant_id=:t
-      AND (CAST(:dealer AS uuid) IS NULL OR j.dealer_id=CAST(:dealer AS uuid))
-      AND (CAST(:outlet AS uuid) IS NULL OR j.outlet_id=CAST(:outlet AS uuid))
-      AND (CAST(:outlets AS uuid[]) IS NULL OR j.outlet_id = ANY(CAST(:outlets AS uuid[])))
 )
 SELECT base.* FROM base
 WHERE CAST(:date_from AS date) IS NULL OR (
@@ -752,14 +765,37 @@ def claim_export(engine: Engine, tenant_id: str, worker_id: str) -> dict[str, An
     return dict(row) if row else None
 
 
+EXPORT_STATEMENT_TIMEOUT_MS = 300_000
+
+
+def _allow_long(connection: Connection) -> None:
+    """The export job's statements get the job's own limit (5 minutes,
+    AUDIT_CORE_EXPORT_STATEMENT_TIMEOUT_MS), whichever engine runs them. The
+    P2 worker shares its 10-second API engine (9 Nov 2026: Mahindra Orissa's
+    18 Oct - 1 Nov export was cancelled on the scope query); SET LOCAL ends
+    with the transaction, so the engine keeps its own limit."""
+    ms = os.environ.get("AUDIT_CORE_EXPORT_STATEMENT_TIMEOUT_MS", "").strip()
+    value = int(ms) if ms.isdigit() and int(ms) > 0 else EXPORT_STATEMENT_TIMEOUT_MS
+    connection.execute(text(f"SET LOCAL statement_timeout = {value}"))
+
+
+@contextmanager
+def _job_transaction(engine: Engine, tenant_id: str) -> Iterator[Connection]:
+    """One transaction of the export job: the tenant's context and the job's
+    statement limit."""
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        _allow_long(connection)
+        yield connection
+
+
 def run_export(engine: Engine, export: dict[str, Any], *, storage: Any = None) -> None:
     """Build one export: every journey in its scope, one row each, then the file."""
     tenant_id = str(export["tenant_id"])
     export_id = str(export["export_id"])
     filters = dict(export["filters"] or {})
     try:
-        with engine.begin() as connection:
-            set_tenant_context(connection, tenant_id)
+        with _job_transaction(engine, tenant_id) as connection:
             journeys = journeys_in_scope(connection, tenant_id=tenant_id, filters=filters,
                                          outlet_ids=export.get("outlet_ids"))
             connection.execute(
@@ -770,8 +806,7 @@ def run_export(engine: Engine, export: dict[str, Any], *, storage: Any = None) -
         failed: list[str] = []
         for index, base in enumerate(journeys, start=1):
             try:
-                with engine.begin() as connection:
-                    set_tenant_context(connection, tenant_id)
+                with _job_transaction(engine, tenant_id) as connection:
                     rows.append(export_row(connection, tenant_id=tenant_id, base=base))
             except Exception:  # one journey never stops the export; it is listed on the job
                 logger.warning("journey_export_row_failed", export_id=export_id,
@@ -780,8 +815,7 @@ def run_export(engine: Engine, export: dict[str, Any], *, storage: Any = None) -
                 rows.append({"Dealership": base.get("dealer_name"), "Booking No": base.get("journey_reference"),
                              "File Status": "Could not be read for the export"})
             if index % 10 == 0 or index == len(journeys):
-                with engine.begin() as connection:
-                    set_tenant_context(connection, tenant_id)
+                with _job_transaction(engine, tenant_id) as connection:
                     connection.execute(
                         text("UPDATE auditcore.p2_journey_exports SET done=:d, heartbeat_at_utc=now() "
                              "WHERE tenant_id=:t AND export_id=:id"),
@@ -796,8 +830,7 @@ def run_export(engine: Engine, export: dict[str, Any], *, storage: Any = None) -
         # The file's own name last, so the browser saves it under that name.
         key = f"exports/{tenant_id}/journeys/{export_id}/{export.get('file_name') or 'Journey-Export.xlsx'}"
         storage.put_object(key, data, content_type=XLSX_TYPE)
-        with engine.begin() as connection:
-            set_tenant_context(connection, tenant_id)
+        with _job_transaction(engine, tenant_id) as connection:
             connection.execute(
                 text(
                     """
@@ -813,8 +846,7 @@ def run_export(engine: Engine, export: dict[str, Any], *, storage: Any = None) -
         logger.info("journey_export_ready", export_id=export_id, rows=len(rows), failed=len(failed))
     except Exception as exc:
         logger.warning("journey_export_failed", export_id=export_id, exc_info=True)
-        with engine.begin() as connection:
-            set_tenant_context(connection, tenant_id)
+        with _job_transaction(engine, tenant_id) as connection:
             connection.execute(
                 text("UPDATE auditcore.p2_journey_exports SET status='FAILED', error=:e, finished_at_utc=now() "
                      "WHERE tenant_id=:t AND export_id=:id"),
