@@ -19,6 +19,7 @@ from typing import Any
 from sqlalchemy import Connection, text
 
 from audit_core.activity_settings import activity_rule_note, reading_window_minutes
+from audit_core.people_employment import exit_dates, gone_on
 from audit_core.task_manager import (
     EXECUTIVE,
     TaskManagerError,
@@ -287,8 +288,10 @@ def build_engagement(connection: Connection, *, tenant_id: str, start_day: date,
                 by_day[(o["actor"], d)].append(_minute_of(o["at"], d))
     day_detail = {key: day_analysis(merged_minutes(rows), by_day.get(key, [])) for key, rows in minute_rows.items()}
     out_people = []
+    exits = exit_dates(connection)
     for actor in sorted(set(people) | set(cells)):
-        if actor.upper() == "SYSTEM":
+        # Shown for the days they were employed only (2026-11-09).
+        if actor.upper() == "SYSTEM" or gone_on(exits, actor, start_day):
             continue
         per_day = cells.get(actor, {})
         total = _empty()

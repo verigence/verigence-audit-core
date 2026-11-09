@@ -15,6 +15,7 @@ from typing import Any
 
 from sqlalchemy import Connection, text
 
+from audit_core.people_employment import exit_dates, gone_on
 from audit_core.task_manager import (
     EXECUTIVE,
     Caller,
@@ -95,6 +96,9 @@ def build_task_status(connection: Connection, *, tenant_id: str, day: date,
     cut = min(end, now)
     rows = connection.execute(text(_STATUS_SQL), {"t": tenant_id, "s": start, "e": end}).mappings().all()
     names = known_names(connection, tenant_id=tenant_id)
+    # Someone who had left before the day is not reported on it (2026-11-09).
+    exits = exit_dates(connection)
+    rows = [row for row in rows if not gone_on(exits, row["person"], day)]
     sections: dict[str, dict[str, Any]] = {
         "JOURNEY": {"people": {}, "flags": [], "totals": _empty_person()},
         "TASK_MANAGER": {"people": {}, "flags": [], "totals": _empty_person()},
@@ -499,8 +503,11 @@ def build_utilisation(connection: Connection, *, tenant_id: str, start_day: date
 
     span = [start_day + timedelta(days=i) for i in range((end_day - start_day).days + 1)]
     out_people = []
+    exits = exit_dates(connection)
     for actor in sorted(set(people) | set(days)):
-        if actor.upper() == "SYSTEM":
+        # Shown for the days they were employed; not at all for a period
+        # that starts after they left (2026-11-09).
+        if actor.upper() == "SYSTEM" or gone_on(exits, actor, start_day):
             continue
         per_day = days.get(actor, {})
         totals = _empty_day()

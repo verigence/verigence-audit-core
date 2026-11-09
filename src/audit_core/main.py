@@ -17,6 +17,7 @@ from audit_core.dependencies import get_engine
 from audit_core.di_project_master_proxy import router as di_project_master_proxy_router
 from audit_core.errors import install_error_handlers
 from audit_core.feedback import router as feedback_router
+from audit_core.hr_employment_api import router as people_employment_router
 from audit_core.hr_work_context import router as hr_work_context_router
 from audit_core.insurance_tradein import router as insurance_tradein_router
 from audit_core.journey_housekeeping import router as journey_housekeeping_router
@@ -405,6 +406,7 @@ def create_app() -> FastAPI:
     application.include_router(daily_operations_router)
     application.include_router(feedback_router)
     application.include_router(hr_work_context_router)
+    application.include_router(people_employment_router)
     application.include_router(sevasutra_feed_router)
     application.include_router(sevasutra_instances_router)
     application.include_router(user_project_history_router)
