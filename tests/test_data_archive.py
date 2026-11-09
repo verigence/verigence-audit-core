@@ -22,6 +22,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, ProgrammingError
 
 from audit_core import data_archive as archive
+from audit_core import data_archive_api as archive_api
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
 from audit_core.dependencies import HumanAdminRequest, require_super_admin_request
 from audit_core.main import app
@@ -621,3 +622,76 @@ def test_archive_statements_get_the_job_time_limit_on_a_short_timeout_engine():
             assert connection.execute(text("SHOW statement_timeout")).scalar_one() == "10s"
     finally:
         short.dispose()
+
+
+# ── System health: Data archive tab ──────────────────────────────────────────
+def _super_admin():
+    app.dependency_overrides[require_super_admin_request] = lambda: HumanAdminRequest(
+        user_id="sa-1", bearer_token="t",
+        admin_context=SecurityAdminContext(user_id="sa-1", is_super_admin=True, admin_scopes=()))
+
+
+def _run(status: str, at: datetime, *, mode: str = "LIVE", error: str | None = None) -> dict:
+    return {"status": status, "mode": mode, "startedAtUtc": at, "error": error}
+
+
+def test_archive_status_is_red_when_last_night_failed_amber_when_stale_or_refused():
+    now = datetime(2026, 11, 9, 2, 0, tzinfo=UTC)               # 07:30 IST on 9 Nov
+    night = datetime(2026, 11, 8, 21, 30, tzinfo=UTC)           # 03:00 IST on 9 Nov
+    failed = archive_api.archive_status([
+        _run("SUCCEEDED", night), _run("FAILED", night + timedelta(seconds=20),
+                                       error="P2DocumentStorageError: Failed to store archive/x\nTraceback..."),
+        _run("SUCCEEDED", night - timedelta(days=1)),
+    ], now)
+    assert failed["tone"] == "RED" and "1 of 2 runs failed on the night of 2026-11-09" in failed["reason"]
+    assert "Failed to store archive/x" in failed["reason"] and "Traceback" not in failed["reason"]
+    # An older night's failure does not make last night red.
+    assert archive_api.archive_status([_run("SUCCEEDED", night), _run("FAILED", night - timedelta(days=1))],
+                                      now)["tone"] == "GREEN"
+    assert archive_api.archive_status([_run("SUCCEEDED", night - timedelta(days=2))], now)["tone"] == "AMBER"
+    assert archive_api.archive_status([_run("REFUSED", night, error="AUDIT_CORE_ARCHIVE_BUCKET is not set")],
+                                      now)["tone"] == "AMBER"
+    assert archive_api.archive_status([], now)["tone"] == "AMBER"
+    dry = archive_api.archive_status([_run("SUCCEEDED", night, mode="DRY_RUN")], now)
+    assert dry["tone"] == "GREEN" and "dry runs only" in dry["reason"]
+
+
+def test_errors_are_short_and_never_carry_a_secret():
+    assert archive_api.short_error(None) is None
+    assert archive_api.short_error("x" * 500).endswith("…") and len(archive_api.short_error("x" * 500)) == 200
+    masked = archive_api.short_error("boto failed secret=abc123 access_key_id: AKIAXYZ password=p")
+    assert "abc123" not in masked and "AKIAXYZ" not in masked and "secret=***" in masked
+
+
+def test_archive_settings_view_shows_names_and_switches_never_keys():
+    env = {"AUDIT_CORE_ARCHIVE_BUCKET": "verigence-archive", "AUDIT_CORE_ARCHIVE_RULE_EXECUTIONS_ENABLED": "on",
+           "AUDIT_CORE_ARCHIVE_RETENTION_DAYS": "365", "AUDIT_CORE_ARCHIVE_STORAGE_SECRET_ACCESS_KEY": "s3cr3t",
+           "AUDIT_CORE_ARCHIVE_STORAGE_ACCESS_KEY_ID": "AKIA123"}
+    view = archive_api.archive_settings_view(env)
+    assert view["bucket"] == "verigence-archive" and view["retentionDays"] == 365
+    [table] = view["tables"]
+    assert table == {**table, "table": "auditcore.rule_executions", "enabled": True, "ageDays": 30}
+    assert "s3cr3t" not in json.dumps(view) and "AKIA123" not in json.dumps(view)
+    bad = archive_api.archive_settings_view({"AUDIT_CORE_ARCHIVE_RETENTION_DAYS": "forever"})
+    assert bad["problem"] and bad["retentionDays"] is None
+
+
+def test_the_system_health_archive_tab(setup):
+    archive.run_archive(setup["job"], mode=archive.MODE_LIVE, settings=_settings(batch_size=5), started_by="test",
+                        store_factory=lambda b: FakeStore(), now=NOW, tenant_ids=[setup["tenant"]])
+    _super_admin()
+    client = TestClient(app, raise_server_exceptions=False)
+    body = client.get("/v1/admin/system-health/archive", params={"nights": 2})
+    assert body.status_code == 200, body.text
+    data = body.json()
+    assert data["status"]["tone"] in {"GREEN", "AMBER", "RED"} and data["status"]["reason"]
+    mine = [r for n in data["nights"] for r in n["runs"] if r["tenantId"] == setup["tenant"]]
+    [run] = [r for r in mine if r["mode"] == "LIVE"]
+    assert (run["status"], run["archived"], run["table"]) == ("SUCCEEDED", 7, "auditcore.rule_executions")
+    assert run["objects"] >= 2 and run["durationSeconds"] is not None and run["night"]
+    assert data["archivedToDate"] >= 7 and data["lastSucceededAtUtc"]
+    [table] = data["tables"]
+    assert table["table"] == "auditcore.rule_executions" and table["totalBytes"] > 0
+    assert data["settings"]["tables"][0]["key"] == "rule_executions"
+    app.dependency_overrides.pop(require_super_admin_request, None)
+    assert client.get("/v1/admin/system-health/archive").status_code in (401, 403)
