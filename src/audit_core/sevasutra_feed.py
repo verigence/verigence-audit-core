@@ -3,8 +3,8 @@
 Verigence is central (product owner, 9 Nov 2026): a service-audit Project, its Dealers and Outlets, and
 who works on it in which role and at which Outlets, are set up in Verigence (Project Administration).
 SevaSutra reads this feed with its ServiceIntegration token and keeps its dealerships, outlets and each
-person's outlet scope in step; it never creates them itself. This endpoint only reads: no tables, no
-writes, no existing code path touched. SevaSutra calls it every few minutes with a short timeout.
+person's outlet scope in step; it never creates them itself. This endpoint only reads. Each Project
+carries the SevaSutra instance a Super Admin asked for (sevasutra_instances), if any. SevaSutra calls it every few minutes with a short timeout.
 """
 
 from __future__ import annotations
@@ -56,6 +56,14 @@ class SevaSutraAssignment(BaseModel):
     dealerIds: list[UUID]
 
 
+class SevaSutraFeedInstance(BaseModel):
+    """The SevaSutra instance a Super Admin asked for in Project Administration (sevasutra_instances)."""
+
+    dealershipName: str
+    subdomain: str | None
+    status: str
+
+
 class SevaSutraProject(BaseModel):
     tenantId: str
     projectCode: str
@@ -68,6 +76,7 @@ class SevaSutraProject(BaseModel):
     dealers: list[SevaSutraDealer]
     outlets: list[SevaSutraOutlet]
     assignments: list[SevaSutraAssignment]
+    instance: SevaSutraFeedInstance | None = None
 
 
 class SevaSutraFeedResponse(BaseModel):
@@ -113,6 +122,14 @@ _ASSIGNMENTS_SQL = text(
 )
 
 
+_INSTANCE_SQL = text(
+    """
+    SELECT dealership_name, subdomain, status
+    FROM auditcore.sevasutra_instances WHERE tenant_id = :tenant_id
+    """
+)
+
+
 def _assignments(rows: list[Any]) -> list[SevaSutraAssignment]:
     grouped: dict[str, dict[str, Any]] = {}
     for r in rows:
@@ -150,6 +167,7 @@ def load_service_projects(engine: Engine) -> list[SevaSutraProject]:
             dealers = connection.execute(_DEALERS_SQL, {"tenant_id": tenant_id}).mappings().all()
             outlets = connection.execute(_OUTLETS_SQL, {"tenant_id": tenant_id}).mappings().all()
             assignments = connection.execute(_ASSIGNMENTS_SQL, {"tenant_id": tenant_id}).mappings().all()
+            instance = connection.execute(_INSTANCE_SQL, {"tenant_id": tenant_id}).mappings().one_or_none()
         out.append(
             SevaSutraProject(
                 tenantId=tenant_id,
@@ -169,6 +187,11 @@ def load_service_projects(engine: Engine) -> list[SevaSutraProject]:
                     for o in outlets
                 ],
                 assignments=_assignments(list(assignments)),
+                instance=(
+                    SevaSutraFeedInstance(dealershipName=str(instance["dealership_name"]), subdomain=instance["subdomain"], status=str(instance["status"]))
+                    if instance
+                    else None
+                ),
             )
         )
     return out
