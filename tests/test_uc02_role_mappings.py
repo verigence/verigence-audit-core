@@ -583,3 +583,51 @@ def test_role_mapping_idempotency_conflict_and_operation_table_has_no_delete_pri
             )
         ).scalar_one()
     assert can_delete is False
+
+
+def test_sevasutra_analyst_is_outlet_scoped_and_client_project_wide(role_mapping_setup) -> None:
+    """SevaSutra's roles (product owner, 9 Nov 2026): an Analyst covers Outlets exactly as a PC does; a
+    Client (not a JBR employee, SevaSutra analytics only) is Project-wide."""
+    setup = role_mapping_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    tenant = setup["tenant_a"]
+
+    no_outlet = client.put(
+        f"/v1/tenants/{tenant}/role-mappings/analyst-1",
+        headers={"Idempotency-Key": "analyst-none"},
+        json={"operatingRole": "ANALYST", "dealerIds": [], "outletIds": []},
+    )
+    assert no_outlet.status_code == 422
+    by_dealer = client.put(
+        f"/v1/tenants/{tenant}/role-mappings/analyst-1",
+        headers={"Idempotency-Key": "analyst-dealer"},
+        json={"operatingRole": "ANALYST", "dealerIds": [setup["dealer_a"]], "outletIds": [setup["outlet_onsite"]]},
+    )
+    assert by_dealer.status_code == 422
+    analyst = client.put(
+        f"/v1/tenants/{tenant}/role-mappings/analyst-1",
+        headers={"Idempotency-Key": "analyst-ok"},
+        json={"operatingRole": "ANALYST", "dealerIds": [], "outletIds": [setup["outlet_onsite"]]},
+    )
+    assert analyst.status_code == 200
+    assert analyst.json()["mapping"] == {
+        "userId": "analyst-1",
+        "operatingRole": "ANALYST",
+        "dealerIds": [],
+        "outletIds": [setup["outlet_onsite"]],
+    }
+    assert client.get(f"/v1/tenants/{tenant}/role-mappings/analyst-1").json() == analyst.json()["mapping"]
+
+    scoped_client = client.put(
+        f"/v1/tenants/{tenant}/role-mappings/client-1",
+        headers={"Idempotency-Key": "client-scoped"},
+        json={"operatingRole": "CLIENT", "dealerIds": [], "outletIds": [setup["outlet_onsite"]]},
+    )
+    assert scoped_client.status_code == 422
+    project_client = client.put(
+        f"/v1/tenants/{tenant}/role-mappings/client-1",
+        headers={"Idempotency-Key": "client-ok"},
+        json={"operatingRole": "CLIENT", "dealerIds": [], "outletIds": []},
+    )
+    assert project_client.status_code == 200
+    assert project_client.json()["mapping"]["operatingRole"] == "CLIENT"

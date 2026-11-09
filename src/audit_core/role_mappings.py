@@ -36,7 +36,9 @@ from audit_core.security_integration import SecurityAdminClient, SecurityAdminEr
 logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1/tenants/{tenant_id}", tags=["role-mapping"])
 
-OperatingRole = Literal["PC", "TL", "PM", "CRM", "Executive", "REVIEWER"]
+# ANALYST and CLIENT are SevaSutra's operating roles (Security 0052/0056); their scope rules live in
+# role_mapping_policy.
+OperatingRole = Literal["PC", "TL", "PM", "CRM", "Executive", "REVIEWER", "ANALYST", "CLIENT"]
 _OPERATION_TYPE = "ROLE_MAPPING"
 _RUNTIME_ROLE = "audit_core_runtime"
 
@@ -140,7 +142,7 @@ def _mapping_from_rows(user_id: str, rows: list[Any]) -> RoleMappingResponse:
     # import time and owns the authoritative per-role scope shapes; the set here
     # stays in step with it so a REVIEWER assignment can never 500 a read of the
     # Tenant's whole role-mapping list through either implementation.
-    if role not in {"PC", "TL", "PM", "CRM", "Executive", "REVIEWER"}:
+    if role not in {"PC", "TL", "PM", "CRM", "Executive", "REVIEWER", "ANALYST", "CLIENT"}:
         raise RuntimeError("Active business assignment has unsupported operating role")
 
     dealer_ids = sorted(
