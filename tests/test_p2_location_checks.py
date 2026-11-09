@@ -5,22 +5,29 @@ as the runtime role, so row security and the append-only grant are exercised);
 Security is a double."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from conftest import delete_tenant_data
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from p2_support import AllowAllAuthorization, create_p2_journey, database_engine
 from sqlalchemy import text
 
 from audit_core import uc03_p2_location_checks as checks
 from audit_core.db import set_tenant_context
-from audit_core.dependencies import get_engine, get_human_principal
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_engine,
+    get_human_principal,
+    require_super_admin_request,
+)
 from audit_core.main import app
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import get_security_authorization_client
+from audit_core.security_integration import SecurityAdminContext
 from audit_core.uc03_p2_object_keys import IST
 
 # Utkal Mahindra, CDA Cuttack (roughly) and points around it.
@@ -283,3 +290,164 @@ def test_log_is_append_only_and_tenant_isolated(setup):
             set_tenant_context(connection, s.journey.tenant_id)
             connection.execute(text(statement))
     assert len(_rows(s)) == 1
+
+
+# --------------------------------------------------------------------------- away more than N km, date-wise
+# Product owner, 9 Nov 2026: "can we show just consolidate view date wise and roughly
+# how far they were during each instance.. you should report the one for which they
+# were away more than 5 km".
+
+
+def _when(day: int, hour: int, minute: int = 0) -> datetime:
+    return datetime(2026, 11, day, hour, minute, tzinfo=IST)
+
+
+def _insert_check(s, at: datetime, status: str, distance_m: float | None, *, actor: str | None = None,
+                  outlet: str = "Utkal Mahindra – CDA", accuracy: float = 20.0, device: str = "ANDROID") -> None:
+    with s.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.p2_location_checks (tenant_id, actor_id, checked_at_utc, check_status, "
+                 "latitude, longitude, accuracy_m, distance_m, nearest_outlet_id, nearest_outlet_name, "
+                 "location_source, device_type) VALUES (:t, :a, :at, :st, 20.5, 85.9, :acc, :d, :o, :on, "
+                 "'NATIVE', :dev)"),
+            {"t": s.journey.tenant_id, "a": actor or s.journey.actor_id, "at": at, "st": status, "acc": accuracy,
+             "d": distance_m, "o": s.journey.outlet_id, "on": outlet, "dev": device},
+        )
+
+
+def test_away_range_defaults_and_limits():
+    today = date(2026, 11, 9)
+    # Nothing asked: this calendar month so far.
+    assert checks.away_range(date_from=None, date_to=None, today=today) == (today.replace(day=1), today)
+    only_to = date(2026, 10, 15)
+    assert checks.away_range(date_from=None, date_to=only_to, today=today) == (only_to.replace(day=1), only_to)
+    only_from = date(2026, 10, 20)
+    assert checks.away_range(date_from=only_from, date_to=None, today=today) == (only_from, today)
+    first = date(2026, 8, 9)
+    assert checks.away_range(date_from=first, date_to=today, today=today) == (first, today)  # 93 days
+    with pytest.raises(HTTPException) as too_long:
+        checks.away_range(date_from=date(2026, 8, 8), date_to=today, today=today)
+    assert too_long.value.status_code == 422
+    with pytest.raises(HTTPException) as backwards:
+        checks.away_range(date_from=today, date_to=only_to, today=today)
+    assert backwards.value.status_code == 422
+    assert checks._km(5150) == 5.2 and checks._km(5049.9) == 5.0 and checks._km(145812.3) == 145.8
+
+
+def test_away_report_lists_checks_further_than_the_threshold_date_wise(setup):
+    s = setup
+    other = f"loc-pc2-{uuid4().hex[:8]}"
+    _insert_check(s, _when(5, 11, 0), "AWAY", 5000.0)          # exactly 5.0 km: not more than 5 km
+    _insert_check(s, _when(5, 11, 20), "AWAY", 5100.0)         # 5.1 km: listed
+    _insert_check(s, _when(5, 12, 0), "UNCLEAR", 145800.0)     # never AWAY, however far
+    _insert_check(s, _when(5, 12, 30), "AT_OUTLET", 100.0)
+    _insert_check(s, _when(5, 0, 10), "AWAY", 5600.0)          # 4 Nov 18:40 UTC: an IST 5 Nov check
+    _insert_check(s, _when(4, 23, 55), "AWAY", 6000.0)         # 4 Nov IST: outside the range
+    _insert_check(s, _when(6, 23, 50), "AWAY", 5550.0)         # 6 Nov IST (6 Nov 18:20 UTC)
+    _insert_check(s, _when(7, 0, 5), "AWAY", 7000.0)           # 7 Nov IST (6 Nov 18:35 UTC): outside
+    _insert_check(s, _when(6, 10, 30), "AWAY", 145800.0, actor=other, outlet="Aditya Motors - Cuttack",
+                  device="WEB", accuracy=12.0)
+
+    s.acting["subject"] = s.tl
+    response = s.client.get(f"{s.base}:away", params={"from": "2026-11-05", "to": "2026-11-06"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["from"] == "2026-11-05" and body["to"] == "2026-11-06" and body["minKm"] == 5
+    assert [(i["date"], i["time"], i["distanceKm"]) for i in body["instances"]] == [
+        ("2026-11-05", "00:10", 5.6), ("2026-11-05", "11:20", 5.1),
+        ("2026-11-06", "10:30", 145.8), ("2026-11-06", "23:50", 5.6),
+    ]
+    far = body["instances"][2]
+    assert far["actorId"] == other and far["outletName"] == "Aditya Motors - Cuttack"
+    assert far["deviceType"] == "WEB" and far["accuracyM"] == 12 and far["distanceM"] == 145800
+    assert "latitude" not in far
+    assert body["byDate"] == [
+        {"date": "2026-11-05", "instances": 2, "pcs": 1, "furthestKm": 5.6},
+        {"date": "2026-11-06", "instances": 2, "pcs": 2, "furthestKm": 145.8},
+    ]
+    assert body["totals"] == {"instances": 4, "pcs": 2, "days": 2, "furthestKm": 145.8}
+    [first, second] = body["byPc"]
+    assert first["actorId"] == s.journey.actor_id and first["instances"] == 3 and first["days"] == 2
+    assert first["furthestKm"] == 5.6 and first["last"]["date"] == "2026-11-06" and first["last"]["time"] == "23:50"
+    assert second["actorId"] == other and second["instances"] == 1 and second["furthestKm"] == 145.8
+    assert body["truncated"] is False
+
+    # A higher threshold keeps only the far one; the IST day bounds hold on one day.
+    ten = s.client.get(f"{s.base}:away", params={"from": "2026-11-05", "to": "2026-11-06", "minKm": "10"}).json()
+    assert [i["distanceKm"] for i in ten["instances"]] == [145.8]
+    one_day = s.client.get(f"{s.base}:away", params={"from": "2026-11-05", "to": "2026-11-05"}).json()
+    assert [i["time"] for i in one_day["instances"]] == ["00:10", "11:20"]
+
+
+def test_away_report_defaults_to_this_month(setup, monkeypatch):
+    s = setup
+    monkeypatch.setattr(checks, "ist_today", lambda now=None: date(2026, 11, 9))
+    _insert_check(s, _when(1, 0, 5), "AWAY", 8000.0)
+    _insert_check(s, datetime(2026, 10, 31, 23, 55, tzinfo=IST), "AWAY", 9000.0)
+    s.acting["subject"] = s.tl
+    body = s.client.get(f"{s.base}:away").json()
+    assert body["from"] == "2026-11-01" and body["to"] == "2026-11-09"
+    assert [(i["date"], i["distanceKm"]) for i in body["instances"]] == [("2026-11-01", 8.0)]
+
+
+def test_away_report_is_for_executive_and_super_admin_only(setup):
+    s = setup
+    _insert_check(s, _when(5, 11, 0), "AWAY", 9000.0)
+    params = {"from": "2026-11-05", "to": "2026-11-05"}
+    # A PC does not read it, nor a TL or PM (product owner, 6 Nov 2026).
+    assert s.client.get(f"{s.base}:away", params=params).status_code == 403
+    for role in ("TL", "PM"):
+        viewer = f"loc-{role.lower()}-{uuid4().hex[:8]}"
+        with s.engine.begin() as connection:
+            set_tenant_context(connection, s.journey.tenant_id)
+            connection.execute(
+                text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code) "
+                     "VALUES (:t, :a, :r)"),
+                {"t": s.journey.tenant_id, "a": viewer, "r": role},
+            )
+        s.acting["subject"] = viewer
+        assert s.client.get(f"{s.base}:away", params=params).status_code == 403, role
+
+    s.acting["subject"] = s.tl
+    assert s.client.get(f"{s.base}:away", params={**params, "minKm": "0"}).status_code in (400, 422)
+    assert s.client.get(f"{s.base}:away", params={"from": "2026-01-01", "to": "2026-11-05"}).status_code == 422
+
+    admin_base = f"/v1/admin/tenants/{s.journey.tenant_id}/location-checks:away"
+    app.dependency_overrides[require_super_admin_request] = lambda: HumanAdminRequest(
+        user_id="sa-1", bearer_token="t",
+        admin_context=SecurityAdminContext(user_id="sa-1", is_super_admin=True, admin_scopes=()))
+    admin = s.client.get(admin_base, params=params)
+    assert admin.status_code == 200, admin.text
+    assert [i["distanceKm"] for i in admin.json()["instances"]] == [9.0]
+    assert s.client.get(f"/v1/admin/tenants/tenant-missing-{uuid4().hex[:6]}/location-checks:away").status_code == 404
+    app.dependency_overrides[require_super_admin_request] = lambda: HumanAdminRequest(
+        user_id="a-1", bearer_token="t",
+        admin_context=SecurityAdminContext(user_id="a-1", is_super_admin=False, admin_scopes=()))
+    assert s.client.get(admin_base, params=params).status_code == 403
+
+
+def test_dealer_scoped_executive_sees_only_their_pcs_away(setup):
+    s = setup
+    _insert_check(s, _when(5, 11, 0), "AWAY", 9000.0)
+    with s.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        other_dealer = connection.execute(
+            text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
+                 "VALUES (:t, :c, 'Other') RETURNING dealer_id"),
+            {"t": s.journey.tenant_id, "c": f"OTHER-{uuid4().hex[:6]}"},
+        ).scalar_one()
+        connection.execute(
+            text("UPDATE auditcore.business_assignments SET dealer_id=:d WHERE tenant_id=:t AND security_actor_id=:a"),
+            {"d": other_dealer, "t": s.journey.tenant_id, "a": s.tl},
+        )
+    s.acting["subject"] = s.tl
+    params = {"from": "2026-11-05", "to": "2026-11-05"}
+    assert s.client.get(f"{s.base}:away", params=params).json()["instances"] == []
+    with s.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.business_assignments SET dealer_id=:d WHERE tenant_id=:t AND security_actor_id=:a"),
+            {"d": s.journey.dealer_id, "t": s.journey.tenant_id, "a": s.tl},
+        )
+    assert len(s.client.get(f"{s.base}:away", params=params).json()["instances"]) == 1
