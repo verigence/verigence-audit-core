@@ -25,6 +25,7 @@ from audit_core.dependencies import (
     get_connection,
     get_engine,
     require_project_admin_request,
+    require_super_admin_request,
 )
 from audit_core.errors import (
     AuditCoreError,
@@ -60,6 +61,20 @@ class SevaSutraInstanceRequest(BaseModel):
     dealershipName: str = Field(min_length=2, max_length=240)
     # The part before .sevasutra.jbrconsulting.in; empty for no address of its own.
     subdomain: str | None = Field(default=None, max_length=40)
+    # Attach this existing SevaSutra dealership (one no Project owns, e.g. the demo) instead of a new one.
+    existingDealerCode: str | None = Field(default=None, max_length=60)
+
+
+class SevaSutraFreeDealership(BaseModel):
+    dealerCode: str
+    dealershipName: str
+    outlets: int
+    visits: int
+    reportedAtUtc: datetime
+
+
+class SevaSutraFreeDealerships(BaseModel):
+    dealerships: list[SevaSutraFreeDealership]
 
 
 class SevaSutraInstanceEnvelope(BaseModel):
@@ -126,31 +141,64 @@ def put_instance(
     current = _read(connection, tenant_id)
     name = body.dealershipName.strip()
     changed_address = current is None or current.subdomain != subdomain
+    attach = (body.existingDealerCode or "").strip().lower() or None
+    if attach is not None:
+        if current is not None and current.status != "REQUESTED":
+            raise BusinessValidationError(detail="This Project already has its dealership in SevaSutra.")
+        if not connection.execute(
+            text("SELECT 1 FROM auditcore.sevasutra_free_dealerships WHERE dealer_code = :c"), {"c": attach}
+        ).first():
+            raise BusinessValidationError(detail="That SevaSutra dealership is not free to attach. Refresh the list and choose again.")
+        changed_address = True
     try:
         with connection.begin_nested():
             connection.execute(
                 text(
                     """
                     INSERT INTO auditcore.sevasutra_instances
-                        (tenant_id, dealership_name, subdomain, status, requested_by_actor_id, requested_at_utc, updated_at_utc)
-                    VALUES (:tenant_id, :name, :subdomain, 'REQUESTED', :actor, now(), now())
+                        (tenant_id, dealership_name, subdomain, status, dealer_code, requested_by_actor_id, requested_at_utc, updated_at_utc)
+                    VALUES (:tenant_id, :name, :subdomain, 'REQUESTED', :attach, :actor, now(), now())
                     ON CONFLICT (tenant_id) DO UPDATE SET
                         dealership_name = EXCLUDED.dealership_name,
                         subdomain = EXCLUDED.subdomain,
+                        dealer_code = CASE WHEN CAST(:attach AS varchar) IS NOT NULL THEN CAST(:attach AS varchar) ELSE auditcore.sevasutra_instances.dealer_code END,
                         status = CASE WHEN :changed THEN 'REQUESTED' ELSE auditcore.sevasutra_instances.status END,
                         status_message = CASE WHEN :changed THEN NULL ELSE auditcore.sevasutra_instances.status_message END,
                         requested_by_actor_id = EXCLUDED.requested_by_actor_id,
                         updated_at_utc = now()
                     """
                 ),
-                {"tenant_id": tenant_id, "name": name, "subdomain": subdomain, "actor": admin_request.user_id, "changed": changed_address},
+                {"tenant_id": tenant_id, "name": name, "subdomain": subdomain, "attach": attach, "actor": admin_request.user_id, "changed": changed_address},
             )
     except IntegrityError as exc:
         if "ux_sevasutra_instances_subdomain" in str(exc.orig):
             raise ConflictError(error_code="VAC-SEVA-003", title="Address in use", detail=f"{subdomain}.sevasutra.jbrconsulting.in is already used by another Project.") from exc
         raise
-    logger.info("sevasutra_instance_requested", tenant_id=tenant_id, subdomain=subdomain)
+    logger.info("sevasutra_instance_requested", tenant_id=tenant_id, subdomain=subdomain, attach=attach)
     return SevaSutraInstanceEnvelope(instance=_read(connection, tenant_id))
+
+
+@router.get("/v1/sevasutra/free-dealerships", response_model=SevaSutraFreeDealerships)
+def free_dealerships(
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> SevaSutraFreeDealerships:
+    """SevaSutra dealerships no Project owns yet (the demo, for one), as SevaSutra last reported them."""
+    rows = connection.execute(
+        text(
+            "SELECT dealer_code, dealership_name, outlets, visits, reported_at_utc"
+            " FROM auditcore.sevasutra_free_dealerships ORDER BY dealership_name"
+        )
+    ).mappings().all()
+    return SevaSutraFreeDealerships(
+        dealerships=[
+            SevaSutraFreeDealership(
+                dealerCode=r["dealer_code"], dealershipName=r["dealership_name"], outlets=r["outlets"],
+                visits=r["visits"], reportedAtUtc=r["reported_at_utc"],
+            )
+            for r in rows
+        ]
+    )
 
 
 # ---------------------------------------------------------------- what SevaSutra reports back
@@ -166,8 +214,17 @@ class SevaSutraInstanceReport(BaseModel):
     statusMessage: str | None = Field(default=None, max_length=500)
 
 
+class SevaSutraFreeReport(BaseModel):
+    dealerCode: str = Field(min_length=1, max_length=60)
+    dealershipName: str = Field(min_length=1, max_length=240)
+    outlets: int = 0
+    visits: int = 0
+
+
 class SevaSutraReportBatch(BaseModel):
     instances: list[SevaSutraInstanceReport]
+    # The dealerships no Project owns; replaces the last list. Absent: the list is left as it is.
+    unlinked: list[SevaSutraFreeReport] | None = None
 
 
 @router.post("/v1/service/sevasutra/instances")
@@ -207,5 +264,16 @@ def report_instances(
                 {"t": r.tenantId, "name": r.dealershipName, "subdomain": subdomain, "status": r.status, "message": r.statusMessage, "code": r.dealerCode, "live": r.liveHostname},
             )
             updated += 1
-    logger.info("sevasutra_instances_reported", count=updated)
+    if body.unlinked is not None:
+        with engine.begin() as connection:
+            connection.execute(text("DELETE FROM auditcore.sevasutra_free_dealerships"))
+            for f in body.unlinked:
+                connection.execute(
+                    text(
+                        "INSERT INTO auditcore.sevasutra_free_dealerships (dealer_code, dealership_name, outlets, visits)"
+                        " VALUES (:c, :n, :o, :v) ON CONFLICT (dealer_code) DO NOTHING"
+                    ),
+                    {"c": f.dealerCode.lower(), "n": f.dealershipName, "o": f.outlets, "v": f.visits},
+                )
+    logger.info("sevasutra_instances_reported", count=updated, unlinked=None if body.unlinked is None else len(body.unlinked))
     return {"updated": updated}

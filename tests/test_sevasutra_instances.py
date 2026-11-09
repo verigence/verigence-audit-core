@@ -13,6 +13,7 @@ from audit_core.dependencies import (
     HumanAdminRequest,
     get_engine,
     require_project_admin_request,
+    require_super_admin_request,
 )
 from audit_core.main import app
 from audit_core.security import ServiceIntegrationPrincipal
@@ -163,3 +164,30 @@ def test_a_project_with_an_instance_stays_a_service_audit(projects):
     client.put(f"/v1/tenants/{service}/sevasutra-instance", json={"dealershipName": "Aditya", "subdomain": f"k{suffix}"}, headers=H)
     r = client.patch(f"/v1/tenants/{service}/project", json={"auditType": "SALES"}, headers={**H, "If-Match": f'"{_version(engine, service)}"'})
     assert r.status_code == 422
+
+
+def test_attach_an_existing_sevasutra_dealership(projects):
+    engine, service, other, _, suffix = projects
+    client = TestClient(app)
+    demo = f"demo-{suffix}"
+    _service("sevasutra")
+    r = client.post(
+        "/v1/service/sevasutra/instances",
+        json={"instances": [], "unlinked": [{"dealerCode": demo, "dealershipName": "Premium Motors", "outlets": 1, "visits": 85}]},
+        headers=H,
+    )
+    assert r.status_code == 200
+    _admin(True)
+    app.dependency_overrides[require_super_admin_request] = app.dependency_overrides[require_project_admin_request]
+    free = client.get("/v1/sevasutra/free-dealerships", headers=H).json()["dealerships"]
+    assert {"dealerCode": demo, "dealershipName": "Premium Motors", "outlets": 1, "visits": 85}.items() <= next(f for f in free if f["dealerCode"] == demo).items()
+    # Not one SevaSutra does not list.
+    r = client.put(f"/v1/tenants/{other}/sevasutra-instance", json={"dealershipName": "Other", "existingDealerCode": "nope"}, headers=H)
+    assert r.status_code == 422
+    r = client.put(f"/v1/tenants/{service}/sevasutra-instance", json={"dealershipName": "Premium Motors", "existingDealerCode": demo}, headers=H)
+    assert r.status_code == 200, r.text
+    assert r.json()["instance"]["dealerCode"] == demo and r.json()["instance"]["status"] == "REQUESTED"
+    feed = {p.tenantId: p for p in load_service_projects(engine)}
+    assert feed[service].instance.dealerCode == demo
+    with engine.begin() as c:
+        c.execute(text("DELETE FROM auditcore.sevasutra_free_dealerships WHERE dealer_code = :c"), {"c": demo})
