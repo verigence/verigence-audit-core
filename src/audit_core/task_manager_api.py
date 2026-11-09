@@ -169,6 +169,11 @@ class ActivityCommand(BaseModel):
     firstActiveAt: str | None = None
     lastActiveAt: str | None = None
     sessions: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    # One character per minute of the IST day (. B I A K) and the screens opened. Missing from this
+    # model until 9 Nov 2026, so Pydantic dropped them and every stored day had no minute states:
+    # the "longest stretch with no output" check (product owner 2026-10-28) never had data.
+    minuteStates: str | None = Field(default=None, max_length=1440)
+    visits: list[dict[str, Any]] = Field(default_factory=list, max_length=3000)
 
 
 # --------------------------------------------------------------------------- shared handlers
