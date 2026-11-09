@@ -62,6 +62,8 @@ class SevaSutraFeedInstance(BaseModel):
     dealershipName: str
     subdomain: str | None
     status: str
+    # While REQUESTED: an existing SevaSutra dealership to attach (the demo, for one) instead of a new one.
+    dealerCode: str | None = None
 
 
 class SevaSutraProject(BaseModel):
@@ -124,7 +126,7 @@ _ASSIGNMENTS_SQL = text(
 
 _INSTANCE_SQL = text(
     """
-    SELECT dealership_name, subdomain, status
+    SELECT dealership_name, subdomain, status, dealer_code
     FROM auditcore.sevasutra_instances WHERE tenant_id = :tenant_id
     """
 )
@@ -188,7 +190,12 @@ def load_service_projects(engine: Engine) -> list[SevaSutraProject]:
                 ],
                 assignments=_assignments(list(assignments)),
                 instance=(
-                    SevaSutraFeedInstance(dealershipName=str(instance["dealership_name"]), subdomain=instance["subdomain"], status=str(instance["status"]))
+                    SevaSutraFeedInstance(
+                        dealershipName=str(instance["dealership_name"]),
+                        subdomain=instance["subdomain"],
+                        status=str(instance["status"]),
+                        dealerCode=instance["dealer_code"],
+                    )
                     if instance
                     else None
                 ),
