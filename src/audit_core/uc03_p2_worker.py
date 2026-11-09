@@ -5171,11 +5171,15 @@ _NAMES_REFRESH_SECONDS = 6 * 3600
 
 
 def _refresh_names_every(engine: Engine) -> None:
-    """People's names from Security, at start and every six hours (2026-10-27)."""
+    """People's names from Security, at start and every six hours (2026-10-27).
+    Also ends the roles of people HR reports as gone once their last day is
+    over (2026-11-09): a leaving date set ahead takes effect here."""
+    from audit_core.people_employment import end_leaver_roles_quietly
     from audit_core.people_names import refresh_people_names
 
     while not _stopping.is_set():
         refresh_people_names(engine)
+        end_leaver_roles_quietly(engine)
         _stopping.wait(_NAMES_REFRESH_SECONDS)
 
 
