@@ -399,6 +399,20 @@ def test_http_routes_and_role_gates(project):
     assert client.post(f"{base}/activity", json={
         "date": tm.ist_today().isoformat(), "activeSeconds": 60, "idleSeconds": 0,
         "backgroundSeconds": 0}).json() == {"recorded": True}
+    # The minute-by-minute record and the screens reach the database through the HTTP route
+    # (until 9 Nov 2026 the request model dropped them and every stored day had none).
+    states = "." * 600 + "KAI" + "." * 837
+    assert client.post(f"{base}/activity", json={
+        "date": tm.ist_today().isoformat(), "activeSeconds": 120, "idleSeconds": 60,
+        "backgroundSeconds": 0, "minuteStates": states,
+        "visits": [{"at": datetime.now(UTC).isoformat(), "screen": "home"}]}).json() == {"recorded": True}
+    with p.engine.connect() as c:
+        set_tenant_context(c, p.tenant)
+        stored = c.execute(text(
+            "SELECT minute_states, jsonb_array_length(screen_visits) FROM auditcore.p2_user_activity_daily "
+            "WHERE tenant_id = :t AND actor_id = :a AND activity_date = :d"),
+            {"t": p.tenant, "a": p.people["PC"], "d": tm.ist_today()}).one()
+    assert stored[0] is not None and stored[0][600:603] == "KAI" and stored[1] == 1
 
     acting["subject"] = p.people["EXECUTIVE"]
     assert client.get(f"{base}/reports/employee-utilisation").status_code == 200
