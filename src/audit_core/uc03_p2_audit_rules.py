@@ -496,6 +496,18 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
         return RuleOutcome(code, "SKIPPED", f"Not checked until the booking date is corrected: {rejected}.")
     if not _standards_known(facts):
         return RuleOutcome(code, "SKIPPED", _NO_STANDARD)
+    # Registration on a scrappage deal (2026-11-09, uc03_scrappage_registration):
+    # a shortfall that is exactly the 25% concession is not an undercharge.
+    from audit_core import uc03_scrappage_registration as scrappage_rule
+    from audit_core.uc03_discount_given import has_figure
+
+    scrappage = scrappage_rule.scrappage_evidence(
+        cod_documents=len(facts.documents(*scrappage_rule.COD_DOCUMENT_TYPES)),
+        scrappage_discounts=[d for d in facts.sheet.get("discounts") or []
+                             if str(d.get("key") or "").startswith("SCRAPPAGE") and has_figure(d)],
+    )
+    explained: list[dict[str, Any]] = []
+    concession_total = Decimal(0)
     short: list[dict[str, Any]] = []
     for group in facts.sheet["categories"]:
         for row in group["components"]:
@@ -510,31 +522,54 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
             if standard is None or charged is None:
                 continue
             gap = standard - charged
+            note = None
+            if gap > _LINE_TOLERANCE and row["key"] in scrappage_rule.REGISTRATION_KEYS:
+                line = scrappage_rule.assess_line(standard=standard, charged=charged, scrappage=scrappage)
+                note = line.get("note")
+                if line["explained"]:
+                    explained.append({"key": row["key"], "label": row["label"], "standard": standard,
+                                      "charged": charged, "short": gap, "concession": line["concession"],
+                                      "scrappage": scrappage})
+                    concession_total += line["concession"]
+                    continue
             if gap > _LINE_TOLERANCE:
                 short.append({"key": row["key"], "label": row["label"], "standard": str(standard),
                               "charged": str(charged), "short": str(gap),
                               "source": (_billed_on(row, charged) if row["billed"] is not None
                                          else "nothing billed" if row.get("currentSource") == "not_invoiced"
-                                         else "booking form")})
+                                         else "booking form"),
+                              **({"note": note} if note else {})})
+    concession_details = {"scrappageConcession": [
+        {k: (str(v) if isinstance(v, Decimal) else v) for k, v in e.items()} for e in explained]}
+    explained_text = "; ".join(
+        f"{e['label']}: {_rupees(e['charged'])} against the standard {_rupees(e['standard'])} is the 25% scrappage "
+        f"concession ({_rupees(e['concession'])}), not counted as short" for e in explained)
     net = facts.sheet["summary"]["net"]
     net_standard, net_current = _dec(net["standard"]), _dec(net["current"])
+    if net_standard is not None:
+        net_standard -= concession_total
     net_gap = net_standard - net_current if net_standard is not None and net_current is not None else None
     if not short and (net_gap is None or net_gap <= _TOLERANCE):
-        return RuleOutcome(code, "PASS", "Every price component is charged at or above its standard price.")
+        reason = "Every price component is charged at or above its standard price"
+        return RuleOutcome(code, "PASS", reason + (f" ({explained_text})." if explained else "."),
+                           concession_details)
     parts = [
         f"{s['label']}: {_rupees(s['charged'])} on the {s['source']} against the standard {_rupees(s['standard'])} "
-        f"({_rupees(s['short'])} short)"
+        f"({_rupees(s['short'])} short{'; ' + s['note'] if s.get('note') else ''})"
         for s in short
     ]
     if net_gap is not None and net_gap > _TOLERANCE:
         parts.append(f"Net deal {_rupees(net_current)} against the standard {_rupees(net_standard)} "
-                     f"({_rupees(net_gap)} short)")
+                     f"({_rupees(net_gap)} short{', after the scrappage concession' if explained else ''})")
+    if explained:
+        parts.append(explained_text)
     return RuleOutcome(code, "FAIL", "; ".join(parts) + ".", {
         "findingTitle": "Deal charged below the standard price",
         "components": short,
         "netStandard": str(net_standard) if net_standard is not None else None,
         "netCurrent": str(net_current) if net_current is not None else None,
         "netShort": str(net_gap) if net_gap is not None else None,
+        **concession_details,
     })
 
 
@@ -1620,6 +1655,13 @@ def run_p2_audit_rules(
             result = RuleOutcome(code, "ERROR", "The check could not run; it will be retried.")
         finding_id = _sync_finding(connection, tenant_id=tenant_id, journey_id=journey_id, stage=stage,
                                    result=result, correlation_id=correlation_id)
+        if code == "DEAL_UNDERCHARGED" and result.outcome in {"PASS", "FAIL"}:
+            # The PC is told when the registration was taken as lower by the
+            # scrappage concession (2026-11-09).
+            from audit_core.uc03_scrappage_registration import refresh_pc_task
+
+            refresh_pc_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                            explained=list(result.details.get("scrappageConcession") or []))
         record_execution(
             connection, tenant_id=tenant_id, journey_id=journey_id, rule_code=code,
             triggering_event=triggering_event, outcome=result.outcome, reason=result.reason,

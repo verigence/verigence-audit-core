@@ -783,6 +783,9 @@ _TASK_TYPE_FINDING_CLASS: dict[str, str] = {
     "ACCOUNT_STATEMENT_NO_EX_SHOWROOM": "DATA_GAP",
     "DOCUMENT_KEY_FIGURES_NOT_READ": "DATA_GAP",
     "STATEMENT_ROWS_DO_NOT_ADD_UP": "DATA_GAP",
+    # 2026-11-09: the registration taken as lower by the scrappage
+    # concession -- for information, the PC checks it against the CoD.
+    "SCRAPPAGE_REGISTRATION_CONCESSION": "DATA_GAP",
     "ACCOUNT_STATEMENT_TALLY_DEVIATION": "DATA_GAP",
     # 2026-10-20: an invoice whose own figures do not add up, or whose taxes
     # were not read (uc03_invoice_materialization) -- the PC re-checks it.
