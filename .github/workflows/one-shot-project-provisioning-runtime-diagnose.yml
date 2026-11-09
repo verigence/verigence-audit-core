@@ -31,7 +31,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm install --global @railway/cli@5.70.0
+          npm install --global @railway/cli
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
 
       - name: Wait for replacement Security deployment

@@ -27,7 +27,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: npm install --global @railway/cli@5.70.0
+      - run: npm install --global @railway/cli
       - name: Collect recent logs
         shell: bash
         run: |

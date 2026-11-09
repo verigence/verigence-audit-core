@@ -25,7 +25,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install Railway CLI
-        run: npm install --global @railway/cli@5.70.0
+        run: npm install --global @railway/cli
 
       - name: Publish in ephemeral Railway private-network sandbox
         shell: bash

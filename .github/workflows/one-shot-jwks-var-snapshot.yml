@@ -15,7 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: {ref: dev, fetch-depth: 0}
-      - run: npm install --global @railway/cli@5.70.0
+      - run: npm install --global @railway/cli
       - shell: bash
         run: |
           set -euo pipefail
