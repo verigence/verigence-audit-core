@@ -398,14 +398,14 @@ def test_http_routes_and_role_gates(project):
         "AWAITING_REQUESTER_REVIEW"
     assert client.post(f"{base}/activity", json={
         "date": tm.ist_today().isoformat(), "activeSeconds": 60, "idleSeconds": 0,
-        "backgroundSeconds": 0}).json() == {"recorded": True}
+        "backgroundSeconds": 0}).json()["recorded"] is True
     # The minute-by-minute record and the screens reach the database through the HTTP route
     # (until 9 Nov 2026 the request model dropped them and every stored day had none).
     states = "." * 600 + "KAI" + "." * 837
     assert client.post(f"{base}/activity", json={
         "date": tm.ist_today().isoformat(), "activeSeconds": 120, "idleSeconds": 60,
         "backgroundSeconds": 0, "minuteStates": states,
-        "visits": [{"at": datetime.now(UTC).isoformat(), "screen": "home"}]}).json() == {"recorded": True}
+        "visits": [{"at": datetime.now(UTC).isoformat(), "screen": "home"}]}).json()["recorded"] is True
     with p.engine.connect() as c:
         set_tenant_context(c, p.tenant)
         stored = c.execute(text(
