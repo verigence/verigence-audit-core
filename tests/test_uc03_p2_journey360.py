@@ -264,6 +264,12 @@ def test_compliance_report_extends_legacy_with_ledger_and_verdict(journey):
     # booking's figure is never compared, 2026-11-02).
     assert "Essential kit" in labels and "Ex-showroom price" not in labels
     assert client.get(f"{base}/duplicates").json() == {"pairs": []}
+    # The crisp report (2026-11-09): what is on file and what is missed, and
+    # until a closure decides them, the observations with a suggested severity.
+    checklist = body["documentChecklist"]
+    assert checklist and {"label", "stage", "requirement", "onFile"} <= set(checklist[0])
+    assert body["reviewerClosure"] is None
+    assert all(c["suggestedSeverity"] in {"HIGH", "MEDIUM", "LOW"} for c in body["observationCandidates"])
 
 
 def test_before_any_billing_document_nothing_is_current(journey):
