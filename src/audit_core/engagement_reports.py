@@ -18,6 +18,7 @@ from typing import Any
 
 from sqlalchemy import Connection, text
 
+from audit_core.activity_settings import activity_rule_note, reading_window_minutes
 from audit_core.task_manager import (
     EXECUTIVE,
     TaskManagerError,
@@ -28,7 +29,6 @@ from audit_core.uc03_p2_object_keys import IST
 
 MAX_DAYS = 93
 PERIODS = ("day", "week", "month")
-IDLE_THRESHOLD_MINUTES = 4
 SESSION_GAP_MINUTES = 30
 
 # Work on a Journey task (as in the Daily Processing report).
@@ -319,16 +319,15 @@ def build_engagement(connection: Connection, *, tenant_id: str, start_day: date,
                      for d in span if d in per_day and per_day[d]["activeMinutes"]],
         })
     out_people.sort(key=lambda p: (_ROLE_ORDER.get(p["role"] or "", 9), (p["name"] or p["actorId"]).lower()))
+    window = reading_window_minutes(connection, tenant_id)
     return {
         "from": start_day.isoformat(), "to": end_day.isoformat(), "period": period,
         "periods": [{"periodStart": p.isoformat(), "label": period_label(p, period)} for p in period_starts],
         "workingDays": working_days(start_day, end_day),
-        "idleThresholdMinutes": IDLE_THRESHOLD_MINUTES, "sessionGapMinutes": SESSION_GAP_MINUTES,
+        "idleThresholdMinutes": window, "readingWindowMinutes": window, "sessionGapMinutes": SESSION_GAP_MINUTES,
         "people": out_people,
         "notes": [
-            ("Time on Verigence is measured in the browser: active = a click, tap, key or scroll with the app "
-             f"visible; idle = visible with no interaction for {IDLE_THRESHOLD_MINUTES} minutes or more; "
-             "background = tab hidden or app minimised."),
+            activity_rule_note(window),
             (f"A session is a stretch of use with no break of {SESSION_GAP_MINUTES} minutes or more. Sessions are "
              "counted from 27 Oct 2026; days before show time but no sessions."),
             ("Efficacy figures are plain ratios: files and tasks per active hour, tasks closed on time, the share "
@@ -458,15 +457,21 @@ def _hhmm(minute: int) -> str:
 def day_analysis(minute_states: str | None, output_minutes: list[int]) -> dict[str, Any] | None:
     """The day minute by minute: the longest stretch without output, the
     20-minute blocks, and stretches of scrolling with no click. None when the
-    browser sent no minutes for the day."""
+    browser sent no minutes for the day.
+
+    From 9 Nov 2026 the app marks a scrolled minute with no click, tap or key in
+    the reading window S (idle, kept apart); before, a scroll made the minute A
+    like reading after a click. Scrolling-only stretches are runs of S, or, on a
+    day the app sent no S at all (the earlier rule), runs of A with no K."""
     if not minute_states:
         return None
     active = [i for i, c in enumerate(minute_states) if c in "AK"]
-    used = [i for i, c in enumerate(minute_states) if c in "AKI"]
+    used = [i for i, c in enumerate(minute_states) if c in "AKSI"]
+    scroll_marks = "S" if "S" in minute_states else "A"
     if not active:
         return {"firstActive": None, "lastActive": None, "longestNoOutput": None, "blocks": [],
                 "blockCounts": {"WORKING": 0, "ACTIVE_NO_OUTPUT": 0, "IDLE": 0, "AWAY": 0},
-                "scrollOnly": [], "activeMinutes": 0}
+                "scrollOnly": [], "activeMinutes": 0, "scrollOnlyMinutes": minute_states.count("S")}
     first, last = active[0], active[-1]
     marks = sorted({m for m in output_minutes if first <= m <= last})
     edges = [first, *marks, last + 1]
@@ -486,24 +491,28 @@ def day_analysis(minute_states: str | None, output_minutes: list[int]) -> dict[s
         window = minute_states[b:b + BLOCK_MINUTES]
         n_out = sum(1 for m in out_set if b <= m < b + BLOCK_MINUTES)
         n_active = sum(1 for c in window if c in "AK")
-        n_idle = window.count("I")
+        n_scroll = window.count("S")
+        n_idle = window.count("I") + n_scroll  # scrolling with no click is idle (2026-11-09)
         state = ("WORKING" if n_out else "ACTIVE_NO_OUTPUT" if n_active else "IDLE" if n_idle else "AWAY")
         counts[state] += 1
         blocks.append({"from": _hhmm(b), "to": _hhmm(b + BLOCK_MINUTES) if b + BLOCK_MINUTES < 1440 else "24:00",
                        "state": state, "outputs": n_out, "activeMinutes": n_active,
-                       "idleMinutes": n_idle, "hiddenMinutes": window.count("B")})
+                       "idleMinutes": n_idle, "scrollOnlyMinutes": n_scroll, "hiddenMinutes": window.count("B")})
     scroll_only = []
     run_start = None
-    for i in range(first, last + 2):
+    scan_from = min(i for i, c in enumerate(minute_states) if c in "AKS")
+    scan_to = max(i for i, c in enumerate(minute_states) if c in "AKS")
+    for i in range(scan_from, scan_to + 2):
         c = minute_states[i] if i <= 1439 else "."
-        if c == "A":
+        if c == scroll_marks:
             run_start = i if run_start is None else run_start
             continue
         if run_start is not None and i - run_start >= SCROLL_ONLY_MINUTES:
             scroll_only.append({"from": _hhmm(run_start), "to": _hhmm(min(i, 1439)), "minutes": i - run_start})
         run_start = None
     return {"firstActive": _hhmm(first), "lastActive": _hhmm(last), "longestNoOutput": longest,
-            "blocks": blocks, "blockCounts": counts, "scrollOnly": scroll_only, "activeMinutes": len(active)}
+            "blocks": blocks, "blockCounts": counts, "scrollOnly": scroll_only, "activeMinutes": len(active),
+            "scrollOnlyMinutes": minute_states.count("S")}
 
 
 def merged_minutes(rows: list[dict[str, Any]]) -> str | None:
@@ -561,8 +570,11 @@ def person_day(connection: Connection, *, tenant_id: str, actor_id: str, day: da
     for item in timeline:
         item["journeyReference"] = refs.get(str(item["journeyId"])) if item["journeyId"] else None
     names = known_names(connection, tenant_id=tenant_id)
+    window = reading_window_minutes(connection, tenant_id)
     return {
         "actorId": actor_id, "name": (person or {}).get("displayName") or names.get(actor_id), "role": role,
+        "readingWindowMinutes": window,
+        "scrollOnlyMinutes": minutes.count("S") if minutes else 0,
         "day": day.isoformat(),
         "activeMinutes": round(sum(int(r["active_seconds"]) for r in rows) / 60),
         "idleMinutes": round(sum(int(r["idle_seconds"]) for r in rows) / 60),
@@ -583,9 +595,12 @@ def person_day(connection: Connection, *, tenant_id: str, actor_id: str, day: da
         "notes": [
             ("Output for a PC: files uploaded, journeys started, task actions, values corrected or confirmed, pages "
              "removed, retried or retyped. For a Reviewer (and supervisors) opening a document also counts."),
+            activity_rule_note(window),
             (f"The day is cut into {BLOCK_MINUTES}-minute blocks: Working (at least one output), Active with no "
-             "output (clicks or scrolls, nothing saved), Idle (open, untouched), Away (hidden or closed)."),
-            f"Scrolling only: {SCROLL_ONLY_MINUTES} minutes or more active with no click, tap or key.",
+             "output (clicks, taps or keys, nothing saved), Idle (open with no click, tap or key; scrolling "
+             "included), Away (hidden or closed)."),
+            (f"Scrolling only: {SCROLL_ONLY_MINUTES} minutes or more of scrolling with no click, tap or key "
+             f"within {window} minutes (before November 2026: active minutes with no click)."),
             "Minute-by-minute detail and screens are recorded from 28 Oct 2026; earlier days show totals only.",
         ],
     }

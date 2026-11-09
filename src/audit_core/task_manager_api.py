@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, text
 
+from audit_core.activity_settings import reading_window, reading_window_minutes
 from audit_core.authorization import AuthorizationError
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import (
@@ -169,7 +170,7 @@ class ActivityCommand(BaseModel):
     firstActiveAt: str | None = None
     lastActiveAt: str | None = None
     sessions: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
-    # One character per minute of the IST day (. B I A K) and the screens opened. Missing from this
+    # One character per minute of the IST day (. B I S A K) and the screens opened. Missing from this
     # model until 9 Nov 2026, so Pydantic dropped them and every stored day had no minute states:
     # the "longest stretch with no output" check (product owner 2026-10-28) never had data.
     minuteStates: str | None = Field(default=None, max_length=1440)
@@ -367,10 +368,20 @@ def activity(tenant_id: str, command: ActivityCommand, principal: Principal, cli
     caller = _project_caller(connection, tenant_id=tenant_id, principal=principal, client=client,
                              require_role=False)
     if caller.role is None:
-        return {"recorded": False}
+        return {"recorded": False, "readingWindowMinutes": reading_window_minutes(connection, tenant_id)}
     recorded = _run(lambda: record_activity(connection, tenant_id=tenant_id, caller=caller,
                                             payload=command.model_dump()))
-    return {"recorded": recorded}
+    # The app picks up a changed reading window from its next send (product owner 2026-11-09).
+    return {"recorded": recorded, "readingWindowMinutes": reading_window_minutes(connection, tenant_id)}
+
+
+@router.get("/activity/settings")
+def activity_settings(tenant_id: str, principal: Principal, client: Client, connection: Db) -> dict[str, Any]:
+    """The reading window the app classifies each minute with (activity_settings): a minute is
+    active when a click, tap or key was in it or in this many minutes before it."""
+    _project_caller(connection, tenant_id=tenant_id, principal=principal, client=client, require_role=False)
+    window = reading_window(connection, tenant_id)
+    return {"readingWindowMinutes": window["minutes"], "scope": window["scope"]}
 
 
 # --------------------------------------------------------------------------- superadmin routes

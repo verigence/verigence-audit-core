@@ -26,7 +26,6 @@ from audit_core.task_manager import (
 from audit_core.uc03_p2_object_keys import IST
 
 MAX_UTILISATION_DAYS = 31
-IDLE_THRESHOLD_MINUTES = 4
 _FLAG_LIMIT = 300
 
 # A person's work on a Journey task (as in the Daily Processing report).
@@ -320,8 +319,11 @@ def _stored_day(connection: Connection, *, tenant_id: str, actor_id: str, day: d
 
 # One character per minute of the IST day (2026-10-28): nothing, hidden, idle,
 # active, and a click / tap / key in that very minute. Busiest wins on merge,
-# so a repeated or late send never lowers a minute.
-MINUTE_RANK = {".": 0, "B": 1, "I": 2, "A": 3, "K": 4}
+# so a repeated or late send never lowers a minute. S (2026-11-09): visible and
+# scrolled, with no click, tap or key in the reading window -- counted as idle,
+# kept apart so the reports can show scrolling with no click. An A is a minute in
+# the reading window after a click (before 9 Nov: also after a scroll).
+MINUTE_RANK = {".": 0, "B": 1, "I": 2, "S": 3, "A": 4, "K": 5}
 MINUTES_PER_DAY = 1440
 
 
@@ -531,13 +533,15 @@ def build_utilisation(connection: Connection, *, tenant_id: str, start_day: date
         })
     role_order = {EXECUTIVE: 0, "PM": 1, "TL": 2, "CRM": 3, "REVIEWER": 4, "PC": 5}
     out_people.sort(key=lambda p: (role_order.get(p["role"] or "", 9), (p["name"] or p["actorId"]).lower()))
+    from audit_core.activity_settings import activity_rule_note, reading_window_minutes
+
+    window = reading_window_minutes(connection, tenant_id)
     return {
-        "from": start_day.isoformat(), "to": end_day.isoformat(), "idleThresholdMinutes": IDLE_THRESHOLD_MINUTES,
+        "from": start_day.isoformat(), "to": end_day.isoformat(), "idleThresholdMinutes": window,
+        "readingWindowMinutes": window,
         "people": out_people,
         "notes": [
-            ("Time on Verigence is measured in the browser: active = a click, tap, key or scroll with the app "
-             f"visible; idle = visible with no interaction for {IDLE_THRESHOLD_MINUTES} minutes or more; "
-             "background = tab hidden or app minimised."),
+            activity_rule_note(window),
             ("It measures interaction, not work: read it next to the output figures. Minutes since the last send "
              "are lost if the browser is closed abruptly (an undercount, never an overcount); someone using two "
              "browsers on the same day shows the larger of the two."),

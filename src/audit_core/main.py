@@ -7,6 +7,7 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from audit_core import mahindra_masters, role_mappings
+from audit_core.activity_settings import admin_router as activity_settings_admin_router
 from audit_core.config import load_settings
 from audit_core.contract_guards import install_contract_guards
 from audit_core.daily_operations_api import router as daily_operations_router
@@ -340,6 +341,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_upload_pause_router)
     application.include_router(uc03_p2_upload_pause_admin_router)
     application.include_router(data_archive_router)
+    application.include_router(activity_settings_admin_router)
     application.include_router(uc03_p2_daily_report_router)
     application.include_router(uc03_p2_location_checks_router)
     application.include_router(uc03_p2_location_checks_admin_router)
