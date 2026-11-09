@@ -4337,7 +4337,29 @@ def compliance_report(connection: Connection, *, tenant_id: str, journey_id: UUI
         # The Reviewer's closure summary (product owner 2026-11-04): every open
         # item at closure and the specific answer given for it. None until closed.
         "reviewerClosure": _reviewer_closure(connection, tenant_id=tenant_id, journey_id=journey_id),
+        # The crisp report (product owner 2026-11-09): what is on file and what
+        # is missed, and -- until a closure decides them -- the observations
+        # the closure will list, each with its suggested severity.
+        "documentChecklist": _document_checklist(connection, tenant_id=tenant_id, journey_id=journey_id),
+        "observationCandidates": _observation_candidates(connection, tenant_id=tenant_id, journey_id=journey_id),
     }
+
+
+def _document_checklist(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    from audit_core.uc03_p2_audit_summary import required_documents
+
+    return [{"key": d["key"], "label": d["label"], "stage": d["stage"], "requirement": d["requirement"],
+             "reason": d.get("reason"), "onFile": bool(d["onFile"])}
+            for d in required_documents(connection, tenant_id=tenant_id, journey_id=journey_id)]
+
+
+def _observation_candidates(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    from audit_core.uc03_reviewer_closure import closure_items
+
+    return [{"key": i["key"], "kind": i["kind"], "stage": i.get("stage"), "label": i["label"],
+             "detail": i.get("detail"), "suggestedSeverity": i["suggestedSeverity"],
+             "suggestedStands": i["suggestedStands"], "prefilledAnswer": i.get("prefilledAnswer")}
+            for i in closure_items(connection, tenant_id=tenant_id, journey_id=journey_id)["items"]]
 
 
 def _closure_state(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
