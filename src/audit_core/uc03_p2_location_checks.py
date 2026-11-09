@@ -5,9 +5,12 @@ moments: between 1 and 3 times in each clock hour, only between 10:00 and 19:30
 IST." The app (web or Android) picks the moments; each check sends where the
 device is, and Audit Core decides what it means:
 
-    POST /p2/v1/tenants/{tenant_id}/location-checks        a PC's check
-    GET  /p2/v1/tenants/{tenant_id}/location-checks        the day's log (TL, PM, Executive)
-    GET  /v1/admin/tenants/{tenant_id}/location-checks     the same, for SuperAdmin
+    POST /p2/v1/tenants/{tenant_id}/location-checks             a PC's check
+    GET  /p2/v1/tenants/{tenant_id}/location-checks             the day's log (Executive)
+    GET  /v1/admin/tenants/{tenant_id}/location-checks          the same, for SuperAdmin
+    GET  /p2/v1/tenants/{tenant_id}/location-checks:away        every AWAY check further than minKm
+                                                                over a range of days (Executive)
+    GET  /v1/admin/tenants/{tenant_id}/location-checks:away     the same, for SuperAdmin
 
 The distance is worked out here (Haversine) to the nearest outlet the PC is
 assigned to in the Project, among those with coordinates; a distance sent by a
@@ -30,6 +33,7 @@ from __future__ import annotations
 import math
 from collections import defaultdict
 from datetime import UTC, date, datetime, time, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -396,17 +400,37 @@ def get_location_checks(
     day: Annotated[date | None, Query()] = None,
     away_only: Annotated[bool, Query(alias="awayOnly")] = False,
 ) -> dict[str, Any]:
-    """The log for TLs, PMs and Executives of the Project (and an admin acting in it)."""
+    """The log for the Executives of the Project (and an admin acting in it)."""
+    visible = _reader_scope(connection, tenant_id=tenant_id, human_principal=human_principal,
+                            authorization_client=authorization_client)
+    return build_location_log(connection, tenant_id=tenant_id, day=day or ist_today(),
+                              away_only=away_only, visible=visible)
+
+
+def _reader_scope(
+    connection: Connection, *, tenant_id: str, human_principal: HumanPrincipal,
+    authorization_client: SecurityAuthorizationClient,
+) -> set[str] | None:
+    """Refuse anyone but an Executive of the Project (or an admin acting in it) and
+    return the PCs they see (None: all). Sets the tenant context."""
     decision = check_p2_permission(tenant_id=tenant_id, human_principal=human_principal,
                                    authorization_client=authorization_client, permission_key=_READ_PERMISSION)
     set_tenant_context(connection, tenant_id)
-    visible: set[str] | None = None
-    if str(getattr(decision, "role_key", "") or "").upper() not in _ADMIN_FUNCTIONAL_ROLES:
-        if caller_role(connection, tenant_id=tenant_id, actor_id=human_principal.subject) not in _VIEWER_ROLES:
-            raise AuthorizationError(error_code="VAC-AUTH-002", status_code=403, title="Permission denied")
-        visible = _visible_pcs(connection, tenant_id=tenant_id, viewer_id=human_principal.subject)
-    return build_location_log(connection, tenant_id=tenant_id, day=day or ist_today(),
-                              away_only=away_only, visible=visible)
+    if str(getattr(decision, "role_key", "") or "").upper() in _ADMIN_FUNCTIONAL_ROLES:
+        return None
+    if caller_role(connection, tenant_id=tenant_id, actor_id=human_principal.subject) not in _VIEWER_ROLES:
+        raise AuthorizationError(error_code="VAC-AUTH-002", status_code=403, title="Permission denied")
+    return _visible_pcs(connection, tenant_id=tenant_id, viewer_id=human_principal.subject)
+
+
+def _admin_project(connection: Connection, *, tenant_id: str, admin: HumanAdminRequest) -> None:
+    """SuperAdmin only, and the Project must exist. Sets the tenant context."""
+    if not admin.admin_context.is_super_admin:
+        raise AuthorizationError(error_code="VAC-AUTH-002", status_code=403, title="Permission denied")
+    set_tenant_context(connection, tenant_id)
+    if connection.execute(text("SELECT 1 FROM auditcore.projects WHERE tenant_id = :t"),
+                          {"t": tenant_id}).scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Project not found.")
 
 
 @admin_router.get("/location-checks")
@@ -418,11 +442,167 @@ def admin_get_location_checks(
     away_only: Annotated[bool, Query(alias="awayOnly")] = False,
 ) -> dict[str, Any]:
     """The same log for SuperAdmin, one Project at a time."""
-    if not admin.admin_context.is_super_admin:
-        raise AuthorizationError(error_code="VAC-AUTH-002", status_code=403, title="Permission denied")
-    set_tenant_context(connection, tenant_id)
-    if connection.execute(text("SELECT 1 FROM auditcore.projects WHERE tenant_id = :t"),
-                          {"t": tenant_id}).scalar_one_or_none() is None:
-        raise HTTPException(status_code=404, detail="Project not found.")
+    _admin_project(connection, tenant_id=tenant_id, admin=admin)
     return build_location_log(connection, tenant_id=tenant_id, day=day or ist_today(),
                               away_only=away_only, visible=None)
+
+
+# --------------------------------------------------------------------------- away instances over a range
+
+# Product owner, 9 Nov 2026: "can we show just consolidate view date wise and
+# roughly how far they were during each instance.. you should report the one for
+# which they were away more than 5 km". Every AWAY check further than minKm from
+# the PC's nearest outlet, over a range of India dates, with a summary per date and
+# per PC. An UNCLEAR check (a reading too inaccurate to place anyone) is never AWAY,
+# so it is never listed here however far it points.
+DEFAULT_AWAY_MIN_KM = 5.0
+MAX_RANGE_DAYS = 92  # 'to' at most 92 days after 'from' (93 days, about a quarter)
+_MAX_INSTANCES = 5000
+
+
+def _km(metres: Any) -> float:
+    """Metres as kilometres rounded to 0.1 (half up: 5,150 m is 5.2 km)."""
+    return float((Decimal(str(metres)) / 1000).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
+
+def away_range(*, date_from: date | None, date_to: date | None, today: date) -> tuple[date, date]:
+    """The India dates asked for. Neither given: this calendar month so far. Only
+    'to': from the first of its month. Only 'from': up to today."""
+    last = date_to or today
+    first = date_from or last.replace(day=1)
+    if last < first:
+        raise HTTPException(status_code=422, detail="'to' is before 'from'.")
+    if (last - first).days > MAX_RANGE_DAYS:
+        raise HTTPException(status_code=422, detail=f"Choose at most {MAX_RANGE_DAYS + 1} days at a time.")
+    return first, last
+
+
+def build_away_report(
+    connection: Connection, *, tenant_id: str, date_from: date, date_to: date, min_km: float,
+    visible: set[str] | None,
+) -> dict[str, Any]:
+    """The AWAY checks further than ``min_km`` between two India dates (both included):
+    every instance by date and time, and a summary per date and per PC."""
+    start = datetime.combine(date_from, time(0, 0), IST)
+    end = datetime.combine(date_to + timedelta(days=1), time(0, 0), IST)
+    rows = connection.execute(
+        text(
+            """
+            SELECT check_id, actor_id, checked_at_utc, distance_m, accuracy_m, nearest_outlet_id,
+                   nearest_outlet_name, location_source, device_type
+            FROM auditcore.p2_location_checks
+            WHERE tenant_id = :t AND check_status = 'AWAY' AND distance_m > :min_m
+              AND checked_at_utc >= :s AND checked_at_utc < :e
+              AND (CAST(:everyone AS boolean) OR actor_id = ANY(CAST(:actors AS varchar[])))
+            ORDER BY checked_at_utc, actor_id, check_id
+            """
+        ),
+        {"t": tenant_id, "min_m": Decimal(str(min_km)) * 1000, "s": start, "e": end,
+         "everyone": visible is None, "actors": sorted(visible or ())},
+    ).mappings().all()
+    names = known_names(connection, tenant_id=tenant_id) if rows else {}
+
+    instances: list[dict[str, Any]] = []
+    days: dict[str, dict[str, Any]] = {}
+    people: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        actor = str(row["actor_id"])
+        local = row["checked_at_utc"].astimezone(IST)
+        day_key = local.date().isoformat()
+        km = _km(row["distance_m"])
+        item = {
+            "checkId": str(row["check_id"]),
+            "actorId": actor,
+            "name": names.get(actor),
+            "date": day_key,
+            "time": local.strftime("%H:%M"),
+            "checkedAtUtc": row["checked_at_utc"],
+            "distanceM": _number(row["distance_m"]),
+            "distanceKm": km,
+            "outletId": str(row["nearest_outlet_id"]) if row["nearest_outlet_id"] else None,
+            "outletName": row["nearest_outlet_name"],
+            "accuracyM": _number(row["accuracy_m"]),
+            "source": row["location_source"],
+            "deviceType": row["device_type"],
+        }
+        if len(instances) < _MAX_INSTANCES:
+            instances.append(item)
+        summary = days.setdefault(day_key, {"date": day_key, "instances": 0, "actors": set(), "furthestKm": 0.0})
+        summary["instances"] += 1
+        summary["actors"].add(actor)
+        summary["furthestKm"] = max(summary["furthestKm"], km)
+        person = people.setdefault(actor, {
+            "actorId": actor, "name": names.get(actor), "instances": 0, "dates": set(), "furthestKm": 0.0,
+        })
+        person["instances"] += 1
+        person["dates"].add(day_key)
+        person["furthestKm"] = max(person["furthestKm"], km)
+        person["last"] = item  # rows come oldest first
+
+    by_date = [
+        {"date": d["date"], "instances": d["instances"], "pcs": len(d["actors"]), "furthestKm": d["furthestKm"]}
+        for d in days.values()
+    ]
+    by_pc = [
+        {
+            "actorId": p["actorId"], "name": p["name"], "instances": p["instances"], "days": len(p["dates"]),
+            "furthestKm": p["furthestKm"],
+            "last": {key: p["last"][key] for key in ("date", "time", "checkedAtUtc", "distanceKm", "outletName")},
+        }
+        for p in people.values()
+    ]
+    by_pc.sort(key=lambda p: (-p["instances"], -p["furthestKm"], (p["name"] or p["actorId"]).lower()))
+    return {
+        "from": date_from.isoformat(),
+        "to": date_to.isoformat(),
+        "timezone": "Asia/Kolkata",
+        "minKm": min_km,
+        "radiusM": GEOFENCE_RADIUS_M,
+        "accuracyLimitM": ACCURACY_LIMIT_M,
+        "maxRangeDays": MAX_RANGE_DAYS + 1,
+        "totals": {
+            "instances": len(rows), "pcs": len(people), "days": len(days),
+            "furthestKm": max((p["furthestKm"] for p in by_pc), default=None),
+        },
+        "byDate": by_date,
+        "byPc": by_pc,
+        "instances": instances,
+        "truncated": len(rows) > len(instances),
+    }
+
+
+_MinKm = Annotated[float, Query(alias="minKm", gt=0, le=1000)]
+
+
+@router.get("/location-checks:away")
+def get_location_checks_away(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    date_from: Annotated[date | None, Query(alias="from")] = None,
+    date_to: Annotated[date | None, Query(alias="to")] = None,
+    min_km: _MinKm = DEFAULT_AWAY_MIN_KM,
+) -> dict[str, Any]:
+    """Away more than minKm, date-wise, for the Executives of the Project (product owner 2026-11-09)."""
+    visible = _reader_scope(connection, tenant_id=tenant_id, human_principal=human_principal,
+                            authorization_client=authorization_client)
+    first, last = away_range(date_from=date_from, date_to=date_to, today=ist_today())
+    return build_away_report(connection, tenant_id=tenant_id, date_from=first, date_to=last, min_km=min_km,
+                             visible=visible)
+
+
+@admin_router.get("/location-checks:away")
+def admin_get_location_checks_away(
+    tenant_id: str,
+    admin: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    date_from: Annotated[date | None, Query(alias="from")] = None,
+    date_to: Annotated[date | None, Query(alias="to")] = None,
+    min_km: _MinKm = DEFAULT_AWAY_MIN_KM,
+) -> dict[str, Any]:
+    """The same for SuperAdmin, one Project at a time."""
+    _admin_project(connection, tenant_id=tenant_id, admin=admin)
+    first, last = away_range(date_from=date_from, date_to=date_to, today=ist_today())
+    return build_away_report(connection, tenant_id=tenant_id, date_from=first, date_to=last, min_km=min_km,
+                             visible=None)
