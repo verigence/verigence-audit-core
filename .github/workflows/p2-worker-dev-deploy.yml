@@ -36,7 +36,7 @@ jobs:
           ref: ${{ env.DEPLOY_SHA }}
 
       - name: Install Railway CLI
-        run: npm install --global @railway/cli
+        run: npm install --global @railway/cli@5.70.0
 
       - name: Link approved Railway DEV project
         shell: bash

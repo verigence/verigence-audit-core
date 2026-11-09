@@ -97,7 +97,7 @@ jobs:
           PY
 
       - name: Install Railway CLI
-        run: npm install --global @railway/cli
+        run: npm install --global @railway/cli@5.70.0
 
       - name: Link and verify Audit Core Railway DEV target
         shell: bash

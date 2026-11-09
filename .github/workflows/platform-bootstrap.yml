@@ -30,7 +30,7 @@ jobs:
           fi
 
       - name: Install Railway CLI
-        run: npm install --global @railway/cli
+        run: npm install --global @railway/cli@5.70.0
 
       - name: Link target project and environment
         shell: bash
