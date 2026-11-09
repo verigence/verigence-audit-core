@@ -53,7 +53,12 @@ from audit_core.uc03_p2_journey_views import (
     BREAKDOWN_SQL,
     COUNTS_SQL,
     SCOPED_SQL,
+    SUGGEST_LIMIT,
+    SUGGEST_SQL,
     counts_from_row,
+    masked_mobile,
+    scope_params,
+    suggestion_ready,
     view_sql,
 )
 from audit_core.uc03_p2_object_keys import original_key
@@ -567,14 +572,18 @@ def list_p2_journeys(
     pc_actor_id: str | None = None,
     sort: str | None = None,
     month_basis: str | None = None,
+    dealer_id: UUID | None = None,
+    kind: str | None = None,
 ) -> dict[str, Any]:
     """Bookings / Journey 360 list, one page of one tab (uc03_p2_journey_views):
     ``view`` names the tab (``state`` open / closed / all is the older
     spelling), ``offset`` / ``limit`` the page (50 by default), and ``month``
     (YYYY-MM, the month the journey was started; with ``month_basis=business``
     the month of its booking date or delivery date, the Team Lead dashboard's
-    calendar month), ``outlet_id`` and
-    ``pc_actor_id`` narrow it. ``sort=outlet`` lists Outlet by Outlet, the
+    calendar month), ``dealer_id``, ``outlet_id`` and ``pc_actor_id`` narrow
+    it, ``kind`` (booking / delivery) keeps Bookings only or Deliveries only,
+    and ``q`` searches it (a customer's name or mobile number, the vehicle,
+    the Outlet or the Journey; uc03_p2_journey_views). ``sort=outlet`` lists Outlet by Outlet, the
     tab's own order inside each. ``nextOffset`` is set when there is more."""
     _authorize(
         connection,
@@ -584,7 +593,6 @@ def list_p2_journeys(
         authorization_client=authorization_client,
         permission_key=_READ_PERMISSION,
     )
-    search = (q or "").strip()
     chosen = view if view in ALL_VIEWS else (state if state in {"open", "closed", "all"} else "all")
     where, order = view_sql(chosen, sort)
     page_size = min(max(limit, 1), 250)
@@ -813,12 +821,10 @@ def list_p2_journeys(
         {
             "tenant_id": tenant_id,
             "actor_id": human_principal.subject,
-            "search": search,
+            **scope_params(search=q, dealer_id=dealer_id, outlet_id=outlet_id, pc_actor_id=pc_actor_id, kind=kind),
             "date_floor": programme_date_floor() or date(1900, 1, 1),
             "limit": page_size + 1,
             "offset": max(offset, 0),
-            "outlet_id": str(outlet_id) if outlet_id else None,
-            "pc_actor_id": (pc_actor_id or "").strip() or None,
             "month": month if month and re.fullmatch(r"\d{4}-\d{2}", month) else None,
             "month_basis": _month_basis(month_basis),
             "timezone": _project_timezone(connection, tenant_id),
@@ -884,10 +890,12 @@ def journey_view_counts(
     pc_actor_id: str | None = None,
     breakdown: bool = False,
     month_basis: str | None = None,
+    dealer_id: UUID | None = None,
+    kind: str | None = None,
 ) -> dict[str, Any]:
     """How many journeys each list tab holds, under the same filters as the
     list. ``breakdown`` adds open / needs TL / overdue / high-risk / stuck
-    per outlet and per PC (the TL / PM strip). With ``month`` and
+    per Dealership, per outlet and per PC (the TL / PM / Executive strip). With ``month`` and
     ``month_basis=business``, ``bookings_in_month`` / ``deliveries_in_month``
     count the journeys whose booking / delivery date is in that month."""
     _authorize(
@@ -897,9 +905,7 @@ def journey_view_counts(
     params = {
         "tenant_id": tenant_id,
         "actor_id": human_principal.subject,
-        "search": (q or "").strip(),
-        "outlet_id": str(outlet_id) if outlet_id else None,
-        "pc_actor_id": (pc_actor_id or "").strip() or None,
+        **scope_params(search=q, dealer_id=dealer_id, outlet_id=outlet_id, pc_actor_id=pc_actor_id, kind=kind),
         "month": month if month and re.fullmatch(r"\d{4}-\d{2}", month) else None,
         "month_basis": _month_basis(month_basis),
         "date_floor": programme_date_floor() or date(1900, 1, 1),
@@ -919,14 +925,79 @@ def journey_view_counts(
                 out.append(item)
             return out
 
+        result["byDealer"] = [
+            {**r, "dealer_id": str(r["dealer_id"])}
+            for r in rows("s.dealer_id, MAX(s.dealer_name) AS dealer_name", "s.dealer_id")
+        ]
         result["byOutlet"] = [
             {**r, "outlet_id": str(r["outlet_id"])}
-            for r in rows("s.outlet_id, MAX(s.outlet_name) AS outlet_name, MAX(s.outlet_code) AS outlet_code",
-                          "s.outlet_id")
+            # The Outlet's Dealership too, so a Dealership's Outlets can be offered on their own.
+            for r in rows("s.outlet_id, MAX(s.outlet_name) AS outlet_name, MAX(s.outlet_code) AS outlet_code, "
+                          "MAX(CAST(s.dealer_id AS text)) AS dealer_id", "s.outlet_id")
         ]
         result["byPc"] = rows("s.created_by_actor_id AS pc_actor_id, MAX(s.pc_name) AS pc_name",
                               "s.created_by_actor_id")
     return result
+
+
+@router.get("/journeys:suggest")
+def journey_suggestions(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+    q: str | None = None,
+    month: str | None = None,
+    month_basis: str | None = None,
+    dealer_id: UUID | None = None,
+    outlet_id: UUID | None = None,
+    pc_actor_id: str | None = None,
+    kind: str | None = None,
+    limit: int = SUGGEST_LIMIT,
+) -> dict[str, Any]:
+    """Search as you type (product owner 2026-11-09): up to ``limit`` (8) journeys
+    matching ``q`` with the list's own scope, filters and matching, newest first --
+    the customer, the mobile masked to its last four, the Dealership / Outlet, the
+    PC, and whether it is a booking or a delivery with its date. Nothing is read
+    until ``q`` has two characters (three digits for a number)."""
+    _authorize(
+        connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_READ_PERMISSION,
+    )
+    if not suggestion_ready(q):
+        return {"items": []}
+    rows = connection.execute(
+        text(SUGGEST_SQL),
+        {
+            "tenant_id": tenant_id,
+            "actor_id": human_principal.subject,
+            **scope_params(search=q, dealer_id=dealer_id, outlet_id=outlet_id, pc_actor_id=pc_actor_id, kind=kind),
+            "month": month if month and re.fullmatch(r"\d{4}-\d{2}", month) else None,
+            "month_basis": _month_basis(month_basis),
+            "date_floor": programme_date_floor() or date(1900, 1, 1),
+            "timezone": _project_timezone(connection, tenant_id),
+            "limit": min(max(limit, 1), 10),
+        },
+    ).mappings().all()
+    items = []
+    for row in rows:
+        delivery = row["delivery_date"]
+        items.append({
+            "journeyId": str(row["journey_id"]),
+            "journeyReference": row["journey_reference"],
+            "customerName": row["customer_name"],
+            "mobileMasked": masked_mobile(row["mobile_number"], row["document_phone"], row["mobile_last4"]),
+            "dealerName": row["dealer_name"],
+            "outletName": row["outlet_name"] or row["outlet_code"],
+            "pcName": row["pc_name"],
+            "vehicle": row["vehicle"],
+            # A delivery once its delivery has a date (started or delivered), else a booking.
+            "kind": "DELIVERY" if delivery is not None else "BOOKING",
+            "date": (delivery or row["booking_date"]).isoformat() if (delivery or row["booking_date"]) else None,
+        })
+    return {"items": items}
 
 
 @router.get("/journeys:summary")
