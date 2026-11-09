@@ -49,6 +49,17 @@ number"). A mobile search ignores spaces, dashes, a +91 country code and a
 leading 0; four digits match the number's last four (as before), five or more
 match anywhere in the number -- on the customer record or on a customer phone
 read from one of the Journey's own documents (mobile_search_pattern).
+
+``kind`` keeps Bookings only or Deliveries only (product owner 2026-11-09), by the
+same dates as the month figures: a booking by its booking date, a delivery by its
+delivery date (the delivery started or delivered). With a calendar month (business
+basis) Bookings only are the journeys whose booking date is in the month and
+Deliveries only those whose delivery date is -- the bookings_in_month /
+deliveries_in_month figures; without one, every journey is a booking and the
+deliveries are the journeys with a delivery date. The tabs' counts follow it.
+
+journeys:suggest (SUGGEST_SQL) is search as you type: the same scope, filters and
+matching as the list, at most a few journeys, newest first.
 """
 from __future__ import annotations
 
@@ -65,9 +76,123 @@ _IN_FLIGHT = ("QUEUED", "PREPARING_PAGE", "DI_UPLOAD_PREPARING", "DI_UPLOADING",
               "CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE", "RETRY_WAIT")
 _IN_FLIGHT_SQL = ", ".join(f"'{s}'" for s in _IN_FLIGHT)
 
+# --- Pieces the list (SCOPED_SQL) and the search suggestions (SUGGEST_SQL) share, so
+# both see the same journeys and match a search the same way. No literal braces:
+# BREAKDOWN_SQL is filled in with str.format.
+
+# Journeys with a customer phone read from one of their own documents that matches the
+# searched mobile number; nothing is read without one (the (tenant_id, field_key) index).
+_PHONE_HITS_CTE = """phone_hits AS (
+        SELECT DISTINCT f.journey_id
+        FROM auditcore.journey_document_extracted_fields f
+        JOIN auditcore.evidence e
+          ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+         AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
+        WHERE CAST(:mobile_pattern AS varchar) IS NOT NULL
+          AND f.tenant_id = :tenant_id AND f.field_key = 'customer_phone'
+          AND regexp_replace(COALESCE(f.effective_value::text, ''), '[^0-9]', '', 'g')
+              LIKE CAST(:mobile_pattern AS varchar)
+    )"""
+
+_VEHICLE_SQL = """NULLIF(concat_ws(' · ',
+                 NULLIF(jp.model_name_snapshot,''),
+                 NULLIF(jp.variant_name_snapshot,''),
+                 NULLIF(jp.colour_name_snapshot,'')
+               ), '')"""
+
+_JOURNEY_FROM_SQL = """auditcore.journeys j
+        JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+        JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+        JOIN auditcore.dealer_outlets o
+          ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
+        LEFT JOIN auditcore.journey_products jp ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id"""
+
+
+def _business_dates_lateral(condition: str) -> str:
+    """``bm.booking_date`` / ``bm.delivery_date`` of journey ``j`` (see the module
+    docstring), worked out only when ``condition`` holds; null otherwise."""
+    return f"""LEFT JOIN LATERAL (
+            SELECT COALESCE(
+                     CASE WHEN bk.booking_date >= CAST(:date_floor AS date) THEN bk.booking_date END,
+                     CAST(j.created_at_utc AT TIME ZONE :timezone AS date)) AS booking_date,
+                   COALESCE(
+                     (SELECT CAST(btrim(f.effective_value::text, '"') AS date)
+                      FROM auditcore.evidence e
+                      JOIN auditcore.journey_document_extracted_fields f
+                        ON f.tenant_id = e.tenant_id AND f.journey_id = e.journey_id
+                       AND f.di_document_id = e.di_document_id
+                      WHERE e.tenant_id = j.tenant_id AND e.journey_id = j.journey_id
+                        AND e.association_status = 'ACTIVE' AND e.document_type_key = 'gate_pass'
+                        AND f.field_key = 'delivery_date'
+                        AND btrim(f.effective_value::text, '"') ~ '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$'
+                        AND CAST(btrim(f.effective_value::text, '"') AS date) >= CAST(:date_floor AS date)
+                      ORDER BY e.linked_at_utc DESC LIMIT 1),
+                     CASE WHEN CAST(dl.actual_delivered_at AS date) >= CAST(:date_floor AS date)
+                          THEN CAST(dl.actual_delivered_at AS date) END,
+                     CAST(dst.first_started_at_utc AT TIME ZONE :timezone AS date)) AS delivery_date
+            FROM (SELECT 1) one
+            LEFT JOIN auditcore.bookings bk ON bk.tenant_id = j.tenant_id AND bk.journey_id = j.journey_id
+            LEFT JOIN auditcore.deliveries dl ON dl.tenant_id = j.tenant_id AND dl.journey_id = j.journey_id
+            LEFT JOIN auditcore.journey_stage_states dst
+              ON dst.tenant_id = j.tenant_id AND dst.journey_id = j.journey_id AND dst.stage_code = 'DELIVERY'
+            WHERE {condition}
+            LIMIT 1
+        ) bm ON true"""
+
+
+# The booking / delivery dates are only worked out when a filter reads them (the
+# calendar month, or Bookings only / Deliveries only).
+_DATES_WHEN_FILTERED = "(CAST(:month_basis AS varchar) = 'business' OR CAST(:kind AS varchar) IS NOT NULL)"
+_BUSINESS_MONTH = "(CAST(:month AS varchar) IS NOT NULL AND CAST(:month_basis AS varchar) = 'business')"
+
+# The caller's scope, the filters and the search, over j / c / d / o / jp / bm and phone_hits.
+_SCOPE_WHERE_SQL = f"""j.tenant_id = :tenant_id
+          AND EXISTS (
+            SELECT 1 FROM auditcore.business_assignments ba
+            WHERE ba.tenant_id = j.tenant_id AND ba.security_actor_id = :actor_id
+              AND ba.assignment_status = 'ACTIVE' AND ba.effective_from <= now()
+              AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+              AND (ba.dealer_id IS NULL
+                   OR (ba.dealer_id = j.dealer_id AND (ba.outlet_id IS NULL OR ba.outlet_id = j.outlet_id)))
+          )
+          AND (CAST(:dealer_id AS uuid) IS NULL OR j.dealer_id = CAST(:dealer_id AS uuid))
+          AND (CAST(:outlet_id AS uuid) IS NULL OR j.outlet_id = CAST(:outlet_id AS uuid))
+          AND (CAST(:pc_actor_id AS varchar) IS NULL OR j.created_by_actor_id = CAST(:pc_actor_id AS varchar))
+          AND (CAST(:month AS varchar) IS NULL
+               OR (COALESCE(CAST(:month_basis AS varchar), '') <> 'business'
+                   AND to_char(j.created_at_utc AT TIME ZONE :timezone, 'YYYY-MM') = CAST(:month AS varchar))
+               OR (CAST(:month_basis AS varchar) = 'business'
+                   AND (to_char(bm.booking_date, 'YYYY-MM') = CAST(:month AS varchar)
+                        OR to_char(bm.delivery_date, 'YYYY-MM') = CAST(:month AS varchar))))
+          -- Bookings only / Deliveries only (2026-11-09): a booking by its booking date, a
+          -- delivery by its delivery date (delivery started or delivered) -- in the calendar
+          -- month when one is chosen, the bookings_in_month / deliveries_in_month figures.
+          AND (CAST(:kind AS varchar) IS NULL
+               OR (CAST(:kind AS varchar) = 'booking'
+                   AND (NOT {_BUSINESS_MONTH} OR to_char(bm.booking_date, 'YYYY-MM') = CAST(:month AS varchar)))
+               OR (CAST(:kind AS varchar) = 'delivery' AND bm.delivery_date IS NOT NULL
+                   AND (NOT {_BUSINESS_MONTH} OR to_char(bm.delivery_date, 'YYYY-MM') = CAST(:month AS varchar))))
+          AND (
+            :search = ''
+            OR c.display_name ILIKE '%' || :search || '%'
+            OR COALESCE(c.legal_name,'') ILIKE '%' || :search || '%'
+            OR d.dealer_name ILIKE '%' || :search || '%'
+            OR o.outlet_name ILIKE '%' || :search || '%'
+            OR COALESCE(jp.model_name_snapshot,'') ILIKE '%' || :search || '%'
+            OR COALESCE(j.journey_reference,'') ILIKE '%' || :search || '%'
+            OR j.journey_id::text ILIKE '%' || :search || '%'
+            OR COALESCE(c.mobile_last4,'') = :search
+            OR (CAST(:mobile_pattern AS varchar) IS NOT NULL
+                AND (regexp_replace(COALESCE(c.mobile_number,''), '[^0-9]', '', 'g')
+                       LIKE CAST(:mobile_pattern AS varchar)
+                     OR (char_length(CAST(:mobile_pattern AS varchar)) = 5
+                         AND COALESCE(c.mobile_last4,'') = substr(CAST(:mobile_pattern AS varchar), 2))
+                     OR j.journey_id IN (SELECT ph.journey_id FROM phone_hits ph)))
+          )"""
+
 # The journeys in the caller's scope with every flag a tab is decided on.
-# Parameters: tenant_id, actor_id, search, mobile_pattern, dealer_id, outlet_id, pc_actor_id, month,
-# month_basis, date_floor, timezone (scope_params builds the filter ones).
+# Parameters: tenant_id, actor_id, search, mobile_pattern, dealer_id, outlet_id, pc_actor_id, kind,
+# month, month_basis, date_floor, timezone (scope_params builds the filter ones).
 # No literal braces below: BREAKDOWN_SQL is filled in with str.format.
 SCOPED_SQL = f"""
     open_tasks AS (
@@ -110,31 +235,16 @@ SCOPED_SQL = f"""
                    AND (st.business_status IN ('BOOKING_CANCELLED', 'DUPLICATE_BOOKING')
                         OR st.closure_disposition = 'NO_DELIVERY')))
     ),
-    -- Journeys with a customer phone read from one of their own documents that
-    -- matches the searched mobile number; nothing is read without one.
-    phone_hits AS (
-        SELECT DISTINCT f.journey_id
-        FROM auditcore.journey_document_extracted_fields f
-        JOIN auditcore.evidence e
-          ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
-         AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
-        WHERE CAST(:mobile_pattern AS varchar) IS NOT NULL
-          AND f.tenant_id = :tenant_id AND f.field_key = 'customer_phone'
-          AND regexp_replace(COALESCE(f.effective_value::text, ''), '[^0-9]', '', 'g')
-              LIKE CAST(:mobile_pattern AS varchar)
-    ),
+    {_PHONE_HITS_CTE},
     scoped AS (
         SELECT j.tenant_id, j.journey_id, j.journey_reference, j.customer_id, j.dealer_id,
                j.outlet_id, j.created_at_utc, j.updated_at_utc, j.created_by_actor_id,
                COALESCE(c.legal_name, c.display_name) AS customer_name, c.mobile_last4,
                d.dealer_name, o.outlet_name, o.outlet_code,
-               NULLIF(concat_ws(' · ',
-                 NULLIF(jp.model_name_snapshot,''),
-                 NULLIF(jp.variant_name_snapshot,''),
-                 NULLIF(jp.colour_name_snapshot,'')
-               ), '') AS vehicle,
+               {_VEHICLE_SQL} AS vehicle,
                j.created_by_display_name AS pc_name,
-               bm.booking_month, bm.delivery_month,
+               to_char(bm.booking_date, 'YYYY-MM') AS booking_month,
+               to_char(bm.delivery_date, 'YYYY-MM') AS delivery_month,
                (fin.journey_id IS NOT NULL) AS is_closed,
                COALESCE(ot.pc_task, false) AS pc_task,
                COALESCE(ot.tl_task, false) AS tl_task,
@@ -153,81 +263,15 @@ SCOPED_SQL = f"""
                          OR EXISTS (SELECT 1 FROM auditcore.journey_stage_states ds
                                     WHERE ds.tenant_id = j.tenant_id AND ds.journey_id = j.journey_id
                                       AND ds.stage_code = 'DELIVERY') END AS in_delivery
-        FROM auditcore.journeys j
-        JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
-        JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
-        JOIN auditcore.dealer_outlets o
-          ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
-        LEFT JOIN auditcore.journey_products jp ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
+        FROM {_JOURNEY_FROM_SQL}
         LEFT JOIN auditcore.p2_journey_runtime pr ON pr.tenant_id=j.tenant_id AND pr.journey_id=j.journey_id
         LEFT JOIN finished fin ON fin.journey_id = j.journey_id
         LEFT JOIN open_tasks ot ON ot.journey_id = j.journey_id
         LEFT JOIN (SELECT journey_id, bool_or(processing) AS processing, bool_or(stuck) AS stuck
                    FROM pages GROUP BY journey_id) pg ON pg.journey_id = j.journey_id
         LEFT JOIN risky rk ON rk.journey_id = j.journey_id
-        -- The calendar month of the booking and of the delivery; only worked out
-        -- when the month is read on that basis (the WHERE is a one-time filter).
-        LEFT JOIN LATERAL (
-            SELECT to_char(COALESCE(
-                     CASE WHEN bk.booking_date >= CAST(:date_floor AS date) THEN bk.booking_date END,
-                     CAST(j.created_at_utc AT TIME ZONE :timezone AS date)), 'YYYY-MM') AS booking_month,
-                   to_char(COALESCE(
-                     (SELECT CAST(btrim(f.effective_value::text, '"') AS date)
-                      FROM auditcore.evidence e
-                      JOIN auditcore.journey_document_extracted_fields f
-                        ON f.tenant_id = e.tenant_id AND f.journey_id = e.journey_id
-                       AND f.di_document_id = e.di_document_id
-                      WHERE e.tenant_id = j.tenant_id AND e.journey_id = j.journey_id
-                        AND e.association_status = 'ACTIVE' AND e.document_type_key = 'gate_pass'
-                        AND f.field_key = 'delivery_date'
-                        AND btrim(f.effective_value::text, '"') ~ '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$'
-                        AND CAST(btrim(f.effective_value::text, '"') AS date) >= CAST(:date_floor AS date)
-                      ORDER BY e.linked_at_utc DESC LIMIT 1),
-                     CASE WHEN CAST(dl.actual_delivered_at AS date) >= CAST(:date_floor AS date)
-                          THEN CAST(dl.actual_delivered_at AS date) END,
-                     CAST(dst.first_started_at_utc AT TIME ZONE :timezone AS date)), 'YYYY-MM') AS delivery_month
-            FROM (SELECT 1) one
-            LEFT JOIN auditcore.bookings bk ON bk.tenant_id = j.tenant_id AND bk.journey_id = j.journey_id
-            LEFT JOIN auditcore.deliveries dl ON dl.tenant_id = j.tenant_id AND dl.journey_id = j.journey_id
-            LEFT JOIN auditcore.journey_stage_states dst
-              ON dst.tenant_id = j.tenant_id AND dst.journey_id = j.journey_id AND dst.stage_code = 'DELIVERY'
-            WHERE CAST(:month_basis AS varchar) = 'business'
-            LIMIT 1
-        ) bm ON true
-        WHERE j.tenant_id = :tenant_id
-          AND EXISTS (
-            SELECT 1 FROM auditcore.business_assignments ba
-            WHERE ba.tenant_id = j.tenant_id AND ba.security_actor_id = :actor_id
-              AND ba.assignment_status = 'ACTIVE' AND ba.effective_from <= now()
-              AND (ba.effective_to IS NULL OR ba.effective_to >= now())
-              AND (ba.dealer_id IS NULL
-                   OR (ba.dealer_id = j.dealer_id AND (ba.outlet_id IS NULL OR ba.outlet_id = j.outlet_id)))
-          )
-          AND (CAST(:dealer_id AS uuid) IS NULL OR j.dealer_id = CAST(:dealer_id AS uuid))
-          AND (CAST(:outlet_id AS uuid) IS NULL OR j.outlet_id = CAST(:outlet_id AS uuid))
-          AND (CAST(:pc_actor_id AS varchar) IS NULL OR j.created_by_actor_id = CAST(:pc_actor_id AS varchar))
-          AND (CAST(:month AS varchar) IS NULL
-               OR (COALESCE(CAST(:month_basis AS varchar), '') <> 'business'
-                   AND to_char(j.created_at_utc AT TIME ZONE :timezone, 'YYYY-MM') = CAST(:month AS varchar))
-               OR (CAST(:month_basis AS varchar) = 'business'
-                   AND (bm.booking_month = CAST(:month AS varchar) OR bm.delivery_month = CAST(:month AS varchar))))
-          AND (
-            :search = ''
-            OR c.display_name ILIKE '%' || :search || '%'
-            OR COALESCE(c.legal_name,'') ILIKE '%' || :search || '%'
-            OR d.dealer_name ILIKE '%' || :search || '%'
-            OR o.outlet_name ILIKE '%' || :search || '%'
-            OR COALESCE(jp.model_name_snapshot,'') ILIKE '%' || :search || '%'
-            OR COALESCE(j.journey_reference,'') ILIKE '%' || :search || '%'
-            OR j.journey_id::text ILIKE '%' || :search || '%'
-            OR COALESCE(c.mobile_last4,'') = :search
-            OR (CAST(:mobile_pattern AS varchar) IS NOT NULL
-                AND (regexp_replace(COALESCE(c.mobile_number,''), '[^0-9]', '', 'g')
-                       LIKE CAST(:mobile_pattern AS varchar)
-                     OR (char_length(CAST(:mobile_pattern AS varchar)) = 5
-                         AND COALESCE(c.mobile_last4,'') = substr(CAST(:mobile_pattern AS varchar), 2))
-                     OR j.journey_id IN (SELECT ph.journey_id FROM phone_hits ph)))
-          )
+        {_business_dates_lateral(_DATES_WHEN_FILTERED)}
+        WHERE {_SCOPE_WHERE_SQL}
     )
 """
 
@@ -340,8 +384,9 @@ def scope_params(
     dealer_id: Any = None,
     outlet_id: Any = None,
     pc_actor_id: str | None = None,
+    kind: str | None = None,
 ) -> dict[str, Any]:
-    """The search and filter parameters SCOPED_SQL reads, from the request's own."""
+    """The search and filter parameters SCOPED_SQL / SUGGEST_SQL read, from the request's own."""
     text_ = (search or "").strip()
     return {
         "search": text_,
@@ -349,7 +394,78 @@ def scope_params(
         "dealer_id": str(dealer_id) if dealer_id else None,
         "outlet_id": str(outlet_id) if outlet_id else None,
         "pc_actor_id": (pc_actor_id or "").strip() or None,
+        "kind": journey_kind(kind),
     }
+
+
+# Search suggestions (journeys:suggest, product owner 2026-11-09: "after a few characters, show the
+# matching bookings and deliveries"): the list's own scope, filters and matching
+# (_SCOPE_WHERE_SQL) without the tenant-wide task / page / finding / stage flag sets the list
+# needs for its tabs. The journeys are read newest first on the (tenant_id, updated_at_utc DESC)
+# index and the read stops at :limit matches; the dates and a document phone are then read for
+# those few rows only.
+SUGGEST_SQL = f"""
+    WITH {_PHONE_HITS_CTE},
+    hits AS (
+        SELECT j.journey_id, j.journey_reference, j.updated_at_utc,
+               COALESCE(c.legal_name, c.display_name) AS customer_name,
+               c.mobile_number, c.mobile_last4,
+               d.dealer_name, o.outlet_name, o.outlet_code,
+               j.created_by_display_name AS pc_name,
+               {_VEHICLE_SQL} AS vehicle
+        FROM {_JOURNEY_FROM_SQL}
+        {_business_dates_lateral(_DATES_WHEN_FILTERED)}
+        WHERE {_SCOPE_WHERE_SQL}
+        ORDER BY j.updated_at_utc DESC, j.journey_id DESC
+        LIMIT :limit
+    )
+    SELECT h.*, bm.booking_date, bm.delivery_date, ph.document_phone
+    FROM hits h
+    JOIN auditcore.journeys j ON j.tenant_id = :tenant_id AND j.journey_id = h.journey_id
+    {_business_dates_lateral("true")}
+    LEFT JOIN LATERAL (
+        SELECT f.effective_value::text AS document_phone
+        FROM auditcore.journey_document_extracted_fields f
+        JOIN auditcore.evidence e
+          ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+         AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
+        WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id AND f.field_key = 'customer_phone'
+          AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+        ORDER BY e.linked_at_utc DESC
+        LIMIT 1
+    ) ph ON true
+    ORDER BY h.updated_at_utc DESC, h.journey_id DESC
+"""
+
+SUGGEST_LIMIT = 8
+
+
+def suggestion_ready(search: str | None) -> bool:
+    """Whether a search text is long enough to suggest from: two characters, or
+    three when it is only a number (two digits match too much of every number)."""
+    text_ = (search or "").strip()
+    if text_ and _MOBILE_CHARACTERS.match(text_):
+        return sum(ch.isdigit() for ch in text_) >= 3
+    return len(text_) >= 2
+
+
+def masked_mobile(*values: Any) -> str | None:
+    """The first value with four or more digits, masked to its last four ("******3210")."""
+    for value in values:
+        digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+        if len(digits) >= 4:
+            return f"******{digits[-4:]}"
+    return None
+
+
+def journey_kind(value: str | None) -> str | None:
+    """``booking`` / ``delivery`` (Bookings only / Deliveries only), else None (both)."""
+    text_ = (value or "").strip().lower()
+    if text_ in {"booking", "bookings"}:
+        return "booking"
+    if text_ in {"delivery", "deliveries"}:
+        return "delivery"
+    return None
 
 
 def counts_from_row(row: Any) -> dict[str, int]:

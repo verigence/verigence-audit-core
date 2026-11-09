@@ -214,3 +214,147 @@ def test_search_by_full_or_partial_mobile_number(uc03_create_booking_setup):  # 
     assert found("9000011111") == set()      # a document that is not this booking's
     assert found("Ravi") == {on_record}      # names still match
     assert found("ravi kum") == {on_record}
+
+
+def _booking_and_delivery_dates(setup, ids):
+    """booking: booked in September; booking_complete: booked in September, delivery started
+    in October; delivery: booked in August, delivered in September (gate-pass-less, by the
+    delivery record)."""
+    booking, booking_complete, delivery = ids[0], ids[1], ids[2]
+    tenant_id = setup["tenant_id"]
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, tenant_id)
+
+        def booked(journey_id, day):
+            connection.execute(
+                text("INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date) VALUES (:t, :j, :d) "
+                     "ON CONFLICT (tenant_id, journey_id) DO UPDATE SET booking_date = EXCLUDED.booking_date"),
+                {"t": tenant_id, "j": journey_id, "d": day})
+
+        booked(booking, "2026-09-10")
+        booked(booking_complete, "2026-09-28")
+        booked(delivery, "2026-08-20")
+        booking_id = connection.execute(
+            text("SELECT booking_id FROM auditcore.bookings WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": tenant_id, "j": delivery}).scalar_one()
+        connection.execute(
+            text("INSERT INTO auditcore.deliveries (tenant_id, journey_id, booking_id, actual_delivered_at, "
+                 "status_source) VALUES (:t, :j, :b, '2026-09-25T10:00:00+05:30', 'EVIDENCE') "
+                 "ON CONFLICT (tenant_id, journey_id) DO UPDATE SET actual_delivered_at = EXCLUDED.actual_delivered_at"),
+            {"t": tenant_id, "j": delivery, "b": booking_id})
+        connection.execute(
+            text("INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code, business_status, "
+                 "audit_state, audit_status, first_started_at_utc, latest_activity_at_utc, version_no) "
+                 "VALUES (:t, :j, 'DELIVERY', 'DELIVERY_IN_PROGRESS', 'IN_PROGRESS', 'NOT_EVALUATED', "
+                 "'2026-10-03T10:00:00+05:30', now(), 1) ON CONFLICT DO NOTHING"),
+            {"t": tenant_id, "j": booking_complete})
+    return booking, booking_complete, delivery
+
+
+def test_bookings_only_and_deliveries_only_agree_with_the_month_figures(uc03_create_booking_setup):  # noqa: F811
+    """Bookings only / Deliveries only (product owner 2026-11-09) by the month figures'
+    own dates: in a calendar month the list and its counts are exactly the
+    bookings_in_month / deliveries_in_month figures."""
+    setup = uc03_create_booking_setup
+    client, base, ids = _seed(setup)
+    booking, booking_complete, delivery = _booking_and_delivery_dates(setup, ids)
+
+    def listed(**params):
+        response = client.get(f"{base}/journeys", params={"view": "all", **params})
+        assert response.status_code == 200, response.text
+        return {item["journey_id"] for item in response.json()["items"]}
+
+    def counted(**params):
+        return client.get(f"{base}/journeys:counts", params=params).json()["counts"]
+
+    september = {"month": "2026-09", "month_basis": "business"}
+    figures = counted(**september)
+    assert listed(**september, kind="booking") == {booking, booking_complete}
+    assert counted(**september, kind="booking")["all"] == figures["bookings_in_month"] == 2
+    assert listed(**september, kind="delivery") == {delivery}
+    assert counted(**september, kind="delivery")["all"] == figures["deliveries_in_month"] == 1
+    # October: the delivery started that month is a delivery of October, not a booking.
+    october = {"month": "2026-10", "month_basis": "business"}
+    assert listed(**october, kind="delivery") == {booking_complete}
+    assert listed(**october, kind="booking") == set()
+    # All months: every journey is a booking; deliveries are those with a delivery date.
+    assert listed(kind="booking") == set(ids)
+    # (_seed's closed journey was delivered: its delivery stage started today.)
+    assert listed(kind="delivery") == {booking_complete, delivery, ids[3]}
+    # Anything else is both.
+    assert listed(kind="something") == set(ids)
+
+
+def test_search_suggestions_use_the_list_scope_and_matching(uc03_create_booking_setup):  # noqa: F811
+    setup = uc03_create_booking_setup
+    client, base, ids = _seed(setup)
+    booking, _booking_complete, delivery = _booking_and_delivery_dates(setup, ids)
+    tenant_id = setup["tenant_id"]
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        customer = connection.execute(
+            text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": tenant_id, "j": delivery}).scalar_one()
+        connection.execute(
+            text("UPDATE auditcore.customers SET mobile_number='+919876543210', mobile_last4='3210', "
+                 "legal_name='Sunita Rao' WHERE tenant_id=:t AND customer_id=:c"),
+            {"t": tenant_id, "c": customer})
+
+    def suggest(q, **params):
+        response = client.get(f"{base}/journeys:suggest", params={"q": q, **params})
+        assert response.status_code == 200, response.text
+        return response.json()["items"]
+
+    (hit,) = suggest("sunita")
+    assert hit["journeyId"] == delivery and hit["customerName"] == "Sunita Rao"
+    assert hit["mobileMasked"] == "******3210"
+    assert hit["kind"] == "DELIVERY" and hit["date"] == "2026-09-25"
+    assert hit["outletName"] == "Create Booking Outlet" and hit["dealerName"]
+    assert [h["journeyId"] for h in suggest("98765 43210")] == [delivery]
+    assert [h["journeyId"] for h in suggest("+91 987")] == [delivery]
+    # Too short: nothing is read.
+    assert suggest("s") == [] and suggest("98") == []
+    # The list's filters apply: not a booking of September, and not in another Dealership.
+    assert suggest("sunita", month="2026-09", month_basis="business", kind="booking") == []
+    assert suggest("sunita", dealer_id=str(uuid4())) == []
+    # Every list match is offered (newest first), at most `limit`.
+    by_outlet = suggest("Create Booking", limit=3)
+    assert len(by_outlet) == 3
+    booking_hit = next(h for h in suggest("Create Booking", limit=10) if h["journeyId"] == booking)
+    assert booking_hit["kind"] == "BOOKING" and booking_hit["date"] == "2026-09-10"
+    list_ids = {i["journey_id"] for i in client.get(f"{base}/journeys", params={"view": "all", "q": "Create Booking"})
+                .json()["items"]}
+    assert {h["journeyId"] for h in suggest("Create Booking", limit=10)} == list_ids
+
+
+def test_suggestions_stay_in_a_dealership_tl_scope(uc03_create_booking_setup):  # noqa: F811
+    setup = uc03_create_booking_setup
+    client, base, _ids = _seed(setup)
+    _dealer_two, _outlet_two, journey_two = _second_dealership(setup)
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        dealer_one = connection.execute(
+            text("SELECT dealer_id FROM auditcore.dealer_outlets WHERE tenant_id=:t AND outlet_id=:o"),
+            {"t": setup["tenant_id"], "o": setup["outlet_id"]}).scalar_one()
+        tl = f"tl-{uuid4().hex[:8]}"
+        connection.execute(
+            text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, "
+                 "dealer_id, outlet_id) VALUES (:t, :a, 'TL', :d, NULL)"),
+            {"t": setup["tenant_id"], "a": tl, "d": dealer_one})
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=tl)
+    items = client.get(f"{base}/journeys:suggest", params={"q": "Second Outlet"}).json()["items"]
+    assert journey_two not in {h["journeyId"] for h in items} and items == []
+    _project_wide(setup, "Executive")
+    items = client.get(f"{base}/journeys:suggest", params={"q": "Second Outlet"}).json()["items"]
+    assert [h["journeyId"] for h in items] == [journey_two]
+
+
+@pytest.mark.parametrize(
+    ("typed", "ready"),
+    [("s", False), ("su", True), ("98", False), ("987", True), ("+9", False), ("+91", False),
+     ("+919", True), ("a1", True), ("  ", False), (None, False)],
+)
+def test_suggestions_wait_for_enough_characters(typed, ready):
+    from audit_core.uc03_p2_journey_views import suggestion_ready
+
+    assert suggestion_ready(typed) is ready
