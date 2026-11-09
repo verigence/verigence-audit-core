@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Response
@@ -14,6 +14,7 @@ from audit_core.dependencies import (
     require_project_admin_request,
 )
 from audit_core.errors import (
+    AuditCoreError,
     BusinessValidationError,
     ConflictError,
     NotFoundError,
@@ -60,6 +61,9 @@ class ProjectPatch(BaseModel):
     effectiveEndDate: date | None = None
     timezoneName: str | None = Field(default=None, min_length=1, max_length=100)
     regionCode: str | None = Field(default=None, max_length=100)
+    # Sales or service audit (product owner, 2026-11-09): a Super Admin sets it, and only while the
+    # Project has no Journeys or published masters, since the two kinds use different masters.
+    auditType: Literal["SALES", "SERVICE"] | None = None
 
 
 def _not_found() -> NotFoundError:
@@ -312,6 +316,7 @@ def patch_project(
         "segmentIds": patch.segmentIds,
         "effectiveStartDate": patch.effectiveStartDate,
         "timezoneName": patch.timezoneName,
+        "auditType": patch.auditType,
     }
     if any(name in supplied and value is None for name, value in non_nullable.items()):
         raise ValidationError(detail="Required Project fields cannot be set to null.")
@@ -352,6 +357,30 @@ def patch_project(
             and patch.effectiveStartDate != current["effective_start_date"]
         )
     )
+    if "auditType" in supplied and patch.auditType != current["audit_type"]:
+        if not admin_request.admin_context.is_super_admin:
+            raise AuditCoreError(
+                error_code="VAC-AUTH-AUDIT-TYPE",
+                status_code=403,
+                title="Not permitted",
+                detail="Only a Super Admin can change whether a Project is a sales or a service audit.",
+            )
+        # Every Project starts with the same default masters, so only operational records lock it.
+        if connection.execute(
+            text("SELECT EXISTS (SELECT 1 FROM auditcore.journeys WHERE tenant_id = :tenant_id)"),
+            {"tenant_id": tenant_id},
+        ).scalar_one():
+            raise BusinessValidationError(
+                detail="The audit type cannot be changed after Journeys have been recorded for the Project."
+            )
+        if current["audit_type"] == "SERVICE" and connection.execute(
+            text("SELECT EXISTS (SELECT 1 FROM auditcore.sevasutra_instances WHERE tenant_id = :tenant_id)"),
+            {"tenant_id": tenant_id},
+        ).scalar_one():
+            raise BusinessValidationError(
+                detail="This Project has a SevaSutra instance, so it stays a service audit."
+            )
+
     if restricted_changed and _has_project_dependencies(connection, tenant_id):
         raise BusinessValidationError(
             detail=(
@@ -381,6 +410,7 @@ def patch_project(
         "effectiveEndDate": ("effective_end_date", patch.effectiveEndDate),
         "timezoneName": ("timezone_name", patch.timezoneName),
         "regionCode": ("region_code", patch.regionCode),
+        "auditType": ("audit_type", patch.auditType),
     }
     assignments: list[str] = []
     parameters: dict[str, object] = {
