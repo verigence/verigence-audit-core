@@ -392,10 +392,10 @@ def web_url() -> str | None:
     explicit = _env("VERIGENCE_WEB_URL")
     if explicit:
         return explicit
+    if _env("APP_ENV").lower() in ("dev", "development"):
+        return DEV_WEB_ORIGIN
     origins = [o.strip() for o in _env("AUDIT_CORE_CORS_ALLOWED_ORIGINS").split(",") if o.strip()]
-    if origins:
-        return origins[0]
-    return DEV_WEB_ORIGIN if _env("APP_ENV").lower() in ("dev", "development") else None
+    return origins[0] if origins else None
 
 
 def probe_web(url: str | None) -> dict[str, Any]:

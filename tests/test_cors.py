@@ -1,7 +1,7 @@
 from fastapi.testclient import TestClient
 
 import audit_core.main as audit_core_main
-from audit_core.config import DEV_WEB_ORIGIN
+from audit_core.config import DEV_WEB_ORIGIN, LEGACY_DEV_WEB_ORIGIN
 
 REQUESTED_HEADERS = (
     "authorization,content-type,idempotency-key,if-match,"
@@ -51,6 +51,18 @@ def test_dev_web_cors_preflight_allows_uc02_headers(monkeypatch) -> None:
         for header in response.headers["access-control-allow-headers"].split(",")
     }
     assert set(REQUESTED_HEADERS.split(",")) <= allowed_headers
+
+
+def test_dev_keeps_the_workers_dev_address_for_installed_apps(monkeypatch) -> None:
+    monkeypatch.setenv("APP_ENV", "dev")
+    monkeypatch.delenv("AUDIT_CORE_CORS_ALLOWED_ORIGINS", raising=False)
+    client = _client(monkeypatch)
+
+    assert DEV_WEB_ORIGIN == "https://verigence.jbrconsulting.in"
+    response = _preflight(client, LEGACY_DEV_WEB_ORIGIN)
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == LEGACY_DEV_WEB_ORIGIN
 
 
 def test_dev_web_cors_preflight_rejects_unapproved_origin(monkeypatch) -> None:

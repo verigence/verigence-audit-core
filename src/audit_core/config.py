@@ -2,7 +2,9 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-DEV_WEB_ORIGIN = "https://verigence-web-dev.jbrconsulting-it.workers.dev"
+DEV_WEB_ORIGIN = "https://verigence.jbrconsulting.in"
+# Apps installed before 1.6.5 still use the workers.dev address of the same worker.
+LEGACY_DEV_WEB_ORIGIN = "https://verigence-web-dev.jbrconsulting-it.workers.dev"
 _DEV_ENVIRONMENTS = {"dev", "development"}
 
 
@@ -75,7 +77,7 @@ def _cors_allowed_origins(environ: Mapping[str, str], environment: str) -> tuple
     if configured:
         return configured
     if environment.strip().lower() in _DEV_ENVIRONMENTS:
-        return (DEV_WEB_ORIGIN,)
+        return (DEV_WEB_ORIGIN, LEGACY_DEV_WEB_ORIGIN)
     return ()
 
 
