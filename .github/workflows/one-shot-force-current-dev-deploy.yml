@@ -39,7 +39,7 @@ jobs:
           grep -q 'install_native_effective_date(mahindra_masters)' src/audit_core/main.py
           echo "SOURCE_SHA=${GITHUB_SHA}"
           echo 'SOURCE_0015_NATIVE_MAHINDRA=PASS'
-      - run: npm install --global @railway/cli
+      - run: npm install --global @railway/cli@5.70.0
       - name: Upload exact DEV source to Railway
         shell: bash
         run: |

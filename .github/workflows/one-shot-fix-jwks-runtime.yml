@@ -25,7 +25,7 @@ jobs:
         with:
           ref: dev
           fetch-depth: 0
-      - run: npm install --global @railway/cli
+      - run: npm install --global @railway/cli@5.70.0
 
       - name: Link DEV and snapshot deployments
         shell: bash

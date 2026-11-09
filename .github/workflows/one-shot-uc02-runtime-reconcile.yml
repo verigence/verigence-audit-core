@@ -34,7 +34,7 @@ jobs:
       - name: Install Railway CLI and PostgreSQL driver
         run: |
           set -euo pipefail
-          npm install --global @railway/cli
+          npm install --global @railway/cli@5.70.0
           python -m pip install 'psycopg[binary]>=3.2,<4'
 
       - name: Link shared DEV project and collect runtime metadata

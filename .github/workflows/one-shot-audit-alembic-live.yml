@@ -43,7 +43,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm install --global @railway/cli
+          npm install --global @railway/cli@5.70.0
           railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
           railway variable list --service "$DB_SERVICE" --json >/tmp/db-vars.json
           python - <<'PY'

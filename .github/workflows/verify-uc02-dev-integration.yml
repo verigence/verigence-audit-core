@@ -20,7 +20,7 @@ jobs:
       DEV_WEB_URL: https://verigence-web-dev.jbrconsulting-it.workers.dev
     steps:
       - name: Install Railway CLI
-        run: npm install --global @railway/cli
+        run: npm install --global @railway/cli@5.70.0
 
       - name: Resolve and verify Audit Core DEV
         shell: bash
