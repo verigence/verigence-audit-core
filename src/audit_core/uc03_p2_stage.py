@@ -781,6 +781,40 @@ def _as_text(value: Any) -> str:
     return "" if text_value.lower() in {"", "null", "none", "na", "n/a", "-", "nil"} else text_value
 
 
+def recorded_figures(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """The figures recorded from the journey's documents (field_key, value,
+    document_type_key) that still stand, as the Deal reads them.
+
+    2026-10-20 (review S8): a value from a voided or superseded document no
+    longer makes a condition true. 2026-11-10: nor one an NDC's earlier reading
+    recorded that its reading today no longer gives -- source rows are never
+    deleted, so a re-read or a person's correction left the first figure behind
+    (UTK-SU-261020-005: the Reviewer cleared the struck-out accessories
+    Rs 7,000 on the NDC; the Rs 7,000 recorded from its first reading kept
+    "Upload the Accessory Invoice" open). The same rule as the Deal
+    (uc03_p2_journey360._standing_copies)."""
+    from audit_core.uc03_p2_journey360 import _standing_copies
+
+    rows = [dict(r) for r in connection.execute(
+        text(
+            """
+            SELECT s.line_kind, s.component_key, s.amount, s.source_document_type, s.source_document_id
+            FROM auditcore.commercial_line_source_values s WHERE s.tenant_id=:t AND s.journey_id=:j
+              AND NOT EXISTS (
+                SELECT 1 FROM auditcore.evidence e
+                WHERE e.tenant_id = s.tenant_id AND e.journey_id = s.journey_id
+                  AND (e.di_document_id = s.source_document_id OR e.evidence_id = s.source_evidence_id)
+                  AND e.association_status <> 'ACTIVE'
+              )
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()]
+    standing = _standing_copies(connection, tenant_id=tenant_id, journey_id=journey_id, sources=rows)
+    return [{"field_key": r["component_key"], "value": float(r["amount"]) if r["amount"] is not None else None,
+             "document_type_key": r["source_document_type"]} for r in standing]
+
+
 def condition_reasons(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, str]:
     """Evidence key -> the evidence that makes it true (a readable sentence)."""
     fields = connection.execute(
@@ -793,23 +827,13 @@ def condition_reasons(connection: Connection, *, tenant_id: str, journey_id: UUI
              AND e.association_status='ACTIVE'
             WHERE f.tenant_id=:t AND f.journey_id=:j
             UNION ALL
-            -- 2026-10-20 (review S8): a value from a voided or superseded
-            -- document no longer makes a condition true.
-            SELECT s.component_key, to_jsonb(s.amount), s.source_document_type
-            FROM auditcore.commercial_line_source_values s WHERE s.tenant_id=:t AND s.journey_id=:j
-              AND NOT EXISTS (
-                SELECT 1 FROM auditcore.evidence e
-                WHERE e.tenant_id = s.tenant_id AND e.journey_id = s.journey_id
-                  AND (e.di_document_id = s.source_document_id OR e.evidence_id = s.source_evidence_id)
-                  AND e.association_status <> 'ACTIVE'
-              )
-            UNION ALL
             SELECT discount_key, to_jsonb(actual_discount_amount), 'deal'
             FROM auditcore.discount_applications WHERE tenant_id=:t AND journey_id=:j
             """
         ),
         {"t": tenant_id, "j": journey_id},
     ).mappings().all()
+    fields = [*fields, *recorded_figures(connection, tenant_id=tenant_id, journey_id=journey_id)]
     facts = connection.execute(
         text(
             f"""
