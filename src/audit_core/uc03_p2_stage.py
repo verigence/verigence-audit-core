@@ -783,22 +783,33 @@ def _as_text(value: Any) -> str:
 
 def recorded_figures(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
     """The figures recorded from the journey's documents (field_key, value,
-    document_type_key) that still stand, as the Deal reads them.
+    document_type_key) that still stand.
 
     2026-10-20 (review S8): a value from a voided or superseded document no
-    longer makes a condition true. 2026-11-10: nor one an NDC's earlier reading
-    recorded that its reading today no longer gives -- source rows are never
-    deleted, so a re-read or a person's correction left the first figure behind
-    (UTK-SU-261020-005: the Reviewer cleared the struck-out accessories
-    Rs 7,000 on the NDC; the Rs 7,000 recorded from its first reading kept
-    "Upload the Accessory Invoice" open). The same rule as the Deal
-    (uc03_p2_journey360._standing_copies)."""
-    from audit_core.uc03_p2_journey360 import _standing_copies
+    longer makes a condition true. 2026-11-10: nor one that an NDC or cost
+    sheet ON FILE recorded from an earlier reading and no longer gives --
+    source rows are never deleted, so a re-read or a person's correction left
+    the first figure behind (UTK-SU-261020-005: the Reviewer cleared the
+    struck-out accessories Rs 7,000 on the NDC; the Rs 7,000 recorded from its
+    first reading kept "Upload the Accessory Invoice" open). Today's reading is
+    the statement sync's (uc03_account_statement.standing_figures), the same
+    the Deal reads; a figure whose document is not a statement on file (a Tally
+    posting, recorded under no document) is kept as recorded."""
+    from audit_core.uc03_account_statement import (
+        COST_SHEET_KEYS,
+        COST_SHEET_TYPE,
+        standing_figures,
+    )
 
     rows = [dict(r) for r in connection.execute(
         text(
             """
-            SELECT s.line_kind, s.component_key, s.amount, s.source_document_type, s.source_document_id
+            SELECT s.line_kind, s.component_key, s.amount, s.source_document_type,
+                   s.source_document_id::text AS document_id,
+                   EXISTS (SELECT 1 FROM auditcore.evidence e
+                           WHERE e.tenant_id = s.tenant_id AND e.journey_id = s.journey_id
+                             AND e.di_document_id = s.source_document_id AND e.association_status = 'ACTIVE'
+                             AND e.document_type_key IN ('customer_ledger', 'cost_sheet')) AS statement_on_file
             FROM auditcore.commercial_line_source_values s WHERE s.tenant_id=:t AND s.journey_id=:j
               AND NOT EXISTS (
                 SELECT 1 FROM auditcore.evidence e
@@ -810,9 +821,24 @@ def recorded_figures(connection: Connection, *, tenant_id: str, journey_id: UUID
         ),
         {"t": tenant_id, "j": journey_id},
     ).mappings().all()]
-    standing = _standing_copies(connection, tenant_id=tenant_id, journey_id=journey_id, sources=rows)
+    standing: dict[str, set[tuple[str, str, str]]] | None = None
+    kept = []
+    for row in rows:
+        kind = str(row["source_document_type"] or "").lower()
+        key = str(row["component_key"]).lower()
+        judged = row["statement_on_file"] and not (kind == COST_SHEET_TYPE and key not in COST_SHEET_KEYS)
+        if judged:
+            if standing is None:
+                standing = {
+                    str(t).lower(): {(str(k).upper(), str(c).lower(), str(d or "").lower())
+                                     for (k, c), d in figures.items()}
+                    for t, figures in standing_figures(connection, tenant_id=tenant_id, journey_id=journey_id).items()
+                }
+            if (str(row["line_kind"]).upper(), key, str(row["document_id"]).lower()) not in standing.get(kind, set()):
+                continue
+        kept.append(row)
     return [{"field_key": r["component_key"], "value": float(r["amount"]) if r["amount"] is not None else None,
-             "document_type_key": r["source_document_type"]} for r in standing]
+             "document_type_key": r["source_document_type"]} for r in kept]
 
 
 def condition_reasons(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, str]:
