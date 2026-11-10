@@ -5003,6 +5003,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # document type" does (2026-11-02): see uc03_page_retype.
         from audit_core.uc03_page_retype import run_page_retype
         return run_page_retype, (engine, tag, reports)
+    if kind == "FIELD_SET":
+        # Named fields of named documents set as the system, with the trail
+        # (2026-11-10): see uc03_reread_corrections.run_field_set. A dry run lists them.
+        from audit_core.uc03_reread_corrections import run_field_set
+        return run_field_set, (engine, tag, reports)
     if kind == "COST_SHEET_STATEMENTS":
         # Account statements filed as cost sheets before the classifier knew
         # the difference, read again as the NDC (2026-11-05): see
@@ -5183,6 +5188,22 @@ def _refresh_names_every(engine: Engine) -> None:
         _stopping.wait(_NAMES_REFRESH_SECONDS)
 
 
+_REREAD_CORRECTIONS_SECONDS = 180
+
+
+def _settle_reread_corrections_every(engine: Engine) -> None:
+    """Corrections a person made before a page was read again: carried to the
+    new reading or listed for the PC once it is ready (2026-11-10, uc03_reread_corrections)."""
+    from audit_core.uc03_reread_corrections import settle
+
+    while not _stopping.is_set():
+        try:
+            settle(engine, _active_tenants(engine))
+        except Exception:  # e.g. the table not migrated yet; try again later
+            logger.warning("reread_corrections_round_failed", exc_info=True)
+        _stopping.wait(_REREAD_CORRECTIONS_SECONDS)
+
+
 def main() -> None:
     _configure_worker_observability()
     engine = get_engine()
@@ -5199,6 +5220,8 @@ def main() -> None:
     threading.Thread(target=_watch_worker_jobs, args=(engine,), name="worker-jobs", daemon=True).start()
     threading.Thread(target=_refresh_names_every, args=(engine,), name="people-names", daemon=True).start()
     threading.Thread(target=_build_journey_exports, args=(engine,), name="journey-exports", daemon=True).start()
+    threading.Thread(target=_settle_reread_corrections_every, args=(engine,), name="reread-corrections",
+                     daemon=True).start()
     logger.info(
         "p2_worker_started",
         worker_id=_WORKER_ID,

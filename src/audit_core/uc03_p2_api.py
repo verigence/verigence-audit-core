@@ -2602,6 +2602,11 @@ def _send_page_again(
     ).scalar_one_or_none()
     if inserted is None:
         raise HTTPException(status_code=409, detail="This page is already being sent again.")
+    # The corrections a person made to the document this page was are kept,
+    # to be applied again or listed once it is read (2026-11-10, uc03_reread_corrections).
+    from audit_core.uc03_reread_corrections import record as record_corrections
+
+    record_corrections(connection, tenant_id=tenant_id, journey_id=journey_id, from_unit=unit, to_queue_id=new_id)
     enqueue_work(
         connection, tenant_id=tenant_id, journey_id=journey_id, work_type="DOCUMENT_INGEST",
         work_key=str(new_id), payload={"queueId": str(new_id), "uploadedBy": actor_id},

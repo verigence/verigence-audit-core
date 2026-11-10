@@ -56,9 +56,12 @@ KEY_FIGURES_TASK = "DOCUMENT_KEY_FIGURES_NOT_READ"
 ADDS_UP_TASK = "STATEMENT_ROWS_DO_NOT_ADD_UP"
 # The registration taken as lower by the scrappage concession (2026-11-09): for information.
 SCRAPPAGE_REGISTRATION_TASK = "SCRAPPAGE_REGISTRATION_CONCESSION"
+# Corrections made before a page was read again that the new reading does not
+# carry (2026-11-10, uc03_reread_corrections): the PC re-checks and closes it.
+CORRECTIONS_RECHECK_TASK = "CORRECTIONS_RECHECK"
 CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK, COST_SHEET_DIFFERENCE_TASK, COPIES_DIFFERENCE_TASK,
                               REVIEWER_CORRECTIONS_TASK, KEY_FIGURES_TASK, ADDS_UP_TASK,
-                              SCRAPPAGE_REGISTRATION_TASK})
+                              SCRAPPAGE_REGISTRATION_TASK, CORRECTIONS_RECHECK_TASK})
 # "Upload the ..." tasks (a conditional document, or the booking docket) close
 # by hand too (product owner 2026-11-02): a single page uploaded for them is
 # often refused for scan quality and never read, so the machine check cannot

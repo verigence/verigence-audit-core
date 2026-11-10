@@ -919,9 +919,10 @@ def test_the_action_belongs_to_the_image_quality_and_large_upload_tasks_only(jou
     # 2026-11-04: and the TL's information task for a Reviewer's corrections;
     # and a document's key figure not read, when it is not printed on it;
     # 2026-11-05: and an NDC / cost sheet whose rows do not add up;
-    # 2026-11-09: and the registration lower by the scrappage concession.)
+    # 2026-11-09: and the registration lower by the scrappage concession;
+    # 2026-11-10: and corrections a page read again does not carry.)
     assert sorted(name for name, template in tasks.items() if CLOSE in template.actions) == [
-        "COST_SHEET_NDC_DIFFERENCE", "DOCUMENT_KEY_FIGURES_NOT_READ", "NDC_COPIES_DIFFERENCE",
+        "CORRECTIONS_RECHECK", "COST_SHEET_NDC_DIFFERENCE", "DOCUMENT_KEY_FIGURES_NOT_READ", "NDC_COPIES_DIFFERENCE",
         "PC_LARGE_UPLOAD_REVIEW", "PC_PAGE_QUALITY_REJECTED", "REVIEWER_CORRECTIONS_INFO",
         "SCRAPPAGE_REGISTRATION_CONCESSION", "STATEMENT_ROWS_DO_NOT_ADD_UP"]
     # The file's other failed page keeps its own, unchanged task and cannot use it.
