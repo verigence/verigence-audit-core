@@ -213,7 +213,21 @@ def _split(connection: Any, *, tenant_id: str, journey_id: UUID, group: dict[str
     return sent
 
 
-def run_page_retype(engine: Engine, tag: str, reports: list[str]) -> dict[str, Any]:
+def _pinned_unit(connection: Any, *, tenant_id: str, queue_id: UUID) -> dict[str, Any] | None:
+    row = connection.execute(
+        text("SELECT journey_id, queue_id FROM auditcore.p2_document_queue WHERE tenant_id = :t AND queue_id = :q"),
+        {"t": tenant_id, "q": queue_id},
+    ).mappings().one_or_none()
+    return dict(row) if row else None
+
+
+def run_page_retype(engine: Engine, tag: str, reports: list[str], *,
+                    units: list[UUID | None] | None = None) -> dict[str, Any]:
+    """``units``, when given, names the exact unit of each report (by position):
+    a booking with several uploads has a page 1 in each, and the page number
+    alone picked the newest of them (2026-11-10, UTK-BI-261020-005: the
+    statement on one upload's page 1 was never sent, another upload's page 1
+    was read again as a cost sheet four times)."""
     from audit_core.uc03_p2_api import (
         _RETYPEABLE_PAGE_STATES,
         _guard_reviewed_stage,
@@ -228,14 +242,17 @@ def run_page_retype(engine: Engine, tag: str, reports: list[str]) -> dict[str, A
     out: dict[str, Any] = {"commit": commit, "sent": [], "wouldSend": [], "skipped": []}
     asked = {(reference, page): registry.documents.get(key) for reference, page, key, _ in items}
     split_done: set[tuple[str, int]] = set()
-    for reference, page, template_key, current in items:
+    for index, (reference, page, template_key, current) in enumerate(items):
+        pinned = units[index] if units and index < len(units) else None
         if (reference, page) in split_done:
             continue  # read alone already, as asked, when its group was split
         template = registry.documents.get(template_key)
         if template_key == _SUPPORTING and template is not None:
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
-                found = _current_unit(connection, tenant_id=tenant_id, reference=reference, page=page, current=current)
+                found = (_pinned_unit(connection, tenant_id=tenant_id, queue_id=pinned) if pinned is not None
+                     else _current_unit(connection, tenant_id=tenant_id, reference=reference, page=page,
+                                        current=current))
                 if found is None:
                     out["skipped"].append({"journey": reference, "page": page, "why": "no live page"})
                     continue
@@ -261,7 +278,9 @@ def run_page_retype(engine: Engine, tag: str, reports: list[str]) -> dict[str, A
             continue
         with engine.begin() as connection:
             set_tenant_context(connection, tenant_id)
-            found = _current_unit(connection, tenant_id=tenant_id, reference=reference, page=page, current=current)
+            found = (_pinned_unit(connection, tenant_id=tenant_id, queue_id=pinned) if pinned is not None
+                     else _current_unit(connection, tenant_id=tenant_id, reference=reference, page=page,
+                                        current=current))
             if found is None:
                 out["skipped"].append({"journey": reference, "page": page, "why": "no live page"})
                 continue
