@@ -114,7 +114,8 @@ def test_the_current_type_picks_the_page_when_two_uploads_share_its_number(journ
     _, [ledger] = add_batch_pages(journey, [("customer_ledger", "READY")], grouping_status="NOT_NEEDED")
     reference = _reference(journey)
     plain = retype.run_page_retype(journey.engine, f"{journey.tenant_id}:look", [f"{reference}:1:customer_ledger"])
-    assert plain["wouldSend"][0]["from"] == "customer_ledger"  # the newest upload's page 1
+    # Two uploads have a page 1: nothing is guessed (2026-11-10, UTK-BI-261020-005).
+    assert plain["wouldSend"] == [] and "2 uploads" in plain["skipped"][0]["why"]
     named = retype.run_page_retype(journey.engine, f"{journey.tenant_id}:look",
                                    [f"{reference}:1:customer_ledger:booking_form"])
     assert named["wouldSend"][0]["from"] == "booking_form"
