@@ -97,6 +97,16 @@ jobs:
                   return {"basis": body["basis"],
                           "districts": [(r["label"], r["journeys"], r["statementDeals"]) for r in body["districts"][:12]],
                           "outlets": [(r["label"][:28], r["homeDistrict"], r["homeSharePercent"]) for r in body["outlets"][:14]]}
+              if report == "sales":
+                  return {"basis": body["basis"], "network": body["network"], "months": body["months"],
+                          "bands": body["daysToDeliverBands"],
+                          "outlets": [(r["label"][:28], r["journeys"], r["delivered"], r["billedValue"]) for r in body["outlets"][:14]],
+                          "models": [(r["label"], r["journeys"], r["billedValue"]) for r in body["models"][:12]]}
+              if report == "payments":
+                  return {"basis": body["basis"], "network": body["network"],
+                          "modes": [(m["label"], m["receipts"], m["amount"], m["sharePercent"]) for m in body["modes"]],
+                          "outlets": [(r["label"][:28], r["amount"], r["cashPercent"], r["cashAboveLimit"]) for r in body["outlets"][:14]],
+                          "cashAboveLimit": len(body["cashAboveLimit"]), "cashAboveLimitInAll": len(body["cashAboveLimitInAll"])}
               return {"basis": body["basis"],
                       "network": {k: v for k, v in body["network"].items()},
                       "concentration": body["concentration"],
