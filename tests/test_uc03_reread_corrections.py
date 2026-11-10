@@ -181,3 +181,23 @@ def test_the_worker_sweeps_cost_sheet_statements_every_hour():
     from audit_core import uc03_p2_worker as worker
 
     assert worker._COST_SHEET_SWEEP_SECONDS == 3600 and callable(worker._sweep_cost_sheet_statements_every)
+
+
+def test_each_page_is_sent_by_its_own_upload_when_two_uploads_share_a_page_number(journey):
+    """Live 2026-11-10, UTK-BI-261020-005: page 1 of one upload was the
+    statement, page 1 of another an untitled cost sheet. By page number the job
+    sent the newest page 1 as a cost sheet, four times; the statement never moved."""
+    statement = _cost_sheet_page(journey)
+    add_extracted_field(journey, di_document_id=statement["di_document_id"], field_key="document_title",
+                        value="VEHICLE ACCOUNT STATEMENT", document_type="cost_sheet")
+    untitled = _cost_sheet_page(journey)  # the newer upload's page 1
+    assert statement["page_number"] == untitled["page_number"] == 1
+
+    done = statements.run_cost_sheet_statements(journey.engine, f"{journey.tenant_id}:go-commit", [])
+    assert done["sent"] == 2 and done["skipped"] == []
+    moved = {r["queue_id"]: r for r in _sql(
+        journey, "SELECT o.queue_id, n.template_key FROM auditcore.p2_document_queue o "
+                 "JOIN auditcore.p2_document_queue n ON n.queue_id = o.merged_into_queue_id "
+                 "WHERE o.journey_id = :j").mappings().all()}
+    assert moved[statement["queue_id"]]["template_key"] == "customer_ledger"
+    assert moved[untitled["queue_id"]]["template_key"] == "cost_sheet"

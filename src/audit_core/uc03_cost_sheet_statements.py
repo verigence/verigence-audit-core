@@ -65,7 +65,11 @@ def statement_pages(engine: Engine, tenant_id: str) -> list[dict[str, Any]]:
                 SELECT j.journey_reference, e.di_document_id, f.effective_value #>> '{}' AS title,
                        (SELECT min(q.page_number) FROM auditcore.p2_document_queue q
                          WHERE q.tenant_id = e.tenant_id AND q.journey_id = e.journey_id
-                           AND q.di_document_id = e.di_document_id) AS page_number
+                           AND q.di_document_id = e.di_document_id) AS page_number,
+                       (SELECT q.queue_id FROM auditcore.p2_document_queue q
+                         WHERE q.tenant_id = e.tenant_id AND q.journey_id = e.journey_id
+                           AND q.di_document_id = e.di_document_id AND q.queue_status <> 'MERGED'
+                         ORDER BY q.created_at_utc DESC LIMIT 1) AS queue_id
                 FROM auditcore.evidence e
                 JOIN auditcore.journeys j ON j.tenant_id = e.tenant_id AND j.journey_id = e.journey_id
                 JOIN auditcore.journey_document_extracted_fields f
@@ -94,7 +98,13 @@ def untitled_pages(engine: Engine, tenant_id: str) -> list[dict[str, Any]]:
                            AND q.di_document_id = e.di_document_id
                            AND q.queue_status NOT IN ('MERGED', 'CANCELLED')
                            -- read again once already: never again (the sweep runs hourly)
-                           AND q.type_overridden_by_actor_id IS DISTINCT FROM :again) AS page_number
+                           AND q.type_overridden_by_actor_id IS DISTINCT FROM :again) AS page_number,
+                       (SELECT q.queue_id FROM auditcore.p2_document_queue q
+                         WHERE q.tenant_id = e.tenant_id AND q.journey_id = e.journey_id
+                           AND q.di_document_id = e.di_document_id
+                           AND q.queue_status NOT IN ('MERGED', 'CANCELLED')
+                           AND q.type_overridden_by_actor_id IS DISTINCT FROM :again
+                         ORDER BY q.created_at_utc DESC LIMIT 1) AS queue_id
                 FROM auditcore.evidence e
                 JOIN auditcore.journeys j ON j.tenant_id = e.tenant_id AND j.journey_id = e.journey_id
                 WHERE e.tenant_id = :t AND e.association_status = 'ACTIVE' AND e.document_type_key = 'cost_sheet'
@@ -119,14 +129,23 @@ def run_cost_sheet_statements(engine: Engine, tag: str, reports: list[str]) -> d
     pages = statement_pages(engine, tenant_id)
     untitled = untitled_pages(engine, tenant_id)
     no_page = sorted(p["journey_reference"] for p in untitled if p["page_number"] is None)
-    items = sorted({f"{p['journey_reference']}:{p['page_number']}:{_NDC_TEMPLATE}:cost_sheet" for p in pages}
-                   | {f"{p['journey_reference']}:{p['page_number']}:cost_sheet:cost_sheet"
-                      for p in untitled if p["page_number"] is not None})
+    # Each page is sent by its own unit (2026-11-10): a booking with several
+    # uploads has a page 1 in each, and the page number alone named the wrong one.
+    # A statement first: the same unit is never sent twice in one run.
+    asked: dict[Any, str] = {}
+    for p in pages:
+        if p["page_number"] is not None and p["queue_id"] is not None:
+            asked.setdefault(p["queue_id"], f"{p['journey_reference']}:{p['page_number']}:{_NDC_TEMPLATE}:cost_sheet")
+    for p in untitled:
+        if p["page_number"] is not None and p["queue_id"] is not None:
+            asked.setdefault(p["queue_id"], f"{p['journey_reference']}:{p['page_number']}:cost_sheet:cost_sheet")
+    order = sorted(asked, key=lambda q: asked[q])
+    items, units = [asked[q] for q in order], list(order)
     out: dict[str, Any] = {"commit": label.endswith("-commit"), "found": len(pages), "remaining": len(untitled),
                            "titles": sorted({str(p["title"]) for p in pages}), "sent": 0, "wouldSend": 0,
                            "noLivePage": no_page, "skipped": []}
     for start in range(0, len(items), _CHUNK):
-        result = run_page_retype(engine, tag, items[start:start + _CHUNK])
+        result = run_page_retype(engine, tag, items[start:start + _CHUNK], units=units[start:start + _CHUNK])
         out["sent"] += len(result["sent"])
         out["wouldSend"] += len(result["wouldSend"])
         out["skipped"] += result["skipped"]
