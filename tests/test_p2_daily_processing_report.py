@@ -335,8 +335,11 @@ def test_a_closed_delivery_file_counts_under_the_journeys_own_pc(journey):
 
 
 # Exact duplicate files (product owner 2026-11-03): every page uploaded before, nothing new.
-def _file_with_pages(journey, shas: list[str], *, minutes_ago: float) -> str:
-    """One uploaded file whose pages carry these fingerprints, uploaded ``minutes_ago``."""
+def _file_with_pages(journey, shas: list[str], *, day, order: int) -> str:
+    """One uploaded file whose pages carry these fingerprints, the ``order``-th upload of
+    ``day``. Its time is counted from the start of that day in the Project's timezone,
+    never back from now: "minutes ago" lands on the day before whenever the suite runs
+    in the first minutes after midnight IST (CI, 5 Nov 00:15 and 11 Nov 00:03 IST)."""
     batch = None
     for n, sha in enumerate(shas, start=1):
         b, queue, _ = add_page(journey, page_number=n, status="READY")
@@ -353,20 +356,20 @@ def _file_with_pages(journey, shas: list[str], *, minutes_ago: float) -> str:
                            "WHERE tenant_id=:t AND queue_id=:q"), {"s": sha, "t": journey.tenant_id, "q": queue})
     with journey.engine.begin() as c:
         set_tenant_context(c, journey.tenant_id)
-        c.execute(text("UPDATE auditcore.p2_upload_batches SET created_at_utc = now() - (:m * interval '1 minute'), "
+        c.execute(text("UPDATE auditcore.p2_upload_batches SET created_at_utc = "
+                       "(CAST(:day AS timestamp) AT TIME ZONE 'Asia/Kolkata') + (:o * interval '1 second'), "
                        "page_count=:n WHERE tenant_id=:t AND batch_id=:b"),
-                  {"m": minutes_ago, "n": len(shas), "t": journey.tenant_id, "b": batch})
+                  {"day": day, "o": order, "n": len(shas), "t": journey.tenant_id, "b": batch})
     return str(batch)
 
 
 def test_exact_duplicate_files_are_counted_per_pc(journey):
     tl = _tl(journey)
     a, b, c = (uuid4().hex for _ in range(3))
-    # Minutes apart, not half an hour: run just after midnight IST the first file
-    # would otherwise fall on the day before the report's (CI, 5 Nov 00:15 IST).
-    first = _file_with_pages(journey, [a, b], minutes_ago=3)           # new
-    again = _file_with_pages(journey, [b, a], minutes_ago=2)           # all pages seen before
-    more = _file_with_pages(journey, [a, c], minutes_ago=1)            # one new page: not a duplicate
+    day = _today(journey)                                               # one day for the files and the report
+    first = _file_with_pages(journey, [a, b], day=day, order=1)        # new
+    again = _file_with_pages(journey, [b, a], day=day, order=2)        # all pages seen before
+    more = _file_with_pages(journey, [a, c], day=day, order=3)         # one new page: not a duplicate
     with journey.engine.begin() as conn:                                # the same file uploaded again, cancelled
         set_tenant_context(conn, journey.tenant_id)
         conn.execute(
@@ -375,7 +378,9 @@ def test_exact_duplicate_files_are_counted_per_pc(journey):
                  "sha256) VALUES (:t, :id, :j, 'scan.pdf', 'application/pdf', 100, 0, 'k', 'CANCELLED', :a, :sha)"),
             {"t": journey.tenant_id, "id": uuid4(), "j": journey.journey_id, "a": journey.actor_id,
              "sha": uuid4().hex})
-    report = _report(journey, tl)
+    with journey.engine.begin() as conn:
+        set_tenant_context(conn, journey.tenant_id)
+        report = build_daily_processing_report(conn, tenant_id=journey.tenant_id, actor_id=tl, day=day)
     flags = {f["batchId"]: f["exactDuplicate"] for f in report["files"]}
     assert (flags[first], flags[again], flags[more]) == (False, True, False)
     [pc] = report["documentStatus"]["byPc"]
