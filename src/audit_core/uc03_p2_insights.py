@@ -237,6 +237,9 @@ _DAYS_BANDS: tuple[tuple[str, float, float], ...] = (
     ("Over 60 days", 61, float("inf")),
 )
 CASH_LIMIT = float(_CASH_RECEIPT_LIMIT)
+# A cash receipt within this share of the limit is "just under" it: many of them on one
+# outlet is the pattern a reviewer looks for (cash kept below the line).
+CASH_NEAR_LIMIT_SHARE = 0.95
 MODEL_NOT_RESOLVED = "Model not resolved"
 DISTRICT_NOT_READ = "District not read"
 
@@ -854,8 +857,30 @@ def insurance_report(facts: list[dict[str, Any]], *, today: date | None = None) 
         entry["dealers"][fact["dealer"]] += 1
         entry["outlets"][fact["outlet"]] += 1
         entry["journeys"].append({"journeyId": fact["journeyId"], "reference": fact["reference"]})
+    # One agent whose code was read two ways (a digit dropped) is one agent: groups that
+    # carry the same name are joined, the code read most often stands and all are listed.
+    by_name: dict[str, dict[str, Any]] = {}
+    for entry in sorted(agents.values(), key=lambda a: -a["policies"]):
+        name = entry["names"].most_common(1)[0][0]
+        name_key = re.sub(r"[^A-Z0-9]", "", name.upper())
+        joinable = entry["key"] != "none" and name != "Name not read" and len(name_key) >= 4
+        first = by_name.get(name_key) if joinable else None
+        entry["codes"] = [entry["code"]] if entry["code"] else []
+        if first is None:
+            by_name[name_key if joinable else entry["key"]] = entry
+            continue
+        first["names"].update(entry["names"])
+        first["dealers"].update(entry["dealers"])
+        first["outlets"].update(entry["outlets"])
+        first["journeys"].extend(entry["journeys"])
+        first["codes"].extend(c for c in entry["codes"] if c not in first["codes"])
+        first["code"] = first["code"] or entry["code"]
+        for field in ("policies", "premium", "confirmedOutside"):
+            first[field] += entry[field]
+    agents = {a["key"]: a for a in by_name.values()}
     agent_rows = [{
-        "key": a["key"], "agent": a["names"].most_common(1)[0][0], "code": a["code"], "policies": a["policies"],
+        "key": a["key"], "agent": a["names"].most_common(1)[0][0], "code": a["code"], "codes": a["codes"],
+        "policies": a["policies"],
         "premium": _rupees(a["premium"]), "confirmedOutside": a["confirmedOutside"],
         "dealers": [name for name, _n in a["dealers"].most_common()],
         "outlets": [{"outlet": name, "policies": n} for name, n in a["outlets"].most_common()],
@@ -1274,20 +1299,28 @@ def price_check(facts: list[dict[str, Any]]) -> Callable[[dict[str, Any]], bool]
     return sound
 
 
-def _days_to_deliver(fact: dict[str, Any]) -> int | None:
+def _delivery_date(fact: dict[str, Any], today: date | None) -> date | None:
+    """The delivery date where it can be one: a date after today was misread, so the
+    Journey stays delivered and its date is not charted or measured."""
+    delivered = fact["deliveredOn"]
+    return None if delivered is None or (today is not None and delivered > today) else delivered
+
+
+def _days_to_deliver(fact: dict[str, Any], today: date | None = None) -> int | None:
     """Booking to delivery, where the booking date itself was read (never the opening day)."""
-    if not fact["bookingDateRead"] or fact["deliveredOn"] is None:
+    delivered = _delivery_date(fact, today)
+    if not fact["bookingDateRead"] or delivered is None:
         return None
-    days = (fact["deliveredOn"] - fact["bookingDate"]).days
+    days = (delivered - fact["bookingDate"]).days
     return days if days >= 0 else None
 
 
-def sales_report(facts: list[dict[str, Any]]) -> dict[str, Any]:
+def sales_report(facts: list[dict[str, Any]], *, today: date | None = None) -> dict[str, Any]:
     sound = price_check(facts)
 
     def block(members: list[dict[str, Any]]) -> dict[str, Any]:
         billed = [f for f in members if f["dealSheet"] and sound(f)]
-        days = [d for d in (_days_to_deliver(f) for f in members) if d is not None]
+        days = [d for d in (_days_to_deliver(f, today) for f in members) if d is not None]
         return {
             "journeys": len(members), "sharePercent": _pct(len(members), len(facts)),
             "deliveryStarted": sum(1 for f in members if f["deliveryStarted"]),
@@ -1314,17 +1347,20 @@ def sales_report(facts: list[dict[str, Any]]) -> dict[str, Any]:
         if fact["bookingDate"] is not None:
             month = fact["bookingDate"].strftime("%Y-%m")
             months.setdefault(month, {"month": month, "booked": 0, "delivered": 0})["booked"] += 1
-        if fact["deliveredOn"] is not None:
-            month = fact["deliveredOn"].strftime("%Y-%m")
+        delivered = _delivery_date(fact, today)
+        if delivered is not None:
+            month = delivered.strftime("%Y-%m")
             months.setdefault(month, {"month": month, "booked": 0, "delivered": 0})["delivered"] += 1
 
-    all_days = [d for d in (_days_to_deliver(f) for f in facts) if d is not None]
+    all_days = [d for d in (_days_to_deliver(f, today) for f in facts) if d is not None]
     return {
         "basis": {
             "liveJourneys": len(facts), "thinBelow": THIN_SAMPLE,
             "bookingDateRead": sum(1 for f in facts if f["bookingDateRead"]),
             "priceInDoubt": sum(1 for f in facts if f["dealSheet"] and f["exShowroom"] and not sound(f)),
             "modelNotResolved": sum(1 for f in facts if not f["model"]),
+            "deliveryDateInDoubt": sum(
+                1 for f in facts if f["deliveredOn"] is not None and _delivery_date(f, today) is None),
         },
         "network": block(facts),
         "months": [months[m] for m in sorted(months)],
@@ -1344,7 +1380,8 @@ def sales_report(facts: list[dict[str, Any]]) -> dict[str, Any]:
             ("By month: booked in the month of the booking date (the day the Journey was opened where no "
              "booking date stands), delivered in the month of the delivery date."),
             ("Days to deliver runs from the booking date as read to the delivery date, on delivered Journeys "
-             "that have both."),
+             "that have both. A delivery date after today was misread: the Journey counts as delivered and "
+             "its date is left out of the months and the days."),
         ],
     }
 
@@ -1361,6 +1398,8 @@ def payments_report(facts: list[dict[str, Any]]) -> dict[str, Any]:
         cash = [r for r in receipts if is_cash(r)]
         unread = [r for r in receipts if r["mode"] == "OTHERS"]
         large = [r for r in cash if r["amount"] > CASH_LIMIT]
+        at_limit = [r for r in cash if r["amount"] == CASH_LIMIT]
+        near = [r for r in cash if CASH_LIMIT * CASH_NEAR_LIMIT_SHARE <= r["amount"] < CASH_LIMIT]
         return {
             "journeys": len(members), "journeysWithReceipts": sum(1 for f in members if f["receipts"]),
             "receipts": len(receipts), "amount": _rupees(amount) or 0,
@@ -1368,6 +1407,8 @@ def payments_report(facts: list[dict[str, Any]]) -> dict[str, Any]:
             "cashPercent": _pct(sum(r["amount"] for r in cash), amount),
             "journeysPayingCash": sum(1 for f in members if any(is_cash(r) for r in f["receipts"])),
             "cashAboveLimit": len(large), "cashAboveLimitAmount": _rupees(sum(r["amount"] for r in large)) or 0,
+            "cashAtLimit": len(at_limit), "cashAtLimitAmount": _rupees(sum(r["amount"] for r in at_limit)) or 0,
+            "cashNearLimit": len(near), "cashNearLimitAmount": _rupees(sum(r["amount"] for r in near)) or 0,
             "journeysCashAboveLimitInAll": sum(
                 1 for f in members if sum(r["amount"] for r in f["receipts"] if is_cash(r)) > CASH_LIMIT),
             "modeNotRead": len(unread), "modeNotReadAmount": _rupees(sum(r["amount"] for r in unread)) or 0,
@@ -1413,6 +1454,16 @@ def payments_report(facts: list[dict[str, Any]]) -> dict[str, Any]:
         "receiptNumber": receipt["receiptNumber"],
     } for fact in facts for receipt in fact["receipts"] if is_cash(receipt) and receipt["amount"] > CASH_LIMIT),
         key=lambda r: -r["amount"])
+    def band(amount: float) -> str:
+        return "ABOVE" if amount > CASH_LIMIT else "AT" if amount == CASH_LIMIT else "NEAR"
+
+    around_limit = sorted(({
+        **journey_row(fact), "amount": _rupees(receipt["amount"]), "band": band(receipt["amount"]),
+        "date": None if receipt["date"] is None else receipt["date"].isoformat(),
+        "receiptNumber": receipt["receiptNumber"],
+    } for fact in facts for receipt in fact["receipts"]
+        if is_cash(receipt) and receipt["amount"] >= CASH_LIMIT * CASH_NEAR_LIMIT_SHARE),
+        key=lambda r: (-r["amount"], r["date"] or "", r["reference"] or ""))
     cash_in_all = []
     for fact in facts:
         cash = [r for r in fact["receipts"] if is_cash(r)]
@@ -1424,12 +1475,14 @@ def payments_report(facts: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "basis": {"liveJourneys": len(facts), "cashLimit": _rupees(CASH_LIMIT),
+                  "nearLimitFrom": _rupees(CASH_LIMIT * CASH_NEAR_LIMIT_SHARE),
                   "refunds": len(refunds), "refundAmount": _rupees(sum(abs(r["amount"]) for r in refunds)) or 0},
         "network": block(facts),
         "modes": mode_rows,
         "dealers": grouped(lambda f: (f["dealerId"] or "-", f["dealer"], None)),
         "outlets": grouped(lambda f: (f["outletId"] or "-", f["outlet"], f["dealer"])),
         "cashAboveLimit": large_cash[:200],
+        "cashAroundLimit": around_limit[:300],
         "cashAboveLimitInAll": cash_in_all[:200],
         "notes": [
             ("Receipts are the payment receipts read on the Journeys, on documents still on file; a receipt "
@@ -1437,6 +1490,9 @@ def payments_report(facts: list[dict[str, Any]]) -> dict[str, Any]:
             (f"Cash above the limit: one cash receipt of more than ₹{CASH_LIMIT:,.0f}, the limit the audit rule "
              "uses. 'In all' lists Journeys whose cash receipts add up to more than that, receipt by receipt "
              "within it or not."),
+            (f"At the limit: a cash receipt of exactly ₹{CASH_LIMIT:,.0f}. Just under: ₹{CASH_LIMIT * CASH_NEAR_LIMIT_SHARE:,.0f} "
+             "and more, below the limit. Neither fails the audit rule, which fires above the limit only; "
+             "they are listed because many of them at one outlet is worth a look."),
             ("Mode not read: the receipt carries no payment mode the reader could classify. It is not cash "
              "and not a bank transfer until someone reads it."),
         ],
@@ -1609,7 +1665,9 @@ def discount_report(facts: list[dict[str, Any]], findings: list[dict[str, Any]],
     return {
         "basis": {
             "liveJourneys": len(facts), "billedDeals": len(billed), "pricedDeals": len(priced),
-            "priceInDoubt": len(billed) - len(priced), "notYetCalculated": not_yet_calculated,
+            "priceNotRead": sum(1 for f in billed if not f["exShowroom"]),
+            "priceInDoubt": sum(1 for f in billed if f["exShowroom"] and not sound_price(f)),
+            "notYetCalculated": not_yet_calculated,
             "thinBelow": THIN_SAMPLE, "outlierPercent": OUTLIER_PERCENT, "outlierAmount": OUTLIER_AMOUNT,
             "toleranceRupees": LINE_TOLERANCE,
         },
@@ -1720,7 +1778,7 @@ def build_insight(
     elif report == "catchment":
         body = catchment_report(facts)
     elif report == "sales":
-        body = sales_report(facts)
+        body = sales_report(facts, today=now.date())
     elif report == "payments":
         body = payments_report(facts)
     else:
