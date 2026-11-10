@@ -113,31 +113,34 @@ def dealer_codes(connection: Connection, *, tenant_id: str, dealer_id: Any) -> s
     ).scalars().all())
 
 
-def premium_on_dealer_invoice(connection: Connection, *, tenant_id: str, journey_id: UUID) -> float | None:
-    """The premium a current dealer invoice bills, if any."""
-    rows = connection.execute(
-        text(
-            """
-            SELECT DISTINCT ON (f.di_document_id, f.field_key)
-                   f.di_document_id, f.field_key, f.effective_value
-            FROM auditcore.journey_document_extracted_fields f
-            JOIN auditcore.evidence e
-              ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
-             AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
-            WHERE f.tenant_id = :t AND f.journey_id = :j
-              AND COALESCE(e.document_type_key, f.source_document_type_key) = ANY(CAST(:types AS text[]))
-              AND f.field_key IN ('line_items', 'insurance_amount', 'invoice_nature', 'invoice_purpose',
-                                  'document_title')
-              AND NOT EXISTS (
-                  SELECT 1 FROM auditcore.p2_document_queue q
-                  WHERE q.tenant_id = f.tenant_id AND q.di_document_id = f.di_document_id
-                  HAVING bool_and(q.retired_at_utc IS NOT NULL OR q.queue_status IN ('MERGED', 'CANCELLED'))
-              )
-            ORDER BY f.di_document_id, f.field_key, f.source_fact_version DESC NULLS LAST, f.updated_at_utc DESC
-            """
-        ),
-        {"t": tenant_id, "j": journey_id, "types": list(_INVOICE_TYPES)},
-    ).mappings().all()
+# Every reading a dealer invoice gives of an insurance premium, for one Journey
+# (``:j``) or, with ``journeys`` set, for a list of them in one statement (the
+# insights reports ask for many Journeys at once, 2026-11-10).
+def _invoice_rows_sql(*, many: bool) -> str:
+    journeys = "f.journey_id = ANY(CAST(:journeys AS uuid[]))" if many else "f.journey_id = :j"
+    return f"""
+        SELECT DISTINCT ON (f.journey_id, f.di_document_id, f.field_key)
+               f.journey_id, f.di_document_id, f.field_key, f.effective_value
+        FROM auditcore.journey_document_extracted_fields f
+        JOIN auditcore.evidence e
+          ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+         AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
+        WHERE f.tenant_id = :t AND {journeys}
+          AND COALESCE(e.document_type_key, f.source_document_type_key) = ANY(CAST(:types AS text[]))
+          AND f.field_key IN ('line_items', 'insurance_amount', 'invoice_nature', 'invoice_purpose',
+                              'document_title')
+          AND NOT EXISTS (
+              SELECT 1 FROM auditcore.p2_document_queue q
+              WHERE q.tenant_id = f.tenant_id AND q.di_document_id = f.di_document_id
+              HAVING bool_and(q.retired_at_utc IS NOT NULL OR q.queue_status IN ('MERGED', 'CANCELLED'))
+          )
+        ORDER BY f.journey_id, f.di_document_id, f.field_key, f.source_fact_version DESC NULLS LAST,
+                 f.updated_at_utc DESC
+    """
+
+
+def premium_in_invoice_rows(rows: list[Any]) -> float | None:
+    """The premium the dealer invoices among ``rows`` (one Journey's) bill, if any."""
     not_a_bill = {
         str(r["di_document_id"]) for r in rows
         if r["field_key"] in ("invoice_nature", "invoice_purpose", "document_title")
@@ -166,6 +169,37 @@ def premium_on_dealer_invoice(connection: Connection, *, tenant_id: str, journey
             if amount is not None and amount > 0:
                 best = max(best or 0.0, amount)
     return best
+
+
+def premium_on_dealer_invoice(connection: Connection, *, tenant_id: str, journey_id: UUID) -> float | None:
+    """The premium a current dealer invoice bills, if any."""
+    rows = connection.execute(
+        text(_invoice_rows_sql(many=False)),
+        {"t": tenant_id, "j": journey_id, "types": list(_INVOICE_TYPES)},
+    ).mappings().all()
+    return premium_in_invoice_rows(list(rows))
+
+
+def premiums_on_dealer_invoices(
+    connection: Connection, *, tenant_id: str, journey_ids: list[str],
+) -> dict[str, float]:
+    """``premium_on_dealer_invoice`` for many Journeys in one statement: the Journeys
+    (by id) whose dealer invoice bills an insurance premium, and the premium."""
+    if not journey_ids:
+        return {}
+    rows = connection.execute(
+        text(_invoice_rows_sql(many=True)),
+        {"t": tenant_id, "journeys": journey_ids, "types": list(_INVOICE_TYPES)},
+    ).mappings().all()
+    by_journey: dict[str, list[Any]] = {}
+    for row in rows:
+        by_journey.setdefault(str(row["journey_id"]), []).append(row)
+    out: dict[str, float] = {}
+    for journey, journey_rows in by_journey.items():
+        premium = premium_in_invoice_rows(journey_rows)
+        if premium is not None:
+            out[journey] = premium
+    return out
 
 
 # The dealer's own deal sheets: the NDC / account statement, the cost sheet
