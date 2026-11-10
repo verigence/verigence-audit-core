@@ -190,6 +190,27 @@ def test_insurance_report_names_the_agents_outside_policies_went_through():
     assert [(r["month"], r["policies"]) for r in report["renewals"]] == [("2027-10", 2), ("2027-11", 1)]
 
 
+def test_an_agent_whose_code_was_read_two_ways_is_one_agent():
+    def outside(agent, code, premium, outlet="Outlet 1"):
+        return _fact(channel=insights.OUTSIDE_UNCONFIRMED, outlet=outlet, policy={
+            "insurer": "X", "policyNumber": uuid4().hex, "premium": premium, "confirmed": None,
+            "agentName": agent, "agentCode": code, "mispCode": None, "covers": []})
+
+    facts = [outside("Saswati Dhar", "PS0000041087", 30000.0), outside("Saswati Dhar", "PS0000041087", 30000.0),
+             outside("SASWATI  DHAR", "PS000041087", 20000.0, outlet="Outlet 2"),     # a zero dropped by the reader
+             outside("Saswati Dhar", None, 10000.0),                                  # the code not read at all
+             outside("Mathura Bhoi", "NY0000001773", 15000.0),
+             outside(None, "ZZ-1", 5000.0), outside(None, "ZZ-2", 5000.0),            # no name: never joined
+             outside(None, None, 1000.0)]
+    agents = insights.insurance_report(facts, today=date(2026, 11, 10))["outsideAgents"]
+    assert [(a["agent"], a["policies"], a["premium"]) for a in agents] == [
+        ("Saswati Dhar", 4, 90000), ("Mathura Bhoi", 1, 15000), ("Name not read", 1, 5000), ("Name not read", 1, 5000),
+        ("No agent or code on the policy", 1, 1000)]
+    assert agents[0]["code"] == "PS0000041087" and agents[0]["codes"] == ["PS0000041087", "PS000041087"]
+    assert {o["outlet"]: o["policies"] for o in agents[0]["outlets"]} == {"Outlet 1": 3, "Outlet 2": 1}
+    assert len(agents[0]["journeys"]) == 4
+
+
 def test_scrappage_report_shows_where_certificates_come_from_and_what_they_save():
     def cert(number, state="Delhi", kind="TRANSFERRED"):
         return [{"number": number, "key": number, "kind": kind, "oldRegistration": "X", "state": state,
@@ -389,6 +410,24 @@ def test_sales_report_counts_what_was_booked_billed_and_delivered():
     assert _row(report["categories"], "CV")["journeys"] == 1
 
 
+def test_a_delivery_date_after_today_is_delivered_but_not_charted_or_measured():
+    facts = [
+        _fact(bookingDate=date(2026, 10, 1), deliveredOn=date(2026, 10, 9)),
+        _fact(bookingDate=date(2026, 10, 3), deliveredOn=date(2027, 10, 9)),       # the year misread
+    ]
+    report = insights.sales_report(facts, today=date(2026, 11, 10))
+    assert report["network"]["delivered"] == 2 and report["basis"]["deliveryDateInDoubt"] == 1
+    assert report["months"] == [{"month": "2026-10", "booked": 2, "delivered": 1}]
+    assert (report["network"]["typicalDaysToDeliver"], report["network"]["daysMeasuredOn"]) == (8.0, 1)
+    assert sum(b["deals"] for b in report["daysToDeliverBands"]) == 1
+
+
+def test_a_price_not_read_is_not_a_price_in_doubt():
+    facts = [_fact() for _ in range(3)] + [_fact(exShowroom=None), _fact(exShowroom=90_000_000.0)]
+    basis = insights.discount_report(facts, [])["basis"]
+    assert (basis["billedDeals"], basis["pricedDeals"], basis["priceNotRead"], basis["priceInDoubt"]) == (5, 3, 1, 1)
+
+
 def test_payments_report_measures_cash_against_the_limit():
     def receipt(amount, mode, label=None, day=date(2026, 10, 5), number="R-1"):
         return {"amount": amount, "mode": mode, "modeLabel": label or mode.title(), "date": day,
@@ -417,6 +456,29 @@ def test_payments_report_measures_cash_against_the_limit():
     assert [(r["reference"], r["cashTotal"]) for r in report["cashAboveLimitInAll"]] == [("SPLIT", 300_000), ("ONE-BIG", 250_000)]
     second = _row(report["outlets"], "Outlet 2")
     assert (second["cashPercent"], second["cashAboveLimit"]) == (84.6, 1)
+
+
+def test_cash_at_the_limit_and_just_under_it_is_counted_apart_from_cash_above_it():
+    def cash(amount, number, day=date(2026, 10, 5)):
+        return {"amount": amount, "mode": "CASH", "modeLabel": "Cash", "date": day, "receiptNumber": number}
+
+    facts = [
+        _fact(reference="AT", receipts=[cash(200_000.0, "R-1"), cash(200_000.0, "R-2", date(2026, 10, 6))]),
+        _fact(reference="NEAR", outletId="o2", outlet="Outlet 2", receipts=[cash(199_000.0, "R-3"), cash(190_000.0, "R-4")]),
+        _fact(reference="ABOVE", receipts=[cash(200_001.0, "R-5")]),
+        _fact(reference="SMALL", receipts=[cash(189_999.0, "R-6"),
+                                           {"amount": 200_000.0, "mode": "RTGS", "modeLabel": "RTGS", "date": None,
+                                            "receiptNumber": "R-7"}]),
+    ]
+    report = insights.payments_report(facts)
+    network = report["network"]
+    assert (network["cashAboveLimit"], network["cashAtLimit"], network["cashNearLimit"]) == (1, 2, 2)
+    assert (network["cashAtLimitAmount"], network["cashNearLimitAmount"]) == (400_000, 389_000)
+    assert report["basis"]["nearLimitFrom"] == 190_000
+    assert [(r["reference"], r["receiptNumber"], r["band"]) for r in report["cashAroundLimit"]] == [
+        ("ABOVE", "R-5", "ABOVE"), ("AT", "R-1", "AT"), ("AT", "R-2", "AT"), ("NEAR", "R-3", "NEAR"), ("NEAR", "R-4", "NEAR")]
+    second = _row(report["outlets"], "Outlet 2")
+    assert (second["cashAtLimit"], second["cashNearLimit"]) == (0, 2)
 
 
 # --------------------------------------------------------------------------- read from Postgres
