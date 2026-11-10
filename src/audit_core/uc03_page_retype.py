@@ -117,23 +117,36 @@ def parse_request(tag: str, reports: list[str]) -> tuple[str, bool, list[tuple[s
 def _current_unit(connection: Any, *, tenant_id: str, reference: str, page: int,
                   current: str | None = None) -> dict[str, Any] | None:
     """The booking and the live (not merged, not retired) unit holding the page
-    (read now as ``current``, when given)."""
-    row = connection.execute(
+    (read now as ``current``, when given). When more than one upload of the
+    booking has a live unit with that page and type, none is picked: the
+    newest used to be, and on 10 Nov that read the wrong upload's page 1 four
+    times (UTK-BI-261020-005). The caller reports it as ambiguous."""
+    rows = connection.execute(
         text(
             """
-            SELECT j.journey_id, q.queue_id
+            SELECT j.journey_id, q.queue_id, q.batch_id
             FROM auditcore.journeys j
             JOIN auditcore.p2_document_queue q ON q.tenant_id = j.tenant_id AND q.journey_id = j.journey_id
             WHERE j.tenant_id = :t AND upper(j.journey_reference) = :r AND :p = ANY(q.page_numbers)
               AND q.queue_status <> 'MERGED' AND q.retired_at_utc IS NULL
               AND (CAST(:c AS text) IS NULL OR COALESCE(q.template_key, q.classified_document_type) = :c)
             ORDER BY q.created_at_utc DESC
-            LIMIT 1
             """
         ),
         {"t": tenant_id, "r": reference, "p": page, "c": current},
-    ).mappings().first()
-    return dict(row) if row else None
+    ).mappings().all()
+    if not rows:
+        return None
+    if len({r["batch_id"] for r in rows}) > 1:
+        return {"ambiguous": len({r["batch_id"] for r in rows})}
+    return {"journey_id": rows[0]["journey_id"], "queue_id": rows[0]["queue_id"]}
+
+
+def _not_found(found: dict[str, Any] | None) -> str:
+    if found is None:
+        return "no live page"
+    return (f"{found['ambiguous']} uploads of this booking have a live page with this number: name the type "
+            "it is read as now (the fourth part), or send it by its unit")
 
 
 def _own_page_unit(connection: Any, *, tenant_id: str, journey_id: UUID, batch_id: Any,
@@ -253,8 +266,8 @@ def run_page_retype(engine: Engine, tag: str, reports: list[str], *,
                 found = (_pinned_unit(connection, tenant_id=tenant_id, queue_id=pinned) if pinned is not None
                      else _current_unit(connection, tenant_id=tenant_id, reference=reference, page=page,
                                         current=current))
-                if found is None:
-                    out["skipped"].append({"journey": reference, "page": page, "why": "no live page"})
+                if found is None or found.get("ambiguous"):
+                    out["skipped"].append({"journey": reference, "page": page, "why": _not_found(found)})
                     continue
                 journey_id = UUID(str(found["journey_id"]))
                 unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id,
@@ -281,8 +294,8 @@ def run_page_retype(engine: Engine, tag: str, reports: list[str], *,
             found = (_pinned_unit(connection, tenant_id=tenant_id, queue_id=pinned) if pinned is not None
                      else _current_unit(connection, tenant_id=tenant_id, reference=reference, page=page,
                                         current=current))
-            if found is None:
-                out["skipped"].append({"journey": reference, "page": page, "why": "no live page"})
+            if found is None or found.get("ambiguous"):
+                out["skipped"].append({"journey": reference, "page": page, "why": _not_found(found)})
                 continue
             journey_id = UUID(str(found["journey_id"]))
             unit = _page_unit(connection, tenant_id=tenant_id, journey_id=journey_id,
