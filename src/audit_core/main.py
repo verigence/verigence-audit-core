@@ -139,6 +139,7 @@ from audit_core.uc03_p2_daily_report import router as uc03_p2_daily_report_route
 from audit_core.uc03_p2_deal_actions import router as uc03_p2_deal_router
 from audit_core.uc03_p2_documents import router as uc03_p2_documents_router
 from audit_core.uc03_p2_gate_pass import router as uc03_p2_gate_pass_router
+from audit_core.uc03_p2_insights import router as uc03_p2_insights_router
 from audit_core.uc03_p2_journey360_api import router as uc03_p2_journey360_router
 from audit_core.uc03_p2_journey_delete import router as uc03_p2_journey_delete_router
 from audit_core.uc03_p2_journey_export import router as uc03_p2_journey_export_router
@@ -358,6 +359,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_journey_export_router)
     application.include_router(uc03_p2_my_work_router)
     application.include_router(uc03_p2_project_tracker_router)
+    application.include_router(uc03_p2_insights_router)
     application.include_router(uc03_p2_missing_documents_router)
     application.include_router(task_manager_router)
     application.include_router(task_manager_admin_router)

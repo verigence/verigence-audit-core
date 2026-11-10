@@ -1,0 +1,130 @@
+name: One-shot insights verify (DEV, read-only)
+
+# Read-only: builds every business insight report (uc03_p2_insights) for each
+# Project on DEV, as an administrator would read it, and prints the headline
+# figures so they can be checked against the Journeys. Never writes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-insights-verify.yml'
+      - 'src/audit_core/uc03_p2_insights.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-insights-verify
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          npm install --global @railway/cli@5.70.0
+
+      - name: Resolve Railway DEV database connection
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          raw="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          variables = json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(variables.get('DATABASE_PUBLIC_URL') or variables.get('DATABASE_URL') or '')
+          PY
+          )"
+          [[ -n "$raw" ]] || { echo '::error::no DATABASE_URL on the DEV service.'; exit 1; }
+          case "$raw" in
+            postgresql+psycopg://*) url="$raw" ;;
+            postgresql+asyncpg://*) url="postgresql+psycopg://${raw#postgresql+asyncpg://}" ;;
+            postgresql://*) url="postgresql+psycopg://${raw#postgresql://}" ;;
+            postgres://*) url="postgresql+psycopg://${raw#postgres://}" ;;
+            *) echo '::error::DATABASE_URL is not a PostgreSQL URL.'; exit 1 ;;
+          esac
+          echo "::add-mask::$url"
+          echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
+
+      - name: Build every report for every Project and print the headline figures
+        shell: bash
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          import json, os, time
+          from sqlalchemy import create_engine, text
+          from audit_core import uc03_p2_insights as insights
+          from audit_core.db import set_tenant_context
+
+          def headline(report, body):
+              if report == "penetration":
+                  return {"basis": body["basis"],
+                          "network": {k: (c["count"], c["percent"]) for k, c in body["network"]["products"].items()},
+                          "outlets": [(r["label"][:28], r["deals"], {k: c["percent"] for k, c in r["products"].items()})
+                                      for r in body["outlets"][:14]],
+                          "models": [(r["label"], r["deals"]) for r in body["models"][:12]]}
+              if report == "insurance":
+                  return {"basis": body["basis"], "network": body["network"],
+                          "agents": [(a["agent"][:30], a["code"], a["policies"], a["premium"]) for a in body["outsideAgents"][:8]],
+                          "offStatement": {k: v for k, v in body["dealerCodeOffStatement"].items() if k != "journeys"},
+                          "insurers": [(i["insurer"], i["policies"]) for i in body["insurers"][:8]],
+                          "covers": body["covers"][:6], "renewals": body["renewals"][:4]}
+              if report == "scrappage":
+                  return {"summary": body["summary"], "states": body["states"][:8], "effect": body["roadTaxEffect"],
+                          "usedTwice": len(body["usedTwice"]), "register": len(body["register"])}
+              if report == "finance":
+                  return {"basis": body["basis"], "summary": body["summary"],
+                          "lenders": [(r["lender"], r["deals"], r["sharePercent"], r["typicalLoan"], r["typicalLoanToValue"])
+                                      for r in body["lenders"][:10]],
+                          "ltv": body["loanToValueBands"], "gaps": len(body["sanctionGaps"])}
+              if report == "catchment":
+                  return {"basis": body["basis"],
+                          "districts": [(r["label"], r["journeys"], r["statementDeals"]) for r in body["districts"][:12]],
+                          "outlets": [(r["label"][:28], r["homeDistrict"], r["homeSharePercent"]) for r in body["outlets"][:14]]}
+              return {"basis": body["basis"],
+                      "network": {k: v for k, v in body["network"].items()},
+                      "concentration": body["concentration"],
+                      "byDiscount": [(r["label"], r["deals"], r["given"], r["over"], r["kitAsCash"], r["unknown"])
+                                     for r in body["byDiscount"]],
+                      "reasons": [(r["reason"], r["label"], r["lines"], r["amount"]) for r in body["unknownByReason"][:8]],
+                      "outlets": [(r["label"][:28], r["deals"], r["givenPercent"], r["index"]) for r in body["outlets"][:14]],
+                      "outliers": [(o["reference"], o["given"], o["percent"]) for o in body["outliers"][:8]],
+                      "decisions": {k: v for k, v in body["decisions"].items() if k != "remarks"}}
+
+          engine = create_engine(os.environ["DATABASE_URL"])
+          with engine.connect() as connection:
+              tenants = connection.execute(text(
+                  "SELECT p.tenant_id, p.project_name FROM auditcore.projects p ORDER BY p.project_name")).all()
+          for tenant_id, name in tenants:
+              with engine.begin() as connection:
+                  set_tenant_context(connection, tenant_id)
+                  journeys = connection.execute(
+                      text("SELECT count(*) FROM auditcore.journeys WHERE tenant_id = :t"), {"t": tenant_id}).scalar_one()
+                  if not journeys:
+                      continue
+                  print(f"\n########## {name} ({journeys} journeys)")
+                  for report in insights.REPORTS:
+                      started = time.monotonic()
+                      body = insights.build_insight(connection, tenant_id=tenant_id, report=report,
+                                                    actor_id="insights-verify", admin=True)
+                      took = time.monotonic() - started
+                      line = json.dumps(headline(report, body), default=str, ensure_ascii=False)
+                      print(f"===== {report} [{took:.2f}s, {len(json.dumps(body, default=str)) // 1024} KB]\n{line}")
+          print("\nINSIGHTS_VERIFY=PASS")
+          PY
