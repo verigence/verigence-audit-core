@@ -46,6 +46,7 @@ logger = structlog.get_logger(__name__)
 
 _STATEMENT_TITLE = re.compile(r".*\b(ACCOUNTS? STATEMENT|OFFER LETTER|PAYMENT DETAILS)\b.*")
 _NDC_TEMPLATE = "customer_ledger"
+_RETYPE_ACTOR = "SYSTEM:PAGE_RETYPE"  # uc03_page_retype._ACTOR
 _CHUNK = 60
 
 
@@ -91,7 +92,9 @@ def untitled_pages(engine: Engine, tenant_id: str) -> list[dict[str, Any]]:
                        (SELECT min(q.page_number) FROM auditcore.p2_document_queue q
                          WHERE q.tenant_id = e.tenant_id AND q.journey_id = e.journey_id
                            AND q.di_document_id = e.di_document_id
-                           AND q.queue_status NOT IN ('MERGED', 'CANCELLED')) AS page_number
+                           AND q.queue_status NOT IN ('MERGED', 'CANCELLED')
+                           -- read again once already: never again (the sweep runs hourly)
+                           AND q.type_overridden_by_actor_id IS DISTINCT FROM :again) AS page_number
                 FROM auditcore.evidence e
                 JOIN auditcore.journeys j ON j.tenant_id = e.tenant_id AND j.journey_id = e.journey_id
                 WHERE e.tenant_id = :t AND e.association_status = 'ACTIVE' AND e.document_type_key = 'cost_sheet'
@@ -102,7 +105,7 @@ def untitled_pages(engine: Engine, tenant_id: str) -> list[dict[str, Any]]:
                 ORDER BY j.journey_reference
                 """
             ),
-            {"t": tenant_id},
+            {"t": tenant_id, "again": _RETYPE_ACTOR},
         ).mappings().all()
     return [dict(r) for r in rows]
 

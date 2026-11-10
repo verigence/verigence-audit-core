@@ -164,3 +164,20 @@ def test_field_set_puts_a_value_back_with_the_trail(journey):
     assert _value(journey, page["di_document_id"], "accessories_amount") == 0
     no_remark = [json.dumps({**json.loads(ask[0]), "remarks": ""})]
     assert carry.run_field_set(journey.engine, f"{journey.tenant_id}:fix-commit", no_remark)["skipped"]
+
+
+def test_a_page_read_again_once_is_never_read_again_by_the_sweep(journey):
+    """The sweep runs hourly: a page already read again with no title is left alone."""
+    page = _cost_sheet_page(journey)
+    new_queue = _send_again(journey, page, "cost_sheet")
+    _read(journey, new_queue, "cost_sheet", ex_showroom_price=1011500)  # still no title
+    _sql(journey, "UPDATE auditcore.evidence SET association_status='VOIDED' WHERE di_document_id=:d",
+         d=page["di_document_id"])
+    found = statements.untitled_pages(journey.engine, journey.tenant_id)
+    assert len(found) == 1 and found[0]["page_number"] is None
+
+
+def test_the_worker_sweeps_cost_sheet_statements_every_hour():
+    from audit_core import uc03_p2_worker as worker
+
+    assert worker._COST_SHEET_SWEEP_SECONDS == 3600 and callable(worker._sweep_cost_sheet_statements_every)

@@ -411,15 +411,16 @@ def test_confirm_loan_disbursement_writes_pc_confirmed_and_notifies_tl(finance_s
         assert row["loan_disbursement_confidence"] == "PC_CONFIRMED"
         assert row["loan_disbursement_payment_id"] == chosen["payment_id"]
 
-        tasks = connection.execute(
+        # Both tasks are written in this one transaction, so they share
+        # created_at_utc: compared by type, never by row order (2026-11-10).
+        tasks = {r["task_type"]: r for r in connection.execute(
             text("SELECT task_type, task_status, assigned_role_code FROM auditcore.workflow_tasks "
-                 "WHERE tenant_id=:t AND journey_id=:j ORDER BY created_at_utc"),
+                 "WHERE tenant_id=:t AND journey_id=:j"),
             {"t": setup["tenant_id"], "j": setup["journey_id"]},
-        ).mappings().all()
-        assert tasks[0]["task_type"] == TASK_TYPE
-        assert tasks[0]["task_status"] == "CANCELLED"
-        assert tasks[1]["task_type"] == TL_NOTICE_TASK_TYPE
-        assert tasks[1]["assigned_role_code"] == "TL"
+        ).mappings().all()}
+        assert set(tasks) == {TASK_TYPE, TL_NOTICE_TASK_TYPE}
+        assert tasks[TASK_TYPE]["task_status"] == "CANCELLED"
+        assert tasks[TL_NOTICE_TASK_TYPE]["assigned_role_code"] == "TL"
 
 
 def test_confirm_rejects_a_payment_that_is_not_an_eligible_candidate(finance_setup) -> None:

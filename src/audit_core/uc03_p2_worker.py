@@ -5204,6 +5204,28 @@ def _settle_reread_corrections_every(engine: Engine) -> None:
         _stopping.wait(_REREAD_CORRECTIONS_SECONDS)
 
 
+_COST_SHEET_SWEEP_SECONDS = 3600
+
+
+def _sweep_cost_sheet_statements_every(engine: Engine) -> None:
+    """Every hour, for every live Project: a dealer's statement still filed as a
+    cost sheet is read again as the NDC, and a cost sheet read before its title
+    was is read again first (2026-11-10, uc03_cost_sheet_statements). The
+    classifier files most statements as the NDC since 3 Nov, but not all: on
+    10 Nov two Utkal Vehicle Account Statements uploaded that day were read as
+    cost sheets, and a one-off job cannot catch what comes later."""
+    from audit_core.uc03_cost_sheet_statements import run_cost_sheet_statements
+
+    _stopping.wait(300)  # let the worker settle after a start
+    while not _stopping.is_set():
+        for tenant_id in _active_tenants(engine):
+            try:
+                run_cost_sheet_statements(engine, f"{tenant_id}:hourly-sweep-commit", [])
+            except Exception:
+                logger.warning("cost_sheet_statements_sweep_failed", tenant_id=tenant_id, exc_info=True)
+        _stopping.wait(_COST_SHEET_SWEEP_SECONDS)
+
+
 def main() -> None:
     _configure_worker_observability()
     engine = get_engine()
@@ -5221,6 +5243,8 @@ def main() -> None:
     threading.Thread(target=_refresh_names_every, args=(engine,), name="people-names", daemon=True).start()
     threading.Thread(target=_build_journey_exports, args=(engine,), name="journey-exports", daemon=True).start()
     threading.Thread(target=_settle_reread_corrections_every, args=(engine,), name="reread-corrections",
+                     daemon=True).start()
+    threading.Thread(target=_sweep_cost_sheet_statements_every, args=(engine,), name="cost-sheet-statements",
                      daemon=True).start()
     logger.info(
         "p2_worker_started",
