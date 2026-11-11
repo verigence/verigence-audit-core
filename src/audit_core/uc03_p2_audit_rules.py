@@ -553,23 +553,6 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
         reason = "Every price component is charged at or above its standard price"
         return RuleOutcome(code, "PASS", reason + (f" ({explained_text})." if explained else "."),
                            concession_details)
-    if net_gap is not None and net_gap <= _TOLERANCE:
-        # The deal is judged as a whole (product owner 2026-11-11: "where
-        # customer has actually paid more than standard deal price is showing
-        # negative variance"). A deal whose net is at or above the standard
-        # net is not undercharged because one of its lines is below its own
-        # standard -- live, 85 delivered deals at or above the standard held
-        # this finding for a line, VJ2610-000045 for TCS Rs 250 and a FASTag
-        # of Rs 500 with its net Rs 70,787 above. The lines stay listed, for
-        # information; TCS has its own check (TCS_SHORT / TCS_EXCESS).
-        lines = "; ".join(
-            f"{s['label']} {_rupees(s['charged'])} against {_rupees(s['standard'])}" for s in short)
-        return RuleOutcome(code, "PASS", (
-            f"The deal as a whole is charged at or above the standard: net {_rupees(net_current)} against "
-            f"the standard {_rupees(net_standard)}. Lines below their own standard, for information: {lines}"
-            + (f"; {explained_text}" if explained else "") + "."
-        ), {"componentsBelowStandard": short, "netStandard": str(net_standard), "netCurrent": str(net_current),
-            **concession_details})
     parts = [
         f"{s['label']}: {_rupees(s['charged'])} on the {s['source']} against the standard {_rupees(s['standard'])} "
         f"({_rupees(s['short'])} short{'; ' + s['note'] if s.get('note') else ''})"

@@ -1,7 +1,7 @@
 """The Deal after the product owner's review of 2026-11-11.
 
-1. Every accessory invoice on file adds up to the accessories line; only the
-   NDC / cost sheet's own charge stands before them. The customer ledger
+1. Every accessory invoice on file adds up, shown beside the accessories line;
+   the NDC / cost sheet's charge is the line's figure. The customer ledger
    verifies, it does not price ("NDC / cost sheet figures should be used for
    computation ... customer ledger has to be used to verify the payments").
 2. A charge the NDC / cost sheet shows need not be on an invoice: the row says
@@ -15,8 +15,11 @@
 5. A discount the customer ledger posts and the NDC does not show comes off
    what is still to be received ("discounts need to be handled in customer
    ledger transactions"), never off the deal's net.
-6. A deal is undercharged when its net is below the standard net, not when one
-   line is below its own standard.
+6. Every line charged below its standard is flagged, also when the deal as a
+   whole is above the standard.
+7. For Mahindra Orissa the NDC / cost sheet alone prices the deal ("NDC has to
+   come and there is no escape route for it"); the invoices and the customer
+   ledger tally the payments only.
 """
 from __future__ import annotations
 
@@ -106,8 +109,8 @@ def _accessory_invoice(journey, number: str, total: str, on: str = "2026-10-05")
                        invoice_date=on, grand_total_amount=total)
 
 
-# ── 1. accessory invoices ────────────────────────────────────────────────────
-def test_every_accessory_invoice_adds_up_and_the_customer_ledger_does_not_price_the_line(journey) -> None:
+# ── 1. accessory invoices, and what prices the deal ─────────────────────────
+def test_every_accessory_invoice_adds_up_beside_the_line_and_the_ndc_alone_prices_it(journey) -> None:
     """VJ2610-000045: four accessory invoices of Rs 1,07,812; the Tally customer
     ledger posts two of them (Rs 96,537), which stood as the charge."""
     _statement(journey, ADITYA, tally=[  # the NDC prints no accessories row
@@ -117,13 +120,14 @@ def test_every_accessory_invoice_adds_up_and_the_customer_ledger_does_not_price_
                               ("C1R27B00000749", "5748", "2026-10-07"), ("C1R27B00000782", "5965", "2026-10-12")):
         _accessory_invoice(journey, number, total, on)
     row = _row(_deal(journey), "accessories_cost")
-    assert D(row["billed"]) == D(107812) and row["billedFrom"] == "invoice"
-    assert D(row["current"]) == D(107812)
-    # the ledger's posting is still listed on the row, as a check
-    assert any(s["documentType"] == "customer_ledger_tally" for s in row["sources"])
+    assert D(row["invoiced"]) == D(107812)          # every invoice, added up
+    assert D(row["ledger"]) == D(96537)             # the ledger's posting, as a check
+    # neither prices the line: the NDC does not charge the accessories
+    assert row["billed"] is None and row["current"] is None
+    assert row["notTaken"] is True and "NOT_ON_STATEMENT" in row["flags"]
 
 
-def test_the_ndc_charge_stands_before_the_accessory_invoices(journey) -> None:
+def test_the_ndc_charge_is_the_accessories_figure_with_the_invoices_beside_it(journey) -> None:
     _statement(journey, UTKAL)  # Accessories 30,000 charged on the NDC
     _accessory_invoice(journey, "ACC-1", "20000")
     _accessory_invoice(journey, "ACC-2", "15000", "2026-10-09")
@@ -132,13 +136,42 @@ def test_the_ndc_charge_stands_before_the_accessory_invoices(journey) -> None:
     assert D(row["invoiced"]) == D(35000) and D(row["freeByInvoice"]) == D(5000)
 
 
-def test_the_customer_ledger_prices_a_line_only_when_no_other_document_gives_it(journey) -> None:
+def test_the_customer_ledger_never_prices_a_line(journey) -> None:
     _statement(journey, _without(UTKAL, "RSA", "Insurance amount"), tally=[
         _posting("RSA CHARGES", "Journal", debit=2021), _posting("INSURANCE PREMIUM", "Journal", debit=40000)])
     _source(journey, "insurance_amount", "insurance_cover", "38201")
     view = _deal(journey)
-    assert D(_row(view, "rsa_amount")["billed"]) == D(2021)  # nothing else gives it
-    assert D(_row(view, "insurance_amount")["billed"]) == D(38201)  # the policy stands before the ledger
+    rsa = _row(view, "rsa_amount")
+    assert rsa["billed"] is None and rsa["current"] is None and D(rsa["ledger"]) == D(2021)
+    insurance = _row(view, "insurance_amount")
+    assert D(insurance["billed"]) == D(38201) and D(insurance["ledger"]) == D(40000)  # the policy; the ledger checks
+    assert "BILLED_VS_LEDGER" in insurance["flags"]
+
+
+def test_without_the_ndc_the_deal_waits_for_it_whatever_invoices_and_ledger_are_on_file(journey) -> None:
+    """Product owner 2026-11-11: "NDC has to come and there is no escape route
+    for it ... we will wait till NDC is not there ... Invoice and customer
+    ledger will be used to tally the total payments only"."""
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    add_ready_document(journey, "customer_invoice_dms", process_area="DELIVERY", invoice_purpose="VEHICLE_SALE",
+                       invoice_nature="TAX_INVOICE", invoice_number="INV-1", invoice_date="2026-10-05",
+                       vin_number="MA1NE2XO3T4000001", taxable_amount="701017.32", cgst_rate="9",
+                       cgst_amount="63091.56", sgst_rate="9", sgst_amount="63091.56", tcs_amount="8272.00",
+                       grand_total_amount="835472.44")
+    _accessory_invoice(journey, "ACC-1", "20000")
+    _ledger(journey, [_posting("Sales Accessories@18%", "SALES WORKSHOP", debit=20000),
+                      _posting("FAST TAG (SALES)", "Sales_Inv", debit=600)])
+    _sync(journey)
+    view = _deal(journey)
+    for key in ("ex_showroom_price", "tcs_amount", "accessories_cost", "fastag_amount"):
+        row = _row(view, key)
+        assert row["billed"] is None and row["current"] is None, key
+        assert row["awaiting"] == "NDC (Account Statement)", key
+    assert _row(view, "ex_showroom_price")["invoiced"] is not None  # the invoice is shown beside, to tally
+    assert D(_row(view, "accessories_cost")["invoiced"]) == D(20000)
+    summary = view["summary"]
+    assert summary["payable"] is None and summary["balanceDue"] is None
+    assert summary["invoiceNetPayable"] is not None  # what the invoices add up to, for the payment tally
 
 
 # ── 2. on the NDC, not on an invoice ─────────────────────────────────────────
@@ -259,14 +292,17 @@ def _line(journey, key: str, standard: str, billed: str) -> None:
     _source(journey, key, "tax_invoice_tally", billed)
 
 
-def test_a_line_below_its_standard_is_no_undercharge_when_the_deal_is_above_the_standard(journey) -> None:
+def test_every_line_below_its_standard_is_flagged_also_when_the_deal_is_above_the_standard(journey) -> None:
+    """Product owner 2026-11-11: "if anything is undercharged, like TCS, ex-showroom
+    price, insurance, FASTag, RSA, EW, accessories, it should be flagged"."""
     _line(journey, "ex_showroom_price", "900000", "900000")
     _line(journey, "insurance_amount", "40000", "35000")       # Rs 5,000 below its standard
+    _line(journey, "rsa_amount", "2021", "1500")               # Rs 521 below
     _line(journey, "accessories_cost", "20000", "60000")       # Rs 40,000 above
     under = _run(journey)["DEAL_UNDERCHARGED"]
-    assert under.outcome == "PASS"
-    assert "as a whole is charged at or above the standard" in under.reason
-    assert [c["key"] for c in under.details["componentsBelowStandard"]] == ["insurance_amount"]
+    assert under.outcome == "FAIL"
+    assert [c["key"] for c in under.details["components"]] == ["insurance_amount", "rsa_amount"]
+    assert "Net deal" not in under.reason  # the net is above the standard: only the lines are short
 
 
 def test_a_deal_below_the_standard_net_is_still_undercharged(journey) -> None:
@@ -320,3 +356,20 @@ def test_the_export_carries_the_policy_number_and_the_add_on_covers() -> None:
     assert row["Insurance Add-ons"] == "Zero Depreciation, RSA"
     assert identity_row({}, deal=_export_deal(), vehicle={}, customer={})["Insurance Policy No"] is None
     assert columns()[-3:] == ["Insurance Policy No", "Insurance Add-ons", "Accessories Add-on"]
+
+
+def test_the_buffer_is_the_one_the_reconciliation_last_worked_out_not_an_earlier_month_s(journey) -> None:
+    """A row the account statement owns keeps the reconciliation's figures under
+    "reconciliation"; its top-level grid is what an earlier run left (live: the
+    first September grid on an October deal)."""
+    _statement(journey, _without(UTKAL, "Other Discount (if any)"))
+    _standard(journey, "ex_showroom_price", "1039000")
+    _sql(journey, "INSERT INTO auditcore.discount_applications (tenant_id, journey_id, discount_key, "
+                  "standard_eligible_amount, eligibility_result, actual_source_kind, details) "
+                  "VALUES (:t, :j, 'ADDITIONAL_DISCOUNT', NULL, 'ELIGIBLE_UNCLAIMED', 'EVIDENCE', CAST(:d AS jsonb))",
+         d=json.dumps({"origin": "ACCOUNT_STATEMENT", "potentialAmount": "7000.00",
+                       "grid": {"buffer": "7000.00", "gridVersionNo": 1},
+                       "reconciliation": {"potentialAmount": "5000.00", "informational": True,
+                                          "grid": {"buffer": "5000.00", "gridVersionNo": 5, "tier": "BASE"}}}))
+    row = _benefit(_deal(journey), "ADDITIONAL_DISCOUNT")
+    assert D(row["entitled"]) == D(5000) and D(row["potential"]) == D(5000)
