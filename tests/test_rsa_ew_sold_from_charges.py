@@ -195,7 +195,8 @@ def test_an_open_task_raised_from_the_booking_form_closes_on_settle(journey):
     assert _open_missing_tasks(journey) == ["ew_invoice", "rsa_invoice"]
 
     _settle(journey)
-    assert _open_missing_tasks(journey) == []
+    # The RSA and EW invoice tasks close; the delivery has no NDC or cost sheet, which is asked for (2026-11-11).
+    assert _open_missing_tasks(journey) == ["DEALER_STATEMENT"]
 
 
 def test_a_charge_on_the_ledger_raises_no_task_and_an_open_one_closes(journey):

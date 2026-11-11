@@ -247,8 +247,9 @@ def test_a_delivery_document_is_not_asked_for_while_the_journey_is_at_booking(jo
 def test_a_task_closes_when_the_evidence_no_longer_applies(journey):
     invoice = add_ready_document(journey, "customer_invoice_dms", accessories_cost="12500", process_area="DELIVERY")
     _settle(journey)
-    [task] = _tasks(journey, "DOCUMENT_MISSING")
-    assert task["reference"]["requirementKey"] == "ACCESSORY_INVOICE"
+    # The delivery has no NDC or cost sheet either: that is asked for beside it (2026-11-11).
+    tasks = {t["reference"]["requirementKey"]: t for t in _tasks(journey, "DOCUMENT_MISSING")}
+    assert set(tasks) == {"ACCESSORY_INVOICE", "DEALER_STATEMENT"}
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
@@ -257,8 +258,9 @@ def test_a_task_closes_when_the_evidence_no_longer_applies(journey):
             {"t": journey.tenant_id, "d": invoice},
         )
     _settle(journey)
-    [task] = _tasks(journey, "DOCUMENT_MISSING")
-    assert task["task_status"] == "VERIFIED_COMPLETE"
+    tasks = {t["reference"]["requirementKey"]: t for t in _tasks(journey, "DOCUMENT_MISSING")}
+    assert tasks["ACCESSORY_INVOICE"]["task_status"] == "VERIFIED_COMPLETE"
+    assert tasks["DEALER_STATEMENT"]["task_status"] == "READY"
 
 
 def test_delivery_completes_from_rules_and_waits_for_the_tl_review(journey):

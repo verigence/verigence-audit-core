@@ -3893,6 +3893,15 @@ def _taken_addons(
                 "The customer's own policy" if decided == "SELF"
                 else "Not confirmed in-house: kept out of the deal until the PC confirms")
             taken = False
+        if kind != "insurance" and not billed and any(r.get("notTaken") for r in rows) and (
+                (deal_view.get("summary") or {}).get("billedSource") == "ACCOUNT_STATEMENT"):
+            # The NDC / cost sheet is on file and does not charge it: not taken
+            # with the car, whatever invoice of its kind is on file (product
+            # owner 2026-11-11: "if EW, RSA, FASTag, accessories absent from
+            # NDC ... simply deselect what all is taken by customer.. no tasks
+            # for it"). The invoice stays listed below; it prices nothing.
+            details[kind]["notOnStatement"] = "Not charged on the NDC / cost sheet: not taken with the car"
+            taken, amount, source = False, None, None
         out[kind] = {
             "taken": taken,
             "amount": str(amount) if amount is not None else None,

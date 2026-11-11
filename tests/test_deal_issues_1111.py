@@ -212,6 +212,38 @@ def test_a_product_not_taken_is_not_in_the_standard_deal(journey) -> None:
     assert summary["variance"]["currentVsStandard"] == before["variance"]["currentVsStandard"]
 
 
+def _addons(journey) -> dict:
+    from audit_core.uc03_p2_journey360 import addons
+
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        return addons(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["taken"]
+
+
+def test_an_add_on_the_ndc_does_not_charge_is_switched_off_also_with_its_invoice_on_file(journey) -> None:
+    """Product owner 2026-11-11: "if EW, RSA, FASTag, accessories absent from NDC,
+    just add a line to the observation or simply deselect what all is taken by
+    customer.. no tasks for it"."""
+    _statement(journey, _without(UTKAL, "Shield warranty"))
+    _standard(journey, "additional_warranty_amount", "9999")
+    add_ready_document(journey, "ew_invoice", process_area="DELIVERY", invoice_number="EW-1",
+                       grand_total_amount="9999")
+    warranty = _addons(journey)["warranty"]
+    assert (warranty["taken"], warranty["amount"]) == (False, None)
+    assert warranty["details"]["notOnStatement"].startswith("Not charged on the NDC / cost sheet")
+    assert warranty["documentIds"]  # the invoice stays listed
+    # Nothing asks for anything about it.
+    _missing_sync(journey)
+    assert not {k for k in _missing_tasks(journey) if k in {"ew_invoice", "rsa_invoice"}}
+
+
+def test_an_add_on_the_ndc_charges_stays_switched_on(journey) -> None:
+    _statement(journey, UTKAL)
+    warranty = _addons(journey)["warranty"]
+    assert warranty["taken"] is True and D(warranty["amount"]) == D("9999")
+    assert "notOnStatement" not in warranty["details"]
+
+
 def test_a_product_the_ndc_charges_is_taken_and_in_the_standard(journey) -> None:
     _statement(journey, UTKAL)  # Fastag 600, Shield warranty 9,999, RSA 2,021
     _standard(journey, "ex_showroom_price", "1039000")
@@ -374,3 +406,72 @@ def test_the_buffer_is_the_one_the_reconciliation_last_worked_out_not_an_earlier
                                           "grid": {"buffer": "5000.00", "gridVersionNo": 5, "tier": "BASE"}}}))
     row = _benefit(_deal(journey), "ADDITIONAL_DISCOUNT")
     assert D(row["entitled"]) == D(5000) and D(row["potential"]) == D(5000)
+
+
+# ── the NDC / cost sheet is asked for by a task, with the other pending documents ──
+def _missing_sync(journey) -> dict:
+    from audit_core.uc03_p2_task_producer import sync_document_missing_tasks
+
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        return sync_document_missing_tasks(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+
+def _missing_tasks(journey) -> dict[str, dict]:
+    rows = _sql(journey, "SELECT task_id, dedupe_key, task_type, source_code, title, task_status, "
+                         "assigned_role_code FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+                         "AND dedupe_key LIKE 'document-missing:%'").mappings().all()
+    return {r["dedupe_key"].rsplit(":", 1)[1]: dict(r) for r in rows}
+
+
+def test_a_delivery_without_the_ndc_or_cost_sheet_has_a_missing_document_task(journey) -> None:
+    """Product owner 2026-11-11: "NDC or cost sheet should be uploaded and there
+    should be a task but it should be combined with all the pending docs"."""
+    from audit_core.uc03_p2_document_task_groups import DOCUMENT_CATEGORY_BY_TASK_TYPE
+
+    # Still at booking: nothing of the delivery is asked for yet.
+    _missing_sync(journey)
+    assert "DEALER_STATEMENT" not in _missing_tasks(journey)
+    add_ready_document(journey, "tax_invoice_dms", process_area="DELIVERY", invoice_number="INV-1",
+                       grand_total_amount="1400000")
+    _missing_sync(journey)
+    task = _missing_tasks(journey)["DEALER_STATEMENT"]
+    assert (task["task_type"], task["source_code"], task["task_status"], task["assigned_role_code"]) == (
+        "DOCUMENT_MISSING", "DOCUMENT_MISSING", "READY", "PC")
+    assert task["title"] == "Upload the Dealer statement (NDC / cost sheet)"
+    # The same family as every other pending document: the Missing documents group of the Task Queue.
+    assert DOCUMENT_CATEGORY_BY_TASK_TYPE[task["task_type"]] == "MISSING_DOCUMENT"
+    # Asked for once, however often the producer runs.
+    _missing_sync(journey)
+    assert len([k for k in _missing_tasks(journey) if k == "DEALER_STATEMENT"]) == 1
+
+
+@pytest.mark.parametrize("statement", ["customer_ledger", "cost_sheet"])
+def test_the_ndc_task_closes_itself_once_the_ndc_or_the_cost_sheet_is_read(journey, statement) -> None:
+    add_ready_document(journey, "tax_invoice_dms", process_area="DELIVERY", invoice_number="INV-1",
+                       grand_total_amount="1400000")
+    _missing_sync(journey)
+    assert _missing_tasks(journey)["DEALER_STATEMENT"]["task_status"] == "READY"
+    add_ready_document(journey, statement, process_area="DELIVERY", ex_showroom_price="1400000")
+    _missing_sync(journey)
+    assert _missing_tasks(journey)["DEALER_STATEMENT"]["task_status"] in {"VERIFIED_COMPLETE", "CANCELLED"}
+
+
+def test_the_ndc_task_cannot_be_closed_as_not_required(journey) -> None:
+    """Product owner 2026-11-11: "NDC has to come and there is no escape route for it"."""
+    from audit_core.uc03_not_mandatory_claims import NOT_MANDATORY_CHOICE
+    from audit_core.uc03_p2_tasks import submit_action
+
+    add_ready_document(journey, "tax_invoice_dms", process_area="DELIVERY", invoice_number="INV-1",
+                       grand_total_amount="1400000")
+    _missing_sync(journey)
+    task_id = _missing_tasks(journey)["DEALER_STATEMENT"]["task_id"]
+    with pytest.raises(ValueError, match="cannot be marked as not required"), journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        submit_action(c, tenant_id=journey.tenant_id, task_id=task_id, action="CLOSE_TASK",
+                      actor_id=journey.actor_id, actor_role_code="PC",
+                      comment=f"{NOT_MANDATORY_CHOICE}: the dealer does not give one",
+                      details={"choice": NOT_MANDATORY_CHOICE})
+    assert _missing_tasks(journey)["DEALER_STATEMENT"]["task_status"] == "READY"
+    assert _sql(journey, "SELECT count(*) FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+                         "AND dedupe_key LIKE 'not-mandatory-review:%'").scalar_one() == 0
