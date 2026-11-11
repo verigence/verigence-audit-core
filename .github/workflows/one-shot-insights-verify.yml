@@ -146,7 +146,24 @@ jobs:
                       body = insights.build_insight(connection, tenant_id=tenant_id, report=report,
                                                     actor_id="insights-verify", admin=True)
                       took = time.monotonic() - started
+                      if report == "catchment":       # the map's rows, to check the screen against (no customer names)
+                          os.makedirs("map-export", exist_ok=True)
+                          with open(f"map-export/catchment-{tenant_id}.json", "w") as handle:
+                              json.dump(body, handle, default=str)
                       line = json.dumps(headline(report, body), default=str, ensure_ascii=False)
                       print(f"===== {report} [{took:.2f}s, {len(json.dumps(body, default=str)) // 1024} KB]\n{line}")
+          with engine.connect() as connection:
+              for key, content in connection.execute(text(
+                      "SELECT boundary_key, content_gzip FROM auditcore.geo_boundary_master")).all():
+                  with open(f"map-export/{key}.geojson.gz", "wb") as handle:
+                      handle.write(bytes(content))
           print("\nINSIGHTS_VERIFY=PASS")
           PY
+      - name: Keep the map's rows and outlines for one day
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: insights-map-export
+          path: map-export
+          if-no-files-found: ignore
+          retention-days: 1
