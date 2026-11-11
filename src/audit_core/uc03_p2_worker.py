@@ -83,6 +83,7 @@ from audit_core.uc03_p2_grouping import (
     plan_documents,
     read_once_di_types,
 )
+from audit_core.uc03_p2_journey_classification import sync_classification
 from audit_core.uc03_p2_object_keys import root_of
 from audit_core.uc03_p2_price_variance import (
     backfill_price_variance,
@@ -3325,6 +3326,9 @@ def _sync_rule_tasks(connection, *, tenant_id: str, journey_id: UUID, started_at
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
         "insurance_source": sync_insurance_source_task(
             connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
+        # After the insurance rule: the stored Deal Type, Customer Type and insurance decision (2026-11-11).
+        "classification": sync_classification(
+            connection, tenant_id=tenant_id, journey_id=journey_id, evaluation_started_at=started_at),
     }
     for rule, counts in outcomes.items():
         # The single-task rules answer with what happened to their one task.
@@ -5060,6 +5064,8 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         "INSURANCE_CODE_REPAIR": ("audit_core.uc03_insurance_code_repair", "run_insurance_code_repair"),
         "FINANCE_RULE_REPAIR": ("audit_core.uc03_finance_rule_repair", "run_finance_rule_repair"),
         "INSURANCE_SOURCE_REVIEW": ("audit_core.uc03_insurance_source_review", "run_insurance_source_review"),
+        # Deal Type, Customer Type and the insurance decision of every Journey on file (2026-11-11).
+        "JOURNEY_CLASSIFICATION": ("audit_core.uc03_p2_journey_classification", "run_journey_classification"),
         "INSURANCE_HYPOTHECATION_REREAD": ("audit_core.uc03_insurance_hypothecation_reread",
                                            "run_insurance_hypothecation_reread"),
         "WAITING_CORRECTIONS": ("audit_core.uc03_waiting_corrections", "run_waiting_corrections"),
