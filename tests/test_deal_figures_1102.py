@@ -272,9 +272,11 @@ def test_fastag_is_billed_by_the_ndc_not_a_fastag_invoice(journey) -> None:
     _statement(journey, [line for line in UTKAL if line["particulars_raw"] != "Fastag charges"])
     _source(journey, "fastag_amount", "booking_form", "600")
     row = _row(_deal(journey), "fastag_amount")
-    # the NDC is on file and does not charge it: not charged, never awaited
+    # the NDC is on file and does not charge it: not taken (FASTag is not mandatory,
+    # product owner 2026-11-11), never awaited and never "not invoiced"
     assert row["awaiting"] is None
-    assert (row["current"], row["currentSource"]) == ("0", "not_invoiced")
+    assert (row["current"], row["currentSource"]) == (None, None) and row["notTaken"] is True
+    assert "NOT_INVOICED" not in row["flags"] and "BELOW_STANDARD" not in row["flags"]
 
 
 def test_fastag_awaits_the_ndc_while_the_ndc_has_no_vehicle_line(journey) -> None:

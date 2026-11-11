@@ -225,8 +225,10 @@ def test_money_fields_share_the_ninety_percent_bar(journey):
 def test_delivery_readiness_lists_missing_required_documents(journey):
     result = _recompute(journey)
     missing = {item["key"] for item in result["delivery"]["missing"]}
-    assert {"customer_invoice_dms", "tax_invoice_tally", "insurance_cover",
+    assert {"customer_invoice_dms", "insurance_cover",
             "DEALER_STATEMENT", "payment_receipt", "vehicle_proof"} <= missing
+    # not mandatory (product owner 2026-11-11): used when uploaded, never asked for
+    assert not {"tax_invoice_tally", "ew_invoice", "rsa_invoice"} & missing
     # the lender's loan-closure letter is optional; the NDC is the account statement (2026-10-28)
     assert "no_dues_certificate" not in missing
     assert "gate_pass" not in missing  # optional

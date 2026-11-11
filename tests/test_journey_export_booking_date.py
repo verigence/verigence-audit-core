@@ -187,7 +187,7 @@ def test_the_workbook_shows_the_booking_date_and_its_source(journey, monkeypatch
     book = load_workbook(io.BytesIO(data))
     sheet = book["Deal Audit"]
     header = [c.value for c in next(sheet.iter_rows(max_row=1))]
-    assert header == columns() and header[-1] == "Booking Date Source" and "Booking Date Note" not in header
+    assert header == columns() and "Booking Date Source" in header and "Booking Date Note" not in header
     [row] = list(sheet.iter_rows(min_row=2, values_only=True))
     values = dict(zip(header, row, strict=True))
     assert values["Booking Date"] == (STARTED + timedelta(days=1)).isoformat()

@@ -386,7 +386,10 @@ def test_utkal_like_totals_variance_is_current_net_less_standard_net(journey):
     # TCS is 1% of the ex-showroom price on a car over Rs 9,99,999 (product owner 2026-11-04).
     assert Decimal(rows["tcs_amount"]["standard"]) == Decimal("10299.01")
     assert Decimal(rows["road_tax_registration"]["billed"]) == 103730
-    assert rows["rsa_amount"]["awaiting"] == "RSA invoice" and rows["fastag_amount"]["awaiting"] == "FASTag invoice"
+    # The vehicle invoice is on file and charges neither: not taken, never awaiting an
+    # invoice of their own (product owner 2026-11-11).
+    assert rows["rsa_amount"]["awaiting"] is None and rows["rsa_amount"]["notTaken"] is True
+    assert rows["fastag_amount"]["awaiting"] is None and rows["fastag_amount"]["notTaken"] is True
     assert discounts["CASH_DISCOUNT"]["billed"] == "30000.00" and Decimal(discounts["CASH_DISCOUNT"]["variance"]) == 0
     assert discounts["ADDITIONAL_DISCOUNT"]["billed"] == "5000.00"
     # Unclaimed exchange / scrappage are shown, not subtracted from the standard.
@@ -429,10 +432,17 @@ def test_a_closed_deal_without_the_vehicle_invoice_line_is_not_invoiced(journey)
                   "VALUES (:t, :j, 'fastag_amount', 500)")
     add_ready_document(journey, "booking_form", fastag_amount="500")
     add_ready_document(journey, "customer_invoice_dms", **EXAMPLE)
-    assert _rows(_deal(journey))["fastag_amount"]["awaiting"] == "FASTag invoice"
-    add_ready_document(journey, "gate_pass", delivery_date=(datetime.now(UTC).date() - timedelta(days=30)).isoformat())
+    # FASTag is not mandatory (product owner 2026-11-11): the vehicle invoice does not
+    # charge it, so it is not taken -- before and after the deal closes -- and never
+    # "not invoiced" or below the standard.
     fastag = _rows(_deal(journey))["fastag_amount"]
-    assert fastag["awaiting"] is None and fastag["current"] == "0" and "NOT_INVOICED" in fastag["flags"]
+    assert fastag["awaiting"] is None and fastag["current"] is None and fastag["notTaken"] is True
+    add_ready_document(journey, "gate_pass", delivery_date=(datetime.now(UTC).date() - timedelta(days=30)).isoformat())
+    view = _deal(journey)
+    fastag = _rows(view)["fastag_amount"]
+    assert fastag["awaiting"] is None and fastag["current"] is None and "NOT_INVOICED" not in fastag["flags"]
+    assert fastag["standard"] == "500.00" and fastag["variance"] is None
+    assert [n["key"] for n in view["summary"]["notTaken"]] == ["fastag_amount"]
 
 
 def test_the_header_names_the_plan_used_and_no_price_master_shows_why(journey, monkeypatch):
@@ -631,9 +641,12 @@ def test_a_line_awaiting_its_document_with_no_booking_figure_is_listed_not_price
     view = _deal(journey)
     rows, summary = _rows(view), view["summary"]
     assert rows["road_tax_registration"]["awaiting"] == "RTO challan" and rows["road_tax_registration"]["current"] is None
-    assert rows["rsa_amount"]["awaiting"] == "RSA invoice" and rows["rsa_amount"]["current"] is None
-    assert {a["key"] for a in summary["awaiting"]} == {"road_tax_registration", "rsa_amount"}
-    assert summary["awaitingDocuments"] == 2
+    # RSA needs no invoice of its own (2026-11-11): the vehicle invoice does not charge it, so
+    # it is not taken, in neither net.
+    assert rows["rsa_amount"]["awaiting"] is None and rows["rsa_amount"]["current"] is None
+    assert rows["rsa_amount"]["notTaken"] is True
+    assert {a["key"] for a in summary["awaiting"]} == {"road_tax_registration"}
+    assert summary["awaitingDocuments"] == 1
     assert Decimal(summary["net"]["current"]) == Decimal("827200.44")
     assert Decimal(summary["net"]["standard"]) == 852000
     assert Decimal(summary["balanceDue"]) == Decimal("827200.44")

@@ -3,7 +3,13 @@ them (product owner 2026-11-02): "The booking form shouldn't form the basis;
 it should be the customer ledger, then it should be asked -- and fix all the
 open tasks accordingly." The booking form's RSA / EW amount no longer makes the
 RSA Invoice / Extended Warranty Invoice mandatory; the NDC / customer ledger,
-cost sheet or a customer invoice does. Other conditions are unchanged."""
+cost sheet or a customer invoice does. Other conditions are unchanged.
+
+Product owner 2026-11-11: "Tally Invoice, EWS Invoice, Fastag, RSA Invoice are
+not mandatory and no tasks to be opened for it ... any existing should be
+closed. If available should be used." RSA and extended warranty are still sold
+only when charged (the conditions below), but neither invoice is asked for any
+more: each stays on the checklist as optional and its open task closes."""
 from __future__ import annotations
 
 from uuid import uuid4
@@ -65,16 +71,16 @@ def test_a_booking_form_amount_alone_does_not_ask_for_the_invoice(journey, condi
     add_ready_document(journey, booking_type, customer_name="A", booking_date="2026-09-01", **{field: "1500"})
     reasons, items = _reasons_and_items(journey)
     assert condition not in reasons
-    assert template not in items
+    assert items[template]["required"] is False
 
 
 @pytest.mark.parametrize(("condition", "template", "field"), CASES)
-def test_the_customer_ledger_amount_asks_for_the_invoice(journey, condition, template, field):
+def test_the_customer_ledger_amount_sells_it_but_does_not_ask_for_the_invoice(journey, condition, template, field):
     add_ready_document(journey, "booking_docket", customer_name="A", booking_date="2026-09-01", **{field: "1500"})
     add_ready_document(journey, "customer_ledger", process_area="DELIVERY", **{field: "1500"})
     reasons, items = _reasons_and_items(journey)
     assert "customer ledger" in reasons[condition]
-    assert items[template]["required"] is True and items[template]["received"] is False
+    assert items[template]["required"] is False and items[template]["requirement"] == "OPTIONAL"
 
 
 @pytest.mark.parametrize(("condition", "template", "field"), CASES)
@@ -82,16 +88,17 @@ def test_a_booking_form_source_value_alone_does_not_ask_for_the_invoice(journey,
     _source_value(journey, field, "booking_form", "1500")
     _source_value(journey, field, "booking_docket", "1500")
     reasons, items = _reasons_and_items(journey)
-    assert condition not in reasons and template not in items
+    assert condition not in reasons and items[template]["required"] is False
 
 
 @pytest.mark.parametrize("source", ["customer_ledger", "cost_sheet", "erp_settlement", "customer_invoice_dms",
                                     "tax_invoice_tally"])
 @pytest.mark.parametrize(("condition", "template", "field"), CASES)
-def test_a_charged_source_value_asks_for_the_invoice(journey, condition, template, field, source):
+def test_a_charged_source_value_sells_it_but_does_not_ask_for_the_invoice(journey, condition, template, field,
+                                                                          source):
     _source_value(journey, field, source, "1500")
     reasons, items = _reasons_and_items(journey)
-    assert condition in reasons and items[template]["required"] is True
+    assert condition in reasons and items[template]["required"] is False
 
 
 @pytest.mark.parametrize(("condition", "field"), [("rsaSold", "rsa_amount"), ("ewSold", "additional_warranty_amount")])
@@ -191,13 +198,20 @@ def test_an_open_task_raised_from_the_booking_form_closes_on_settle(journey):
     assert _open_missing_tasks(journey) == []
 
 
-def test_a_task_charged_on_the_ledger_stays_open(journey):
+def test_a_charge_on_the_ledger_raises_no_task_and_an_open_one_closes(journey):
+    """2026-11-11: the RSA / EW invoice is not mandatory even when the NDC or
+    the customer ledger charges the product; a task raised under the old rule
+    closes itself on the next settle."""
     add_ready_document(journey, "booking_docket", customer_name="A", booking_date="2026-09-01", rsa_amount="1500")
-    add_ready_document(journey, "customer_ledger", process_area="DELIVERY", rsa_amount="1500")
+    add_ready_document(journey, "customer_ledger", process_area="DELIVERY", rsa_amount="1500",
+                       additional_warranty_amount="9999")
     _settle(journey)
-    assert "rsa_invoice" in _open_missing_tasks(journey)
+    assert _open_missing_tasks(journey) == []
+    _raise_old_task(journey, "rsa_invoice", "RSA Invoice")
+    _raise_old_task(journey, "ew_invoice", "Extended Warranty Invoice")
+    assert _open_missing_tasks(journey) == ["ew_invoice", "rsa_invoice"]
     _settle(journey)
-    assert "rsa_invoice" in _open_missing_tasks(journey)
+    assert _open_missing_tasks(journey) == []
 
 
 def test_the_rebuild_job_can_be_limited_to_one_project(journey):
