@@ -139,6 +139,14 @@ _DISCOUNT_LABELS = {
 }
 
 
+def _stored_label(connection: Connection, *, tenant_id: str, journey_id: UUID, key: str) -> str | None:
+    """The Journey's Deal Type or Customer Type as every screen and report shows it
+    (uc03_p2_journey_classification, 2026-11-11)."""
+    from audit_core.uc03_p2_journey_classification import view
+
+    return view(connection, tenant_id=tenant_id, journey_id=journey_id)[key]
+
+
 def management_referral(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     """The MR discount as the Team Lead set it: opted out until they opt
     the journey in with an amount and a reason (decision 2026-09-30)."""
@@ -717,6 +725,9 @@ def summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
         ),
         {"t": tenant_id, "j": journey_id},
     ).mappings().one()
+    from audit_core.uc03_p2_journey_classification import view as classification_view
+
+    classification = classification_view(connection, tenant_id=tenant_id, journey_id=journey_id)
     stage = read_booking_stage(connection, tenant_id=tenant_id, journey_id=journey_id)
     deal_view = as_shown(deal(connection, tenant_id=tenant_id, journey_id=journey_id))
     vehicle_text = " · ".join(v for v in (head["model"], head["variant"], head["colour"]) if v) or None
@@ -725,7 +736,10 @@ def summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
             "journeyId": str(head["journey_id"]),
             "reference": head["journey_reference"],
             "customerName": head["legal_name"] or head["customer_name"],
-            "customerType": head["customer_type_code"],
+            # Deal Type, Customer Type and the insurance decision: the stored copy (2026-11-11).
+            "customerType": classification["customerTypeLabel"],
+            "dealType": classification["dealTypeLabel"],
+            "classification": classification,
             "mobileLast4": head["mobile_last4"],
             "dealerName": head["dealer_name"],
             "outletName": head["outlet_name"],
@@ -3989,7 +4003,7 @@ def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID,
         "bookingDate": form.get("booking_date") or (b["booking_confirmation_date"].isoformat() if b.get("booking_confirmation_date") else None),
         "salesConsultant": form.get("sales_person") or b.get("sales_staff_name"),
         "dealerBranch": form.get("dealer_branch") or b.get("outlet_address") or b.get("outlet_name"),
-        "dealType": b.get("deal_type_code"),
+        "dealType": _stored_label(connection, tenant_id=tenant_id, journey_id=journey_id, key="dealTypeLabel"),
         "dealSource": b.get("deal_source_code"),
         "leadSource": b.get("lead_source_code"),
         "expectedDelivery": form.get("expected_delivery_date") or form.get("expected_delivery")
@@ -4115,7 +4129,8 @@ def customer(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         values.setdefault("email", record["email_reference"])
         values.setdefault("relationship", record["relationship_type"])
         values.setdefault("relationshipName", record["relationship_name"])
-        values["customerType"] = record["customer_type_code"]
+    values["customerType"] = _stored_label(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                           key="customerTypeLabel")
     identity = (
         "DOCUMENT_VERIFIED" if kyc_named
         else "VERIFIED" if record is not None and record["legal_name_status"] == "VERIFIED"

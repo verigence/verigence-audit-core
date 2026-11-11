@@ -374,6 +374,15 @@ def set_insurance_source(
     )
     note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id,
                        reason="INSURANCE_SOURCE_SET", correlation_id=correlation_id)
+    _refresh_classification(connection, tenant_id=tenant_id, journey_id=journey_id)
+
+
+def _refresh_classification(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
+    """The stored Deal Type / insurance decision follows a person's own call at once
+    (uc03_p2_journey_classification); the worker's recompute keeps it current after."""
+    from audit_core.uc03_p2_journey_classification import refresh
+
+    refresh(connection, tenant_id=tenant_id, journey_id=journey_id)
 
 
 @router.put("/journeys/{journey_id}/insurance-source")
@@ -398,6 +407,100 @@ def put_insurance_source(
         via="DEAL_TAB",
     )
     return deal(connection, tenant_id=tenant_id, journey_id=journey_id)["insurance"]
+
+
+class DealTypeCommand(BaseModel):
+    """The Team Lead's Deal Type for a journey (product owner 2026-11-11): MR, Lease
+    or Bulk -- theirs alone -- or Inscope / Outscope where the rule cannot decide or
+    is to be overruled. ``RULE`` hands the journey back to the rule."""
+
+    dealType: Literal["INSCOPE", "OUTSCOPE", "MR", "LEASE", "BULK", "RULE"]
+    reason: str | None = Field(default=None, max_length=1000)
+
+
+@router.get("/journeys/{journey_id}/classification")
+def get_classification(
+    tenant_id: str,
+    journey_id: UUID,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    from audit_core.uc03_p2_journey_classification import view
+
+    _auth(connection, tenant_id, journey_id, human_principal, authorization_client, _READ)
+    return view(connection, tenant_id=tenant_id, journey_id=journey_id)
+
+
+class DealTypeForManyCommand(DealTypeCommand):
+    """One Deal Type for several journeys in one go (a bulk order is many journeys)."""
+
+    journeyIds: list[UUID] = Field(min_length=1, max_length=200)
+
+
+def _deal_type_role(connection, tenant_id, journey_id, principal, client) -> str:
+    """The Team Lead, Project Manager or Reviewer setting a Deal Type (product owner
+    2026-11-11). The Team Lead's bundle has audit.work.update, the Reviewer's
+    audit.journey.update: either opens the door, the role is what limits it."""
+    from audit_core.uc03_p2_access import authorize_p2_any
+    from audit_core.uc03_p2_journey_classification import DEAL_TYPE_ROLES
+
+    access = authorize_p2_any(
+        connection, tenant_id=tenant_id, journey_id=journey_id, human_principal=principal,
+        authorization_client=client, permission_keys=("audit.work.update", "audit.journey.update"),
+    )
+    roles = {str(r or "").upper() for r in (access.operating_role, access.functional_role)}
+    role = next((r for r in DEAL_TYPE_ROLES if r in roles), None)
+    if role is None:
+        raise HTTPException(status_code=403, detail="Only a Team Lead or a Reviewer can set the Deal Type.")
+    return role
+
+
+@router.post("/journeys:deal-type")
+def post_deal_type_for_many(
+    tenant_id: str,
+    command: DealTypeForManyCommand,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """The Team Lead or Reviewer sets one Deal Type on the journeys they picked (found
+    by customer name or mobile number on the journey list), without opening each."""
+    from audit_core.uc03_p2_journey_classification import set_deal_type_for_many
+
+    role = _deal_type_role(connection, tenant_id, None, human_principal, authorization_client)
+    reason = (command.reason or "").strip()
+    if len(reason) < 5:
+        raise HTTPException(status_code=422, detail="Give a short reason for this Deal Type.")
+    return set_deal_type_for_many(
+        connection, tenant_id=tenant_id, journey_ids=command.journeyIds,
+        deal_type=None if command.dealType == "RULE" else command.dealType, reason=reason,
+        actor_id=human_principal.subject, role=role, correlation_id=get_correlation_id(request),
+    )
+
+
+@router.put("/journeys/{journey_id}/deal-type")
+def put_deal_type(
+    tenant_id: str,
+    journey_id: UUID,
+    command: DealTypeCommand,
+    request: Request,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    from audit_core.uc03_p2_journey_classification import set_tl_deal_type
+
+    role = _deal_type_role(connection, tenant_id, journey_id, human_principal, authorization_client)
+    reason = (command.reason or "").strip()
+    if len(reason) < 5:
+        raise HTTPException(status_code=422, detail="Give a short reason for this Deal Type.")
+    return set_tl_deal_type(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+        deal_type=None if command.dealType == "RULE" else command.dealType, reason=reason,
+        actor_id=human_principal.subject, role=role, correlation_id=get_correlation_id(request),
+    )
 
 
 class ManagementReferralCommand(BaseModel):
@@ -441,6 +544,7 @@ def set_management_referral(
     )
     note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id,
                        reason="MANAGEMENT_REFERRAL_SET", correlation_id=correlation_id)
+    _refresh_classification(connection, tenant_id=tenant_id, journey_id=journey_id)
     return management_referral(connection, tenant_id=tenant_id, journey_id=journey_id)
 
 

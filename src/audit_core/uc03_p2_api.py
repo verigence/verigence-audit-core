@@ -667,10 +667,16 @@ def list_p2_journeys(
                    ds.capture_completed_at_utc AS delivery_submitted_at,
                    ev.documents, pq.failed_pages, pq.retrying_pages,
                    tk.total_tasks, tk.open_tasks, tk.overdue_tasks, tk.pc_open_tasks, tk.tl_open_tasks,
-                   fd.open_findings
+                   fd.open_findings,
+                   -- Deal Type, Customer Type and the insurance decision: the stored
+                   -- copy (uc03_journey_classification, 2026-11-11).
+                   jc.deal_type, jc.vin_pending AS deal_type_vin_pending, jc.customer_type,
+                   jc.insurance_type, jc.insurance_decided_by
             FROM page p
             LEFT JOIN auditcore.p2_journey_runtime pr
               ON pr.tenant_id=p.tenant_id AND pr.journey_id=p.journey_id
+            LEFT JOIN auditcore.journey_classifications jc
+              ON jc.tenant_id=p.tenant_id AND jc.journey_id=p.journey_id
             LEFT JOIN auditcore.journey_stage_states bs
               ON bs.tenant_id=p.tenant_id AND bs.journey_id=p.journey_id AND bs.stage_code='BOOKING'
             LEFT JOIN auditcore.journey_stage_states ds

@@ -156,7 +156,7 @@ def test_summary_etag_and_sections(journey):
     assert by_key["enteredName"]["value"] == "P2 Customer"
     assert by_key["legalName"]["value"] == "P2 CUSTOMER" and by_key["legalName"]["source"] == "pan_card"
     assert by_key["pan"]["value"] == "ABCDE1234F"
-    assert by_key["customerType"]["value"] == "INDIVIDUAL"
+    assert by_key["customerType"]["value"] == "Individual"
     assert customer["identityStatus"] == "DOCUMENT_VERIFIED" and by_key["identityStatus"]["value"] == "DOCUMENT_VERIFIED"
     assert customer["kycDocuments"] == ["pan_card"]
     assert client.get(f"{base}/nope").status_code == 404
