@@ -31,9 +31,10 @@ with engine.connect() as c:
 print("journeys", len(rows), flush=True)
 
 ROW = ("key", "standard", "booking", "billed", "billedFrom", "current", "currentSource", "variance", "flags",
-       "opted", "excluded", "awaiting", "invoiced", "freeByInvoice", "partOf", "standardBasis", "ledger", "quote")
+       "opted", "excluded", "awaiting", "invoiced", "freeByInvoice", "partOf", "standardBasis", "ledger", "quote",
+       "notTaken", "statementOnly")
 DISC = ("key", "entitled", "booking", "billed", "billedFrom", "current", "variance", "flags", "inStandard",
-        "takenAsGiven", "eligibility", "potential", "awaiting")
+        "takenAsGiven", "eligibility", "potential", "awaiting", "ledgerPosted")
 
 
 def one(row):
@@ -43,6 +44,16 @@ def one(row):
             c.execute(text("SET TRANSACTION READ ONLY"))
             set_tenant_context(c, T)
             view = deal(c, tenant_id=T, journey_id=UUID(str(row["journey_id"])))
+            rules = {}
+            try:
+                from audit_core import uc03_p2_audit_rules as ar
+                facts = ar._Facts(c, T, UUID(str(row["journey_id"])))
+                facts.__dict__["sheet"] = view
+                for fn in (ar.deal_undercharged, ar.insurance_invoice_missing, ar.delivered_on_short_payment):
+                    out = fn(facts)
+                    rules[out.code] = out.outcome
+            except Exception as exc:  # noqa: BLE001
+                rules = {"error": repr(exc)[:200]}
     except Exception as exc:  # noqa: BLE001
         return {"j": str(row["journey_id"]), "ref": row["journey_reference"], "error": repr(exc)[:300]}
     out = {
@@ -60,6 +71,7 @@ def one(row):
         "declared": [{k: d.get(k) for k in ("key", "billed", "booking", "ledger") if d.get(k) is not None}
                      for d in view["declared"]],
         "sku": {k: view["sku"].get(k) for k in ("model", "variant", "resolution")},
+        "rules": rules,
     }
     if str(row["journey_id"]) in FULL:
         out["full"] = view
