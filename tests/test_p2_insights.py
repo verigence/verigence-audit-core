@@ -286,6 +286,52 @@ def test_finance_report_reads_the_loan_and_compares_sanction_with_disbursal():
     assert report["basis"]["financedAllLiveJourneys"] == 6
 
 
+def test_the_pin_code_names_the_district_where_the_postal_directory_knows_it():
+    master = {
+        "752055": {"district": "Khordha", "localities": ["JATNI"]},
+        "758001": {"district": "Keonjhar (Kendujhar)", "localities": ["KEONJHAR"]},
+        "756001": {"district": "Balasore", "localities": []},
+    }
+    facts = [
+        _fact(pin="752055", districtRaw="CUTTACK"),         # the PIN code wins over the district as read
+        _fact(pin="758001", districtRaw=None),              # no district read: the directory gives it
+        _fact(pin=None, districtRaw="KENDUJHAR"),           # no PIN code: the read name, under the directory's
+        _fact(pin=None, districtRaw="BALESWAR"),
+        _fact(pin="831001", districtRaw="WEST SINGHBHUM"),  # outside the directory: as read, not on the map
+        _fact(pin=None, districtRaw=None),
+    ]
+    insights._resolve_districts(facts, master)
+    assert [f["district"] for f in facts] == [
+        "Khordha", "Keonjhar (Kendujhar)", "Keonjhar (Kendujhar)", "Balasore", "West Singhbhum", None]
+    assert [f["onMap"] for f in facts] == [True, True, False, False, False, False]
+    assert facts[0]["localities"] == ["JATNI"] and facts[1]["districtKey"] == facts[2]["districtKey"]
+
+
+def test_the_map_has_a_row_per_pin_code_outlet_and_model():
+    master = {"752055": {"district": "Khordha", "localities": ["JATNI"]}}
+    facts = [
+        _fact(pin="752055", model="THAR", charged={"fastag_amount": 500.0}, deliveredOn=date(2026, 10, 9)),
+        _fact(pin="752055", model="THAR", statement=False, deliveredOn=None),
+        _fact(pin="752055", model="THAR", outletId="o2", outlet="Outlet 2", dealerId="d2", dealer="Dealer 2"),
+        _fact(pin="752055", model="XUV700"),
+        _fact(pin=None, districtRaw="CUTTACK"),
+        _fact(pin=None, districtRaw=None),                  # no place at all: not on the map
+    ]
+    insights._resolve_districts(facts, master)
+    report = insights.catchment_report(
+        facts, outlet_pin={"o1": "751010"}, outlines=[{"key": "odisha-pin", "type": "PIN"}])
+    area = report["map"]
+    assert len(area["cells"]) == 4 and area["offMap"] == 0 and area["boundaries"] == [{"key": "odisha-pin", "type": "PIN"}]
+    first = next(c for c in area["cells"] if c["pin"] == "752055" and c["model"] == "THAR" and c["outletId"] == "o1")
+    assert (first["journeys"], first["delivered"], first["deals"], first["district"], first["onMap"]) == (
+        2, 1, 1, "Khordha", True)
+    assert first["products"]["fastag"] == 1 and first["products"]["rsa"] == 0
+    no_pin = next(c for c in area["cells"] if c["pin"] is None)
+    assert (no_pin["district"], no_pin["journeys"]) == ("Cuttack", 1)
+    assert area["localities"] == {"752055": ["JATNI"]}
+    assert {o["outletId"]: o["pin"] for o in area["outlets"]} == {"o1": "751010", "o2": None}
+
+
 def test_catchment_report_places_customers_by_district_and_pin():
     facts = [
         _fact(pin="758001", districtRaw="KENDUJHAR", charged={"rsa_amount": 2000.0}),
@@ -720,3 +766,46 @@ def test_the_reports_are_for_a_team_lead_and_above_over_their_own_outlets(setup)
     assert s.client.get(f"{s.base}/catchment", params={"to": "2020-01-01"}).json()["basis"]["liveJourneys"] == 0
     assert s.client.get(f"{s.base}/catchment", params={"from": booked.isoformat()}).json()["basis"]["liveJourneys"] == 2
     assert s.client.get(f"{s.base}/catchment", params={"from": "2026-12-01", "to": "2026-11-01"}).status_code == 422
+
+
+def test_the_customer_map_reads_its_places_outlines_and_outlet_from_postgres(setup):
+    import base64
+    import gzip
+    import json
+
+    s = setup
+    _seed_deal(s)
+    lead = "lead-map"
+    _exec(s, "INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, "
+             "dealer_id, outlet_id) VALUES (:t, :a, 'TL', :d, :o)", a=lead, d=s.journey.dealer_id, o=s.journey.outlet_id)
+    _exec(s, "UPDATE auditcore.dealer_outlets SET address_text='Plot 4, NH-20, Keonjhar 758013, Odisha' "
+             "WHERE tenant_id=:t AND outlet_id=:o", o=s.journey.outlet_id)
+    outline = {"type": "FeatureCollection", "features": [{"type": "Feature", "properties": {"name": "758001"}}]}
+    key = f"test-pin-{uuid4().hex[:8]}"
+    try:
+        _exec(s, "INSERT INTO auditcore.geo_pin_master (pincode, state_name, district_name, locality_names, source_name, "
+                 "source_url) VALUES ('758001', 'Odisha', 'Keonjhar (Kendujhar)', '[\"KEONJHAR\"]', 'test', 'test') "
+                 "ON CONFLICT (pincode) DO NOTHING")
+        _exec(s, "INSERT INTO auditcore.geo_boundary_master (boundary_key, state_name, boundary_type, content_gzip, "
+                 "source_name, source_url) VALUES (:k, 'Odisha', 'PIN', :c, 'test', 'test')",
+              k=key, c=gzip.compress(json.dumps(outline).encode()))
+
+        assert s.client.get(f"{s.base}/catchment").status_code == 403           # a PC: not theirs
+        assert s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/insight-boundaries/{key}").status_code == 403
+        s.acting["subject"] = lead
+        area = s.client.get(f"{s.base}/catchment").json()["map"]
+        [cell] = area["cells"]
+        assert (cell["pin"], cell["district"], cell["onMap"], cell["journeys"], cell["deals"]) == (
+            "758001", "Keonjhar (Kendujhar)", True, 1, 1)
+        assert cell["products"]["rsa"] == 1 and cell["products"]["finance"] == 1
+        assert area["localities"] == {"758001": ["KEONJHAR"]}
+        assert [o["pin"] for o in area["outlets"]] == ["758013"]
+        assert key in [b["key"] for b in area["boundaries"]]
+
+        got = s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/insight-boundaries/{key}")
+        assert got.status_code == 200 and got.json()["type"] == "PIN"
+        assert json.loads(gzip.decompress(base64.b64decode(got.json()["contentGzipBase64"]))) == outline
+        assert s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/insight-boundaries/nowhere").status_code == 404
+    finally:
+        _exec(s, "DELETE FROM auditcore.geo_boundary_master WHERE source_name = 'test'")
+        _exec(s, "DELETE FROM auditcore.geo_pin_master WHERE source_name = 'test'")
