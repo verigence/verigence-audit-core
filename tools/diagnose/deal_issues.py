@@ -83,3 +83,4 @@ with ThreadPoolExecutor(max_workers=6) as pool:
         print("DEALROW " + json.dumps(result, default=str, separators=(",", ":")), flush=True)
 print("done", flush=True)
 sys.exit(0)
+# run 3
