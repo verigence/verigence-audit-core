@@ -193,6 +193,20 @@ def test_a_page_set_aside_before_it_was_typed_is_typed_and_its_task_closes(journ
     assert _counted(journey) == []
 
 
+def test_an_issuer_read_with_its_address_is_still_set_aside(journey) -> None:
+    """Live 11 Nov: UTK-SB-261026-006's depot receipt, issuer read with its address, stayed a
+    payment -- its name was longer than the page's name may be."""
+    issuer = ("GOVERNMENT OF INDIA MINISTRY OF DEFENCE ( VISHAKHAPATNAM AREA DEPOT BLDG.NO.T/1/1, , "
+              "VISAKHAPATNAM ANDHRA PRADESH")
+    _, page = _receipt(journey, issuer=issuer, amount="757034", number="D1", page=1)
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        worker.settle_journey(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert _counted(journey) == []
+    name = _page(journey, page)["display_name"]
+    assert name.startswith("Receipt from Government Of India Ministry Of Defence") and len(name) <= 120
+
+
 def test_the_recompute_sets_it_aside_before_the_booking_is_rebuilt(journey) -> None:
     _receipt(journey, issuer="Shivnath Group", amount="500000", number="PB/26-27/0597", page=1)
     _, insurer_page = _receipt(journey, issuer="National Insurance Company Ltd.", amount="50370",

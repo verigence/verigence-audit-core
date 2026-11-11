@@ -134,8 +134,14 @@ def _set_by_a_person(actor: Any) -> bool:
     return bool(actor) and not str(actor).upper().startswith("SYSTEM")
 
 
+# p2_document_queue.display_name is varchar(120). The first release cut the name
+# at 200: a depot's receipt, whose issuer was read with its address (125
+# characters), failed the update and stayed a payment.
+_NAME_MAX = 120
+
+
 def receipt_name(issuer: Any) -> str:
-    return ("Receipt from " + " ".join(str(issuer or "").split()).title())[:200]
+    return ("Receipt from " + " ".join(str(issuer or "").split()).title())[:_NAME_MAX].rstrip(" ,(")
 
 
 def _mark_pages_as_decided(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
