@@ -153,15 +153,24 @@ def _billing_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [s for s in printed if s not in bills] + [combined]
 
 
-def billed_figure(row: dict[str, Any]) -> tuple[Decimal | None, str | None]:
+# Under the statement policy (Mahindra Orissa) these never bill a line: they
+# tally the payments only (product owner 2026-11-11).
+_TALLY_ONLY_DOCUMENTS = _INVOICE_DOCUMENTS | {"customer_ledger_tally"}
+
+
+def billed_figure(row: dict[str, Any], *, statement_only: bool = False) -> tuple[Decimal | None, str | None]:
     """The Deal's billed figure, else the first document that prints the line
-    (account statement, cost sheet, ledger, invoice), and where it is from."""
+    (account statement, cost sheet, ledger, invoice), and where it is from.
+    ``statement_only``: the Project reads its Deal from the NDC / cost sheet, so
+    an invoice or the customer ledger never stands in for a line the Deal has
+    no figure for."""
     billed = dec(row.get("billed"))
     if billed is not None:
         source = next((s.get("document") for s in _billing_sources(row.get("sources") or [])
                        if _same(dec(s.get("amount")), billed)), None)
         return billed, source or "Deal"
-    candidates = sorted(_billing_sources(row.get("sources") or []),
+    candidates = sorted((s for s in _billing_sources(row.get("sources") or [])
+                         if not statement_only or s["documentType"] not in _TALLY_ONLY_DOCUMENTS),
                         key=lambda s: _BILLED_ORDER.index(s["documentType"]))
     if candidates:
         return dec(candidates[0]["amount"]), candidates[0].get("document")
@@ -236,7 +245,7 @@ def registration_row(folded: dict[str, Any], parts: list[dict[str, Any]]) -> dic
 
 
 def conclude_charge(row: dict[str, Any], *, on_file: set[str],
-                    discounts: tuple[Decimal, ...] = ()) -> dict[str, Any]:
+                    discounts: tuple[Decimal, ...] = (), statement_only: bool = False) -> dict[str, Any]:
     """One Deal line (a charge): billed against the price master, or against
     its own proof document for a statutory / insurance line. ``discounts``
     are the amounts the deal counts off the vehicle: an ex-showroom printed
@@ -244,7 +253,7 @@ def conclude_charge(row: dict[str, Any], *, on_file: set[str],
     2026-11-04: the NDC's price net of the dealer discount was disputed
     against the invoice's gross price, 4 journeys)."""
     key = str(row["key"])
-    billed, billed_from = billed_figure(row)
+    billed, billed_from = billed_figure(row, statement_only=statement_only)
     standard = dec(row.get("standard"))
     disputed = disagreement(row, allowances=discounts if key == "ex_showroom_price" else ())
     proof_types = _PROOF_OF_CHARGE.get(key, ())
@@ -665,7 +674,8 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                 continue
             if line["key"] == "road_tax_registration" and parts:
                 line = registration_row(line, parts)
-            row = conclude_charge(line, on_file=on_file, discounts=discount_amounts)
+            row = conclude_charge(line, on_file=on_file, discounts=discount_amounts,
+                                  statement_only=summary.get("billedSource") == "ACCOUNT_STATEMENT")
             row["category"] = group.get("label")
             if line["key"] in _VAS:
                 taken = (line.get("opted") or {}).get("taken") if isinstance(line.get("opted"), dict) else None

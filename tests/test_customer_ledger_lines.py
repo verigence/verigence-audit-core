@@ -89,13 +89,16 @@ def _benefit(view: dict, key: str) -> dict:
     return next(d for d in view["discounts"] if d["key"] == key)
 
 
-def test_the_ledger_prices_the_lines_no_ndc_gives_and_confirms_the_insurance(journey) -> None:
+def test_the_ledger_prices_no_line_and_confirms_the_insurance(journey) -> None:
     """Bapu Dalabehera: no NDC read (it was filed as a booking docket), the
-    Tally ledger on file. Its insurance, RTO, accessories and FASTag are the
-    deal's; the insurance is in-house because the dealer charged it; the
-    scrappage credit note is the scrappage bonus -- since 2026-11-04 shown,
-    never counted, like the ledger's own discount: discounts count from the
-    NDC / cost sheet only."""
+    Tally ledger on file. Product owner 2026-11-11: "NDC has to come and there
+    is no escape route for it ... Invoice and customer ledger will be used to
+    tally the total payments only" -- the ledger's RTO, accessories and FASTag
+    postings stand in the ledger column as checks and the lines wait for the
+    NDC; the policy on file shows the premium. The insurance is in-house
+    because the dealer charged it; the scrappage credit note is the scrappage
+    bonus -- since 2026-11-04 shown, never counted, like the ledger's own
+    discount: discounts count from the NDC / cost sheet only."""
     _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
     _ledger(journey, BAPU)
     _sync(journey)
@@ -104,16 +107,17 @@ def test_the_ledger_prices_the_lines_no_ndc_gives_and_confirms_the_insurance(jou
     add_ready_document(journey, "credit_note", process_area="DELIVERY", invoice_number="UOV27C000046",
                        invoice_date="2026-10-16", grand_total_amount="20000")
     view = _deal(journey)
-    for key, amount in (("insurance_amount", 72391), ("road_tax_registration", 132770),
-                        ("accessories_cost", 48398), ("fastag_amount", 600)):
+    for key, amount in (("road_tax_registration", 132770), ("accessories_cost", 48398), ("fastag_amount", 600)):
         row = _row(view, key)
-        assert D(row["current"]) == D(amount), key
-        # The ledger prices a line no other billing document gives; where the policy is on
-        # file it stands first and the ledger checks it (product owner 2026-11-11: the
-        # customer ledger verifies).
-        first = "insurance_cover" if key == "insurance_amount" else "customer_ledger_tally"
-        assert row["sources"][0]["documentType"] == first, key
+        assert row["billed"] is None and row["current"] is None, key
+        assert D(row["ledger"]) == D(amount), key  # the ledger's posting, as a check
         assert any(s["documentType"] == "customer_ledger_tally" for s in row["sources"]), key
+    assert _row(view, "accessories_cost")["awaiting"] == "NDC (Account Statement)"
+    assert _row(view, "fastag_amount")["awaiting"] == "NDC (Account Statement)"
+    insurance = _row(view, "insurance_amount")
+    assert D(insurance["current"]) == D(72391) and insurance["sources"][0]["documentType"] == "insurance_cover"
+    assert D(insurance["ledger"]) == D(72391)
+    assert view["summary"]["payable"] is None  # nothing is payable until the NDC prices the vehicle
     assert view["insurance"]["decidedBy"] == "DOCUMENT" and view["insurance"]["inDeal"] is True
     scrappage = _benefit(view, "SCRAPPAGE_BONUS_DEALER")
     assert scrappage["current"] is None and D(scrappage["billed"]) == D(20000)
@@ -335,8 +339,10 @@ def test_one_charge_the_ndc_and_the_ledger_name_differently_counts_once(journey)
     _sync(journey)
     view = _deal(journey)
     rsa, fastag = _row(view, "rsa_amount"), _row(view, "fastag_amount")
-    assert rsa["current"] is None and rsa["sameAs"]["key"] == "fastag_amount"
-    assert D(fastag["current"]) == D(600)
+    # Since 2026-11-11 the ledger prices no line, so the Rs 600 counts once by
+    # construction: on the NDC's row as read; the ledger's posting only checks.
+    assert D(rsa["current"]) == D(600)
+    assert fastag["current"] is None and D(fastag["ledger"]) == D(600)
 
 
 def test_a_charge_written_into_its_label_with_no_amount_is_read() -> None:

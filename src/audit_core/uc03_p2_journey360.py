@@ -2218,12 +2218,18 @@ def _invoices_on_file(
     families = set(selection["families"])
     if statement_policy:
         # The dealer's statement (NDC, cost sheet in its place, settlement) is
-        # a bill as much as an invoice is: with either on file, a line none of
-        # them carries is not billed rather than awaited (2026-11-02).
-        statement_rows = [s for s in sources if _norm_type(s["source_document_type"]) in _DEALER_BOOKS_NORM]
-        invoice_on_file = invoice_on_file or bool(statement_rows)
+        # the deal's bill, and the only one (product owner 2026-11-11: "NDC has
+        # to come and there is no escape route for it"): until it is on file
+        # every line waits for it, whatever invoices or ledger are; once it is,
+        # a line it does not carry is not billed rather than awaited
+        # (2026-11-02). The vehicle is billed when the statement prices it,
+        # never because a vehicle invoice is on file.
+        statement_rows = [s for s in sources if _norm_type(s["source_document_type"]) in _STATEMENT_NORM]
+        invoice_on_file = bool(statement_rows)
+        families.discard(FAMILY_VEHICLE)
         if any(str(s["component_key"]) == "ex_showroom_price" for s in statement_rows):
             families.add(FAMILY_VEHICLE)
+        return invoice_on_file, families
     for kind in legacy_invoice_types:
         family = _legacy_invoice_family(kind)
         if family is not None:
@@ -2339,22 +2345,30 @@ def _component_row(
 ) -> dict[str, Any]:
     per_source = [s for s in sources if s["line_kind"] == "COMMERCIAL" and s["component_key"] == key]
     own = [s for s in invoice_sources if s["line_kind"] == "COMMERCIAL" and s["component_key"] == key]
-    cols = _columns(per_source)
+    # MAHINDRA ORISSA: THE NDC PRICES THE DEAL, NOTHING ELSE DOES (product owner
+    # 2026-11-11: "NDC has to come and there is no escape route for it ... we
+    # will wait till NDC is not there ... Invoice and customer ledger will be
+    # used to tally the total payments only"). Under the statement policy an
+    # invoice and the Tally customer ledger never set a line's charge: the
+    # invoices' figure stands beside the line (``invoiced``: every accessory
+    # invoice added up, "it could be multiple ... sum up all accessories
+    # invoice") and the ledger's posting in the ledger column, both as checks.
+    # A line the NDC / cost sheet does not give waits for it. (Live,
+    # VJ2610-000045: with no NDC row read the ex-showroom stood from the
+    # invoice without the invoice's own discount, and the accessories from a
+    # ledger posting two of four invoices.) The policy and the RTO challan
+    # still show what the insurer and the RTO charged.
+    tally = _norm_type(TALLY_LEDGER_TYPE)
+    pricing = [s for s in per_source if not statement_policy or _norm_type(s["source_document_type"]) != tally]
+    cols = _columns(pricing)
+    if statement_policy and cols["ledger"] is None:
+        cols["ledger"] = next((s["amount"] for s in sorted(per_source, key=_source_order)
+                               if _norm_type(s["source_document_type"]) == tally and s["amount"] is not None), None)
     billed_from = None
     invoiced = selection["lines"].get(key)
-    # Only the NDC / cost sheet's own charge (the statement form, the cost
-    # sheet standing in for it, the ERP settlement) stands before the invoices
-    # (product owner 2026-11-11: "NDC / cost sheet figures should be used for
-    # computation ... customer ledger has to be used to verify"). The accessory
-    # invoices on file add up to the accessories line ("it could be multiple
-    # ... sum up all accessories invoice", 2026-10-31 and 2026-11-11). The
-    # Tally customer ledger posts invoices one by one and may hold only some
-    # (live, VJ2610-000045: four accessory invoices of Rs 1,07,812, the ledger
-    # posting two of them, Rs 96,537, stood as the charge): it checks a line,
-    # and prices one only when no other billing document gives it.
     statement_charge = statement_policy and any(
         _norm_type(s["source_document_type"]) in _STATEMENT_NORM and _dec(s["amount"]) is not None for s in per_source)
-    if invoiced is not None and not statement_charge:
+    if invoiced is not None and not statement_policy:
         # Each invoice bills its own lines; distinct invoices add up,
         # copies of one invoice count once (R2).
         cols["billed"], billed_from = invoiced, "invoice"
@@ -2372,20 +2386,21 @@ def _component_row(
     # Two billing documents disagree: copies of one invoice (DMS and
     # Tally), or a non-invoice document (cover note) against what the
     # invoices bill. Distinct invoices are added, never compared.
-    other_billed = {_dec(s["amount"]) for s in per_source
+    other_billed = {_dec(s["amount"]) for s in pricing
                     if _column_for(s["source_document_type"]) == "billed" and _dec(s["amount"]) is not None}
     if (len(other_billed) > 1 or key in disagreeing
             or (billed_from == "invoice" and other_billed and other_billed != {_dec(cols["billed"])})):
         flags.append("INVOICES_DISAGREE")
     # The NDC charges less than the invoices bill on the accessories line when
     # part of them is given free; on any other add-on the two must agree.
-    invoiced_beside = invoiced if statement_charge and invoiced is not None else None
-    if (invoiced_beside is not None and key not in _ADDON_COMPONENTS["accessories"]
+    invoiced_beside = invoiced if statement_policy and invoiced is not None else None
+    if (invoiced_beside is not None and cols["billed"] is not None and key not in _ADDON_COMPONENTS["accessories"]
             and abs(_dec(invoiced_beside) - _dec(cols["billed"])) > _RTO_TOLERANCE
             and "INVOICES_DISAGREE" not in flags):
         flags.append("INVOICES_DISAGREE")
     free_by_invoice = (_dec(invoiced_beside) - _dec(cols["billed"])
-                       if invoiced_beside is not None and key in _ADDON_COMPONENTS["accessories"] else None)
+                       if invoiced_beside is not None and cols["billed"] is not None
+                       and key in _ADDON_COMPONENTS["accessories"] else None)
     # Charged on the dealer's statement and on no other document (product owner
     # 2026-11-11: "anything on NDC / cost sheet if mentioned need not be on
     # invoice ... we can make it a comment but not any hard enforcement"): the
@@ -2393,7 +2408,7 @@ def _component_row(
     statement_only = bool(
         statement_charge and invoiced is None and not own and _line_document(key) != "VEHICLE" and not any(
             _column_for(s["source_document_type"]) == "billed" and _dec(s["amount"]) is not None
-            and _norm_type(s["source_document_type"]) not in _DEALER_BOOKS_NORM for s in per_source))
+            and _norm_type(s["source_document_type"]) not in _DEALER_BOOKS_NORM for s in pricing))
     return {
         "key": key,
         "label": component_label(key),
@@ -2728,7 +2743,8 @@ class _DealSituation:
         vehicle's own figures and the FASTag come from the NDC, never a
         vehicle invoice or a "FASTag invoice", a type that does not exist
         (2026-11-02, Deal defect 7)."""
-        if self.statement_policy and document in _STATEMENT_BILLED_DOCUMENTS | _NEVER_AWAITED_DOCUMENTS:
+        if self.statement_policy and document in _STATEMENT_BILLED_DOCUMENTS | _NEVER_AWAITED_DOCUMENTS | {"ACCESSORY"}:
+            # the NDC prices the accessories too; their invoices only stand beside it (2026-11-11)
             return _COLUMN_LABELS[_STATEMENT_COLUMN_TYPE]
         if document in _NEVER_AWAITED_DOCUMENTS:
             # No invoice of its own is asked for (2026-11-11): the deal's bill.
@@ -2783,6 +2799,9 @@ def _component_current(row: dict[str, Any], situation: _DealSituation) -> None:
         # and is in no total (deal(), ``notTaken``).
         row["current"], row["currentSource"] = None, None
         row["notTaken"] = True
+        if row.get("invoiced") is not None:
+            # Invoiced, yet the NDC / cost sheet does not charge it: said so on the row.
+            row["flags"] = [*row["flags"], "NOT_ON_STATEMENT"]
         return
     document = _line_document(row["key"])
     if not situation.invoice_on_file:
@@ -2791,7 +2810,8 @@ def _component_current(row: dict[str, Any], situation: _DealSituation) -> None:
         row["flags"] = [*row["flags"], "AWAITING_DOCUMENT"]
         return
     vehicle_reading = situation.vehicle_reading
-    if row["key"] == "ex_showroom_price" and vehicle_reading is not None and not situation.vehicle_taxes_read:
+    if (row["key"] == "ex_showroom_price" and vehicle_reading is not None and not situation.vehicle_taxes_read
+            and not situation.statement_policy):
         # The vehicle invoice is on file but its own taxes were not
         # read: never borrowed, never guessed (R1).
         row["current"], row["currentSource"] = None, None

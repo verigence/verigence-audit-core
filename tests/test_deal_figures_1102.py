@@ -83,16 +83,19 @@ def _statement(journey, lines: list[dict]) -> None:
 
 
 # ── 1. TCS / ex-showroom ─────────────────────────────────────────────────────
-def test_tcs_the_statement_does_not_print_comes_from_the_vehicle_invoice(journey) -> None:
+def test_tcs_the_statement_does_not_print_is_not_taken_from_the_vehicle_invoice(journey) -> None:
     _statement(journey, [line for line in UTKAL if line["particulars_raw"] != "TCS"])
     add_ready_document(journey, "customer_invoice_dms", process_area="DELIVERY", **VEHICLE_INVOICE)
     view = _deal(journey)
     tcs = _row(view, "tcs_amount")
-    assert D(tcs["billed"]) == D("8272.00")
-    # The invoice is a billing document: it stands where the NDC is silent,
-    # under its own name (product owner 2026-11-02).
+    # Product owner 2026-11-11 (replaces 2026-11-02's "worst case from the
+    # invoice"): the NDC prices the deal and nothing else does; the invoice
+    # tallies the payments only. Its TCS stands beside the line, never as the
+    # charge: TCS the NDC does not charge is TCS not charged, flagged.
+    assert tcs["billed"] is None and D(tcs["invoiced"]) == D("8272.00")
     assert [s["documentType"] for s in tcs["sources"]] == ["customer_invoice_dms"]
-    assert tcs["billedFrom"] == "invoice"
+    assert (tcs["current"], tcs["currentSource"]) == ("0", "not_invoiced")
+    assert "BELOW_STANDARD" in tcs["flags"]
     # The statement still prices the vehicle; the invoice adds nothing else.
     assert D(_row(view, "ex_showroom_price")["billed"]) == D(1039000)
     assert view["summary"]["billedSource"] == "ACCOUNT_STATEMENT"
