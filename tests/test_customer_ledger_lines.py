@@ -108,7 +108,12 @@ def test_the_ledger_prices_the_lines_no_ndc_gives_and_confirms_the_insurance(jou
                         ("accessories_cost", 48398), ("fastag_amount", 600)):
         row = _row(view, key)
         assert D(row["current"]) == D(amount), key
-        assert row["sources"][0]["documentType"] == "customer_ledger_tally", key
+        # The ledger prices a line no other billing document gives; where the policy is on
+        # file it stands first and the ledger checks it (product owner 2026-11-11: the
+        # customer ledger verifies).
+        first = "insurance_cover" if key == "insurance_amount" else "customer_ledger_tally"
+        assert row["sources"][0]["documentType"] == first, key
+        assert any(s["documentType"] == "customer_ledger_tally" for s in row["sources"]), key
     assert view["insurance"]["decidedBy"] == "DOCUMENT" and view["insurance"]["inDeal"] is True
     scrappage = _benefit(view, "SCRAPPAGE_BONUS_DEALER")
     assert scrappage["current"] is None and D(scrappage["billed"]) == D(20000)

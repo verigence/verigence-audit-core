@@ -81,15 +81,24 @@ _PROOF_OF_PRODUCT: dict[str, tuple[str, ...]] = {
     "rsa_amount": ("rsa_invoice", "value_added_service_document"),
     "fastag_amount": ("value_added_service_document",),
 }
+# Products whose own invoice is not mandatory (product owner 2026-11-11: "Tally
+# Invoice, EWS Invoice, Fastag, RSA Invoice are not mandatory ... anything on
+# NDC / cost sheet if mentioned need not be on invoice ... we can make it a
+# comment"): charged with no such document on file is a comment, never
+# "unsupported".
+_PROOF_NOT_REQUIRED = frozenset({"additional_warranty_amount", "extended_warranty_amount", "rsa_amount",
+                                 "fastag_amount"})
 # Which document the billed figure is taken from when the Deal has none.
 # The dealer's statement (as the Deal names it under the statement policy)
 # comes first, so the insurance and RTO checks set the policy and the challan
 # against the statement, never against themselves (2026-11-02).
+# The customer ledger's posting comes last: it verifies, it does not price
+# (product owner 2026-11-11), as on the Deal (uc03_p2_journey360._SOURCE_ORDER).
 _BILLED_ORDER = ("account_statement", "erp_settlement", "cost_sheet_in_place_of_ndc",
-                 "customer_ledger", "cost_sheet", "customer_ledger_tally", "customer_invoice_dms", "tax_invoice_tally", "tax_invoice_dms",
+                 "customer_ledger", "cost_sheet", "customer_invoice_dms", "tax_invoice_tally", "tax_invoice_dms",
                  "tax_invoice", "customer_invoice_dms_v2", "invoice_generic", "accessory_invoice_dms",
                  "accessory_invoice_tally", "ew_invoice", "rsa_invoice", "insurance_cover", "rto_challan",
-                 "credit_note", "debit_note")
+                 "credit_note", "debit_note", "customer_ledger_tally")
 # Documents that print a billed figure (the booking form is the offer, not a bill).
 _BILLING_DOCUMENTS = frozenset(_BILLED_ORDER)
 # The dealership's own bills: distinct ones on one line add up. A credit note
@@ -369,6 +378,10 @@ def conclude_product(charge: dict[str, Any], *, on_file: set[str], taken: bool |
         out.update(conclusion=INFO, rule=None, impact=None, reason="Not taken." if billed == 0 else out["reason"])
         return out
     if proof_types and not out["proof"]["onFile"] and out["conclusion"] in (OK, CANNOT):
+        if str(charge["key"]) in _PROOF_NOT_REQUIRED:
+            if out["conclusion"] == OK:
+                out["reason"] = "Charged on the NDC / cost sheet or a bill; an invoice of its own is not required."
+            return out
         out.update(conclusion=UNSUPPORTED, rule="AS-06", impact=CUSTOMER,
                    reason="Charged, but no document that proves the product is on file.")
     return out
@@ -657,6 +670,9 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
             if line["key"] in _VAS:
                 taken = (line.get("opted") or {}).get("taken") if isinstance(line.get("opted"), dict) else None
                 products.append(conclude_product(row, on_file=on_file, taken=taken))
+                if line.get("notTaken"):
+                    # No bill charges it (2026-11-11): not taken, said so.
+                    products[-1].update(taken=False, reason="Not taken.")
             else:
                 charges.append(row)
     benefits = [conclude_benefit(d, unknown_results=ENTITLEMENT_UNKNOWN_RESULTS) for d in deal.get("discounts") or []]

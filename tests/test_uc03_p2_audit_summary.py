@@ -175,13 +175,24 @@ def test_a_benefit_the_deal_does_not_count_is_never_shown_as_given() -> None:
 
 
 def test_a_product_charged_without_its_document_is_unsupported() -> None:
-    charge = summary.conclude_charge({"key": "additional_warranty_amount", "label": "Extended warranty",
+    charge = summary.conclude_charge({"key": "accessories_cost", "label": "Accessories",
                                       "standard": "17999", "billed": "17999",
                                       "sources": [_src("cost_sheet", "17999")]}, on_file=set())
     out = summary.conclude_product(charge, on_file=set(), taken=None)
     assert (out["conclusion"], out["rule"], out["taken"]) == (summary.UNSUPPORTED, "AS-06", True)
-    with_invoice = summary.conclude_product(charge, on_file={"ew_invoice"}, taken=None)
+    with_invoice = summary.conclude_product(charge, on_file={"accessory_invoice_dms"}, taken=None)
     assert with_invoice["conclusion"] == summary.OK
+
+
+def test_an_extended_warranty_rsa_or_fastag_needs_no_invoice_of_its_own() -> None:
+    """Product owner 2026-11-11: the EW invoice, the RSA invoice and a FASTag bill are not
+    mandatory, and what the NDC / cost sheet shows need not be on an invoice: a comment."""
+    for key in ("additional_warranty_amount", "extended_warranty_amount", "rsa_amount", "fastag_amount"):
+        charge = summary.conclude_charge({"key": key, "label": key, "standard": "2021", "billed": "2021",
+                                          "sources": [_src("account_statement", "2021")]}, on_file=set())
+        out = summary.conclude_product(charge, on_file=set(), taken=None)
+        assert (out["conclusion"], out["taken"]) == (summary.OK, True), key
+        assert "not required" in out["reason"]
 
 
 def test_settlement_and_verdict() -> None:
