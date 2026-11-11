@@ -1,0 +1,75 @@
+name: One-shot deal issues diagnose (DEV, read-only)
+
+# Read-only: the Deal of every delivered journey, as Journey 360 builds it. Never writes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/deal-issues-diagnose]
+    paths:
+      - '.github/workflows/one-shot-deal-issues-diagnose.yml'
+      - 'tools/diagnose/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-deal-issues-diagnose
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          npm install --global @railway/cli@5.70.0
+
+      - name: Resolve Railway DEV database connection
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/tmp/link.json
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          raw="$(python - <<'PY'
+          import json
+          from pathlib import Path
+          variables = json.loads(Path('/tmp/audit-vars.json').read_text())
+          print(variables.get('DATABASE_PUBLIC_URL') or variables.get('DATABASE_URL') or '')
+          PY
+          )"
+          [[ -n "$raw" ]] || { echo '::error::no DATABASE_URL on the DEV service.'; exit 1; }
+          case "$raw" in
+            postgresql+psycopg://*) url="$raw" ;;
+            postgresql+asyncpg://*) url="postgresql+psycopg://${raw#postgresql+asyncpg://}" ;;
+            postgresql://*) url="postgresql+psycopg://${raw#postgresql://}" ;;
+            postgres://*) url="postgresql+psycopg://${raw#postgres://}" ;;
+            *) echo '::error::DATABASE_URL is not a PostgreSQL URL.'; exit 1 ;;
+          esac
+          echo "::add-mask::$url"
+          echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
+
+      - name: Deals, read-only
+        shell: bash
+        run: |
+          PYTHONPATH=src python tools/diagnose/deal_issues.py > /tmp/deal-rows.txt
+          wc -c /tmp/deal-rows.txt
+          grep -c '^DEALROW' /tmp/deal-rows.txt || true
+          gzip -9 /tmp/deal-rows.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deal-rows
+          path: /tmp/deal-rows.txt.gz
+          retention-days: 3
