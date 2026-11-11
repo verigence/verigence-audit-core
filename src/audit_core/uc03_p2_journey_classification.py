@@ -266,24 +266,43 @@ WHERE f.tenant_id=:t AND f.journey_id=:j AND f.field_key IN ('vin_number', 'chas
 
 
 def agreed_vin(readings: list[tuple[str, str, Any]], *, today: date | None = None) -> str | None:
-    """The VIN most of the sale's documents agree on. ``readings`` are (document type,
-    document id, value as read). One misread copy does not decide it (2026-11-11:
-    ADI-SJ-261027-006's invoice read ...XZTK6K... -- "2019" -- where the insurance policy and
-    the RTO challan both print ...XZXT6K...). On a tie: a VIN that names its month of
-    manufacture first, then the invoice's."""
-    documents: dict[str, set[str]] = {}
+    """The VIN the sale's documents agree on. ``readings`` are (document type, document id,
+    value as read).
+
+    * A document supports a VIN when it prints it in full, or prints a short chassis number
+      (6 characters or more: "T2K26045") that is the VIN's own ending.
+    * One misread copy does not decide it (2026-11-11: ADI-SJ-261027-006's invoice read
+      ...XZTK6K... -- "2019" -- where the policy and the RTO challan both print ...XZXT6K...).
+    * Documents that print different VINs with none supported by a second document do NOT
+      agree: there is no VIN (SHI-SW-261110-001: the invoice read a "2022" VIN, the RTO
+      challan another; UTK-JI-261106-006: three papers, three readings). The Deal Type then
+      waits for the VIN or the Team Lead.
+    * Equal support: a VIN that names its month of manufacture first, then the invoice's."""
+    full: dict[str, set[str]] = {}
+    short: list[tuple[str, str]] = []
     on_invoice: set[str] = set()
     for document_type, document_id, value in readings:
         vin = clean_vin(value)
-        if vin is None:
+        if vin is not None:
+            full.setdefault(vin, set()).add(str(document_id))
+            if document_type in _INVOICE_TYPES:
+                on_invoice.add(vin)
             continue
-        documents.setdefault(vin, set()).add(str(document_id))
-        if document_type in _INVOICE_TYPES:
-            on_invoice.add(vin)
-    if not documents:
+        # "T5J31078 (MA1RE2TTKT5J31078)", "CHNO - 52F79014": each run of letters and digits.
+        for part in re.findall(r"[A-Z0-9]{6,17}", str(value or "").upper()):
+            whole = clean_vin(part)
+            if whole is not None:
+                full.setdefault(whole, set()).add(str(document_id))
+            else:
+                short.append((part, str(document_id)))
+    if not full:
         return None
-    return max(sorted(documents), key=lambda vin: (
-        len(documents[vin]), vin_manufacture_month(vin, today=today) is not None, vin in on_invoice))
+    support = {vin: documents | {doc for part, doc in short if vin.endswith(part)} for vin, documents in full.items()}
+    best = max(sorted(support), key=lambda vin: (
+        len(support[vin]), vin_manufacture_month(vin, today=today) is not None, vin in on_invoice))
+    if len(support) > 1 and len(support[best]) < 2:
+        return None
+    return best
 
 
 # The vehicle's own invoice: the DMS one first, then the Tally one.

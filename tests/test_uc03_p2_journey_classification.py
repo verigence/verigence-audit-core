@@ -58,15 +58,32 @@ def test_the_vin_is_the_one_the_sale_documents_agree_on() -> None:
         ("rto_challan", "d3", "MA1NA2XZXT6K57070"),
         ("accessory_invoice_dms", "d4", "T6K57070"),
     ], today=TODAY) == "MA1NA2XZXT6K57070"
-    # The same document read twice counts once; on a tie the invoice's VIN stands.
+    # The same document read twice counts once. Two papers, two VINs, nothing else: no VIN.
     assert rule.agreed_vin([
         ("rto_challan", "d1", "MA1NS2NP1T2F75014"), ("rto_challan", "d1", "MA1NS2NP1T2F75014"),
         ("customer_invoice_dms", "d2", "MA1NS2NP1T2F79014"),
-    ], today=TODAY) == "MA1NS2NP1T2F79014"
-    # A tie between a VIN that names its month and one that does not.
+    ], today=TODAY) is None
+    # A short chassis number that is one VIN's own ending supports it (SHI-SW-261110-001).
     assert rule.agreed_vin([
-        ("insurance_cover", "d1", "MA1RY3JNKI5J35425"), ("rto_challan", "d2", "MA1RY3JNKT5J35425"),
+        ("customer_invoice_dms", "d1", "MA1JU2ZUZN2K26945"),
+        ("rto_challan", "d2", "MA1UJ2JJ2T2K26045"),
+        ("customer_ledger", "d3", "T2K26045"),
+    ], today=TODAY) == "MA1UJ2JJ2T2K26045"
+    # Three papers, three readings (UTK-JI-261106-006): they do not agree.
+    assert rule.agreed_vin([
+        ("customer_invoice_dms", "d1", "MA1RY2JNKTJ535417"),
+        ("customer_ledger", "d2", "MA1RY2NKTSJ35417"),
+        ("insurance_cover", "d3", "MA1Y22NTSJ5J56417"),
+    ], today=TODAY) is None
+    # Equal support of two documents each: the VIN that names its month, then the invoice's.
+    assert rule.agreed_vin([
+        ("insurance_cover", "d1", "MA1RY3JNKI5J35425"), ("form_21", "d2", "MA1RY3JNKI5J35425"),
+        ("rto_challan", "d3", "MA1RY3JNKT5J35425"), ("customer_invoice_dms", "d4", "MA1RY3JNKT5J35425"),
     ], today=TODAY) == "MA1RY3JNKT5J35425"
+    # A single paper with the only VIN stands; a VIN printed inside a longer text is read.
+    assert rule.agreed_vin([("rto_challan", "d1", "MA1NS2NP1T2F75014")], today=TODAY) == "MA1NS2NP1T2F75014"
+    assert rule.agreed_vin([("accessory_invoice_dms", "d1", "T5J31078 (MA1RE2TTKT5J31078)")],
+                           today=TODAY) == "MA1RE2TTKT5J31078"
     assert rule.agreed_vin([("accessory_invoice_dms", "d1", "T1J82078")], today=TODAY) is None
     assert rule.agreed_vin([], today=TODAY) is None
 
