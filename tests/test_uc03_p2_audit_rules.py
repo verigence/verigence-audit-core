@@ -681,7 +681,9 @@ def test_delivery_not_completed_in_time_lists_everything_pending_for_the_tl(jour
     state = _states(journey)["DELIVERY_NOT_COMPLETED_IN_TIME"]
     assert state["control_status"] == "FAIL"
     assert "8 days after the gate pass dated" in state["status_reason"]
-    assert "documents missing: " in state["status_reason"] and "Tax Invoice (Tally)" in state["status_reason"]
+    assert "documents missing: " in state["status_reason"] and "Payment Receipt" in state["status_reason"]
+    # not mandatory (product owner 2026-11-11), so never listed as missing
+    assert "Tax Invoice (Tally)" not in state["status_reason"]
     assert "Vehicle photos" in state["status_reason"] or "VIN" in state["status_reason"]
     status, severity, title = _finding(journey, "DELIVERY_NOT_COMPLETED_IN_TIME")
     assert (status, severity) == ("OPEN", "HIGH") and title.startswith("Delivery not completed in time: ")

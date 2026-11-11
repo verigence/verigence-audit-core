@@ -142,8 +142,13 @@ DISCOUNT_HEADS: tuple[tuple[str, tuple[str, ...]], ...] = (
 PAYMENT_COLUMNS = ("Total Amt To Be Received", "Total Amt Received", "Payment Variance", "Payment Status")
 
 # After the Deal Audit export's own columns, so its layout is unchanged: where
-# a journey's Booking Date came from (product owner 2026-11-07).
-NOTE_COLUMNS = ("Booking Date Source",)
+# a journey's Booking Date came from (product owner 2026-11-07); the insurance
+# policy number, the policy's add-on covers and the accessories taken over the
+# standard kit (product owner 2026-11-11).
+NOTE_COLUMNS = ("Booking Date Source", "Insurance Policy No", "Insurance Add-ons", "Accessories Add-on")
+# The accessories lines of the Deal (the standard kit and what is billed on it).
+_ACCESSORY_KEYS = frozenset({"accessories_cost", "essential_kit_amount", "genuine_accessories_amount",
+                             "non_genuine_accessories_amount"})
 BOOKING_DATE_SOURCES = {
     "BOOKING_DOCKET": "Booking docket",
     "BOOKING_DOCS_UPLOADED": "Day booking documents were uploaded",
@@ -242,6 +247,11 @@ def column_notes() -> list[tuple[str, str]]:
                                  "'Day booking documents were uploaded' (no usable booking date on file: the "
                                  "day, IST, of the PC's first upload holding a booking page), or 'Day the "
                                  "journey was started' (no booking documents uploaded either)")),
+        ("Insurance Policy No", "Insurance policy / cover note (policy number); blank when no policy is on file"),
+        ("Insurance Add-ons", "The add-on covers printed on the insurance policy (zero depreciation, RSA ...)"),
+        ("Accessories Add-on", ("Accessories billed over the price master's standard accessories kit: the Deal's "
+                                "accessories as billed less their standard, when more (0 when not more; blank "
+                                "when no accessories are billed)")),
     ]
     return notes
 
@@ -298,13 +308,28 @@ def deal_amounts(deal: dict[str, Any]) -> dict[str, Any]:
         if amount is not None:
             bucket[head] = bucket.get(head, Decimal(0)) + amount
 
+    # Heads holding a line of the deal, and heads holding only the master's
+    # price of a product that is not in the deal.
+    in_deal: set[str] = set()
+    reference_only: set[str] = set()
     for group in deal.get("categories") or []:
         for line in group.get("components") or []:
             # A part of a folded line (road tax inside "road tax + registration")
-            # is in its parent already; an excluded line is not counted.
-            if line.get("partOf") or line.get("excluded"):
+            # is in its parent already.
+            if line.get("partOf"):
                 continue
             head = _head_of(str(line.get("key") or ""), CHARGE_HEADS)
+            if line.get("excluded") or line.get("notTaken"):
+                # Not part of the deal (the customer's own insurance, a product
+                # not taken): the price master's figure is still shown (product
+                # owner 2026-11-11: "standard price for Insurance, EW, RSA,
+                # fastag is missing"), with no actual and no variance, and it
+                # is in no total.
+                if _dec(line.get("standard")) is not None:
+                    add(std, head, _dec(line.get("standard")))
+                    reference_only.add(head)
+                continue
+            in_deal.add(head)
             current = _dec(line.get("current"))
             standard = _dec(line.get("standard"))
             if standard is None and line.get("key") in taken_as_charged:
@@ -333,7 +358,9 @@ def deal_amounts(deal: dict[str, Any]) -> dict[str, Any]:
         else:
             s, a = std.get(label, Decimal(0)), act.get(label, Decimal(0))
         out[f"Std: {label}"], out[f"Act: {label}"] = _num(s), _num(a)
-        out[f"Var: {label}"] = _num(a - s) if delivery_started and s is not None and a is not None else None
+        comparable = label in in_deal or label not in reference_only
+        out[f"Var: {label}"] = (_num(a - s) if delivery_started and comparable and s is not None and a is not None
+                                else None)
     for label, keys in DISCOUNT_HEADS:
         s, a = (None, None) if not keys else (std_d.get(label, Decimal(0)), act_d.get(label, Decimal(0)))
         out[f"Std Disc: {label}"], out[f"Act Disc: {label}"] = _num(s), _num(a)
@@ -351,6 +378,14 @@ def deal_amounts(deal: dict[str, Any]) -> dict[str, Any]:
 
     payable = _dec(summary.get("payable"))
     received = _dec((summary.get("paid") or {}).get("total")) or Decimal(0)
+    accessories = [line for group in deal.get("categories") or [] for line in group.get("components") or []
+                   if line.get("key") in _ACCESSORY_KEYS and not line.get("partOf") and _dec(line.get("current")) is not None]
+    if accessories:
+        billed = sum((_dec(line.get("current")) or Decimal(0) for line in accessories), Decimal(0))
+        kit = sum((_dec(line.get("standard")) or Decimal(0) for line in accessories), Decimal(0))
+        out["Accessories Add-on"] = _num(max(billed - kit, Decimal(0)))
+    else:
+        out["Accessories Add-on"] = None
     out["Total Amt To Be Received"] = _num(payable)
     out["Total Amt Received"] = _num(received)
     if payable is None:
@@ -393,6 +428,25 @@ def _date_text(value: Any) -> str | None:
     return text_ or None
 
 
+def _add_on_text(value: Any) -> str | None:
+    """The policy's add-on covers as one cell: the reading is a list, or a
+    JSON list kept as text."""
+    if isinstance(value, str):
+        text_ = value.strip()
+        if text_.startswith("["):
+            try:
+                value = json.loads(text_)
+            except ValueError:
+                return text_ or None
+        else:
+            return text_ or None
+    if isinstance(value, (list, tuple)):
+        names = [str(v.get("name") or v.get("cover") or v.get("description") or "").strip() if isinstance(v, dict)
+                 else str(v).strip() for v in value]
+        return ", ".join(n for n in names if n) or None
+    return None
+
+
 _DMS_INVOICE_TYPES = ("customer_invoice_dms", "customer_invoice_dms_v2", "tax_invoice_dms")
 _CLOSURE_STATUS = {"PENDING": "Closed by Reviewer (awaiting TL)", "ACCEPTED": "Closed and accepted by TL",
                    "AUTO_ACCEPTED": "Closed, auto-accepted", "REJECTED": "Closure rejected by TL"}
@@ -414,6 +468,7 @@ def identity_row(base: dict[str, Any], *, deal: dict[str, Any], vehicle: dict[st
         (i for i in deal.get("invoices") or [] if i.get("documentType") in _DMS_INVOICE_TYPES), {})
     insurance = deal.get("insurance") or {}
     insurance_type = {"SELF": "Self", "INHOUSE": "In-house" if insurance.get("inDeal") else "In-house (not confirmed)"}
+    policy = (((vehicle.get("addons") or {}).get("insurance") or {}).get("details")) or {}
     closure_status = base.get("closure_status")
     location = ", ".join(p for p in (base.get("outlet_name"), base.get("outlet_address")) if p)
     return {
@@ -455,6 +510,8 @@ def identity_row(base: dict[str, Any], *, deal: dict[str, Any], vehicle: dict[st
         "GST No": base.get("gst_no"),
         "Pincode": fields.get("pincode"),
         "Booking Date Source": BOOKING_DATE_SOURCES.get(str(base.get("booking_date_source") or "")),
+        "Insurance Policy No": policy.get("policyNumber"),
+        "Insurance Add-ons": _add_on_text(policy.get("addOns")),
     }
 
 
@@ -714,6 +771,10 @@ def workbook_bytes(rows: Iterable[dict[str, Any]], *, title: str, filters_text: 
     about.append([f"Generated {datetime.now(UTC).astimezone().strftime('%Y-%m-%d %H:%M UTC')}"])
     about.append([("Amounts are the Deal's own, as Journey 360 shows them. Variance is blank until delivery "
                    "has started. Blank: not on file, or not captured by Verigence yet (see Columns).")])
+    about.append([("Std: Insurance, EW, RSA, Fasttag Taken and the accessories heads show the price master's "
+                   "figure even when the customer did not take the product or arranged their own insurance. "
+                   "Such a line is not part of the deal: its Act is 0, its Var is blank and it is not in Total "
+                   "Standard Deal, so the Std columns can add up to more than Total Standard Deal.")])
     out = io.BytesIO()
     book.save(out)
     return out.getvalue()

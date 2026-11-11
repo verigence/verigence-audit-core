@@ -590,12 +590,16 @@ document_types:
     - VEHICLE
     - FINANCE
     - CUSTOMER
+  # Not mandatory (product owner 2026-11-11: "Tally Invoice, EWS Invoice,
+  # Fastag, RSA Invoice are not mandatory and no tasks to be opened for it ...
+  # if available should be used"): on the checklist as optional, read and used
+  # when uploaded, never asked for.
   tax_invoice_tally:
     display_name: Tax Invoice (Tally)
     di_types:
     - tax_invoice_tally
     stage: DELIVERY
-    requirement: REQUIRED
+    requirement: OPTIONAL
     condition: null
     accepted_early: true
     pages: *id001
@@ -911,13 +915,15 @@ document_types:
     - DELIVERY
     - VEHICLE
     - AUDIT
+  # Not mandatory (product owner 2026-11-11, see tax_invoice_tally): the
+  # extended warranty the NDC / cost sheet charges needs no invoice of its own.
   ew_invoice:
     display_name: Extended Warranty Invoice
     di_types:
     - ew_invoice
     stage: DELIVERY
-    requirement: CONDITIONAL
-    condition: ewSold
+    requirement: OPTIONAL
+    condition: null
     accepted_early: true
     pages: *id001
     extraction:
@@ -941,13 +947,14 @@ document_types:
     journey_360:
     - INVOICES
     - DEAL
+  # Not mandatory (product owner 2026-11-11, see tax_invoice_tally).
   rsa_invoice:
     display_name: RSA Invoice
     di_types:
     - rsa_invoice
     stage: DELIVERY
-    requirement: CONDITIONAL
-    condition: rsaSold
+    requirement: OPTIONAL
+    condition: null
     accepted_early: true
     pages: *id001
     extraction:

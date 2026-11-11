@@ -790,11 +790,16 @@ def _column_for(document_type: Any) -> str:
 _SOURCE_ORDER = tuple(_norm_type(t) for t in (
     "booking_form", "booking_docket", "order_taking_form",
     _STATEMENT_COLUMN_TYPE, _SETTLEMENT_TYPE, _COST_SHEET_STANDIN_TYPE,
-    "customer_ledger", "cost_sheet", TALLY_LEDGER_TYPE,
+    "customer_ledger", "cost_sheet",
     "tax_invoice_tally", "customer_invoice_dms", "invoice_generic", "customer_invoice_dms_v2", "tax_invoice",
     "tax_invoice_dms", "accessory_invoice_dms", "accessory_invoice_tally", "ew_invoice", "rsa_invoice",
     "insurance_cover_note", "insurance_policy", "insurance_cover", "rto_challan", "rto_tax_receipt",
     "credit_note", "debit_note",
+    # The customer ledger verifies; it does not price (product owner
+    # 2026-11-11: "NDC / cost sheet figures should be used for computation ...
+    # customer ledger has to be used to verify the payments"). Its posting
+    # stands on a line only when no other billing document gives the line.
+    TALLY_LEDGER_TYPE,
 ))
 
 
@@ -1069,6 +1074,17 @@ _OPTED_COMPONENTS = frozenset({
 # The products the customer may or may not take; with the NDC on file, one it
 # does not charge (nor any other bill) is not taken (2026-11-03).
 _OPTIONAL_PRODUCTS = _OPTED_COMPONENTS | {"rsa_amount"}
+# The products whose own invoice is never waited for (product owner
+# 2026-11-11: "Tally Invoice, EWS Invoice, Fastag, RSA Invoice are not
+# mandatory and no tasks to be opened for it ... if available should be
+# used"): once the vehicle's own bill is on file (the NDC / cost sheet with
+# its vehicle line, or the vehicle invoice), one that no bill charges is not
+# taken; until then it waits for that bill. Accessories keep their invoice:
+# with no NDC / cost sheet on file they wait for it.
+_NEVER_AWAITED_PRODUCTS = frozenset({
+    "additional_warranty_amount", "extended_warranty_amount", "rsa_amount", "fastag_amount",
+})
+_NEVER_AWAITED_DOCUMENTS = frozenset({"EXTENDED_WARRANTY", "RSA", "FASTAG"})
 # Every vehicle-sale invoice type (2026-10-20: not two hard-coded ones); an
 # invoice_generic counts as one when it prints a vehicle-sale purpose.
 _VEHICLE_INVOICE_TYPES = tuple(sorted(VEHICLE_SALE_TYPES))
@@ -1492,7 +1508,17 @@ def _only_the_statement_gives(discount_rows: list[dict[str, Any]]) -> None:
     the ERP settlement printout) gives its amount; another document may name
     it (a credit note's reason, the invoice naming the cost sheet's total).
     Every other benefit a document gives stays on the Deal, marked not on the
-    NDC, out of every total and never a variance."""
+    NDC, out of every total and never a variance.
+
+    Product owner 2026-11-11 ("customer ledger has to be used to verify the
+    payments and discounts need to be handled in customer ledger
+    transactions"): a benefit the customer ledger posts (a credit note, a
+    "discount allowed" journal) that the statement does not give is still not
+    a discount of the deal sheet, but the ledger has credited the customer
+    with it. The row carries ``ledgerPosted`` and deal() takes it off what is
+    still to be received, so a payment verified against the ledger is not
+    read as short by the ledger's own discount."""
+    tally = _norm_type(TALLY_LEDGER_TYPE)
     for row in discount_rows:
         if row.get("current") is None or row.get("fromStatement"):
             continue
@@ -1502,6 +1528,11 @@ def _only_the_statement_gives(discount_rows: list[dict[str, Any]]) -> None:
             for s in row.get("sources") or []
         ):
             continue
+        if amount is not None and amount > 0 and any(
+            _norm_type(s.get("documentType")) == tally and _near(s.get("amount"), amount, _SAME_BENEFIT_TOLERANCE)
+            for s in row.get("sources") or []
+        ):
+            row["ledgerPosted"] = _money(amount)
         row["current"], row["currentSource"], row["variance"] = None, None, None
         # Not given, so not "taken as given" in the standard either (deal() adds those
         # rows' current figure: live 2026-11-05, a TypeError on a None).
@@ -1797,10 +1828,18 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # (it is listed under "awaiting"), so it is never a variance of its own.
     awaiting_unpriced = [r for r in counted_rows if r["awaiting"] and r["current"] is None]
     counted_rows = [r for r in counted_rows if r not in awaiting_unpriced]
+    # A product the customer did not take is not part of the deal, so its
+    # master price is not part of the standard deal either (product owner
+    # 2026-11-11: a customer who paid more than the standard deal price showed
+    # a negative variance -- live, 451 delivered deals carried an extended
+    # warranty nobody bought in their Standard total, 371 an RSA, 363 a FASTag,
+    # 95 the accessories). The row keeps the master's price for reference.
+    not_taken = [r for r in counted_rows if r.get("notTaken")]
+    counted_rows = [r for r in counted_rows if not r.get("notTaken")]
     standard_discounts = [r for r in discount_rows if r["inStandard"]]
     for group in groups:
         group["totals"] = {
-            c: _column_total([r for r in group["components"] if not r.get("partOf")], c)
+            c: _column_total([r for r in group["components"] if not r.get("partOf") and not r.get("notTaken")], c)
             for c in ("standard", "booking", "billed", "ledger", "effective", "current")
         }
     std_total, cur_total, bl_total, lg_total = (
@@ -1849,7 +1888,12 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # the price read "not invoiced", 0, and the payable was Rs 2,161).
     price_billed = any(r["key"] == "ex_showroom_price" and (_dec(r["current"]) or Decimal(0)) > 0
                        for r in all_rows if not r.get("excluded"))
-    payable = net_cur if price_billed else None
+    # What the customer ledger has credited the customer with and the deal
+    # sheet does not show (see _only_the_statement_gives): off what is still
+    # to be received, never off the deal's net or its variance.
+    ledger_discounts = sum((Decimal(r["ledgerPosted"]) for r in discount_rows
+                            if r.get("ledgerPosted") and not r.get("sameAs")), Decimal(0))
+    payable = (str(Decimal(net_cur) - ledger_discounts) if net_cur is not None else None) if price_billed else None
     paid = _paid(connection, tenant_id=tenant_id, journey_id=journey_id)
     # The old vehicle the NDC takes against the price ("Exchanged vehicle",
     # or its "Trade in value" row) is paid in kind (2026-11-02, Deal defect 4).
@@ -1919,6 +1963,9 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             "awaiting": [{"key": r["key"], "label": r["label"], "document": r["awaiting"],
                           "standard": r["standard"]} for r in awaiting_unpriced],
             "awaitingDocuments": len({r["awaiting"] for r in awaiting_unpriced}),
+            # Optional products no bill charges: not taken, in no total; the
+            # master's price is shown for reference.
+            "notTaken": [{"key": r["key"], "label": r["label"], "standard": r["standard"]} for r in not_taken],
             # True once a customer invoice is on file: current and every
             # variance are then the invoices' figures (lines awaiting their
             # own document excepted).
@@ -1937,6 +1984,9 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                      "oldVehicle": str(old_vehicle) if old_vehicle is not None else None,
                      "total": str(paid_total)},
             "payable": payable,
+            # Discounts the customer ledger posts that the NDC / cost sheet does
+            # not show: taken off the payable above (2026-11-11), else None.
+            "ledgerDiscounts": str(ledger_discounts) if ledger_discounts else None,
             # A financed deal whose loan is not on file has no balance yet:
             # it would be the loan itself, not a shortfall (as the Summary).
             "balanceDue": None if loan_view["unknown"] else _minus(payable, paid_total),
@@ -2282,8 +2332,18 @@ def _component_row(
     cols = _columns(per_source)
     billed_from = None
     invoiced = selection["lines"].get(key)
+    # Only the NDC / cost sheet's own charge (the statement form, the cost
+    # sheet standing in for it, the ERP settlement) stands before the invoices
+    # (product owner 2026-11-11: "NDC / cost sheet figures should be used for
+    # computation ... customer ledger has to be used to verify"). The accessory
+    # invoices on file add up to the accessories line ("it could be multiple
+    # ... sum up all accessories invoice", 2026-10-31 and 2026-11-11). The
+    # Tally customer ledger posts invoices one by one and may hold only some
+    # (live, VJ2610-000045: four accessory invoices of Rs 1,07,812, the ledger
+    # posting two of them, Rs 96,537, stood as the charge): it checks a line,
+    # and prices one only when no other billing document gives it.
     statement_charge = statement_policy and any(
-        _norm_type(s["source_document_type"]) in _DEALER_BOOKS_NORM and _dec(s["amount"]) is not None for s in per_source)
+        _norm_type(s["source_document_type"]) in _STATEMENT_NORM and _dec(s["amount"]) is not None for s in per_source)
     if invoiced is not None and not statement_charge:
         # Each invoice bills its own lines; distinct invoices add up,
         # copies of one invoice count once (R2).
@@ -2316,6 +2376,14 @@ def _component_row(
         flags.append("INVOICES_DISAGREE")
     free_by_invoice = (_dec(invoiced_beside) - _dec(cols["billed"])
                        if invoiced_beside is not None and key in _ADDON_COMPONENTS["accessories"] else None)
+    # Charged on the dealer's statement and on no other document (product owner
+    # 2026-11-11: "anything on NDC / cost sheet if mentioned need not be on
+    # invoice ... we can make it a comment but not any hard enforcement"): the
+    # statement's figure is the charge, and the row says so -- no task.
+    statement_only = bool(
+        statement_charge and invoiced is None and not own and _line_document(key) != "VEHICLE" and not any(
+            _column_for(s["source_document_type"]) == "billed" and _dec(s["amount"]) is not None
+            and _norm_type(s["source_document_type"]) not in _DEALER_BOOKS_NORM for s in per_source))
     return {
         "key": key,
         "label": component_label(key),
@@ -2336,6 +2404,7 @@ def _component_row(
         # the billed figure, and (accessories) the part of it not charged.
         "invoiced": _money(invoiced_beside),
         "freeByInvoice": _money(free_by_invoice) if free_by_invoice is not None and free_by_invoice > 0 else None,
+        "statementOnly": statement_only,
     }
 
 
@@ -2561,6 +2630,16 @@ def _discount_entitled(key: str, row: dict[str, Any]) -> Any:
     stays blank and the discount is taken as given."""
     entitled = row.get("standard_eligible_amount")
     unknown = row.get("eligibility_result") in ENTITLEMENT_UNKNOWN_RESULTS
+    if (entitled is None and key == "ADDITIONAL_DISCOUNT" and row.get("eligibility_result") == "ELIGIBLE_UNCLAIMED"
+            and _dec(row.get("grid_buffer")) is not None):
+        # The dealer discount grid's buffer is the standard deal's dealer
+        # discount whether or not the dealer gave one (product owner
+        # 2026-11-11: "Buffer discount is not shown in the standard deal; it
+        # should have been fetched from the dealership grid"). The
+        # reconciliation records it as the line's potential when the deal
+        # claims no dealer discount; live, 174 delivered deals had a grid
+        # buffer and a Standard of Rs 0.
+        entitled = _dec(row["grid_buffer"])
     if entitled is None and not unknown and (
         row.get("eligibility_result") == "NOT_ELIGIBLE" or key == "ADDITIONAL_DISCOUNT"
     ):
@@ -2639,8 +2718,11 @@ class _DealSituation:
         vehicle's own figures and the FASTag come from the NDC, never a
         vehicle invoice or a "FASTag invoice", a type that does not exist
         (2026-11-02, Deal defect 7)."""
-        if self.statement_policy and document in _STATEMENT_BILLED_DOCUMENTS:
+        if self.statement_policy and document in _STATEMENT_BILLED_DOCUMENTS | _NEVER_AWAITED_DOCUMENTS:
             return _COLUMN_LABELS[_STATEMENT_COLUMN_TYPE]
+        if document in _NEVER_AWAITED_DOCUMENTS:
+            # No invoice of its own is asked for (2026-11-11): the deal's bill.
+            return _LINE_DOCUMENT_LABELS["VEHICLE"]
         return _LINE_DOCUMENT_LABELS[document]
 
     def billed_on_vehicle_bill(self, document: str) -> bool:
@@ -2675,14 +2757,22 @@ def _component_current(row: dict[str, Any], situation: _DealSituation) -> None:
     if row["billed"] is not None:
         row["current"], row["currentSource"] = row["billed"], row.get("billedFrom") or "document"
         return
-    if situation.offer_on_file and row["key"] in _OPTIONAL_PRODUCTS:
+    if (situation.offer_on_file and row["key"] in _OPTIONAL_PRODUCTS) or (
+        situation.invoice_on_file and situation.vehicle_on_file and row["key"] in _NEVER_AWAITED_PRODUCTS
+    ):
         # An optional product (accessories, extended warranty, RSA) the NDC /
         # cost sheet does not charge, nor any other bill: not taken -- never
         # awaited, never a shortfall (product owner 2026-11-03: the NDC sets
         # the offer; 2026-11-02: RSA / EW are sold only when charged). Live,
         # SHI-SS-261031-008: its Offer Letter leaves the EW and RSA rows blank,
-        # and the settlement could not be judged "awaiting the EW and RSA bills".
+        # and the settlement could not be judged "awaiting the EW and RSA
+        # bills". The extended warranty, RSA and FASTag need no invoice of
+        # their own (2026-11-11), so with the vehicle's bill on file one no
+        # bill charges is not taken either -- never "not invoiced", never
+        # below the standard. Its master price stays on the row for reference
+        # and is in no total (deal(), ``notTaken``).
         row["current"], row["currentSource"] = None, None
+        row["notTaken"] = True
         return
     document = _line_document(row["key"])
     if not situation.invoice_on_file:
@@ -2784,7 +2874,14 @@ def _insurance_accounted(
     presence, so this stays evidence of an accounted premium and not merely
     of an upload."""
     invoice_documents = [d for d in documents if d["documentType"] in _CUSTOMER_INVOICE_TYPES]
-    return any(
+    # The dealer's statement charging the premium accounts for it (product
+    # owner 2026-11-11: what the NDC / cost sheet shows need not be on an
+    # invoice).
+    on_statement = any(
+        s["line_kind"] == "COMMERCIAL" and s["component_key"] in _ADDON_COMPONENTS["insurance"]
+        and _norm_type(s["source_document_type"]) in _DEALER_BOOKS_NORM and (_dec(s["amount"]) or Decimal(0)) > 0
+        for s in sources)
+    return on_statement or any(
         s["line_kind"] == "COMMERCIAL" and s["component_key"] in _ADDON_COMPONENTS["insurance"]
         and str(s["source_document_type"]) in _INVOICE_TYPES for s in sources
     ) or "insurance_amount" in selection["lines"] or bool(
