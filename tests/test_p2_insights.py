@@ -286,6 +286,29 @@ def test_finance_report_reads_the_loan_and_compares_sanction_with_disbursal():
     assert report["basis"]["financedAllLiveJourneys"] == 6
 
 
+def test_accessory_items_add_up_by_item_dealer_and_model():
+    facts = [
+        _fact(journeyId="j1", model="MAXX HD", dealer="Utkal Mahindra"),
+        _fact(journeyId="j2", model="XUV3XO", dealer="Aditya Motors"),
+        _fact(journeyId="j3", model=None, dealer="Utkal Mahindra"),
+    ]
+    lines = [
+        {"journeyId": "j1", "label": "SEAT COVER SET", "units": 1.0, "net": 2900.0},
+        {"journeyId": "j1", "label": "Seat  Cover Set", "units": 1.0, "net": 2900.0},   # spacing and case fold
+        {"journeyId": "j2", "label": "SEAT COVER SET", "units": 2.0, "net": 5600.0},
+        {"journeyId": "j2", "label": "MUD FLAP SET", "units": 1.0, "net": 700.0},
+        {"journeyId": "j3", "label": "MUD FLAP SET", "units": 1.0, "net": 700.0},
+        {"journeyId": "gone", "label": "OUT OF SCOPE", "units": 9.0, "net": 9000.0},    # not a fact in scope
+    ]
+    block = insights.penetration_report(facts, invoice_lines=lines)["accessoryItems"]
+    assert (block["journeysWithInvoice"], block["lines"], block["units"], block["value"]) == (3, 5, 6, 12800)
+    [seat, flap] = block["items"]
+    assert (seat["label"], seat["units"], seat["value"], seat["journeys"]) == ("SEAT COVER SET", 4, 11400, 2)
+    assert seat["dealers"] == {"Utkal Mahindra": 2, "Aditya Motors": 2}
+    assert seat["models"] == {"MAXX HD": 2, "XUV3XO": 2}
+    assert flap["models"] == {"XUV3XO": 1, "Model not resolved": 1}
+
+
 def test_the_pin_code_names_the_district_where_the_postal_directory_knows_it():
     master = {
         "752055": {"district": "Khordha", "localities": ["JATNI"]},
@@ -766,6 +789,36 @@ def test_the_reports_are_for_a_team_lead_and_above_over_their_own_outlets(setup)
     assert s.client.get(f"{s.base}/catchment", params={"to": "2020-01-01"}).json()["basis"]["liveJourneys"] == 0
     assert s.client.get(f"{s.base}/catchment", params={"from": booked.isoformat()}).json()["basis"]["liveJourneys"] == 2
     assert s.client.get(f"{s.base}/catchment", params={"from": "2026-12-01", "to": "2026-11-01"}).status_code == 422
+
+
+def test_accessory_invoice_lines_are_read_from_active_invoices_only(setup):
+    import json
+
+    s = setup
+    _seed_deal(s)
+    lead = "lead-acc"
+    _exec(s, "INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, "
+             "dealer_id, outlet_id) VALUES (:t, :a, 'TL', :d, :o)", a=lead, d=s.journey.dealer_id, o=s.journey.outlet_id)
+
+    def invoice(lines, *, active=True):
+        document = uuid4()
+        evidence = add_evidence(s.journey, di_document_id=document, document_type_key="accessory_tax_invoice",
+                                status="ACTIVE" if active else "SUPERSEDED")
+        _exec(s, "INSERT INTO auditcore.invoice_review_values (tenant_id, journey_id, source_di_document_id, "
+                 "source_evidence_id, document_type_key, invoice_purpose, invoice_nature, line_items, reviewed_by_actor_id) "
+                 "VALUES (:t, :j, :d, :e, 'accessory_tax_invoice', 'ACCESSORY', 'TAX_INVOICE', CAST(:l AS jsonb), 'reviewer-acc')",
+              d=document, e=evidence, l=json.dumps(lines))
+
+    invoice([{"description_raw": "Seat Cover Set", "quantity": "2", "net_amount": "5,600.00"},
+             {"description_raw": "MUD FLAP SET", "quantity": None, "net_amount": "700"},
+             {"description_raw": "", "quantity": "1", "net_amount": "100"}])          # no label: not counted
+    invoice([{"description_raw": "SUPERSEDED ITEM", "quantity": "1", "net_amount": "999"}], active=False)
+
+    s.acting["subject"] = lead
+    block = s.client.get(f"{s.base}/penetration").json()["accessoryItems"]
+    assert (block["journeysWithInvoice"], block["lines"], block["units"], block["value"]) == (1, 2, 3, 6300)
+    assert [(item["label"], item["units"], item["value"]) for item in block["items"]] == [
+        ("SEAT COVER SET", 2, 5600), ("MUD FLAP SET", 1, 700)]
 
 
 def test_the_customer_map_reads_its_places_outlines_and_outlet_from_postgres(setup):
