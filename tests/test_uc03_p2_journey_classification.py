@@ -50,6 +50,27 @@ def test_a_vin_that_cannot_be_read_gives_no_month(vin: str | None) -> None:
     assert rule.vin_manufacture_month(vin, today=TODAY) is None
 
 
+def test_the_vin_is_the_one_the_sale_documents_agree_on() -> None:
+    # One misread copy (the invoice) against two that agree (ADI-SJ-261027-006).
+    assert rule.agreed_vin([
+        ("customer_invoice_dms", "d1", "MA1NA2XZTK6K57070"),
+        ("insurance_cover", "d2", "MA1NA2XZXT6K57070"),
+        ("rto_challan", "d3", "MA1NA2XZXT6K57070"),
+        ("accessory_invoice_dms", "d4", "T6K57070"),
+    ], today=TODAY) == "MA1NA2XZXT6K57070"
+    # The same document read twice counts once; on a tie the invoice's VIN stands.
+    assert rule.agreed_vin([
+        ("rto_challan", "d1", "MA1NS2NP1T2F75014"), ("rto_challan", "d1", "MA1NS2NP1T2F75014"),
+        ("customer_invoice_dms", "d2", "MA1NS2NP1T2F79014"),
+    ], today=TODAY) == "MA1NS2NP1T2F79014"
+    # A tie between a VIN that names its month and one that does not.
+    assert rule.agreed_vin([
+        ("insurance_cover", "d1", "MA1RY3JNKI5J35425"), ("rto_challan", "d2", "MA1RY3JNKT5J35425"),
+    ], today=TODAY) == "MA1RY3JNKT5J35425"
+    assert rule.agreed_vin([("accessory_invoice_dms", "d1", "T1J82078")], today=TODAY) is None
+    assert rule.agreed_vin([], today=TODAY) is None
+
+
 # ── Deal Type ────────────────────────────────────────────────────────────────
 
 def _deal(**overrides):
@@ -138,12 +159,9 @@ def _stored(journey):
 
 
 def _set_vin(journey, vin: str) -> None:
-    with journey.engine.begin() as connection:
-        set_tenant_context(connection, journey.tenant_id)
-        connection.execute(
-            text("INSERT INTO auditcore.vehicle_records (tenant_id, journey_id, vin, source_kind) "
-                 "VALUES (:t, :j, :v, 'EVIDENCE')"),
-            {"t": journey.tenant_id, "j": journey.journey_id, "v": vin})
+    """The sale's invoice prints the VIN; the customer's old car's RC prints another."""
+    add_ready_document(journey, "customer_invoice_dms", vin_number=vin)
+    add_ready_document(journey, "vehicle_rc", chassis_number="MA1ZP2TAKE2C61179")
 
 
 def _task(journey):
