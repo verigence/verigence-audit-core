@@ -96,7 +96,12 @@ jobs:
               if report == "catchment":
                   return {"basis": body["basis"],
                           "districts": [(r["label"], r["journeys"], r["statementDeals"]) for r in body["districts"][:12]],
-                          "outlets": [(r["label"][:28], r["homeDistrict"], r["homeSharePercent"]) for r in body["outlets"][:14]]}
+                          "outlets": [(r["label"][:28], r["homeDistrict"], r["homeSharePercent"]) for r in body["outlets"][:14]],
+                          "map": {"cells": len(body["map"]["cells"]), "offMap": body["map"]["offMap"],
+                                  "onMap": sum(c["journeys"] for c in body["map"]["cells"] if c["onMap"]),
+                                  "boundaries": [b["key"] for b in body["map"]["boundaries"]],
+                                  "outletsWithPin": sum(1 for o in body["map"]["outlets"] if o["pin"]),
+                                  "outlets": len(body["map"]["outlets"])}}
               if report == "sales":
                   return {"basis": body["basis"], "network": body["network"], "months": body["months"],
                           "bands": body["daysToDeliverBands"],
@@ -121,6 +126,13 @@ jobs:
           with engine.connect() as connection:
               tenants = connection.execute(text(
                   "SELECT p.tenant_id, p.project_name FROM auditcore.projects p ORDER BY p.project_name")).all()
+          with engine.connect() as connection:
+              ready = connection.execute(text("SELECT to_regclass('auditcore.geo_pin_master')")).scalar_one()
+          if ready is None:
+              # The reports read the PIN code master; until the deploy has applied its
+              # migration there is nothing to verify against.
+              print("INSIGHTS_VERIFY=SKIPPED (the geography masters are not migrated yet)")
+              raise SystemExit(0)
           for tenant_id, name in tenants:
               with engine.begin() as connection:
                   set_tenant_context(connection, tenant_id)

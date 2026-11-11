@@ -592,7 +592,7 @@ def load_facts(connection: Connection, *, tenant_id: str) -> list[dict[str, Any]
             fact["policyEnd"] = parse_extracted_date(value)
 
     out = list(facts.values())
-    _resolve_districts(out)
+    _resolve_districts(out, pin_master(connection))
     for fact in out:
         fact["loan"] = loan_amount(fact)
     return out
@@ -665,22 +665,55 @@ def loan_amount(fact: dict[str, Any]) -> float | None:
     return None
 
 
-def _resolve_districts(facts: list[dict[str, Any]]) -> None:
+# Names a district is also written by, each against the name the postal directory uses.
+_DISTRICT_ALSO = {
+    "Balasore": ("Baleshwar", "Baleswar"), "Keonjhar (Kendujhar)": ("Keonjhar", "Kendujhar"),
+    "Deogarh": ("Debagarh", "Devgarh"), "Subarnapur": ("Sonepur", "Sonapur"), "Nuaparha": ("Nuapada",),
+    "Rayagarha": ("Rayagada",), "Boudh": ("Baudh", "Bauda"), "Nabarangapur": ("Nabarangpur", "Nawarangpur"),
+    "Balangir": ("Bolangir",), "Anugul": ("Angul",), "Jajapur": ("Jajpur",), "Khordha": ("Khurda", "Khorda"),
+    "Jagatsinghpur": ("Jagatsinghapur",), "Sundargarh": ("Sundergarh",),
+}
+
+
+def pin_master(connection: Connection) -> dict[str, dict[str, Any]]:
+    """PIN code -> its district and localities, from the postal directory (reference data)."""
+    return {
+        str(r["pincode"]): {"district": r["district_name"], "localities": list(r["locality_names"] or [])}
+        for r in _rows(connection, "SELECT pincode, district_name, locality_names FROM auditcore.geo_pin_master")
+    }
+
+
+def _resolve_districts(facts: list[dict[str, Any]], master: dict[str, dict[str, Any]] | None = None) -> None:
+    """Each Journey's district. The PIN code decides where the postal directory knows it;
+    else the district as read, under the directory's name for it where it has one, and
+    otherwise the commonest of its spellings. ``onMap``: the PIN code is in the directory."""
+    master = master or {}
+    names: dict[str, str] = {}                      # every known spelling's key -> the directory's name
+    for name in {m["district"] for m in master.values() if m["district"]}:
+        for spelling in (name, *_DISTRICT_ALSO.get(name, ())):
+            names[district_key(spelling)] = name
     spellings: dict[str, Counter[str]] = defaultdict(Counter)
     by_pin: dict[str, Counter[str]] = defaultdict(Counter)
     for fact in facts:
+        place = master.get(fact["pin"] or "")
+        fact["onMap"] = place is not None
+        fact["localities"] = place["localities"] if place else []
         key = district_key(fact["districtRaw"])
-        fact["districtKey"] = key or None
+        if place and place["district"]:
+            fact["districtKey"] = district_key(place["district"])
+            names[fact["districtKey"]] = place["district"]
+            continue
+        fact["districtKey"] = (district_key(names[key]) if key in names else key) or None
         if key:
-            spellings[key][fact["districtRaw"].title()] += 1
+            spellings[fact["districtKey"]][fact["districtRaw"].title()] += 1
             if fact["pin"]:
-                by_pin[fact["pin"]][key] += 1
+                by_pin[fact["pin"]][fact["districtKey"]] += 1
     for fact in facts:
         if fact["districtKey"] is None and fact["pin"] in by_pin:
             fact["districtKey"] = by_pin[fact["pin"]].most_common(1)[0][0]
-        fact["district"] = (
-            min(spellings[fact["districtKey"]].items(), key=lambda kv: (-kv[1], kv[0]))[0]
-            if fact["districtKey"] else None)
+        key = fact["districtKey"]
+        fact["district"] = None if not key else names.get(key) or min(
+            spellings[key].items(), key=lambda kv: (-kv[1], kv[0]))[0]
 
 
 # --------------------------------------------------------------------------- product penetration
@@ -1206,7 +1239,55 @@ def finance_report(facts: list[dict[str, Any]]) -> dict[str, Any]:
 
 # --------------------------------------------------------------------------- catchment
 
-def catchment_report(facts: list[dict[str, Any]]) -> dict[str, Any]:
+def outlet_pins(connection: Connection, tenant_id: str) -> dict[str, str]:
+    """Each outlet's PIN code: its postal code, else the PIN code written in its address."""
+    pins = {}
+    for r in _rows(connection, """
+        SELECT outlet_id, postal_code, address_text FROM auditcore.dealer_outlets WHERE tenant_id = :t
+    """, t=tenant_id):
+        found = re.search(r"(?<!\d)[1-9]\d{5}(?!\d)", f"{r['postal_code'] or ''} {r['address_text'] or ''}")
+        if found:
+            pins[str(r["outlet_id"])] = found.group(0)
+    return pins
+
+
+def boundaries(connection: Connection) -> list[dict[str, Any]]:
+    """The outlines the map can draw, without their content."""
+    return [{"key": r["boundary_key"], "type": r["boundary_type"], "state": r["state_name"], "source": r["source_name"]}
+            for r in _rows(connection, """
+                SELECT boundary_key, boundary_type, state_name, source_name
+                FROM auditcore.geo_boundary_master ORDER BY boundary_type, boundary_key
+            """)]
+
+
+def _map_cells(facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The map's rows: one per PIN code (or district, where no PIN code was read), outlet
+    and model, so the screen can pick a dealership, a model and a measure without asking
+    again. ``products`` counts the statement deals that took each product."""
+    cells: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for fact in facts:
+        if not fact["pin"] and not fact["districtKey"]:
+            continue
+        key = (fact["pin"], fact["districtKey"], fact["outletId"], fact["model"])
+        cell = cells.setdefault(key, {
+            "pin": fact["pin"], "onMap": fact["onMap"], "district": fact["district"],
+            "dealerId": fact["dealerId"], "dealer": fact["dealer"], "outletId": fact["outletId"],
+            "outlet": fact["outlet"], "model": fact["model"], "journeys": 0, "delivered": 0, "deals": 0,
+            "products": dict.fromkeys((key for key, _label, _how in PRODUCTS), 0),
+        })
+        cell["journeys"] += 1
+        cell["delivered"] += 1 if fact["deliveredOn"] is not None else 0
+        if fact["statement"]:
+            cell["deals"] += 1
+            for product in cell["products"]:
+                cell["products"][product] += 1 if _taken(fact, product) else 0
+    return sorted(cells.values(), key=lambda c: (c["pin"] or "", c["district"] or "", c["outlet"] or "", c["model"] or ""))
+
+
+def catchment_report(
+    facts: list[dict[str, Any]], *, outlet_pin: dict[str, str] | None = None,
+    outlines: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     def place_rows(key_of: Callable[[dict[str, Any]], tuple[str, str, str | None] | None]) -> list[dict[str, Any]]:
         groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
         labels: dict[str, tuple[str, str | None]] = {}
@@ -1264,9 +1345,25 @@ def catchment_report(facts: list[dict[str, Any]]) -> dict[str, Any]:
             lambda f: (f["districtKey"], f["district"], None) if f["districtKey"] else None),
         "pins": place_rows(lambda f: (f["pin"], f["pin"], f["district"]) if f["pin"] else None),
         "outlets": outlet_rows,
+        "map": {
+            "boundaries": outlines or [],
+            "cells": _map_cells(facts),
+            "localities": {f["pin"]: f["localities"] for f in facts if f["pin"] and f.get("localities")},
+            "outlets": sorted(
+                ({"outletId": oid, "outlet": outlet, "dealerId": did, "dealer": dealer,
+                  "pin": (outlet_pin or {}).get(oid)}
+                 for oid, outlet, did, dealer in {(f["outletId"], f["outlet"], f["dealerId"], f["dealer"])
+                                                  for f in facts if f["outletId"]}),
+                key=lambda o: (o["dealer"] or "", o["outlet"] or "")),
+            "offMap": sum(1 for f in facts if f["pin"] and not f.get("onMap")),
+        },
         "notes": [
-            ("The place is the customer's address as read from the Journey's documents: the PIN code and the "
-            "district. Spellings of one district are folded together."),
+            ("The place is the customer's address as read from the Journey's documents. The PIN code names "
+            "the district where the postal directory knows it; otherwise the district as read, its spellings "
+            "folded together."),
+            ("On the map an area takes the colour of the dealership with the most customers there; an area "
+            "more than one dealership sells into is marked as shared. An outlet is drawn at its own PIN code. "
+            "A customer's PIN code is where they live, not a dealership's territory."),
             ("Penetration by place is of the statement deals in that place; a place with fewer than "
             f"{THIN_SAMPLE} statement deals is marked, and most single PIN codes are below it today."),
             "Home district is the district most of an outlet's located customers come from.",
@@ -1776,7 +1873,7 @@ def build_insight(
     elif report == "finance":
         body = finance_report(facts)
     elif report == "catchment":
-        body = catchment_report(facts)
+        body = catchment_report(facts, outlet_pin=outlet_pins(connection, tenant_id), outlines=boundaries(connection))
     elif report == "sales":
         body = sales_report(facts, today=now.date())
     elif report == "payments":
@@ -1802,6 +1899,34 @@ def build_insight(
         "period": {"first": min(dates).isoformat() if dates else None, "last": max(dates).isoformat() if dates else None},
         **body,
     }
+
+
+@router.get("/insight-boundaries/{boundary_key}")
+def read_boundary(
+    tenant_id: str,
+    boundary_key: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """One outline for the customer map: GeoJSON, gzip, base64. Reference data, the same
+    for every Project; the reader's role is checked as for the reports."""
+    access = authorize_p2(
+        connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_READ_PERMISSION,
+    )
+    _require_report_role(connection, tenant_id=tenant_id, actor_id=human_principal.subject,
+                         functional_role=access.functional_role)
+    row = connection.execute(text("""
+        SELECT boundary_key, boundary_type, encode(content_gzip, 'base64') AS content, source_name
+        FROM auditcore.geo_boundary_master WHERE boundary_key = :k
+    """), {"k": boundary_key}).mappings().first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="This map outline is not on file.")
+    return {"key": row["boundary_key"], "type": row["boundary_type"], "source": row["source_name"],
+            "contentGzipBase64": row["content"].replace("\n", "")}
 
 
 @router.get("/insights/{report}")
