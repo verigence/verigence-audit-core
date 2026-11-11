@@ -3391,6 +3391,25 @@ def _bring_back_earlier_copies(connection, *, tenant_id: str, journey_id: UUID) 
         logger.warning("p2_earlier_copy_back_failed", tenant_id=tenant_id, journey_id=str(journey_id), exc_info=True)
 
 
+def _set_aside_receipts_not_from_the_dealership(connection, *, tenant_id: str, journey_id: UUID) -> None:
+    """As _apply_file_identity: a failure is logged and the recompute goes on;
+    a deadlock fails the item so it is retried."""
+    from audit_core.uc03_db_transient import raise_if_worker_transient
+    from audit_core.uc03_receipt_issuer import (
+        set_aside_receipts_not_from_the_dealership,
+    )
+
+    try:
+        with connection.begin_nested():
+            aside = set_aside_receipts_not_from_the_dealership(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if aside:
+            logger.info("p2_receipts_not_from_the_dealership", tenant_id=tenant_id, journey_id=str(journey_id),
+                        receipts=[item["name"] for item in aside])
+    except Exception as exc:
+        raise_if_worker_transient(exc)
+        logger.warning("p2_receipt_issuer_failed", tenant_id=tenant_id, journey_id=str(journey_id), exc_info=True)
+
+
 def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
                    started_at: datetime | None = None) -> dict[str, Any]:
     """Recompute the stage from the documents, raise / close the rule tasks
@@ -3415,6 +3434,10 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     # a document never read) is the booking's again (2026-11-01,
     # uc03_p2_earlier_copy), before the booking is rebuilt from its documents.
     _bring_back_earlier_copies(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # Only the dealership's own receipt is a payment (2026-11-11): an insurer's
+    # premium receipt, or another dealership's, leaves the booking's payments
+    # before they are rebuilt and stays on file as a supporting document.
+    _set_aside_receipts_not_from_the_dealership(connection, tenant_id=tenant_id, journey_id=journey_id)
     _materialize_journey(connection, tenant_id=tenant_id, journey_id=journey_id)
     # The booking date follows the receipts still on file: a receipt deleted,
     # re-read or replaced since the last pass no longer sets it (2026-10-20).
