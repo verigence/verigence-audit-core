@@ -331,7 +331,8 @@ def test_a_line_awaits_its_own_document_and_is_never_zeroed_by_another_invoice(j
     assert vehicle["currentSource"] is None and vehicle["variance"] is None
     assert "AWAITING_DOCUMENT" in vehicle["flags"] and "NOT_INVOICED" not in vehicle["flags"]
     warranty = rows["extended_warranty_amount"]
-    assert warranty["awaiting"] == "extended warranty invoice" and warranty["current"] is None
+    # No invoice of its own is asked for (2026-11-11): it waits for the vehicle's bill.
+    assert warranty["awaiting"] == "vehicle invoice" and warranty["current"] is None
     # Variance vs standard is Current net less Standard net, on the billed lines.
     assert Decimal(summary["net"]["current"]) == 22000 and Decimal(summary["net"]["standard"]) == 20000
     assert Decimal(summary["variance"]["currentVsStandard"]) == 2000

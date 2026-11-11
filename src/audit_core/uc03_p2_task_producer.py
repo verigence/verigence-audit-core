@@ -1489,6 +1489,17 @@ def sync_booking_date_task(
     return counts
 
 
+# Required documents that are asked for by a task as well as shown on the
+# checklist. Product owner 2026-11-11: "NDC or cost sheet should be uploaded
+# and there should be a task but it should be combined with all the pending
+# docs" -- the Deal is read from the dealer's statement and waits until it is
+# on file ("NDC has to come and there is no escape route for it"), yet a
+# delivery without one had no task at all: 179 delivered deals had no vehicle
+# price from an NDC or cost sheet. Its task is a missing-document task like
+# the others, in the same Missing documents group and report.
+ALWAYS_ASKED_REQUIREMENTS = frozenset({"DEALER_STATEMENT"})
+
+
 def sync_document_missing_tasks(
     connection: Connection,
     *,
@@ -1529,9 +1540,10 @@ def sync_document_missing_tasks(
     for stage in stages:
         for item in requirement_items(connection, registry, tenant_id=tenant_id, journey_id=journey_id,
                                       stage=stage, reasons=reasons):
-            if item["requirement"] != "CONDITIONAL" or not item["required"] or item["received"]:
+            always = item["key"] in ALWAYS_ASKED_REQUIREMENTS and item["requirement"] == "REQUIRED"
+            if (item["requirement"] != "CONDITIONAL" and not always) or not item["required"] or item["received"]:
                 continue
-            if not item.get("raisesMissingTask", True):
+            if not always and not item.get("raisesMissingTask", True):
                 continue
             key = f"document-missing:{journey_id}:{item['key']}"
             wanted.add(key)
@@ -1543,9 +1555,13 @@ def sync_document_missing_tasks(
                 connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
                 task_type="DOCUMENT_MISSING", source_type="DOCUMENT", source_code="DOCUMENT_MISSING",
                 title=f"Upload the {item['label']}",
-                description=(f"{item['reason']} The {item['label']} is therefore mandatory for this "
-                             f"{'booking' if stage == 'BOOKING' else 'delivery'} ({conditions}). "
-                             "Upload it; this task closes itself once it is read."),
+                description=(
+                    (f"The {item['label']} is mandatory for every delivery: the Deal is read from it and "
+                     "waits until it is on file. Upload it; this task closes itself once it is read.")
+                    if always else
+                    (f"{item['reason']} The {item['label']} is therefore mandatory for this "
+                     f"{'booking' if stage == 'BOOKING' else 'delivery'} ({conditions}). "
+                     "Upload it; this task closes itself once it is read.")),
                 reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "DOCUMENT_MISSING",
                            "requirementKey": item["key"], "templateKeys": item["templates"],
                            "conditions": item["conditions"], "stage": stage},

@@ -481,6 +481,20 @@ def submit_action(
         if not comment:
             raise ValueError("Write a comment to close this task, for example that the document was uploaded.")
 
+    if action == CLOSE_TASK and task["task_type"] == MISSING_DOCUMENT_TASK:
+        # The NDC / cost sheet cannot be claimed "not required" (product owner
+        # 2026-11-11: "NDC has to come and there is no escape route for it").
+        from audit_core.uc03_not_mandatory_claims import is_claim as _is_claim
+        from audit_core.uc03_p2_task_producer import ALWAYS_ASKED_REQUIREMENTS
+
+        reference = task.get("reference") or {}
+        if isinstance(reference, str):
+            reference = json.loads(reference or "{}")
+        if (str(reference.get("requirementKey") or "") in ALWAYS_ASKED_REQUIREMENTS
+                and _is_claim(str((details or {}).get("choice") or ""))):
+            raise ValueError("The NDC / cost sheet is mandatory for every delivery and cannot be marked as not "
+                             "required. Upload it; the Deal waits for it.")
+
     journey_id = UUID(str(task["journey_id"]))
     record_task_event(
         connection,
