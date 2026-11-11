@@ -502,6 +502,7 @@ def materialize_delivery_vehicle(
         existing[key] == merged[key]
         for key in ("vin", "chassis_number", "dms_reference", "invoice_reference")
     ):
+        _correct_vehicle_record(connection, tenant_id=tenant_id, journey_id=journey_id)
         return 0
 
     connection.execute(
@@ -535,7 +536,19 @@ def materialize_delivery_vehicle(
             "source_evidence_id": source_evidence_id,
         },
     )
-    return sum(1 for key, value in values.items() if value is not None and (existing is None or existing[key] is None))
+    filled = sum(1 for key, value in values.items() if value is not None and (existing is None or existing[key] is None))
+    _correct_vehicle_record(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return filled
+
+
+def _correct_vehicle_record(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
+    """The record above keeps the first VIN / chassis number it was given, from whichever
+    document came first -- a misread copy, or the customer's old vehicle's RC, stayed on
+    it for good. The Journey's VIN is the one the sale's own documents agree on
+    (uc03_p2_journey_classification, 2026-11-11); the record follows it."""
+    from audit_core.uc03_p2_journey_classification import correct_vehicle_record
+
+    correct_vehicle_record(connection, tenant_id=tenant_id, journey_id=journey_id)
 
 
 def materialize_delivery_registration(
