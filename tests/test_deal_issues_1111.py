@@ -240,7 +240,7 @@ def test_an_add_on_the_ndc_does_not_charge_is_switched_off_also_with_its_invoice
 def test_an_add_on_the_ndc_charges_stays_switched_on(journey) -> None:
     _statement(journey, UTKAL)
     warranty = _addons(journey)["warranty"]
-    assert warranty["taken"] is True and D(warranty["amount"]) == D("9999")
+    assert warranty["taken"] is True and D(warranty["amount"]) == D(9999)
     assert "notOnStatement" not in warranty["details"]
 
 
