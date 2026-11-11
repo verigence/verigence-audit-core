@@ -1888,6 +1888,13 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # the price read "not invoiced", 0, and the payable was Rs 2,161).
     price_billed = any(r["key"] == "ex_showroom_price" and (_dec(r["current"]) or Decimal(0)) > 0
                        for r in all_rows if not r.get("excluded"))
+    if statement_policy and not price_billed:
+        # The deal waits for its NDC (product owner 2026-11-11: "we will wait
+        # till NDC is not there"): with no vehicle price billed there is no
+        # deal to set against the standard yet. Live, VJ2610-000045 read
+        # Rs 30,000 above a standard of minus Rs 7,431 -- its RTO challan
+        # against the scheme benefits alone.
+        current_vs_standard = None
     # What the customer ledger has credited the customer with and the deal
     # sheet does not show (see _only_the_statement_gives): off what is still
     # to be received, never off the deal's net or its variance.

@@ -171,6 +171,7 @@ def test_without_the_ndc_the_deal_waits_for_it_whatever_invoices_and_ledger_are_
     assert D(_row(view, "accessories_cost")["invoiced"]) == D(20000)
     summary = view["summary"]
     assert summary["payable"] is None and summary["balanceDue"] is None
+    assert summary["variance"]["currentVsStandard"] is None  # no deal to set against the standard yet
     assert summary["invoiceNetPayable"] is not None  # what the invoices add up to, for the payment tally
 
 
