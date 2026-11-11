@@ -225,6 +225,18 @@ task_types:
     actions:
     - COMPLETE_ACTION
     - ADD_COMMENT
+  # Deal Type (product owner 2026-11-11): not filled while a Journey has no
+  # VIN to read the vehicle's age from. Once delivery has started the Team
+  # Lead is asked to set it; their answer wins over the rule.
+  DEAL_TYPE_CONFIRM:
+    category: CORRECTION_APPROVAL
+    owner: TL
+    origin: SYSTEM
+    source: RULE
+    completion: MACHINE_VERIFIED
+    actions:
+    - COMPLETE_ACTION
+    - ADD_COMMENT
   # SKU resolution (decision 2026-10-20). The closest price-master SKU is
   # only suggested: the PC accepts it or rejects it and picks one by hand.
   SKU_CLOSEST_MATCH_CONFIRM:

@@ -569,6 +569,14 @@ def submit_action(
         return answer_insurance_source_task(connection, tenant_id=tenant_id, task=task, actor_id=actor_id,
                                             comment=comment, details=details)
 
+    if task["task_type"] == "DEAL_TYPE_CONFIRM" and action == "COMPLETE_ACTION":
+        from audit_core.uc03_p2_journey_classification import (
+            answer_task as answer_deal_type_task,
+        )
+
+        return answer_deal_type_task(connection, tenant_id=tenant_id, task=task, actor_id=actor_id,
+                                     actor_role_code=actor_role_code, comment=comment, details=details)
+
     if task["task_type"] == "TL_MANAGEMENT_REFERRAL" and action == "COMPLETE_ACTION":
         return _enable_management_referral(
             connection, tenant_id=tenant_id, task=task, actor_id=actor_id, actor_role_code=actor_role_code,
