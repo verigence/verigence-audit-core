@@ -154,6 +154,45 @@ def test_a_page_a_person_typed_as_a_receipt_stays_a_receipt(journey) -> None:
     assert _counted(journey) == ["50370.00"]
 
 
+def _type_tasks(journey):
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        return c.execute(
+            text("SELECT task_status FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
+                 "AND source_code='DOCUMENT_UNCLASSIFIED'"),
+            {"t": journey.tenant_id, "j": journey.journey_id}).scalars().all()
+
+
+def test_the_pc_is_not_asked_to_set_the_type_of_a_receipt_set_aside(journey) -> None:
+    """Live 11 Nov: each of the first receipts set aside raised "Set the document type"."""
+    _, insurer_page = _receipt(journey, issuer="National Insurance", amount="50370", number="N1", page=1)
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        worker.settle_journey(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert _type_tasks(journey) == []
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        assert c.execute(text("SELECT type_overridden_by_actor_id FROM auditcore.p2_document_queue "
+                              "WHERE tenant_id=:t AND queue_id=:q"),
+                         {"t": journey.tenant_id, "q": insurer_page}).scalar_one() == "SYSTEM:RECEIPT_ISSUER"
+
+
+def test_a_page_set_aside_before_it_was_typed_is_typed_and_its_task_closes(journey) -> None:
+    _, insurer_page = _receipt(journey, issuer="National Insurance", amount="50370", number="N1", page=1)
+    _set_aside(journey)
+    with journey.engine.begin() as c:   # as the first release left it
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("UPDATE auditcore.p2_document_queue SET type_overridden_by_actor_id=NULL "
+                       "WHERE tenant_id=:t AND queue_id=:q"), {"t": journey.tenant_id, "q": insurer_page})
+        worker.sync_unclassified_page_tasks(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert _type_tasks(journey) == ["READY"]
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        worker.settle_journey(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert all(status in ("VERIFIED_COMPLETE", "CANCELLED") for status in _type_tasks(journey))
+    assert _counted(journey) == []
+
+
 def test_the_recompute_sets_it_aside_before_the_booking_is_rebuilt(journey) -> None:
     _receipt(journey, issuer="Shivnath Group", amount="500000", number="PB/26-27/0597", page=1)
     _, insurer_page = _receipt(journey, issuer="National Insurance Company Ltd.", amount="50370",

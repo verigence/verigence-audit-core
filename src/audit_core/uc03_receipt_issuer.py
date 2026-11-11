@@ -27,6 +27,10 @@ earlier check compared the two names for likeness (0.55) and would have called
 "Utkal Automobiles Pvt Ltd" another dealer; it raised a notice in the previous
 flow only and never ran here.
 
+The page is typed by the rule (``type_overridden_by_actor_id``), so the PC is not
+asked to "Set the document type" of it (uc03_p2_task_producer raises that task
+for a supporting page nobody typed).
+
 Left as they are: a receipt with no issuer read, a dealership whose name has no
 word of its own, and a page whose type a person set by hand. A PC who finds a
 receipt set aside wrongly (the issuer misread) sets the page's type back to a
@@ -134,6 +138,28 @@ def receipt_name(issuer: Any) -> str:
     return ("Receipt from " + " ".join(str(issuer or "").split()).title())[:200]
 
 
+def _mark_pages_as_decided(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
+    """A page this rule set aside is typed: what it is has been decided, so the
+    PC is not asked to "Set the document type" of it. The first receipts set
+    aside (11 Nov, 8 pages) were left untyped and each raised that task; this
+    types them on the booking's next recompute, which closes the task."""
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_queue q
+            SET type_overridden_by_actor_id = :actor, updated_at_utc = now()
+            WHERE q.tenant_id = :t AND q.journey_id = :j AND q.queue_status = 'SUPPORTING'
+              AND q.type_overridden_by_actor_id IS NULL AND q.di_document_id IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM auditcore.evidence e
+                  WHERE e.tenant_id = q.tenant_id AND e.journey_id = q.journey_id
+                    AND e.di_document_id = q.di_document_id AND e.voided_by_actor_id = :actor)
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "actor": ACTOR},
+    )
+
+
 def set_aside_receipts_not_from_the_dealership(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str | None = None,
 ) -> list[dict[str, Any]]:
@@ -142,6 +168,7 @@ def set_aside_receipts_not_from_the_dealership(
     aside. Idempotent: a receipt set aside is no longer on the booking."""
     from audit_core.uc03_p2_runtime import record_activity
 
+    _mark_pages_as_decided(connection, tenant_id=tenant_id, journey_id=journey_id)
     names = _dealership_names(connection, tenant_id=tenant_id, journey_id=journey_id)
     if not own_words(names):
         return []
@@ -160,11 +187,11 @@ def set_aside_receipts_not_from_the_dealership(
                     """
                     UPDATE auditcore.p2_document_queue
                     SET queue_status = 'SUPPORTING', template_key = :k, display_name = :n, status_reason = :why,
-                        updated_at_utc = now()
+                        type_overridden_by_actor_id = :actor, updated_at_utc = now()
                     WHERE tenant_id = :t AND queue_id = :q
                     """
                 ),
-                {"t": tenant_id, "q": receipt["queue_id"], "k": SUPPORTING, "n": name, "why": why},
+                {"t": tenant_id, "q": receipt["queue_id"], "k": SUPPORTING, "n": name, "why": why, "actor": ACTOR},
             )
         connection.execute(
             text(
