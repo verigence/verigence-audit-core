@@ -74,11 +74,14 @@ jobs:
 
           def headline(report, body):
               if report == "penetration":
+                  acc = body["accessoryItems"]
+                  body = {**body, "_acc": {"basis": {k: acc[k] for k in ("journeysWithInvoice", "lines", "units", "value", "itemsSeen")},
+                                           "top": [(i["label"][:34], i["units"], i["value"]) for i in acc["items"][:8]]}}
                   return {"basis": body["basis"],
                           "network": {k: (c["count"], c["percent"]) for k, c in body["network"]["products"].items()},
                           "outlets": [(r["label"][:28], r["deals"], {k: c["percent"] for k, c in r["products"].items()})
                                       for r in body["outlets"][:14]],
-                          "models": [(r["label"], r["deals"]) for r in body["models"][:12]]}
+                          "models": [(r["label"], r["deals"]) for r in body["models"][:12]], "accessories": body["_acc"]}
               if report == "insurance":
                   return {"basis": body["basis"], "network": body["network"],
                           "agents": [(a["agent"][:30], a["code"], a["policies"], a["premium"]) for a in body["outsideAgents"][:8]],

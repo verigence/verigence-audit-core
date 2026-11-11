@@ -795,7 +795,79 @@ def _penetration_rows(
     return rows
 
 
-def penetration_report(facts: list[dict[str, Any]]) -> dict[str, Any]:
+ACCESSORY_ITEM_LIMIT = 30
+ACCESSORY_MODEL_LIMIT = 10
+
+
+def accessory_lines(connection: Connection, *, tenant_id: str) -> list[dict[str, Any]]:
+    """One row per line of an ACTIVE accessory invoice: what was fitted, how many, for what.
+    A line without a quantity counts as one unit; a line without an amount carries none."""
+    rows = _rows(connection, """
+        SELECT v.journey_id, line.item->>'description_raw' AS label,
+               line.item->>'quantity' AS quantity, line.item->>'net_amount' AS net
+        FROM auditcore.invoice_review_values v
+        JOIN auditcore.evidence e ON e.tenant_id = v.tenant_id AND e.evidence_id = v.source_evidence_id
+             AND e.association_status = 'ACTIVE'
+        CROSS JOIN LATERAL jsonb_array_elements(
+            CASE WHEN jsonb_typeof(v.line_items) = 'array' THEN v.line_items ELSE '[]'::jsonb END) line(item)
+        WHERE v.tenant_id = :t AND upper(trim(COALESCE(v.invoice_purpose, ''))) = 'ACCESSORY'
+    """, t=tenant_id)
+    lines = []
+    for row in rows:
+        label = re.sub(r"\s+", " ", str(row["label"] or "")).strip()
+        if not label:
+            continue
+        quantity = parse_amount(row["quantity"])
+        lines.append({
+            "journeyId": str(row["journey_id"]), "label": label,
+            # A quantity the reader missed, or read wild (a part number in the box), counts as one.
+            "units": quantity if quantity and 0 < quantity <= 1000 else 1.0,
+            "net": parse_amount(row["net"]) or 0.0,
+        })
+    return lines
+
+
+def _accessory_block(facts: list[dict[str, Any]], lines: list[dict[str, Any]]) -> dict[str, Any]:
+    """The accessory items fitted, from the invoices of the facts in scope."""
+    by_journey = {f["journeyId"]: f for f in facts}
+    scoped = [line for line in lines if line["journeyId"] in by_journey]
+    items: dict[str, dict[str, Any]] = {}
+    model_units: Counter[str] = Counter()
+    for line in scoped:
+        fact = by_journey[line["journeyId"]]
+        model = fact["model"] or MODEL_NOT_RESOLVED
+        model_units[model] += line["units"]
+        # One item however its label was spaced or cased on different invoices.
+        label = re.sub(r"\s+", " ", str(line["label"])).strip().upper()
+        item = items.setdefault(label, {
+            "label": label, "lines": 0, "units": 0.0, "value": 0.0,
+            "journeys": set(), "dealers": Counter(), "models": Counter(),
+        })
+        item["lines"] += 1
+        item["units"] += line["units"]
+        item["value"] += line["net"]
+        item["journeys"].add(line["journeyId"])
+        item["dealers"][fact["dealer"] or "Dealership not named"] += line["units"]
+        item["models"][model] += line["units"]
+    top = sorted(items.values(), key=lambda i: (-i["units"], -i["value"]))[:ACCESSORY_ITEM_LIMIT]
+    top_models = [model for model, _units in model_units.most_common(ACCESSORY_MODEL_LIMIT)]
+    return {
+        "journeysWithInvoice": len({line["journeyId"] for line in scoped}),
+        "lines": len(scoped), "units": round(sum(line["units"] for line in scoped)),
+        "value": _rupees(sum(line["net"] for line in scoped)) or 0,
+        "itemsSeen": len(items), "topModels": top_models,
+        "items": [{
+            "label": item["label"], "lines": item["lines"], "units": round(item["units"]),
+            "value": _rupees(item["value"]) or 0, "journeys": len(item["journeys"]),
+            "dealers": {dealer: round(units) for dealer, units in item["dealers"].most_common()},
+            "models": {model: round(units) for model, units in item["models"].items() if model in top_models},
+        } for item in top],
+    }
+
+
+def penetration_report(
+    facts: list[dict[str, Any]], *, invoice_lines: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     deals = [f for f in facts if f["statement"]]
     model_rates: dict[str, dict[str, float]] = {key: {} for key, _l, _h in PRODUCTS}
     by_model: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -819,12 +891,16 @@ def penetration_report(facts: list[dict[str, Any]]) -> dict[str, Any]:
             None),
         "districts": _penetration_rows(
             deals, lambda f: (f["districtKey"] or "-", f["district"] or DISTRICT_NOT_READ, None), model_rates),
+        "accessoryItems": _accessory_block(facts, invoice_lines or []),
         "notes": [
             ("A statement deal is a live Journey whose account statement (NDC) or Tally customer ledger is on "
             "file. Every percentage is of statement deals."),
             ("Expected is what the group would sell at the network's rate for each of its models, so a "
             "commercial-vehicle outlet is not measured against an SUV outlet. Gap is actual minus expected."),
             f"A group with fewer than {THIN_SAMPLE} statement deals is marked: its rate moves a lot with one deal.",
+            ("The accessory items are read from the accessory tax invoices on file (live bookings, current "
+             "documents), item by item: units, and the net rupees on the invoice lines. A line without a "
+             "readable quantity counts as one unit."),
         ],
     }
 
@@ -1865,7 +1941,7 @@ def build_insight(
         load_facts(connection, tenant_id=tenant_id), outlet_ids=None if wide else in_scope,
         dealer_id=dealer_id, outlet_id=outlet_id, first=first, last=last)
     if report == "penetration":
-        body = penetration_report(facts)
+        body = penetration_report(facts, invoice_lines=accessory_lines(connection, tenant_id=tenant_id))
     elif report == "insurance":
         body = insurance_report(facts, today=now.date())
     elif report == "scrappage":
