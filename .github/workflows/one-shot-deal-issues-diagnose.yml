@@ -66,6 +66,7 @@ jobs:
           PYTHONPATH=src python tools/diagnose/deal_issues.py > /tmp/deal-rows.txt
           wc -c /tmp/deal-rows.txt
           grep -c '^DEALROW' /tmp/deal-rows.txt || true
+          cat /tmp/deal-rows.txt
           gzip -9 /tmp/deal-rows.txt
 
       - uses: actions/upload-artifact@v4
