@@ -44,7 +44,8 @@ Insurance -- Dealership or Self
 ``refresh`` writes ``auditcore.journey_classifications`` on every recompute of a
 Journey (the worker's rule pass) and after a Team Lead's or PC's own decision.
 ``run_journey_classification`` (p2_worker_jobs kind JOURNEY_CLASSIFICATION) fills
-every Journey already on file: a DRY RUN unless the tag ends with "-commit".
+every Journey already on file, and corrects its vehicle record's VIN
+(``correct_vehicle_record``): a DRY RUN unless the tag ends with "-commit".
 """
 from __future__ import annotations
 
@@ -146,6 +147,69 @@ def decide_deal_type(
         return {**out, "deal_type": OUTSCOPE,
                 "deal_type_basis": f"{made} ({MAX_VEHICLE_AGE_DAYS} days or more). {booked}."}
     return {**out, "deal_type_basis": f"{booked}. {made} (under {MAX_VEHICLE_AGE_DAYS} days)."}
+
+
+# Papers that can be about the customer's OLD vehicle (an exchange or scrappage deal).
+_OLD_VEHICLE_DOCUMENT_TYPES = ("vehicle_rc", "valuation_report", "transfer_letter",
+                               "scrappage_certificate_of_deposit")
+
+
+def journey_vin(connection: Connection, *, tenant_id: str, journey_id: UUID, today: date | None = None) -> str | None:
+    """The Journey's VIN: the one a person entered, else the one most of the sale's own
+    documents agree on (``agreed_vin``). None when neither gives a 17-character VIN."""
+    params = {"t": tenant_id, "j": journey_id}
+    entered = next((v for v in (clean_vin(x) for x in connection.execute(
+        text(_ENTERED_VIN_SQL), params).scalars().all()) if v is not None), None)
+    return entered or agreed_vin(
+        [(r["document_type_key"], r["di_document_id"], r["value"]) for r in connection.execute(
+            text(_DOCUMENT_VIN_SQL), {**params, "types": list(_SALE_DOCUMENT_TYPES)}).mappings().all()],
+        today=today)
+
+
+def correct_vehicle_record(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                           apply: bool = True) -> dict[str, Any] | None:
+    """Bring the Journey's vehicle record (the VIN / chassis number Journey 360 and the VIN
+    checks read) in line with ``journey_vin``. The record keeps the first value it was
+    given, so a misread copy or the old vehicle's RC stayed on it for good (2026-11-11).
+
+    * A VIN is known: it is the record's VIN; a chassis number that is another 17-character
+      number, or a short one that is not the VIN's own ending, becomes the VIN too.
+    * No VIN is known: a value the record holds that was read from an old-vehicle paper
+      (an RC, valuation report, transfer letter, scrappage certificate) is taken off.
+
+    Returns what changed (``apply=False``: what would), or None when nothing does."""
+    params = {"t": tenant_id, "j": journey_id}
+    record = connection.execute(
+        text("SELECT vin, chassis_number FROM auditcore.vehicle_records WHERE tenant_id=:t AND journey_id=:j "
+             + ("FOR UPDATE" if apply else "")), params).mappings().first()
+    if record is None:
+        return None
+    vin = journey_vin(connection, tenant_id=tenant_id, journey_id=journey_id)
+    new_vin, new_chassis = record["vin"], record["chassis_number"]
+    if vin is not None:
+        new_vin = vin
+        chassis = re.sub(r"[^A-Z0-9]", "", str(record["chassis_number"] or "").upper())
+        if not chassis or (len(chassis) >= 17 and chassis != vin) or (len(chassis) < 17 and not vin.endswith(chassis)):
+            new_chassis = vin
+    else:
+        old_vehicle = {clean_vin(v) for v in connection.execute(
+            text(_DOCUMENT_VIN_SQL), {**params, "types": list(_OLD_VEHICLE_DOCUMENT_TYPES)},
+        ).mappings().all() for v in [v["value"]]} - {None}
+        if clean_vin(record["vin"]) in old_vehicle:
+            new_vin = None
+        if clean_vin(record["chassis_number"]) in old_vehicle:
+            new_chassis = None
+    if (new_vin, new_chassis) == (record["vin"], record["chassis_number"]):
+        return None
+    change = {"vin": {"from": record["vin"], "to": new_vin},
+              "chassisNumber": {"from": record["chassis_number"], "to": new_chassis}}
+    if apply:
+        connection.execute(
+            text("UPDATE auditcore.vehicle_records SET vin=:vin, chassis_number=:chassis, updated_at_utc=now(), "
+                 "version_no=version_no+1 WHERE tenant_id=:t AND journey_id=:j"),
+            {**params, "vin": new_vin, "chassis": new_chassis})
+        logger.info("vehicle_record_vin_corrected", tenant_id=tenant_id, journey_id=str(journey_id), **change)
+    return change
 
 
 def _usable(value: Any, *, floor: date | None, today: date) -> date | None:
@@ -254,12 +318,7 @@ def _vehicle_age_inputs(connection: Connection, *, tenant_id: str, journey_id: U
     from audit_core.uc03_p2_dates import programme_date_floor
 
     params = {"t": tenant_id, "j": journey_id}
-    entered = next((v for v in (clean_vin(x) for x in connection.execute(
-        text(_ENTERED_VIN_SQL), params).scalars().all()) if v is not None), None)
-    vin = entered or agreed_vin(
-        [(r["document_type_key"], r["di_document_id"], r["value"]) for r in connection.execute(
-            text(_DOCUMENT_VIN_SQL), {**params, "types": list(_SALE_DOCUMENT_TYPES)}).mappings().all()],
-        today=today)
+    vin = journey_vin(connection, tenant_id=tenant_id, journey_id=journey_id, today=today)
     floor = programme_date_floor()
     reference: tuple[date | None, str | None] = (None, None)
     for kind, sql in (("invoice", _INVOICE_DATE_SQL), ("delivery", _DELIVERY_DATE_SQL)):
@@ -630,6 +689,8 @@ def run_journey_classification(engine: Engine, tag: str, tenant_ids: list[str]) 
             try:
                 with engine.begin() as connection:
                     set_tenant_context(connection, tenant_id)
+                    corrected = correct_vehicle_record(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                                       apply=commit)
                     facts = (refresh if commit else classify)(connection, tenant_id=tenant_id, journey_id=journey_id)
             except Exception:
                 count("failed")
@@ -641,6 +702,10 @@ def run_journey_classification(engine: Engine, tag: str, tenant_ids: list[str]) 
             count(f"insurance_{str(facts['insurance_type']).lower()}_{str(facts['insurance_decided_by']).lower()}")
             if facts.get("changed"):
                 count("written")
+            if corrected is not None:
+                count("vehicle_record_corrected")
+                if len(report.setdefault("vehicleRecords", [])) < 300:
+                    report["vehicleRecords"].append({"journey": journey["journey_reference"], **corrected})
         report["tenants"][tenant_id] = {"journeys": len(journeys), **dict(sorted(counts.items()))}
         logger.info("journey_classification_finished", tag=tag, tenant_id=tenant_id, commit=commit,
                     journeys=len(journeys), **dict(sorted(counts.items())))

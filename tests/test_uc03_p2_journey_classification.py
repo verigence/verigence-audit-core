@@ -251,3 +251,55 @@ def test_one_deal_type_for_several_journeys_in_one_go(engine) -> None:
     assert (row["deal_type"], row["deal_type_decided_by"], row["tl_set_by_role"]) == ("BULK", "TL", "REVIEWER")
     # The system's own task for the Journey is answered with it.
     assert _task(journey)["task_status"] == "VERIFIED_COMPLETE"
+
+
+def _record(journey):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return connection.execute(
+            text("SELECT vin, chassis_number FROM auditcore.vehicle_records WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": journey.tenant_id, "j": journey.journey_id}).one()
+
+
+def _put_record(journey, vin, chassis) -> None:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.vehicle_records (tenant_id, journey_id, vin, chassis_number, source_kind) "
+                 "VALUES (:t, :j, :v, :c, 'EVIDENCE')"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "v": vin, "c": chassis})
+
+
+def test_vehicle_record_follows_the_vin_the_sale_documents_agree_on(engine) -> None:
+    # A misread copy on the record; the policy and the RTO challan agree on the VIN.
+    journey = create_p2_journey(engine, prefix="clsrec")
+    _put_record(journey, "MA1NA2XZTK6K57070", "T6K57070")
+    add_ready_document(journey, "customer_invoice_dms", vin_number="MA1NA2XZTK6K57070")
+    add_ready_document(journey, "insurance_cover", chassis_number="MA1NA2XZXT6K57070")
+    add_ready_document(journey, "rto_challan", chassis_number="MA1NA2XZXT6K57070")
+    assert _run(journey, rule.correct_vehicle_record, apply=False) is not None
+    assert tuple(_record(journey)) == ("MA1NA2XZTK6K57070", "T6K57070")  # a dry run writes nothing
+    change = _run(journey, rule.correct_vehicle_record)
+    assert change["vin"] == {"from": "MA1NA2XZTK6K57070", "to": "MA1NA2XZXT6K57070"}
+    # The short chassis number is the VIN's own ending: kept.
+    assert tuple(_record(journey)) == ("MA1NA2XZXT6K57070", "T6K57070")
+    assert _run(journey, rule.correct_vehicle_record) is None
+
+
+def test_vehicle_record_drops_the_old_vehicles_chassis(engine) -> None:
+    # Only the customer's old car's RC names a chassis number: it is not this sale's vehicle.
+    journey = create_p2_journey(engine, prefix="clsold")
+    _put_record(journey, None, "MA1ZP2TAKE2C61179")
+    add_ready_document(journey, "vehicle_rc", chassis_number="MA1ZP2TAKE2C61179")
+    _run(journey, rule.correct_vehicle_record)
+    assert tuple(_record(journey)) == (None, None)
+    assert _run(journey, rule.refresh)["deal_type"] is None
+
+    # The RC over the sale's own documents: the record takes the sale's VIN.
+    other = create_p2_journey(engine, prefix="clsrc")
+    _put_record(other, "73722535", "MA1XL2TVXS6H24533")
+    add_ready_document(other, "vehicle_rc", chassis_number="MA1XL2TVXS6H24533")
+    add_ready_document(other, "customer_invoice_dms", chassis_number="MA1XL2TVXT5J30535")
+    add_ready_document(other, "insurance_cover", chassis_number="MA1XL2TVXT5J30535")
+    _run(other, rule.correct_vehicle_record)
+    assert tuple(_record(other)) == ("MA1XL2TVXT5J30535", "MA1XL2TVXT5J30535")
