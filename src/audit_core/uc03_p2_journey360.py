@@ -2017,7 +2017,17 @@ def _discount_applications(connection: Connection, params: dict[str, Any]) -> li
             """
             SELECT da.discount_key, da.standard_eligible_amount, da.actual_discount_amount,
                    da.eligibility_result, da.evidence_status, da.actual_source_kind, da.discount_scheme_version_id,
-                   da.details->>'potentialAmount' AS potential_amount, da.details->'grid'->>'buffer' AS grid_buffer,
+                   -- What the reconciliation last worked out. On a row an invoice or the account
+                   -- statement owns it is kept under "reconciliation" (_write_discount_row); the
+                   -- top-level copy there is whatever an earlier run left, possibly another month's
+                   -- grid (live 2026-11-11: 18 such rows named the first September grid on October
+                   -- deals, and 9 unclaimed ones had no top-level grid at all).
+                   CASE WHEN da.details->'reconciliation' IS NOT NULL
+                        THEN da.details->'reconciliation'->>'potentialAmount'
+                        ELSE da.details->>'potentialAmount' END AS potential_amount,
+                   CASE WHEN da.details->'reconciliation' IS NOT NULL
+                        THEN da.details->'reconciliation'->'grid'->>'buffer'
+                        ELSE da.details->'grid'->>'buffer' END AS grid_buffer,
                    ds.scheme_code, ds.scheme_name, ds.scheme_category,
                    dsv.version_no AS scheme_version, dsv.effective_from, dsv.effective_to,
                    dsv.combinability_code

@@ -320,3 +320,20 @@ def test_the_export_carries_the_policy_number_and_the_add_on_covers() -> None:
     assert row["Insurance Add-ons"] == "Zero Depreciation, RSA"
     assert identity_row({}, deal=_export_deal(), vehicle={}, customer={})["Insurance Policy No"] is None
     assert columns()[-3:] == ["Insurance Policy No", "Insurance Add-ons", "Accessories Add-on"]
+
+
+def test_the_buffer_is_the_one_the_reconciliation_last_worked_out_not_an_earlier_month_s(journey) -> None:
+    """A row the account statement owns keeps the reconciliation's figures under
+    "reconciliation"; its top-level grid is what an earlier run left (live: the
+    first September grid on an October deal)."""
+    _statement(journey, _without(UTKAL, "Other Discount (if any)"))
+    _standard(journey, "ex_showroom_price", "1039000")
+    _sql(journey, "INSERT INTO auditcore.discount_applications (tenant_id, journey_id, discount_key, "
+                  "standard_eligible_amount, eligibility_result, actual_source_kind, details) "
+                  "VALUES (:t, :j, 'ADDITIONAL_DISCOUNT', NULL, 'ELIGIBLE_UNCLAIMED', 'EVIDENCE', CAST(:d AS jsonb))",
+         d=json.dumps({"origin": "ACCOUNT_STATEMENT", "potentialAmount": "7000.00",
+                       "grid": {"buffer": "7000.00", "gridVersionNo": 1},
+                       "reconciliation": {"potentialAmount": "5000.00", "informational": True,
+                                          "grid": {"buffer": "5000.00", "gridVersionNo": 5, "tier": "BASE"}}}))
+    row = _benefit(_deal(journey), "ADDITIONAL_DISCOUNT")
+    assert D(row["entitled"]) == D(5000) and D(row["potential"]) == D(5000)
