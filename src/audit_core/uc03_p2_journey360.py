@@ -3791,7 +3791,9 @@ def _taken_addons(
         },
         "insurance": {
             "insurerName": insurance_row.get("insurer_name") or cover_fields.get("insurer_name"),
-            "policyNumber": insurance_row.get("policy_reference") or cover_fields.get("policy_number"),
+            # The policy on file as it reads now (a correction or a re-read included) before the
+            # stored record: live 2026-11-11, 21 of 601 records still held an earlier reading.
+            "policyNumber": cover_fields.get("policy_number") or insurance_row.get("policy_reference"),
             "policyType": cover_fields.get("policy_type"),
             "coverNoteReference": insurance_row.get("cover_note_reference"),
             # The Deal's decision, not one reading's field (2026-11-03).
