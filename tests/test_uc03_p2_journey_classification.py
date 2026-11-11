@@ -208,3 +208,28 @@ def test_team_lead_is_asked_in_delivery_and_their_answer_wins(engine) -> None:
     _run(journey, rule.set_tl_deal_type, deal_type=None, reason="set by mistake", actor_id=journey.actor_id,
          role="TL", correlation_id=None)
     assert _stored(journey)["deal_type"] is None
+
+
+def test_one_deal_type_for_several_journeys_in_one_go(engine) -> None:
+    journey = create_p2_journey(engine, prefix="clsmany")
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="supporting_document", process_area="DELIVERY")
+    _run(journey, rule.sync_classification)
+    assert _task(journey)["task_status"] not in ("VERIFIED_COMPLETE", "CANCELLED")
+    outside = uuid4()  # not a Journey of this Project: refused, nothing changed
+
+    def bulk(actor_id: str):
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            return rule.set_deal_type_for_many(
+                connection, tenant_id=journey.tenant_id, journey_ids=[journey.journey_id, outside, journey.journey_id],
+                deal_type="BULK", reason="fleet order of 12 vehicles", actor_id=actor_id, role="REVIEWER",
+                correlation_id=None)
+
+    # Someone with no Dealership / Outlet of the Journey: refused.
+    assert bulk("someone-else")["updated"] == []
+    result = bulk(journey.actor_id)
+    assert [u["dealType"] for u in result["updated"]] == ["BULK"] and result["refused"] == [str(outside)]
+    row = _stored(journey)
+    assert (row["deal_type"], row["deal_type_decided_by"], row["tl_set_by_role"]) == ("BULK", "TL", "REVIEWER")
+    # The system's own task for the Journey is answered with it.
+    assert _task(journey)["task_status"] == "VERIFIED_COMPLETE"

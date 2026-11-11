@@ -2,10 +2,12 @@
 one stored copy (product owner 2026-11-11).
 
 Deal Type -- Inscope, Outscope, MR, Lease or Bulk
-    * The Team Lead's call wins over the rule below ("TL task will hold precedence"):
-      MR, Lease and Bulk are theirs alone, and they can also settle Inscope / Outscope
-      (``set_tl_deal_type``, from Journey 360 or the DEAL_TYPE_CONFIRM task). A Journey
-      the Team Lead opted into the Management Referral discount is MR as well.
+    * The Team Lead's (or Reviewer's) call wins over the rule below ("TL task will hold
+      precedence"): MR, Lease and Bulk are theirs alone, and they can also settle
+      Inscope / Outscope -- for one Journey (``set_tl_deal_type``: Journey 360 or the
+      DEAL_TYPE_CONFIRM task) or for several found by customer name or mobile number in
+      one go (``set_deal_type_for_many``: a bulk order is many Journeys). A Journey the
+      Team Lead opted into the Management Referral discount is MR as well.
     * Inscope: the booking date is on or after 1 Sep 2026 AND the vehicle is less than
       90 days old. Outscope: booked before 1 Sep 2026, or the vehicle is 90 days old or
       more.
@@ -500,10 +502,63 @@ def set_tl_deal_type(connection: Connection, *, tenant_id: str, journey_id: UUID
         subject_type="JOURNEY", subject_id=str(journey_id),
         details={"dealType": deal_type or "RULE", "reason": reason, "role": role}, correlation_id=correlation_id,
     )
-    refresh(connection, tenant_id=tenant_id, journey_id=journey_id)
+    facts = refresh(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if facts["deal_type"] is not None:
+        # The system's own question for this Journey is answered with it.
+        from audit_core.uc03_p2_task_producer import resolve_if_open
+
+        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=_dedupe_key(journey_id),
+                        evidence={"dealType": facts["deal_type"], "decidedBy": "TL", "setBy": actor_id,
+                                  "role": role, "reason": reason,
+                                  "verifiedAt": datetime.now().astimezone().isoformat()})
     note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id, reason="DEAL_TYPE_SET",
                        correlation_id=correlation_id)
     return view(connection, tenant_id=tenant_id, journey_id=journey_id)
+
+
+# Who may set a Deal Type: the Team Lead (and Project Manager), and the Reviewer
+# (product owner 2026-11-11: "TL or reviewer should be able to do this").
+DEAL_TYPE_ROLES = ("TL", "PM", "REVIEWER")
+MAX_JOURNEYS_AT_ONCE = 200
+
+
+def journeys_in_scope(connection: Connection, *, tenant_id: str, actor_id: str, journey_ids: list[UUID]) -> set[str]:
+    """Those of ``journey_ids`` inside the actor's Dealerships / Outlets, by the same
+    assignment test the journey list uses (uc03_p2_journey_views)."""
+    return {str(v) for v in connection.execute(
+        text(
+            """
+            SELECT j.journey_id FROM auditcore.journeys j
+            WHERE j.tenant_id=:t AND j.journey_id = ANY(CAST(:ids AS uuid[]))
+              AND EXISTS (
+                SELECT 1 FROM auditcore.business_assignments ba
+                WHERE ba.tenant_id = j.tenant_id AND ba.security_actor_id = :actor
+                  AND ba.assignment_status = 'ACTIVE' AND ba.effective_from <= now()
+                  AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                  AND (ba.dealer_id IS NULL
+                       OR (ba.dealer_id = j.dealer_id AND (ba.outlet_id IS NULL OR ba.outlet_id = j.outlet_id))))
+            """
+        ),
+        {"t": tenant_id, "actor": actor_id, "ids": [str(i) for i in journey_ids]},
+    ).scalars().all()}
+
+
+def set_deal_type_for_many(connection: Connection, *, tenant_id: str, journey_ids: list[UUID], deal_type: str | None,
+                           reason: str, actor_id: str, role: str, correlation_id: str | None) -> dict[str, Any]:
+    """One Deal Type for several Journeys in one go (a bulk or lease order is many
+    Journeys; product owner 2026-11-11). Journeys outside the actor's scope are
+    refused, by id, and nothing is changed for them."""
+    wanted = list(dict.fromkeys(journey_ids))
+    allowed = journeys_in_scope(connection, tenant_id=tenant_id, actor_id=actor_id, journey_ids=wanted)
+    updated: list[dict[str, Any]] = []
+    for journey_id in wanted:
+        if str(journey_id) not in allowed:
+            continue
+        shown = set_tl_deal_type(connection, tenant_id=tenant_id, journey_id=journey_id, deal_type=deal_type,
+                                 reason=reason, actor_id=actor_id, role=role, correlation_id=correlation_id)
+        updated.append({"journeyId": str(journey_id), "dealType": shown["dealType"],
+                        "dealTypeLabel": shown["dealTypeLabel"]})
+    return {"updated": updated, "refused": [str(i) for i in wanted if str(i) not in allowed]}
 
 
 # ── every Journey already on file ────────────────────────────────────────────
