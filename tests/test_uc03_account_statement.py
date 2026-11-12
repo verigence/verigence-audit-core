@@ -1226,3 +1226,62 @@ def test_a_figure_the_ndc_no_longer_gives_on_a_re_read_stops_counting(journey) -
             {"v": json.dumps(UTKAL_NDC), "t": journey.tenant_id, "j": journey.journey_id, "d": document_id})
     _sync(journey)
     assert statement_rows()["insurance_amount"] == D(40825)
+
+
+def test_a_bare_word_where_a_figure_belongs_does_not_lose_the_statement() -> None:
+    """2026-11-12: "credit_amount": No confidence made the whole NDC unparseable, so none of
+    its rows -- its "Vehicle cost" among them -- was read."""
+    raw = ('[{"particulars_raw": "Vehicle cost", "debit_amount": 1091500, "pageNo": 1}, '
+           '{"particulars_raw": "FINANCE D/O", "credit_amount": No confidence, "pageNo": 1}, '
+           '{"particulars_raw": "Accessories", "debit_amount": NOT Taken}, '
+           '{"particulars_raw": "MR NO", "voucher_number": "RPM00418", "credit_amount": Not mentioned}]')
+    rows = module.line_rows(raw)
+    assert [r["particulars_raw"] for r in rows] == ["Vehicle cost", "FINANCE D/O", "Accessories", "MR NO"]
+    assert rows[0]["debit_amount"] == 1091500 and rows[1]["credit_amount"] is None and rows[2]["debit_amount"] is None
+    # Well-formed JSON and the older Python repr are read as before; nonsense is still no rows.
+    assert module.line_rows('[{"particulars_raw": "TCS", "debit_amount": 10915, "paid": true}]')[0]["paid"] is True
+    assert module.line_rows("[{'particulars_raw': 'TCS', 'debit_amount': None}]")[0]["debit_amount"] is None
+    assert module.line_rows("0") == [] and module.line_rows("not a statement") == []
+
+
+def test_the_figures_of_an_ndc_that_could_not_be_read_are_kept(journey) -> None:
+    """A failed reading says nothing about what the paper prints (2026-11-12: four NDCs whose
+    rows did not parse had every figure withdrawn, their vehicle price included)."""
+    from audit_core.uc03_deal_source_history import active_source_rows
+
+    def statement_rows() -> dict[str, D]:
+        with journey.engine.begin() as c:
+            set_tenant_context(c, journey.tenant_id)
+            return {r["component_key"]: r["amount"] for r in active_source_rows(
+                c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+                if r["source_document_type"] == "customer_ledger" and r["line_kind"] == "COMMERCIAL"}
+
+    def set_lines(document_id, value: str) -> None:
+        with journey.engine.begin() as c:
+            set_tenant_context(c, journey.tenant_id)
+            c.execute(
+                text("UPDATE auditcore.journey_document_extracted_fields "
+                     "SET extracted_value=to_jsonb(CAST(:v AS text)), effective_value=to_jsonb(CAST(:v AS text)) "
+                     "WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d AND field_key='line_items'"),
+                {"v": value, "t": journey.tenant_id, "j": journey.journey_id, "d": document_id})
+
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    document_id, _ = _ledger(journey, UTKAL_NDC)
+    _sync(journey)
+    before = statement_rows()
+    assert before["ex_showroom_price"] == D(999899)
+
+    # The document is read again and nothing of it parses.
+    set_lines(document_id, '[{"particulars_raw": "Ex Showroom", "debit_amount": 999899, {{{ broken')
+    assert _sync(journey)["sourceValuesWithdrawn"] == 0
+    assert statement_rows() == before
+
+    # Figures taken from it while it was unread (as on 2026-11-12) come back.
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("UPDATE auditcore.commercial_line_source_values SET withdrawn_at_utc=now() "
+                       "WHERE tenant_id=:t AND journey_id=:j AND source_document_type='customer_ledger'"),
+                  {"t": journey.tenant_id, "j": journey.journey_id})
+    assert statement_rows() == {}
+    _sync(journey)
+    assert statement_rows() == before

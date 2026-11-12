@@ -105,18 +105,32 @@ def _amount(value: Any) -> Decimal | None:
         return None
 
 
+# A value DI wrote as bare words where a number belongs ("credit_amount": No confidence,
+# "debit_amount": NOT Taken): not JSON, so the whole statement failed to parse and none of
+# its rows was read (2026-11-12: UTK-SR-261106-002, UTK-SU-261019-001, UTK-SU-261020-004 --
+# each prints its "Vehicle cost" row). The bare words mean "no figure": null.
+_BARE_VALUE = re.compile(r'(":\s*)(?!(?:true|false|null|None|True|False)\b)([A-Za-z][A-Za-z ./\-]*?)(\s*[,}\]])')
+
+
 def line_rows(value: Any) -> list[dict[str, Any]]:
     """The statement's line items as a list of dicts, whatever shape DI stored
-    them in (JSON, or the Python repr older extractions left behind)."""
+    them in (JSON, or the Python repr older extractions left behind). A row's
+    value written as bare words is read as no figure, so one such value does
+    not lose the whole statement."""
     raw = value
     if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except (ValueError, TypeError):
+        for text_value in (raw, _BARE_VALUE.sub(r"\1null\3", raw)):
             try:
-                raw = ast.literal_eval(raw)
-            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
-                return []
+                raw = json.loads(text_value)
+                break
+            except (ValueError, TypeError):
+                try:
+                    raw = ast.literal_eval(text_value.replace(": null", ": None"))
+                    break
+                except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                    continue
+        else:
+            return []
     return [row for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
 
 
@@ -1542,7 +1556,7 @@ def _latest(tallies: list[tuple[dict[str, Any], list[dict[str, Any]]]]) -> dict[
 
 def _record_tally_lines(
     connection: Connection, *, tenant_id: str, journey_id: UUID,
-    tallies: list[tuple[dict[str, Any], list[dict[str, Any]]]],
+    tallies: list[tuple[dict[str, Any], list[dict[str, Any]]]], unread: bool = False,
 ) -> int:
     """One row per line, under no document id (the ledger's pages are read
     together), tied to the newest page's evidence: a re-read overwrites it,
@@ -1567,9 +1581,12 @@ def _record_tally_lines(
                     document_id=None,
                 )
                 reported.add((kind, key, None))
-    # A line the ledger gave on an earlier reading and no longer gives stops counting.
+    # A line the ledger gave on an earlier reading and no longer gives stops counting --
+    # unless a ledger page on file could not be read at all (``unread``): a failed reading
+    # says nothing about what the ledger prints, so its earlier lines stand.
     withdraw_unreported(connection, tenant_id=tenant_id, journey_id=journey_id,
-                        source_document_type=TALLY_LEDGER_TYPE, reported=reported)
+                        source_document_type=TALLY_LEDGER_TYPE, reported=reported,
+                        keep_all=unread and not reported)
     return len(reported)
 
 
@@ -1708,6 +1725,11 @@ def sync_account_statement(
 
     documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
     parsed = [(d, line_rows(d["fields"].get("line_items"))) for d in documents]
+    # A ledger document on file none of whose rows was read (the reading failed, or DI read
+    # only its printed totals): it says nothing about what the paper prints, so the figures
+    # an earlier reading of it gave are kept, never withdrawn (2026-11-12: four NDCs whose
+    # rows did not parse lost every figure, their "Vehicle cost" included).
+    unread_documents = {str(d["documentId"]) for d, rows in parsed if not rows}
     parsed = [(d, rows, statement_kind(rows)) for d, rows in parsed]
     forms = [(d, rows) for d, rows, kind in parsed if kind == KIND_FORM]
     tallies = [(d, rows) for d, rows, kind in parsed if kind == KIND_TALLY]
@@ -1781,7 +1803,8 @@ def sync_account_statement(
     # The customer ledger's own charges and credit-note benefits, recorded for
     # the Deal under their own name: below the NDC and the cost sheet, above
     # the invoices (product owner 2026-11-02). Rewritten on every sync.
-    tally_lines = _record_tally_lines(connection, tenant_id=tenant_id, journey_id=journey_id, tallies=tallies)
+    tally_lines = _record_tally_lines(connection, tenant_id=tenant_id, journey_id=journey_id, tallies=tallies,
+                                      unread=bool(unread_documents))
 
     # The cost sheet: its lines are recorded for the Deal (shown as the cost
     # sheet's, standing in the billed column only when no NDC is on file -- see
@@ -1801,9 +1824,18 @@ def sync_account_statement(
     # A figure the NDC, the settlement printout or the cost sheet gave on an earlier reading
     # and no longer gives stops counting (SHI-SS-261027-024: a re-read NDC with no insurance
     # row kept "insurance Rs 82,000" in the Deal and the insurance in-house).
+    # A cost sheet copy on file that gave no line at all on this reading is unread too.
+    unread_sheets = {str(d["documentId"]) for d in sheets if not read_cost_sheet(d["fields"]).components}
+    keep = {
+        ACCOUNT_STATEMENT_TYPE: (unread_documents, False),
+        # The settlement printout is a ledger document: with one on file unread and no
+        # settlement figure this pass, its earlier figures stand.
+        SETTLEMENT_SOURCE_TYPE: (unread_documents, bool(unread_documents) and not reported[SETTLEMENT_SOURCE_TYPE]),
+        COST_SHEET_TYPE: (unread_sheets, False),
+    }
     withdrawn = sum(
         withdraw_unreported(connection, tenant_id=tenant_id, journey_id=journey_id, source_document_type=source_type,
-                            reported=keys)
+                            reported=keys, keep_documents=keep[source_type][0], keep_all=keep[source_type][1])
         for source_type, keys in reported.items())
     differences = (cost_sheet_differences(statement, document["fields"], sheet)
                    if statement is not None and document is not None and sheet is not None else [])
