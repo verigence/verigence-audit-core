@@ -502,7 +502,28 @@ def test_trade_in_resale_window_and_loss(journey):
 # ------------------------------------------------------------------ accessories
 
 
+def _accessories_check(journey, enabled: bool) -> None:
+    _sql(journey, "INSERT INTO auditcore.tenant_rule_config (tenant_id, accessories_fitted_check_enabled) "
+                  "VALUES (:t, :e) ON CONFLICT (tenant_id) DO UPDATE "
+                  "SET accessories_fitted_check_enabled=EXCLUDED.accessories_fitted_check_enabled", e=enabled)
+
+
+def test_accessories_fitted_is_not_asked_while_the_project_has_it_switched_off(journey):
+    """Product owner 2026-11-12: "lets remove the tasks for accessories fitted are billed,
+    we may introduce it later". Off by default; the Project's switch brings it back."""
+    _deliver(journey, TODAY - timedelta(days=1))
+    result = _run(journey, "DELIVERY")
+    assert result["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "PASS"
+    assert "switched off" in result["ACCESSORIES_FITTED_UNCONFIRMED"].reason
+    assert result["ACCESSORY_FITTED_UNBILLED"].outcome == "SKIPPED"
+    _accessories_check(journey, True)
+    assert _run(journey, "DELIVERY")["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "FAIL"
+    _accessories_check(journey, False)
+    assert _run(journey, "DELIVERY")["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "PASS"
+
+
 def test_accessories_fitted_is_asked_once_the_car_is_delivered(journey):
+    _accessories_check(journey, True)
     assert _run(journey, "DELIVERY")["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "SKIPPED"
     _deliver(journey, TODAY - timedelta(days=1))
     asked = _run(journey, "DELIVERY")["ACCESSORIES_FITTED_UNCONFIRMED"]
@@ -748,77 +769,27 @@ def test_a_broken_rule_is_reported_and_the_other_rules_still_run(journey, monkey
 # ------------------------------------------------------ insurance invoice
 
 
-def test_insurance_invoice_is_asked_for_once_the_vehicle_is_invoiced(journey):
-    """Decision 2026-09-30: an invoiced vehicle with no insurance invoice is
-    a HIGH task for the PC (upload it first; or admit self insurance)."""
+def test_insurance_invoice_is_optional_and_never_asked_for(journey):
+    """Product owner 2026-11-12: the insurance invoice is optional. Through the dealership
+    the premium on the NDC shows it; for a customer's own insurance only the cover note is
+    needed. An invoiced vehicle with nothing billing the premium raises no task (decision
+    2026-09-30 withdrawn)."""
     _start_delivery(journey)
     assert _run(journey, "BOOKING")["INSURANCE_INVOICE_MISSING"].outcome == "PASS"
     add_ready_document(journey, "tax_invoice_tally", invoice_number="INV-1")
     _evaluate(journey, "NATIVE:BOOKING")
-    assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "FAIL"
-    task = _task(journey, "INSURANCE_INVOICE_MISSING")
-    assert task["task_type"] == "PC_CONFIRMATION" and task["assigned_role_code"] == "PC"
-    # The ask is the insurance cover note, not a debit note: a dealer-
-    # arranged policy produces a cover note, while a debit note is a
-    # commercial instrument the dealership may never raise.
-    assert task["reference"]["uploadFirst"] is True and task["reference"]["documentTypes"] == ["insurance_cover"]
-    assert [a["value"] for a in task["reference"]["answers"]] == ["SELF"]
-    priority = _sql(journey, "SELECT priority FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_id=:k",
-                    k=task["task_id"]).scalar_one()
-    assert priority == "HIGH"
-    assert _states(journey)["SELF_INSURANCE_DECLARED"]["control_status"] == "PASS"
+    state = _states(journey)["INSURANCE_INVOICE_MISSING"]
+    assert state["control_status"] == "PASS" and "optional" in state["status_reason"]
+    assert _task(journey, "INSURANCE_INVOICE_MISSING") is None
 
-    _source(journey, "COMMERCIAL", "insurance_amount", "debit_note", "40000")
-    _evaluate(journey, "NATIVE:BOOKING")
-    assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "PASS"
-    assert _task(journey, "INSURANCE_INVOICE_MISSING")["task_status"] == "VERIFIED_COMPLETE"
-
-
-def test_insurance_cover_note_premium_closes_the_insurance_invoice_rule(journey):
-    """The cover note is what a dealer-arranged policy produces, so a cover
-    note stating the premium accounts for it.
-
-    `_INVOICE_TYPES` carries `debit_note` but not `insurance_cover`, so the
-    rule could previously only ever be closed by a debit note -- a
-    commercial instrument the dealership may never raise -- while the
-    document the PC actually holds did nothing. The ask and the way to
-    satisfy it are now the same document."""
-    _start_delivery(journey)
-    add_ready_document(journey, "tax_invoice_tally", invoice_number="INV-1")
-    _evaluate(journey, "NATIVE:BOOKING")
-    assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "FAIL"
-
-    add_ready_document(journey, "insurance_cover", premium_amount="40000")
-    _evaluate(journey, "NATIVE:BOOKING")
-    assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "PASS"
-    assert _task(journey, "INSURANCE_INVOICE_MISSING")["task_status"] == "VERIFIED_COMPLETE"
-
-
-def test_cover_note_without_a_premium_does_not_account_for_it(journey):
-    """Evidence of an accounted premium, not of an upload: a cover note that
-    carries no premium figure leaves the rule failing."""
-    add_ready_document(journey, "tax_invoice_tally", invoice_number="INV-1")
+    # A cover note with no premium figure, or a premium on a debit note: still nothing asked.
     add_ready_document(journey, "insurance_cover", policy_number="POL-9")
     _evaluate(journey, "NATIVE:BOOKING")
-    assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "FAIL"
-
-
-def test_self_insurance_admission_drops_the_premium_and_flags_the_team_lead(journey):
-    _start_delivery(journey)
-    add_ready_document(journey, "tax_invoice_tally", invoice_number="INV-1")
+    assert _states(journey)["INSURANCE_INVOICE_MISSING"]["control_status"] == "PASS"
+    _source(journey, "COMMERCIAL", "insurance_amount", "debit_note", "40000")
     _evaluate(journey, "NATIVE:BOOKING")
-    _answer(journey, "INSURANCE_INVOICE_MISSING", "SELF", "Customer brought their own policy")
-    _evaluate(journey, "NATIVE:BOOKING")
-    state = _states(journey)
-    assert state["INSURANCE_INVOICE_MISSING"]["control_status"] == "PASS"
-    assert "Self insurance (confirmed by the PC" in state["INSURANCE_INVOICE_MISSING"]["status_reason"]
-    assert state["SELF_INSURANCE_DECLARED"]["control_status"] == "FAIL"
-    flag = _task(journey, "SELF_INSURANCE_DECLARED")
-    assert flag["task_type"] == "FINDING_REVIEW" and flag["assigned_role_code"] == "TL"
-    assert _finding(journey, "SELF_INSURANCE_DECLARED")[:2] == ("OPEN", "MEDIUM")
-    source = _sql(journey, "SELECT insurance_source FROM auditcore.insurance_records WHERE tenant_id=:t AND journey_id=:j"
-                  ).scalar_one()
-    assert source == "SELF"
+    state = _states(journey)["INSURANCE_INVOICE_MISSING"]
+    assert state["control_status"] == "PASS" and "accounted for" in state["status_reason"]
 
 
 # ------------------------------------------- no usable booking date (2026-10-24)

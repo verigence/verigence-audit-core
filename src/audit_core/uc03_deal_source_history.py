@@ -159,29 +159,49 @@ def withdraw_unreported(
     A document that could not be read at all on this pass says nothing about what it
     prints: the rows of the documents in ``keep_documents`` (and, with ``keep_all``, every
     row of the type -- for a source recorded under no document id) are never withdrawn,
-    and a row of theirs withdrawn earlier is brought back when nothing of that document
-    (or type) stands. Found the day this shipped (2026-11-12): four NDCs whose rows did
+    and the rows taken from such a document since its current reading are brought back. Found the day this shipped (2026-11-12): four NDCs whose rows did
     not parse had every figure taken back, their vehicle price included.
 
     Call it once per source type, after every figure of this reading is recorded
     (record_source_value brings a row back when the document gives the figure again).
     Returns the number of rows withdrawn."""
     kept = {str(d) for d in (keep_documents or set())}
-    # Bring back what was taken from an unread document, when none of its rows stands.
-    for document in sorted(kept) if not keep_all else [None]:
-        which = "TRUE" if keep_all else "s.source_document_id = CAST(:document AS uuid)"
+    params = {"t": tenant_id, "j": journey_id, "type": normalise_document_type(source_document_type)}
+    # Bring back what was taken from an unread document while it was unread: the rows
+    # withdrawn since its current reading. What an earlier, readable reading of it took
+    # back stays withdrawn. (UTK-PP-261023-007, 2026-11-12: its NDC's rows do not parse, a
+    # few of its figures still stood, and its vehicle price stayed withdrawn.)
+    for document in sorted(kept):
+        connection.execute(
+            text(
+                f"""
+                UPDATE auditcore.commercial_line_source_values s
+                SET withdrawn_at_utc = NULL
+                WHERE s.tenant_id = :t AND s.journey_id = :j AND s.withdrawn_at_utc IS NOT NULL
+                  AND {NORMALISED_TYPE_SQL} = :type AND s.source_document_id = CAST(:document AS uuid)
+                  AND {_DOCUMENT_ON_FILE}
+                  AND s.withdrawn_at_utc >= COALESCE((
+                        SELECT max(f.updated_at_utc) FROM auditcore.journey_document_extracted_fields f
+                        WHERE f.tenant_id = s.tenant_id AND f.journey_id = s.journey_id
+                          AND f.di_document_id = s.source_document_id), s.withdrawn_at_utc)
+                """
+            ),
+            {**params, "document": document},
+        )
+    # A source recorded under no document id (the Tally ledger's lines): with a page on
+    # file unread and nothing of the type standing, all of it comes back.
+    if keep_all:
         stands = connection.execute(
             text(
                 f"""
                 SELECT count(*) FILTER (WHERE s.withdrawn_at_utc IS NULL) AS standing,
                        count(*) FILTER (WHERE s.withdrawn_at_utc IS NOT NULL) AS taken
                 FROM auditcore.commercial_line_source_values s
-                WHERE s.tenant_id = :t AND s.journey_id = :j AND {NORMALISED_TYPE_SQL} = :type AND {which}
+                WHERE s.tenant_id = :t AND s.journey_id = :j AND {NORMALISED_TYPE_SQL} = :type
                   AND {_DOCUMENT_ON_FILE}
                 """
             ),
-            {"t": tenant_id, "j": journey_id, "type": normalise_document_type(source_document_type),
-             "document": document},
+            params,
         ).mappings().one()
         if stands["taken"] and not stands["standing"]:
             connection.execute(
@@ -190,11 +210,10 @@ def withdraw_unreported(
                     UPDATE auditcore.commercial_line_source_values s
                     SET withdrawn_at_utc = NULL
                     WHERE s.tenant_id = :t AND s.journey_id = :j AND s.withdrawn_at_utc IS NOT NULL
-                      AND {NORMALISED_TYPE_SQL} = :type AND {which} AND {_DOCUMENT_ON_FILE}
+                      AND {NORMALISED_TYPE_SQL} = :type AND {_DOCUMENT_ON_FILE}
                     """
                 ),
-                {"t": tenant_id, "j": journey_id, "type": normalise_document_type(source_document_type),
-                 "document": document},
+                params,
             )
     if keep_all:
         return 0
