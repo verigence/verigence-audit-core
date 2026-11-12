@@ -271,6 +271,21 @@ _IDENTITY_SQL = f"""
                            WHERE e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
                              AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
                              AND e.document_type_key IN ('booking_form', 'booking_docket'))) AS booking_refs,
+           (SELECT array_agg(DISTINCT f.effective_value #>> '{{}}')
+              FROM auditcore.journey_document_extracted_fields f
+             WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+               AND f.field_key = 'receipt_number' AND f.source_document_type_key = 'dealer_receipt'
+               AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+               AND {_ON_ACTIVE_DOCUMENT}) AS receipt_numbers,
+           (SELECT array_agg(DISTINCT f.effective_value #>> '{{}}')
+              FROM auditcore.journey_document_extracted_fields f
+             WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+               AND f.field_key = 'invoice_number'
+               AND f.source_document_type_key IN ('customer_invoice_dms', 'tax_invoice_tally')
+               AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+               AND {_ON_ACTIVE_DOCUMENT}) AS invoice_numbers,
+           (SELECT jc.vin_used FROM auditcore.journey_classifications jc
+             WHERE jc.tenant_id = j.tenant_id AND jc.journey_id = j.journey_id) AS vin,
            {_CLOSED_SQL} AS is_closed
     FROM auditcore.journeys j
     JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
@@ -336,6 +351,11 @@ class FileIdentity:
     booking_ref_display: str | None = None
     # 2026-11-03: the same file is a mistake within one outlet only.
     outlet_id: UUID | None = None
+    # 2026-11-12: the dealer receipt numbers on its receipts still on file, the numbers of
+    # its vehicle invoices (DMS / Tally) and its agreed VIN -- the same sale (same_sale_fields).
+    receipt_numbers: frozenset[str] = frozenset()
+    invoice_numbers: frozenset[str] = frozenset()
+    vin: str | None = None
 
     @property
     def model_key(self) -> str:
@@ -391,6 +411,9 @@ def _identities(connection: Connection, *, tenant_id: str, journey_ids: Iterable
             closed=bool(row["is_closed"]),
             booking_refs=frozenset(code for _, code in refs),
             booking_ref_display=" ".join(str(refs[0][0]).split()) if refs else None,
+            receipt_numbers=_document_numbers(row["receipt_numbers"]),
+            invoice_numbers=_document_numbers(row["invoice_numbers"]),
+            vin=(str(row["vin"]).strip().upper() or None) if row["vin"] else None,
         )
     return out
 
@@ -553,6 +576,86 @@ def matched_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, 
          "exact": bool(shared)},
     ]
     return fields
+
+
+def _document_numbers(values: Iterable[Any] | None) -> frozenset[str]:
+    """Receipt / invoice numbers as compared: letters and digits only, upper case, at
+    least six characters (a bare "1" or "R-2" identifies nothing)."""
+    out = set()
+    for value in values or []:
+        code = re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+        if len(code) >= 6:
+            out.add(code)
+    return frozenset(out)
+
+
+def two_vehicles(left: FileIdentity, right: FileIdentity) -> bool:
+    """The two journeys are for two vehicles: each has its VIN and they differ, or (VINs
+    not both known) each has a vehicle invoice and they share no number."""
+    if left.vin and right.vin:
+        return left.vin != right.vin
+    return bool(left.invoice_numbers and right.invoice_numbers
+                and not left.invoice_numbers & right.invoice_numbers)
+
+
+def same_sale_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
+    """The fields when the two journeys are one sale uploaded twice at one outlet: a
+    booking file, then the delivery file with those documents again (product owner
+    2026-11-12, AVINASH PATRA, UTK-PR-261103-001 and UTK-PR-261104-002: "if the same
+    details are found but with additional documents then we will update the existing
+    booking").
+
+    The same PAN and/or Aadhaar and the same dealer receipt number on both: a dealership
+    issues each receipt number once, so one payment is one sale. The mobile, the booking
+    reference number, the model and the name are not required here -- on that pair the
+    mobile and the booking number each misread by one digit on one copy, and a model
+    changed between booking and invoice is common. Never two vehicles (two_vehicles).
+    None otherwise; matched_fields is unchanged."""
+    if not same_outlet(new, existing):
+        return None
+    if new.dealer_id and existing.dealer_id and new.dealer_id != existing.dealer_id:
+        return None
+    customer = same_customer(new, existing)
+    if customer is None:
+        return None
+    shared = sorted(new.receipt_numbers & existing.receipt_numbers)
+    if not shared or two_vehicles(new, existing):
+        return None
+    same_pan, same_aadhaar = customer
+    fields: list[dict[str, Any]] = []
+    if same_pan:
+        fields.append({"field": "pan", "label": "PAN", "newValue": _masked(new.pan),
+                       "existingValue": _masked(existing.pan), "exact": True})
+    if same_aadhaar:
+        fields.append({"field": "aadhaar", "label": "Aadhaar", "newValue": mask_aadhaar(new.aadhaar),
+                       "existingValue": mask_aadhaar(existing.aadhaar), "exact": True})
+    fields += [
+        {"field": "receipt", "label": "Dealer receipt number", "newValue": shared[0],
+         "existingValue": shared[0], "exact": True},
+        {"field": "mobile", "label": "Mobile", "newValue": _masked(new.mobile),
+         "existingValue": _masked(existing.mobile), "exact": bool(new.mobile and new.mobile == existing.mobile)},
+        {"field": "model", "label": "Model", "newValue": new.model_name, "existingValue": existing.model_name,
+         "exact": bool(new.model_id and new.model_id == existing.model_id) or new.model_name == existing.model_name},
+        {"field": "name", "label": "Customer name", "newValue": new.name, "existingValue": existing.name,
+         "exact": new.name == existing.name},
+        {"field": "outlet", "label": "Outlet", "newValue": _place(new.dealer_name, new.outlet_name),
+         "existingValue": _place(existing.dealer_name, existing.outlet_name), "exact": True},
+        {"field": "bookingReference", "label": "Booking reference number",
+         "newValue": new.booking_ref_display, "existingValue": existing.booking_ref_display,
+         "exact": booking_reference_shared(new, existing)},
+    ]
+    return fields
+
+
+def same_file_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
+    """One booking entered twice (matched_fields) or one sale uploaded twice (same_sale_fields)."""
+    return matched_fields(new, existing) or same_sale_fields(new, existing)
+
+
+def booking_identified(new: FileIdentity, existing: FileIdentity) -> bool:
+    """The copy is known to be the same booking: a booking number in common, or the same
+    sale by its receipt -- otherwise it is kept and alerted (KEPT_NO_BOOKING_REFERENCE)."""
+    return booking_reference_shared(new, existing) or same_sale_fields(new, existing) is not None
 
 
 def document_counts(connection: Connection, *, tenant_id: str, journey_ids: Iterable[UUID]) -> dict[UUID, int]:
@@ -894,7 +997,7 @@ def _raise(
         outcome = KEPT_NOT_INDIVIDUAL
     elif _reviewed(connection, tenant_id=tenant_id, journey_id=new.journey_id):
         outcome = KEPT_REVIEWED
-    elif not booking_reference_shared(new, existing):
+    elif not booking_identified(new, existing):
         outcome, kept_reason = KEPT_NO_BOOKING_REFERENCE, _no_booking_reference_reason(new, existing)
     elif (plan := carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing)).unsure:
         outcome, kept_reason = KEPT_OWN_DOCUMENTS, plan.unsure
@@ -1033,11 +1136,13 @@ def _raise_cross_outlet(connection: Connection, *, tenant_id: str, new: FileIden
     return alert_id is not None
 
 
-def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str) -> dict[str, Any]:
+def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str,
+            window: bool = True) -> dict[str, Any]:
     me = _identities(connection, tenant_id=tenant_id, journey_ids=[journey_id]).get(journey_id)
     # The customer, mobile and model are enough to look (a duplicate across outlets needs no
     # name); the same file still needs everything (matched_fields).
-    if me is None or me.closed or not ((me.pan or me.aadhaar) and me.mobile and (me.model_id or me.model_key)):
+    # A journey known only by its PAN / Aadhaar and receipt can still be the same sale.
+    if me is None or me.closed or not (me.pan or me.aadhaar):
         return {"examined": 0, "raised": 0}
     candidate_ids = [
         UUID(str(v)) for v in connection.execute(
@@ -1077,7 +1182,7 @@ def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correla
             if _raise_cross_outlet(connection, tenant_id=tenant_id, new=newer, existing=earliest, fields=fields,
                                    same_dealership=same_dealer):
                 flagged += 1
-    matches = [o for o in others.values() if not o.closed and matched_fields(me, o) is not None]
+    matches = [o for o in others.values() if not o.closed and same_file_fields(me, o) is not None]
     if not matches:
         return {"examined": len(others), "raised": 0, "acrossOutlets": flagged}
     group = [me, *matches]
@@ -1089,10 +1194,10 @@ def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correla
     for new in sorted(group, key=lambda identity: identity.order_key):
         if new is original:
             continue
-        if max(new.created_at, original.created_at) < cutoff:
+        if window and max(new.created_at, original.created_at) < cutoff:
             # Neither just uploaded: left to DUPLICATE_BOOKING.
             continue
-        fields = matched_fields(new, original)
+        fields = same_file_fields(new, original)
         if fields is None:  # matched this journey, not the oldest one
             continue
         outcome = _raise(connection, tenant_id=tenant_id, new=new, existing=original, fields=fields,
@@ -1166,10 +1271,11 @@ def recheck_before_delete(
         raise SameFileNoLongerHolds(f"{ref} is closed")
     if new.closed:
         raise SameFileNoLongerHolds("it is already closed")
-    if matched_fields(new, existing) is None:
+    if same_file_fields(new, existing) is None:
         raise SameFileNoLongerHolds(
-            f"its PAN / Aadhaar, mobile, model, customer name or booking reference number no longer match {ref}")
-    if not booking_reference_shared(new, existing):
+            f"its PAN / Aadhaar, mobile, model, customer name, booking reference number or receipt "
+            f"no longer match {ref}")
+    if not booking_identified(new, existing):
         raise SameFileNoLongerHolds(_no_booking_reference_reason(new, existing))
     counts = document_counts(connection, tenant_id=tenant_id, journey_ids=[new_journey_id, existing_journey_id])
     if counts.get(new_journey_id, 0) > counts.get(existing_journey_id, 0):
