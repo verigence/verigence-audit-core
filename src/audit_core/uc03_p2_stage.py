@@ -990,7 +990,8 @@ def vehicle_proof(connection: Connection, *, tenant_id: str, journey_id: UUID) -
             """
             SELECT
               (SELECT COUNT(*) FROM auditcore.delivery_vehicle_photos
-                WHERE tenant_id=:t AND journey_id=:j AND deleted_at_utc IS NULL) AS photos,
+                WHERE tenant_id=:t AND journey_id=:j AND deleted_at_utc IS NULL
+                  AND COALESCE(view_code, '') <> 'EXTRA') AS photos,
               (SELECT row_to_json(v) FROM (
                  SELECT vin, chassis_number, engine_number, entered_by_role, created_at_utc
                  FROM auditcore.p2_vehicle_identifications WHERE tenant_id=:t AND journey_id=:j

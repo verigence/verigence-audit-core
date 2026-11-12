@@ -65,6 +65,7 @@ def _vehicle_photo_count(connection: Connection, *, tenant_id: str, journey_id: 
             """
             SELECT count(*) FROM auditcore.delivery_vehicle_photos
             WHERE tenant_id=:tenant_id AND journey_id=:journey_id AND deleted_at_utc IS NULL
+              AND COALESCE(view_code, '') <> 'EXTRA'
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},

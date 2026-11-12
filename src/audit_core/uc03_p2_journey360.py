@@ -714,7 +714,7 @@ def summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
               (SELECT COUNT(*) FROM auditcore.evidence WHERE tenant_id=:t AND journey_id=:j
                  AND association_status='ACTIVE') AS documents,
               (SELECT COUNT(*) FROM auditcore.delivery_vehicle_photos WHERE tenant_id=:t
-                 AND journey_id=:j AND deleted_at_utc IS NULL) AS photos,
+                 AND journey_id=:j AND deleted_at_utc IS NULL AND COALESCE(view_code, '') <> 'EXTRA') AS photos,
               (SELECT COUNT(*) FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j
                  AND task_status NOT IN {_OPEN_TASK_EXCLUDED}) AS open_tasks,
               (SELECT COUNT(*) FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j
@@ -4008,6 +4008,7 @@ def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID,
             """
             SELECT COUNT(*) FROM auditcore.delivery_vehicle_photos
             WHERE tenant_id=:t AND journey_id=:j AND deleted_at_utc IS NULL
+              AND COALESCE(view_code, '') <> 'EXTRA'
             """
         ),
         params,

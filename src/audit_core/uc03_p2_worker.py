@@ -2110,6 +2110,17 @@ def _di_failure_reason(di_item: dict[str, Any] | None) -> str:
 # the nightly sweep can tell a page that was genuinely read empty from one
 # that was merely never copied.
 _NOTHING_READ_REASON = "Document Intelligence read this page but found no values on it."
+# A page no known document type fits (product owner 12 Nov 2026): "if the document fails
+# classification due to schema not available, then we have to send a message that system
+# doesn't understand the document. Pls recheck and if required submit again". A page refused
+# for its scan quality keeps its own message.
+# Then (same day): "these documents which are not recognized can be uploaded in the photos ...
+# alter the message that given pages are not understood. If they need to be scanned and
+# extracted pls consult with TL and reupload otherwise they are copied to the extras folder ...
+# make it simple". The page is kept in the journey's Extras (uc03_p2_vehicle_photos).
+UNRECOGNISED_REASON = (
+    "The system did not understand this page. It is kept in Photos and other documents (Extras) and is not read. If it needs to be read, check with your TL and upload it again."
+)
 _NOT_QUEUED_REASON = (
     "Identified but not read: the booking already holds this document, or this document "
     "type is not read. Kept as supporting evidence."
@@ -2154,10 +2165,7 @@ def classify_page_outcome(
         return _failed_page_outcome(di_item)
     if state == "UNKNOWN":
         # Docket covers, letters, e-mails, printouts: evidence, never a blocker.
-        return PageOutcome(
-            "SUPPORTING",
-            "Kept as supporting evidence. Set the document type if this is a checklist document.",
-        )
+        return PageOutcome("SUPPORTING", UNRECOGNISED_REASON)
     if state == "CLASSIFIED" and processing == "PROCESSED":
         if facts_copy == "COPIED":
             return PageOutcome("NEEDS_REVIEW", _NOTHING_READ_REASON)
@@ -2999,6 +3007,10 @@ def _reconcile_page(
         },
     )
 
+    if outcome.reason == UNRECOGNISED_REASON:
+        from audit_core.uc03_p2_vehicle_photos import add_unrecognised_page
+
+        add_unrecognised_page(connection, tenant_id=work.tenant_id, queue_id=queue_id)
     if outcome.status in _PAGE_SETTLED_STATES and page["queue_status"] != outcome.status:
         _refresh_batch_status(connection, work.tenant_id, UUID(str(page["batch_id"])))
         record_activity(
