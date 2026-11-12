@@ -654,7 +654,10 @@ def same_sale_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str
 
 
 def same_file_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
-    """One booking entered twice (matched_fields) or one sale uploaded twice (same_sale_fields)."""
+    """One booking entered twice (matched_fields) or one sale uploaded twice (same_sale_fields);
+    never two vehicles (different VINs, or vehicle invoices with no number in common)."""
+    if two_vehicles(new, existing):
+        return None
     return matched_fields(new, existing) or same_sale_fields(new, existing)
 
 
@@ -866,6 +869,10 @@ def documents_only_on(connection: Connection, *, tenant_id: str, new_journey_id:
     return sorted(new_kinds - existing_kinds)
 
 
+# Receipts: a customer can have several, so one is carried when its number is new.
+_RECEIPT_KINDS = frozenset({"dealer_receipt", "payment_receipt"})
+# A page not typed yet is carried: nothing says the earlier journey has it.
+_UNTYPED_KINDS = frozenset({"document", "unknown", "other", "unclassified"})
 # The customer's own files (file identity): only their documents are carried to the earlier journey.
 _CARRIED_IDENTITY = "BELONGS"
 _GONE_UNITS = ("CANCELLED", "MERGED")
@@ -879,6 +886,8 @@ class CarryPlan:
     kinds: tuple[str, ...]
     units: tuple[dict[str, Any], ...]
     unsure: str | None
+    # Every page of the copy is on the earlier journey already, by fingerprint (2026-11-12).
+    identical: bool = False
 
 
 def _unit_pages(unit: dict[str, Any]) -> list[int]:
@@ -903,7 +912,7 @@ def carry_plan(connection: Connection, *, tenant_id: str, new: FileIdentity, exi
     rows = [dict(r) for r in connection.execute(
         text(
             """
-            SELECT q.queue_id, q.batch_id, q.unit_kind, q.page_number, q.page_numbers, q.page_sha256,
+            SELECT q.queue_id, q.batch_id, q.unit_kind, q.page_number, q.page_numbers, q.page_sha256, q.di_document_id,
                    q.page_object_key, q.queue_status, q.classified_document_type, q.merged_into_queue_id,
                    b.original_filename, b.content_type, b.identity_status, b.batch_status, b.uploaded_by_actor_id,
                    (SELECT e.document_type_key FROM auditcore.evidence e
@@ -922,7 +931,7 @@ def carry_plan(connection: Connection, *, tenant_id: str, new: FileIdentity, exi
     pages = [r for r in rows if r["unit_kind"] == "PAGE"]
     fresh = [p for p in pages if not p["page_sha256"] or str(p["page_sha256"]) not in on_existing]
     if not fresh:
-        return CarryPlan(kinds=(), units=(), unsure=None)  # the same set of documents
+        return CarryPlan(kinds=(), units=(), unsure=None, identical=bool(pages))  # the same set of documents
     unsettled = [p for p in fresh if p["identity_status"] != _CARRIED_IDENTITY]
     if unsettled:
         return CarryPlan(kinds=(), units=(), unsure=(
@@ -938,8 +947,31 @@ def carry_plan(connection: Connection, *, tenant_id: str, new: FileIdentity, exi
                 "has no stored document to copy yet"))
         units[str(unit["queue_id"])] = {**unit, "document_type_key": unit["document_type_key"]
                                         or unit["classified_document_type"] or "document"}
-    kinds = tuple(sorted({str(u["document_type_key"]) for u in units.values()}))
-    return CarryPlan(kinds=kinds, units=tuple(units.values()), unsure=None)
+    # Only what the earlier journey does not have (product owner 2026-11-12: "add additional
+    # documents"): a PC re-photographs the PAN, booking docket and receipt for the delivery
+    # file, so those pages differ by fingerprint yet are documents the journey already holds.
+    # A kind it already holds is not copied again; a receipt is, when its number is new.
+    held = {str(k) for k in connection.execute(
+        text("SELECT DISTINCT document_type_key FROM auditcore.evidence WHERE tenant_id=:t AND journey_id=:j "
+             "AND association_status='ACTIVE' AND document_type_key IS NOT NULL"),
+        {"t": tenant_id, "j": existing.journey_id},
+    ).scalars().all()}
+    carried: dict[str, dict[str, Any]] = {}
+    for key, unit in units.items():
+        kind = str(unit["document_type_key"])
+        if kind in _RECEIPT_KINDS:
+            numbers = _document_numbers(connection.execute(
+                text("SELECT f.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields f "
+                     "WHERE f.tenant_id=:t AND f.journey_id=:j AND f.di_document_id=:d AND f.field_key='receipt_number'"),
+                {"t": tenant_id, "j": new.journey_id, "d": unit["di_document_id"]},
+            ).scalars().all()) if unit["di_document_id"] else frozenset()
+            if numbers and numbers <= existing.receipt_numbers:
+                continue
+        elif kind in held and kind not in _UNTYPED_KINDS:
+            continue
+        carried[key] = unit
+    kinds = tuple(sorted({str(u["document_type_key"]) for u in carried.values()}))
+    return CarryPlan(kinds=kinds, units=tuple(carried.values()), unsure=None)
 
 
 def _own_documents_reason(connection: Connection, *, tenant_id: str, new: FileIdentity,
@@ -989,8 +1021,7 @@ def identical_documents(connection: Connection, *, tenant_id: str, new: FileIden
     ).scalar_one()
     if not has_pages:
         return False
-    plan = carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing)
-    return plan.unsure is None and not plan.kinds
+    return carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing).identical
 
 
 def carry_documents(engine: Engine, *, tenant_id: str, new_journey_id: UUID, existing_journey_id: UUID) -> list[str]:

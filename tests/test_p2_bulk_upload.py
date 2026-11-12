@@ -207,8 +207,9 @@ def _identity(journey: P2Journey, *, pan: str = PAN, model: str = "THAR") -> Non
                        "VALUES (:t, :j, :m)"), {"t": journey.tenant_id, "j": journey.journey_id, "m": model})
 
 
-def _read(s, journey_id: UUID, *, shas: list[str]) -> P2Journey:
-    """The journey read for the drop: its upload split into pages with these fingerprints, all read."""
+def _read(s, journey_id: UUID, *, shas: list[str], kinds: list[str] | None = None) -> P2Journey:
+    """The journey read for the drop: its upload split into pages with these fingerprints, all
+    read (as ``kinds``, page for page; a Tally invoice by default)."""
     j = P2Journey(**{**s.journey.__dict__, "journey_id": journey_id})
     with s.journey.engine.begin() as c:
         set_tenant_context(c, s.journey.tenant_id)
@@ -216,7 +217,7 @@ def _read(s, journey_id: UUID, *, shas: list[str]) -> P2Journey:
                        "WHERE tenant_id=:t AND journey_id=:j"), {"t": s.journey.tenant_id, "j": journey_id})
         c.execute(text("UPDATE auditcore.p2_document_queue SET queue_status='READY' WHERE tenant_id=:t AND journey_id=:j"),
                   {"t": s.journey.tenant_id, "j": journey_id})
-    for sha in shas:
+    for i, sha in enumerate(shas):
         batch, queue, doc = add_page(j, status="READY")
         with s.journey.engine.begin() as c:
             set_tenant_context(c, s.journey.tenant_id)
@@ -224,7 +225,8 @@ def _read(s, journey_id: UUID, *, shas: list[str]) -> P2Journey:
                            "WHERE tenant_id=:t AND queue_id=:q"), {"s": sha, "t": s.journey.tenant_id, "q": queue})
             c.execute(text("UPDATE auditcore.p2_upload_batches SET identity_status='BELONGS', batch_status='COMPLETED' "
                            "WHERE tenant_id=:t AND batch_id=:b"), {"t": s.journey.tenant_id, "b": batch})
-        add_evidence(j, di_document_id=doc, document_type_key="tax_invoice_tally")
+        add_evidence(j, di_document_id=doc, document_type_key=(kinds or [])[i] if i < len(kinds or []) else
+                     "tax_invoice_tally")
     return j
 
 
@@ -243,11 +245,12 @@ def test_a_delivery_file_joins_the_customers_booking_and_its_new_pages_are_carri
     booking = s.journey                      # the customer's booking, its KYC already read
     _identity(booking)
     shared = uuid4().hex
-    _read(s, booking.journey_id, shas=[shared])
+    _read(s, booking.journey_id, shas=[shared], kinds=["pan_card"])
     bulk_id = _drop(s, {"Asha Das delivery.pdf": b"%PDF delivery file"})
     _run_upload(s, bulk_id)
     [file] = _files(s, bulk_id)
-    read_on = _read(s, file["journey_id"], shas=[shared, uuid4().hex])  # the KYC again, and the invoice
+    read_on = _read(s, file["journey_id"], shas=[shared, uuid4().hex],  # the KYC again, and the invoice
+                    kinds=["pan_card", "tax_invoice_tally"])
     _identity(read_on)
     # Still reading: not settled yet.
     with s.journey.engine.begin() as c:
