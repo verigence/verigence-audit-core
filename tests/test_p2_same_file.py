@@ -1482,3 +1482,45 @@ def test_a_company_copy_kept_earlier_is_deleted_once_its_documents_are_the_same(
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
     [alert] = _alerts(new)
     assert alert["outcome"] == "PENDING_DELETE" and len(_queued(new)) == 1
+
+
+def test_a_rephotographed_document_the_earlier_journey_holds_is_not_carried(tenant, monkeypatch):
+    """Product owner 2026-11-12, "add additional documents": the PAN photographed again for
+    the delivery file differs by fingerprint but is not an additional document."""
+    from audit_core import uc03_p2_storage
+
+    old, new = _pair(tenant)
+    _same_pages(old, new)
+    _page(old, sha=uuid4().hex, kind="pan_card")
+    _page(new, sha=uuid4().hex, kind="pan_card")  # the PAN again, a new photograph
+    _quiet(new)
+    monkeypatch.setattr(uc03_p2_storage, "get_p2_document_storage", lambda: CopyStorage())
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    assert "carryDocuments" not in _alerts(new)[0]["payload"]
+    assert _delete(new) == "DELETED" and _batches_copied(old) == []
+
+
+@pytest.mark.parametrize(("number", "carried"), [("BRMM/2627/04861", False), ("BRMM/2627/09999", True)])
+def test_a_receipt_is_carried_only_when_its_number_is_new(tenant, number, carried):
+    old, new = _pair(tenant)
+    _same_pages(old, new)
+    _receipt(old, "BRMM/2627/04861")
+    _page(old, sha=uuid4().hex, kind="dealer_receipt")
+    _, _, doc = _page(new, sha=uuid4().hex, kind="dealer_receipt")
+    add_extracted_field(new, di_document_id=doc, field_key="receipt_number", value=number,
+                        document_type="dealer_receipt")
+    _quiet(new)
+    _detect(new)
+    payload = _alerts(new)[0]["payload"]
+    assert ("dealer_receipt" in payload.get("carryDocuments", [])) is carried
+
+
+def test_two_vehicles_are_never_the_same_file(tenant):
+    old, new = _pair(tenant)
+    _invoice(old, "INV27P000001")
+    _invoice(new, "INV27P000002")
+    assert _detect(new).get("raised", 0) == 0 and _alerts(new) == []
+
+
+def _batches_copied(journey: P2Journey) -> list[dict]:
+    return [b for b in _batches(journey) if str(b["client_upload_id"] or "").startswith("dup-merge-")]
