@@ -42,7 +42,7 @@ API = "https://www.googleapis.com/drive/v3"
 FOLDER_TYPE = "application/vnd.google-apps.folder"
 FILE_FIELDS = "id,name,mimeType,size,md5Checksum,createdTime,modifiedTime,parents,trashed"
 DEFAULT_REDIRECT_URI = "https://verigence.jbrconsulting.in/audit-core/p2/v1/integrations/google-drive/callback"
-DEFAULT_RETURN_URL = "https://verigence.jbrconsulting.in/"
+DEFAULT_RETURN_URL = "https://verigence.jbrconsulting.in/p2/drive-uploads"
 _STATE_SECONDS = 900
 _TIMEOUT = httpx.Timeout(60.0, connect=15.0)
 
