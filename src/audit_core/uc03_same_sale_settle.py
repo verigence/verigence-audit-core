@@ -1,14 +1,15 @@
-"""SAME_SALE_SETTLE (2026-11-12): the sales already uploaded twice, settled once.
+"""SAME_SALE_SETTLE (2026-11-12): the copies already on file, settled once.
 
 Product owner 2026-11-12, AVINASH PATRA (UTK-PR-261103-001 booking file, UTK-PR-261104-002
-delivery file): "we discussed, if the same details are found but with additional documents
-then we will update the existing booking.. why it is showing two here". The same-file check
-now knows one sale by its dealer receipt (uc03_p2_same_file.same_sale_fields), but it acts
-only while the newer copy is within P2_SAME_FILE_WINDOW_HOURS of its upload. This job runs
-the check, without that window, on every open journey that shares a dealer receipt number
-with another journey of its outlet: the documents only the smaller copy holds are carried
-to the one kept, the copy is deleted, and both show under Duplicate bookings -- exactly as
-a new upload is handled. A company's file, a reviewed copy, or one holding a document that
+delivery file): "if the same details are found but with additional documents then we will
+update the existing booking"; and "i never put a rule of 48 hours.. if all the documents
+matches, add additional documents, if it exactly same documents auto delete the booking".
+The same-file check (uc03_p2_same_file) now acts on a same-outlet copy however old and
+knows one sale by its dealer receipt. This job runs that check once on every journey that
+shares a PAN, an Aadhaar or a dealer receipt number with another journey of its outlet:
+the documents only the smaller copy holds are carried to the one kept, the copy is
+deleted, and both show under Duplicate bookings -- exactly as a new upload is handled. A
+company's file with documents of its own, a reviewed copy, or one holding a document that
 cannot be carried is kept and alerted, as always.
 
 Worker job ``SAME_SALE_SETTLE``: tag ``<tenant_id>:<label>``; reports the journey
@@ -32,20 +33,23 @@ logger = structlog.get_logger(__name__)
 JOB = "SAME_SALE_SETTLE"
 
 _CANDIDATES_SQL = """
-    WITH r AS (
+    WITH k AS (
         SELECT DISTINCT f.journey_id,
-               regexp_replace(upper(f.effective_value #>> '{}'), '[^A-Z0-9]', '', 'g') AS code
+               f.field_key || ':' || CASE
+                   WHEN f.field_key = 'aadhaar_number'
+                       THEN regexp_replace(f.effective_value #>> '{}', '[^0-9]', '', 'g')
+                   ELSE regexp_replace(upper(f.effective_value #>> '{}'), '[^A-Z0-9]', '', 'g') END AS code
         FROM auditcore.journey_document_extracted_fields f
-        WHERE f.tenant_id = :t AND f.source_document_type_key = 'dealer_receipt'
-          AND f.field_key = 'receipt_number' AND f.effective_value IS NOT NULL
-          AND f.effective_value <> 'null'::jsonb
+        WHERE f.tenant_id = :t AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+          AND (f.field_key IN ('pan_number', 'aadhaar_number')
+               OR (f.field_key = 'receipt_number' AND f.source_document_type_key = 'dealer_receipt'))
           AND EXISTS (SELECT 1 FROM auditcore.evidence e
                       WHERE e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
                         AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE')
     )
     SELECT DISTINCT j.journey_id, j.journey_reference, j.created_at_utc
-    FROM r a
-    JOIN r b ON a.code = b.code AND a.journey_id <> b.journey_id AND length(a.code) >= 6
+    FROM k a
+    JOIN k b ON a.code = b.code AND a.journey_id <> b.journey_id AND length(a.code) >= 14
     JOIN auditcore.journeys j ON j.tenant_id = :t AND j.journey_id = a.journey_id
     JOIN auditcore.journeys o ON o.tenant_id = :t AND o.journey_id = b.journey_id AND o.outlet_id = j.outlet_id
     ORDER BY j.created_at_utc
@@ -75,7 +79,7 @@ def run_same_sale_settle(engine: Engine, tag: str, reports: list[str]) -> dict[s
             try:
                 with connection.begin_nested():
                     _detect(connection, tenant_id=tenant_id, journey_id=UUID(str(row["journey_id"])),
-                            correlation_id=f"same-sale-settle:{tag}", window=False)
+                            correlation_id=f"same-sale-settle:{tag}")
             except Exception:
                 failed += 1
                 logger.warning("same_sale_settle_failed", tag=tag, reference=row["journey_reference"],

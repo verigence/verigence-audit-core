@@ -33,7 +33,9 @@ Files uploaded (p2_upload_batches created in the period; a duplicate cancelled o
 arrival is not an upload), under the PC who uploaded
     files, pages, documents (the units the pages became), journeys uploaded to, of which
     deliveries (a delivery page among those uploads) and bookings (none); newJourneys:
-    Journeys started in the period, under the PC who started them
+    Journeys started in the period, under the PC who started them; duplicatesDeleted: the
+    Journeys the PC uploaded in the period that were deleted as the same file uploaded
+    again (from 12 Nov 2026, product owner)
 
 Google Drive (p2_drive_files first seen in the period; uc03_p2_drive_intake), under the PC
 the outlet's files are attributed to
@@ -171,7 +173,7 @@ def _blank() -> dict[str, Any]:
                      "onRegister": 0, "intimated": 0, "notNotified": 0, "uploadedInTool": 0, "pendingWithPc": 0,
                      "stockTransfers": 0},
         "uploads": {"files": 0, "pages": 0, "documents": 0, "journeys": set(), "deliveries": set(),
-                    "newJourneys": 0},
+                    "newJourneys": 0, "duplicatesDeleted": 0},
         "closed": {"deliveryFiles": 0, "reviewer": 0},
         "drive": {"files": 0, "documents": 0, "photos": 0, "taken": 0, "duplicates": 0, "setAside": 0, "failed": 0,
                   "waiting": 0, "reading": 0, "newBookings": 0, "addedToBookings": 0, "keptForReview": 0, "pages": 0,
@@ -403,6 +405,14 @@ def _add_uploads(connection: Connection, tree: _Tree, *, tenant_id: str, start: 
         oid = str(r["outlet_id"])
         if tree.has_outlet(oid):
             _bump(tree.nodes(oid, r["created_by_actor_id"]), "uploads", "newJourneys")
+    # The PC's duplicate uploads deleted as the same file (product owner 2026-11-12), on the
+    # day the copy was uploaded, under the PC who uploaded it.
+    from audit_core.uc03_p2_same_file import duplicate_uploads_deleted
+
+    for r in duplicate_uploads_deleted(connection, tenant_id=tenant_id, start=start, end=end):
+        oid = str(r["outlet_id"])
+        if tree.has_outlet(oid):
+            _bump(tree.nodes(oid, r["pc_actor_id"]), "uploads", "duplicatesDeleted")
 
 
 def _add_drive(connection: Connection, tree: _Tree, *, tenant_id: str, start: datetime, end: datetime) -> None:
@@ -659,7 +669,9 @@ def build_project_tracker(
              "delivery files whose vehicle gate pass is dated that day."),
             ("Files uploaded: uploads made in the period under the PC who uploaded them (a duplicate dropped "
              "on arrival is not counted). A Journey counts as a delivery when a delivery page is among those "
-             "uploads, otherwise as a booking; a Journey uploaded to by two PCs counts once on the outlet."),
+             "uploads, otherwise as a booking; a Journey uploaded to by two PCs counts once on the outlet. "
+             "Duplicates deleted: Journeys the PC uploaded in the period that the system deleted as the same "
+             "file uploaded again (counted from 12 Nov 2026)."),
             ("Google Drive: the files put in the Project's Drive in the period (by when Verigence first saw "
              "them), under the PC of their outlet: taken, exact duplicates, set aside, still waiting; the pages "
              "read and the pages to scan again; and the manual verification tasks their Journeys got since."),
