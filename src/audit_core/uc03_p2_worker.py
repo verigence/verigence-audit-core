@@ -2098,6 +2098,13 @@ def _di_failure_reason(di_item: dict[str, Any] | None) -> str:
 # the nightly sweep can tell a page that was genuinely read empty from one
 # that was merely never copied.
 _NOTHING_READ_REASON = "Document Intelligence read this page but found no values on it."
+# A page no known document type fits (product owner 12 Nov 2026): "if the document fails
+# classification due to schema not available, then we have to send a message that system
+# doesn't understand the document. Pls recheck and if required submit again". A page refused
+# for its scan quality keeps its own message.
+UNRECOGNISED_REASON = (
+    "The system does not understand this document. Please recheck it and, if required, submit it again."
+)
 _NOT_QUEUED_REASON = (
     "Identified but not read: the booking already holds this document, or this document "
     "type is not read. Kept as supporting evidence."
@@ -2142,10 +2149,7 @@ def classify_page_outcome(
         return _failed_page_outcome(di_item)
     if state == "UNKNOWN":
         # Docket covers, letters, e-mails, printouts: evidence, never a blocker.
-        return PageOutcome(
-            "SUPPORTING",
-            "Kept as supporting evidence. Set the document type if this is a checklist document.",
-        )
+        return PageOutcome("SUPPORTING", UNRECOGNISED_REASON)
     if state == "CLASSIFIED" and processing == "PROCESSED":
         if facts_copy == "COPIED":
             return PageOutcome("NEEDS_REVIEW", _NOTHING_READ_REASON)
