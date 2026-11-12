@@ -482,8 +482,8 @@ def test_a_closed_journeys_folder_goes_to_the_archive_after_the_retention_and_no
     client, _ = drive.connected_client(s.engine, s.t)
     assert drive.archive_closed(s.engine, s.t, client) == {"archived": 0}       # 30 days to begin with
     _as(s, "admin", "TENANT_ADMIN")
-    assert s.client.put(f"{s.base}/integrations/google-drive/settings", json={"retentionDays": 7}).json() == {
-        "retentionDays": 7}
+    saved = s.client.put(f"{s.base}/integrations/google-drive/settings", json={"retentionDays": 7}).json()
+    assert saved == {"retentionDays": 7, "dailyRunTime": "21:00", "dailyRunEnabled": True, "outletIds": None}
     assert drive.archive_closed(s.engine, s.t, client) == {"archived": 1}
     month = f"{datetime.now(UTC) - timedelta(days=10):%Y-%m}"
     path = []
@@ -579,3 +579,46 @@ def test_the_project_tracker_shows_the_drive_figures(s):
     [person] = [p for d in tracker["dealers"] for o in d["outlets"] for p in o["people"]
                 if p["actorId"] == s.journey.actor_id]
     assert person["drive"]["files"] == 2
+
+
+def test_the_daily_run_time_and_the_outlets_that_use_drive_are_the_projects_to_set(s):
+    _tree(s)
+    _as(s, "admin", "TENANT_ADMIN")
+    settings = f"{s.base}/integrations/google-drive/settings"
+    shown = s.client.get(f"{s.base}/integrations/google-drive").json()
+    assert (shown["dailyRunTime"], shown["dailyRunEnabled"], shown["outletIds"]) == ("21:00", True, None)
+    assert [(o["outletName"], o["usesDrive"]) for o in shown["outlets"]] == [("Aditya Motors - Cuttack", True)]
+    assert s.client.put(settings, json={"dailyRunTime": "25:00"}).status_code == 400  # the request itself is not valid
+    assert s.client.put(settings, json={"outletIds": [str(uuid4())]}).status_code == 422
+    saved = s.client.put(settings, json={"dailyRunTime": "18:30"}).json()
+    assert (saved["dailyRunTime"], saved["retentionDays"], saved["outletIds"]) == ("18:30", 30, None)
+    # 18:30 IST is 13:00 UTC: due then, not at nine.
+    six_thirty = datetime(2026, 11, 12, 13, 5, tzinfo=UTC)
+    assert "endOfDayRun" in drive.drive_round(s.engine, [s.t], worker_id="w1", now=six_thirty)[s.t]
+    assert drive.end_of_day_due(datetime(2026, 11, 12, 12, 55, tzinfo=UTC), drive.time(18, 30)) is None
+    # Switched off: the next day's slot asks for nothing.
+    assert s.client.put(settings, json={"dailyRunEnabled": False}).json()["dailyRunEnabled"] is False
+    next_day = six_thirty + timedelta(days=1)
+    assert "endOfDayRun" not in drive.drive_round(s.engine, [s.t], worker_id="w1", now=next_day)[s.t]
+    assert len(_rows(s, "SELECT 1 FROM auditcore.p2_drive_runs WHERE tenant_id=:t")) == 1
+
+
+def test_the_daily_run_takes_only_the_outlets_that_use_drive_but_a_run_asked_for_takes_its_own(s):
+    outlet = _tree(s)
+    s.fake.put("docket.pdf", s.fake.folder("Hari-343434", outlet), b"%PDF hari")
+    _sync(s)
+    _as(s, "admin", "TENANT_ADMIN")
+    saved = s.client.put(f"{s.base}/integrations/google-drive/settings", json={"outletIds": []}).json()
+    assert saved["outletIds"] == []
+    shown = s.client.get(f"{s.base}/integrations/google-drive").json()
+    assert [o["usesDrive"] for o in shown["outlets"]] == [False]
+    with s.engine.begin() as c:
+        set_tenant_context(c, s.t)
+        daily = drive.request_run(c, tenant_id=s.t, trigger="END_OF_DAY", actor_id="system")
+    assert drive.run_drive_intake(s.engine, f"{s.t}:{daily['run_id']}")["documents"] == 0
+    assert _files(s)["docket.pdf"]["file_status"] == "NEW"
+    _as(s, s.journey.actor_id, "PC")
+    assert _run(s)["documents"] == 1
+    # Chosen again (null: every outlet): the daily run is for it once more.
+    _as(s, "admin", "TENANT_ADMIN")
+    assert s.client.put(f"{s.base}/integrations/google-drive/settings", json={"outletIds": None}).json()["outletIds"] is None

@@ -46,7 +46,9 @@ Whose journey a folder is (``journey_for_folder``), known before anything is rea
 
 Taking the files (job DRIVE_RUN, ``run_drive_intake``)
     A run is asked for by the PC ("Submit Drive uploads", for an outlet they upload
-    for), by the end of the day (21:00 IST, every outlet), or on demand by a Team
+    for), by the day's own run (at the time the Project set, 21:00 IST to begin with,
+    for the outlets it uses Drive for -- every outlet unless it chose some; it can be
+    switched off), or on demand by a Team
     Lead, PM, Executive or Reviewer for a day of upload and an outlet, a dealership
     or all they are mapped to. Each waiting file is copied to storage under
     dealership / outlet / day / customer's folder / its own name, and only then
@@ -288,6 +290,12 @@ def outlets_with_pcs(connection: Connection, tenant_id: str) -> list[dict[str, A
     return list(out.values())
 
 
+def uses_drive(link: dict[str, Any], outlet_id: Any) -> bool:
+    """Whether the outlet is one the Project uses Drive for (every outlet, unless it chose some)."""
+    chosen = link.get("outlet_ids")
+    return chosen is None or str(outlet_id) in {str(o) for o in chosen}
+
+
 def attributed_pc(outlet: dict[str, Any] | None, folder_pc: str | None, submitter: str | None) -> dict[str, Any] | None:
     """Whose the files of an outlet are: the PC folder they are in, else the outlet's only PC,
     else the PC who pressed Submit, else the PC mapped to the outlet first."""
@@ -419,7 +427,7 @@ def _ensure_tree(engine: Engine, tenant_id: str, client: DriveClient) -> dict[st
         root, new = _root(connection, tenant_id, client, link)
         made += new
         for outlet in outlets_with_pcs(connection, tenant_id):
-            if not outlet["pcs"]:
+            if not outlet["pcs"] or not uses_drive(link, outlet["outlet_id"]):
                 continue
             dealer, new = _ensure(connection, tenant_id, client, "DEALER", root, str(outlet["dealer_name"]),
                                   dealer_id=outlet["dealer_id"], outlet_id=None)
@@ -796,6 +804,7 @@ def _claim(engine: Engine, tenant_id: str, run: dict[str, Any]) -> list[dict[str
     file a run left behind long ago is free again)."""
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
+        chosen = (_connection_row(connection, tenant_id) or {}).get("outlet_ids")
         connection.execute(
             text(
                 """
@@ -816,11 +825,14 @@ def _claim(engine: Engine, tenant_id: str, run: dict[str, Any]) -> list[dict[str
                   AND (CAST(:outlet AS uuid) IS NULL OR outlet_id=CAST(:outlet AS uuid))
                   AND (CAST(:dealer AS uuid) IS NULL OR dealer_id=CAST(:dealer AS uuid))
                   AND (CAST(:day AS date) IS NULL OR upload_date=CAST(:day AS date))
+                  AND (CAST(:only AS uuid[]) IS NULL OR outlet_id = ANY(CAST(:only AS uuid[])))
                 RETURNING *
                 """
             ),
             {"t": tenant_id, "r": run["run_id"], "outlet": run["outlet_id"], "dealer": run["dealer_id"],
-             "day": run["upload_date"]},
+             "day": run["upload_date"],
+             # The daily run is for the outlets the Project uses Drive for; a run someone asks for is theirs.
+             "only": [str(o) for o in chosen] if run["run_trigger"] == "END_OF_DAY" and chosen is not None else None},
         ).mappings().all()
     return sorted((dict(r) for r in rows), key=lambda r: (str(r["outlet_id"]), str(r["customer_folder_id"]),
                                                           r["file_name"]))
@@ -1388,11 +1400,12 @@ def tracker_rows(connection: Connection, *, tenant_id: str, start: datetime, end
 
 # --------------------------------------------------------------------------- the worker's round
 
-def end_of_day_due(now: datetime | None = None) -> str | None:
-    """The end-of-day slot that is open now: 21:00 IST passed, at most three hours ago (so a
-    worker that was down then still runs it, and the night does not)."""
+def end_of_day_due(now: datetime | None = None, at: time | None = None) -> str | None:
+    """The daily slot that is open now: the Project's run time (India time; 21:00 unless it
+    set another) passed, at most three hours ago -- so a worker that was down then still
+    runs it, and it does not run at any hour after."""
     local = (now or datetime.now(UTC)).astimezone(IST)
-    slot = datetime.combine(local.date(), END_OF_DAY_IST, tzinfo=IST)
+    slot = datetime.combine(local.date(), at or END_OF_DAY_IST, tzinfo=IST)
     if local < slot:
         slot -= timedelta(days=1)
     return slot.date().isoformat() if local - slot < _END_OF_DAY_CATCHUP else None
@@ -1417,7 +1430,7 @@ def drive_round(engine: Engine, tenant_ids: list[str], *, worker_id: str | None 
             client, link = linked
             result: dict[str, Any] = {"tree": ensure_tree(engine, tenant_id, client),
                                       "found": sync(engine, tenant_id, client, link)}
-            due = end_of_day_due(now)
+            due = end_of_day_due(now, link["daily_run_time"]) if link["daily_run_enabled"] else None
             if due is not None:
                 with engine.begin() as connection:
                     set_tenant_context(connection, tenant_id)
@@ -1453,7 +1466,12 @@ class DriveRunCommand(BaseModel):
 
 
 class DriveSettingsCommand(BaseModel):
-    retentionDays: int = Field(ge=0, le=3650)
+    """Only what is sent is changed. ``outletIds``: the outlets that use Drive; null for every outlet."""
+
+    retentionDays: int | None = Field(default=None, ge=0, le=3650)
+    dailyRunTime: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    dailyRunEnabled: bool | None = None
+    outletIds: list[UUID] | None = None
 
 
 def _public_run(run: dict[str, Any]) -> dict[str, Any]:
@@ -1496,6 +1514,17 @@ def _caller(connection: Connection, tenant_id: str, principal: HumanPrincipal, c
             "outlets": lead_outlets | pc_outlets}
 
 
+def _public_settings(link: dict[str, Any] | None) -> dict[str, Any]:
+    if link is None:
+        return {"retentionDays": None, "dailyRunTime": f"{END_OF_DAY_IST:%H:%M}", "dailyRunEnabled": True,
+                "outletIds": None}
+    return {
+        "retentionDays": int(link["retention_days"]), "dailyRunTime": f"{link['daily_run_time']:%H:%M}",
+        "dailyRunEnabled": bool(link["daily_run_enabled"]),
+        "outletIds": None if link["outlet_ids"] is None else [str(o) for o in link["outlet_ids"]],
+    }
+
+
 def _settings_or_503() -> DriveSettings:
     settings = google_drive.drive_settings()
     if settings is None:
@@ -1525,7 +1554,12 @@ def get_drive_connection(
         "account": link["google_email"] if link else None,
         "folderUrl": (f"https://drive.google.com/drive/folders/{link['root_folder_id']}"
                       if link and link["root_folder_id"] else None),
-        "retentionDays": int(link["retention_days"]) if link else None,
+        **_public_settings(link),
+        # For the administrator's choice of outlets: every outlet, with whether it has a PC.
+        "outlets": [{"dealerId": str(o["dealer_id"]), "dealerName": o["dealer_name"], "outletId": str(o["outlet_id"]),
+                     "outletName": o["outlet_name"], "pcs": len(o["pcs"]),
+                     "usesDrive": bool(o["pcs"]) and (link is None or uses_drive(link, o["outlet_id"]))}
+                    for o in outlets_with_pcs(connection, tenant_id)] if who["admin"] else None,
         "lastCheckedAtUtc": link["last_synced_at_utc"].isoformat() if link and link["last_synced_at_utc"] else None,
         "problem": link["last_error"] if link else None,
         "canConnect": who["admin"], "canRun": who["lead"] or bool(who["pcOutlets"]),
@@ -1541,17 +1575,37 @@ def set_drive_settings(
     client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    """How many days after a journey is closed its folder goes to the archive (an administrator)."""
+    """The Project's Drive settings (an administrator): how many days after a journey is closed
+    its folder goes to the archive, when the daily run starts (India time) and whether it runs
+    at all, and which outlets use Drive."""
     who = _caller(connection, tenant_id, principal, client, _UPDATE)
     if not who["admin"]:
         raise HTTPException(status_code=403, detail="Only an administrator changes the Drive settings.")
-    updated = connection.execute(
-        text("UPDATE auditcore.p2_drive_connections SET retention_days=:d, updated_at_utc=now() WHERE tenant_id=:t "
-             "RETURNING retention_days"), {"d": command.retentionDays, "t": tenant_id},
-    ).scalar_one_or_none()
-    if updated is None:
+    link = _connection_row(connection, tenant_id)
+    if link is None:
         raise HTTPException(status_code=409, detail="The Project's Google Drive is not connected.")
-    return {"retentionDays": int(updated)}
+    sent = command.model_fields_set
+    values: dict[str, Any] = {}
+    if command.retentionDays is not None:
+        values["retention_days"] = command.retentionDays
+    if command.dailyRunTime is not None:
+        values["daily_run_time"] = time.fromisoformat(command.dailyRunTime)
+    if command.dailyRunEnabled is not None:
+        values["daily_run_enabled"] = command.dailyRunEnabled
+    if "outletIds" in sent:
+        known = {str(o["outlet_id"]) for o in outlets_with_pcs(connection, tenant_id)}
+        chosen = None if command.outletIds is None else sorted({str(o) for o in command.outletIds})
+        if chosen is not None and not set(chosen) <= known:
+            raise HTTPException(status_code=422, detail="An outlet chosen is not one of this Project's.")
+        values["outlet_ids"] = chosen
+    if values:
+        sets = ", ".join(f"{k}=CAST(:{k} AS uuid[])" if k == "outlet_ids" else f"{k}=:{k}" for k in values)
+        connection.execute(
+            text(f"UPDATE auditcore.p2_drive_connections SET {sets}, updated_at_utc=now() WHERE tenant_id=:t"),
+            {**values, "t": tenant_id},
+        )
+        link = _connection_row(connection, tenant_id)
+    return _public_settings(link)
 
 
 @router.post("/tenants/{tenant_id}/integrations/google-drive/connect")
