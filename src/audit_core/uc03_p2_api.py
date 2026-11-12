@@ -2728,6 +2728,9 @@ def set_page_type(
         swept=swept or quality_refused, event_type="PAGE_RETYPED", override_reason=override,
         correlation_id=get_correlation_id(request), quality_confirmed=quality_refused,
     )
+    from audit_core.uc03_p2_vehicle_photos import remove_unrecognised_page
+
+    remove_unrecognised_page(connection, tenant_id=tenant_id, queue_id=queue_id, actor_id=human_principal.subject)
     return {"queueId": str(new_id), "status": "QUEUED", "templateKey": template.key}
 
 

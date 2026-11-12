@@ -56,6 +56,52 @@ _CONTENT_TYPES = {
     PDF_TYPE: "pdf",
 }
 VIEW_CODES = ("FRONT", "REAR", "LEFT", "RIGHT", "INTERIOR", "ODOMETER", "CHASSIS", "DELIVERY", "OTHER")
+# Extras (product owner 2026-11-12): a page the system did not understand is kept with the
+# photos and other documents, not read. Added by the system only (add_unrecognised_page); it is
+# not a vehicle photo, so it counts neither towards the limits nor as proof of the vehicle.
+EXTRA_VIEW = "EXTRA"
+EXTRA_SOURCE = "P2_UNRECOGNISED"
+
+
+def extra_upload_id(queue_id: Any) -> str:
+    return f"extra:{queue_id}"
+
+
+def add_unrecognised_page(connection: Connection, *, tenant_id: str, queue_id: Any) -> bool:
+    """Keep a page no document type fits in the journey's Extras (its stored page, not a copy).
+    Once per page; True when it was added now."""
+    return connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.delivery_vehicle_photos (tenant_id, journey_id, object_key, original_filename,
+                content_type, size_bytes, uploaded_by_actor_id, client_upload_id, view_code, capture_source)
+            SELECT q.tenant_id, q.journey_id, q.page_object_key,
+                   left(b.original_filename || ' - page ' || array_to_string(
+                        COALESCE(q.page_numbers, ARRAY[q.page_number]), '-'), 255),
+                   CASE WHEN q.page_object_key LIKE '%.pdf' THEN 'application/pdf'
+                        ELSE COALESCE(b.content_type, 'application/octet-stream') END,
+                   0, b.uploaded_by_actor_id, :client, :view, :source
+            FROM auditcore.p2_document_queue q
+            JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
+            WHERE q.tenant_id=:t AND q.queue_id=:q AND q.page_object_key IS NOT NULL
+            ON CONFLICT (tenant_id, journey_id, client_upload_id) WHERE client_upload_id IS NOT NULL DO NOTHING
+            RETURNING photo_id
+            """
+        ),
+        {"t": tenant_id, "q": str(queue_id), "client": extra_upload_id(queue_id), "view": EXTRA_VIEW,
+         "source": EXTRA_SOURCE},
+    ).first() is not None
+
+
+def remove_unrecognised_page(connection: Connection, *, tenant_id: str, queue_id: Any, actor_id: str) -> None:
+    """The page was given a document type and is read after all: it leaves the Extras."""
+    connection.execute(
+        text(
+            "UPDATE auditcore.delivery_vehicle_photos SET deleted_at_utc=now(), deleted_by_actor_id=:a "
+            "WHERE tenant_id=:t AND client_upload_id=:client AND deleted_at_utc IS NULL"
+        ),
+        {"t": tenant_id, "client": extra_upload_id(queue_id), "a": actor_id},
+    )
 _CLIENT_UPLOAD_ID = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 
 
@@ -105,6 +151,7 @@ def _active_count(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                 """
                 SELECT COUNT(*) FROM auditcore.delivery_vehicle_photos
                 WHERE tenant_id=:t AND journey_id=:j AND deleted_at_utc IS NULL
+                  AND COALESCE(view_code, '') <> 'EXTRA'
                 """
             ),
             {"t": tenant_id, "j": journey_id},
@@ -119,6 +166,7 @@ def _active_pdf_count(connection: Connection, *, tenant_id: str, journey_id: UUI
                 """
                 SELECT COUNT(*) FROM auditcore.delivery_vehicle_photos
                 WHERE tenant_id=:t AND journey_id=:j AND deleted_at_utc IS NULL AND content_type=:pdf
+                  AND COALESCE(view_code, '') <> 'EXTRA'
                 """
             ),
             {"t": tenant_id, "j": journey_id, "pdf": PDF_TYPE},

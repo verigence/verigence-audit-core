@@ -132,7 +132,7 @@ def test_unclassified_page_raises_a_high_task_that_closes_when_the_type_is_set(j
     [task] = _open_unclassified_tasks(journey)
     assert task["task_type"] == "PC_VERIFY_UNRECOGNIZED_DOCUMENT" and task["severity"] == "HIGH"
     assert task["task_status"] == "READY"
-    assert task["title"] == "Set the document type: page 1 of packet.pdf"
+    assert task["title"] == "Not understood: page 1 of packet.pdf"
     assert task["reference"]["queueId"] == str(page["queue_id"]) and task["reference"]["pageNumbers"] == [1]
     assert str(classified["queue_id"]) not in task["dedupe_key"]
 

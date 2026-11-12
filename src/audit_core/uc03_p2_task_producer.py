@@ -1417,14 +1417,12 @@ def sync_unclassified_page_tasks(
             connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
             task_type="PC_VERIFY_UNRECOGNIZED_DOCUMENT", source_type="DOCUMENT",
             source_code="DOCUMENT_UNCLASSIFIED",
-            title=f"Set the document type: {where.lower()} of {row['original_filename']}",
+            title=f"Not understood: {where.lower()} of {row['original_filename']}",
             # Product owner 12 Nov 2026: "system doesn't understand the document. Pls recheck
             # and if required submit again".
-            description=(f"The system does not understand {where.lower()} of {row['original_filename']}, "
-                         "so nothing was read from it. Please recheck it and, if required, submit it again. "
-                         "If it is a checklist document, you can also open Upload / Edit Documents, find its "
-                         "card and choose the document type; it is then read as that document. Choose "
-                         "Others if it is not a checklist document: it stays on file without being read."),
+            description=(f"The system did not understand {where.lower()} of {row['original_filename']}. "
+                         "It is kept in Photos and other documents (Extras) and is not read. If it needs to "
+                         "be read, check with your TL and upload it again."),
             reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "DOCUMENT_UNCLASSIFIED",
                        "batchId": str(row["batch_id"]), "queueId": str(row["queue_id"]),
                        "filename": row["original_filename"], "pageNumbers": pages},

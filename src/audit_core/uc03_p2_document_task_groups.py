@@ -229,8 +229,8 @@ def document_detail(item: Mapping[str, Any], category: str, registry: Any = None
     elif task_type == "PC_VERIFY_UNRECOGNIZED_DOCUMENT":
         # Product owner 12 Nov 2026: "system doesn't understand the document. Pls recheck and
         # if required submit again".
-        reason = ("The system does not understand this document, so nothing was read from it. "
-                  "Please recheck it and, if required, submit it again.")
+        reason = ("Not understood by the system: kept in Photos and other documents (Extras), not read. "
+                  "If it needs to be read, check with your TL and upload it again.")
     elif task_type == "TL_DOCUMENT_STUCK":
         counts = ref.get("pages") or {}
         reason = (f"Not read for more than a day ({counts.get('read', 0)} of {counts.get('total', 0)} "

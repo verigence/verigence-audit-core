@@ -2102,8 +2102,12 @@ _NOTHING_READ_REASON = "Document Intelligence read this page but found no values
 # classification due to schema not available, then we have to send a message that system
 # doesn't understand the document. Pls recheck and if required submit again". A page refused
 # for its scan quality keeps its own message.
+# Then (same day): "these documents which are not recognized can be uploaded in the photos ...
+# alter the message that given pages are not understood. If they need to be scanned and
+# extracted pls consult with TL and reupload otherwise they are copied to the extras folder ...
+# make it simple". The page is kept in the journey's Extras (uc03_p2_vehicle_photos).
 UNRECOGNISED_REASON = (
-    "The system does not understand this document. Please recheck it and, if required, submit it again."
+    "The system did not understand this page. It is kept in Photos and other documents (Extras) and is not read. If it needs to be read, check with your TL and upload it again."
 )
 _NOT_QUEUED_REASON = (
     "Identified but not read: the booking already holds this document, or this document "
@@ -2986,6 +2990,10 @@ def _reconcile_page(
         },
     )
 
+    if outcome.reason == UNRECOGNISED_REASON:
+        from audit_core.uc03_p2_vehicle_photos import add_unrecognised_page
+
+        add_unrecognised_page(connection, tenant_id=work.tenant_id, queue_id=queue_id)
     if outcome.status in _PAGE_SETTLED_STATES and page["queue_status"] != outcome.status:
         _refresh_batch_status(connection, work.tenant_id, UUID(str(page["batch_id"])))
         record_activity(
