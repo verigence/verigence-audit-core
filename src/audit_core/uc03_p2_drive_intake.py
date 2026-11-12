@@ -15,8 +15,12 @@ The folders (the Project's own Google account, google_drive)
     not be the master's. An outlet has one folder and no two outlets share one
     (product owner 2026-11-12: "each outlet should have one folder ... no two
     outlets share one folder"): the PCs of an outlet all work in it, and a PC
-    mapped to several outlets works in each outlet's own folder. The PC makes
-    only the customer's folder -- the name and the booking / OTF
+    mapped to several outlets works in each outlet's own folder. The PCs do not
+    hold the account's password ("I need option B"): each outlet's folder is
+    shared with the Google account of every PC mapped to it -- their Verigence
+    sign-in email -- once the PC has asked for it on Drive uploads, and the
+    sharing is taken away when the PC is no longer mapped (``ensure_shares``).
+    The PC makes only the customer's folder -- the name and the booking / OTF
     number or the mobile number, in either order -- and keeps putting that
     customer's files in it: the booking papers, later the delivery file, later
     whatever was missing. A folder inside it whose name starts with "photo" or "pic"
@@ -301,11 +305,9 @@ def uses_drive(link: dict[str, Any], outlet_id: Any) -> bool:
 
 
 def attributed_pc(outlet: dict[str, Any] | None, folder_pc: str | None, submitter: str | None) -> dict[str, Any] | None:
-    """Whose the files of an outlet are: the outlet's only PC, else the PC who pressed
-    Submit, else the PC mapped to the outlet first. Every PC signs in to the Project's one
-    Google account, so Drive cannot say which of an outlet's PCs put a file there.
-    (``folder_pc``: the PC already on the file -- from the PC folders of the first hours of
-    12 Nov 2026, see ``_retire_pc_folders``.)"""
+    """Whose the files of an outlet are: the PC whose Google account put the file in Drive
+    (``folder_pc``: the PC recorded on the file, by the file's owner), else the outlet's only
+    PC, else the PC who pressed Submit, else the PC mapped to the outlet first."""
     pcs = (outlet or {}).get("pcs") or []
     by_id = {p["actor_id"]: p for p in pcs}
     if folder_pc and folder_pc in by_id:
@@ -488,6 +490,160 @@ def _retire_pc_folders(connection: Connection, tenant_id: str, client: DriveClie
     return retired
 
 
+# --------------------------------------------------------------------------- the PCs' own Google accounts
+
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_SHARE_RETRY = timedelta(hours=1)
+
+
+def _people(connection: Connection, tenant_id: str) -> dict[str, str]:
+    """The Google account each person uses for Drive, by actor."""
+    return {str(r["actor_id"]): str(r["google_email"]) for r in connection.execute(
+        text("SELECT actor_id, google_email FROM auditcore.p2_drive_people WHERE tenant_id=:t"), {"t": tenant_id},
+    ).mappings()}
+
+
+def _shares(connection: Connection, tenant_id: str) -> dict[tuple[str, str], dict[str, Any]]:
+    return {(str(r["drive_folder_id"]), str(r["actor_id"])): dict(r) for r in connection.execute(
+        text("SELECT * FROM auditcore.p2_drive_shares WHERE tenant_id=:t"), {"t": tenant_id},
+    ).mappings()}
+
+
+def _shared(row: dict[str, Any] | None) -> bool:
+    return bool(row and row["permission_id"] and row["removed_at_utc"] is None)
+
+
+def _outlet_folders(connection: Connection, tenant_id: str, link: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every outlet that uses Drive and has its folder, with the folder's id."""
+    out = []
+    for outlet in outlets_with_pcs(connection, tenant_id):
+        if not outlet["pcs"] or not uses_drive(link, outlet["outlet_id"]):
+            continue
+        folder = _made(connection, tenant_id, "OUTLET", dealer_id=outlet["dealer_id"], outlet_id=outlet["outlet_id"])
+        if folder is not None:
+            out.append({**outlet, "folder_id": str(folder["drive_folder_id"])})
+    return out
+
+
+def ensure_shares(engine: Engine, tenant_id: str, client: DriveClient, only_actor: str | None = None) -> dict[str, int]:
+    """Each outlet's folder is shared with the Google account of every PC mapped to the outlet
+    who has asked for it, and with nobody Verigence shared it with before who is no longer
+    mapped (product owner 2026-11-12, option B). Google emails the PC the link when the
+    folder is first shared. A sharing Google refused is kept with the reason and tried again
+    after an hour. ``only_actor``: one person's folders only (they have just asked)."""
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        link = _connection_row(connection, tenant_id)
+        if link is None:
+            return {"shared": 0, "removed": 0, "refused": 0}
+        people, before = _people(connection, tenant_id), _shares(connection, tenant_id)
+        wanted = {(o["folder_id"], pc["actor_id"]): (people[pc["actor_id"]], o["outlet_id"])
+                  for o in _outlet_folders(connection, tenant_id, link) for pc in o["pcs"] if pc["actor_id"] in people}
+    counts = {"shared": 0, "removed": 0, "refused": 0}
+    locked: set[str] = {folder_id for (folder_id, _), row in before.items() if row["permission_id"]}
+    now = datetime.now(UTC)
+
+    def save(folder_id: str, actor_id: str, **values: Any) -> None:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO auditcore.p2_drive_shares (tenant_id, drive_folder_id, actor_id, outlet_id,
+                        google_email, permission_id, last_error, shared_at_utc, removed_at_utc)
+                    VALUES (:t, :f, :a, :outlet_id, :google_email, :permission_id, :last_error, :shared_at_utc,
+                            :removed_at_utc)
+                    ON CONFLICT (tenant_id, drive_folder_id, actor_id) DO UPDATE SET
+                        outlet_id=EXCLUDED.outlet_id, google_email=EXCLUDED.google_email,
+                        permission_id=EXCLUDED.permission_id, last_error=EXCLUDED.last_error,
+                        shared_at_utc=EXCLUDED.shared_at_utc, removed_at_utc=EXCLUDED.removed_at_utc,
+                        updated_at_utc=now()
+                    """
+                ),
+                {"t": tenant_id, "f": folder_id, "a": actor_id, **values},
+            )
+
+    def take_away(folder_id: str, actor_id: str, row: dict[str, Any]) -> bool:
+        try:
+            client.unshare(folder_id, str(row["permission_id"]))
+        except DriveAuthorizationLost:
+            raise
+        except DriveError as exc:
+            logger.warning("p2_drive_unshare_failed", tenant_id=tenant_id, folder_id=folder_id, error=str(exc))
+            return False
+        save(folder_id, actor_id, outlet_id=row["outlet_id"], google_email=row["google_email"], permission_id=None,
+             last_error=None, shared_at_utc=row["shared_at_utc"], removed_at_utc=now)
+        counts["removed"] += 1
+        return True
+
+    for (folder_id, actor_id), (email, outlet_id) in wanted.items():
+        if only_actor and actor_id != only_actor:
+            continue
+        row = before.get((folder_id, actor_id))
+        same = row is not None and str(row["google_email"]).lower() == email.lower()
+        if _shared(row) and same:
+            continue
+        if _shared(row) and not take_away(folder_id, actor_id, row):  # another address before: that one goes first
+            continue
+        if (row is not None and same and row["last_error"] and not only_actor
+                and row["updated_at_utc"] > now - _SHARE_RETRY):
+            continue
+        try:
+            if folder_id not in locked:
+                client.lock_sharing(folder_id)
+                locked.add(folder_id)
+            permission_id, error = client.share(folder_id, email), None
+        except DriveAuthorizationLost:
+            raise
+        except DriveError as exc:
+            permission_id, error = None, str(exc)[:500]
+        save(folder_id, actor_id, outlet_id=outlet_id, google_email=email, permission_id=permission_id,
+             last_error=error, shared_at_utc=now if permission_id else None, removed_at_utc=None)
+        counts["shared" if permission_id else "refused"] += 1
+    for (folder_id, actor_id), row in before.items():
+        if (folder_id, actor_id) not in wanted and _shared(row) and not (only_actor and actor_id != only_actor):
+            take_away(folder_id, actor_id, row)
+    return counts
+
+
+def my_access(connection: Connection, tenant_id: str, link: dict[str, Any] | None, actor_id: str,
+              pc_outlets: set[str]) -> dict[str, Any]:
+    """A PC's own way into Drive: the Google account their outlets' folders are shared with,
+    and each of those folders with its link."""
+    if link is None:
+        return {"googleEmail": None, "folders": []}
+    shares = _shares(connection, tenant_id)
+    folders = []
+    for outlet in _outlet_folders(connection, tenant_id, link):
+        if str(outlet["outlet_id"]) not in pc_outlets:
+            continue
+        row = shares.get((outlet["folder_id"], actor_id))
+        folders.append({
+            "outletId": str(outlet["outlet_id"]), "outletName": outlet["outlet_name"], "dealerName": outlet["dealer_name"],
+            "url": f"https://drive.google.com/drive/folders/{outlet['folder_id']}", "shared": _shared(row),
+            "problem": row["last_error"] if row and not _shared(row) else None,
+        })
+    return {"googleEmail": _people(connection, tenant_id).get(actor_id), "folders": folders}
+
+
+def access_overview(connection: Connection, tenant_id: str, link: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """For the administrator: every PC of an outlet that uses Drive, the Google account their
+    folders are shared with (none: they have not asked yet), and each folder's state."""
+    if link is None:
+        return []
+    people, shares = _people(connection, tenant_id), _shares(connection, tenant_id)
+    out: dict[str, dict[str, Any]] = {}
+    for outlet in _outlet_folders(connection, tenant_id, link):
+        for pc in outlet["pcs"]:
+            row = shares.get((outlet["folder_id"], pc["actor_id"]))
+            node = out.setdefault(pc["actor_id"], {"actorId": pc["actor_id"], "name": pc["name"],
+                                                   "googleEmail": people.get(pc["actor_id"]), "folders": []})
+            node["folders"].append({"outletId": str(outlet["outlet_id"]), "outletName": outlet["outlet_name"],
+                                    "dealerName": outlet["dealer_name"], "shared": _shared(row),
+                                    "problem": row["last_error"] if row and not _shared(row) else None})
+    return sorted(out.values(), key=lambda p: str(p["name"] or p["actorId"]).lower())
+
+
 # --------------------------------------------------------------------------- finding what is new
 
 class _Places:
@@ -590,8 +746,15 @@ def register_file(engine: Engine, tenant_id: str, places: _Places, meta: dict[st
         "outlet": parent["outlet_id"], "day": created.astimezone(IST).date() if created else ist_today(),
         "pc": parent["pc_actor_id"], "lane": lane, "status": "SET_ASIDE" if reason else "NEW", "detail": reason,
     }
+    owner = str(((meta.get("owners") or [{}])[0] or {}).get("emailAddress") or "").strip().lower()
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
+        if owner:
+            # Whose Google account put it in Drive: that PC's file (two PCs can share an outlet's folder).
+            values["pc"] = connection.execute(
+                text("SELECT actor_id FROM auditcore.p2_drive_people WHERE tenant_id=:t AND lower(google_email)=:e "
+                     "ORDER BY asked_at_utc LIMIT 1"), {"t": tenant_id, "e": owner},
+            ).scalar_one_or_none() or values["pc"]
         # An earlier content of the same file that was never taken is no longer the file.
         connection.execute(
             text("UPDATE auditcore.p2_drive_files SET file_status='SET_ASIDE', updated_at_utc=now(), "
@@ -1473,6 +1636,7 @@ def drive_round(engine: Engine, tenant_ids: list[str], *, worker_id: str | None 
                 continue
             client, link = linked
             result: dict[str, Any] = {"tree": ensure_tree(engine, tenant_id, client),
+                                      "shares": ensure_shares(engine, tenant_id, client),
                                       "found": sync(engine, tenant_id, client, link)}
             due = end_of_day_due(now, link["daily_run_time"]) if link["daily_run_enabled"] else None
             if due is not None:
@@ -1507,6 +1671,10 @@ class DriveRunCommand(BaseModel):
     day: date | None = Field(default=None, alias="date")
     mode: str | None = None
     requestedByName: str | None = Field(default=None, max_length=300)
+
+
+class DriveAccessCommand(BaseModel):
+    googleEmail: str = Field(min_length=3, max_length=320)
 
 
 class DriveSettingsCommand(BaseModel):
@@ -1608,7 +1776,54 @@ def get_drive_connection(
         "problem": link["last_error"] if link else None,
         "canConnect": who["admin"], "canRun": who["lead"] or bool(who["pcOutlets"]),
         "waitingByOutlet": waiting, "waiting": sum(waiting.values()),
+        # A PC: the Google account their outlets' folders are shared with, and the folders.
+        "myAccess": my_access(connection, tenant_id, link, principal.subject, who["pcOutlets"])
+        if who["pcOutlets"] else None,
+        # The administrator: every PC and whether their folders are shared.
+        "people": access_overview(connection, tenant_id, link) if who["admin"] else None,
     }
+
+
+@router.post("/tenants/{tenant_id}/drive/access")
+def ask_drive_access(
+    tenant_id: str,
+    command: DriveAccessCommand,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    engine: Annotated[Engine, Depends(get_engine)],
+) -> dict[str, Any]:
+    """A PC asks for the folders of the outlets they upload for: each is shared with their own
+    Google account -- the email they sign in to Verigence with, sent by the app -- and Google
+    emails them the links. Asked again with another address, the folders move to that one."""
+    who = _caller(connection, tenant_id, principal, client, _UPDATE)
+    if not who["pcOutlets"]:
+        raise HTTPException(status_code=403, detail="Only a PC is given the folders of the outlets they upload for.")
+    email = command.googleEmail.strip().lower()
+    if not _EMAIL.match(email):
+        raise HTTPException(status_code=422, detail="Give the email of your Google account.")
+    link = _connection_row(connection, tenant_id)
+    if link is None or link["connection_status"] != "CONNECTED":
+        raise HTTPException(status_code=409, detail="The Project's Google Drive is not connected.")
+    with engine.begin() as own:
+        set_tenant_context(own, tenant_id)
+        own.execute(
+            text("INSERT INTO auditcore.p2_drive_people (tenant_id, actor_id, google_email) VALUES (:t, :a, :e) "
+                 "ON CONFLICT (tenant_id, actor_id) DO UPDATE SET google_email=EXCLUDED.google_email, "
+                 "updated_at_utc=now()"), {"t": tenant_id, "a": principal.subject, "e": email},
+        )
+    linked = connected_client(engine, tenant_id)
+    if linked is None:
+        raise HTTPException(status_code=409, detail="The Project's Google Drive is not connected.")
+    try:
+        ensure_shares(engine, tenant_id, linked[0], only_actor=principal.subject)
+    except DriveError as exc:
+        logger.warning("p2_drive_access_failed", tenant_id=tenant_id, actor_id=principal.subject, error=str(exc))
+        raise HTTPException(status_code=502, detail="Google Drive could not share the folders just now. "
+                                                    "Try again in a few minutes.") from exc
+    with engine.begin() as own:
+        set_tenant_context(own, tenant_id)
+        return my_access(own, tenant_id, _connection_row(own, tenant_id), principal.subject, who["pcOutlets"])
 
 
 @router.put("/tenants/{tenant_id}/integrations/google-drive/settings")

@@ -5,8 +5,9 @@ complexity": a plain Google account, no Workspace and no shared drive. In a plai
 Drive only a file's owner can delete it and a service account can own nothing,
 so Verigence does not use a service account: the account's owner approves once
 on Google's own screen (OAuth, offline access) and Verigence then acts as that
-account -- it makes the folders, reads what the PCs put in them, and moves a
-closed journey's folder to the archive. Nothing a PC put in Drive is deleted; the
+account -- it makes the folders, shares each outlet's folder with the Google
+accounts of that outlet's PCs (they never hold the account's password), reads
+what the PCs put in them, and moves a closed journey's folder to the archive. Nothing a PC put in Drive is deleted; the
 one thing ever put in the bin is an empty folder Verigence itself made and no
 longer uses (``DriveClient.bin_folder``).
 
@@ -42,7 +43,7 @@ AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 API = "https://www.googleapis.com/drive/v3"
 FOLDER_TYPE = "application/vnd.google-apps.folder"
-FILE_FIELDS = "id,name,mimeType,size,md5Checksum,createdTime,modifiedTime,parents,trashed"
+FILE_FIELDS = "id,name,mimeType,size,md5Checksum,createdTime,modifiedTime,parents,trashed,owners(emailAddress)"
 DEFAULT_REDIRECT_URI = "https://verigence.jbrconsulting.in/audit-core/p2/v1/integrations/google-drive/callback"
 DEFAULT_RETURN_URL = "https://verigence.jbrconsulting.in/p2/drive-uploads"
 _STATE_SECONDS = 900
@@ -271,6 +272,26 @@ class DriveClient:
         if old_parent_id:
             params["removeParents"] = old_parent_id
         self._request("PATCH", f"/files/{file_id}", params=params, body={})
+
+    def share(self, folder_id: str, email: str) -> str:
+        """The folder (and everything in it) shared with a person's own Google account, as an
+        editor: they can add customer folders and files to it. Google emails them the link.
+        Returns Google's id of the sharing, by which it is taken away again."""
+        return str(self._request(
+            "POST", f"/files/{folder_id}/permissions", params={"sendNotificationEmail": "true", "fields": "id"},
+            body={"type": "user", "role": "writer", "emailAddress": email},
+        ).json()["id"])
+
+    def unshare(self, folder_id: str, permission_id: str) -> None:
+        """The sharing taken away (already gone is fine)."""
+        try:
+            self._request("DELETE", f"/files/{folder_id}/permissions/{permission_id}")
+        except DriveNotFound:
+            return
+
+    def lock_sharing(self, folder_id: str) -> None:
+        """Only the account itself shares the folder on: an editor cannot add other people."""
+        self._request("PATCH", f"/files/{folder_id}", params={"fields": "id"}, body={"writersCanShare": False})
 
     def bin_folder(self, folder_id: str) -> bool:
         """An empty folder to Drive's bin (from where it can be restored for 30 days).

@@ -46,6 +46,9 @@ class FakeDrive:
         self.data: dict[str, bytes] = {}
         self.log: list[str] = []
         self.downloads: list[str] = []
+        self.shared: dict[str, dict[str, str]] = {}     # folder -> {permission id: email}
+        self.locked: set[str] = set()
+        self.refuse: set[str] = set()                   # emails Google will not share with
 
     def _new(self, name: str, mime: str, parent: str | None, data: bytes | None = None) -> dict:
         item = {"id": f"d{len(self.items) + 1:04d}", "name": name, "mimeType": mime,
@@ -63,8 +66,11 @@ class FakeDrive:
     def folder(self, name: str, parent: str | None) -> str:
         return self._new(name, FOLDER_TYPE, parent)["id"]
 
-    def put(self, name: str, parent: str, data: bytes, mime: str = PDF) -> str:
-        return self._new(name, mime, parent, data)["id"]
+    def put(self, name: str, parent: str, data: bytes, mime: str = PDF, owner: str | None = None) -> str:
+        item = self._new(name, mime, parent, data)
+        if owner:   # put there by a PC's own Google account
+            item["owners"] = [{"emailAddress": owner}]
+        return item["id"]
 
     def bin(self, item_id: str) -> None:
         self.items[item_id]["trashed"] = True
@@ -101,6 +107,19 @@ class FakeDrive:
     def move(self, file_id: str, new_parent_id: str, old_parent_id: str | None) -> None:
         self.items[file_id]["parents"] = [new_parent_id]
         self.log.append(file_id)
+
+    def share(self, folder_id: str, email: str) -> str:
+        if email in self.refuse:
+            raise google_drive.DriveError(400, "Bad Request. User message: \"You cannot share this item\"")
+        permission_id = f"p{sum(len(v) for v in self.shared.values()) + 1}-{email}"
+        self.shared.setdefault(folder_id, {})[permission_id] = email
+        return permission_id
+
+    def unshare(self, folder_id: str, permission_id: str) -> None:
+        self.shared.get(folder_id, {}).pop(permission_id, None)
+
+    def lock_sharing(self, folder_id: str) -> None:
+        self.locked.add(folder_id)
 
     def bin_folder(self, folder_id: str) -> bool:
         if self.children(folder_id):
@@ -346,6 +365,72 @@ def test_a_folder_deleted_in_drive_is_made_again(s):
     client, _ = drive.connected_client(s.engine, s.t)
     assert drive.ensure_tree(s.engine, s.t, client) == {"made": 1}
     assert s.fake.named("Aditya Motors - Cuttack")["id"] != outlet
+
+
+# --------------------------------------------------------------------------- the PCs' own Google accounts
+
+def test_a_pc_asks_for_the_folders_and_they_are_shared_with_their_google_account(s):
+    """Product owner 2026-11-12: "I need option B" -- the PCs do not hold the account's password."""
+    outlet = _tree(s)
+    before = s.client.get(f"{s.base}/integrations/google-drive").json()
+    assert before["myAccess"] == {"googleEmail": None, "folders": [
+        {"outletId": str(s.journey.outlet_id), "outletName": "Aditya Motors - Cuttack", "dealerName": "Aditya Motors",
+         "url": f"https://drive.google.com/drive/folders/{outlet}", "shared": False, "problem": None}]}
+    assert s.client.post(f"{s.base}/drive/access", json={"googleEmail": "not an email"}).status_code == 422
+    asked = s.client.post(f"{s.base}/drive/access", json={"googleEmail": " Ravi@Gmail.com "})
+    assert asked.status_code == 200, asked.text
+    assert asked.json()["googleEmail"] == "ravi@gmail.com" and asked.json()["folders"][0]["shared"] is True
+    assert list(s.fake.shared[outlet].values()) == ["ravi@gmail.com"] and outlet in s.fake.locked
+    # Asked again, and on every round: shared once.
+    s.client.post(f"{s.base}/drive/access", json={"googleEmail": "ravi@gmail.com"})
+    client, _ = drive.connected_client(s.engine, s.t)
+    assert drive.ensure_shares(s.engine, s.t, client) == {"shared": 0, "removed": 0, "refused": 0}
+    assert list(s.fake.shared[outlet].values()) == ["ravi@gmail.com"]
+    # Another address: the folder moves to it.
+    s.client.post(f"{s.base}/drive/access", json={"googleEmail": "ravi.k@gmail.com"})
+    assert list(s.fake.shared[outlet].values()) == ["ravi.k@gmail.com"]
+    # Someone who uploads for no outlet is given nothing; the administrator sees who has what.
+    _as(s, "admin", "TENANT_ADMIN")
+    assert s.client.post(f"{s.base}/drive/access", json={"googleEmail": "boss@gmail.com"}).status_code == 403
+    [person] = s.client.get(f"{s.base}/integrations/google-drive").json()["people"]
+    assert person["googleEmail"] == "ravi.k@gmail.com" and person["folders"][0]["shared"] is True
+
+
+def test_a_pc_no_longer_mapped_loses_the_folder_and_a_refusal_is_kept_and_tried_again(s):
+    outlet = _tree(s)
+    s.fake.refuse.add("ravi@gmail.com")
+    asked = s.client.post(f"{s.base}/drive/access", json={"googleEmail": "ravi@gmail.com"}).json()
+    assert asked["folders"][0]["shared"] is False and "cannot share" in asked["folders"][0]["problem"]
+    client, _ = drive.connected_client(s.engine, s.t)
+    s.fake.refuse.clear()
+    assert drive.ensure_shares(s.engine, s.t, client)["shared"] == 0                 # not before an hour has passed
+    _exec(s, "UPDATE auditcore.p2_drive_shares SET updated_at_utc = now() - interval '2 hours' WHERE tenant_id=:t")
+    assert drive.ensure_shares(s.engine, s.t, client)["shared"] == 1
+    assert list(s.fake.shared[outlet].values()) == ["ravi@gmail.com"]
+    _exec(s, "UPDATE auditcore.business_assignments SET assignment_status='INACTIVE' WHERE tenant_id=:t "
+             "AND security_actor_id=:a", a=s.journey.actor_id)
+    _exec(s, "INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, dealer_id, "
+             "outlet_id) VALUES (:t, 'second-pc', 'PC', :d, :o)", d=s.journey.dealer_id, o=s.journey.outlet_id)
+    assert drive.ensure_shares(s.engine, s.t, client) == {"shared": 0, "removed": 1, "refused": 0}
+    assert s.fake.shared[outlet] == {}
+
+
+def test_in_an_outlet_with_two_pcs_a_file_is_the_pcs_whose_google_account_put_it(s):
+    outlet = _tree(s)
+    _exec(s, "INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, dealer_id, "
+             "outlet_id) VALUES (:t, 'second-pc', 'PC', :d, :o)", d=s.journey.dealer_id, o=s.journey.outlet_id)
+    _exec(s, "INSERT INTO auditcore.p2_drive_people (tenant_id, actor_id, google_email) VALUES "
+             "(:t, 'second-pc', 'Sita@gmail.com'), (:t, :a, 'ravi@gmail.com')", a=s.journey.actor_id)
+    s.fake.put("docket.pdf", s.fake.folder("Akansh-456909", outlet), b"%PDF docket", owner="sita@gmail.com")
+    s.fake.put("pan.pdf", s.fake.folder("Bimal-778899", outlet), b"%PDF pan", owner="ravi@gmail.com")
+    s.fake.put("form.pdf", s.fake.folder("Chitta-112233", outlet), b"%PDF form")          # by the account itself
+    _sync(s)
+    files = _files(s)
+    assert files["docket.pdf"]["pc_actor_id"] == "second-pc" and files["pan.pdf"]["pc_actor_id"] == s.journey.actor_id
+    assert files["form.pdf"]["pc_actor_id"] is None
+    assert drive.attributed_pc({"pcs": [{"actor_id": "a"}, {"actor_id": "b"}]}, "b", "a") == {"actor_id": "b"}
+    assert drive.attributed_pc({"pcs": [{"actor_id": "a"}, {"actor_id": "b"}]}, None, "b") == {"actor_id": "b"}
+    assert drive.attributed_pc({"pcs": [{"actor_id": "a"}, {"actor_id": "b"}]}, "gone", None) == {"actor_id": "a"}
 
 
 # --------------------------------------------------------------------------- what the feed finds
