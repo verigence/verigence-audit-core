@@ -1465,34 +1465,26 @@ def _insurance_decided(insurance: dict[str, Any]) -> str:
 
 
 def insurance_invoice_missing(facts: _Facts) -> RuleOutcome:
-    """The vehicle is invoiced but nothing bills the insurance premium: the
-    PC uploads the insurance document, or admits the customer arranged their
-    own insurance (which keeps the premium out of the deal and flags the
-    Team Lead). Decision 2026-09-30; the cover-note reading follows.
+    """The insurance invoice is optional (product owner 2026-11-12): nothing asks for it.
 
-    This asked for a ``debit_note`` -- a commercial instrument the
-    dealership may never raise -- as the proof. Dealer-arranged insurance is
-    evidenced by the insurance copy, so the ask is ``insurance_cover``, the
-    document the PC actually has (and which is REQUIRED for Delivery
-    anyway). A debit note, when one exists, is still read and still checked
-    against the cover note by INSURANCE_PREMIUM_VS_DEBIT_NOTE."""
+    Insurance through the dealership is shown by the premium on the NDC; for a customer's
+    own insurance no invoice is due at all -- only the insurance cover note, which is a
+    Delivery document of its own (asked for by the document requirements, not here).
+
+    Until then this failed once the vehicle was invoiced and nothing on file billed the
+    premium, and asked the PC to upload the cover note or admit self insurance (decision
+    2026-09-30). The check stays registered and always passes, so the tasks it raised
+    close on the Journey's next evaluation; whether the insurance is in-house or the
+    customer's own is the INSURANCE_SOURCE_CONFIRM question."""
     code = "INSURANCE_INVOICE_MISSING"
     insurance = facts.sheet["insurance"]
     if insurance["source"] == "SELF":
-        return RuleOutcome(code, "PASS", f"Self insurance ({_insurance_decided(insurance)}): no dealer insurance invoice is due.")
+        return RuleOutcome(code, "PASS", f"Self insurance ({_insurance_decided(insurance)}): no insurance invoice "
+                                         "is due; the insurance cover note is the document needed.")
     if insurance["invoiceOnFile"]:
-        return RuleOutcome(code, "PASS", "The insurance premium is invoiced.")
-    if not insurance["vehicleInvoiced"]:
-        return RuleOutcome(code, "PASS", "The vehicle is not invoiced yet; the insurance invoice is due with it.")
-    return RuleOutcome(code, "FAIL", (
-        "The vehicle is invoiced but nothing on file bills the insurance premium. Upload the insurance "
-        "cover note, or confirm that the customer arranged their own insurance."
-    ), {
-        "findingTitle": "Insurance invoice missing",
-        "question": "Is the insurance through the dealership? Upload the insurance cover note; if the customer arranged their own, say so.",
-        "answers": [{"value": "SELF", "label": "Self insurance: the customer arranged it", "requiresComment": True}],
-        "uploadFirst": True, "documentTypes": ["insurance_cover"],
-    })
+        return RuleOutcome(code, "PASS", "The insurance premium is accounted for on the documents on file.")
+    return RuleOutcome(code, "PASS", "The insurance invoice is optional: the premium on the NDC shows insurance "
+                                     "through the dealership.")
 
 
 def self_insurance_declared(facts: _Facts) -> RuleOutcome:
