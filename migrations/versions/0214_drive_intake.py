@@ -1,4 +1,4 @@
-"""0213_drive_intake -- journey files dropped in the Project's Google Drive (product owner 2026-11-12).
+"""0214_drive_intake -- journey files dropped in the Project's Google Drive (product owner 2026-11-12).
 
 PCs put a customer's files in Google Drive, under the Project's own Google account;
 Verigence takes them from there (uc03_p2_drive_intake). Drive is the inbox, these
@@ -34,8 +34,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0213_drive_intake"
-down_revision = "0212_source_values_withdrawn"
+revision = "0214_drive_intake"
+down_revision = "0213_accessories_check_switch"
 branch_labels = None
 depends_on = None
 
