@@ -6,7 +6,9 @@ Drive only a file's owner can delete it and a service account can own nothing,
 so Verigence does not use a service account: the account's owner approves once
 on Google's own screen (OAuth, offline access) and Verigence then acts as that
 account -- it makes the folders, reads what the PCs put in them, and moves a
-closed journey's folder to the archive (nothing is deleted).
+closed journey's folder to the archive. Nothing a PC put in Drive is deleted; the
+one thing ever put in the bin is an empty folder Verigence itself made and no
+longer uses (``DriveClient.bin_folder``).
 
 What is kept is the refresh token, sealed with a key made from the OAuth client
 secret (the secret is in the service's variables, never in the database), so the
@@ -269,6 +271,15 @@ class DriveClient:
         if old_parent_id:
             params["removeParents"] = old_parent_id
         self._request("PATCH", f"/files/{file_id}", params=params, body={})
+
+    def bin_folder(self, folder_id: str) -> bool:
+        """An empty folder to Drive's bin (from where it can be restored for 30 days).
+        Refused -- False -- when anything is in it, so nothing a person put in Drive goes
+        with it."""
+        if self.children(folder_id):
+            return False
+        self._request("PATCH", f"/files/{folder_id}", params={"fields": "id,trashed"}, body={"trashed": True})
+        return True
 
     def download(self, file_id: str) -> bytes:
         return self._request("GET", f"/files/{file_id}", params={"alt": "media"}).content

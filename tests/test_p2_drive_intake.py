@@ -102,6 +102,12 @@ class FakeDrive:
         self.items[file_id]["parents"] = [new_parent_id]
         self.log.append(file_id)
 
+    def bin_folder(self, folder_id: str) -> bool:
+        if self.children(folder_id):
+            return False
+        self.bin(folder_id)
+        return True
+
     def download(self, file_id: str) -> bytes:
         self.downloads.append(file_id)
         return self.data[file_id]
@@ -300,11 +306,37 @@ def test_verigence_makes_the_project_dealership_and_outlet_folders_once(s):
     assert s.fake.items[outlet]["parents"] == [s.fake.named("Aditya Motors")["id"]]
     client, _ = drive.connected_client(s.engine, s.t)
     assert drive.ensure_tree(s.engine, s.t, client) == {"made": 0}
-    # A second PC at the outlet: a folder each.
+    # A second PC at the outlet: still the outlet's one folder, with nothing made in it.
     _exec(s, "INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, dealer_id, "
              "outlet_id) VALUES (:t, 'second-pc', 'PC', :d, :o)", d=s.journey.dealer_id, o=s.journey.outlet_id)
-    assert drive.ensure_tree(s.engine, s.t, client) == {"made": 2}
-    assert sum(1 for i in s.fake.items.values() if i["parents"] == [outlet]) == 2
+    assert drive.ensure_tree(s.engine, s.t, client) == {"made": 0}
+    assert not [i for i in s.fake.items.values() if i["parents"] == [outlet]]
+
+
+def test_the_pc_folders_of_12_nov_are_emptied_into_the_outlets_folder_and_binned(s):
+    """Product owner 2026-11-12: "each outlet should have one folder". The folders per PC
+    made before that go; what a PC had already put in one is still the outlet's."""
+    outlet = _tree(s)
+    used, empty = s.fake.folder("Ravi", outlet), s.fake.folder("Second PC", outlet)
+    for folder_id, actor in ((used, s.journey.actor_id), (empty, "second-pc")):
+        _exec(s, "INSERT INTO auditcore.p2_drive_folders (tenant_id, drive_folder_id, folder_kind, parent_folder_id, "
+                 "folder_name, dealer_id, outlet_id, pc_actor_id, made_by_system) "
+                 "VALUES (:t, :f, 'PC', :p, 'PC', :d, :o, :a, true)", f=folder_id, p=outlet,
+              d=s.journey.dealer_id, o=s.journey.outlet_id, a=actor)
+    customer = s.fake.folder("Akansh-456909", used)
+    s.fake.put("docket.pdf", customer, b"%PDF docket")
+    assert _sync(s)["new"] == 1
+    client, _ = drive.connected_client(s.engine, s.t)
+    assert drive.ensure_tree(s.engine, s.t, client) == {"made": 0, "retired": 2}
+    assert s.fake.items[customer]["parents"] == [outlet]
+    assert s.fake.items[used]["trashed"] and s.fake.items[empty]["trashed"]
+    assert drive.ensure_tree(s.engine, s.t, client) == {"made": 0}       # once
+    _sync(s)
+    file = _files(s)["docket.pdf"]
+    assert file["file_status"] == "NEW" and str(file["outlet_id"]) == str(s.journey.outlet_id)
+    # A customer's folder put straight in the outlet's folder afterwards is the outlet's as before.
+    s.fake.put("pan.pdf", s.fake.folder("Bimal-778899", outlet), b"%PDF pan")
+    assert _sync(s)["new"] == 1
 
 
 def test_a_folder_deleted_in_drive_is_made_again(s):

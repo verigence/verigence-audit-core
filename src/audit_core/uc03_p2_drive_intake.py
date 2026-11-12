@@ -12,8 +12,11 @@ The folders (the Project's own Google account, google_drive)
     <Project> / <Dealership> / <Outlet> / <Name-Number> / ...
     Verigence makes every level down to the outlet, from its own masters
     (``ensure_tree``): a journey belongs to an outlet, and a name typed by hand need
-    not be the master's. Where an outlet has more than one PC it holds a folder per
-    PC. The PC makes only the customer's folder -- the name and the booking / OTF
+    not be the master's. An outlet has one folder and no two outlets share one
+    (product owner 2026-11-12: "each outlet should have one folder ... no two
+    outlets share one folder"): the PCs of an outlet all work in it, and a PC
+    mapped to several outlets works in each outlet's own folder. The PC makes
+    only the customer's folder -- the name and the booking / OTF
     number or the mobile number, in either order -- and keeps putting that
     customer's files in it: the booking papers, later the delivery file, later
     whatever was missing. A folder inside it whose name starts with "photo" or "pic"
@@ -297,8 +300,11 @@ def uses_drive(link: dict[str, Any], outlet_id: Any) -> bool:
 
 
 def attributed_pc(outlet: dict[str, Any] | None, folder_pc: str | None, submitter: str | None) -> dict[str, Any] | None:
-    """Whose the files of an outlet are: the PC folder they are in, else the outlet's only PC,
-    else the PC who pressed Submit, else the PC mapped to the outlet first."""
+    """Whose the files of an outlet are: the outlet's only PC, else the PC who pressed
+    Submit, else the PC mapped to the outlet first. Every PC signs in to the Project's one
+    Google account, so Drive cannot say which of an outlet's PCs put a file there.
+    (``folder_pc``: the PC already on the file -- from the PC folders of the first hours of
+    12 Nov 2026, see ``_retire_pc_folders``.)"""
     pcs = (outlet or {}).get("pcs") or []
     by_id = {p["actor_id"]: p for p in pcs}
     if folder_pc and folder_pc in by_id:
@@ -351,7 +357,7 @@ def _save_folder(connection: Connection, tenant_id: str, **values: Any) -> dict[
 
 
 def _made(connection: Connection, tenant_id: str, kind: str, **keys: Any) -> dict[str, Any] | None:
-    """The folder Verigence made for these keys (a dealership, an outlet, a PC, an archive month)."""
+    """The folder Verigence made for these keys (a dealership, an outlet, an archive month)."""
     conditions = " AND ".join(
         f"{column} IS NULL" if value is None else f"{column} = :{column}" for column, value in keys.items())
     row = connection.execute(
@@ -384,8 +390,8 @@ def _ensure(connection: Connection, tenant_id: str, client: DriveClient, kind: s
 
 
 def ensure_tree(engine: Engine, tenant_id: str, client: DriveClient) -> dict[str, int]:
-    """The Project's folders down to every outlet that has a PC (and a folder per PC where an
-    outlet has more than one): made once, found by what they are for (not by their name), so
+    """The Project's folders down to every outlet that has a PC -- one folder an outlet,
+    however many PCs it has: made once, found by what they are for (not by their name), so
     a folder renamed in Drive is still the outlet's, and an outlet added later gets its
     folder on the next round. One worker at a time (the others skip the round)."""
     try:
@@ -433,15 +439,52 @@ def _ensure_tree(engine: Engine, tenant_id: str, client: DriveClient) -> dict[st
                                   dealer_id=outlet["dealer_id"], outlet_id=None)
             made += new
             place = {"dealer_id": outlet["dealer_id"], "outlet_id": outlet["outlet_id"]}
-            outlet_folder, new = _ensure(connection, tenant_id, client, "OUTLET", dealer, str(outlet["outlet_name"]),
-                                         **place)
+            _, new = _ensure(connection, tenant_id, client, "OUTLET", dealer, str(outlet["outlet_name"]), **place)
             made += new
-            if len(outlet["pcs"]) > 1:
-                for pc in outlet["pcs"]:
-                    _, new = _ensure(connection, tenant_id, client, "PC", outlet_folder,
-                                     str(pc["name"] or "PC")[:120], pc_actor_id=pc["actor_id"], **place)
-                    made += new
-    return {"made": made}
+        retired = _retire_pc_folders(connection, tenant_id, client)
+    return {"made": made, "retired": retired} if retired else {"made": made}
+
+
+def _retire_pc_folders(connection: Connection, tenant_id: str, client: DriveClient) -> int:
+    """The folders per PC that Verigence made inside two-PC outlets for a few hours on
+    12 Nov 2026, before the product owner's "each outlet should have one folder": whatever
+    was put in one moves up into the outlet's folder (same Drive ids, so the record
+    follows), and the folder, once empty, goes to Drive's bin. One that cannot be emptied
+    or has lost its outlet folder is left for the next round."""
+    retired = 0
+    rows = connection.execute(
+        text("SELECT pc.drive_folder_id, pc.parent_folder_id FROM auditcore.p2_drive_folders pc "
+             "JOIN auditcore.p2_drive_folders o ON o.tenant_id=pc.tenant_id AND o.drive_folder_id=pc.parent_folder_id "
+             " AND o.folder_kind='OUTLET' AND o.gone_at_utc IS NULL "
+             "WHERE pc.tenant_id=:t AND pc.folder_kind='PC' AND pc.made_by_system AND pc.gone_at_utc IS NULL"),
+        {"t": tenant_id},
+    ).mappings().all()
+    for row in rows:
+        folder_id, outlet_folder = str(row["drive_folder_id"]), str(row["parent_folder_id"])
+        try:
+            for child in client.children(folder_id):
+                client.move(str(child["id"]), outlet_folder, folder_id)
+                connection.execute(
+                    text("UPDATE auditcore.p2_drive_folders SET parent_folder_id=:o, pc_actor_id=NULL, "
+                         "updated_at_utc=now() WHERE tenant_id=:t AND drive_folder_id=:f"),
+                    {"t": tenant_id, "o": outlet_folder, "f": str(child["id"])},
+                )
+            binned = client.bin_folder(folder_id)
+        except DriveNotFound:
+            binned = True  # already gone from Drive
+        except DriveAuthorizationLost:
+            raise
+        except DriveError as exc:  # left as it is; the round goes on and tries again next time
+            logger.warning("p2_drive_pc_folder_not_retired", tenant_id=tenant_id, folder_id=folder_id, error=str(exc))
+            continue
+        if not binned:
+            continue
+        connection.execute(
+            text("UPDATE auditcore.p2_drive_folders SET gone_at_utc=now(), updated_at_utc=now() "
+                 "WHERE tenant_id=:t AND drive_folder_id=:f"), {"t": tenant_id, "f": folder_id},
+        )
+        retired += 1
+    return retired
 
 
 # --------------------------------------------------------------------------- finding what is new
