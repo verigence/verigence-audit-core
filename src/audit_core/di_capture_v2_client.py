@@ -54,6 +54,7 @@ class DiCaptureV2Client:
         classification_mode: str | None = None,
         quality_gate: str | None = None,
         skip_reading_document_type_keys: list[str] | None = None,
+        gemini_tier: str | None = None,
     ) -> dict[str, Any]:
         """``classification_mode="TRUST_SINGLE_CANDIDATE"`` (exactly one
         candidate): the type is already known, DI skips its paid
@@ -81,6 +82,9 @@ class DiCaptureV2Client:
             body["qualityGate"] = quality_gate
         if skip:
             body["skipReadingDocumentTypeKeys"] = skip
+        if gemini_tier == "FLEX":
+            # Gemini's Flex tier (DI migration 0067): half price, answered in minutes.
+            body["geminiTier"] = "FLEX"
         return self._request(
             "POST",
             f"/v2/tenants/{tenant_id}/audit-storage-contexts/"

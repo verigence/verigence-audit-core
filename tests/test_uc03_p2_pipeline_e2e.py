@@ -86,7 +86,7 @@ class FakeDI:
     def create_upload_intents(self, *, token, tenant_id, external_context_ref, phase, files,
                               candidate_document_type_keys, requirement_refs_by_document_type_key,
                               classification_mode=None, quality_gate=None,
-                              skip_reading_document_type_keys=None):
+                              skip_reading_document_type_keys=None, gemini_tier=None):
         self.intent_calls += 1
         self.quality_gates = getattr(self, "quality_gates", [])
         self.quality_gates.extend((f["filename"], quality_gate) for f in files)

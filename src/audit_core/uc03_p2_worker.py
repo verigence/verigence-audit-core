@@ -89,7 +89,7 @@ from audit_core.uc03_p2_price_variance import (
     backfill_price_variance,
     refresh_price_variance,
 )
-from audit_core.uc03_p2_read_skip import read_skip_types
+from audit_core.uc03_p2_read_skip import gemini_tier, read_skip_types
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_retry_stop import (
     STOPPED_CODE,
@@ -1672,6 +1672,7 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
             connection, tenant_id=work.tenant_id, journey_id=work.journey_id, batch_id=row["batch_id"],
             registry=get_registry(), classify_only=classify_only,
         )
+        tier = gemini_tier(connection, tenant_id=work.tenant_id, batch_id=row["batch_id"])
     v2_client = get_di_capture_v2_client()
     content_type = "application/pdf" if str(row["page_object_key"]).endswith(".pdf") else str(row["original_content_type"] or "application/octet-stream")
     filename = (
@@ -1701,6 +1702,7 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
         ),
         classification_mode=classification_mode,
         skip_reading_document_type_keys=skip_reading,
+        gemini_tier=tier,
         **({"quality_gate": quality_gate} if quality_gate else {}),
         # DI's capture contract takes the file's identity only; it measures
         # the bytes itself on upload and rejects any other field.
@@ -3967,6 +3969,15 @@ READ_CEILING = timedelta(minutes=30)
 # rule.) GROUPING_CEILING stays a named constant so the rule is read in one
 # place, and is tied to READ_CEILING so the two cannot drift apart.
 GROUPING_CEILING = READ_CEILING
+# Drive intake pages (12 Nov 2026): read on Gemini's Flex tier (half price, answered in
+# minutes; uc03_p2_read_skip.gemini_tier). Nobody waits on them, and a Flex first try plus a
+# standard-tier retry can pass 30 minutes, so they get an hour before they are failed.
+DRIVE_READ_CEILING = timedelta(minutes=60)
+_DRIVE_BATCH_SQL = (
+    "EXISTS (SELECT 1 FROM auditcore.p2_bulk_files bf JOIN auditcore.p2_bulk_uploads bu "
+    "ON bu.tenant_id=bf.tenant_id AND bu.bulk_id=bf.bulk_id "
+    "WHERE bf.tenant_id=b.tenant_id AND bf.batch_id=b.batch_id AND bu.source='DRIVE')"
+)
 _UNSETTLED_PAGE_STATES = tuple(s for s in _PAGE_ACTIVE_STATES if s != "SYNCING_TO_AUDIT_CORE")
 _UNSETTLED_BATCH_STATES = ("AWAITING_UPLOAD", "UPLOADED", "SPLITTING")
 GROUPING_FAILED_CODE = "GROUPING_FAILED"
@@ -4041,9 +4052,10 @@ def fail_unsettled_pages(connection, *, tenant_id: str, now: datetime | None = N
     now = now or datetime.now(UTC)
     cutoff = now - READ_CEILING
     group_cutoff = now - GROUPING_CEILING
+    drive_cutoff = now - DRIVE_READ_CEILING
     pages = [dict(r) for r in connection.execute(
         text(
-            """
+            f"""
             UPDATE auditcore.p2_document_queue AS q
             SET queue_status='FAILED', status_reason=:reason, last_error=:code,
                 next_attempt_at_utc=NULL,
@@ -4056,11 +4068,12 @@ def fail_unsettled_pages(connection, *, tenant_id: str, now: datetime | None = N
                 OR (q.read_clock_started_at_utc IS NULL AND q.unit_kind <> 'GROUP' AND b.created_at_utc < :cutoff)
                 OR (q.read_clock_started_at_utc IS NULL AND q.unit_kind = 'GROUP' AND b.created_at_utc < :group_cutoff)
               )
+              AND (NOT {_DRIVE_BATCH_SQL} OR COALESCE(q.read_clock_started_at_utc, b.created_at_utc) < :drive_cutoff)
             RETURNING q.queue_id, q.journey_id, q.batch_id, q.di_document_id, q.last_error
             """
         ),
         {"t": tenant_id, "states": list(_UNSETTLED_PAGE_STATES), "cutoff": cutoff, "group_cutoff": group_cutoff,
-         "reason": NOT_READ_IN_TIME_REASON, "code": NOT_READ_IN_TIME_CODE},
+         "drive_cutoff": drive_cutoff, "reason": NOT_READ_IN_TIME_REASON, "code": NOT_READ_IN_TIME_CODE},
     ).mappings().all()]
     files = connection.execute(
         text(

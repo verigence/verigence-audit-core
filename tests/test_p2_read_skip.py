@@ -120,3 +120,63 @@ def test_pages_only_classified_are_still_merged_into_their_document(journey, mon
             {"t": journey.tenant_id, "b": batch_id},
         ).mappings().all()
     assert [(g["page_numbers"], g["candidate_override"]) for g in groups] == [([1, 2], ["aadhaar"])]
+
+
+def _bulk(journey, batch_id, source: str) -> None:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        bulk_id = connection.execute(
+            text("INSERT INTO auditcore.p2_bulk_uploads (tenant_id, dealer_id, outlet_id, uploaded_by_actor_id, "
+                 "folder, source) VALUES (:t, :d, :o, :a, 'f', :s) RETURNING bulk_id"),
+            {"t": journey.tenant_id, "d": journey.dealer_id, "o": journey.outlet_id, "a": journey.actor_id,
+             "s": source},
+        ).scalar_one()
+        connection.execute(
+            text("INSERT INTO auditcore.p2_bulk_files (tenant_id, bulk_id, original_filename, content_type, "
+                 "object_key, batch_id) VALUES (:t, :b, 'a.pdf', 'application/pdf', :key, :batch)"),
+            {"t": journey.tenant_id, "b": bulk_id, "batch": str(batch_id), "key": f"k-{batch_id}"},
+        )
+
+
+def test_drive_pages_are_read_on_the_flex_tier_and_get_an_hour(journey):
+    """"Used as batch ... lower the cost": Gemini's Flex tier, half price, answered in minutes."""
+    from datetime import UTC, datetime, timedelta
+
+    app_batch, _ = add_batch_pages(journey, [("pan_card", "CLASSIFYING")])
+    web_bulk, _ = add_batch_pages(journey, [("pan_card", "CLASSIFYING")])
+    drive_batch, _ = add_batch_pages(journey, [("pan_card", "CLASSIFYING")])
+    _bulk(journey, web_bulk, "WEB")
+    _bulk(journey, drive_batch, "DRIVE")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        tiers = [rs.gemini_tier(connection, tenant_id=journey.tenant_id, batch_id=b)
+                 for b in (app_batch, web_bulk, drive_batch)]
+        # A bulk upload from the web is a plain bulk upload: "already on the journey" applies.
+        assert rs.from_bulk_upload(connection, tenant_id=journey.tenant_id, batch_id=web_bulk)
+        connection.execute(text("UPDATE auditcore.p2_document_queue SET read_clock_started_at_utc=:c "
+                                "WHERE tenant_id=:t"),
+                           {"t": journey.tenant_id, "c": datetime.now(UTC) - timedelta(minutes=45)})
+        worker.fail_unsettled_pages(connection, tenant_id=journey.tenant_id)
+        status = dict(connection.execute(
+            text("SELECT batch_id::text, queue_status FROM auditcore.p2_document_queue WHERE tenant_id=:t"),
+            {"t": journey.tenant_id},
+        ).all())
+    assert tiers == [None, None, "FLEX"]
+    # 45 minutes: the app and web pages are failed at 30, the Drive page waits to 60.
+    assert (status[str(app_batch)], status[str(web_bulk)], status[str(drive_batch)]) == ("FAILED", "FAILED",
+                                                                                           "CLASSIFYING")
+
+
+def test_the_flex_tier_is_asked_for_only_when_set() -> None:
+    sent: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        return httpx.Response(200, json={"uploads": []})
+
+    client = DiCaptureV2Client(base_url="http://di.test", transport=httpx.MockTransport(handler))
+    common = {"token": "t", "tenant_id": "tenant-1", "external_context_ref": "ctx-1", "phase": "BOOKING",
+              "files": [{"clientUploadId": "c", "filename": "a.pdf"}], "candidate_document_type_keys": ["pan_card"]}
+    client.create_upload_intents(**common)
+    client.create_upload_intents(gemini_tier="FLEX", **common)
+    assert "geminiTier" not in sent[0] and sent[1]["geminiTier"] == "FLEX"

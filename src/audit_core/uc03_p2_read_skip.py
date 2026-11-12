@@ -137,6 +137,21 @@ def read_skip_types(
     return sorted(skip)
 
 
+def gemini_tier(connection: Connection, *, tenant_id: str, batch_id: UUID | str) -> str | None:
+    """FLEX for a page of the Drive intake (product owner 12 Nov 2026: "used as batch ... lower
+    the cost"): Gemini's Flex tier, half price, answered in minutes (DI #131, migration 0067).
+    None (the standard tier) for every other upload, where a PC is waiting."""
+    drive = connection.execute(
+        text(
+            "SELECT 1 FROM auditcore.p2_bulk_files f JOIN auditcore.p2_bulk_uploads u "
+            "ON u.tenant_id=f.tenant_id AND u.bulk_id=f.bulk_id "
+            "WHERE f.tenant_id=:t AND f.batch_id=:b AND u.source='DRIVE' LIMIT 1"
+        ),
+        {"t": tenant_id, "b": str(batch_id)},
+    ).first()
+    return "FLEX" if drive is not None else None
+
+
 def describe(types: list[str]) -> dict[str, Any]:
     """For the log line."""
     return {"read_skip_types": types, "read_skip_count": len(types)}
