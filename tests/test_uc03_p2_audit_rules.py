@@ -502,7 +502,28 @@ def test_trade_in_resale_window_and_loss(journey):
 # ------------------------------------------------------------------ accessories
 
 
+def _accessories_check(journey, enabled: bool) -> None:
+    _sql(journey, "INSERT INTO auditcore.tenant_rule_config (tenant_id, accessories_fitted_check_enabled) "
+                  "VALUES (:t, :e) ON CONFLICT (tenant_id) DO UPDATE "
+                  "SET accessories_fitted_check_enabled=EXCLUDED.accessories_fitted_check_enabled", e=enabled)
+
+
+def test_accessories_fitted_is_not_asked_while_the_project_has_it_switched_off(journey):
+    """Product owner 2026-11-12: "lets remove the tasks for accessories fitted are billed,
+    we may introduce it later". Off by default; the Project's switch brings it back."""
+    _deliver(journey, TODAY - timedelta(days=1))
+    result = _run(journey, "DELIVERY")
+    assert result["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "PASS"
+    assert "switched off" in result["ACCESSORIES_FITTED_UNCONFIRMED"].reason
+    assert result["ACCESSORY_FITTED_UNBILLED"].outcome == "SKIPPED"
+    _accessories_check(journey, True)
+    assert _run(journey, "DELIVERY")["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "FAIL"
+    _accessories_check(journey, False)
+    assert _run(journey, "DELIVERY")["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "PASS"
+
+
 def test_accessories_fitted_is_asked_once_the_car_is_delivered(journey):
+    _accessories_check(journey, True)
     assert _run(journey, "DELIVERY")["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "SKIPPED"
     _deliver(journey, TODAY - timedelta(days=1))
     asked = _run(journey, "DELIVERY")["ACCESSORIES_FITTED_UNCONFIRMED"]

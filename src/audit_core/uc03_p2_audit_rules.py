@@ -147,6 +147,14 @@ class _Facts:
         return [dict(r) for r in self.connection.execute(text(sql), self._params).mappings().all()]
 
     @cached_property
+    def accessories_fitted_check_enabled(self) -> bool:
+        """The Project's switch for the "accessories fitted are billed" question
+        (tenant_rule_config, migration 0213): off unless the Project has it on."""
+        return bool(self.connection.execute(
+            text("SELECT accessories_fitted_check_enabled FROM auditcore.tenant_rule_config WHERE tenant_id=:t"),
+            {"t": self.tenant_id}).scalar_one_or_none())
+
+    @cached_property
     def sheet(self) -> dict[str, Any]:
         from audit_core.uc03_p2_journey360 import deal
 
@@ -1422,6 +1430,10 @@ def delivery_not_completed_in_time(facts: _Facts) -> RuleOutcome:
 
 def accessories_fitted_unconfirmed(facts: _Facts) -> RuleOutcome:
     code = "ACCESSORIES_FITTED_UNCONFIRMED"
+    # Product owner 2026-11-12: the question is switched off for now ("we may introduce it
+    # later"); a Project's switch brings it back. Passing closes the tasks already raised.
+    if not facts.accessories_fitted_check_enabled:
+        return RuleOutcome(code, "PASS", "The accessories-fitted question is switched off for this Project.")
     docs = facts.documents("gate_pass", "accessory_invoice_dms", "accessory_invoice_tally")
     if not docs:
         return RuleOutcome(code, "SKIPPED", "Waiting for the delivery documents (gate pass or accessory invoice).")
@@ -1447,6 +1459,8 @@ def accessory_fitted_unbilled(facts: _Facts) -> RuleOutcome:
                            {"findingTitle": "Accessory fitted but not billed",
                             "documentIds": [d["documentId"] for d in docs]})
     if answer is None:
+        if not facts.accessories_fitted_check_enabled:
+            return RuleOutcome(code, "SKIPPED", "The accessories-fitted question is switched off for this Project.")
         return RuleOutcome(code, "SKIPPED", "Waiting for the PC to confirm the accessories fitted are billed.")
     return RuleOutcome(code, "PASS", f"Every fitted accessory is billed (confirmed on {_when(answer['at'])}){_remark(answer)}.")
 
