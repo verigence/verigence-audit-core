@@ -46,7 +46,7 @@ def test_a_page_not_understood_is_kept_in_the_extras_and_is_not_a_vehicle_photo(
     engine = database_engine()
     journey = create_p2_journey(engine, prefix="extra")
     try:
-        batch_id, pages = add_batch_pages(journey, [("pan_card", "SUPPORTING"), (None, "SUPPORTING")])
+        _, pages = add_batch_pages(journey, [("pan_card", "SUPPORTING"), (None, "SUPPORTING")])
         queue_id = pages[1]["queue_id"]
         with engine.begin() as c:
             set_tenant_context(c, journey.tenant_id)
