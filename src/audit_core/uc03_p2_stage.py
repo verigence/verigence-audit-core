@@ -811,6 +811,7 @@ def recorded_figures(connection: Connection, *, tenant_id: str, journey_id: UUID
                              AND e.di_document_id = s.source_document_id AND e.association_status = 'ACTIVE'
                              AND e.document_type_key IN ('customer_ledger', 'cost_sheet')) AS statement_on_file
             FROM auditcore.commercial_line_source_values s WHERE s.tenant_id=:t AND s.journey_id=:j
+              AND s.withdrawn_at_utc IS NULL
               AND NOT EXISTS (
                 SELECT 1 FROM auditcore.evidence e
                 WHERE e.tenant_id = s.tenant_id AND e.journey_id = s.journey_id
