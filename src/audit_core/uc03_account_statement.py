@@ -1547,24 +1547,30 @@ def _record_tally_lines(
     """One row per line, under no document id (the ledger's pages are read
     together), tied to the newest page's evidence: a re-read overwrites it,
     and it stops counting once that page is no longer on file
-    (ACTIVE_SOURCE_CONDITION). Never deleted: the service role may not delete
+    (ACTIVE_SOURCE_CONDITION) or the ledger no longer gives the line
+    (withdraw_unreported). Never deleted: the service role may not delete
     source rows (live 2026-11-02: a DELETE here failed every statement sync)."""
-    from audit_core.uc03_deal_source_history import record_source_value
+    from audit_core.uc03_deal_source_history import (
+        record_source_value,
+        withdraw_unreported,
+    )
 
-    if not tallies:
-        return 0
-    origin = _latest(tallies)
-    read = read_tally_lines(combined_tally_rows(tallies))
-    written = 0
-    for kind, figures in (("COMMERCIAL", read.components), ("DISCOUNT", read.discounts)):
-        for key, amount in sorted(figures.items()):
-            record_source_value(
-                connection, tenant_id=tenant_id, journey_id=journey_id, line_kind=kind, component_key=key,
-                source_document_type=TALLY_LEDGER_TYPE, amount=amount, evidence_id=origin["evidenceId"],
-                document_id=None,
-            )
-            written += 1
-    return written
+    reported: set[tuple[str, str, str | None]] = set()
+    if tallies:
+        origin = _latest(tallies)
+        read = read_tally_lines(combined_tally_rows(tallies))
+        for kind, figures in (("COMMERCIAL", read.components), ("DISCOUNT", read.discounts)):
+            for key, amount in sorted(figures.items()):
+                record_source_value(
+                    connection, tenant_id=tenant_id, journey_id=journey_id, line_kind=kind, component_key=key,
+                    source_document_type=TALLY_LEDGER_TYPE, amount=amount, evidence_id=origin["evidenceId"],
+                    document_id=None,
+                )
+                reported.add((kind, key, None))
+    # A line the ledger gave on an earlier reading and no longer gives stops counting.
+    withdraw_unreported(connection, tenant_id=tenant_id, journey_id=journey_id,
+                        source_document_type=TALLY_LEDGER_TYPE, reported=reported)
+    return len(reported)
 
 
 def _stale_statement_rows(
@@ -1689,7 +1695,16 @@ def sync_account_statement(
     from audit_core.uc03_deal_source_history import (
         record_source_value,
         upsert_commercial_actual,
+        withdraw_unreported,
     )
+
+    # Everything each source gives on this reading: what it gave before and no longer
+    # gives is withdrawn at the end (2026-11-12).
+    reported: dict[str, set[tuple[str, str, str | None]]] = {
+        ACCOUNT_STATEMENT_TYPE: set(), SETTLEMENT_SOURCE_TYPE: set(), COST_SHEET_TYPE: set()}
+
+    def note(source_type: str, kind: str, key: str, document_id: Any) -> None:
+        reported[source_type].add((kind, key, str(document_id) if document_id else None))
 
     documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
     parsed = [(d, line_rows(d["fields"].get("line_items"))) for d in documents]
@@ -1713,6 +1728,7 @@ def sync_account_statement(
                 source_document_type=ACCOUNT_STATEMENT_TYPE, amount=amount, evidence_id=origin["evidenceId"],
                 document_id=origin["documentId"],
             )
+            note(ACCOUNT_STATEMENT_TYPE, "COMMERCIAL", key, origin["documentId"])
             if upsert_commercial_actual(
                 connection, tenant_id=tenant_id, journey_id=journey_id, component_key=key, amount=amount,
                 document_type=ACCOUNT_STATEMENT_TYPE, document_id=origin["documentId"],
@@ -1726,6 +1742,7 @@ def sync_account_statement(
                 source_document_type=ACCOUNT_STATEMENT_TYPE, amount=amount, evidence_id=origin["evidenceId"],
                 document_id=origin["documentId"],
             )
+            note(ACCOUNT_STATEMENT_TYPE, "DISCOUNT", key, origin["documentId"])
             _write_discount(connection, tenant_id=tenant_id, journey_id=journey_id, key=key, amount=amount,
                             document_id=origin["documentId"], evidence_id=origin["evidenceId"])
             discounts_written += 1
@@ -1742,6 +1759,7 @@ def sync_account_statement(
                 source_document_type=ACCOUNT_STATEMENT_TYPE, amount=amount, evidence_id=origin["evidenceId"],
                 document_id=origin["documentId"],
             )
+            note(ACCOUNT_STATEMENT_TYPE, "COMMERCIAL", key, origin["documentId"])
 
     # No statement form, but the ERP settlement printout: its charges without a
     # GST split are recorded for the Deal under their own name (the Deal view
@@ -1757,6 +1775,7 @@ def sync_account_statement(
                 source_document_type=SETTLEMENT_SOURCE_TYPE, amount=amount, evidence_id=erp_document["evidenceId"],
                 document_id=erp_document["documentId"],
             )
+            note(SETTLEMENT_SOURCE_TYPE, "COMMERCIAL", key, erp_document["documentId"])
             settlement_lines += 1
 
     # The customer ledger's own charges and credit-note benefits, recorded for
@@ -1778,6 +1797,14 @@ def sync_account_statement(
                 source_document_type=COST_SHEET_TYPE, amount=amount, evidence_id=origin["evidenceId"],
                 document_id=origin["documentId"],
             )
+            note(COST_SHEET_TYPE, "COMMERCIAL", key, origin["documentId"])
+    # A figure the NDC, the settlement printout or the cost sheet gave on an earlier reading
+    # and no longer gives stops counting (SHI-SS-261027-024: a re-read NDC with no insurance
+    # row kept "insurance Rs 82,000" in the Deal and the insurance in-house).
+    withdrawn = sum(
+        withdraw_unreported(connection, tenant_id=tenant_id, journey_id=journey_id, source_document_type=source_type,
+                            reported=keys)
+        for source_type, keys in reported.items())
     differences = (cost_sheet_differences(statement, document["fields"], sheet)
                    if statement is not None and document is not None and sheet is not None else [])
     if differences:
@@ -1895,7 +1922,7 @@ def sync_account_statement(
             "statements": len(forms), "tallies": len(tallies), "invoiceActualsCleared": cleared,
             "unmapped": len(statement.unmapped) if statement else 0,
             "conflicts": len(statement.conflicts) if statement else 0, "tallyDeviations": len(deviations),
-            "costSheetDifferences": len(differences)}
+            "costSheetDifferences": len(differences), "sourceValuesWithdrawn": withdrawn}
 
 
 def sync_if_source_of_truth(

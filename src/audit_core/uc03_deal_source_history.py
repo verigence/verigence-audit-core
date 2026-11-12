@@ -98,6 +98,7 @@ def record_source_value(
             DO UPDATE SET
                 amount=EXCLUDED.amount,
                 source_evidence_id=EXCLUDED.source_evidence_id,
+                withdrawn_at_utc=NULL,
                 updated_at_utc=CASE
                     WHEN auditcore.commercial_line_source_values.amount IS DISTINCT FROM EXCLUDED.amount
                     THEN now() ELSE auditcore.commercial_line_source_values.updated_at_utc END
@@ -120,14 +121,65 @@ def record_source_value(
 # (a value recorded without a document link) or an ACTIVE one. A document
 # that was voided, superseded or merged into another stops counting
 # (2026-10-20, R2: "voided/removed documents stop counting").
+# A row its document no longer gives (withdraw_unreported) stops counting as well
+# (2026-11-12): a figure read once and gone on a later reading stood for good.
 ACTIVE_SOURCE_CONDITION = """
-    NOT EXISTS (
+    s.withdrawn_at_utc IS NULL AND NOT EXISTS (
         SELECT 1 FROM auditcore.evidence e
         WHERE e.tenant_id = s.tenant_id AND e.journey_id = s.journey_id
           AND (e.di_document_id = s.source_document_id OR e.evidence_id = s.source_evidence_id)
           AND e.association_status <> 'ACTIVE'
     )
 """
+
+
+def withdraw_unreported(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, source_document_type: str,
+    reported: set[tuple[str, str, str | None]],
+) -> int:
+    """Take back what a source said earlier and no longer says.
+
+    ``reported`` is everything the source type gives for the Journey on this reading, as
+    (line kind, component key, document id or None). Any other row of that type still
+    standing is marked withdrawn: its document was read again and no longer gives the
+    figure, or another copy now gives it. Until 2026-11-12 such a row stood for as long as
+    its document stayed on file -- SHI-SS-261027-024's NDC has no insurance row, but its
+    earlier "insurance Rs 82,000" kept the insurance in-house and the premium in the Deal.
+
+    Call it once per source type, after every figure of this reading is recorded
+    (record_source_value brings a row back when the document gives the figure again).
+    Returns the number of rows withdrawn."""
+    wanted = {(kind, key.strip().lower(), str(document) if document else None) for kind, key, document in reported}
+    standing = connection.execute(
+        text(
+            f"""
+            SELECT s.line_kind, s.component_key, s.source_document_type AS stored_type,
+                   CAST(s.source_document_id AS text) AS document_id
+            FROM auditcore.commercial_line_source_values s
+            WHERE s.tenant_id = :t AND s.journey_id = :j AND s.withdrawn_at_utc IS NULL
+              AND {NORMALISED_TYPE_SQL} = :type
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "type": normalise_document_type(source_document_type)},
+    ).mappings().all()
+    withdrawn = 0
+    for row in standing:
+        if (row["line_kind"], row["component_key"], row["document_id"]) in wanted:
+            continue
+        withdrawn += connection.execute(
+            text(
+                """
+                UPDATE auditcore.commercial_line_source_values s
+                SET withdrawn_at_utc = now()
+                WHERE s.tenant_id = :t AND s.journey_id = :j AND s.withdrawn_at_utc IS NULL
+                  AND s.line_kind = :kind AND s.component_key = :key AND s.source_document_type = :stored_type
+                  AND s.source_document_id IS NOT DISTINCT FROM CAST(:document AS uuid)
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "kind": row["line_kind"], "key": row["component_key"],
+             "stored_type": row["stored_type"], "document": row["document_id"]},
+        ).rowcount
+    return withdrawn
 
 
 # The SQL twin of normalise_document_type.

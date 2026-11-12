@@ -1173,3 +1173,56 @@ def test_a_statement_form_on_file_keeps_the_settlement_printout_out_of_the_deal(
     _sync(journey)
     rows = _deal_rows(journey)
     assert not any(s["document"] == "Settlement (ERP printout)" for r in rows.values() for s in r["sources"])
+
+
+def test_a_figure_the_ndc_no_longer_gives_on_a_re_read_stops_counting(journey) -> None:
+    """SHI-SS-261027-024 (2026-11-12): the NDC was read again and has no insurance row, but its
+    earlier insurance figure stood in the Deal's sources, so the insurance was decided
+    in-house ("the dealer's statement charges the premium") on a customer's own policy."""
+    import json
+
+    from audit_core.uc03_deal_source_history import active_source_rows
+    from audit_core.uc03_insurance_source import premium_on_dealer_statement
+
+    def statement_rows() -> dict[str, D]:
+        with journey.engine.begin() as c:
+            set_tenant_context(c, journey.tenant_id)
+            return {r["component_key"]: r["amount"] for r in active_source_rows(
+                c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+                if r["source_document_type"] == "customer_ledger" and r["line_kind"] == "COMMERCIAL"}
+
+    def premium() -> D | None:
+        with journey.engine.begin() as c:
+            set_tenant_context(c, journey.tenant_id)
+            return premium_on_dealer_statement(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    document_id, _ = _ledger(journey, UTKAL_NDC)
+    assert _sync(journey)["sourceValuesWithdrawn"] == 0
+    assert statement_rows()["insurance_amount"] == D(40825) and premium() == 40825
+
+    # The same document, read again: no insurance row this time.
+    reread = [line for line in UTKAL_NDC if line["particulars_raw"] != "Insurance"]
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(
+            text("UPDATE auditcore.journey_document_extracted_fields "
+                 "SET extracted_value=CAST(:v AS jsonb), effective_value=CAST(:v AS jsonb) "
+                 "WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d AND field_key='line_items'"),
+            {"v": json.dumps(reread), "t": journey.tenant_id, "j": journey.journey_id, "d": document_id})
+    assert _sync(journey)["sourceValuesWithdrawn"] >= 1
+    rows = statement_rows()
+    assert "insurance_amount" not in rows and rows["ex_showroom_price"] == D(999899)
+    assert premium() is None
+    assert _sync(journey)["sourceValuesWithdrawn"] == 0  # nothing more to take back
+
+    # Read a third time with the row back: it counts again.
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(
+            text("UPDATE auditcore.journey_document_extracted_fields "
+                 "SET extracted_value=CAST(:v AS jsonb), effective_value=CAST(:v AS jsonb) "
+                 "WHERE tenant_id=:t AND journey_id=:j AND di_document_id=:d AND field_key='line_items'"),
+            {"v": json.dumps(UTKAL_NDC), "t": journey.tenant_id, "j": journey.journey_id, "d": document_id})
+    _sync(journey)
+    assert statement_rows()["insurance_amount"] == D(40825)

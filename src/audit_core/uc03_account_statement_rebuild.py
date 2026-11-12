@@ -147,9 +147,19 @@ def rebuild_journey(
     if statement:
         item.update(_ex_showroom_references(connection, tenant_id, journey_id))
     if not commit:
+        # What the sync would take back (figures a document gave earlier and no longer gives):
+        # run for real inside a savepoint and rolled back, so the dry run's count is the sync's own.
+        savepoint = connection.begin_nested()
+        try:
+            item["sourceValuesWithdrawn"] = sync_account_statement(
+                connection, tenant_id=tenant_id, journey_id=journey_id,
+                correlation_id=f"account-statement:{tag}")["sourceValuesWithdrawn"]
+        finally:
+            savepoint.rollback()
         return item
-    sync_account_statement(connection, tenant_id=tenant_id, journey_id=journey_id,
-                           correlation_id=f"account-statement:{tag}")
+    item["sourceValuesWithdrawn"] = sync_account_statement(
+        connection, tenant_id=tenant_id, journey_id=journey_id,
+        correlation_id=f"account-statement:{tag}")["sourceValuesWithdrawn"]
     if _on_phase_two(connection, tenant_id, journey_id):
         from audit_core.uc03_p2_runtime import note_facts_changed
 
@@ -159,11 +169,14 @@ def rebuild_journey(
     return item
 
 
-def run_account_statement_rebuild(engine: Engine, tag: str, tenant_ids: list[str]) -> None:
+def run_account_statement_rebuild(engine: Engine, tag: str, tenant_ids: list[str]) -> dict[str, Any]:
     commit = tag.endswith("-commit")
+    report: dict[str, Any] = {}
     for tenant_id in tenant_ids:
         totals = {"journeys": 0, "with_statement": 0, "no_statement": 0, "no_ex_showroom": 0,
-                  "tally_deviations": 0, "invoice_held_after": 0, "failed": 0}
+                  "tally_deviations": 0, "invoice_held_after": 0, "failed": 0,
+                  "source_values_withdrawn": 0, "journeys_with_withdrawn": 0}
+        withdrawn_journeys: list[str] = []
         try:
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
@@ -190,6 +203,13 @@ def run_account_statement_rebuild(engine: Engine, tag: str, tenant_ids: list[str
             totals["no_ex_showroom"] += bool(item["statements"]) and item["exShowroom"] is None
             totals["tally_deviations"] += bool(item["tallyDeviations"])
             totals["invoice_held_after"] += bool(item.get("invoiceHeldAfter"))
+            totals["source_values_withdrawn"] += int(item.get("sourceValuesWithdrawn") or 0)
+            if item.get("sourceValuesWithdrawn"):
+                totals["journeys_with_withdrawn"] += 1
+                if len(withdrawn_journeys) < 400:
+                    withdrawn_journeys.append(str(journey_id))
             logger.info("account_statement_item", tag=tag, tenant_id=tenant_id, commit=commit,
                         journey_id=str(journey_id), **{k: str(v) for k, v in item.items()})
         logger.info("account_statement_rebuild_finished", tag=tag, tenant_id=tenant_id, commit=commit, **totals)
+        report[tenant_id] = {**totals, "withdrawnJourneys": withdrawn_journeys}
+    return {"commit": commit, "tenants": report}
