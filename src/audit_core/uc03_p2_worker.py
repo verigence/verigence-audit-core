@@ -3410,6 +3410,26 @@ def _set_aside_receipts_not_from_the_dealership(connection, *, tenant_id: str, j
         logger.warning("p2_receipt_issuer_failed", tenant_id=tenant_id, journey_id=str(journey_id), exc_info=True)
 
 
+def _count_delivery_receipt_as_gate_pass(connection, *, tenant_id: str, journey_id: UUID) -> None:
+    """As _apply_file_identity: a failure is logged and the recompute goes on;
+    a deadlock fails the item so it is retried."""
+    from audit_core.uc03_db_transient import raise_if_worker_transient
+    from audit_core.uc03_delivery_receipt_gate_pass import (
+        count_delivery_receipt_as_gate_pass,
+    )
+
+    try:
+        with connection.begin_nested():
+            typed = count_delivery_receipt_as_gate_pass(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if typed:
+            logger.info("p2_delivery_receipt_is_the_gate_pass", tenant_id=tenant_id, journey_id=str(journey_id),
+                        documents=typed)
+    except Exception as exc:
+        raise_if_worker_transient(exc)
+        logger.warning("p2_delivery_receipt_gate_pass_failed", tenant_id=tenant_id, journey_id=str(journey_id),
+                       exc_info=True)
+
+
 def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
                    started_at: datetime | None = None) -> dict[str, Any]:
     """Recompute the stage from the documents, raise / close the rule tasks
@@ -3438,6 +3458,9 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     # premium receipt, or another dealership's, leaves the booking's payments
     # before they are rebuilt and stays on file as a supporting document.
     _set_aside_receipts_not_from_the_dealership(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # A Vehicle Delivery Receipt carrying the delivery date is the gate pass
+    # (2026-11-12): typed so before the delivery is built from it.
+    _count_delivery_receipt_as_gate_pass(connection, tenant_id=tenant_id, journey_id=journey_id)
     _materialize_journey(connection, tenant_id=tenant_id, journey_id=journey_id)
     # The booking date follows the receipts still on file: a receipt deleted,
     # re-read or replaced since the last pass no longer sets it (2026-10-20).

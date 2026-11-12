@@ -124,7 +124,50 @@ def test_every_accessory_invoice_adds_up_beside_the_line_and_the_ndc_alone_price
     assert D(row["ledger"]) == D(96537)             # the ledger's posting, as a check
     # neither prices the line: the NDC does not charge the accessories
     assert row["billed"] is None and row["current"] is None
-    assert row["notTaken"] is True and "NOT_ON_STATEMENT" in row["flags"]
+    # ... and what the ledger posts beyond the NDC is the accessories add-on (2026-11-12),
+    # no longer "invoiced but not on the NDC"
+    assert row["notTaken"] is True and "NOT_ON_STATEMENT" not in row["flags"]
+    assert D(row["addOn"]) == D(96537)
+
+
+def test_accessories_invoiced_with_no_ledger_posting_are_still_not_on_the_ndc(journey) -> None:
+    _statement(journey, ADITYA)  # the NDC prints no accessories row; no Tally ledger on file
+    _accessory_invoice(journey, "C1R27B00000717", "90789", "2026-09-30")
+    view = _deal(journey)
+    row = _row(view, "accessories_cost")
+    assert row["notTaken"] is True and "NOT_ON_STATEMENT" in row["flags"] and not row.get("addOn")
+    assert view["summary"]["accessoriesAddOn"] is None
+
+
+def test_accessories_bought_beyond_the_ndc_are_an_add_on_in_the_amount_to_be_received(journey) -> None:
+    """Product owner 2026-11-12, SHI-SS-261027-023: the NDC charges accessories of Rs 5,000, the customer
+    bought Rs 8,380 more after delivery and the ledger posts Rs 13,380 -- "accessories add on is to be
+    counted in the total amount to be received"."""
+    _statement(journey, UTKAL)  # Accessories 30,000 charged on the NDC
+    before = _deal(journey)
+    assert before["summary"]["accessoriesAddOn"] is None and not _row(before, "accessories_cost").get("addOn")
+    _accessory_invoice(journey, "ACC-1", "38382")
+    _ledger(journey, [_posting("Sales Accessories@18%", "SALES WORKSHOP", debit=38380)])
+    _sync(journey)
+    view = _deal(journey)
+    row = _row(view, "accessories_cost")
+    # the NDC still prices the line; the add-on is beside it, never in the deal's own figures
+    assert D(row["billed"]) == D(30000) and D(row["current"]) == D(30000)
+    assert D(row["addOn"]) == D(8380) and row["freeByInvoice"] is None
+    summary = view["summary"]
+    assert D(summary["accessoriesAddOn"]) == D(8380)
+    assert D(summary["payable"]) == D(before["summary"]["payable"]) + D(8380)
+    assert summary["gross"]["current"] == before["summary"]["gross"]["current"]
+    assert summary["variance"]["currentVsStandard"] == before["summary"]["variance"]["currentVsStandard"]
+    accessories = _addons(journey)["accessories"]
+    assert accessories["taken"] is True and D(accessories["amount"]) == D(38380)
+    assert D(accessories["details"]["addOn"]) == D(8380)
+
+
+def test_a_ledger_posting_no_more_than_the_ndc_charges_is_no_add_on(journey) -> None:
+    _statement(journey, UTKAL, tally=[_posting("Sales Accessories@18%", "SALES WORKSHOP", debit=30000)])
+    view = _deal(journey)
+    assert view["summary"]["accessoriesAddOn"] is None and not _row(view, "accessories_cost").get("addOn")
 
 
 def test_the_ndc_charge_is_the_accessories_figure_with_the_invoices_beside_it(journey) -> None:
@@ -379,6 +422,16 @@ def test_the_export_shows_the_master_price_of_a_line_that_is_not_in_the_deal() -
     assert row["Std: Essential Kit"] == 30000 and row["Var: Essential Kit"] == 77812
     assert row["Accessories Add-on"] == 77812  # billed over the standard kit
     assert row["Net Variance"] == 82812
+
+
+def test_the_export_takes_the_accessories_add_on_from_the_deal_where_the_ndc_prices_it() -> None:
+    """2026-11-12: under the NDC the add-on is what the ledger posts over the NDC's charge."""
+    deal = _export_deal()
+    deal["summary"].update(billedSource="ACCOUNT_STATEMENT", accessoriesAddOn="8380", payable="1116192")
+    row = deal_amounts(deal)
+    assert row["Accessories Add-on"] == 8380 and row["Total Amt To Be Received"] == 1116192
+    deal["summary"]["accessoriesAddOn"] = None
+    assert deal_amounts(deal)["Accessories Add-on"] is None
 
 
 def test_the_export_carries_the_policy_number_and_the_add_on_covers() -> None:

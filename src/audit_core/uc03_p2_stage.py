@@ -269,6 +269,15 @@ def receipt_split(connection: Connection, *, tenant_id: str, journey_id: UUID,
     }
 
 
+def receipt_stage_by_document(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, str]:
+    """Each counted receipt's document id -> "BOOKING" or "DELIVERY", as
+    receipt_split derives it. The one answer to "which stage is this receipt
+    under": a receipt carries no stage of its own, and the area it was
+    uploaded under says nothing (decision 2026-10-19)."""
+    split = receipt_split(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return {entry["documentId"]: stage for stage in ("BOOKING", "DELIVERY") for entry in split[stage]}
+
+
 def open_task_count(connection: Connection, *, tenant_id: str, journey_id: UUID, task_types: tuple[str, ...]) -> int:
     row = connection.execute(
         text(
