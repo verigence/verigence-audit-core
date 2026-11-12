@@ -5133,6 +5133,8 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # read for it joined to the customer's booking or kept: see uc03_p2_bulk_upload.
         "BULK_UPLOAD": ("audit_core.uc03_p2_bulk_upload", "run_bulk_upload"),
         "BULK_SETTLE": ("audit_core.uc03_p2_bulk_upload", "run_bulk_settle"),
+        # The files waiting in the Project's Google Drive, taken (2026-11-12): see uc03_p2_drive_intake.
+        "DRIVE_RUN": ("audit_core.uc03_p2_drive_intake", "run_drive_intake"),
     }
     if kind not in per_tenant:
         raise ValueError(f"unknown worker job kind {kind!r}")
@@ -5278,6 +5280,26 @@ def _sweep_cost_sheet_statements_every(engine: Engine) -> None:
         _stopping.wait(_COST_SHEET_SWEEP_SECONDS)
 
 
+_DRIVE_ROUND_SECONDS = 300
+
+
+def _drive_every(engine: Engine) -> None:
+    """Every five minutes, for every Project whose Google Drive is connected: the outlets'
+    folders are there, what came into Drive is recorded, the end-of-day run (21:00 IST) is
+    asked for once, what the reading decided is brought back, and once a day the folders of
+    journeys closed long enough go to the archive (2026-11-12, uc03_p2_drive_intake).
+    Nothing is done while Google Drive is not set up."""
+    from audit_core.uc03_p2_drive_intake import drive_round
+
+    _stopping.wait(120)  # let the worker settle after a start
+    while not _stopping.is_set():
+        try:
+            drive_round(engine, _active_tenants(engine), worker_id=_WORKER_ID)
+        except Exception:  # e.g. the tables not migrated yet; try again later
+            logger.warning("p2_drive_round_failed", exc_info=True)
+        _stopping.wait(_DRIVE_ROUND_SECONDS)
+
+
 def main() -> None:
     _configure_worker_observability()
     engine = get_engine()
@@ -5298,6 +5320,7 @@ def main() -> None:
                      daemon=True).start()
     threading.Thread(target=_sweep_cost_sheet_statements_every, args=(engine,), name="cost-sheet-statements",
                      daemon=True).start()
+    threading.Thread(target=_drive_every, args=(engine,), name="drive-intake", daemon=True).start()
     logger.info(
         "p2_worker_started",
         worker_id=_WORKER_ID,

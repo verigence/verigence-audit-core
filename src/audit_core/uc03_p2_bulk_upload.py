@@ -36,6 +36,16 @@ What happens to each file (job BULK_UPLOAD, then BULK_SETTLE)
     otherwise alert the whole Project about a file the PC was told to drop).
 
 Read-only for the PC after submit; every file says where it went.
+
+A drop taken from the Project's Google Drive (uc03_p2_drive_intake, 2026-11-12)
+    is the same drop, made for the outlet's PC without the PC. Its files say more than
+    a name: the customer's folder they came in is their group (``group_key`` is set when
+    the file is added, not guessed from its name), a file added to a folder whose files
+    already went to a journey goes straight to that journey (``target_journey_id``), and
+    the folder's number -- the booking / OTF number, or the customer's mobile -- finds the
+    customer's open booking at the outlet when the file itself carries no PAN or Aadhaar
+    to find it by (``booking_number``; where both files have a PAN or Aadhaar they must
+    still be the same customer's).
 """
 from __future__ import annotations
 
@@ -198,7 +208,7 @@ def create_bulk_upload(
     folder = bulk_folder(tenant_id, outlet["dealer_name"], outlet["outlet_name"])
     row = connection.execute(
         text("SELECT * FROM auditcore.p2_bulk_uploads WHERE tenant_id=:t AND uploaded_by_actor_id=:a "
-             "AND outlet_id=:o AND status='OPEN' AND folder=:f ORDER BY created_at_utc DESC LIMIT 1"),
+             "AND outlet_id=:o AND status='OPEN' AND folder=:f AND source='WEB' ORDER BY created_at_utc DESC LIMIT 1"),
         {"t": tenant_id, "a": principal.subject, "o": command.outletId, "f": folder},
     ).mappings().one_or_none()
     if row is None:
@@ -453,6 +463,21 @@ def _earlier_copy(connection: Connection, tenant_id: str, sha: str, file_id: Any
     return dict(row) if row else None
 
 
+def _open_target(engine: Engine, tenant_id: str, journey_id: Any) -> dict[str, Any] | None:
+    """The journey a file is to go straight to, when it is still there and still open; else
+    None, and the file is read on a journey of its own like any other."""
+    if not journey_id:
+        return None
+    from audit_core.uc03_p2_same_file import _identities
+
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        me = _identities(connection, tenant_id=tenant_id, journey_ids=[UUID(str(journey_id))]).get(UUID(str(journey_id)))
+    if me is None or me.closed:
+        return None
+    return {"journey_id": me.journey_id, "journey_reference": me.reference}
+
+
 def _journey_for_group(engine: Engine, tenant_id: str, bulk: dict[str, Any], key: str, names: list[str]) -> UUID:
     """The journey a group is read on: the PC's New booking at the outlet (idempotent per group)."""
     from audit_core.uc03_p2_api import start_p2_journey
@@ -556,7 +581,7 @@ def run_bulk_upload(engine: Engine, tag: str, tenant_ids: list[str] | None = Non
         ).mappings().all()]
     storage = get_p2_document_storage()
     groups: dict[str, list[dict[str, Any]]] = {}
-    duplicates = 0
+    duplicates = direct = 0
     for file in files:
         try:
             payload = storage.get_object(str(file["object_key"]))
@@ -570,7 +595,16 @@ def run_bulk_upload(engine: Engine, tag: str, tenant_ids: list[str] | None = Non
                           placed_journey_id=earlier["journey_id"], placed_reference=earlier["journey_reference"],
                           detail="The same file, byte for byte, was already uploaded")
                 continue
-            key = group_key(file["original_filename"], str(file["file_id"]))
+            target = _open_target(engine, tenant_id, file.get("target_journey_id"))
+            if target is not None:
+                batch_id = _upload_to(engine, tenant_id, bulk, file, target["journey_id"], payload)
+                _set_file(engine, tenant_id, file["file_id"], sha256=file["sha256"], outcome="ADDED_TO_BOOKING",
+                          journey_id=target["journey_id"], batch_id=batch_id,
+                          placed_journey_id=target["journey_id"], placed_reference=target["journey_reference"],
+                          detail=f"Added to {target['journey_reference']}: its customer's folder is this booking's")
+                direct += 1
+                continue
+            key = file.get("group_key") or group_key(file["original_filename"], str(file["file_id"]))
             _set_file(engine, tenant_id, file["file_id"], sha256=file["sha256"], group_key=key)
             groups.setdefault(key, []).append(file)
         except Exception as exc:
@@ -601,7 +635,7 @@ def run_bulk_upload(engine: Engine, tag: str, tenant_ids: list[str] | None = Non
                           detail=f"{type(exc).__name__}: {exc}"[:500])
     _finish_if_settled(engine, tenant_id, bulk_id)
     result = {"bulkId": str(bulk_id), "files": len(files), "exactDuplicates": duplicates, "groups": len(groups),
-              "reading": reading}
+              "reading": reading, "addedToTheirBooking": direct}
     logger.info("p2_bulk_upload_done", tenant_id=tenant_id, **result)
     return result
 
@@ -652,6 +686,61 @@ def find_booking(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
     return min(candidates, key=lambda o: o.order_key) if candidates else None
 
 
+def find_booking_by_number(connection: Connection, *, tenant_id: str, journey_id: UUID) -> Any | None:
+    """For a file whose folder gives a number (a Drive drop): the one open booking of the same
+    outlet whose booking form or docket prints that number, or whose customer's mobile it
+    is -- used only when the PAN / Aadhaar found none (``find_booking``). Where both journeys
+    have a PAN or an Aadhaar they must be the same customer's; none when no booking, or more
+    than one, has the number."""
+    from audit_core.uc03_duplicate_booking_detection import _normalize_mobile
+    from audit_core.uc03_p2_same_file import (
+        _identities,
+        normalize_booking_reference,
+        same_outlet,
+    )
+
+    numbers = {code: raw for raw in connection.execute(
+        text("SELECT DISTINCT booking_number FROM auditcore.p2_bulk_files WHERE tenant_id=:t AND journey_id=:j "
+             "AND outcome='READING' AND booking_number IS NOT NULL"), {"t": tenant_id, "j": journey_id},
+    ).scalars().all() if (code := normalize_booking_reference(raw))}
+    if len(numbers) != 1:
+        return None
+    code, raw = next(iter(numbers.items()))
+    mobile = _normalize_mobile(raw)
+    me = _identities(connection, tenant_id=tenant_id, journey_ids=[journey_id]).get(journey_id)
+    if me is None or me.outlet_id is None:
+        return None
+    digits = max((run for run in code.split("-") if run.isdigit()), key=len, default="")
+    if not digits:
+        return None
+    ids = [UUID(str(v)) for v in connection.execute(
+        text(
+            """
+            SELECT DISTINCT f.journey_id
+            FROM auditcore.journey_document_extracted_fields f
+            JOIN auditcore.journeys j ON j.tenant_id=f.tenant_id AND j.journey_id=f.journey_id
+            WHERE f.tenant_id=:t AND f.journey_id <> :j AND j.outlet_id=:o
+              AND f.field_key IN ('booking_reference_number', 'customer_phone')
+              AND regexp_replace(COALESCE(f.effective_value #>> '{}', ''), '[^0-9]', '', 'g') LIKE :digits
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "o": me.outlet_id, "digits": f"%{digits}%"},
+    ).scalars().all()]
+    others = _identities(connection, tenant_id=tenant_id, journey_ids=ids)
+    busy = reading_for_bulk(connection, tenant_id=tenant_id, journey_ids=list(others))
+
+    def another_customer(o: Any) -> bool:
+        return bool((me.pan and o.pan and me.pan != o.pan) or (me.aadhaar and o.aadhaar and me.aadhaar != o.aadhaar))
+
+    candidates = [
+        o for o in others.values()
+        if not o.closed and same_outlet(me, o) and not another_customer(o)
+        and (code in o.booking_refs or (mobile is not None and o.mobile == mobile))
+        and (o.journey_id not in busy or o.order_key < me.order_key)
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def run_bulk_settle(engine: Engine, tag: str, tenant_ids: list[str] | None = None) -> dict[str, Any]:
     """BULK_SETTLE: each journey of the drop that has finished reading joins the customer's
     booking (its new pages carried, the journey deleted) or stays as the new booking."""
@@ -676,7 +765,8 @@ def run_bulk_settle(engine: Engine, tag: str, tenant_ids: list[str] | None = Non
             set_tenant_context(connection, tenant_id)
             if _still_reading(connection, tenant_id, journey_id):
                 continue
-            target = find_booking(connection, tenant_id=tenant_id, journey_id=journey_id)
+            target = (find_booking(connection, tenant_id=tenant_id, journey_id=journey_id)
+                      or find_booking_by_number(connection, tenant_id=tenant_id, journey_id=journey_id))
             me = _identities(connection, tenant_id=tenant_id, journey_ids=[journey_id]).get(journey_id)
             unsure = (carry_plan(connection, tenant_id=tenant_id, new=me, existing=target).unsure
                       if target is not None and me is not None else None)

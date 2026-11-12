@@ -35,6 +35,12 @@ arrival is not an upload), under the PC who uploaded
     deliveries (a delivery page among those uploads) and bookings (none); newJourneys:
     Journeys started in the period, under the PC who started them
 
+Google Drive (p2_drive_files first seen in the period; uc03_p2_drive_intake), under the PC
+the outlet's files are attributed to
+    files (documents, photos), taken, duplicates, setAside, failed, waiting, reading,
+    newBookings, addedToBookings, keptForReview, pages, pagesRead, pagesToRescan,
+    pagesReading, manualVerificationTasks -- all zero for a Project whose Drive is not connected
+
 Files closed, under the Journey's PC
     deliveryFiles   the product owner's "delivery file closed" rule (2026-11-02), exactly as
                     the Daily processing report and My Tracker count it
@@ -167,6 +173,9 @@ def _blank() -> dict[str, Any]:
         "uploads": {"files": 0, "pages": 0, "documents": 0, "journeys": set(), "deliveries": set(),
                     "newJourneys": 0},
         "closed": {"deliveryFiles": 0, "reviewer": 0},
+        "drive": {"files": 0, "documents": 0, "photos": 0, "taken": 0, "duplicates": 0, "setAside": 0, "failed": 0,
+                  "waiting": 0, "reading": 0, "newBookings": 0, "addedToBookings": 0, "keptForReview": 0, "pages": 0,
+                  "pagesRead": 0, "pagesToRescan": 0, "pagesReading": 0, "manualVerificationTasks": 0},
         "tasks": {
             "journey": task_section(), "taskManager": task_section(),
             "byRole": defaultdict(lambda: {"raised": 0, "closed": 0, "open": 0, "overdue": 0}),
@@ -396,6 +405,21 @@ def _add_uploads(connection: Connection, tree: _Tree, *, tenant_id: str, start: 
             _bump(tree.nodes(oid, r["created_by_actor_id"]), "uploads", "newJourneys")
 
 
+def _add_drive(connection: Connection, tree: _Tree, *, tenant_id: str, start: datetime, end: datetime) -> None:
+    """The files put in the Project's Google Drive in the period, under the PC they are
+    attributed to (uc03_p2_drive_intake.tracker_rows): nothing while Drive is not connected."""
+    from audit_core.uc03_p2_drive_intake import tracker_rows
+
+    for row in tracker_rows(connection, tenant_id=tenant_id, start=start, end=end):
+        oid = row["outletId"]
+        if not tree.has_outlet(oid):
+            continue
+        nodes = tree.nodes(oid, row["actorId"])
+        for key, value in row.items():
+            if key not in ("outletId", "actorId") and value:
+                _bump(nodes, "drive", key, int(value))
+
+
 def _add_closed(connection: Connection, tree: _Tree, *, tenant_id: str, actor_id: str, start: datetime,
                 end: datetime, wide: bool) -> None:
     files = delivery_files_closed(connection, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end,
@@ -608,6 +632,7 @@ def build_project_tracker(
                    today=today, now=now)
     _add_uploads(connection, tree, tenant_id=tenant_id, start=start, end=end)
     _add_closed(connection, tree, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end, wide=wide)
+    _add_drive(connection, tree, tenant_id=tenant_id, start=start, end=end)
     _add_tasks(connection, tree, tenant_id=tenant_id, start=start, end=end, first=first, last=last, now=now,
                wide=wide)
     totals, dealers = tree.result()
@@ -635,6 +660,9 @@ def build_project_tracker(
             ("Files uploaded: uploads made in the period under the PC who uploaded them (a duplicate dropped "
              "on arrival is not counted). A Journey counts as a delivery when a delivery page is among those "
              "uploads, otherwise as a booking; a Journey uploaded to by two PCs counts once on the outlet."),
+            ("Google Drive: the files put in the Project's Drive in the period (by when Verigence first saw "
+             "them), under the PC of their outlet: taken, exact duplicates, set aside, still waiting; the pages "
+             "read and the pages to scan again; and the manual verification tasks their Journeys got since."),
             ("Delivery files closed: all mandatory delivery documents in (or the PC closed their 'Upload the "
              "...' task) and every document task closed, counted on the day the last of them closed, under "
              "the Journey's PC (the Daily processing report's rule). Closed by Reviewer: Journeys a Reviewer "
