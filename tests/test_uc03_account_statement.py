@@ -1276,12 +1276,25 @@ def test_the_figures_of_an_ndc_that_could_not_be_read_are_kept(journey) -> None:
     assert _sync(journey)["sourceValuesWithdrawn"] == 0
     assert statement_rows() == before
 
-    # Figures taken from it while it was unread (as on 2026-11-12) come back.
+    # Figures taken from it while it was unread (as on 2026-11-12) come back -- also when
+    # some of its figures still stand (UTK-PP-261023-007).
     with journey.engine.begin() as c:
         set_tenant_context(c, journey.tenant_id)
         c.execute(text("UPDATE auditcore.commercial_line_source_values SET withdrawn_at_utc=now() "
-                       "WHERE tenant_id=:t AND journey_id=:j AND source_document_type='customer_ledger'"),
+                       "WHERE tenant_id=:t AND journey_id=:j AND source_document_type='customer_ledger' "
+                       "AND component_key <> 'registration_charges'"),
                   {"t": journey.tenant_id, "j": journey.journey_id})
-    assert statement_rows() == {}
+    assert set(statement_rows()) == {"registration_charges"}
     _sync(journey)
     assert statement_rows() == before
+
+    # What a readable reading took back earlier stays withdrawn when the document later
+    # cannot be read: the row withdrawn before the document's current reading.
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("UPDATE auditcore.commercial_line_source_values SET withdrawn_at_utc=now() - interval '2 days' "
+                       "WHERE tenant_id=:t AND journey_id=:j AND source_document_type='customer_ledger' "
+                       "AND component_key = 'insurance_amount'"),
+                  {"t": journey.tenant_id, "j": journey.journey_id})
+    _sync(journey)
+    assert "insurance_amount" not in statement_rows() and statement_rows()["ex_showroom_price"] == D(999899)
