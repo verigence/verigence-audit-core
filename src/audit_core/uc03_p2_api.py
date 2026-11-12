@@ -75,6 +75,7 @@ from audit_core.uc03_p2_stage import (
     read_booking_stage,
     ready_document_counts,
     receipt_split,
+    receipt_stage_by_document,
     requirement_items,
 )
 from audit_core.uc03_p2_storage import (
@@ -1852,9 +1853,20 @@ def list_documents(
     )
 
     ledgers = payment_ledger_ids(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # A receipt is under Booking or Delivery by the minimum booking amount, never
+    # by the area it was uploaded under (decision 2026-10-19; product owner
+    # 2026-11-12: "any payment more than the minimum payment has to be considered
+    # as part of the delivery ... why same issue again"). The checklist counted
+    # the receipts by that split, but each document was placed here by its upload
+    # area: live, SHI-YK-261111-001's six receipts all came in one delivery file
+    # filed under Booking, so all six sat on the Booking Payment Receipt card and
+    # the Delivery Payment Receipt card read "Missing" beside "5 of 6 received".
+    receipt_stages = receipt_stage_by_document(connection, tenant_id=tenant_id, journey_id=journey_id)
     documents = []
     for raw in evidence_rows:
         doc = dict(raw)
+        if raw["association_status"] == "ACTIVE" and str(raw["di_document_id"]) in receipt_stages:
+            doc["process_area"] = receipt_stages[str(raw["di_document_id"])]
         template = registry.template_for_di_type(
             doc.get("document_type_key"), stage=str(doc.get("process_area") or "").upper() or None,
         )
