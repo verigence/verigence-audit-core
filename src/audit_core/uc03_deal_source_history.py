@@ -121,6 +121,15 @@ def record_source_value(
 # (a value recorded without a document link) or an ACTIVE one. A document
 # that was voided, superseded or merged into another stops counting
 # (2026-10-20, R2: "voided/removed documents stop counting").
+_DOCUMENT_ON_FILE = """
+    NOT EXISTS (
+        SELECT 1 FROM auditcore.evidence e
+        WHERE e.tenant_id = s.tenant_id AND e.journey_id = s.journey_id
+          AND (e.di_document_id = s.source_document_id OR e.evidence_id = s.source_evidence_id)
+          AND e.association_status <> 'ACTIVE'
+    )
+"""
+
 # A row its document no longer gives (withdraw_unreported) stops counting as well
 # (2026-11-12): a figure read once and gone on a later reading stood for good.
 ACTIVE_SOURCE_CONDITION = """
@@ -136,6 +145,7 @@ ACTIVE_SOURCE_CONDITION = """
 def withdraw_unreported(
     connection: Connection, *, tenant_id: str, journey_id: UUID, source_document_type: str,
     reported: set[tuple[str, str, str | None]],
+    keep_documents: set[str] | None = None, keep_all: bool = False,
 ) -> int:
     """Take back what a source said earlier and no longer says.
 
@@ -146,9 +156,48 @@ def withdraw_unreported(
     its document stayed on file -- SHI-SS-261027-024's NDC has no insurance row, but its
     earlier "insurance Rs 82,000" kept the insurance in-house and the premium in the Deal.
 
+    A document that could not be read at all on this pass says nothing about what it
+    prints: the rows of the documents in ``keep_documents`` (and, with ``keep_all``, every
+    row of the type -- for a source recorded under no document id) are never withdrawn,
+    and a row of theirs withdrawn earlier is brought back when nothing of that document
+    (or type) stands. Found the day this shipped (2026-11-12): four NDCs whose rows did
+    not parse had every figure taken back, their vehicle price included.
+
     Call it once per source type, after every figure of this reading is recorded
     (record_source_value brings a row back when the document gives the figure again).
     Returns the number of rows withdrawn."""
+    kept = {str(d) for d in (keep_documents or set())}
+    # Bring back what was taken from an unread document, when none of its rows stands.
+    for document in sorted(kept) if not keep_all else [None]:
+        which = "TRUE" if keep_all else "s.source_document_id = CAST(:document AS uuid)"
+        stands = connection.execute(
+            text(
+                f"""
+                SELECT count(*) FILTER (WHERE s.withdrawn_at_utc IS NULL) AS standing,
+                       count(*) FILTER (WHERE s.withdrawn_at_utc IS NOT NULL) AS taken
+                FROM auditcore.commercial_line_source_values s
+                WHERE s.tenant_id = :t AND s.journey_id = :j AND {NORMALISED_TYPE_SQL} = :type AND {which}
+                  AND {_DOCUMENT_ON_FILE}
+                """
+            ),
+            {"t": tenant_id, "j": journey_id, "type": normalise_document_type(source_document_type),
+             "document": document},
+        ).mappings().one()
+        if stands["taken"] and not stands["standing"]:
+            connection.execute(
+                text(
+                    f"""
+                    UPDATE auditcore.commercial_line_source_values s
+                    SET withdrawn_at_utc = NULL
+                    WHERE s.tenant_id = :t AND s.journey_id = :j AND s.withdrawn_at_utc IS NOT NULL
+                      AND {NORMALISED_TYPE_SQL} = :type AND {which} AND {_DOCUMENT_ON_FILE}
+                    """
+                ),
+                {"t": tenant_id, "j": journey_id, "type": normalise_document_type(source_document_type),
+                 "document": document},
+            )
+    if keep_all:
+        return 0
     wanted = {(kind, key.strip().lower(), str(document) if document else None) for kind, key, document in reported}
     standing = connection.execute(
         text(
@@ -164,7 +213,7 @@ def withdraw_unreported(
     ).mappings().all()
     withdrawn = 0
     for row in standing:
-        if (row["line_kind"], row["component_key"], row["document_id"]) in wanted:
+        if (row["line_kind"], row["component_key"], row["document_id"]) in wanted or row["document_id"] in kept:
             continue
         withdrawn += connection.execute(
             text(
