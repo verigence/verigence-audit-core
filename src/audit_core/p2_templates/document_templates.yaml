@@ -1298,12 +1298,15 @@ document_types:
     - DOCUMENTS
     - FINANCE
   purchase_order:
+    # Product owner 2026-11-12: "make PO non mandatory and no tasks". It was mandatory for a
+    # "corporate customer" (any buyer GSTIN on an invoice): 129 tasks open, 75 of them sole
+    # proprietors on their own PAN, and 34 POs ever uploaded. Read and kept when uploaded.
     display_name: Purchase Order
     di_types:
     - purchase_order
     stage: DELIVERY
-    requirement: CONDITIONAL
-    condition: corporateCustomer
+    requirement: OPTIONAL
+    condition: null
     accepted_early: true
     pages:
       shape: MULTI_PAGE
