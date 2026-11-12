@@ -677,6 +677,8 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
             row = conclude_charge(line, on_file=on_file, discounts=discount_amounts,
                                   statement_only=summary.get("billedSource") == "ACCOUNT_STATEMENT")
             row["category"] = group.get("label")
+            if line.get("addOn"):
+                row["addOn"] = line["addOn"]
             if line["key"] in _VAS:
                 taken = (line.get("opted") or {}).get("taken") if isinstance(line.get("opted"), dict) else None
                 products.append(conclude_product(row, on_file=on_file, taken=taken))
@@ -821,6 +823,8 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         # discounts the deal does not count, beside a payable that leaves them out).
         "deal": {"charges": charges, "gross": (summary.get("gross") or {}).get("current"),
                  "discounts": (summary.get("discounts") or {}).get("current"),
+                 # Accessories bought beyond the NDC (2026-11-12): in the net payable, in no line above.
+                 "accessoriesAddOn": summary.get("accessoriesAddOn"),
                  "netPayable": summary.get("payable")},
         "benefits": benefits,
         "products": products,

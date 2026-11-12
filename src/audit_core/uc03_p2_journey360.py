@@ -1914,7 +1914,18 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     # to be received, never off the deal's net or its variance.
     ledger_discounts = sum((Decimal(r["ledgerPosted"]) for r in discount_rows
                             if r.get("ledgerPosted") and not r.get("sameAs")), Decimal(0))
-    payable = (str(Decimal(net_cur) - ledger_discounts) if net_cur is not None else None) if price_billed else None
+    # Accessories bought beyond the NDC / cost sheet (product owner 2026-11-12:
+    # "accessories add on is to be counted in the total amount to be
+    # received"). Live, SHI-SS-261027-023: the NDC charges accessories of
+    # Rs 5,000, the customer bought Rs 8,380 more after delivery, and the
+    # customer ledger posts Rs 13,380 -- the deal showed Rs 5,000 and the
+    # Rs 8,380 nowhere. The NDC alone prices the deal, so the add-on is no
+    # part of the deal's lines, its standard or its variance: it is what the
+    # customer ledger posts for accessories over what the NDC charges, shown
+    # on the accessories line and added to what is to be received.
+    accessories_add_on = _accessories_add_on(all_rows) if statement_policy and price_billed else None
+    payable = ((str(Decimal(net_cur) - ledger_discounts + (accessories_add_on or Decimal(0)))
+                if net_cur is not None else None) if price_billed else None)
     paid = _paid(connection, tenant_id=tenant_id, journey_id=journey_id)
     # The old vehicle the NDC takes against the price ("Exchanged vehicle",
     # or its "Trade in value" row) is paid in kind (2026-11-02, Deal defect 4).
@@ -2008,6 +2019,9 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
             # Discounts the customer ledger posts that the NDC / cost sheet does
             # not show: taken off the payable above (2026-11-11), else None.
             "ledgerDiscounts": str(ledger_discounts) if ledger_discounts else None,
+            # Accessories the customer ledger posts over what the NDC / cost
+            # sheet charges: in the payable above (2026-11-12), else None.
+            "accessoriesAddOn": str(accessories_add_on) if accessories_add_on else None,
             # A financed deal whose loan is not on file has no balance yet:
             # it would be the loan itself, not a shortfall (as the Summary).
             "balanceDue": None if loan_view["unknown"] else _minus(payable, paid_total),
@@ -2452,6 +2466,29 @@ def _component_row(
         "freeByInvoice": _money(free_by_invoice) if free_by_invoice is not None and free_by_invoice > 0 else None,
         "statementOnly": statement_only,
     }
+
+
+def _accessories_add_on(rows: list[dict[str, Any]]) -> Decimal | None:
+    """What the customer ledger posts for accessories over what the NDC / cost
+    sheet charges for them, across the accessories lines together (the ledger
+    posts one accessories amount; the NDC may charge a kit and accessories on
+    two lines). Marks the line carrying the posting (``addOn``); a line it
+    covers is no longer "invoiced but not on the NDC". None when the ledger
+    posts no accessories or no more than the NDC charges."""
+    lines = [r for r in rows if r["key"] in _ADDON_COMPONENTS["accessories"]
+             and not r.get("partOf") and not r.get("excluded")]
+    posted = [r for r in lines if _dec(r.get("ledger")) is not None]
+    if not posted:
+        return None
+    charged = sum((_dec(r.get("billed")) or Decimal(0) for r in lines), Decimal(0))
+    add_on = sum((_dec(r["ledger"]) for r in posted), Decimal(0)) - charged
+    if add_on <= _RTO_TOLERANCE:
+        return None
+    carrier = posted[0]
+    carrier["addOn"] = _money(add_on)
+    carrier["freeByInvoice"] = None  # charged in the ledger, so not given free
+    carrier["flags"] = [f for f in carrier["flags"] if f != "NOT_ON_STATEMENT"]
+    return add_on
 
 
 def _off_file(line: Any, on_file: frozenset[str] | None) -> bool:
@@ -3907,7 +3944,15 @@ def _taken_addons(
                 "The customer's own policy" if decided == "SELF"
                 else "Not confirmed in-house: kept out of the deal until the PC confirms")
             taken = False
-        if kind != "insurance" and not billed and any(r.get("notTaken") for r in rows) and (
+        add_on = _dec((deal_view.get("summary") or {}).get("accessoriesAddOn")) if kind == "accessories" else None
+        if add_on:
+            # Accessories bought beyond the NDC (2026-11-12): taken, at what the
+            # customer ledger posts over the NDC's charge, added to the NDC's.
+            details[kind]["addOn"] = str(add_on)
+            taken = True
+            amount = sum(billed, Decimal(0)) + add_on
+            source = "billed" if billed else "record"
+        elif kind != "insurance" and not billed and any(r.get("notTaken") for r in rows) and (
                 (deal_view.get("summary") or {}).get("billedSource") == "ACCOUNT_STATEMENT"):
             # The NDC / cost sheet is on file and does not charge it: not taken
             # with the car, whatever invoice of its kind is on file (product

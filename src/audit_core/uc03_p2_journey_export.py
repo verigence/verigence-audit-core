@@ -249,9 +249,11 @@ def column_notes() -> list[tuple[str, str]]:
                                  "journey was started' (no booking documents uploaded either)")),
         ("Insurance Policy No", "Insurance policy / cover note (policy number); blank when no policy is on file"),
         ("Insurance Add-ons", "The add-on covers printed on the insurance policy (zero depreciation, RSA ...)"),
-        ("Accessories Add-on", ("Accessories billed over the price master's standard accessories kit: the Deal's "
-                                "accessories as billed less their standard, when more (0 when not more; blank "
-                                "when no accessories are billed)")),
+        ("Accessories Add-on", ("Where the NDC / cost sheet prices the deal: accessories bought beyond it, what "
+                                "the customer ledger posts for accessories over the NDC's charge; it is in Total "
+                                "Amt To Be Received (blank when none). Elsewhere: accessories billed over the "
+                                "price master's standard accessories kit (0 when not more; blank when no "
+                                "accessories are billed)")),
     ]
     return notes
 
@@ -380,7 +382,11 @@ def deal_amounts(deal: dict[str, Any]) -> dict[str, Any]:
     received = _dec((summary.get("paid") or {}).get("total")) or Decimal(0)
     accessories = [line for group in deal.get("categories") or [] for line in group.get("components") or []
                    if line.get("key") in _ACCESSORY_KEYS and not line.get("partOf") and _dec(line.get("current")) is not None]
-    if accessories:
+    if summary.get("billedSource") == "ACCOUNT_STATEMENT":
+        # The NDC prices the deal: the add-on is what the customer ledger posts
+        # for accessories over the NDC's charge (2026-11-12), as the Deal counts it.
+        out["Accessories Add-on"] = _num(_dec(summary.get("accessoriesAddOn")))
+    elif accessories:
         billed = sum((_dec(line.get("current")) or Decimal(0) for line in accessories), Decimal(0))
         kit = sum((_dec(line.get("standard")) or Decimal(0) for line in accessories), Decimal(0))
         out["Accessories Add-on"] = _num(max(billed - kit, Decimal(0)))
