@@ -5089,6 +5089,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # uc03_sku_set. A dry run unless the tag's label ends with "-commit".
         from audit_core.uc03_sku_set import run_sku_set
         return run_sku_set, (engine, tag, reports)
+    if kind == "SAME_SALE_SETTLE":
+        # The sales uploaded twice before the same-sale match (2026-11-12): see
+        # uc03_same_sale_settle. A dry run unless the label ends with "-commit".
+        from audit_core.uc03_same_sale_settle import run_same_sale_settle
+        return run_same_sale_settle, (engine, tag, reports)
     if kind == "RULES_RERUN":
         # Every booking's checks run again after a rule changes (2026-11-03):
         # see uc03_rules_rerun. A dry run unless the label ends with "-commit".

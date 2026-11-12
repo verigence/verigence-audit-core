@@ -1317,3 +1317,103 @@ def test_a_copy_holding_another_customers_file_is_kept(tenant):
     _page(new, sha=uuid4().hex, kind="pan_card", identity="FOREIGN")
     assert _detect(new)["outcomes"] == ["KEPT_OWN_DOCUMENTS"]
     assert "another customer's file" in _alerts(new)[0]["body"]
+
+
+# ── one sale uploaded twice, known by its dealer receipt (2026-11-12) ─────────
+def _receipt(journey: P2Journey, number: str) -> None:
+    doc = uuid4()
+    add_evidence(journey, di_document_id=doc, document_type_key="dealer_receipt")
+    add_extracted_field(journey, di_document_id=doc, field_key="receipt_number", value=number,
+                        document_type="dealer_receipt")
+
+
+def _invoice(journey: P2Journey, number: str) -> None:
+    doc = uuid4()
+    add_evidence(journey, di_document_id=doc, document_type_key="customer_invoice_dms")
+    add_extracted_field(journey, di_document_id=doc, field_key="invoice_number", value=number,
+                        document_type="customer_invoice_dms")
+
+
+def test_the_same_receipt_is_the_same_sale_without_a_database():
+    from audit_core.uc03_p2_same_file import (
+        same_file_fields,
+        same_sale_fields,
+        two_vehicles,
+    )
+
+    receipt = frozenset({"BRMM262704861"})
+    # AVINASH PATRA: the mobile and the booking number each misread by one digit on one copy.
+    booking = _identity(mobile="9338696711", booking_refs=frozenset({"OR26110204479797"}), receipt_numbers=receipt,
+                        model_name="Maxx HD 1.7L LX")
+    delivery = _identity(mobile="9338676711", booking_refs=frozenset({"OR26110204479497"}), receipt_numbers=receipt,
+                         model_name="BOL MAXX PUP HD 1.7L LX", vin="MA1RE2TTKT5K40074",
+                         invoice_numbers=frozenset({"INV27P000427"}))
+    assert matched_fields(delivery, booking) is None
+    fields = {f["field"]: f for f in same_file_fields(delivery, booking)}
+    assert fields["receipt"]["exact"] and not fields["mobile"]["exact"] and not fields["bookingReference"]["exact"]
+    # No receipt in common, another person, or two vehicles: not the same sale.
+    assert same_sale_fields(delivery, _identity(receipt_numbers=frozenset({"BRMM262704862"}))) is None
+    assert same_sale_fields(delivery, _identity(pan="ABCPE9999F", receipt_numbers=receipt)) is None
+    other_car = _identity(receipt_numbers=receipt, vin="MA1RE2TTKT5K40075")
+    assert two_vehicles(delivery, other_car) and same_sale_fields(delivery, other_car) is None
+    same_car = _identity(receipt_numbers=receipt, vin="MA1RE2TTKT5K40074", invoice_numbers=frozenset({"INV21Q000186"}))
+    assert same_sale_fields(delivery, same_car) is not None  # one VIN: an invoice misread does not split it
+    assert two_vehicles(_identity(invoice_numbers=frozenset({"INV1000001"})),
+                        _identity(invoice_numbers=frozenset({"INV1000002"})))
+
+
+def test_a_booking_file_then_its_delivery_file_become_one_journey(tenant):
+    """Product owner 2026-11-12: "if the same details are found but with additional
+    documents then we will update the existing booking"."""
+    now = datetime.now(UTC)
+    booking = _journey(tenant, ref="BOOKING-FILE", created=now - timedelta(days=1))
+    delivery = _journey(tenant, ref="DELIVERY-FILE", created=now - timedelta(minutes=5))
+    _file(booking, mobile="+91 93386 96711", booking_ref="OR26110204479797", model="Maxx HD 1.7L LX")
+    _file(delivery, mobile="+91 93386 76711", booking_ref="OR26110204479497", model="BOL MAXX PUP HD 1.7L LX")
+    _receipt(booking, "BRMM/2627/04861")
+    _receipt(delivery, "BRMM/2627/04861")
+    _invoice(delivery, "INV27P000427")
+    _quiet(delivery)
+
+    assert _detect(delivery)["raised"] == 1
+    [alert] = _alerts(delivery)
+    # The delivery file holds more documents: it is kept, the booking file is the copy.
+    assert alert["subject_journey_id"] == booking.journey_id and alert["related_journey_id"] == delivery.journey_id
+    assert alert["outcome"] == "PENDING_DELETE"
+    assert {f["field"] for f in alert["payload"]["matchedFields"]} >= {"pan", "receipt"}
+    assert _delete(booking) == "DELETED"
+    assert not _exists(booking) and _exists(delivery)
+
+
+def test_the_same_receipt_on_two_vehicles_is_two_sales(tenant):
+    now = datetime.now(UTC)
+    first = _journey(tenant, ref="CAR-ONE", created=now - timedelta(days=1))
+    second = _journey(tenant, ref="CAR-TWO", created=now - timedelta(minutes=5))
+    _file(first, booking_ref="OR1")
+    _file(second, booking_ref="OR2")
+    for journey, invoice in ((first, "INV27P000001"), (second, "INV27P000002")):
+        _receipt(journey, "BRMM/2627/04861")
+        _invoice(journey, invoice)
+    assert _detect(second).get("raised", 0) == 0 and _alerts(second) == []
+
+
+def test_the_settle_job_finds_old_pairs_and_its_dry_run_changes_nothing(tenant):
+    from audit_core.uc03_same_sale_settle import run_same_sale_settle
+
+    now = datetime.now(UTC)
+    booking = _journey(tenant, ref="OLD-BOOKING", created=now - timedelta(days=10))
+    delivery = _journey(tenant, ref="OLD-DELIVERY", created=now - timedelta(days=8))
+    _file(booking, mobile="+91 93386 96711", booking_ref="OR797")
+    _file(delivery, mobile="+91 93386 76711", booking_ref="OR497")
+    _receipt(booking, "BRMM/2627/04861")
+    _receipt(delivery, "BRMM/2627/04861")
+    _invoice(delivery, "INV27P000427")
+    assert _detect(delivery)["raised"] == 0  # outside the 48-hour window
+
+    dry = run_same_sale_settle(tenant.engine, f"{tenant.tenant_id}:settle", [])
+    assert dry["commit"] is False and dry["toDelete"] == 1
+    assert dry["pairs"] == [{"copy": "OLD-BOOKING", "kept": "OLD-DELIVERY", "outcome": "PENDING_DELETE"}]
+    assert _alerts(delivery) == [] and _queued(delivery) == []
+
+    done = run_same_sale_settle(tenant.engine, f"{tenant.tenant_id}:settle-commit", [])
+    assert done["toDelete"] == 1 and len(_queued(delivery)) == 1
