@@ -130,8 +130,38 @@ def line_rows(value: Any) -> list[dict[str, Any]]:
                 except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
                     continue
         else:
-            return []
+            return _salvaged_rows(raw)
     return [row for row in raw if isinstance(row, dict)] if isinstance(raw, list) else []
+
+
+_ROW_OBJECT = re.compile(r"\{[^{}]*\}")
+_ROW_AMOUNT = re.compile(r'"(debit_amount|credit_amount)"\s*:\s*"?(-?\d[\d,]*(?:\.\d+)?)')
+_ROW_LABEL = re.compile(r'"particulars_raw"\s*:\s*"(.*?)"?\s*(?:"[a-z_]+"\s*:|\}$)', re.DOTALL)
+
+
+def _salvaged_rows(raw: str) -> list[dict[str, Any]]:
+    """The rows of a statement whose text is not a valid list as a whole, read one row at
+    a time. One broken row (UTK-PP-261023-007, 2026-11-12: a corrected row written as
+    ``{"particulars_raw": ",other charges "debit_amount": 6000}``) lost every row of the
+    NDC, its "Vehicle cost" included. A row that parses is taken as it is; from a broken
+    one the label and its amount are still read; a row that gives neither is left out."""
+    rows: list[dict[str, Any]] = []
+    for piece in _ROW_OBJECT.findall(raw):
+        for text_value in (piece, _BARE_VALUE.sub(r"\1null\3", piece)):
+            try:
+                row = json.loads(text_value)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+            break
+        else:
+            amounts = {key: float(value.replace(",", "")) for key, value in _ROW_AMOUNT.findall(piece)}
+            label = _ROW_LABEL.search(piece)
+            name = label.group(1).strip(" ,\"") if label else ""
+            if amounts and name:
+                rows.append({"particulars_raw": name, **{k: int(v) if v == int(v) else v for k, v in amounts.items()}})
+    return rows
 
 
 # ── the mapping ──────────────────────────────────────────────────────────────

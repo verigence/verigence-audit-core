@@ -1298,3 +1298,20 @@ def test_the_figures_of_an_ndc_that_could_not_be_read_are_kept(journey) -> None:
                   {"t": journey.tenant_id, "j": journey.journey_id})
     _sync(journey)
     assert "insurance_amount" not in statement_rows() and statement_rows()["ex_showroom_price"] == D(999899)
+
+
+def test_one_broken_row_does_not_lose_the_statement() -> None:
+    """UTK-PP-261023-007, 2026-11-12: a corrected row with a quote out of place made the
+    whole list unreadable, and the NDC gave no vehicle price."""
+    from audit_core.uc03_account_statement import line_rows
+
+    rows = line_rows(
+        '[{"particulars_raw": "Vehicle cost", "debit_amount": 1081500}, '
+        '{"particulars_raw": "TCS", "debit_amount": 10718}, '
+        '{"particulars_raw": ",other charges "debit_amount": 6000}, '
+        '{"particulars_raw": "Finance D/O", "entry_date": "2026-10-09", "credit_amount": 1075545}]'
+    )
+    assert [(r["particulars_raw"], r.get("debit_amount"), r.get("credit_amount")) for r in rows] == [
+        ("Vehicle cost", 1081500, None), ("TCS", 10718, None), ("other charges", 6000, None),
+        ("Finance D/O", None, 1075545)]
+    assert line_rows("not a statement at all") == []
