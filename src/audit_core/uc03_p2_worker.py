@@ -89,6 +89,7 @@ from audit_core.uc03_p2_price_variance import (
     backfill_price_variance,
     refresh_price_variance,
 )
+from audit_core.uc03_p2_read_skip import read_skip_types
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_retry_stop import (
     STOPPED_CODE,
@@ -1654,12 +1655,22 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
         # after grouping stands alone and is read in full.
         read_once = read_once_di_types(get_registry())
         requirement_refs = {k: v for k, v in requirement_refs.items() if k not in read_once}
+        classify_only = read_once
+    else:
+        classify_only = frozenset()
     with engine.begin() as connection:
         set_tenant_context(connection, work.tenant_id)
         quality_gate = (
             UPLOADER_CONFIRMED_QUALITY
             if page_refused_for_scan_quality_before(connection, tenant_id=work.tenant_id, queue_id=queue_id)
             else None
+        )
+        # Classified but not read (12 Nov 2026, uc03_p2_read_skip): UPI screenshots always,
+        # a page of a document read once merged, and -- for bulk and Drive uploads -- a
+        # one-per-journey document the journey already holds read.
+        skip_reading = read_skip_types(
+            connection, tenant_id=work.tenant_id, journey_id=work.journey_id, batch_id=row["batch_id"],
+            registry=get_registry(), classify_only=classify_only,
         )
     v2_client = get_di_capture_v2_client()
     content_type = "application/pdf" if str(row["page_object_key"]).endswith(".pdf") else str(row["original_content_type"] or "application/octet-stream")
@@ -1689,6 +1700,7 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
             {k: v for k, v in requirement_refs.items() if k in override} if override else requirement_refs
         ),
         classification_mode=classification_mode,
+        skip_reading_document_type_keys=skip_reading,
         **({"quality_gate": quality_gate} if quality_gate else {}),
         # DI's capture contract takes the file's identity only; it measures
         # the bytes itself on upload and rejects any other field.
@@ -2670,7 +2682,7 @@ def _group_batch(engine: Engine, work: WorkItem) -> None:
             text(
                 """
                 SELECT queue_id, page_number, classified_document_type, business_stage,
-                       queue_status, page_object_key
+                       queue_status, page_object_key, type_overridden_by_actor_id
                 FROM auditcore.p2_document_queue
                 WHERE tenant_id=:tenant_id AND batch_id=:batch_id
                   AND unit_kind='PAGE' AND queue_status <> 'MERGED'
@@ -2681,13 +2693,19 @@ def _group_batch(engine: Engine, work: WorkItem) -> None:
         ).mappings().all()
 
     by_number = {int(page["page_number"]): dict(page) for page in pages}
+    read_once = read_once_di_types(registry)
     plan = plan_documents(
         [
             PageFact(
                 page_number=int(page["page_number"]),
+                # A page of an always-merged type is only classified (uc03_p2_read_skip):
+                # DI does not read it, so the reconcile may already have settled it as
+                # supporting. It is still part of its document.
                 di_type=(
                     page["classified_document_type"]
                     if page["queue_status"] not in {"SUPPORTING", "FAILED", "DEAD_LETTER", "CANCELLED"}
+                    or (page["queue_status"] == "SUPPORTING" and page["classified_document_type"] in read_once
+                        and page["type_overridden_by_actor_id"] is None)
                     else None
                 ),
                 status=str(page["queue_status"]),
@@ -2699,7 +2717,6 @@ def _group_batch(engine: Engine, work: WorkItem) -> None:
     )
     # Multi-page documents, and single pages of an always-merged type (only
     # classified at page level), get one upload each: one extraction.
-    read_once = read_once_di_types(registry)
     grouped = [document for document in plan if needs_document_upload(document, read_once)]
 
     storage = get_p2_document_storage()
@@ -3950,6 +3967,14 @@ READ_CEILING = timedelta(minutes=30)
 # rule.) GROUPING_CEILING stays a named constant so the rule is read in one
 # place, and is tied to READ_CEILING so the two cannot drift apart.
 GROUPING_CEILING = READ_CEILING
+# Drive intake pages (product owner 12 Nov 2026: "we can go with 60 mins for drive pages"):
+# nobody waits on them, so they get an hour before they are failed as not read.
+DRIVE_READ_CEILING = timedelta(minutes=60)
+_DRIVE_BATCH_SQL = (
+    "EXISTS (SELECT 1 FROM auditcore.p2_bulk_files bf JOIN auditcore.p2_bulk_uploads bu "
+    "ON bu.tenant_id=bf.tenant_id AND bu.bulk_id=bf.bulk_id "
+    "WHERE bf.tenant_id=b.tenant_id AND bf.batch_id=b.batch_id AND bu.source='DRIVE')"
+)
 _UNSETTLED_PAGE_STATES = tuple(s for s in _PAGE_ACTIVE_STATES if s != "SYNCING_TO_AUDIT_CORE")
 _UNSETTLED_BATCH_STATES = ("AWAITING_UPLOAD", "UPLOADED", "SPLITTING")
 GROUPING_FAILED_CODE = "GROUPING_FAILED"
@@ -4024,9 +4049,10 @@ def fail_unsettled_pages(connection, *, tenant_id: str, now: datetime | None = N
     now = now or datetime.now(UTC)
     cutoff = now - READ_CEILING
     group_cutoff = now - GROUPING_CEILING
+    drive_cutoff = now - DRIVE_READ_CEILING
     pages = [dict(r) for r in connection.execute(
         text(
-            """
+            f"""
             UPDATE auditcore.p2_document_queue AS q
             SET queue_status='FAILED', status_reason=:reason, last_error=:code,
                 next_attempt_at_utc=NULL,
@@ -4039,11 +4065,12 @@ def fail_unsettled_pages(connection, *, tenant_id: str, now: datetime | None = N
                 OR (q.read_clock_started_at_utc IS NULL AND q.unit_kind <> 'GROUP' AND b.created_at_utc < :cutoff)
                 OR (q.read_clock_started_at_utc IS NULL AND q.unit_kind = 'GROUP' AND b.created_at_utc < :group_cutoff)
               )
+              AND (NOT {_DRIVE_BATCH_SQL} OR COALESCE(q.read_clock_started_at_utc, b.created_at_utc) < :drive_cutoff)
             RETURNING q.queue_id, q.journey_id, q.batch_id, q.di_document_id, q.last_error
             """
         ),
         {"t": tenant_id, "states": list(_UNSETTLED_PAGE_STATES), "cutoff": cutoff, "group_cutoff": group_cutoff,
-         "reason": NOT_READ_IN_TIME_REASON, "code": NOT_READ_IN_TIME_CODE},
+         "drive_cutoff": drive_cutoff, "reason": NOT_READ_IN_TIME_REASON, "code": NOT_READ_IN_TIME_CODE},
     ).mappings().all()]
     files = connection.execute(
         text(

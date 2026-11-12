@@ -53,10 +53,19 @@ class DiCaptureV2Client:
         requirement_refs_by_document_type_key: dict[str, str] | None = None,
         classification_mode: str | None = None,
         quality_gate: str | None = None,
+        skip_reading_document_type_keys: list[str] | None = None,
+        gemini_tier: str | None = None,
     ) -> dict[str, Any]:
         """``classification_mode="TRUST_SINGLE_CANDIDATE"`` (exactly one
         candidate): the type is already known, DI skips its paid
-        classification call."""
+        classification call.
+
+        ``skip_reading_document_type_keys`` (12 Nov 2026, DI migration 0066):
+        types DI classifies but does not read. The UPI screenshot is always
+        among them, on every upload (product owner: "a standard rule across")."""
+        from audit_core.uc03_p2_read_skip import NEVER_READ_DI_TYPES
+
+        skip = sorted(set(skip_reading_document_type_keys or ()) | NEVER_READ_DI_TYPES)
         body: dict[str, Any] = {
             "phase": phase,
             "candidateDocumentTypeKeys": candidate_document_type_keys,
@@ -71,6 +80,11 @@ class DiCaptureV2Client:
             # UPLOADER_CONFIRMED: the person sent this refused scan again; DI
             # records its scan-quality scores but does not refuse it.
             body["qualityGate"] = quality_gate
+        if skip:
+            body["skipReadingDocumentTypeKeys"] = skip
+        if gemini_tier == "FLEX":
+            # Gemini's Flex tier (DI migration 0067): half price, answered in minutes.
+            body["geminiTier"] = "FLEX"
         return self._request(
             "POST",
             f"/v2/tenants/{tenant_id}/audit-storage-contexts/"

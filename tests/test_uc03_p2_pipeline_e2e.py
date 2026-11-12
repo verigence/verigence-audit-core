@@ -85,7 +85,8 @@ class FakeDI:
 
     def create_upload_intents(self, *, token, tenant_id, external_context_ref, phase, files,
                               candidate_document_type_keys, requirement_refs_by_document_type_key,
-                              classification_mode=None, quality_gate=None):
+                              classification_mode=None, quality_gate=None,
+                              skip_reading_document_type_keys=None, gemini_tier=None):
         self.intent_calls += 1
         self.quality_gates = getattr(self, "quality_gates", [])
         self.quality_gates.extend((f["filename"], quality_gate) for f in files)
@@ -100,7 +101,9 @@ class FakeDI:
                 doc_type = candidate_document_type_keys[0] if trusted else PAGE_TYPES[page]
                 doc = {"documentId": str(uuid4()), "clientUploadId": f["clientUploadId"], "page": page,
                        "type": doc_type, "finalized": False, "trusted": trusted,
-                       "read": doc_type in (requirement_refs_by_document_type_key or {})}
+                       # DI reads every classified page except the types it is asked to
+                       # skip (DI migration 0066, 12 Nov 2026).
+                       "read": doc_type not in (skip_reading_document_type_keys or [])}
                 self.by_client[f["clientUploadId"]] = doc
             uploads.append({"documentId": doc["documentId"], "uploadUrl": f"https://di.test/{doc['documentId']}",
                             "uploadHeaders": {}})
