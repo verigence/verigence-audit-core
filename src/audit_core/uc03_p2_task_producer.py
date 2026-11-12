@@ -1575,9 +1575,71 @@ def sync_document_missing_tasks(
         connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"document-missing:{journey_id}:",
         keep=wanted, evidence={**deferred, "verifiedAt": datetime.now(UTC).isoformat()},
     )
+    closed += _close_answered_but_not_required(
+        connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"document-missing:{journey_id}:",
+        keep=wanted, evidence={**deferred, "verifiedAt": datetime.now(UTC).isoformat()},
+    )
     if closed:
         counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed
     return counts
+
+
+def _close_answered_but_not_required(connection: Connection, *, tenant_id: str, journey_id: UUID, prefix: str,
+                                     keep: set[str], evidence: dict[str, Any]) -> int:
+    """A document task the PC already answered, waiting for the requester to review that
+    answer, whose document is no longer required: closed, and its review with it -- there
+    is nothing left to review (2026-11-12: 24 "Upload the Purchase Order" tasks stayed open
+    this way after the Purchase Order was made optional)."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT task_id, dedupe_key FROM auditcore.p2_tasks
+            WHERE tenant_id=:t AND journey_id=:j AND dedupe_key LIKE :prefix
+              AND task_status = 'AWAITING_REQUESTER_REVIEW'
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "prefix": f"{prefix}%"},
+    ).mappings().all()
+    closed = 0
+    for row in rows:
+        if row["dedupe_key"] in keep:
+            continue
+        task_id = UUID(str(row["task_id"]))
+        details = {**evidence, "closedBecause": "The document is no longer required."}
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_tasks
+                SET task_status='VERIFIED_COMPLETE', verified_at_utc=now(),
+                    completion_result=COALESCE(completion_result, '{}'::jsonb) || CAST(:result AS jsonb),
+                    updated_at_utc=now()
+                WHERE tenant_id=:t AND task_id=:id
+                """
+            ),
+            {"t": tenant_id, "id": task_id, "result": _json({"machineVerification": "PASS", **details})},
+        )
+        record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id, task_id=task_id,
+                          event_type="MACHINE_VERIFICATION_PASS", actor_id="SYSTEM", actor_role_code="SYSTEM",
+                          details=details)
+        reviews = connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_tasks
+                SET task_status='CANCELLED',
+                    completion_result=COALESCE(completion_result, '{}'::jsonb) || CAST(:result AS jsonb),
+                    updated_at_utc=now()
+                WHERE tenant_id=:t AND parent_task_id=:id AND task_type='REQUESTER_CONFIRMATION'
+                  AND task_status NOT IN ('VERIFIED_COMPLETE', 'CANCELLED')
+                RETURNING task_id
+                """
+            ),
+            {"t": tenant_id, "id": task_id, "result": _json(details)},
+        ).scalars().all()
+        for review_id in reviews:
+            record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id, task_id=UUID(str(review_id)),
+                              event_type="CANCELLED", actor_id="SYSTEM", actor_role_code="SYSTEM", details=details)
+        closed += 1
+    return closed
 
 
 BOOKING_FORM_MISSING_CODE = "BOOKING_FORM_MISSING"

@@ -528,3 +528,28 @@ def test_the_ndc_task_cannot_be_closed_as_not_required(journey) -> None:
     assert _missing_tasks(journey)["DEALER_STATEMENT"]["task_status"] == "READY"
     assert _sql(journey, "SELECT count(*) FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
                          "AND dedupe_key LIKE 'not-mandatory-review:%'").scalar_one() == 0
+
+
+def test_an_answered_task_whose_document_is_no_longer_required_closes_with_its_review(journey) -> None:
+    """2026-11-12: 24 "Upload the Purchase Order" tasks the PCs had answered stayed open,
+    waiting for a review of the answer, after the Purchase Order was made optional."""
+    add_ready_document(journey, "tax_invoice_dms", process_area="DELIVERY", invoice_number="INV-1",
+                       grand_total_amount="1400000")
+    _missing_sync(journey)
+    task = _missing_tasks(journey)["DEALER_STATEMENT"]
+    review = uuid4()
+    _sql(journey, "UPDATE auditcore.p2_tasks SET task_status='AWAITING_REQUESTER_REVIEW' WHERE task_id=:id",
+         id=task["task_id"])
+    # The requester's review of the PC's answer: a copy of the task, as the task flow makes one.
+    _sql(journey, "INSERT INTO auditcore.p2_tasks SELECT (jsonb_populate_record(NULL::auditcore.p2_tasks, "
+                  "to_jsonb(t) || jsonb_build_object('task_id', CAST(:r AS text), 'task_type', "
+                  "'REQUESTER_CONFIRMATION', 'dedupe_key', 'requester-review:' || t.task_id || ':round:1', "
+                  "'task_status', 'READY', 'parent_task_id', t.task_id, 'assigned_role_code', 'REVIEWER'))).* "
+                  "FROM auditcore.p2_tasks t WHERE t.task_id=:id", r=str(review), id=task["task_id"])
+    _missing_sync(journey)
+    assert _missing_tasks(journey)["DEALER_STATEMENT"]["task_status"] == "AWAITING_REQUESTER_REVIEW"  # still required
+    add_ready_document(journey, "cost_sheet", process_area="DELIVERY", ex_showroom_price="1400000")
+    _missing_sync(journey)
+    assert _missing_tasks(journey)["DEALER_STATEMENT"]["task_status"] == "VERIFIED_COMPLETE"
+    status = _sql(journey, "SELECT task_status FROM auditcore.p2_tasks WHERE task_id=:r", r=review).scalar_one()
+    assert status == "CANCELLED"
