@@ -628,18 +628,16 @@ def _ready_to_delete(tenant: P2Journey, **new_overrides):
 
 
 # 1. only a file uploaded in the last 48 hours
-def test_an_older_pair_is_left_to_the_duplicate_booking_rule(tenant, monkeypatch):
-    from audit_core import uc03_p2_same_file
-
+def test_an_older_pair_is_acted_on_too(tenant):
+    """Product owner 2026-11-12: "i never put a rule of 48 hours"."""
     now = datetime.now(UTC)
     old = _journey(tenant, ref="HIST-OLD", created=now - timedelta(days=9))
     new = _journey(tenant, ref="HIST-NEW", created=now - timedelta(days=3))
     _file(old)
     _file(new)
-    assert _detect(new)["raised"] == 0 and _detect(old)["raised"] == 0
-    assert _alerts(new) == [] and _queued(new) == []
-    monkeypatch.setattr(uc03_p2_same_file, "SAME_FILE_WINDOW_HOURS", 24 * 4)
-    assert _detect(old)["raised"] == 1
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    [work] = _queued(new)
+    assert work["journey_id"] == new.journey_id
 
 
 # 2. a company booking with the signatory's personal PAN
@@ -1408,7 +1406,6 @@ def test_the_settle_job_finds_old_pairs_and_its_dry_run_changes_nothing(tenant):
     _receipt(booking, "BRMM/2627/04861")
     _receipt(delivery, "BRMM/2627/04861")
     _invoice(delivery, "INV27P000427")
-    assert _detect(delivery)["raised"] == 0  # outside the 48-hour window
 
     dry = run_same_sale_settle(tenant.engine, f"{tenant.tenant_id}:settle", [])
     assert dry["commit"] is False and dry["toDelete"] == 1
@@ -1417,3 +1414,71 @@ def test_the_settle_job_finds_old_pairs_and_its_dry_run_changes_nothing(tenant):
 
     done = run_same_sale_settle(tenant.engine, f"{tenant.tenant_id}:settle-commit", [])
     assert done["toDelete"] == 1 and len(_queued(delivery)) == 1
+
+
+# ── exactly the same documents are deleted whatever else is said (2026-11-12) ──
+def test_exactly_the_same_documents_of_a_company_are_deleted(tenant):
+    now = datetime.now(UTC)
+    old = _journey(tenant, ref="CO-OLD", created=now - timedelta(days=5))
+    new = _journey(tenant, ref="CO-NEW", created=now - timedelta(minutes=30))
+    _file(old, pan=COMPANY_PAN, name="Sarthak Motors Pvt Ltd")
+    _file(new, pan=COMPANY_PAN, name="Sarthak Motors Pvt Ltd")
+    _same_pages(old, new, n=2)
+    _quiet(new)
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    assert _delete(new) == "DELETED" and not _exists(new) and _exists(old)
+
+
+def test_exactly_the_same_documents_without_a_booking_number_are_deleted(tenant):
+    old, new = _pair(tenant, booking_ref=None)
+    _same_pages(old, new)
+    _quiet(new)
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    assert _delete(new) == "DELETED"
+
+
+def test_a_company_copy_with_a_document_of_its_own_is_still_kept(tenant):
+    now = datetime.now(UTC)
+    old = _journey(tenant, ref="CO2-OLD", created=now - timedelta(days=5))
+    new = _journey(tenant, ref="CO2-NEW", created=now - timedelta(minutes=30))
+    _file(old, pan=COMPANY_PAN, name="Sarthak Motors Pvt Ltd")
+    _file(new, pan=COMPANY_PAN, name="Sarthak Motors Pvt Ltd")
+    _same_pages(old, new)
+    # Each holds a page the other does not (two invoices): not exactly the same documents.
+    _page(old, sha=uuid4().hex, kind="customer_invoice_dms")
+    _page(new, sha=uuid4().hex, kind="customer_invoice_dms")
+    assert _detect(new)["outcomes"] == ["KEPT_NOT_INDIVIDUAL"] and _queued(new) == []
+
+
+def test_a_deleted_copy_counts_under_the_pc_who_uploaded_it(tenant):
+    """Product owner 2026-11-12: a count of duplicate uploads per PC, in the trackers."""
+    from audit_core.uc03_p2_same_file import duplicate_uploads_deleted
+
+    old, new = _pair(tenant)
+    _same_pages(old, new)
+    _quiet(new)
+    _detect(new)
+    assert _delete(new) == "DELETED"
+    now = datetime.now(UTC)
+    with new.engine.begin() as connection:
+        set_tenant_context(connection, new.tenant_id)
+        rows = duplicate_uploads_deleted(connection, tenant_id=new.tenant_id, start=now - timedelta(days=1),
+                                         end=now + timedelta(minutes=1))
+        none_before = duplicate_uploads_deleted(connection, tenant_id=new.tenant_id,
+                                                start=now - timedelta(days=30), end=now - timedelta(hours=1))
+    assert [r["journey_id"] for r in rows] == [new.journey_id] and str(rows[0]["outlet_id"]) == str(new.outlet_id)
+    assert none_before == []
+
+
+def test_a_company_copy_kept_earlier_is_deleted_once_its_documents_are_the_same(tenant):
+    now = datetime.now(UTC)
+    old = _journey(tenant, ref="CO3-OLD", created=now - timedelta(days=5))
+    new = _journey(tenant, ref="CO3-NEW", created=now - timedelta(minutes=30))
+    _file(old, pan=COMPANY_PAN, name="Sarthak Motors Pvt Ltd")
+    _file(new, pan=COMPANY_PAN, name="Sarthak Motors Pvt Ltd")
+    assert _detect(new)["outcomes"] == ["KEPT_NOT_INDIVIDUAL"]  # no pages yet to compare
+    _same_pages(old, new)
+    _quiet(new)
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    [alert] = _alerts(new)
+    assert alert["outcome"] == "PENDING_DELETE" and len(_queued(new)) == 1

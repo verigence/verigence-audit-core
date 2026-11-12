@@ -11,6 +11,8 @@ PC
     journeysUploaded    Journeys they uploaded a file to in the period
     bookingsUploaded    of those, Journeys uploaded to while still at booking
     deliveriesUpdated   of those, Journeys with a delivery page in those uploads
+    duplicatesDeleted   Journeys they uploaded in the period that the system deleted as the
+                        same file uploaded again (product owner 2026-11-12; from that day)
     journeysCompleted   their Journeys whose delivery file closed in the period, by the
                         Daily processing report's rule (all mandatory delivery documents
                         in, every document task of the PC closed)
@@ -353,6 +355,22 @@ def _completed(connection: Connection, *, tenant_id: str, actor_id: str, tz: str
     return out
 
 
+def _duplicates(connection: Connection, *, tenant_id: str, actor_id: str, tz: str, start: date,
+                end: date) -> list[dict[str, Any]]:
+    """The PC's uploads deleted as the same file uploaded again (product owner 2026-11-12),
+    on the day (in the Project's time zone) the copy was uploaded."""
+    from zoneinfo import ZoneInfo
+
+    from audit_core.uc03_p2_same_file import duplicate_uploads_deleted
+
+    zone = ZoneInfo(tz)
+    first = datetime.combine(start, datetime.min.time(), zone)
+    after = datetime.combine(end + timedelta(days=1), datetime.min.time(), zone)
+    return [{"outlet_id": str(r["outlet_id"]), "day": r["uploaded_at"].astimezone(zone).date()}
+            for r in duplicate_uploads_deleted(connection, tenant_id=tenant_id, start=first, end=after,
+                                               pc_actor_id=actor_id)]
+
+
 def _outlet_line(o: dict[str, Any]) -> dict[str, Any]:
     return {"outletId": str(o["outlet_id"]), "outletName": o["outlet_name"], "dealerId": str(o["dealer_id"]),
             "dealerName": o["dealer_name"], "classification": o["outlet_classification"]}
@@ -382,11 +400,12 @@ def buckets(start: date, end: date, by: str = "day") -> list[tuple[date, date, s
     return out
 
 
-_PC_KEYS = ("journeysTotal", "journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "journeysCompleted",
+_PC_KEYS = ("journeysTotal", "journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "duplicatesDeleted",
+            "journeysCompleted",
             "gateRegisterDays", "gateRegisterUploaded", "gateRegisterMissed", "registerTotal", "registerIntimated",
             "uploadedInTool", "pendingDeliveryFiles", "notIntimated", "tasksWorked", "tasksClosed", "tasksPending")
 # The figures of one row (a day, week or month) of one outlet.
-_PC_ROW_KEYS = ("journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "journeysCompleted",
+_PC_ROW_KEYS = ("journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "duplicatesDeleted", "journeysCompleted",
                 "gateRegisterDays", "gateRegisterUploaded", "registerTotal", "registerIntimated",
                 "uploadedInTool", "pendingDeliveryFiles", "tasksWorked", "tasksClosed")
 _REVIEWER_KEYS = ("journeysWorked", "reviewsClosed", "corrections", "tasksWorked", "tasksClosed", "tasksPending")
@@ -417,6 +436,7 @@ def build_pc_work(connection: Connection, *, tenant_id: str, actor_id: str, star
     pending = _tasks_pending(connection, tenant_id=tenant_id, actor_id=actor_id, role="PC", outlet_ids=ids)
     worked = _task_events(connection, tenant_id=tenant_id, actor_id=actor_id, tz=tz, start=start, end=end)
     completed = _completed(connection, tenant_id=tenant_id, actor_id=actor_id, tz=tz, start=start, end=end)
+    duplicates = _duplicates(connection, tenant_id=tenant_id, actor_id=actor_id, tz=tz, start=start, end=end)
     rows = []
     totals = dict.fromkeys(_PC_KEYS, 0)
     for o in outlets:
@@ -428,6 +448,7 @@ def build_pc_work(connection: Connection, *, tenant_id: str, actor_id: str, star
             "journeysTotal": totals_by_outlet.get(oid, 0),
             **_uploaded([u for u in uploads if str(u["outlet_id"]) == oid]),
             "journeysCompleted": len({c["journey_id"] for c in completed if c["outlet_id"] == oid}),
+            "duplicatesDeleted": sum(1 for d in duplicates if d["outlet_id"] == oid),
             "gateRegisterDays": len(days),
             "gateRegisterUploaded": len(done),
             "gateRegisterMissed": sum(1 for d in days if d["status"] == "MISSED"),
@@ -463,6 +484,7 @@ def build_pc_work(connection: Connection, *, tenant_id: str, actor_id: str, star
                 **_uploaded([u for u in uploads if str(u["outlet_id"]) == oid and inside(u["day"])]),
                 "journeysCompleted": len({c["journey_id"] for c in completed
                                           if c["outlet_id"] == oid and inside(c["day"])}),
+                "duplicatesDeleted": sum(1 for d in duplicates if d["outlet_id"] == oid and inside(d["day"])),
                 "gateRegisterDays": len(entries),
                 "gateRegisterUploaded": sum(1 for g in entries if g["status"] not in ("NOT_UPLOADED", "MISSED")),
                 "registerTotal": sum(g["total"] or 0 for g in entries),

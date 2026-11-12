@@ -110,8 +110,14 @@ What happens to it
       bookings lists them (uc03_duplicate_bookings_report).
 
 Safeguards (review of #594, 2026-10-31)
-    - Only a new file created within P2_SAME_FILE_WINDOW_HOURS (48) is acted
-      on; older pairs stay with DUPLICATE_BOOKING and the purge job.
+    - Product owner 2026-11-12: "i never put a rule of 48 hours". A same-outlet copy is
+      acted on whenever it is found, however old; only the duplicate-across-outlets
+      alert still looks at newly uploaded journeys (P2_SAME_FILE_WINDOW_HOURS), as an
+      old pair would otherwise block both PCs' uploads at once.
+    - Product owner 2026-11-12: "if it exactly same documents auto delete the booking".
+      A copy whose every page is already on the kept journey (page fingerprint) is
+      deleted even when the booking looks like a company's or its booking number was
+      not read: identical pages cannot be a second vehicle.
     - Never deleted when anything says the booking is a company's or firm's:
       a non-individual PAN on any document on file of either journey, a
       GSTIN on either (not a sole proprietor's GSTIN built on the customer's
@@ -134,7 +140,7 @@ import os
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -172,10 +178,10 @@ SAME_DEALERSHIP_TITLE = "Duplicate booking at two outlets: uploads paused"
 DELETE_WORK_TYPE = "SAME_FILE_DELETE"
 ALERT_HOURS = 24
 ALERT_TITLE = "Same file being uploaded"
-# Only a new file uploaded within this window is acted on (review of #594,
-# 2026-10-31): the nightly forced re-run of every booking's checks must not
-# delete older pairs -- those stay with the DUPLICATE_BOOKING rule and the
-# product owner's own list (DUPLICATE_JOURNEY_PURGE).
+# Only the duplicate-across-outlets alert looks at newly uploaded journeys alone (an old
+# pair would block both PCs' uploads at once). The same-outlet copy has no window: product
+# owner 2026-11-12, "i never put a rule of 48 hours" -- the window added in review of #594
+# is gone for it.
 SAME_FILE_WINDOW_HOURS = int(os.environ.get("P2_SAME_FILE_WINDOW_HOURS", "48"))
 # A journey still receiving pages is not deleted under the PC's upload: the
 # delete waits until nothing was uploaded to it for this long.
@@ -943,12 +949,54 @@ def _own_documents_reason(connection: Connection, *, tenant_id: str, new: FileId
     return carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing).unsure
 
 
+# Product owner 2026-11-12: "maintain a count of duplicate uploads for each PC from now
+# onwards.. one which are deleted.. it should be going in the daily tracker of PC and TL /PM
+# executive". Counted from that message on, by the day the copy was uploaded.
+DUPLICATE_UPLOADS_COUNTED_FROM = datetime(2026, 11, 12, 11, 45, tzinfo=UTC)
+
+
+def duplicate_uploads_deleted(connection: Connection, *, tenant_id: str, start: datetime, end: datetime,
+                              pc_actor_id: str | None = None) -> list[dict[str, Any]]:
+    """The copies deleted as the same file (or the same sale) uploaded again, by the journey
+    they were: outlet, the PC who uploaded it and when (journey_created_at_utc), uploaded in
+    [start, end) and not before DUPLICATE_UPLOADS_COUNTED_FROM. The Project Tracker and My
+    Tracker count these under the PC."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT d.journey_id, d.outlet_id, d.pc_actor_id, d.journey_created_at_utc AS uploaded_at
+            FROM auditcore.p2_journey_deletions d
+            WHERE d.tenant_id = :t AND d.deletion_kind = :kind AND d.deletion_status = 'COMPLETED'
+              AND d.journey_created_at_utc >= GREATEST(CAST(:s AS timestamptz), CAST(:from_ AS timestamptz))
+              AND d.journey_created_at_utc < :e
+              AND (CAST(:pc AS text) IS NULL OR d.pc_actor_id = :pc)
+            """
+        ),
+        {"t": tenant_id, "kind": DELETION_KIND, "s": start, "e": end, "from_": DUPLICATE_UPLOADS_COUNTED_FROM,
+         "pc": pc_actor_id},
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def identical_documents(connection: Connection, *, tenant_id: str, new: FileIdentity,
+                        existing: FileIdentity) -> bool:
+    """Every page of the copy is already on the kept journey, by page fingerprint: exactly
+    the same documents (product owner 2026-11-12). A copy with no page at all is not."""
+    has_pages = connection.execute(
+        text("SELECT EXISTS (SELECT 1 FROM auditcore.p2_document_queue WHERE tenant_id=:t AND journey_id=:j "
+             "AND unit_kind='PAGE' AND queue_status <> 'CANCELLED')"),
+        {"t": tenant_id, "j": new.journey_id},
+    ).scalar_one()
+    if not has_pages:
+        return False
+    plan = carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing)
+    return plan.unsure is None and not plan.kinds
+
+
 def carry_documents(engine: Engine, *, tenant_id: str, new_journey_id: UUID, existing_journey_id: UUID) -> list[str]:
     """Copy the documents only the copy holds to the earlier journey, as new uploads there
     (uc03_duplicate_merge._copy_unit; idempotent: one fixed upload per unit). Returns the
     kinds carried; nothing when there is nothing to carry or it is not all the customer's."""
-    from datetime import UTC
-
     from audit_core.db import set_tenant_context
     from audit_core.uc03_duplicate_merge import _copy_unit
 
@@ -993,10 +1041,13 @@ def _raise(
     file was already handled (the marker)."""
     kept_reason = business_reason(connection, tenant_id=tenant_id, files=[new, existing])
     plan = CarryPlan(kinds=(), units=(), unsure=None)
-    if kept_reason:
+    if _reviewed(connection, tenant_id=tenant_id, journey_id=new.journey_id):
+        outcome, kept_reason = KEPT_REVIEWED, None
+    elif identical_documents(connection, tenant_id=tenant_id, new=new, existing=existing):
+        # Exactly the same documents: deleted whatever else is said (2026-11-12).
+        outcome, kept_reason = PENDING_DELETE, None
+    elif kept_reason:
         outcome = KEPT_NOT_INDIVIDUAL
-    elif _reviewed(connection, tenant_id=tenant_id, journey_id=new.journey_id):
-        outcome = KEPT_REVIEWED
     elif not booking_identified(new, existing):
         outcome, kept_reason = KEPT_NO_BOOKING_REFERENCE, _no_booking_reference_reason(new, existing)
     elif (plan := carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing)).unsure:
@@ -1051,8 +1102,10 @@ def _raise(
             ),
             {"t": tenant_id, "k": ALERT_KIND, "j": new.journey_id, "related": existing.journey_id,
              "outcome": outcome, "body": alert_body(payload, outcome), "payload": json.dumps(payload, default=str),
-             # 2026-11-03: kept for what it alone held, now carried to the earlier journey.
-             "was": [KEPT_NO_BOOKING_REFERENCE, KEPT_OWN_DOCUMENTS]},
+             # 2026-11-03: kept for what it alone held, now carried to the earlier journey;
+             # 2026-11-12: kept as a company's, or changed at delete time, and now found to be
+             # exactly the same documents (or the same again).
+             "was": [KEPT_NO_BOOKING_REFERENCE, KEPT_OWN_DOCUMENTS, KEPT_NOT_INDIVIDUAL, KEPT_CHANGED]},
         ).scalar_one_or_none()
     if alert_id is None:
         return None
@@ -1136,8 +1189,7 @@ def _raise_cross_outlet(connection: Connection, *, tenant_id: str, new: FileIden
     return alert_id is not None
 
 
-def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str,
-            window: bool = True) -> dict[str, Any]:
+def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str) -> dict[str, Any]:
     me = _identities(connection, tenant_id=tenant_id, journey_ids=[journey_id]).get(journey_id)
     # The customer, mobile and model are enough to look (a duplicate across outlets needs no
     # name); the same file still needs everything (matched_fields).
@@ -1193,9 +1245,6 @@ def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correla
     outcomes: list[str] = []
     for new in sorted(group, key=lambda identity: identity.order_key):
         if new is original:
-            continue
-        if window and max(new.created_at, original.created_at) < cutoff:
-            # Neither just uploaded: left to DUPLICATE_BOOKING.
             continue
         fields = same_file_fields(new, original)
         if fields is None:  # matched this journey, not the oldest one
@@ -1275,12 +1324,14 @@ def recheck_before_delete(
         raise SameFileNoLongerHolds(
             f"its PAN / Aadhaar, mobile, model, customer name, booking reference number or receipt "
             f"no longer match {ref}")
-    if not booking_identified(new, existing):
-        raise SameFileNoLongerHolds(_no_booking_reference_reason(new, existing))
     counts = document_counts(connection, tenant_id=tenant_id, journey_ids=[new_journey_id, existing_journey_id])
     if counts.get(new_journey_id, 0) > counts.get(existing_journey_id, 0):
         # the copy now holds more documents (pages still arriving): the other one is the copy
         raise SameFileNoLongerHolds(f"it now holds more documents than {ref}")
+    if identical_documents(connection, tenant_id=tenant_id, new=new, existing=existing):
+        return  # exactly the same documents (2026-11-12)
+    if not booking_identified(new, existing):
+        raise SameFileNoLongerHolds(_no_booking_reference_reason(new, existing))
     reason = business_reason(connection, tenant_id=tenant_id, files=[new, existing]) or _own_documents_reason(
         connection, tenant_id=tenant_id, new=new, existing=existing)
     if reason:
