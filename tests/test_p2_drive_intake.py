@@ -466,6 +466,19 @@ def test_only_what_is_in_a_customers_folder_is_recorded_and_only_once(s):
     assert status["folderUrl"].endswith(s.fake.named("Mahindra Orissa")["id"]) and status["retentionDays"] == 30
 
 
+def test_files_a_computer_leaves_behind_are_ignored(s):
+    """A folder uploaded from a Mac carries .DS_Store (seen in the 12 Nov sample zip)."""
+    outlet = _tree(s)
+    customer = s.fake.folder("Akansh-456909", outlet)
+    s.fake.put(".DS_Store", customer, b"mac", "application/octet-stream")
+    s.fake.put("Thumbs.db", customer, b"win", "application/octet-stream")
+    s.fake.put("docket.pdf", s.fake.folder("__MACOSX", customer), b"%PDF mac copy")
+    s.fake.put("docket.pdf", customer, b"%PDF docket")
+    found = _sync(s)
+    assert found["new"] == 1 and found["setAside"] == 0
+    assert set(_files(s)) == {"docket.pdf"}
+
+
 def test_the_feed_started_again_meets_the_whole_tree(s):
     outlet = _tree(s)
     s.fake.put("docket.pdf", s.fake.folder("Akansh-456909", outlet), b"%PDF docket")

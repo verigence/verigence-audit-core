@@ -197,6 +197,16 @@ def is_photo_folder(name: str) -> bool:
     return bool(_PHOTO_FOLDER.match(str(name or "")))
 
 
+_SYSTEM_NAMES = frozenset({"thumbs.db", "desktop.ini", "__macosx"})
+
+
+def is_system_file(name: str) -> bool:
+    """A file a computer leaves next to the PC's files (.DS_Store and the like from a Mac,
+    Thumbs.db from Windows): never a document, never shown as "not taken" (12 Nov 2026)."""
+    plain = str(name or "").strip()
+    return plain.startswith(".") or plain.lower() in _SYSTEM_NAMES
+
+
 def _plain(name: Any, fallback: str) -> str:
     """A name as it was given, without what a storage key cannot hold."""
     value = "".join(ch for ch in str(name or "").replace("\\", "/").rsplit("/", 1)[-1]
@@ -728,8 +738,10 @@ def register_file(engine: Engine, tenant_id: str, places: _Places, meta: dict[st
     """A file met in Drive, recorded once per content: NEW when it is to be taken, SET_ASIDE
     with the reason when it cannot be. Returns the status recorded, or None for a file that
     is not in the Project's tree (never recorded) or is already taken."""
+    if is_system_file(str(meta.get("name") or "")):
+        return None
     parent = places.folder((meta.get("parents") or [None])[0])
-    if parent is None:
+    if parent is None or is_system_file(str(parent.get("folder_name") or "")):
         return None
     kind = parent["folder_kind"]
     created = _when(meta.get("createdTime"))
