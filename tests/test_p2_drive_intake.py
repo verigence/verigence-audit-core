@@ -570,7 +570,8 @@ def test_the_callback_keeps_the_sealed_token_and_makes_the_folders(s, monkeypatc
     assert gone.status_code == 303 and gone.headers["location"].endswith("drive=expired")
     back = s.client.get("/p2/v1/integrations/google-drive/callback", params={"code": "c", "state": state},
                         follow_redirects=False)
-    assert back.status_code == 303 and back.headers["location"].endswith("drive=connected")
+    # ...and says which Project it is about: the page shows the one the person has open.
+    assert back.status_code == 303 and back.headers["location"].endswith(f"drive=connected&project={s.t}")
     [link] = _rows(s, "SELECT * FROM auditcore.p2_drive_connections WHERE tenant_id=:t")
     assert link["google_email"] == "project@example.com" and link["connected_by_actor_id"] == "admin"
     assert google_drive.unseal(SETTINGS, link["refresh_token_sealed"]) == "new-refresh"

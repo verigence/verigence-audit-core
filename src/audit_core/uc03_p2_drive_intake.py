@@ -82,6 +82,7 @@ import json
 import re
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Annotated, Any
+from urllib.parse import urlencode
 from uuid import UUID
 
 import structlog
@@ -1679,12 +1680,15 @@ def drive_callback(
     the browser goes back to Verigence with the outcome. One Google account may be the Drive
     of several Projects: each has its own Project folder in it."""
     settings = _settings_or_503()
+    asked = google_drive.read_state(settings, state or "")
 
     def back(outcome: str) -> RedirectResponse:
+        # The page the browser lands on shows the Project the person has open in Verigence,
+        # which need not be the one that asked: the answer says which Project it is about.
+        about = {"drive": outcome, **({"project": asked["tenant_id"]} if asked and asked["tenant_id"] else {})}
         separator = "&" if "?" in settings.return_url else "?"
-        return RedirectResponse(f"{settings.return_url}{separator}drive={outcome}", status_code=303)
+        return RedirectResponse(f"{settings.return_url}{separator}{urlencode(about)}", status_code=303)
 
-    asked = google_drive.read_state(settings, state or "")
     if asked is None or not asked["tenant_id"]:
         return back("expired")
     if error or not code:
