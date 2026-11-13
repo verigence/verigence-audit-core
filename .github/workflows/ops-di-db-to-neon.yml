@@ -1,0 +1,145 @@
+name: "Ops: copy DI database (Railway) to Neon"
+
+# Product owner, 13 Nov 2026: move the DI database from Railway Postgres into Neon,
+# in steps. This is step 1 only: copy DI's schema and data into Neon. Nothing switches
+# connections; DI keeps running on Railway Postgres until step 2.
+#
+# - Source: the DEV "Postgres" service (DI's live database), schema docintel.
+# - Target: the Neon database Audit Core uses (its DATABASE_URL).
+# - Neon already holds an older docintel schema. It is not merged into or dropped:
+#   it is renamed docintel_pre_move_<UTC timestamp>, and the copy is loaded as docintel,
+#   all in one transaction (any error leaves Neon exactly as it was).
+# - Afterwards every table's rows are counted on both sides. Tables DI writes all the
+#   time (heartbeats, jobs) can be a few rows ahead on Railway by then; the final
+#   re-copy at the switch (step 2) closes that gap.
+#
+# Runs on push to ops/di-db-to-neon only (a manual run needs the file on main, which is
+# not touched). Uses the existing RAILWAY_API_TOKEN secret, as archive-dev.yml does.
+on:
+  push:
+    branches: [ops/di-db-to-neon]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ops-di-db-to-neon
+  cancel-in-progress: false
+
+jobs:
+  copy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      DI_DB_SERVICE: Postgres
+      SCHEMA: docintel
+    steps:
+      - name: Install Railway CLI and PostgreSQL 18 client
+        run: |
+          set -euo pipefail
+          npm install --global @railway/cli@5.70.0
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt noble-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-18 >/dev/null
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve both database URLs (masked)
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json >/tmp/audit-vars.json
+          railway variable list --service "$DI_DB_SERVICE" --json >/tmp/di-db-vars.json
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          def plain(raw, what):
+              for prefix in ('postgresql+psycopg://', 'postgresql+asyncpg://', 'postgresql://', 'postgres://'):
+                  if raw.startswith(prefix):
+                      return 'postgresql://' + raw[len(prefix):]
+              raise SystemExit(f'::error::no PostgreSQL URL for {what}.')
+          audit = json.loads(Path('/tmp/audit-vars.json').read_text()); Path('/tmp/audit-vars.json').unlink()
+          di = json.loads(Path('/tmp/di-db-vars.json').read_text()); Path('/tmp/di-db-vars.json').unlink()
+          neon = plain(audit.get('DATABASE_URL', ''), 'Neon (Audit Core DATABASE_URL)')
+          src = plain(di.get('DATABASE_PUBLIC_URL', ''), 'Railway Postgres (DATABASE_PUBLIC_URL)')
+          if 'neon.tech' not in neon:
+              raise SystemExit('::error::Audit Core DATABASE_URL is not a Neon database; stopping.')
+          if 'neon.tech' in src:
+              raise SystemExit('::error::source is already Neon; stopping.')
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              for name, value in (('SRC_URL', src), ('NEON_URL', neon)):
+                  print(f'::add-mask::{value}')
+                  env.write(f'{name}={value}\n')
+          print('source host:', src.split('@')[-1].split('/')[0].split(':')[0])
+          print('target host:', neon.split('@')[-1].split('/')[0].split(':')[0])
+          PY
+
+      - name: Look before copying (read only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          q() { psql "$1" -X -A -t -F ' | ' -v ON_ERROR_STOP=1 -c "$2"; }
+          echo "== server versions"; q "$SRC_URL" "show server_version"; q "$NEON_URL" "show server_version"
+          echo "== source: schemas with tables (schema | tables | size)"
+          q "$SRC_URL" "select n.nspname, count(c.oid), pg_size_pretty(sum(pg_total_relation_size(c.oid))) from pg_class c join pg_namespace n on n.oid=c.relnamespace where c.relkind in ('r','p') and n.nspname not in ('pg_catalog','information_schema') and n.nspname not like 'pg_toast%' group by 1 order by 1"
+          echo "== source: extensions"; q "$SRC_URL" "select extname, extversion from pg_extension where extname<>'plpgsql' order by 1"
+          echo "== source: DI migration"; q "$SRC_URL" "select version_num from $SCHEMA.alembic_version" || true
+          echo "== Neon: existing $SCHEMA tables (table | rows estimate)"
+          q "$NEON_URL" "select c.relname, c.reltuples::bigint from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='$SCHEMA' and c.relkind in ('r','p') order by 1" || true
+          echo "== Neon: DI migration"; q "$NEON_URL" "select version_num from $SCHEMA.alembic_version" || true
+          others=$(q "$SRC_URL" "select string_agg(distinct n.nspname, ',') from pg_class c join pg_namespace n on n.oid=c.relnamespace where c.relkind in ('r','p') and n.nspname not in ('pg_catalog','information_schema','$SCHEMA') and n.nspname not like 'pg_toast%'")
+          if [ -n "$others" ]; then
+            echo "::error::the source also has tables outside $SCHEMA ($others); stopping so they can be reviewed before any copy."
+            exit 1
+          fi
+
+      - name: Copy docintel into Neon (one transaction)
+        shell: bash
+        run: |
+          set -euo pipefail
+          stamp=$(date -u +%Y%m%d_%H%M)
+          pg_dump "$SRC_URL" --schema="$SCHEMA" --no-owner --no-privileges --format=plain --file=/tmp/di.sql
+          echo "dump size: $(du -h /tmp/di.sql | cut -f1)"
+          {
+            for ext in $(psql "$SRC_URL" -X -A -t -c "select extname from pg_extension where extname<>'plpgsql'"); do
+              echo "CREATE EXTENSION IF NOT EXISTS \"$ext\";"
+            done
+            cat <<SQL
+          DO \$\$ BEGIN
+            IF EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = '$SCHEMA') THEN
+              EXECUTE 'ALTER SCHEMA $SCHEMA RENAME TO ${SCHEMA}_pre_move_$stamp';
+              RAISE NOTICE 'old $SCHEMA kept as ${SCHEMA}_pre_move_$stamp';
+            END IF;
+          END \$\$;
+          SQL
+          } > /tmp/pre.sql
+          # pg_dump writes CREATE SCHEMA docintel itself; -1 runs pre.sql and the dump in one transaction.
+          psql "$NEON_URL" -X -q -1 -v ON_ERROR_STOP=1 -f /tmp/pre.sql -f /tmp/di.sql
+          rm -f /tmp/di.sql
+          echo "COPY_DONE=PASS (old schema kept as ${SCHEMA}_pre_move_$stamp if it existed)"
+
+      - name: Compare row counts (source vs Neon)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tables=$(psql "$SRC_URL" -X -A -t -c "select c.relname from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='$SCHEMA' and c.relkind in ('r','p') order by 1")
+          missing=0; behind=0; total=0
+          printf '%-55s %12s %12s\n' table railway neon
+          for t in $tables; do
+            s=$(psql "$SRC_URL" -X -A -t -c "select count(*) from $SCHEMA.\"$t\"")
+            n=$(psql "$NEON_URL" -X -A -t -c "select count(*) from $SCHEMA.\"$t\"" 2>/dev/null || echo MISSING)
+            flag=""
+            if [ "$n" = MISSING ]; then flag="  <-- MISSING"; missing=$((missing+1));
+            elif [ "$s" != "$n" ]; then flag="  (written since the copy)"; behind=$((behind+1)); fi
+            total=$((total+1))
+            printf '%-55s %12s %12s%s\n' "$t" "$s" "$n" "$flag"
+          done
+          echo "tables: $total, missing in Neon: $missing, differing (live writes): $behind"
+          psql "$NEON_URL" -X -A -t -c "select 'Neon $SCHEMA size: '||pg_size_pretty(sum(pg_total_relation_size(c.oid))) from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='$SCHEMA'"
+          psql "$NEON_URL" -X -A -t -c "select 'Neon DI migration: '||version_num from $SCHEMA.alembic_version"
+          [ "$missing" -eq 0 ] || { echo '::error::tables missing in Neon after the copy.'; exit 1; }
