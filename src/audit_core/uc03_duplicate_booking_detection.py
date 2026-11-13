@@ -476,12 +476,118 @@ def _buyer_gstin(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
     ).scalar_one_or_none()
 
 
-def _candidate_journeys(
-    connection: Connection, *, tenant_id: str, journey_id: UUID
+# ── which other journeys can pair with this one at all (2026-11-13) ──────────
+# Until now every check read the identity values of EVERY other journey of the
+# Project and compared them here: about 8 rows a journey, so 11,600 rows a check
+# on a Project of 1,400 journeys, 35,000 checks in twelve days -- 370 million
+# rows carried from the database to this service, the largest single part of
+# the database's data-transfer bill, and growing with the square of the
+# Project (each new journey adds a check AND makes every check longer).
+#
+# The comparison itself is unchanged (_match_basis). What changed is which
+# journeys are read: only those that share something a basis needs. Every basis
+# needs one of -- the same PAN, Aadhaar, mobile or buyer GSTIN; this booking's
+# surname on the other's relative's name (or the other way round); or the same
+# pincode with the same surname. A journey sharing none of them cannot match on
+# any basis, so leaving it unread changes no finding.
+#
+# The database only narrows; it never decides. Each condition is looser than
+# the comparison it stands for, so no pair the comparison would make is lost:
+#   * numbers are compared by their digits alone (a PAN by its four, a GSTIN by
+#     its own), whatever the letters and punctuation around them;
+#   * a surname is looked for anywhere in the other name (the surname is the
+#     last run of letters of the name -- _normalize_name -- so it is always in
+#     the text as written);
+#   * a value the database's text form may not render the way this module
+#     reads it (digits of another script, a value stored as a list, an object
+#     or a decimal number) keeps its journey in, to be compared here as before.
+_NUMBER_FIELDS: list[str] = ["pan_number", "aadhaar_number", "customer_phone", "address_pincode"]
+_NOT_ASCII_DIGIT = re.compile(r"[^0-9]")
+
+_FIELD_TEXT = "(k.effective_value #>> '{}')"
+_FIELD_DIGITS = f"regexp_replace({_FIELD_TEXT}, '[^0-9]', '', 'g')"
+# COLLATE "C": only A-Z / a-z change case, exactly the letters a surname is made of.
+_FIELD_UPPER = f"upper({_FIELD_TEXT} COLLATE \"C\")"
+
+_SHARING_JOURNEYS_SQL = f"""
+    SELECT k.journey_id
+    FROM auditcore.journey_document_extracted_fields k
+    WHERE k.tenant_id = :tenant_id AND k.journey_id <> :journey_id
+      AND k.effective_value IS NOT NULL
+      AND (
+           (k.field_key = 'pan_number' AND {_FIELD_DIGITS} = CAST(:pan_digits AS text))
+        OR (k.field_key = 'aadhaar_number' AND {_FIELD_DIGITS} = CAST(:aadhaar AS text))
+        OR (k.field_key = 'customer_phone' AND right({_FIELD_DIGITS}, 10) = CAST(:mobile AS text))
+        OR (k.field_key = ANY(:relationship_fields) AND {_FIELD_UPPER} LIKE CAST(:surname_like AS text))
+        OR (k.field_key = ANY(:name_fields) AND {_FIELD_UPPER} LIKE CAST(:relative_surname_like AS text))
+        OR (k.field_key = 'address_pincode' AND {_FIELD_DIGITS} = CAST(:pincode AS text)
+            AND EXISTS (
+                SELECT 1 FROM auditcore.journey_document_extracted_fields n
+                WHERE n.tenant_id = k.tenant_id AND n.journey_id = k.journey_id
+                  AND n.field_key = ANY(:name_fields) AND n.effective_value IS NOT NULL
+                  AND upper((n.effective_value #>> '{{}}') COLLATE "C") LIKE CAST(:surname_like AS text)))
+        OR (k.field_key = ANY(:number_fields) AND (
+                jsonb_typeof(k.effective_value) IN ('object', 'array')
+                OR (jsonb_typeof(k.effective_value) = 'number' AND strpos({_FIELD_TEXT}, '.') > 0)
+                OR octet_length({_FIELD_TEXT}) <> char_length({_FIELD_TEXT})))
+      )
+"""
+
+# How many journeys are read at a time when only "is there anyone to compare
+# with at all" is asked (see _another_journey_is_identified).
+_PROBE_BATCH = 20
+
+
+def _ascii_digits(value: Any) -> str | None:
+    digits = _NOT_ASCII_DIGIT.sub("", str(value or ""))
+    return digits or None
+
+
+def _sharing_journey_ids(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, signals: dict[str, Any]
+) -> list[UUID]:
+    """The other journeys of the Project that share something a match basis
+    needs with this one -- the only ones worth reading and comparing."""
+    surname = signals.get("surname")
+    relative_surname = _surname(signals.get("relative_name"))
+    ids = set(connection.execute(
+        text(_SHARING_JOURNEYS_SQL),
+        {
+            "tenant_id": tenant_id, "journey_id": journey_id,
+            "pan_digits": _ascii_digits(signals.get("pan")),
+            "aadhaar": signals.get("aadhaar"),
+            "mobile": signals.get("mobile"),
+            "pincode": signals.get("pincode"),
+            "surname_like": f"%{surname}%" if surname else None,
+            "relative_surname_like": f"%{relative_surname}%" if relative_surname else None,
+            "relationship_fields": list(_RELATIONSHIP_NAME_FIELDS),
+            "name_fields": list(_NAME_FIELDS.values()),
+            "number_fields": _NUMBER_FIELDS,
+        },
+    ).scalars().all())
+    gst_digits = _ascii_digits(signals.get("gst"))
+    if gst_digits:
+        ids.update(connection.execute(
+            text(
+                """
+                SELECT DISTINCT v.journey_id
+                FROM (""" + _BUYER_GSTIN_SQL + """) v
+                WHERE v.journey_id <> :journey_id
+                  AND regexp_replace(v.buyer_gstin, '[^0-9]', '', 'g') = :gst_digits
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "gst_digits": gst_digits},
+        ).scalars().all())
+    return list(ids)
+
+
+def _signals_of_journeys(
+    connection: Connection, *, tenant_id: str, journey_ids: list[UUID]
 ) -> list[dict[str, Any]]:
-    """Every other journey in this tenant, with its own latest identity
-    signals -- one row per journey, aggregated in SQL so this stays one
-    round trip regardless of tenant size."""
+    """These journeys' own latest identity signals -- one record per journey
+    that has any, read in two round trips however many journeys are asked for."""
+    if not journey_ids:
+        return []
     rows = connection.execute(
         text(
             """
@@ -494,7 +600,7 @@ def _candidate_journeys(
                 FROM auditcore.journey_document_extracted_fields f
                 JOIN auditcore.journeys j
                   ON j.tenant_id = f.tenant_id AND j.journey_id = f.journey_id
-                WHERE f.tenant_id = :tenant_id AND f.journey_id <> :journey_id
+                WHERE f.tenant_id = :tenant_id AND f.journey_id = ANY(:journey_ids)
                   AND f.field_key = ANY(:field_keys)
                   AND f.effective_value IS NOT NULL
                   AND """ + _NOT_TAKEN_OUT + """
@@ -506,7 +612,7 @@ def _candidate_journeys(
             WHERE r.row_rank = 1
             """
         ),
-        {"tenant_id": tenant_id, "journey_id": journey_id, "field_keys": _IDENTITY_FIELD_KEYS},
+        {"tenant_id": tenant_id, "journey_ids": journey_ids, "field_keys": _IDENTITY_FIELD_KEYS},
     ).mappings().all()
 
     by_journey: dict[UUID, list[Any]] = {}
@@ -523,11 +629,11 @@ def _candidate_journeys(
             SELECT DISTINCT ON (v.journey_id) v.journey_id, v.buyer_gstin, j.created_at_utc
             FROM (""" + _BUYER_GSTIN_SQL + """) v
             JOIN auditcore.journeys j ON j.tenant_id = :tenant_id AND j.journey_id = v.journey_id
-            WHERE v.journey_id <> :journey_id
+            WHERE v.journey_id = ANY(:journey_ids)
             ORDER BY v.journey_id, v.created_at_utc DESC
             """
         ),
-        {"tenant_id": tenant_id, "journey_id": journey_id},
+        {"tenant_id": tenant_id, "journey_ids": journey_ids},
     ).mappings().all()
     gst_by_journey = {
         row["journey_id"]: value
@@ -552,6 +658,45 @@ def _candidate_journeys(
         signals["dealer_id"] = dealer_by_journey.get(candidate_journey_id)
         candidates.append(signals)
     return candidates
+
+
+def _candidate_journeys(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, signals: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """The other journeys of this tenant that can pair with this one on any
+    basis, each with its own latest identity signals."""
+    return _signals_of_journeys(
+        connection, tenant_id=tenant_id,
+        journey_ids=_sharing_journey_ids(
+            connection, tenant_id=tenant_id, journey_id=journey_id, signals=signals),
+    )
+
+
+def _another_journey_is_identified(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """Whether the Project has any other journey with something identifying on
+    it. The rule's log reads "examined 0" as "nothing to compare with yet"
+    (SKIPPED) and anything else as checked (PASS); with only the journeys that
+    can pair being read, an empty list no longer says which of the two it is.
+    Reads a few journeys at a time, newest first, and stops at the first one
+    that has a signal -- on a live Project that is the first batch."""
+    offset = 0
+    while True:
+        batch = list(connection.execute(
+            text(
+                """
+                SELECT journey_id FROM auditcore.journeys
+                WHERE tenant_id = :tenant_id AND journey_id <> :journey_id
+                ORDER BY created_at_utc DESC, journey_id
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "limit": _PROBE_BATCH, "offset": offset},
+        ).scalars().all())
+        if not batch:
+            return False
+        if _signals_of_journeys(connection, tenant_id=tenant_id, journey_ids=batch):
+            return True
+        offset += len(batch)
 
 
 def _match_basis(signals: dict[str, Any], candidate: dict[str, Any]) -> str | None:
@@ -984,10 +1129,10 @@ def sync_duplicate_booking_detection(
         # buyer GSTIN of "No" fell into this branch, and an early return here
         # would have left every wrong pairing open for ever with no way to
         # clear it but by hand. Fall through with no candidates instead.
+        comparing = signals is not None and not _withdrawn(connection, tenant_id=tenant_id, journey_id=journey_id)
         candidates = (
-            _candidate_journeys(connection, tenant_id=tenant_id, journey_id=journey_id)
-            if signals is not None and not _withdrawn(connection, tenant_id=tenant_id, journey_id=journey_id)
-            else []
+            _candidate_journeys(connection, tenant_id=tenant_id, journey_id=journey_id, signals=signals)
+            if comparing else []
         )
         this_journey_created = connection.execute(
             text("SELECT created_at_utc FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
@@ -1123,7 +1268,12 @@ def sync_duplicate_booking_detection(
             )
             resolved += 1
 
-        return {"raised": raised, "resolved": resolved, "examined": len(candidates)}
+        # "examined" is read only as none / some (uc03_rule_execution_log): some
+        # whenever the Project has another identified journey, as before --
+        # also when none of them shares anything with this one.
+        examined = len(candidates) or int(
+            comparing and _another_journey_is_identified(connection, tenant_id=tenant_id, journey_id=journey_id))
+        return {"raised": raised, "resolved": resolved, "examined": examined}
     except Exception:
         logger.warning("sync_duplicate_booking_detection failed", exc_info=True)
         return {"error": True}
