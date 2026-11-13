@@ -544,7 +544,9 @@ def test_the_failure_report_lists_every_failed_page_with_a_link(journey, monkeyp
     assert body["truncated"] is False and body["from"] == body["to"]
     # A day with no failures lists none; a PC may not read the report.
     assert _api(journey, "get", "/reports/failed-pages?from=2026-01-01&to=2026-01-02", subject=tl).json()["rows"] == []
-    assert _api(journey, "get", "/reports/failed-pages").status_code == 403
+    # A PC reads only what they uploaded (the Project Tracker's own view, 2026-11-13).
+    own = _api(journey, "get", "/reports/failed-pages")
+    assert own.status_code == 200 and all(r["uploadedBy"] == journey.actor_id for r in own.json()["rows"])
     assert _api(journey, "get", "/reports/failed-pages?from=2026-02-01&to=2026-01-01", subject=tl).status_code == 422
 
 

@@ -1056,9 +1056,13 @@ def _signed_link(object_key: str | None) -> str | None:
 
 def build_failed_pages_report(
     connection: Connection, *, tenant_id: str, actor_id: str, start: datetime, end: datetime,
-    limit: int = _FAILED_ROWS_LIMIT,
+    limit: int = _FAILED_ROWS_LIMIT, uploaded_by: str | None = None, by_upload: bool = False,
 ) -> dict[str, Any]:
-    """Every page (document unit) now FAILED whose failure falls in [start,
+    """``uploaded_by``: only what that person uploaded (a PC's own failures). ``by_upload``: the
+    files uploaded in [start, end) rather than the failures that happened then (the Project
+    Tracker counts by upload, 2026-11-13).
+
+    Every page (document unit) now FAILED whose failure falls in [start,
     end), and every file that failed before it was split into pages, within
     the reader's own dealers and outlets. Newest failure first. A page the
     day-end sweep cleared from the Journey (2026-10-22) is still listed, with
@@ -1071,7 +1075,9 @@ def build_failed_pages_report(
         page_open_path,
     )
 
-    params = {"t": tenant_id, "actor_id": actor_id, "s": start, "e": end, "limit": limit + 1}
+    params = {"t": tenant_id, "actor_id": actor_id, "s": start, "e": end, "limit": limit + 1, "who": uploaded_by}
+    page_when = "x.uploaded_at" if by_upload else "x.failed_at"
+    file_when = "b.created_at_utc" if by_upload else "b.updated_at_utc"
     pages = connection.execute(
         text(
             f"""
@@ -1100,8 +1106,9 @@ def build_failed_pages_report(
               WHERE q.tenant_id=:t
                 AND (q.queue_status IN ('FAILED','DEAD_LETTER') OR {swept_pending_sql("q")})
                 AND {_SCOPE}
+                AND (CAST(:who AS text) IS NULL OR b.uploaded_by_actor_id = CAST(:who AS text))
             ) x
-            WHERE x.failed_at >= :s AND x.failed_at < :e
+            WHERE {page_when} >= :s AND {page_when} < :e
             ORDER BY x.failed_at DESC
             LIMIT :limit
             """
@@ -1123,7 +1130,8 @@ def build_failed_pages_report(
             LEFT JOIN auditcore.dealer_outlets o
               ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
             WHERE b.tenant_id=:t AND b.batch_status='FAILED' AND b.page_count=0
-              AND b.updated_at_utc >= :s AND b.updated_at_utc < :e AND {_SCOPE}
+              AND {file_when} >= :s AND {file_when} < :e AND {_SCOPE}
+              AND (CAST(:who AS text) IS NULL OR b.uploaded_by_actor_id = CAST(:who AS text))
             ORDER BY b.updated_at_utc DESC
             LIMIT :limit
             """
@@ -1150,7 +1158,7 @@ def build_failed_pages_report(
             "pageNumbers": [int(p) for p in (row["page_numbers"] or [])],
             "attempts": int(row["attempt_count"] or 0) or None,
             "reason": row["status_reason"] or "It could not be read.",
-            "code": row["last_error"], "setupProblem": setup,
+            "code": row["last_error"], "setupProblem": setup, "why": _failure_kind(row["last_error"]),
             # CANCELLED: the day-end sweep cleared it from the Journey; it is
             # listed until it is resubmitted. The file in storage is kept.
             "clearedFromJourney": row["unit_status"] == "CANCELLED",
@@ -1162,7 +1170,7 @@ def build_failed_pages_report(
         rows.append({
             **journey(row), "kind": "FILE", "queueId": None, "pageNumbers": [], "attempts": None,
             "reason": row["failure_reason"] or "The file could not be split into pages.",
-            "code": None, "setupProblem": False, "clearedFromJourney": False,
+            "code": None, "setupProblem": False, "clearedFromJourney": False, "why": "notUploaded",
             # A file that never finished uploading has nothing to open.
             "openUrl": None if not_uploaded else _signed_link(row["original_object_key"]),
             "filePath": None,
@@ -1215,6 +1223,7 @@ def get_failed_pages_report(
     connection: Annotated[Connection, Depends(get_connection)],
     from_day: Annotated[date | None, Query(alias="from")] = None,
     to_day: Annotated[date | None, Query(alias="to")] = None,
+    by: Annotated[str, Query(pattern=r"^(failed|uploaded)$")] = "failed",
 ) -> dict[str, Any]:
     """The failure report (product owner 2026-10-21): every failed page and
     file of the Project (the tenant in the path is the Project) whose
@@ -1230,10 +1239,19 @@ def get_failed_pages_report(
         authorization_client=authorization_client,
         permission_key=_READ_PERMISSION,
     )
-    _require_report_role(
-        connection, tenant_id=tenant_id, actor_id=human_principal.subject,
-        functional_role=access.functional_role,
-    )
+    # A PC or Reviewer reads their own failures (the Project Tracker's own view, 2026-11-13).
+    from audit_core.uc03_p2_project_tracker import _MEMBER_ROLES, _holds
+
+    own = None
+    if (access.functional_role or "").upper() not in _ADMIN_ROLES and not _holds(
+            connection, tenant_id, human_principal.subject, _REPORT_ROLES) and _holds(
+            connection, tenant_id, human_principal.subject, _MEMBER_ROLES):
+        own = human_principal.subject
+    else:
+        _require_report_role(
+            connection, tenant_id=tenant_id, actor_id=human_principal.subject,
+            functional_role=access.functional_role,
+        )
     timezone_name = connection.execute(
         text("SELECT COALESCE(timezone_name, :f) FROM auditcore.projects WHERE tenant_id=:t"),
         {"t": tenant_id, "f": _FALLBACK_TIMEZONE},
@@ -1248,5 +1266,17 @@ def get_failed_pages_report(
     _, _, end = _bounds(connection, tenant_id=tenant_id, day=last)
     report = build_failed_pages_report(
         connection, tenant_id=tenant_id, actor_id=human_principal.subject, start=start, end=end,
+        uploaded_by=own, by_upload=by == "uploaded",
     )
-    return {"from": first.isoformat(), "to": last.isoformat(), "timezone": timezone_name, **report}
+    from audit_core.task_manager import known_names
+
+    names = known_names(connection, tenant_id=tenant_id)
+    for row in report["rows"]:
+        row["uploadedByName"] = names.get(str(row["uploadedBy"] or ""))
+    return {"from": first.isoformat(), "to": last.isoformat(), "timezone": timezone_name, "by": by, **report}
+
+
+def _failure_kind(code: str | None) -> str:
+    from audit_core.uc03_p2_project_tracker import failure_kind
+
+    return failure_kind(code)

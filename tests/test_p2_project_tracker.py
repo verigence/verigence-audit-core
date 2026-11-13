@@ -136,10 +136,10 @@ def _outlet(report, outlet_id) -> dict:
 
 # --------------------------------------------------------------------------- endpoint and scope
 
-def test_only_team_lead_pm_and_executive_read_it(setup):
+def test_team_lead_pm_and_executive_read_the_team(setup):
     s = setup
     url = f"/p2/v1/tenants/{s.journey.tenant_id}/reports/project-tracker"
-    assert s.client.get(url).status_code == 403                       # the PC
+    assert s.client.get(url).json()["scope"]["own"] is True          # the PC: their own row only
     tl = f"tl-{uuid4().hex[:6]}"
     _role(s, tl, "TL")
     s.acting["subject"] = tl
@@ -165,7 +165,7 @@ def test_a_team_lead_sees_only_their_outlets_a_project_wide_one_sees_all(setup):
     _role(s, wide, "TL")
     today = datetime.now(IST).date()
     mine = _build(s, narrow, "DAY", today)
-    assert mine["scope"] == {"projectWide": False, "outlets": 1, "dealers": 1}
+    assert mine["scope"] == {"projectWide": False, "outlets": 1, "dealers": 1, "own": False}
     assert [o["outletId"] for d in mine["dealers"] for o in d["outlets"]] == [str(s.journey.outlet_id)]
     assert mine["totals"]["uploads"]["files"] == 0
     everything = _build(s, wide, "DAY", today)
@@ -314,3 +314,110 @@ def test_recurring_tasks_by_schedule(setup):
     [wide] = [d for d in report["dealers"] if d["dealerId"] is None]
     assert wide["outlets"][0]["people"][0]["actorId"] == tl
     assert wide["outlets"][0]["people"][0]["recurring"][extra]["due"] == 1
+
+
+# --------------------------------------------------------------------------- 13 Nov 2026 additions
+
+def _bulk_source(s, batch_id, source: str):
+    """Mark an upload as a file of a bulk upload from ``source`` (WEB folder upload or DRIVE)."""
+    bulk = str(_exec(s, """
+        INSERT INTO auditcore.p2_bulk_uploads (tenant_id, dealer_id, outlet_id, uploaded_by_actor_id, folder,
+          status, source)
+        VALUES (:t, :d, :o, :a, 'f', 'DONE', :src) RETURNING bulk_id
+    """, d=s.journey.dealer_id, o=s.journey.outlet_id, a=s.journey.actor_id, src=source).scalar_one())
+    _exec(s, """
+        INSERT INTO auditcore.p2_bulk_files (tenant_id, bulk_id, original_filename, content_type, size_bytes,
+          object_key, upload_status, batch_id)
+        VALUES (:t, :b, 'x.pdf', 'application/pdf', 1, :k, 'UPLOADED', :batch)
+    """, b=bulk, k=f"bulk/{uuid4()}", batch=batch_id)
+
+
+def test_files_by_how_they_came_in(setup):
+    s = setup
+    add_batch_pages(s.journey, [("booking_form", "READY")])                     # on its own
+    bulk, _ = add_batch_pages(s.journey, [("booking_form", "READY")] * 2)        # folder upload
+    drive, _ = add_batch_pages(s.journey, [("booking_form", "READY")] * 3)       # Google Drive
+    _bulk_source(s, bulk, "WEB")
+    _bulk_source(s, drive, "DRIVE")
+    tl = f"tl-{uuid4().hex[:6]}"
+    _role(s, tl, "TL")
+    report = _build(s, tl, "DAY", datetime.now(IST).date())
+    pc = next(p for p in _outlet(report, s.journey.outlet_id)["people"] if p["actorId"] == s.journey.actor_id)
+    for level in (report["totals"], pc):
+        c = level["channels"]
+        assert (c["directFiles"], c["bulkFiles"], c["driveFiles"]) == (1, 1, 1)
+        assert (c["directPages"], c["bulkPages"], c["drivePages"]) == (1, 2, 3)
+
+
+def _closure(s, journey, *, by, role="REVIEWER", status="PENDING", decided_by=None, decided_role=None,
+             closed_at=None, decided_at=None):
+    _exec(s, """
+        INSERT INTO auditcore.p2_journey_closures (tenant_id, journey_id, closed_by_actor_id, closed_by_role,
+          comment, item_count, summary, delivery_outcome, closed_at_utc, acceptance_status, acceptance_due_utc,
+          decided_by_actor_id,
+          decided_by_role, decided_at_utc)
+        VALUES (:t, :j, :by, :role, 'Reviewed and closed.', 0, '{}'::jsonb, 'DELIVERED', :at, :st, :at, :dby, :drole, :dat)
+    """, j=journey, by=by, role=role, at=closed_at or datetime.now(UTC), st=status, dby=decided_by,
+          drole=decided_role, dat=decided_at)
+
+
+def test_reviews_closed_decided_and_awaiting(setup):
+    s = setup
+    outlet = str(s.journey.outlet_id)
+    reviewer, tl = f"rv-{uuid4().hex[:6]}", f"tl-{uuid4().hex[:6]}"
+    _role(s, reviewer, "REVIEWER", dealer=s.journey.dealer_id, outlet=s.journey.outlet_id)
+    _role(s, tl, "TL")
+    j1, j2, j3 = (_journey(s, outlet, s.journey.actor_id) for _ in range(3))
+    now = datetime.now(UTC)
+    _closure(s, j1, by=reviewer)                                                       # awaiting the TL
+    _closure(s, j2, by=reviewer, status="ACCEPTED", decided_by=tl, decided_role="TL", decided_at=now)
+    _closure(s, j3, by=reviewer, status="REJECTED", decided_by=tl, decided_role="TL", decided_at=now)
+    report = _build(s, tl, "DAY", datetime.now(IST).date())
+    r = report["totals"]["reviews"]
+    assert (r["closedByReviewer"], r["accepted"], r["rejected"], r["awaitingDecision"]) == (3, 1, 1, 1)
+    people = {p["actorId"]: p for p in _outlet(report, outlet)["people"]}
+    assert people[reviewer]["reviews"]["closedByReviewer"] == 3
+    assert people[reviewer]["reviews"]["awaitingDecision"] == 1
+    assert people[tl]["reviews"]["accepted"] == 1 and people[tl]["reviews"]["rejected"] == 1
+
+
+def test_failed_pages_by_why(setup):
+    s = setup
+    batch, rows = add_batch_pages(s.journey, [("booking_form", "FAILED")] * 3)
+    for row, code in zip(rows, ("DI_QUALITY_IMAGE_BLUR_SCORE", "NOT_READ_IN_30_MIN", "DOCUMENT_AI_RESPONSE_INVALID"),
+                         strict=True):
+        _exec(s, "UPDATE auditcore.p2_document_queue SET last_error=:c WHERE tenant_id=:t AND queue_id=:q",
+              c=code, q=row["queue_id"])
+    _exec(s, """
+        INSERT INTO auditcore.p2_upload_batches (tenant_id, batch_id, journey_id, original_filename, content_type,
+          size_bytes, page_count, original_object_key, batch_status, uploaded_by_actor_id, failure_reason)
+        VALUES (:t, :b, :j, 'lost.pdf', 'application/pdf', 1, 0, :k, 'FAILED', :a, 'did not finish uploading')
+    """, b=uuid4(), j=s.journey.journey_id, k=f"p2/{uuid4()}", a=s.journey.actor_id)
+    tl = f"tl-{uuid4().hex[:6]}"
+    _role(s, tl, "TL")
+    f = _build(s, tl, "DAY", datetime.now(IST).date())["totals"]["failures"]
+    assert (f["files"], f["pages"], f["quality"], f["notRead"], f["readFailed"], f["notUploaded"]) == (2, 3, 1, 1, 1, 1)
+    assert str(batch)  # the batch with the three failed pages is one of the two files
+
+
+def test_a_pc_reads_only_their_own_row(setup):
+    s = setup
+    second = _second_outlet(s)
+    other = f"pc2-{uuid4().hex[:6]}"
+    _role(s, other, "PC", dealer=s.journey.dealer_id, outlet=s.journey.outlet_id)   # same outlet, another PC
+    j2 = _journey(s, str(s.journey.outlet_id), other)
+    add_batch_pages(SimpleNamespace(**{**s.journey.__dict__, "journey_id": j2, "actor_id": other}),
+                    [("booking_form", "READY")] * 2)
+    add_batch_pages(s.journey, [("booking_form", "READY")])
+    url = f"/p2/v1/tenants/{s.journey.tenant_id}/reports/project-tracker"
+    body = s.client.get(url, params={"period": "day"})                  # the PC of the setup
+    assert body.status_code == 200, body.text
+    report = body.json()
+    assert report["scope"]["own"] is True
+    assert report["totals"]["uploads"]["files"] == 1
+    outlets = [o for d in report["dealers"] for o in d["outlets"]]
+    assert all(o["outletId"] != second for o in outlets)
+    assert [p["actorId"] for o in outlets for p in o["people"]] == [s.journey.actor_id]
+    # Their own failures list too.
+    failed = s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/reports/failed-pages", params={"by": "uploaded"})
+    assert failed.status_code == 200, failed.text

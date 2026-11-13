@@ -175,6 +175,11 @@ def _blank() -> dict[str, Any]:
         "uploads": {"files": 0, "pages": 0, "documents": 0, "journeys": set(), "deliveries": set(),
                     "newJourneys": 0, "duplicatesDeleted": 0},
         "closed": {"deliveryFiles": 0, "reviewer": 0},
+        "channels": {"directFiles": 0, "directPages": 0, "bulkFiles": 0, "bulkPages": 0, "driveFiles": 0,
+                     "drivePages": 0},
+        "reviews": {"closedByReviewer": 0, "closedByLead": 0, "closedByOther": 0, "accepted": 0, "rejected": 0,
+                    "autoAccepted": 0, "awaitingDecision": 0, "awaitingReview": 0},
+        "failures": {"files": set(), "pages": 0, "quality": 0, "notRead": 0, "readFailed": 0, "notUploaded": 0},
         "drive": {"files": 0, "documents": 0, "photos": 0, "taken": 0, "duplicates": 0, "setAside": 0, "failed": 0,
                   "waiting": 0, "reading": 0, "newBookings": 0, "addedToBookings": 0, "keptForReview": 0, "pages": 0,
                   "pagesRead": 0, "pagesToRescan": 0, "pagesReading": 0, "manualVerificationTasks": 0},
@@ -194,6 +199,7 @@ def _finish(figures: dict[str, Any]) -> dict[str, Any]:
     journeys, deliveries = uploads.pop("journeys"), uploads.pop("deliveries")
     uploads["journeys"], uploads["deliveries"] = len(journeys), len(deliveries)
     uploads["bookings"] = len(journeys - deliveries)
+    figures["failures"]["files"] = len(figures["failures"]["files"])
     tasks = figures["tasks"]
     tasks["worked"] = {key: len(value) for key, value in tasks["worked"].items()}
     tasks["byRole"] = {role: dict(v) for role, v in sorted(tasks["byRole"].items())}
@@ -206,8 +212,13 @@ def _finish(figures: dict[str, Any]) -> dict[str, Any]:
 class _Tree:
     """The Project, its dealerships, outlets and people; every fact is added at all four."""
 
-    def __init__(self, outlets: list[dict[str, Any]], names: dict[str, str], roles: dict[str, str]):
+    def __init__(self, outlets: list[dict[str, Any]], names: dict[str, str], roles: dict[str, str],
+                 only: str | None = None, pcs: dict[str, list[str]] | None = None):
         self.names, self.roles = names, roles
+        # A team member's own view (product owner 2026-11-13: "for each team member his own
+        # view"): only the facts that count on their own row are added anywhere.
+        self.only = only
+        self._pcs = pcs or {}
         self.total = _blank()
         self.dealers: dict[str, dict[str, Any]] = {}
         self.outlets: dict[str, dict[str, Any]] = {}
@@ -245,8 +256,16 @@ class _Tree:
                            "role": self.roles.get(key) if actor_id else None, "figures": _blank()}
         return people[key]
 
-    def nodes(self, outlet_id: str | None, actor_id: str | None) -> list[dict[str, Any]]:
+    def nodes(self, outlet_id: str | None, actor_id: str | None, *, outlet_pc: bool = False) -> list[dict[str, Any]]:
+        """The Project, dealership, outlet and person a fact counts on. In a team member's own
+        view, nothing for anyone else; ``outlet_pc``: a fact of the outlet with no person (a gate
+        register not uploaded) counts on the PC mapped to that outlet."""
         key = outlet_id or PROJECT_WIDE
+        if self.only is not None:
+            if actor_id is None and outlet_pc and self.only in self._pcs.get(key, []):
+                actor_id = self.only
+            if actor_id != self.only:
+                return []
         if key not in self.outlets:
             self._outlet(key, None)
         return [self.total, self._dealer_of[key]["figures"], self.outlets[key]["figures"],
@@ -351,7 +370,7 @@ def _add_gate_pass(connection: Connection, tree: _Tree, *, tenant_id: str, outle
     for oid, days in register.items():
         for d in days:
             if d["gatePassId"] is None:
-                nodes = tree.nodes(oid, None)
+                nodes = tree.nodes(oid, None, outlet_pc=True)
                 _bump(nodes, "gatePass", "due")
                 _bump(nodes, "gatePass", "missing" if d["status"] == "MISSED" else "notYetDue")
                 continue
@@ -373,14 +392,20 @@ def _add_uploads(connection: Connection, tree: _Tree, *, tenant_id: str, start: 
             SELECT ub.batch_id, ub.journey_id, j.outlet_id, ub.uploaded_by_actor_id AS actor_id,
                    COALESCE(ub.page_count, 0) AS pages,
                    COUNT(q.queue_id) FILTER (WHERE q.queue_status NOT IN ('MERGED', 'CANCELLED')) AS documents,
-                   COALESCE(bool_or(q.business_stage = 'DELIVERY'), false) AS delivery
+                   COALESCE(bool_or(q.business_stage = 'DELIVERY'), false) AS delivery,
+                   -- How the file came in (product owner 2026-11-13): a file of a bulk upload
+                   -- from Google Drive, of a bulk (folder) upload, or uploaded on its own.
+                   (SELECT CASE WHEN count(*) = 0 THEN NULL WHEN bool_or(bu.source = 'DRIVE') THEN 'drive' ELSE 'bulk' END
+                    FROM auditcore.p2_bulk_files bf
+                    JOIN auditcore.p2_bulk_uploads bu ON bu.tenant_id = bf.tenant_id AND bu.bulk_id = bf.bulk_id
+                    WHERE bf.tenant_id = ub.tenant_id AND bf.batch_id = ub.batch_id) AS channel
             FROM auditcore.p2_upload_batches ub
             JOIN auditcore.journeys j ON j.tenant_id = ub.tenant_id AND j.journey_id = ub.journey_id
             LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id = ub.tenant_id AND q.batch_id = ub.batch_id
             WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
               AND ub.batch_status <> 'AWAITING_UPLOAD'
               AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
-            GROUP BY ub.batch_id, ub.journey_id, j.outlet_id, ub.uploaded_by_actor_id, ub.page_count
+            GROUP BY ub.tenant_id, ub.batch_id, ub.journey_id, j.outlet_id, ub.uploaded_by_actor_id, ub.page_count
         """),
         {"t": tenant_id, "s": start, "e": end},
     ).mappings().all()
@@ -392,6 +417,9 @@ def _add_uploads(connection: Connection, tree: _Tree, *, tenant_id: str, start: 
         _bump(nodes, "uploads", "files")
         _bump(nodes, "uploads", "pages", int(r["pages"]))
         _bump(nodes, "uploads", "documents", int(r["documents"]))
+        channel = r["channel"] or "direct"
+        _bump(nodes, "channels", f"{channel}Files")
+        _bump(nodes, "channels", f"{channel}Pages", int(r["pages"]))
         _member(nodes, "uploads", "journeys", str(r["journey_id"]))
         if r["delivery"]:
             _member(nodes, "uploads", "deliveries", str(r["journey_id"]))
@@ -450,6 +478,126 @@ def _add_closed(connection: Connection, tree: _Tree, *, tenant_id: str, actor_id
         oid = str(r["outlet_id"])
         if tree.has_outlet(oid):
             _bump(tree.nodes(oid, r["created_by_actor_id"]), "closed", "reviewer")
+
+
+def _add_reviews(connection: Connection, tree: _Tree, *, tenant_id: str, actor_id: str, start: datetime,
+                 end: datetime, now: datetime, wide: bool) -> None:
+    """Reviews (product owner 2026-11-13: "how many reviews closed by Reviewer/TL/PM and how many
+    still open"). A review is a Reviewer's closure of a Journey (p2_journey_closures); the TL or PM
+    then accepts or rejects it (auto-accepted after 96 hours).
+
+    closedByReviewer / closedByLead / closedByOther  closures in the period, by the closer's role,
+                     on the closer's row
+    accepted / rejected                              decided in the period, on the decider's row
+    autoAccepted                                     accepted on its own in the period, on the closer's row
+    awaitingDecision closures not yet accepted or rejected at the end of the period, on the closer's row
+    awaitingReview   delivery files closed (the PC's rule) by the end of the period that no Reviewer
+                     has closed (or whose closure was rejected), on the Journey's PC's row
+    """
+    cut = min(end, now)
+    rows = connection.execute(
+        text("""
+            SELECT c.journey_id, j.outlet_id, c.closed_by_actor_id, upper(COALESCE(c.closed_by_role, '')) AS role,
+                   c.closed_at_utc, c.acceptance_status, c.decided_by_actor_id, c.decided_at_utc
+            FROM auditcore.p2_journey_closures c
+            JOIN auditcore.journeys j ON j.tenant_id = c.tenant_id AND j.journey_id = c.journey_id
+            WHERE c.tenant_id = :t AND c.closed_at_utc < :e
+        """),
+        {"t": tenant_id, "e": end},
+    ).mappings().all()
+    reviewed: set[str] = set()
+    for r in rows:
+        oid = str(r["outlet_id"])
+        if not tree.has_outlet(oid):
+            continue
+        closer = str(r["closed_by_actor_id"]) if r["closed_by_actor_id"] else None
+        decided_at = r["decided_at_utc"]
+        status = r["acceptance_status"]
+        if start <= r["closed_at_utc"] < end:
+            key = {"Reviewer": "closedByReviewer", "Lead": "closedByLead"}.get(_closer_key(r["role"]), "closedByOther")
+            _bump(tree.nodes(oid, closer), "reviews", key)
+        if decided_at is not None and start <= decided_at < end:
+            if status == "AUTO_ACCEPTED":
+                _bump(tree.nodes(oid, closer), "reviews", "autoAccepted")
+            elif status in ("ACCEPTED", "REJECTED"):
+                decider = str(r["decided_by_actor_id"]) if r["decided_by_actor_id"] else None
+                _bump(tree.nodes(oid, decider), "reviews", status.lower())
+        if r["closed_at_utc"] < cut and (decided_at is None or decided_at >= cut):
+            _bump(tree.nodes(oid, closer), "reviews", "awaitingDecision")
+        # Reviewed by the end of the period: closed then and not rejected by then.
+        if r["closed_at_utc"] < cut and not (status == "REJECTED" and decided_at is not None and decided_at < cut):
+            reviewed.add(str(r["journey_id"]))
+    ready = delivery_files_closed(connection, tenant_id=tenant_id, actor_id=actor_id,
+                                  start=datetime(2000, 1, 1, tzinfo=UTC), end=cut, names={},
+                                  whole_project=wide)["files"]
+    for f in ready:
+        oid = f.get("outletId")
+        if oid and tree.has_outlet(oid) and f["journeyId"] not in reviewed:
+            _bump(tree.nodes(oid, f["pcActorId"]), "reviews", "awaitingReview")
+
+
+# A page that failed for good, by why (product owner 2026-11-13: "if some files are failed to be
+# uploaded and all their retries are exhausted can we have information why that happened").
+_NOT_READ_CODES = ("NOT_READ_IN_30_MIN", "NOT_READ_IN_60_MIN")
+
+
+def failure_kind(code: str | None) -> str:
+    """quality: the page itself (blurred, faded, too small, unreadable) -- scan it again;
+    notRead: not read in the time allowed (Verigence or the reading service was too slow);
+    readFailed: reading failed after every retry (the reading service)."""
+    from audit_core.uc03_p2_daily_report import rejection_reason
+
+    value = str(code or "").upper()
+    if rejection_reason(value) is not None:
+        return "quality"
+    if value in _NOT_READ_CODES:
+        return "notRead"
+    return "readFailed"
+
+
+def _add_failures(connection: Connection, tree: _Tree, *, tenant_id: str, start: datetime, end: datetime) -> None:
+    """Files uploaded in the period whose pages failed for good -- every retry spent, or rejected
+    on image quality -- and files that never arrived or were never split into pages, under the PC
+    who uploaded them. A page the PC has since sent again (superseded) or removed is not a failure;
+    a page the day-end sweep cleared from the Journey still is until it is sent again."""
+    from audit_core.uc03_p2_runtime import swept_pending_sql
+
+    rows = connection.execute(
+        text(f"""
+            SELECT ub.batch_id, j.outlet_id, ub.uploaded_by_actor_id AS actor_id, q.last_error,
+                   COALESCE(cardinality(q.page_numbers), 1) AS pages
+            FROM auditcore.p2_document_queue q
+            JOIN auditcore.p2_upload_batches ub ON ub.tenant_id = q.tenant_id AND ub.batch_id = q.batch_id
+            JOIN auditcore.journeys j ON j.tenant_id = ub.tenant_id AND j.journey_id = ub.journey_id
+            WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
+              AND (q.queue_status IN ('FAILED', 'DEAD_LETTER') OR {swept_pending_sql("q")})
+        """),
+        {"t": tenant_id, "s": start, "e": end},
+    ).mappings().all()
+    for r in rows:
+        oid = str(r["outlet_id"])
+        if not tree.has_outlet(oid):
+            continue
+        nodes = tree.nodes(oid, r["actor_id"])
+        _bump(nodes, "failures", "pages", int(r["pages"]))
+        _bump(nodes, "failures", failure_kind(r["last_error"]), int(r["pages"]))
+        _member(nodes, "failures", "files", str(r["batch_id"]))
+    for r in connection.execute(
+        text("""
+            SELECT ub.batch_id, j.outlet_id, ub.uploaded_by_actor_id AS actor_id
+            FROM auditcore.p2_upload_batches ub
+            JOIN auditcore.journeys j ON j.tenant_id = ub.tenant_id AND j.journey_id = ub.journey_id
+            WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
+              AND ub.batch_status = 'FAILED' AND COALESCE(ub.page_count, 0) = 0
+        """),
+        {"t": tenant_id, "s": start, "e": end},
+    ).mappings():
+        oid = str(r["outlet_id"])
+        if not tree.has_outlet(oid):
+            continue
+        nodes = tree.nodes(oid, r["actor_id"])
+        _bump(nodes, "failures", "notUploaded")
+        _member(nodes, "failures", "files", str(r["batch_id"]))
 
 
 def _closer_key(role: str | None) -> str:
@@ -570,7 +718,9 @@ def _add_tasks(connection: Connection, tree: _Tree, *, tenant_id: str, start: da
         if oid is None:
             continue
         actor_role = normalise_role(ev["role"])
-        person = str(ev["actor_id"]) if actor_role == "PC" else _person_for(task)
+        # A PC's or Reviewer's own work counts on their own row (a Reviewer's own view, 2026-11-13);
+        # a TL's, PM's or Executive's on the row the task counts on.
+        person = str(ev["actor_id"]) if actor_role in ("PC", "REVIEWER") else _person_for(task)
         nodes = tree.nodes(None if oid == PROJECT_WIDE else oid, person)
         for figures in nodes:
             worked = figures["tasks"]["worked"]
@@ -618,8 +768,10 @@ def _schedules(connection: Connection, tenant_id: str, keys: set[str]) -> list[d
 
 def build_project_tracker(
     connection: Connection, *, tenant_id: str, actor_id: str, period: str, day: date, admin: bool = False,
-    now: datetime | None = None,
+    now: datetime | None = None, own: bool = False,
 ) -> dict[str, Any]:
+    """``own``: a team member's own view (a PC or Reviewer, product owner 2026-11-13): the outlets
+    they are mapped to, and only what counts on their own row."""
     now = now or datetime.now(UTC)
     kind = period.upper()
     timezone_name = connection.execute(
@@ -632,17 +784,21 @@ def build_project_tracker(
     start, end = period_bounds(first, last, timezone_name)
     wide, outlets = _scope(connection, tenant_id=tenant_id, actor_id=actor_id, admin=admin)
     roles, pcs = _people(connection, tenant_id)
-    tree = _Tree(outlets, known_names(connection, tenant_id=tenant_id), roles)
+    tree = _Tree(outlets, known_names(connection, tenant_id=tenant_id), roles,
+                 only=actor_id if own else None, pcs=pcs)
     # Every PC mapped to an outlet has a row, also with nothing done in the period.
     for o in outlets:
         for pc in pcs.get(str(o["outlet_id"]), []):
-            tree.person(str(o["outlet_id"]), pc)
+            if not own or pc == actor_id:
+                tree.person(str(o["outlet_id"]), pc)
 
     _add_gate_pass(connection, tree, tenant_id=tenant_id, outlets=outlets, pcs=pcs, first=first, last=last,
                    today=today, now=now)
     _add_uploads(connection, tree, tenant_id=tenant_id, start=start, end=end)
     _add_closed(connection, tree, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end, wide=wide)
     _add_drive(connection, tree, tenant_id=tenant_id, start=start, end=end)
+    _add_reviews(connection, tree, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end, now=now, wide=wide)
+    _add_failures(connection, tree, tenant_id=tenant_id, start=start, end=end)
     _add_tasks(connection, tree, tenant_id=tenant_id, start=start, end=end, first=first, last=last, now=now,
                wide=wide)
     totals, dealers = tree.result()
@@ -654,7 +810,8 @@ def build_project_tracker(
             "startUtc": start.isoformat(), "endUtc": end.isoformat(), "asOfUtc": min(end, now).isoformat(),
             "current": first <= today <= last,
         },
-        "scope": {"projectWide": wide, "outlets": len(outlets), "dealers": len({str(o["dealer_id"]) for o in outlets})},
+        "scope": {"projectWide": wide, "outlets": len(outlets), "dealers": len({str(o["dealer_id"]) for o in outlets}),
+                  "own": own},
         "schedules": schedules,
         "totals": totals,
         "dealers": dealers,
@@ -685,6 +842,18 @@ def build_project_tracker(
              "Journey's PC; a task not tied to a PC counts on the outlet's 'not linked to a PC' row."),
             ("Open at the end of a past period is read from the tasks as they are now: a task closed later "
              "counts as open then; one reopened later counts as closed when it was closed."),
+            ("How files came in: uploaded on their own (app or web), in a bulk (folder) upload, or through "
+             "Google Drive; counted when uploaded, under the PC who uploaded them (a Drive file under the PC "
+             "of its outlet)."),
+            ("Reviews: a Reviewer's closure of a Journey, counted on the closer's row when closed; accepted "
+             "or rejected on the TL's or PM's row when decided (auto-accepted after 96 hours on the closer's "
+             "row). Awaiting decision: closed and not yet accepted or rejected at the end of the period. "
+             "Awaiting review: delivery files closed by then that no Reviewer has closed (or whose closure "
+             "was rejected), on the Journey's PC's row."),
+            ("Failed for good: pages of the files uploaded in the period that failed after every retry or were "
+             "rejected on image quality, and files that never finished uploading or were never split into "
+             "pages, under the PC who uploaded them. Why: the page itself (scan it again), not read in the "
+             "time allowed, or reading failed after every retry. A page sent again or removed is left out."),
             ("Recurring tasks: every occurrence of each schedule in the period (cancelled ones left out) -- "
              "done on time, done late, incomplete, overdue (open past its due time) or not yet due. A new "
              "schedule (a DMS or payment reconciliation) appears here on its own."),
@@ -703,20 +872,43 @@ def get_project_tracker(
     period: Annotated[str, Query(pattern=r"(?i)^(day|week|month)$")] = "DAY",
     day: Annotated[date | None, Query(alias="date")] = None,
 ) -> dict[str, Any]:
-    """The Project Tracker (product owner 2026-11-07): gate pass, files uploaded, files closed,
-    tasks and recurring tasks for a day, a week (Monday to Sunday) or a calendar month, per
-    dealership, outlet and PC. Team Lead, PM, Executive (and an administrator)."""
+    """The Project Tracker (product owner 2026-11-07): gate pass, files uploaded (and how they came
+    in), files closed, reviews, failures, tasks and recurring tasks for a day, a week (Monday to
+    Sunday) or a calendar month, per dealership, outlet and person. Team Lead, PM, Executive (and an
+    administrator) see their whole team; a PC or Reviewer their own row only (2026-11-13)."""
     access = authorize_p2(
         connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,
         authorization_client=authorization_client, permission_key=_READ_PERMISSION,
     )
-    _require_report_role(connection, tenant_id=tenant_id, actor_id=human_principal.subject,
-                         functional_role=access.functional_role)
     admin = (access.functional_role or "").upper() in _ADMIN_ROLES
+    # Team Lead, PM and Executive see the whole team; a PC or Reviewer their own row (product
+    # owner 2026-11-13: "visible for the entire team to TL/PM and Exec .. for each team member
+    # his own view").
+    own = not admin and not _holds(connection, tenant_id, human_principal.subject, _REPORT_ROLES)
+    if own and not _holds(connection, tenant_id, human_principal.subject, _MEMBER_ROLES):
+        _require_report_role(connection, tenant_id=tenant_id, actor_id=human_principal.subject,
+                             functional_role=access.functional_role)
     if day is None:
         timezone_name = connection.execute(
             text("SELECT timezone_name FROM auditcore.projects WHERE tenant_id = :t"), {"t": tenant_id},
         ).scalar_one_or_none()
         day = datetime.now(UTC).astimezone(_zone(timezone_name)).date()
     return build_project_tracker(connection, tenant_id=tenant_id, actor_id=human_principal.subject,
-                                 period=period, day=day, admin=admin)
+                                 period=period, day=day, admin=admin, own=own)
+
+
+_REPORT_ROLES = ("TL", "PM", "EXECUTIVE")
+_MEMBER_ROLES = ("PC", "REVIEWER")
+
+
+def _holds(connection: Connection, tenant_id: str, actor_id: str, roles: tuple[str, ...]) -> bool:
+    return connection.execute(
+        text("""
+            SELECT 1 FROM auditcore.business_assignments
+            WHERE tenant_id = :t AND security_actor_id = :a AND assignment_status = 'ACTIVE'
+              AND effective_from <= now() AND (effective_to IS NULL OR effective_to >= now())
+              AND upper(business_role_code) = ANY(:roles)
+            LIMIT 1
+        """),
+        {"t": tenant_id, "a": actor_id, "roles": list(roles)},
+    ).scalar_one_or_none() is not None
