@@ -136,7 +136,7 @@ def _clear_settings(s):
         connection.exec_driver_sql("DELETE FROM platform_ops.performance_settings")
 
 
-def test_a_super_admin_chooses_what_the_view_shows(setup):
+def test_a_super_admin_chooses_what_each_role_sees(setup):
     from fastapi.testclient import TestClient
 
     from audit_core.dependencies import HumanAdminRequest, require_super_admin_request
@@ -146,8 +146,9 @@ def test_a_super_admin_chooses_what_the_view_shows(setup):
     s = setup
     _clear_settings(s)
     add_batch_pages(s.journey, [("booking_form", "READY")])
-    tl = f"tl-{uuid4().hex[:6]}"
+    tl, pm = f"tl-{uuid4().hex[:6]}", f"pm-{uuid4().hex[:6]}"
     tt._role(s, tl, "TL")
+    tt._role(s, pm, "PM")
     app.dependency_overrides[require_super_admin_request] = lambda: HumanAdminRequest(
         user_id="sa-1", bearer_token="t",
         admin_context=SecurityAdminContext(user_id="sa-1", is_super_admin=True, admin_scopes=()))
@@ -155,24 +156,25 @@ def test_a_super_admin_chooses_what_the_view_shows(setup):
         admin = TestClient(app, raise_server_exceptions=False)
         page = admin.get("/v1/admin/performance-settings")
         assert page.status_code == 200, page.text
-        assert all(item["shown"] for item in page.json()["items"])
-        assert {"activeMinutes", "duties", "peerComparison"} <= {i["key"] for i in page.json()["items"]}
-        assert admin.put("/v1/admin/performance-settings", json={"shown": {"nonsense": False}}).status_code == 422
+        assert page.json()["roles"] == ["PC", "REVIEWER", "TL", "PM", "EXECUTIVE"]
+        assert all(all(item["shown"].values()) for item in page.json()["items"])
+        assert {"pending", "flow", "trend", "efficiency", "duties", "activeMinutes"} <= {
+            i["key"] for i in page.json()["items"]}
+        assert admin.put("/v1/admin/performance-settings", json={"shown": {"TL:nonsense": False}}).status_code == 422
         changed = admin.put("/v1/admin/performance-settings",
-                            json={"shown": {"activeMinutes": False, "duties": False, "peerComparison": False}})
+                            json={"shown": {"TL:activeMinutes": False, "TL:efficiency": False, "TL:pending": False}})
         assert changed.status_code == 200, changed.text
-        assert {i["key"] for i in changed.json()["items"] if not i["shown"]} == {
-            "activeMinutes", "duties", "peerComparison"}
-        report = _build(s, tl)
-        assert "activeMinutes" not in [m["key"] for m in report["measures"]]
-        assert report["shows"] == {"duties": False, "peers": False}
-        assert report["peers"] == {} and report["schedules"] == [] and report["plannedDuties"] == []
-        mine = next(p for p in report["people"] if p["actorId"] == s.journey.actor_id)
-        assert "activeMinutes" not in mine["today"] and "activeMinutes" not in mine["series"]
-        assert mine["standing"]["filesUploaded"] is None and mine["dutiesWindow"] == {}
-        # Switched back on: shown again.
-        admin.put("/v1/admin/performance-settings", json={"shown": {"activeMinutes": True}})
-        assert "activeMinutes" in [m["key"] for m in _build(s, tl)["measures"]]
+        by_key = {i["key"]: i["shown"] for i in changed.json()["items"]}
+        assert by_key["efficiency"]["TL"] is False and by_key["efficiency"]["PM"] is True
+        # The Team Lead no longer gets them; the PM still does.
+        for_tl, for_pm = _build(s, tl), _build(s, pm)
+        assert "activeMinutes" not in [m["key"] for m in for_tl["measures"]]
+        assert "efficiency" not in for_tl and "pending" not in for_tl
+        assert [x["key"] for x in for_tl["sections"]] == ["flow", "trend", "duties"]
+        assert "activeMinutes" in [m["key"] for m in for_pm["measures"]]
+        assert "efficiency" in for_pm and "pending" in for_pm
+        mine = next(p for p in for_tl["people"] if p["actorId"] == s.journey.actor_id)
+        assert "activeMinutes" not in mine["today"]
     finally:
         app.dependency_overrides.pop(require_super_admin_request, None)
         _clear_settings(s)
@@ -221,3 +223,55 @@ def test_outlet_and_dealership_views_and_who_reads_whom(setup):
     # A PC's own view carries no outlets or dealerships.
     own = _build(s, s.journey.actor_id, own=True)
     assert own["outlets"] == [] and own["dealers"] == []
+
+
+def test_pending_work_efficiency_delinquencies_and_bookings_deliveries(setup):
+    s = setup
+    outlet = str(s.journey.outlet_id)
+    me = s.journey.actor_id
+    today = datetime.now(IST).date()
+    now = datetime.now(UTC)
+    # Two delivery files of mine, uploaded today and five days ago; and a booking today.
+    gate_pass_tests._delivery_file(s, journeys=2, pages=2)
+    _uploads(s, me, tt._journey(s, outlet, me), 1)
+    old = tt._journey(s, outlet, me)
+    batch, _rows = add_batch_pages(SimpleNamespace(**{**s.journey.__dict__, "journey_id": old}), [("gate_pass", "READY")])
+    tt._exec(s, "UPDATE auditcore.p2_document_queue SET business_stage='DELIVERY', created_at_utc=:at "
+                "WHERE tenant_id=:t AND batch_id=:b", at=now - timedelta(days=5), b=batch)
+    tt._exec(s, "UPDATE auditcore.p2_upload_batches SET created_at_utc=:at WHERE tenant_id=:t AND batch_id=:b",
+             at=now - timedelta(days=5), b=batch)
+    # Tasks: one open and overdue, one closed in time.
+    tt._task(s, role="PC", journey=old, actor=me, created=now - timedelta(days=2), due=now - timedelta(days=1))
+    done = tt._task(s, role="PC", journey=old, actor=me, status="VERIFIED_COMPLETE", created=now - timedelta(hours=5),
+                    done=now - timedelta(hours=1), due=now + timedelta(hours=3))
+    tt._exec(s, "UPDATE auditcore.p2_tasks SET completed_by_actor_id=:a WHERE tenant_id=:t AND task_id=:id", a=me, id=done)
+    # A duty missed yesterday.
+    schedule = tt._gate_schedule(s, today - timedelta(days=10))
+    tt._task(s, role="PC", actor=me, scope="OUTLET", outlet=outlet, schedule=schedule,
+             occurrence=today - timedelta(days=1), status="READY", created=now - timedelta(days=1, hours=3),
+             due=now - timedelta(hours=2))
+    tl = f"tl-{uuid4().hex[:6]}"
+    tt._role(s, tl, "TL")
+    report = _build(s, tl)
+    assert [x["key"] for x in report["sections"]] == ["pending", "flow", "trend", "efficiency", "duties"]
+
+    pending = next(p for p in report["pending"]["people"] if p["actorId"] == me)["counts"]
+    assert pending["deliveryFilesOpen"][2] == 1                       # the one uploaded five days ago
+    assert sum(pending["tasksOpen"]) >= 1 and sum(pending["tasksOverdue"]) >= 1
+    at_outlet = next(o for o in report["pending"]["outlets"] if o["outletId"] == outlet)["counts"]
+    assert at_outlet["deliveryFilesOpen"][2] == 1
+
+    eff = next(e for e in report["efficiency"]["people"] if e["actorId"] == me)
+    assert eff["deliveryStarted"] >= 1 and eff["tasksWithDue"] == 1 and eff["tasksInTimeShare"] == 100
+    assert eff["firstTimeRight"] == 100 and eff["journeysPerDay"] is not None
+
+    line = next(x for x in report["delinquency"]["lines"] if x["actorId"] == me)
+    assert line["notDone"] == 1 and line["missedDates"] == [(today - timedelta(days=1)).isoformat()]
+
+    flow = next(o for o in report["flow"]["outlets"] if o["outletId"] == outlet)["days"]
+    assert flow[today.isoformat()]["deliveries"] == 2 and flow[today.isoformat()]["bookings"] == 1
+
+    # A PC's own view: their own pending work and delinquencies, no outlets.
+    own = _build(s, me, own=True)
+    assert own["pending"]["outlets"] == [] and [p["actorId"] for p in own["pending"]["people"]] == [me]
+    assert "flow" not in own

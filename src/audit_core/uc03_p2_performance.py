@@ -77,7 +77,7 @@ from audit_core.uc03_p2_project_tracker import (
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-performance"])
 
 _READ_PERMISSION = "audit.journey.read"
-MIN_DAYS, MAX_DAYS, DEFAULT_DAYS = 7, 31, 14
+MIN_DAYS, MAX_DAYS, DEFAULT_DAYS = 7, 42, 14  # 42: six whole weeks for the week-to-week view
 _CACHE_SECONDS = 120.0
 
 # The measures, in the order shown. ``roles``: whose work it is (the screen shows it for them).
@@ -125,17 +125,37 @@ PLANNED_DUTIES: tuple[dict[str, str], ...] = (
 # to be displayed configurable under Superadmin control, like utilization and all"): each
 # measure, the duties, and the comparison with peers. Anything not switched is shown.
 DUTIES_ITEM, PEERS_ITEM = "duties", "peerComparison"
+# The sections of the screen (product owner 13 Nov 2026: pending work, PC efficiency, day to day
+# and week to week, delinquencies, bookings and deliveries).
+SECTIONS: tuple[dict[str, str], ...] = (
+    {"key": "pending", "label": "Pending work"},
+    {"key": "flow", "label": "Bookings and deliveries"},
+    {"key": "trend", "label": "Day to day, week to week"},
+    {"key": "efficiency", "label": "PC efficiency"},
+    {"key": DUTIES_ITEM, "label": "Delinquencies (daily and weekly duties)"},
+)
 SETTING_ITEMS: tuple[dict[str, str], ...] = (
+    *({"key": x["key"], "label": x["label"], "group": "SECTION"} for x in SECTIONS),
     *({"key": m["key"], "label": m["label"], "group": m["group"]} for m in MEASURES),
-    {"key": DUTIES_ITEM, "label": "Daily and weekly duties", "group": "DUTIES"},
     {"key": PEERS_ITEM, "label": "Comparison with peers", "group": "COMPARISON"},
 )
+# Each item is switched per role (product owner 13 Nov 2026: "I want superadmin to be able to
+# control what TL can see and what PM can see"). Stored as "<ROLE>:<item>"; an item with no role
+# (the first version's rows, none were ever set) is ignored.
+SETTING_ROLES = ("PC", "REVIEWER", "TL", "PM", "EXECUTIVE")
 
 
-def hidden_items(connection: Connection) -> set[str]:
-    """The items a SuperAdmin has switched off (one read of a table of a few rows)."""
-    return {str(r[0]) for r in connection.execute(
-        text("SELECT item_key FROM platform_ops.performance_settings WHERE NOT shown"))}
+def hidden_items(connection: Connection, role: str | None = None) -> set[str]:
+    """The items a SuperAdmin has switched off for this role (one read of a table of a few rows).
+    ``role`` None: an administrator, who sees everything."""
+    if role is None:
+        return set()
+    out: set[str] = set()
+    for (key,) in connection.execute(text("SELECT item_key FROM platform_ops.performance_settings WHERE NOT shown")):
+        owner, _, item = str(key).rpartition(":")
+        if owner == role:
+            out.add(item)
+    return out
 
 
 # Within a tenth of the peers' median counts as "with peers".
@@ -178,7 +198,7 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
 
     uploads = connection.execute(text("""
         SELECT ub.uploaded_by_actor_id AS actor, (ub.created_at_utc AT TIME ZONE :tz)::date AS day, j.outlet_id AS outlet,
-               count(*) AS files, count(DISTINCT ub.journey_id) AS journeys
+               count(*) AS files, count(DISTINCT ub.journey_id) AS journeys, sum(COALESCE(ub.page_count, 0)) AS pages
         FROM auditcore.p2_upload_batches ub
         JOIN auditcore.journeys j ON j.tenant_id = ub.tenant_id AND j.journey_id = ub.journey_id
         WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
@@ -188,6 +208,7 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
     """), params).mappings().all()
     put(uploads, "filesUploaded", "files")
     put(uploads, "journeysUploaded", "journeys")
+    put(uploads, "pagesUploaded", "pages")
     put(connection.execute(text("""
         SELECT ub.uploaded_by_actor_id AS actor, (ub.created_at_utc AT TIME ZONE :tz)::date AS day, j.outlet_id AS outlet,
                sum(COALESCE(cardinality(q.page_numbers), 1)) AS n
@@ -303,7 +324,12 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
             person["dealers"].add(str(r["dealer_id"]))
         else:
             person["outlets"].add(str(r["outlet_id"]))
+    from audit_core import uc03_p2_team_insights
+
+    insights = uc03_p2_team_insights.collect(connection, tenant_id=tenant_id, first=first, last=last, start=start,
+                                             end=end, tz=tz, zone=zone, now=now)
     return {"values": values, "duties": duties, "by_outlet": by_outlet, "outlet_duties": outlet_duties,
+            "insights": insights,
             "schedules": schedules, "people": people,
             "names": known_names(connection, tenant_id=tenant_id)}
 
@@ -323,6 +349,86 @@ def _cached(connection: Connection, *, tenant_id: str, first: date, last: date, 
                 _cache.clear()
             _cache[key] = (_time.monotonic(), data)
     return data
+
+
+def _sections(data: dict[str, Any], *, rows: list[dict[str, Any]], outlets: list[dict[str, Any]], own: bool,
+              hidden: set[str], iso: list[str], people: dict[str, Any]) -> dict[str, Any]:
+    """The five things a lead manages by, for the people and outlets the caller reads, leaving out
+    what a SuperAdmin has switched off for their role."""
+    from audit_core.uc03_p2_team_insights import BUCKETS, PENDING_KINDS
+
+    ins = data["insights"]
+    values, duties = data["values"], data["duties"]
+    visible = [r["actorId"] for r in rows]
+    names = {r["actorId"]: r["name"] for r in rows}
+    out: dict[str, Any] = {"sections": [x for x in SECTIONS if x["key"] not in hidden]}
+
+    if "pending" not in hidden:
+        # A person's pending work is their own; an outlet's is everything at the outlet.
+        kinds = [k for k in PENDING_KINDS if not own or k["key"] not in ("awaitingReview",)]
+        out["pending"] = {
+            "kinds": kinds, "buckets": list(BUCKETS),
+            "outlets": [] if own else [
+                {"outletId": str(o["outlet_id"]), "outletName": o["outlet_name"], "dealerId": str(o["dealer_id"]),
+                 "dealerName": o["dealer_name"], "counts": ins["pendingByOutlet"].get(str(o["outlet_id"]), {})}
+                for o in outlets],
+            "people": [{"actorId": a, "name": names[a], "role": people[a]["role"],
+                        "counts": ins["pendingByPerson"].get(a, {})} for a in visible],
+        }
+
+    if "flow" not in hidden and not own:
+        out["flow"] = {"outlets": [
+            {"outletId": str(o["outlet_id"]), "outletName": o["outlet_name"], "dealerId": str(o["dealer_id"]),
+             "dealerName": o["dealer_name"],
+             "days": {d: ins["flow"].get(str(o["outlet_id"]), {}).get(d) for d in iso
+                      if ins["flow"].get(str(o["outlet_id"]), {}).get(d)}}
+            for o in outlets]}
+
+    if "efficiency" not in hidden:
+        table = []
+        for a in visible:
+            if people[a]["role"] != "PC":
+                continue
+            e = ins["efficiency"].get(a, {})
+            v = values.get(a, {})
+            pages = sum(v.get("pagesUploaded", {}).get(d, 0) for d in iso)
+            rejected = sum(v.get("pagesRejected", {}).get(d, 0) for d in iso)
+            journeys = sum(v.get("journeysUploaded", {}).get(d, 0) for d in iso)
+            worked = sum(1 for d in iso if any(v.get(k, {}).get(d, 0) > 0 for k in ("filesUploaded", "tasksClosed")))
+            started, closed = int(e.get("deliveryStarted", 0)), int(e.get("deliveryClosed", 0))
+            due, in_time = int(e.get("tasksWithDue", 0)), int(e.get("tasksInTime", 0))
+            table.append({
+                "actorId": a, "name": names[a], "daysWorked": worked,
+                "deliveryStarted": started, "deliveryClosed": closed,
+                "closedShare": round(100 * closed / started) if started else None,
+                "daysToClose": round(e["daysToCloseSum"] / closed, 1) if closed else None,
+                "pagesUploaded": int(pages), "pagesRejected": int(rejected),
+                "firstTimeRight": round(100 * (pages - rejected) / pages) if pages else None,
+                "tasksWithDue": due, "tasksInTime": in_time,
+                "tasksInTimeShare": round(100 * in_time / due) if due else None,
+                "journeysPerDay": round(journeys / worked, 1) if worked else None,
+            })
+        out["efficiency"] = {"people": table}
+
+    if DUTIES_ITEM not in hidden:
+        lines = []
+        for a in visible:
+            for schedule_id, by_day in duties.get(a, {}).items():
+                total = {"due": 0, "onTime": 0, "late": 0, "notDone": 0, "pending": 0}
+                missed, late = [], []
+                for d in sorted(by_day):
+                    cell = by_day[d]
+                    for k in total:
+                        total[k] += cell[k]
+                    if cell["notDone"]:
+                        missed.append(d)
+                    if cell["late"]:
+                        late.append(d)
+                if total["due"]:
+                    lines.append({"actorId": a, "name": names[a], "role": people[a]["role"], "scheduleId": schedule_id,
+                                  **total, "missedDates": missed, "lateDates": late})
+        out["delinquency"] = {"lines": lines}
+    return out
 
 
 def _caller_roles(connection: Connection, tenant_id: str, actor_id: str) -> list[str]:
@@ -397,14 +503,18 @@ def build_performance(
     # Whom the caller reads: their own row; or the people of their outlets whose role is below
     # their own (a TL: PCs and Reviewers; a PM: those and the TLs; an Executive: the PMs too).
     outlets: list[dict[str, Any]] = []
+    caller_role: str | None = None  # an administrator: everything is shown
     if own:
         visible = [actor_id] if actor_id in people else []
+        caller_role = people.get(actor_id, {}).get("role") or "PC"
     else:
         wide, outlets = _scope(connection, tenant_id=tenant_id, actor_id=actor_id, admin=admin)
         outlet_ids = {str(o["outlet_id"]) for o in outlets}
         dealer_ids = {str(o["dealer_id"]) for o in outlets}
-        rank = 99 if admin else max(
-            [_ROLE_RANK.get(r, 0) for r in _caller_roles(connection, tenant_id, actor_id)] or [0])
+        held = _caller_roles(connection, tenant_id, actor_id)
+        rank = 99 if admin else max([_ROLE_RANK.get(r, 0) for r in held] or [0])
+        if not admin:
+            caller_role = max(held, key=lambda r: _ROLE_RANK.get(r, 0)) if held else "TL"
         visible = [a for a, p in people.items()
                    if (wide or p["outlets"] & outlet_ids or p["dealers"] & dealer_ids)
                    and (_ROLE_RANK.get(p["role"], 0) < rank or a == actor_id)]
@@ -421,7 +531,7 @@ def build_performance(
                 out[schedule_id] = total
         return out
 
-    hidden = hidden_items(connection)
+    hidden = hidden_items(connection, caller_role)
     shown_keys = [k for k in _KEYS if k not in hidden]
     show_duties, show_peers = DUTIES_ITEM not in hidden, PEERS_ITEM not in hidden
     rows = []
@@ -515,6 +625,7 @@ def build_performance(
                          "usualMedian": {k: p["usualMedian"][k] for k in shown_keys}}
                   for role, p in peers.items()} if show_peers else {},
         "people": rows,
+        **_sections(data, rows=rows, outlets=outlets, own=own, hidden=hidden, iso=iso, people=people),
         "unitMeasures": [{k: v for k, v in m.items() if k != "setting"} for m in unit_measures],
         "outlets": outlet_units,
         "dealers": sorted(dealer_units, key=lambda d: (d["dealerName"] or "").lower()),
@@ -575,11 +686,10 @@ class PerformanceSettingsCommand(BaseModel):
 
 
 def _settings(connection: Connection) -> dict[str, Any]:
-    rows = {str(r["item_key"]): r for r in connection.execute(text(
-        "SELECT item_key, shown, updated_by, updated_at_utc FROM platform_ops.performance_settings")).mappings()}
-    return {"items": [
-        {**item, "shown": bool(rows[item["key"]]["shown"]) if item["key"] in rows else True,
-         "updatedAtUtc": rows[item["key"]]["updated_at_utc"].isoformat() if item["key"] in rows else None}
+    rows = {str(r["item_key"]): bool(r["shown"]) for r in connection.execute(text(
+        "SELECT item_key, shown FROM platform_ops.performance_settings")).mappings()}
+    return {"roles": list(SETTING_ROLES), "items": [
+        {**item, "shown": {role: rows.get(f"{role}:{item['key']}", True) for role in SETTING_ROLES}}
         for item in SETTING_ITEMS]}
 
 
@@ -598,8 +708,9 @@ def set_performance_settings(
     admin: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
-    """Show or hide items of the Performance view, for every Project. Takes effect at once."""
-    known = {item["key"] for item in SETTING_ITEMS}
+    """Show or hide an item of the Performance view for a role ("TL:pending": false), for every
+    Project. Takes effect at once."""
+    known = {f"{role}:{item['key']}" for role in SETTING_ROLES for item in SETTING_ITEMS}
     unknown = sorted(set(command.shown) - known)
     if unknown:
         raise HTTPException(status_code=422, detail=f"Unknown item: {', '.join(unknown)}.")
