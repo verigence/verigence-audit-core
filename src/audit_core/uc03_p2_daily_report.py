@@ -62,7 +62,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import Connection, text
@@ -190,6 +190,53 @@ def _add(total: dict[str, Any], part: dict[str, Any]) -> None:
         elif isinstance(value, int) and not isinstance(value, bool):
             total[key] += value
 
+
+
+def _pc_names(connection: Connection, *, tenant_id: str) -> dict[str, str]:
+    """A PC's name is what their app recorded when they started a journey."""
+    return dict(connection.execute(
+        text(
+            """
+            SELECT DISTINCT ON (created_by_actor_id) created_by_actor_id, created_by_display_name
+            FROM auditcore.journeys
+            WHERE tenant_id=:t AND created_by_actor_id IS NOT NULL AND created_by_display_name IS NOT NULL
+            ORDER BY created_by_actor_id, created_at_utc DESC
+            """
+        ),
+        {"t": tenant_id},
+    ).all())
+
+
+_WORK_NOTE = ("Work done counts what people did on tasks that day (comments, reviews, uploads, closing). The "
+              "system's own task updates are not work. Tasks closed = worked by that person and closed on the day. "
+              "A Team Lead's name is not stored with the task, so the account id shows unless a name is known.")
+_CLOSED_NOTE = ("Delivery files closed: journeys with a delivery upload whose mandatory delivery documents are in "
+                "(or whose 'Upload the ...' task the PC closed) and whose document tasks are all closed, counted on "
+                "the day the last of those closed (or the last delivery page was uploaded), under the journey's PC. "
+                "A task reopened later takes the file out until it closes again.")
+
+
+def build_daily_work_report(
+    connection: Connection, *, tenant_id: str, actor_id: str, day: date,
+) -> dict[str, Any]:
+    """Only the work done on tasks and the delivery files closed of one day (product owner 2026-11-13:
+    the Project Tracker keeps these two and leaves uploads, failures and task status to Performance).
+    Two statements and the names, instead of the whole report: no uploads, pages, files, failed pages,
+    task status or trend are read."""
+    timezone_name, start, end = _bounds(connection, tenant_id=tenant_id, day=day)
+    names = _pc_names(connection, tenant_id=tenant_id)
+    return {
+        "day": day.isoformat(),
+        "timezone": timezone_name,
+        "part": "work",
+        "teamWork": _team_work(connection, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end, names=names),
+        "deliveryFilesClosed": delivery_files_closed(
+            connection, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end, names=names,
+        ),
+        "pcs": [],
+        "journeys": [],
+        "notes": [_WORK_NOTE, _CLOSED_NOTE],
+    }
 
 def build_daily_processing_report(
     connection: Connection, *, tenant_id: str, actor_id: str, day: date,
@@ -330,18 +377,7 @@ def build_daily_processing_report(
             {"t": tenant_id, "ids": list(journey_ids)},
         ).mappings()
     } if journey_ids else {}
-    # A PC's name is what their app recorded when they started a journey.
-    names = dict(connection.execute(
-        text(
-            """
-            SELECT DISTINCT ON (created_by_actor_id) created_by_actor_id, created_by_display_name
-            FROM auditcore.journeys
-            WHERE tenant_id=:t AND created_by_actor_id IS NOT NULL AND created_by_display_name IS NOT NULL
-            ORDER BY created_by_actor_id, created_at_utc DESC
-            """
-        ),
-        {"t": tenant_id},
-    ).all())
+    names = _pc_names(connection, tenant_id=tenant_id)
 
     from audit_core.uc03_reviewer_closure import closure_states
 
@@ -563,14 +599,9 @@ def build_daily_processing_report(
              "(the PC is told to upload again); duplicate files are dropped on arrival."),
             (f"Large uploads: a file of more than {LARGE_UPLOAD_PAGES} pages gets the PC a notice to review it and "
              "confirm the pages are needed. Nothing is blocked; the PC closes the notice with a comment, shown here."),
-            ("Work done counts what people did on tasks that day (comments, reviews, uploads, closing). The "
-             "system's own task updates are not work. Tasks closed = worked by that person and closed on the day. "
-             "A Team Lead's name is not stored with the task, so the account id shows unless a name is known."),
+            _WORK_NOTE,
             "File links open the original as uploaded and are valid 30 minutes from when the report was loaded.",
-            ("Delivery files closed: journeys with a delivery upload whose mandatory delivery documents are in "
-             "(or whose 'Upload the ...' task the PC closed) and whose document tasks are all closed, counted on "
-             "the day the last of those closed (or the last delivery page was uploaded), under the journey's PC. "
-             "A task reopened later takes the file out until it closes again."),
+            _CLOSED_NOTE,
         ],
     }
 
@@ -1189,6 +1220,7 @@ def get_daily_processing_report(
     ],
     connection: Annotated[Connection, Depends(get_connection)],
     day: Annotated[date | None, Query()] = None,
+    part: Annotated[Literal["all", "work"], Query()] = "all",
 ) -> dict[str, Any]:
     access = authorize_p2(
         connection,
@@ -1210,6 +1242,9 @@ def get_daily_processing_report(
         day = connection.execute(
             text("SELECT (now() AT TIME ZONE :tz)::date"), {"tz": timezone_name},
         ).scalar_one()
+    if part == "work":
+        # The Project Tracker's "Work done and files closed" tab (2026-11-13): only those two sections.
+        return build_daily_work_report(connection, tenant_id=tenant_id, actor_id=human_principal.subject, day=day)
     return build_daily_processing_report(connection, tenant_id=tenant_id, actor_id=human_principal.subject, day=day)
 
 

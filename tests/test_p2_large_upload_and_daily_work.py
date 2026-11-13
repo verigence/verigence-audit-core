@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+from datetime import date
 from uuid import uuid4
 
 import pytest
@@ -30,7 +31,10 @@ from audit_core.dependencies import get_human_principal
 from audit_core.main import app
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import get_security_authorization_client
-from audit_core.uc03_p2_daily_report import build_daily_processing_report
+from audit_core.uc03_p2_daily_report import (
+    build_daily_processing_report,
+    build_daily_work_report,
+)
 from audit_core.uc03_p2_runtime import LARGE_UPLOAD_PAGES
 from audit_core.uc03_p2_stage import _open_tasks_for
 from audit_core.uc03_p2_task_producer import (
@@ -304,6 +308,34 @@ def test_work_done_counts_what_each_person_did_and_ignores_the_system(journey):
     assert lead["tasksWorked"] == 1 and lead["tasksClosed"] == 1 and lead["name"] is None
     assert not [p for p in work["people"] if p["actorId"].upper() == "SYSTEM"]
     assert work["totals"] == {"people": 2, "tasksWorked": 3, "actions": 4, "tasksClosed": 2}
+
+
+def test_the_work_part_has_only_work_done_and_files_closed_the_same_as_the_full_report(journey):
+    """The Project Tracker's tab reads ?part=work (2026-11-13): the same two sections, nothing else."""
+    tl = _tl(journey)
+    task = _task_row(journey, "Only")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        record_task_event(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id, task_id=task,
+                          event_type="ADD_COMMENT", actor_id=journey.actor_id, actor_role_code="PC", comment="Done")
+    full = _report(journey, tl)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        work = build_daily_work_report(connection, tenant_id=journey.tenant_id, actor_id=tl, day=date.fromisoformat(full["day"]))
+    assert work["teamWork"] == full["teamWork"]
+    assert work["deliveryFilesClosed"] == full["deliveryFilesClosed"]
+    assert work["part"] == "work" and work["pcs"] == [] and work["journeys"] == []
+    assert not {"taskStatus", "files", "documentStatus", "trend", "failedPages"} & work.keys()
+
+    app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=tl)
+    app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization()
+    response = TestClient(app, raise_server_exceptions=False).get(
+        f"/p2/v1/tenants/{journey.tenant_id}/reports/daily-processing?day={full['day']}&part=work")
+    assert response.status_code == 200, response.text
+    assert response.json()["part"] == "work" and "taskStatus" not in response.json()
+    bad = TestClient(app, raise_server_exceptions=False).get(
+        f"/p2/v1/tenants/{journey.tenant_id}/reports/daily-processing?part=everything")
+    assert bad.status_code == 400
 
 
 # ------------------------------------------------------------------------- fresh file link
