@@ -1,4 +1,4 @@
-"""0219_performance_indexes -- day-window reads of uploads and task events.
+"""0220_performance_indexes -- day-window reads of uploads and task events.
 
 Product owner, 13 Nov 2026: "make sure that the DB queries are well optimized, don't
 cause cost overheads". The Project Tracker and the Performance view read the uploads and
@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0219_performance_indexes"
-down_revision = "0218_job_schedules"
+revision = "0220_performance_indexes"
+down_revision = "0219_list_query_indexes"
 branch_labels = None
 depends_on = None
 
