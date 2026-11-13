@@ -295,68 +295,6 @@ def tasks(connection: Connection, *, tenant_id: str, start: datetime, end: datet
 
 
 
-# The lines of a person's daily report that come from what they did on tasks.
-_REPORT_EVENTS = {"CONFIRM_BREACH": "breach", "MARK_FALSE_POSITIVE": "noBreach", "REJECT": "sentBack",
-                  "REJECT_CORRECTION": "sentBack", "REQUEST_CLARIFICATION": "sentBack"}
-
-
-def report(connection: Connection, *, tenant_id: str, start: datetime, end: datetime, tz: str) -> dict[str, Any]:
-    """Per person and day, for the daily report (product owner 13 Nov 2026, from a Team Lead's own
-    daily reporting): booking and delivery files updated, breach / no breach / sent back, payments
-    verified, and the Task Manager tasks they completed (their titles: the "other" work)."""
-    counts: dict[str, dict[str, dict[str, int]]] = defaultdict(lambda: defaultdict(dict))
-    other: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
-
-    def put(person: Any, day: Any, key: str, n: int) -> None:
-        if person and n:
-            cell = counts[str(person)][key]
-            cell[day.isoformat()] = cell.get(day.isoformat(), 0) + int(n)
-
-    params = {"t": tenant_id, "s": start, "e": end, "tz": tz}
-    for r in connection.execute(text("""
-        SELECT x.person, x.day, count(*) FILTER (WHERE x.delivery) AS deliveries,
-               count(*) FILTER (WHERE NOT x.delivery) AS bookings
-        FROM (
-          SELECT ub.uploaded_by_actor_id AS person, ub.journey_id, (ub.created_at_utc AT TIME ZONE :tz)::date AS day,
-                 COALESCE(bool_or(q.business_stage = 'DELIVERY'), false) AS delivery
-          FROM auditcore.p2_upload_batches ub
-          LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id = ub.tenant_id AND q.batch_id = ub.batch_id
-          WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
-            AND ub.batch_status <> 'AWAITING_UPLOAD'
-            AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
-          GROUP BY 1, 2, 3
-        ) x GROUP BY 1, 2
-    """), params).mappings():
-        put(r["person"], r["day"], "bookingFiles", r["bookings"])
-        put(r["person"], r["day"], "deliveryFiles", r["deliveries"])
-    for r in connection.execute(text("""
-        SELECT actor_id AS person, (created_at_utc AT TIME ZONE :tz)::date AS day, event_type, count(*) AS n
-        FROM auditcore.p2_task_events
-        WHERE tenant_id = :t AND created_at_utc >= :s AND created_at_utc < :e AND actor_id IS NOT NULL
-          AND event_type = ANY(:events)
-        GROUP BY 1, 2, 3
-    """), {**params, "events": sorted(_REPORT_EVENTS)}).mappings():
-        put(r["person"], r["day"], _REPORT_EVENTS[r["event_type"]], r["n"])
-    for r in connection.execute(text("""
-        SELECT verified_by_actor_id AS person, (occurred_at_utc AT TIME ZONE :tz)::date AS day, count(*) AS n
-        FROM auditcore.payment_verification_events
-        WHERE tenant_id = :t AND occurred_at_utc >= :s AND occurred_at_utc < :e
-          AND upper(COALESCE(verified_by_role_code, '')) <> 'SYSTEM'
-        GROUP BY 1, 2
-    """), params).mappings():
-        put(r["person"], r["day"], "paymentsVerified", r["n"])
-    for r in connection.execute(text("""
-        SELECT t.completed_by_actor_id AS person, (t.action_completed_at_utc AT TIME ZONE :tz)::date AS day, t.title
-        FROM auditcore.p2_tasks t
-        WHERE t.tenant_id = :t AND t.scope_kind <> 'JOURNEY' AND t.completed_by_actor_id IS NOT NULL
-          AND t.action_completed_at_utc >= :s AND t.action_completed_at_utc < :e
-        ORDER BY t.action_completed_at_utc
-        LIMIT 2000
-    """), params).mappings():
-        other[str(r["person"])][r["day"].isoformat()].append(str(r["title"]))
-    return {"counts": counts, "other": other}
-
-
 
 CHANNELS = ("direct", "bulk", "drive")
 

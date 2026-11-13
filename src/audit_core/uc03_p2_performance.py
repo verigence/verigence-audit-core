@@ -136,7 +136,6 @@ SECTIONS: tuple[dict[str, str], ...] = (
     {"key": "trend", "label": "Day to day, week to week"},
     {"key": "efficiency", "label": "PC efficiency"},
     {"key": DUTIES_ITEM, "label": "Delinquencies (daily and weekly duties)"},
-    {"key": "report", "label": "Daily report"},
 )
 SETTING_ITEMS: tuple[dict[str, str], ...] = (
     *({"key": x["key"], "label": x["label"], "group": "SECTION"} for x in SECTIONS),
@@ -482,26 +481,6 @@ def _sections(part: Any, data: dict[str, Any], *, rows: list[dict[str, Any]], ou
 
     if wanted(DUTIES_ITEM):
         out["delinquency"] = {"lines": [line for a in visible for line in duty_lines(a)]}
-
-    if wanted("report"):
-        rep = part("report")
-
-        def total(actor: str, key: str, source: dict[str, Any]) -> int:
-            return int(sum(source.get(actor, {}).get(key, {}).get(d, 0) for d in iso))
-
-        out["report"] = {"people": [
-            {"actorId": a, "name": names[a], "role": people[a]["role"],
-             "bookingFiles": total(a, "bookingFiles", rep["counts"]),
-             "deliveryFiles": total(a, "deliveryFiles", rep["counts"]),
-             "filesReviewed": total(a, "reviews", values), "journeysClosed": total(a, "journeysClosed", values),
-             "sentBack": total(a, "sentBack", rep["counts"]), "breach": total(a, "breach", rep["counts"]),
-             "noBreach": total(a, "noBreach", rep["counts"]),
-             "paymentsVerified": total(a, "paymentsVerified", rep["counts"]),
-             "tasksClosed": total(a, "tasksClosed", values),
-             "duties": [{"scheduleId": x["scheduleId"], "due": x["due"], "done": x["onTime"] + x["late"],
-                         "missed": x["notDone"]} for x in duty_lines(a)] if DUTIES_ITEM not in hidden else [],
-             "other": [t for d in iso for t in rep["other"].get(a, {}).get(d, [])][:40]}
-            for a in visible]}
     return out
 
 
@@ -515,7 +494,7 @@ def _caller_roles(connection: Connection, tenant_id: str, actor_id: str) -> list
 
 def _part(connection: Connection, name: str, *, tenant_id: str, first: date, last: date, tz: str, now: datetime,
           use_cache: bool) -> Any:
-    """One part of the insights (backlog, efficiency, flow, tasks, report), read only when a
+    """One part of the insights (backlog, efficiency, flow, tasks, channels, quality), read only when a
     section that needs it is asked for, and kept two minutes like the rest (product owner 13 Nov
     2026: "so many in one screen will kill the CPU and RAM, I don't want all to be shown in one")."""
     from audit_core import uc03_p2_team_insights as insights
@@ -539,10 +518,8 @@ def _part(connection: Connection, name: str, *, tenant_id: str, first: date, las
         data = insights.tasks(connection, tenant_id=tenant_id, start=start, end=end, tz=tz)
     elif name == "quality":
         data = insights.quality(connection, tenant_id=tenant_id, start=start, end=end)
-    elif name == "channels":
-        data = insights.channels(connection, tenant_id=tenant_id, start=start, end=end, tz=tz)
     else:
-        data = insights.report(connection, tenant_id=tenant_id, start=start, end=end, tz=tz)
+        data = insights.channels(connection, tenant_id=tenant_id, start=start, end=end, tz=tz)
     if use_cache:
         with _cache_lock:
             _cache[key] = (_time.monotonic(), data)
@@ -773,7 +750,7 @@ def get_performance(
     day: Annotated[date | None, Query(alias="date")] = None,
     days: Annotated[int, Query(ge=MIN_DAYS, le=MAX_DAYS)] = DEFAULT_DAYS,
     first: Annotated[date | None, Query(alias="from")] = None,
-    section: Annotated[str | None, Query(pattern=r"^(pending|flow|uploads|quality|tasks|trend|efficiency|duties|report)$")] = None,
+    section: Annotated[str | None, Query(pattern=r"^(pending|flow|uploads|quality|tasks|trend|efficiency|duties)$")] = None,
 ) -> dict[str, Any]:
     access = authorize_p2(
         connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,

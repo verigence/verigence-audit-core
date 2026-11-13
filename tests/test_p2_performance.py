@@ -172,7 +172,7 @@ def test_a_super_admin_chooses_what_each_role_sees(setup):
         for_tl, for_pm = _build(s, tl), _build(s, pm)
         assert "activeMinutes" not in [m["key"] for m in for_tl["measures"]]
         assert "efficiency" not in for_tl and "pending" not in for_tl
-        assert [x["key"] for x in for_tl["sections"]] == ["flow", "uploads", "quality", "tasks", "trend", "duties", "report"]
+        assert [x["key"] for x in for_tl["sections"]] == ["flow", "uploads", "quality", "tasks", "trend", "duties"]
         assert "activeMinutes" in [m["key"] for m in for_pm["measures"]]
         assert "efficiency" in for_pm and "pending" in for_pm
         mine = next(p for p in for_tl["people"] if p["actorId"] == s.journey.actor_id)
@@ -256,7 +256,7 @@ def test_pending_work_efficiency_delinquencies_and_bookings_deliveries(setup):
     tt._role(s, tl, "TL")
     report = _build(s, tl)
     assert [x["key"] for x in report["sections"]] == ["pending", "flow", "uploads", "quality", "tasks", "trend",
-                                                      "efficiency", "duties", "report"]
+                                                      "efficiency", "duties"]
 
     pending = next(p for p in report["pending"]["people"] if p["actorId"] == me)["counts"]
     assert pending["deliveryFilesOpen"][2] == 1                       # the one uploaded five days ago
@@ -278,14 +278,9 @@ def test_pending_work_efficiency_delinquencies_and_bookings_deliveries(setup):
     mine = next(p for p in report["tasks"]["people"] if p["actorId"] == me)
     assert sum(mine["raised"]) >= 2 and mine["open"] >= 1 and mine["overdue"] >= 1
 
-    # The daily report of a person: what they did in the period, line by line.
-    line = next(p for p in report["report"]["people"] if p["actorId"] == me)
-    assert line["bookingFiles"] >= 1 and line["deliveryFiles"] >= 1
-    assert line["duties"] and line["duties"][0]["missed"] == 1
-
     # Only the tab that is open is read and sent.
     only = _build(s, tl, section="tasks")
-    assert "tasks" in only and "pending" not in only and "report" not in only and "flow" not in only
+    assert "tasks" in only and "pending" not in only and "flow" not in only
 
     # A PC's own view: their own pending work and delinquencies, no outlets.
     own = _build(s, me, own=True)
