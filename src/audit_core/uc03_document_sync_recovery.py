@@ -28,6 +28,7 @@ from uuid import UUID
 import structlog
 from sqlalchemy import Connection, Engine, text
 
+from audit_core import sleep_window
 from audit_core.db import set_tenant_context
 from audit_core.telemetry import record_metric
 from audit_core.workflow_stale_task_recovery import _active_tenant_ids
@@ -212,6 +213,8 @@ async def run_document_sync_recovery_loop(
     """
     while True:
         await asyncio.sleep(interval_seconds)
+        if sleep_window.asleep():  # the night's sleep: nothing was started that could go stale
+            continue
         try:
             await recover_stale_document_syncs_for_all_tenants(engine)
         except Exception:

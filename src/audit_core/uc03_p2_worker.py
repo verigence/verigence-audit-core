@@ -50,6 +50,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError
 from sqlalchemy import Connection, Engine, text
 
+from audit_core import sleep_window
 from audit_core import uc03_p2_runtime as _runtime
 from audit_core.config import SettingsError, load_settings
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
@@ -4647,9 +4648,126 @@ def release_inflight_leases(engine: Engine, items: list[WorkItem] | None = None)
     return released
 
 
+# ── the night's sleep (product owner 2026-11-13, audit_core.sleep_window) ────
+# Inside the window the worker stops asking the database for work every second,
+# so the database can stop and is not billed. It never leaves work undone:
+#
+#   * it sleeps only after a look found nothing to do -- no work waiting or
+#     running and no page still being read (a Drive run that started at 9 pm
+#     and is not through at 12:30 is finished first);
+#   * the night's own runs -- nightly review, day-end sweep, data archive --
+#     are due by the clock, checked without the database; when one is due the
+#     worker is up, runs it and what it queued, and sleeps again;
+#   * work whose retry falls inside the window is woken for at its time;
+#   * once every _NIGHT_LOOK_SECONDS it is up for a short pass anyway (the
+#     sweeps and the side loops each run once) and looks again: that is the
+#     longest a file uploaded at night by someone allowed in waits to start.
+_NIGHT_LOOK_SECONDS = float(os.environ.get("P2_NIGHT_LOOK_MINUTES", "60")) * 60
+_NIGHT_UP_SECONDS = 20.0  # one pass of every loop, each time the worker is up
+_NIGHT_BUSY_LOOK_SECONDS = 5.0  # with pages still being read: look again this often
+_NIGHT_NAP_SECONDS = 5.0  # how often a sleeping loop checks the clock (no database)
+_known_tenants: list[str] = []
+_night: dict[str, float] = {"rest_until": 0.0, "up_until": 0.0, "looked_at": 0.0}
+
+
+def _scheduled_run_due() -> bool:
+    """Whether one of the night's own runs is due for a known Project -- by the
+    clock and what this process already ran, never the database."""
+    return any(
+        _nightly_review_due(tenant_id) or _dayend_sweep_due(tenant_id) or _data_archive_due(tenant_id)
+        for tenant_id in _known_tenants
+    )
+
+
+def _night_work_due_in(engine: Engine) -> float | None:
+    """Seconds until there is something to do: 0 when work is waiting or
+    running or a page is still being read, the wait for the earliest retry
+    otherwise, None when there is nothing at all."""
+    soonest: float | None = None
+    tenants = _active_tenants(engine)
+    _known_tenants[:] = tenants
+    for tenant_id in tenants:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            row = connection.execute(
+                text(
+                    """
+                    SELECT
+                      EXISTS (SELECT 1 FROM auditcore.p2_document_queue
+                              WHERE tenant_id=:tenant_id AND queue_status = ANY(:reading)) AS reading,
+                      (SELECT min(CASE WHEN work_status IN ('CLAIMED','PROCESSING') THEN 0
+                                       ELSE GREATEST(0, EXTRACT(EPOCH FROM
+                                              COALESCE(next_attempt_at_utc, now()) - now())) END)
+                       FROM auditcore.p2_work_queue
+                       WHERE tenant_id=:tenant_id
+                         AND work_status IN ('PENDING','RETRY_WAIT','CLAIMED','PROCESSING')) AS due_in
+                    """
+                ),
+                {"tenant_id": tenant_id, "reading": list(_PAGE_ACTIVE_STATES)},
+            ).mappings().one()
+        if row["reading"]:
+            return 0.0
+        if row["due_in"] is not None:
+            soonest = float(row["due_in"]) if soonest is None else min(soonest, float(row["due_in"]))
+            if soonest <= 0:
+                return 0.0
+    return soonest
+
+
+def _night_rest(engine: Engine, stop: threading.Event) -> bool:
+    """Called with nothing in hand. True when this turn of the loop was spent
+    asleep (the caller asks the database nothing); False when the worker is to
+    carry on as by day."""
+    if not sleep_window.in_window():
+        if _night["rest_until"] or _night["up_until"] or _night["looked_at"]:
+            _night.update(rest_until=0.0, up_until=0.0, looked_at=0.0)
+            sleep_window.keep_awake(False)
+            logger.info("p2_worker_night_over", worker_id=_WORKER_ID)
+        return False
+    now = time.monotonic()
+    if _scheduled_run_due():
+        _night.update(rest_until=0.0, up_until=now + _NIGHT_UP_SECONDS)
+    if now < _night["rest_until"]:
+        stop.wait(max(0.05, min(_NIGHT_NAP_SECONDS, _night["rest_until"] - now, sleep_window.seconds_until_wake())))
+        return True
+    if _night["rest_until"]:  # a rest just ended: up for one pass before looking again
+        _night.update(rest_until=0.0, up_until=now + _NIGHT_UP_SECONDS)
+    if now < _night["up_until"]:
+        sleep_window.keep_awake(True)
+        return False
+    if _night["looked_at"] and now - _night["looked_at"] < _NIGHT_BUSY_LOOK_SECONDS:
+        return False
+    _night["looked_at"] = now
+    try:
+        due_in = _night_work_due_in(engine)
+    except Exception as exc:  # noqa: BLE001 - not knowing is a reason to stay up, never to sleep
+        logger.warning("p2_worker_night_look_failed", **exception_summary(exc))
+        return False
+    if due_in is not None and due_in <= 0:
+        sleep_window.keep_awake(True)
+        return False
+    rest = min(_NIGHT_LOOK_SECONDS, due_in) if due_in is not None else _NIGHT_LOOK_SECONDS
+    _night["rest_until"] = now + max(rest, 1.0)
+    sleep_window.keep_awake(False)
+    logger.info("p2_worker_asleep", worker_id=_WORKER_ID, next_look_in_seconds=round(rest),
+                window_ends_in_seconds=round(sleep_window.seconds_until_wake()))
+    return True
+
+
+def _asleep_nap() -> bool:
+    """For the loops beside the main one: True after a short wait when the
+    worker is asleep (the loop skips its turn), False when it should run."""
+    if not sleep_window.asleep():
+        return False
+    _stopping.wait(_NIGHT_NAP_SECONDS)
+    return True
+
+
 def _claim_free_slots(engine: Engine, free: int) -> list[WorkItem]:
     claimed: list[WorkItem] = []
-    for tenant_id in _active_tenants(engine):
+    tenants = _active_tenants(engine)
+    _known_tenants[:] = tenants
+    for tenant_id in tenants:
         _maybe_sweep(engine, tenant_id)
         remaining = free - len(claimed)
         if remaining > 0 and not _stopping.is_set():
@@ -4674,6 +4792,8 @@ def run_forever(engine: Engine, *, stop: threading.Event | None = None, max_idle
     cycles = failed_cycles = idle = 0
     try:
         while not stop.is_set():
+            if not futures and _night_rest(engine, stop):
+                continue
             cycles += 1
             free = _WORKER_CONCURRENCY - len(futures)
             claimed: list[WorkItem] = []
@@ -5249,6 +5369,8 @@ def _watch_worker_jobs(engine: Engine) -> None:
     """One-off jobs requested as rows of p2_worker_jobs (2026-10-27), so a job
     never needs a restart of the worker."""
     while not _stopping.is_set():
+        if _asleep_nap():
+            continue
         try:
             for job in claim_worker_jobs(engine):
                 threading.Thread(target=_run_job, args=(engine, job), name=f"job-{job['job_kind'].lower()}",
@@ -5268,6 +5390,8 @@ def _build_journey_exports(engine: Engine) -> None:
     from audit_core.uc03_p2_journey_export import run_pending_exports
 
     while not _stopping.is_set():
+        if _asleep_nap():
+            continue
         try:
             run_pending_exports(engine, _active_tenants(engine), _WORKER_ID)
         except Exception:  # e.g. the table not migrated yet; try again later
@@ -5286,6 +5410,8 @@ def _refresh_names_every(engine: Engine) -> None:
     from audit_core.people_names import refresh_people_names
 
     while not _stopping.is_set():
+        if _asleep_nap():
+            continue
         refresh_people_names(engine)
         end_leaver_roles_quietly(engine)
         _stopping.wait(_NAMES_REFRESH_SECONDS)
@@ -5300,6 +5426,8 @@ def _settle_reread_corrections_every(engine: Engine) -> None:
     from audit_core.uc03_reread_corrections import settle
 
     while not _stopping.is_set():
+        if _asleep_nap():
+            continue
         try:
             settle(engine, _active_tenants(engine))
         except Exception:  # e.g. the table not migrated yet; try again later
@@ -5321,6 +5449,8 @@ def _sweep_cost_sheet_statements_every(engine: Engine) -> None:
 
     _stopping.wait(300)  # let the worker settle after a start
     while not _stopping.is_set():
+        if _asleep_nap():
+            continue
         for tenant_id in _active_tenants(engine):
             try:
                 run_cost_sheet_statements(engine, f"{tenant_id}:hourly-sweep-commit", [])
@@ -5341,6 +5471,8 @@ def _drive_every(engine: Engine) -> None:
 
     _stopping.wait(120)  # let the worker settle after a start
     while not _stopping.is_set():
+        if _asleep_nap():
+            continue
         try:
             drive_round(engine, _active_tenants(engine), worker_id=_WORKER_ID)
         except Exception:  # e.g. the tables not migrated yet; try again later

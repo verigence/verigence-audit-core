@@ -32,6 +32,8 @@ from uuid import uuid4
 import structlog
 from sqlalchemy import Engine, text
 
+from audit_core import sleep_window
+
 logger = structlog.get_logger(__name__)
 
 SAMPLE_SECONDS = 5.0
@@ -338,6 +340,11 @@ def _safe(action: str, fn, *args, **kwargs) -> None:  # type: ignore[no-untyped-
 
 
 def _tick(engine: Engine, default_service: str, n: int, *, api: bool) -> None:
+    # Asleep (audit_core.sleep_window): no beat and no samples, so the database
+    # is left alone; System Health reads a service last heard from as the
+    # window opened as running (sleep_window.alive_cutoff).
+    if sleep_window.asleep():
+        return
     _safe("sample", sample_resources)
     if n % BEAT_EVERY_SAMPLES:
         return

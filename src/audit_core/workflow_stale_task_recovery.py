@@ -21,6 +21,7 @@ import asyncio
 import structlog
 from sqlalchemy import Engine, text
 
+from audit_core import sleep_window
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
 from audit_core.workflow import recover_stale_worker_tasks
 
@@ -97,6 +98,8 @@ async def run_stale_worker_task_recovery_loop(
 
     while True:
         await asyncio.sleep(interval_seconds)
+        if sleep_window.asleep():  # the night's sleep: nothing was started that could go stale
+            continue
         try:
             await asyncio.to_thread(recover_stale_worker_tasks_for_all_tenants, engine)
         except Exception:
