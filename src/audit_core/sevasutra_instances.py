@@ -10,7 +10,7 @@ keeps for Project Administration to show.
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
 
 import structlog
@@ -174,6 +174,8 @@ def put_instance(
         if "ux_sevasutra_instances_subdomain" in str(exc.orig):
             raise ConflictError(error_code="VAC-SEVA-003", title="Address in use", detail=f"{subdomain}.sevasutra.jbrconsulting.in is already used by another Project.") from exc
         raise
+    # A new or changed instance is read by SevaSutra within a minute, not at tomorrow's daily sync.
+    _ask_for_sync(admin_request.user_id)
     logger.info("sevasutra_instance_requested", tenant_id=tenant_id, subdomain=subdomain, attach=attach)
     return SevaSutraInstanceEnvelope(instance=_read(connection, tenant_id))
 
@@ -225,6 +227,52 @@ class SevaSutraReportBatch(BaseModel):
     instances: list[SevaSutraInstanceReport]
     # The dealerships no Project owns; replaces the last list. Absent: the list is left as it is.
     unlinked: list[SevaSutraFreeReport] | None = None
+
+
+# ── "Sync with SevaSutra" (product owner 2026-11-13) ────────────────────────
+# "SevaSutra doesnt need to sync every 5 minutes, it can be once in a day, or whenever change
+# happens lets have a sync button on project admin to sync data with sevasutra."
+#
+# SevaSutra read the Project feed every five minutes, day and night, so the database never
+# stopped. It now reads it once a day, at sign-in, and when a Super Admin presses Sync in Project
+# Administration. Pressing Sync only notes the time here; SevaSutra asks for that time once a
+# minute and reads the feed when it is newer than its last read. Asking costs nothing: the time
+# is kept in this process, no database is touched, so the night's sleep is not broken
+# (audit_core.sleep_window). SevaSutra refuses requests from other sites, and it calls Audit Core,
+# never the other way round; this keeps both as they are.
+#
+# Kept in memory on purpose: the API runs as one process, and a restart in the minute between a
+# press and SevaSutra's next question loses only that press (the person presses again).
+_sync_request: dict[str, str | None] = {"requestedAtUtc": None, "requestedBy": None}
+
+
+def _ask_for_sync(requested_by: str | None) -> None:
+    _sync_request.update(requestedAtUtc=datetime.now(UTC).isoformat(), requestedBy=requested_by)
+    logger.info("sevasutra_sync_requested", requested_by=requested_by)
+
+
+class SevaSutraSyncRequest(BaseModel):
+    requestedAtUtc: str | None
+    requestedBy: str | None = None
+
+
+@router.post("/v1/sevasutra/sync-request", response_model=SevaSutraSyncRequest)
+def request_sync(
+    admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+) -> SevaSutraSyncRequest:
+    """A Super Admin asks SevaSutra to read Project Administration now (within a minute)."""
+    _ask_for_sync(admin_request.user_id)
+    return SevaSutraSyncRequest(**_sync_request)
+
+
+@router.get("/v1/service/sevasutra/sync-request", response_model=SevaSutraSyncRequest)
+def sync_request(
+    principal: Annotated[ServiceIntegrationPrincipal, Depends(require_audit_service_principal)],
+) -> SevaSutraSyncRequest:
+    """When a sync was last asked for. SevaSutra's own question; no database is read."""
+    if principal.subject != _SEVASUTRA_SERVICE_SUBJECT:
+        raise AuditCoreError(error_code="VAC-SEVA-001", status_code=403, title="Not permitted", detail="This service identity may not read SevaSutra sync requests.")
+    return SevaSutraSyncRequest(requestedAtUtc=_sync_request["requestedAtUtc"])
 
 
 @router.post("/v1/service/sevasutra/instances")

@@ -86,7 +86,12 @@ def test_create_read_and_change_an_instance(projects):
     client = TestClient(app)
     assert client.get(f"/v1/tenants/{service}/sevasutra-instance", headers=H).json() == {"instance": None}
     sub = f"a{suffix}"
+    from audit_core import sevasutra_instances as _instances
+
+    _instances._sync_request.update(requestedAtUtc=None, requestedBy=None)
     r = client.put(f"/v1/tenants/{service}/sevasutra-instance", json={"dealershipName": " Aditya Motors ", "subdomain": sub.upper()}, headers=H)
+    # SevaSutra is asked to read at once: a new instance does not wait for tomorrow's daily sync.
+    assert r.status_code == 200 and _instances._sync_request["requestedAtUtc"]
     assert r.status_code == 200, r.text
     inst = r.json()["instance"]
     assert (inst["dealershipName"], inst["subdomain"], inst["status"]) == ("Aditya Motors", sub, "REQUESTED")
@@ -191,3 +196,37 @@ def test_attach_an_existing_sevasutra_dealership(projects):
     assert feed[service].instance.dealerCode == demo
     with engine.begin() as c:
         c.execute(text("DELETE FROM auditcore.sevasutra_free_dealerships WHERE dealer_code = :c"), {"c": demo})
+
+
+
+# ── "Sync with SevaSutra" (product owner 2026-11-13) ────────────────────────
+
+def test_a_super_admin_asks_for_a_sync_and_sevasutra_reads_when_it_was_asked(monkeypatch):
+    from audit_core import sevasutra_instances
+    from audit_core.dependencies import get_engine, require_super_admin_request
+
+    def no_database():
+        raise AssertionError("the sync request must not touch the database")
+
+    monkeypatch.setattr(sevasutra_instances, "_sync_request", {"requestedAtUtc": None, "requestedBy": None})
+    app.dependency_overrides[get_engine] = no_database
+    client = TestClient(app, raise_server_exceptions=False)
+
+    _service("sevasutra")
+    assert client.get("/v1/service/sevasutra/sync-request").json() == {"requestedAtUtc": None, "requestedBy": None}
+
+    app.dependency_overrides[require_super_admin_request] = lambda: HumanAdminRequest(
+        user_id="sa-1", bearer_token="t",
+        admin_context=SecurityAdminContext(user_id="sa-1", is_super_admin=True, admin_scopes=()))
+    pressed = client.post("/v1/sevasutra/sync-request")
+    assert pressed.status_code == 200, pressed.text
+    at = pressed.json()["requestedAtUtc"]
+    assert at and pressed.json()["requestedBy"] == "sa-1"
+
+    asked = client.get("/v1/service/sevasutra/sync-request").json()
+    assert asked == {"requestedAtUtc": at, "requestedBy": None}  # SevaSutra is told when, not who
+
+    _service("someone-else")
+    assert client.get("/v1/service/sevasutra/sync-request").status_code == 403
+    app.dependency_overrides.pop(require_super_admin_request, None)
+    assert client.post("/v1/sevasutra/sync-request").status_code in (401, 403)
