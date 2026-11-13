@@ -145,7 +145,9 @@ PAYMENT_COLUMNS = ("Total Amt To Be Received", "Total Amt Received", "Payment Va
 # a journey's Booking Date came from (product owner 2026-11-07); the insurance
 # policy number, the policy's add-on covers and the accessories taken over the
 # standard kit (product owner 2026-11-11).
-NOTE_COLUMNS = ("Booking Date Source", "Insurance Policy No", "Insurance Add-ons", "Accessories Add-on")
+NOTE_COLUMNS = ("Booking Date Source", "Insurance Policy No", "Insurance Add-ons", "Accessories Add-on",
+                # whether the dealer's DMS booking / delivery dump has the journey (product owner 2026-11-13)
+                "DMS Booking Synced", "DMS Delivery Synced")
 # The accessories lines of the Deal (the standard kit and what is billed on it).
 _ACCESSORY_KEYS = frozenset({"accessories_cost", "essential_kit_amount", "genuine_accessories_amount",
                              "non_genuine_accessories_amount"})
@@ -254,6 +256,9 @@ def column_notes() -> list[tuple[str, str]]:
                                 "Amt To Be Received (blank when none). Elsewhere: accessories billed over the "
                                 "price master's standard accessories kit (0 when not more; blank when no "
                                 "accessories are billed)")),
+        ("DMS Booking Synced", "The day (IST) a DMS booking dump uploaded by a TL / Reviewer first had this "
+                               "journey; blank when no dump has it yet"),
+        ("DMS Delivery Synced", "The day (IST) a DMS delivery dump first had this journey; blank when none has"),
     ]
     return notes
 
@@ -518,6 +523,8 @@ def identity_row(base: dict[str, Any], *, deal: dict[str, Any], vehicle: dict[st
         "Booking Date Source": BOOKING_DATE_SOURCES.get(str(base.get("booking_date_source") or "")),
         "Insurance Policy No": policy.get("policyNumber"),
         "Insurance Add-ons": _add_on_text(policy.get("addOns")),
+        "DMS Booking Synced": base.get("dms_booking_synced"),
+        "DMS Delivery Synced": base.get("dms_delivery_synced"),
     }
 
 
@@ -611,13 +618,16 @@ base AS (
                 WHEN up.first_booking_upload_day IS NOT NULL THEN 'BOOKING_DOCS_UPLOADED'
                 ELSE 'JOURNEY_CREATED'
            END AS booking_date_source,
-           COALESCE(dv.actual_delivered_at::date, gp.delivery_date) AS delivery_day
+           COALESCE(dv.actual_delivered_at::date, gp.delivery_date) AS delivery_day,
+           CAST(sy.dms_booking_synced_at AT TIME ZONE 'Asia/Kolkata' AS date) AS dms_booking_synced,
+           CAST(sy.dms_delivery_synced_at AT TIME ZONE 'Asia/Kolkata' AS date) AS dms_delivery_synced
     FROM scoped j
     JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
     JOIN auditcore.dealer_outlets o ON o.tenant_id=j.tenant_id AND o.outlet_id=j.outlet_id
     LEFT JOIN auditcore.bookings b ON b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
     LEFT JOIN auditcore.deliveries dv ON dv.tenant_id=j.tenant_id AND dv.journey_id=j.journey_id
     LEFT JOIN first_booking_upload up ON up.journey_id=j.journey_id
+    LEFT JOIN auditcore.p2_journey_dms_sync sy ON sy.tenant_id=j.tenant_id AND sy.journey_id=j.journey_id
     LEFT JOIN LATERAL (
         SELECT CAST(f.effective_value #>> '{}' AS date) AS delivery_date
         FROM auditcore.journey_document_extracted_fields f

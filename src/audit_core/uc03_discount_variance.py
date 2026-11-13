@@ -102,7 +102,21 @@ def discount_variance_rows(view: dict[str, Any]) -> list[dict[str, Any]]:
 
 _REPORT_SQL = """
     SELECT j.journey_id, j.journey_reference,
-           COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
+           -- A customer created before its KYC was read carries a placeholder id as
+           -- its name (2026-11-13: rows showed "d9c67155-..."): never a name to show.
+           COALESCE(NULLIF(c.legal_name, ''),
+                    CASE WHEN c.display_name ~* '^[0-9a-f]{8}-[0-9a-f]{4}-' THEN NULL
+                         ELSE NULLIF(c.display_name, '') END,
+                    (SELECT NULLIF(btrim(f.effective_value #>> '{}'), '')
+                       FROM auditcore.journey_document_extracted_fields f
+                      WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+                        AND f.field_key = 'customer_name'
+                        AND f.source_document_type_key IN ('customer_kyc', 'booking_form', 'customer_ledger')
+                        AND jsonb_typeof(f.effective_value) = 'string'
+                      ORDER BY CASE f.source_document_type_key WHEN 'customer_kyc' THEN 0
+                                    WHEN 'booking_form' THEN 1 ELSE 2 END
+                      LIMIT 1),
+                    j.journey_reference) AS customer,
            j.created_by_display_name AS pc_name, o.outlet_name,
            j.dealer_id, d.dealer_name, j.outlet_id,
            -- For the date filter (2026-11-06): the booking's confirmation day
