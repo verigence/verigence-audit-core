@@ -421,3 +421,31 @@ def test_a_pc_reads_only_their_own_row(setup):
     # Their own failures list too.
     failed = s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/reports/failed-pages", params={"by": "uploaded"})
     assert failed.status_code == 200, failed.text
+
+
+def test_documents_reviewed_by_role_and_awaiting(setup):
+    s = setup
+    outlet = str(s.journey.outlet_id)
+    reviewer, tl = f"rv-{uuid4().hex[:6]}", f"tl-{uuid4().hex[:6]}"
+    _role(s, reviewer, "REVIEWER", dealer=s.journey.dealer_id, outlet=s.journey.outlet_id)
+    _role(s, tl, "TL")
+    journeys = [_journey(s, outlet, s.journey.actor_id) for _ in range(3)]
+    for j in journeys:
+        _exec(s, """
+            INSERT INTO auditcore.document_capture_v2_documents (tenant_id, journey_id, stage_code, di_document_id,
+              client_upload_id, capture_status, created_by_actor_id)
+            VALUES (:t, :j, 'BOOKING', :d, :c, 'CLASSIFIED', :a)
+        """, j=j, d=uuid4(), c=f"cap-{uuid4().hex}", a=s.journey.actor_id)
+    for j, who, role in ((journeys[0], reviewer, "REVIEWER"), (journeys[1], tl, "TL")):
+        _exec(s, """
+            INSERT INTO auditcore.p2_stage_document_reviews (tenant_id, journey_id, stage_code, reviewed_by_actor_id,
+              reviewed_by_role_code, reviewed_at_utc, document_count, dealer_id, outlet_id)
+            VALUES (:t, :j, 'BOOKING', :a, :r, now(), 1, :d, :o)
+        """, j=j, a=who, r=role, d=s.journey.dealer_id, o=s.journey.outlet_id)
+    report = _build(s, tl, "DAY", datetime.now(IST).date())
+    r = report["totals"]["reviews"]
+    assert (r["stagesReviewedByReviewer"], r["stagesReviewedByLead"], r["stagesAwaitingReview"]) == (1, 1, 1)
+    people = {p["actorId"]: p for p in _outlet(report, outlet)["people"]}
+    assert people[reviewer]["reviews"]["stagesReviewedByReviewer"] == 1
+    assert people[tl]["reviews"]["stagesReviewedByLead"] == 1
+    assert people[s.journey.actor_id]["reviews"]["stagesAwaitingReview"] == 1

@@ -177,7 +177,9 @@ def _blank() -> dict[str, Any]:
         "closed": {"deliveryFiles": 0, "reviewer": 0},
         "channels": {"directFiles": 0, "directPages": 0, "bulkFiles": 0, "bulkPages": 0, "driveFiles": 0,
                      "drivePages": 0},
-        "reviews": {"closedByReviewer": 0, "closedByLead": 0, "closedByOther": 0, "accepted": 0, "rejected": 0,
+        "reviews": {"stagesReviewedByReviewer": 0, "stagesReviewedByLead": 0, "stagesReviewedByOther": 0,
+                    "stagesAwaitingReview": 0,
+                    "closedByReviewer": 0, "closedByLead": 0, "closedByOther": 0, "accepted": 0, "rejected": 0,
                     "autoAccepted": 0, "awaitingDecision": 0, "awaitingReview": 0},
         "failures": {"files": set(), "pages": 0, "quality": 0, "notRead": 0, "readFailed": 0, "notUploaded": 0},
         "drive": {"files": 0, "documents": 0, "photos": 0, "taken": 0, "duplicates": 0, "setAside": 0, "failed": 0,
@@ -483,8 +485,16 @@ def _add_closed(connection: Connection, tree: _Tree, *, tenant_id: str, actor_id
 def _add_reviews(connection: Connection, tree: _Tree, *, tenant_id: str, actor_id: str, start: datetime,
                  end: datetime, now: datetime, wide: bool) -> None:
     """Reviews (product owner 2026-11-13: "how many reviews closed by Reviewer/TL/PM and how many
-    still open"). A review is a Reviewer's closure of a Journey (p2_journey_closures); the TL or PM
-    then accepts or rejects it (auto-accepted after 96 hours).
+    still open"), of two kinds.
+
+    The Booking and Delivery documents-reviewed marks (p2_stage_document_reviews, the Reviewer's
+    board; a TL or PM may give them too):
+    stagesReviewedByReviewer / ByLead / ByOther  marks given in the period, on the row of who gave them
+    stagesAwaitingReview  Booking or Delivery stages with documents uploaded by the end of the period
+                     and no mark by then, on the Journey's PC's row
+
+    A Reviewer's closure of a Journey (p2_journey_closures); the TL or PM then accepts or rejects it
+    (auto-accepted after 96 hours):
 
     closedByReviewer / closedByLead / closedByOther  closures in the period, by the closer's role,
                      on the closer's row
@@ -495,6 +505,36 @@ def _add_reviews(connection: Connection, tree: _Tree, *, tenant_id: str, actor_i
                      has closed (or whose closure was rejected), on the Journey's PC's row
     """
     cut = min(end, now)
+    stages = connection.execute(
+        text("""
+            WITH stages AS (
+              SELECT dc.journey_id, dc.stage_code, MIN(dc.created_at_utc) AS first_document
+              FROM auditcore.document_capture_v2_documents dc
+              WHERE dc.tenant_id = :t AND dc.stage_code IN ('BOOKING', 'DELIVERY')
+                AND dc.capture_status <> 'SUPERSEDED' AND dc.created_at_utc < :cut
+              GROUP BY dc.journey_id, dc.stage_code
+            )
+            SELECT s.journey_id, j.outlet_id, j.created_by_actor_id AS pc, r.reviewed_by_actor_id,
+                   upper(COALESCE(r.reviewed_by_role_code, '')) AS role, r.reviewed_at_utc
+            FROM stages s
+            JOIN auditcore.journeys j ON j.tenant_id = :t AND j.journey_id = s.journey_id
+            LEFT JOIN auditcore.p2_stage_document_reviews r
+              ON r.tenant_id = :t AND r.journey_id = s.journey_id AND r.stage_code = s.stage_code
+        """),
+        {"t": tenant_id, "cut": cut},
+    ).mappings().all()
+    for r in stages:
+        oid = str(r["outlet_id"])
+        if not tree.has_outlet(oid):
+            continue
+        at = r["reviewed_at_utc"]
+        if at is not None and start <= at < end:
+            key = {"Reviewer": "stagesReviewedByReviewer", "Lead": "stagesReviewedByLead"}.get(
+                _closer_key(r["role"]), "stagesReviewedByOther")
+            _bump(tree.nodes(oid, str(r["reviewed_by_actor_id"]) if r["reviewed_by_actor_id"] else None),
+                  "reviews", key)
+        if at is None or at >= cut:
+            _bump(tree.nodes(oid, r["pc"]), "reviews", "stagesAwaitingReview")
     rows = connection.execute(
         text("""
             SELECT c.journey_id, j.outlet_id, c.closed_by_actor_id, upper(COALESCE(c.closed_by_role, '')) AS role,
@@ -845,7 +885,10 @@ def build_project_tracker(
             ("How files came in: uploaded on their own (app or web), in a bulk (folder) upload, or through "
              "Google Drive; counted when uploaded, under the PC who uploaded them (a Drive file under the PC "
              "of its outlet)."),
-            ("Reviews: a Reviewer's closure of a Journey, counted on the closer's row when closed; accepted "
+            ("Documents reviewed: the Booking and Delivery documents-reviewed marks given in the period, on "
+             "the row of the Reviewer, TL or PM who gave them. Awaiting review: Booking or Delivery stages "
+             "with documents uploaded and no mark yet at the end of the period, on the Journey's PC's row."),
+            ("Journey closures: a Reviewer's closure of a Journey, counted on the closer's row when closed; accepted "
              "or rejected on the TL's or PM's row when decided (auto-accepted after 96 hours on the closer's "
              "row). Awaiting decision: closed and not yet accepted or rejected at the end of the period. "
              "Awaiting review: delivery files closed by then that no Reviewer has closed (or whose closure "
