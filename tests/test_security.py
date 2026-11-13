@@ -151,7 +151,7 @@ def test_security_token_rejects_invalid_signature() -> None:
 
 def test_security_token_rejects_expired_token() -> None:
     private_key = _private_key()
-    expired_at = datetime.now(UTC) - timedelta(seconds=1)
+    expired_at = datetime.now(UTC) - timedelta(seconds=120)
 
     with pytest.raises(SecurityTokenError):
         _validator(private_key).validate(_token(private_key, exp=expired_at))
@@ -199,3 +199,22 @@ def test_service_validation_rejects_embedded_tenant_authority() -> None:
                 permissions=["audit.journey.write"],
             )
         )
+
+
+def test_security_token_from_a_clock_running_ahead_is_accepted() -> None:
+    """HR, 12 Nov 2026: its host ran ~15 s behind Security, and a just-issued token was refused
+    as "not yet valid (iat)". Sixty seconds of clock difference are allowed."""
+    private_key = _private_key()
+    now = datetime.now(UTC)
+    token = _token(private_key, iat=now + timedelta(seconds=15), exp=now + timedelta(minutes=15))
+
+    _validator(private_key).validate(token)
+
+
+def test_security_token_issued_far_in_the_future_is_refused() -> None:
+    private_key = _private_key()
+    now = datetime.now(UTC)
+    token = _token(private_key, iat=now + timedelta(minutes=5), exp=now + timedelta(minutes=20))
+
+    with pytest.raises(SecurityTokenError):
+        _validator(private_key).validate(token)
