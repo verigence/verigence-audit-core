@@ -86,7 +86,12 @@ def test_create_read_and_change_an_instance(projects):
     client = TestClient(app)
     assert client.get(f"/v1/tenants/{service}/sevasutra-instance", headers=H).json() == {"instance": None}
     sub = f"a{suffix}"
+    from audit_core import sevasutra_instances as _instances
+
+    _instances._sync_request.update(requestedAtUtc=None, requestedBy=None)
     r = client.put(f"/v1/tenants/{service}/sevasutra-instance", json={"dealershipName": " Aditya Motors ", "subdomain": sub.upper()}, headers=H)
+    # SevaSutra is asked to read at once: a new instance does not wait for tomorrow's daily sync.
+    assert r.status_code == 200 and _instances._sync_request["requestedAtUtc"]
     assert r.status_code == 200, r.text
     inst = r.json()["instance"]
     assert (inst["dealershipName"], inst["subdomain"], inst["status"]) == ("Aditya Motors", sub, "REQUESTED")

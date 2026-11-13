@@ -174,6 +174,8 @@ def put_instance(
         if "ux_sevasutra_instances_subdomain" in str(exc.orig):
             raise ConflictError(error_code="VAC-SEVA-003", title="Address in use", detail=f"{subdomain}.sevasutra.jbrconsulting.in is already used by another Project.") from exc
         raise
+    # A new or changed instance is read by SevaSutra within a minute, not at tomorrow's daily sync.
+    _ask_for_sync(admin_request.user_id)
     logger.info("sevasutra_instance_requested", tenant_id=tenant_id, subdomain=subdomain, attach=attach)
     return SevaSutraInstanceEnvelope(instance=_read(connection, tenant_id))
 
@@ -244,6 +246,11 @@ class SevaSutraReportBatch(BaseModel):
 _sync_request: dict[str, str | None] = {"requestedAtUtc": None, "requestedBy": None}
 
 
+def _ask_for_sync(requested_by: str | None) -> None:
+    _sync_request.update(requestedAtUtc=datetime.now(UTC).isoformat(), requestedBy=requested_by)
+    logger.info("sevasutra_sync_requested", requested_by=requested_by)
+
+
 class SevaSutraSyncRequest(BaseModel):
     requestedAtUtc: str | None
     requestedBy: str | None = None
@@ -254,8 +261,7 @@ def request_sync(
     admin_request: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
 ) -> SevaSutraSyncRequest:
     """A Super Admin asks SevaSutra to read Project Administration now (within a minute)."""
-    _sync_request.update(requestedAtUtc=datetime.now(UTC).isoformat(), requestedBy=admin_request.user_id)
-    logger.info("sevasutra_sync_requested", requested_by=admin_request.user_id)
+    _ask_for_sync(admin_request.user_id)
     return SevaSutraSyncRequest(**_sync_request)
 
 
