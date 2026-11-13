@@ -591,7 +591,63 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
         else:
             (out.components if kind == "COMMERCIAL" else out.discounts)[key] = value
     _price_and_scheme(out, totals, in_conflict)
+    drop_totals_read_as_discounts(out)
     return out
+
+
+# ── a total read on a discount row (product owner 2026-11-13) ────────────────
+# Live, UTK-SB-261106-007 (Pinki Dixit, Utkal "Final Vehicle Accounts
+# Statement"): the "Other Discount (if any)" row was read as Rs 20,52,186 --
+# the statement's money received (Finance D/O + ten MR receipts add up to
+# exactly that; Total Cost 20,53,190 less it is the printed balance 1,004).
+# The Excess Discount tab then showed a Rs 20.47 lakh over-grant. A discount
+# can never be half the deal or more, nor the statement's own money received:
+# such a figure is a total landed on the discount row. It is left blank with
+# the reason (the statement-totals task asks the PC to correct the reading),
+# never counted as a discount. Judged per copy, on every journey.
+_MONEY_RECEIVED_FLOOR = Decimal(100000)
+
+
+def drop_totals_read_as_discounts(out: StatementRead) -> None:
+    charges = sum(out.components.values(), Decimal(0))
+    priced = "ex_showroom_price" in out.components
+    for key, amount in list(out.discounts.items()):
+        why = None
+        if priced and charges > 0 and amount * 2 >= charges:
+            why = "half the statement's charges or more: a total read on the discount row, not a discount"
+        elif out.receipts >= _MONEY_RECEIVED_FLOOR and abs(amount - out.receipts) <= TOLERANCE:
+            why = "the statement's money received read on the discount row, not a discount"
+        elif out.printed_total and out.printed_total >= _MONEY_RECEIVED_FLOOR \
+                and abs(amount - out.printed_total) <= TOLERANCE:
+            why = "the statement's printed total read on the discount row, not a discount"
+        if why is not None:
+            del out.discounts[key]
+            out.unmapped.append({"label": key, "amount": amount, "why": why})
+
+
+# The old vehicle's value printed among the discounts (product owner
+# 2026-11-13, UTK-RM-261024-005): one copy of the NDC prints the old car's
+# Rs 2,30,000 as "Exchange Value" (paid in kind), another copy's discount box
+# labels the same Rs 2,30,000 "Exchange Bonus" -- counted as an exchange bonus
+# Rs 2,10,000 over the scheme's Rs 20,000. A benefit on one copy equal to the
+# old vehicle's value any copy reads is that value, not a discount.
+_OLD_VEHICLE_LOOKALIKES = frozenset({"EXCHANGE_BONUS", "OTHER_SCHEME", "ADDITIONAL_DISCOUNT", "CASH_DISCOUNT"})
+_SAME_FIGURE = Decimal(10)
+
+
+def drop_old_vehicle_read_as_discount(out: StatementRead, values: list[Decimal]) -> list[str]:
+    dropped: list[str] = []
+    for key, amount in list(out.discounts.items()):
+        if key not in _OLD_VEHICLE_LOOKALIKES:
+            continue
+        if any(v and v > 0 and abs(amount - v) <= _SAME_FIGURE for v in values):
+            del out.discounts[key]
+            out.unmapped.append({"label": key, "amount": amount, "why": (
+                "the old vehicle's value (read as the exchanged vehicle on the statement), not a discount")})
+            if out.old_vehicle_value is None:
+                out.old_vehicle_value = amount
+            dropped.append(key)
+    return dropped
 
 
 # The Offer Letter's right-hand benefits, one of which may be its scheme
@@ -1147,6 +1203,19 @@ def combine_statements(
     for read in in_use:
         out.unmapped.extend(read.unmapped)
         out.conflicts.extend(read.conflicts)
+    old_vehicle = [r.old_vehicle_value for r in reads.values() if r.old_vehicle_value]
+    for key in drop_old_vehicle_read_as_discount(out, old_vehicle):
+        combined.figures.pop(("DISCOUNT", key), None)
+        combined.origin.pop(("DISCOUNT", key), None)
+        # Another copy that gives this benefit as a real figure gives it (the
+        # same deal's other NDC: "Exchange Loyalty" Rs 20,000).
+        for document, _ in forms:
+            amount = reads[id(document)].discounts.get(key)
+            if amount is not None and not any(abs(amount - v) <= _SAME_FIGURE for v in old_vehicle):
+                out.discounts[key] = amount
+                combined.figures[("DISCOUNT", key)] = amount
+                combined.origin[("DISCOUNT", key)] = document
+                break
     return out, combined
 
 

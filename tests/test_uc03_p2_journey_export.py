@@ -30,8 +30,9 @@ def test_the_columns_are_the_deal_audit_export_s_in_its_order() -> None:
     # Source (2026-11-07) and the insurance policy number, the policy's add-on
     # covers and the accessories over the standard kit (2026-11-11) after them,
     # so that layout is unchanged.
-    assert len(cols) == 196 and cols[192:] == ["Booking Date Source", "Insurance Policy No", "Insurance Add-ons",
-                                               "Accessories Add-on"]
+    # and the DMS dump sync marks (2026-11-13).
+    assert len(cols) == 198 and cols[192:] == ["Booking Date Source", "Insurance Policy No", "Insurance Add-ons",
+                                               "Accessories Add-on", "DMS Booking Synced", "DMS Delivery Synced"]
     cols = cols[:192]
     assert cols[:4] == ["Dealership", "Location", "Booking No", "Booking Date"]
     assert cols[34] == "Pincode" and cols[35] == "Std: Ex Showroom"

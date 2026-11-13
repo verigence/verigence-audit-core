@@ -441,7 +441,7 @@ def test_the_export_carries_the_policy_number_and_the_add_on_covers() -> None:
     assert row["Insurance Policy No"] == "36140031266107274023"
     assert row["Insurance Add-ons"] == "Zero Depreciation, RSA"
     assert identity_row({}, deal=_export_deal(), vehicle={}, customer={})["Insurance Policy No"] is None
-    assert columns()[-3:] == ["Insurance Policy No", "Insurance Add-ons", "Accessories Add-on"]
+    assert columns()[-5:-2] == ["Insurance Policy No", "Insurance Add-ons", "Accessories Add-on"]
 
 
 def test_the_buffer_is_the_one_the_reconciliation_last_worked_out_not_an_earlier_month_s(journey) -> None:
