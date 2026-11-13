@@ -156,6 +156,7 @@ from audit_core.uc03_p2_missing_documents import (
     router as uc03_p2_missing_documents_router,
 )
 from audit_core.uc03_p2_my_work import router as uc03_p2_my_work_router
+from audit_core.uc03_p2_performance import admin_router as performance_settings_router
 from audit_core.uc03_p2_performance import router as uc03_p2_performance_router
 from audit_core.uc03_p2_project_tracker import router as uc03_p2_project_tracker_router
 from audit_core.uc03_p2_resplit import router as uc03_p2_resplit_router
@@ -365,6 +366,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_my_work_router)
     application.include_router(uc03_p2_project_tracker_router)
     application.include_router(uc03_p2_performance_router)
+    application.include_router(performance_settings_router)
     application.include_router(uc03_p2_insights_router)
     application.include_router(uc03_p2_missing_documents_router)
     application.include_router(task_manager_router)
