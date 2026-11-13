@@ -92,6 +92,12 @@ jobs:
           echo "== Neon: existing $SCHEMA tables (table | rows estimate)"
           q "$NEON_URL" "select c.relname, c.reltuples::bigint from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='$SCHEMA' and c.relkind in ('r','p') order by 1" || true
           echo "== Neon: DI migration"; q "$NEON_URL" "select version_num from $SCHEMA.alembic_version" || true
+          echo "== source: tables outside $SCHEMA (schema.table | rows | size)"
+          q "$SRC_URL" "select n.nspname||'.'||c.relname, c.reltuples::bigint, pg_size_pretty(pg_total_relation_size(c.oid)) from pg_class c join pg_namespace n on n.oid=c.relnamespace where c.relkind in ('r','p') and n.nspname not in ('pg_catalog','information_schema','$SCHEMA') and n.nspname not like 'pg_toast%' order by 1"
+          echo "== Neon: public tables (any same names?)"
+          q "$NEON_URL" "select c.relname from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='public' and c.relkind in ('r','p') order by 1"
+          echo "== source: 12 largest $SCHEMA tables (table | rows | size)"
+          q "$SRC_URL" "select c.relname, c.reltuples::bigint, pg_size_pretty(pg_total_relation_size(c.oid)) from pg_class c join pg_namespace n on n.oid=c.relnamespace where n.nspname='$SCHEMA' and c.relkind in ('r','p') order by pg_total_relation_size(c.oid) desc limit 12"
           others=$(q "$SRC_URL" "select string_agg(distinct n.nspname, ',') from pg_class c join pg_namespace n on n.oid=c.relnamespace where c.relkind in ('r','p') and n.nspname not in ('pg_catalog','information_schema','$SCHEMA') and n.nspname not like 'pg_toast%'")
           if [ -n "$others" ]; then
             echo "::error::the source also has tables outside $SCHEMA ($others); stopping so they can be reviewed before any copy."
