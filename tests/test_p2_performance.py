@@ -176,3 +176,16 @@ def test_a_super_admin_chooses_what_the_view_shows(setup):
     finally:
         app.dependency_overrides.pop(require_super_admin_request, None)
         _clear_settings(s)
+
+
+def test_journeys_closed_by_a_reviewer_count_on_the_reviewer(setup):
+    s = setup
+    reviewer, tl = f"rv-{uuid4().hex[:6]}", f"tl-{uuid4().hex[:6]}"
+    tt._role(s, reviewer, "REVIEWER", dealer=s.journey.dealer_id, outlet=s.journey.outlet_id)
+    tt._role(s, tl, "TL")
+    for _ in range(2):
+        tt._closure(s, tt._journey(s, str(s.journey.outlet_id), s.journey.actor_id), by=reviewer)
+    report = _build(s, tl)
+    assert "journeysClosed" in [m["key"] for m in report["measures"]]
+    people = {p["actorId"]: p for p in report["people"]}
+    assert people[reviewer]["today"]["journeysClosed"] == 2 and people[reviewer]["today"]["reviews"] == 0

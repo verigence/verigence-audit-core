@@ -10,9 +10,10 @@ cash register, and some weekly; it should provision for all of those."
 
 For the day asked and the ``days`` before it (7 to 31), per person and per day:
 
-Output        filesUploaded, journeysUploaded (the PC who uploaded), tasksClosed (whoever
-              closed them), reviews (Booking / Delivery documents-reviewed marks, Journey
-              closures, and a TL's or PM's accept / reject of a closure)
+Output        filesUploaded, journeysUploaded (the PC who uploaded), journeysClosed (a PC's
+              delivery files closed; the Journeys a Reviewer, TL or PM closed), tasksClosed
+              (whoever closed them), reviews (Booking / Delivery documents-reviewed marks and
+              a TL's or PM's accept / reject of a closure)
 Quality       pagesRejected: pages of that day's uploads rejected on image quality
 Duties        every recurring task schedule of the Project (Daily Gate Pass today; a cash
               register or a weekly reconciliation appears on its own once its schedule is
@@ -60,6 +61,7 @@ from audit_core.security_authorization import (
 )
 from audit_core.task_manager import known_names, normalise_role
 from audit_core.uc03_p2_access import authorize_p2
+from audit_core.uc03_p2_daily_report import delivery_files_closed
 from audit_core.uc03_p2_project_tracker import (
     _ADMIN_ROLES,
     _CLOSING_EVENTS,
@@ -82,6 +84,11 @@ _CACHE_SECONDS = 120.0
 MEASURES: tuple[dict[str, Any], ...] = (
     {"key": "filesUploaded", "label": "Files uploaded", "group": "OUTPUT", "roles": ["PC"]},
     {"key": "journeysUploaded", "label": "Journeys uploaded", "group": "OUTPUT", "roles": ["PC"]},
+    # Product owner 13 Nov 2026: "it should also have journeys closed". A PC's: their delivery
+    # files closed (all mandatory documents in, every document task closed); a Reviewer's, TL's or
+    # PM's: the Journeys they closed.
+    {"key": "journeysClosed", "label": "Journeys closed", "group": "OUTPUT",
+     "roles": ["PC", "REVIEWER", "TL", "PM", "EXECUTIVE"]},
     {"key": "reviews", "label": "Reviews", "group": "OUTPUT", "roles": ["REVIEWER", "TL", "PM", "EXECUTIVE"]},
     {"key": "tasksClosed", "label": "Tasks closed", "group": "OUTPUT",
      "roles": ["PC", "REVIEWER", "TL", "PM", "EXECUTIVE"]},
@@ -179,16 +186,26 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
           FROM auditcore.p2_stage_document_reviews
           WHERE tenant_id = :t AND reviewed_at_utc >= :s AND reviewed_at_utc < :e
           UNION ALL
-          SELECT closed_by_actor_id, (closed_at_utc AT TIME ZONE :tz)::date
-          FROM auditcore.p2_journey_closures
-          WHERE tenant_id = :t AND closed_at_utc >= :s AND closed_at_utc < :e
-          UNION ALL
           SELECT decided_by_actor_id, (decided_at_utc AT TIME ZONE :tz)::date
           FROM auditcore.p2_journey_closures
           WHERE tenant_id = :t AND decided_at_utc >= :s AND decided_at_utc < :e
             AND acceptance_status IN ('ACCEPTED', 'REJECTED')
         ) x GROUP BY 1, 2
     """), params).mappings().all(), "reviews")
+    put(connection.execute(text("""
+        SELECT closed_by_actor_id AS actor, (closed_at_utc AT TIME ZONE :tz)::date AS day, count(*) AS n
+        FROM auditcore.p2_journey_closures
+        WHERE tenant_id = :t AND closed_at_utc >= :s AND closed_at_utc < :e
+        GROUP BY 1, 2
+    """), params).mappings().all(), "journeysClosed")
+    # A PC's delivery files closed, by the Daily processing report's rule (one statement for the Project).
+    zone = _zone(tz)
+    for f in delivery_files_closed(connection, tenant_id=tenant_id, actor_id="", start=start, end=end, names={},
+                                   whole_project=True)["files"]:
+        if f["pcActorId"] and f["closedAtUtc"]:
+            day = datetime.fromisoformat(f["closedAtUtc"]).astimezone(zone).date().isoformat()
+            cell = values[str(f["pcActorId"])]["journeysClosed"]
+            cell[day] = cell.get(day, 0) + 1
     put(connection.execute(text("""
         SELECT actor_id AS actor, activity_date AS day, round(sum(active_seconds) / 60.0) AS n
         FROM auditcore.p2_user_activity_daily
@@ -392,8 +409,9 @@ def build_performance(
             "Sundays left out) and against peers (the median, that day, of the people of the same role who "
             "did anything that day). Within a tenth of the median counts as 'with peers'."),
             ("Files and journeys uploaded count under the PC who uploaded them; tasks closed under whoever "
-            "closed them; reviews are Booking / Delivery documents-reviewed marks, Journey closures and a "
-            "TL's or PM's accept or reject of a closure. Pages rejected are pages of that day's uploads "
+            "closed them; journeys closed are a PC's delivery files closed (all mandatory documents in and "
+            "every document task closed) and the Journeys a Reviewer, TL or PM closed; reviews are Booking / "
+            "Delivery documents-reviewed marks and a TL's or PM's accept or reject of a closure. Pages rejected are pages of that day's uploads "
             "rejected on image quality (fewer is better)."),
             ("Duties are the recurring tasks of the Task Manager (daily, weekly or monthly): done on time, "
             "done late or not done. A new duty appears here once its schedule is created."),
