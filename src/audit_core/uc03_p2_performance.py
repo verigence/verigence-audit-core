@@ -130,6 +130,8 @@ DUTIES_ITEM, PEERS_ITEM = "duties", "peerComparison"
 SECTIONS: tuple[dict[str, str], ...] = (
     {"key": "pending", "label": "Backlog"},
     {"key": "flow", "label": "Bookings and deliveries"},
+    {"key": "uploads", "label": "Uploads (direct, bulk, Drive)"},
+    {"key": "quality", "label": "Duplicates and quality issues"},
     {"key": "tasks", "label": "Tasks"},
     {"key": "trend", "label": "Day to day, week to week"},
     {"key": "efficiency", "label": "PC efficiency"},
@@ -386,6 +388,34 @@ def _sections(part: Any, data: dict[str, Any], *, rows: list[dict[str, Any]], ou
                                   if flow.get(str(o["outlet_id"]), {}).get(d)}}
             for o in outlets]}
 
+    if wanted("uploads"):
+        ch = part("channels")
+
+        def by_channel(source: dict[str, Any]) -> dict[str, list[int]]:
+            return {c: [source.get(c, {}).get(d, 0) for d in iso] for c in ("direct", "bulk", "drive")}
+
+        out["uploads"] = {
+            "outlets": [] if own else [{**place(o), **by_channel(ch["byOutlet"].get(str(o["outlet_id"]), {}))}
+                                       for o in outlets],
+            "people": [{"actorId": a, "name": names[a], "role": people[a]["role"],
+                        **by_channel(ch["byPerson"].get(a, {}))} for a in visible if people[a]["role"] == "PC"],
+        }
+
+    if wanted("quality"):
+        q = part("quality")
+
+        def pages(source: dict[str, Any]) -> int:
+            return int(sum(source.get("pagesUploaded", {}).get(d, 0) for d in iso))
+
+        out["quality"] = {
+            "outlets": [] if own else [
+                {**place(o), "pagesUploaded": pages(data["by_outlet"].get(str(o["outlet_id"]), {})),
+                 **q["byOutlet"].get(str(o["outlet_id"]), {})} for o in outlets],
+            "people": [{"actorId": a, "name": names[a], "role": people[a]["role"],
+                        "pagesUploaded": pages(values.get(a, {})), **q["byPerson"].get(a, {})}
+                       for a in visible if people[a]["role"] == "PC"],
+        }
+
     if wanted("tasks"):
         raised, backlog = part("tasks"), part("backlog")
 
@@ -507,6 +537,10 @@ def _part(connection: Connection, name: str, *, tenant_id: str, first: date, las
                              zone=zone, now=now)
     elif name == "tasks":
         data = insights.tasks(connection, tenant_id=tenant_id, start=start, end=end, tz=tz)
+    elif name == "quality":
+        data = insights.quality(connection, tenant_id=tenant_id, start=start, end=end)
+    elif name == "channels":
+        data = insights.channels(connection, tenant_id=tenant_id, start=start, end=end, tz=tz)
     else:
         data = insights.report(connection, tenant_id=tenant_id, start=start, end=end, tz=tz)
     if use_cache:
@@ -739,7 +773,7 @@ def get_performance(
     day: Annotated[date | None, Query(alias="date")] = None,
     days: Annotated[int, Query(ge=MIN_DAYS, le=MAX_DAYS)] = DEFAULT_DAYS,
     first: Annotated[date | None, Query(alias="from")] = None,
-    section: Annotated[str | None, Query(pattern=r"^(pending|flow|tasks|trend|efficiency|duties|report)$")] = None,
+    section: Annotated[str | None, Query(pattern=r"^(pending|flow|uploads|quality|tasks|trend|efficiency|duties|report)$")] = None,
 ) -> dict[str, Any]:
     access = authorize_p2(
         connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,

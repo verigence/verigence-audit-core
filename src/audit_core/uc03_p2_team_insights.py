@@ -355,3 +355,78 @@ def report(connection: Connection, *, tenant_id: str, start: datetime, end: date
     """), params).mappings():
         other[str(r["person"])][r["day"].isoformat()].append(str(r["title"]))
     return {"counts": counts, "other": other}
+
+
+
+CHANNELS = ("direct", "bulk", "drive")
+
+
+def channels(connection: Connection, *, tenant_id: str, start: datetime, end: datetime, tz: str) -> dict[str, Any]:
+    """How files came in, per person, outlet and day (product owner 13 Nov 2026: "our different
+    options to upload, direct, bulk, drive: how they are being used should also be there"): uploaded
+    on its own (app or web), in a bulk (folder) upload, or through Google Drive."""
+    by_person: dict[str, dict[str, dict[str, int]]] = defaultdict(lambda: defaultdict(dict))
+    by_outlet: dict[str, dict[str, dict[str, int]]] = defaultdict(lambda: defaultdict(dict))
+    for r in connection.execute(text("""
+        SELECT x.person, x.outlet, x.day, COALESCE(x.channel, 'direct') AS channel, count(*) AS n
+        FROM (
+          SELECT ub.uploaded_by_actor_id AS person, j.outlet_id AS outlet,
+                 (ub.created_at_utc AT TIME ZONE :tz)::date AS day,
+                 (SELECT CASE WHEN count(*) = 0 THEN NULL WHEN bool_or(bu.source = 'DRIVE') THEN 'drive' ELSE 'bulk' END
+                  FROM auditcore.p2_bulk_files bf
+                  JOIN auditcore.p2_bulk_uploads bu ON bu.tenant_id = bf.tenant_id AND bu.bulk_id = bf.bulk_id
+                  WHERE bf.tenant_id = ub.tenant_id AND bf.batch_id = ub.batch_id) AS channel
+          FROM auditcore.p2_upload_batches ub
+          JOIN auditcore.journeys j ON j.tenant_id = ub.tenant_id AND j.journey_id = ub.journey_id
+          WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
+            AND ub.batch_status <> 'AWAITING_UPLOAD'
+            AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
+        ) x GROUP BY 1, 2, 3, 4
+    """), {"t": tenant_id, "s": start, "e": end, "tz": tz}).mappings():
+        day = r["day"].isoformat()
+        for owner, key in ((by_person, r["person"]), (by_outlet, r["outlet"])):
+            if key:
+                cell = owner[str(key)][r["channel"]]
+                cell[day] = cell.get(day, 0) + int(r["n"])
+    return {"byPerson": by_person, "byOutlet": by_outlet}
+
+
+
+QUALITY_KEYS = ("blurred", "faded", "tooSmall", "otherQuality", "duplicatePages", "duplicateFiles")
+
+
+def quality(connection: Connection, *, tenant_id: str, start: datetime, end: datetime) -> dict[str, Any]:
+    """Duplicates and documents with quality issues, per person and outlet, of the files uploaded in
+    the window (product owner 13 Nov 2026: "duplicate files, documents with quality issues should
+    be there"): pages rejected on image quality by reason, pages already uploaded and not sent
+    again, and uploads deleted as the same file uploaded again."""
+    from audit_core.uc03_p2_daily_report import rejection_reason
+    from audit_core.uc03_p2_same_file import duplicate_uploads_deleted
+
+    by_person: dict[str, dict[str, int]] = defaultdict(lambda: dict.fromkeys(QUALITY_KEYS, 0))
+    by_outlet: dict[str, dict[str, int]] = defaultdict(lambda: dict.fromkeys(QUALITY_KEYS, 0))
+
+    def add(person: Any, outlet: Any, key: str, n: int) -> None:
+        for owner, who in ((by_person, person), (by_outlet, outlet)):
+            if who:
+                owner[str(who)][key] += n
+
+    names = {"blurred": "blurred", "faded": "faded", "tooSmall": "tooSmall"}
+    for r in connection.execute(text("""
+        SELECT ub.uploaded_by_actor_id AS person, j.outlet_id AS outlet, q.last_error,
+               sum(COALESCE(cardinality(q.page_numbers), 1)) AS n
+        FROM auditcore.p2_upload_batches ub
+        JOIN auditcore.journeys j ON j.tenant_id = ub.tenant_id AND j.journey_id = ub.journey_id
+        JOIN auditcore.p2_document_queue q ON q.tenant_id = ub.tenant_id AND q.batch_id = ub.batch_id
+        WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
+          AND ((q.last_error LIKE 'DI\\_QUALITY\\_%' AND q.queue_status IN ('FAILED', 'DEAD_LETTER', 'CANCELLED'))
+               OR q.last_error = 'DUPLICATE_PAGE')
+        GROUP BY 1, 2, 3
+    """), {"t": tenant_id, "s": start, "e": end}).mappings():
+        if r["last_error"] == "DUPLICATE_PAGE":
+            add(r["person"], r["outlet"], "duplicatePages", int(r["n"]))
+        else:
+            add(r["person"], r["outlet"], names.get(rejection_reason(r["last_error"]) or "", "otherQuality"), int(r["n"]))
+    for r in duplicate_uploads_deleted(connection, tenant_id=tenant_id, start=start, end=end):
+        add(r["pc_actor_id"], r["outlet_id"], "duplicateFiles", 1)
+    return {"byPerson": by_person, "byOutlet": by_outlet}

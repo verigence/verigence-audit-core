@@ -172,7 +172,7 @@ def test_a_super_admin_chooses_what_each_role_sees(setup):
         for_tl, for_pm = _build(s, tl), _build(s, pm)
         assert "activeMinutes" not in [m["key"] for m in for_tl["measures"]]
         assert "efficiency" not in for_tl and "pending" not in for_tl
-        assert [x["key"] for x in for_tl["sections"]] == ["flow", "tasks", "trend", "duties", "report"]
+        assert [x["key"] for x in for_tl["sections"]] == ["flow", "uploads", "quality", "tasks", "trend", "duties", "report"]
         assert "activeMinutes" in [m["key"] for m in for_pm["measures"]]
         assert "efficiency" in for_pm and "pending" in for_pm
         mine = next(p for p in for_tl["people"] if p["actorId"] == s.journey.actor_id)
@@ -255,8 +255,8 @@ def test_pending_work_efficiency_delinquencies_and_bookings_deliveries(setup):
     tl = f"tl-{uuid4().hex[:6]}"
     tt._role(s, tl, "TL")
     report = _build(s, tl)
-    assert [x["key"] for x in report["sections"]] == ["pending", "flow", "tasks", "trend", "efficiency", "duties",
-                                                      "report"]
+    assert [x["key"] for x in report["sections"]] == ["pending", "flow", "uploads", "quality", "tasks", "trend",
+                                                      "efficiency", "duties", "report"]
 
     pending = next(p for p in report["pending"]["people"] if p["actorId"] == me)["counts"]
     assert pending["deliveryFilesOpen"][2] == 1                       # the one uploaded five days ago
@@ -314,3 +314,36 @@ def test_backlog_counts_unreconciled_payments_and_a_date_range_is_accepted(setup
     assert body.status_code == 200, body.text
     assert len(body.json()["days"]) == 3 and "flow" in body.json() and "pending" not in body.json()
     assert s.client.get(url, params={"from": (today + timedelta(days=1)).isoformat()}).status_code == 422
+
+
+def test_how_the_upload_options_are_used(setup):
+    s = setup
+    add_batch_pages(s.journey, [("booking_form", "READY")])
+    bulk, _ = add_batch_pages(s.journey, [("booking_form", "READY")])
+    drive, _ = add_batch_pages(s.journey, [("booking_form", "READY")])
+    tt._bulk_source(s, bulk, "WEB")
+    tt._bulk_source(s, drive, "DRIVE")
+    tl = f"tl-{uuid4().hex[:6]}"
+    tt._role(s, tl, "TL")
+    report = _build(s, tl, section="uploads")
+    mine = next(p for p in report["uploads"]["people"] if p["actorId"] == s.journey.actor_id)
+    assert (sum(mine["direct"]), sum(mine["bulk"]), sum(mine["drive"])) == (1, 1, 1)
+    at_outlet = next(o for o in report["uploads"]["outlets"] if o["outletId"] == str(s.journey.outlet_id))
+    assert sum(at_outlet["drive"]) == 1
+
+
+def test_duplicates_and_quality_issues(setup):
+    s = setup
+    _batch, rows = add_batch_pages(s.journey, [("booking_form", "FAILED"), ("booking_form", "FAILED"),
+                                               ("booking_form", "CANCELLED"), ("booking_form", "READY")])
+    for row, code in zip(rows, ("DI_QUALITY_IMAGE_BLUR_SCORE", "DI_QUALITY_IMAGE_CONTRAST", "DUPLICATE_PAGE"),
+                         strict=False):
+        tt._exec(s, "UPDATE auditcore.p2_document_queue SET last_error=:c WHERE tenant_id=:t AND queue_id=:q",
+                 c=code, q=row["queue_id"])
+    tl = f"tl-{uuid4().hex[:6]}"
+    tt._role(s, tl, "TL")
+    report = _build(s, tl, section="quality")
+    mine = next(p for p in report["quality"]["people"] if p["actorId"] == s.journey.actor_id)
+    assert (mine["blurred"], mine["faded"], mine["duplicatePages"], mine["pagesUploaded"]) == (1, 1, 1, 4)
+    at_outlet = next(o for o in report["quality"]["outlets"] if o["outletId"] == str(s.journey.outlet_id))
+    assert at_outlet["blurred"] == 1 and at_outlet["pagesUploaded"] == 4
