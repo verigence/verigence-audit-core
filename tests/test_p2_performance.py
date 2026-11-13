@@ -402,12 +402,16 @@ def test_the_dashboard_of_each_role(setup):
         assert {t["key"]: t["value"] for t in theirs["kpis"]["tiles"]}["closed"] == 1
         assert [k["key"] for k in theirs["pending"]["kinds"]] == ["awaitingReview", "awaitingDecision"]
         assert theirs["pending"]["kinds"][1]["total"] == 1             # my closure is with the TL / PM
+        # What comes in at the outlets I review: channels, failures and duplicates.
+        assert sum(theirs["channels"].values()) >= 4 and theirs["quality"]["pagesUploaded"] > 0
+        assert "toReupload" in theirs["quality"]
 
         # ---- the Team Lead: the team, by name
         team = _build(s, tl, section="dashboard")["dashboard"]
         assert team["view"] == "TEAM"
         tiles = {t["key"]: t for t in team["kpis"]["tiles"]}
         assert tiles["bookings"]["value"] >= 1 and tiles["deliveries"]["value"] >= 3
+        assert tiles["journeysClosed"]["value"] == 1                    # the Reviewer's closure
         assert {k["key"] for k in team["pending"]["kinds"]} >= {"deliveryFilesOpen", "awaitingReview", "paymentsNotReconciled"}
         cards = {c["key"]: c for c in team["scorecards"]}
         assert {"pcs", "reviewers", "outlets"} <= set(cards) and "leads" not in cards

@@ -152,11 +152,21 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
     def missed_dates(actor: str) -> list[str]:
         return sorted({d for by_day in duties.get(actor, {}).values() for d, cell in by_day.items() if cell["notDone"]})
 
-    def quality_block(q: dict[str, int], pages: float) -> dict[str, Any]:
+    def quality_block(q: dict[str, int], pages: float, to_reupload: int = 0) -> dict[str, Any]:
+        """Failures and duplicates of the uploads of the period; ``to_reupload``: pages that failed
+        for good and still wait to be uploaded again (now, whatever the period)."""
         rejected = sum(q.get(k, 0) for k, _ in _QUALITY_REASONS)
         return {"pagesUploaded": int(pages), "rejected": rejected, "rightFirstTime": _pct(pages - rejected, pages),
+                "toReupload": to_reupload,
                 "reasons": [{"key": k, "label": label, "value": q.get(k, 0)} for k, label in _QUALITY_REASONS],
                 "duplicatePages": q.get("duplicatePages", 0), "duplicateFiles": q.get("duplicateFiles", 0)}
+
+    def sum_outlets(source: dict[str, Any]) -> dict[str, int]:
+        q: dict[str, int] = {}
+        for o in outlet_ids:
+            for k, v in source.get(o, {}).items():
+                q[k] = q.get(k, 0) + v
+        return q
 
     def channel_block(source: dict[str, Any]) -> dict[str, int]:
         return {c: int(sum(source.get(c, {}).get(d, 0) for d in iso)) for c in ("direct", "bulk", "drive")}
@@ -190,7 +200,7 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
         pages = total(mine, "pagesUploaded")
         out["title"] = "My dashboard"
         if shown("kpis"):
-            quality = quality_block(q, pages)
+            quality = quality_block(q, pages, _n(counts, "pagesToReupload"))
             tiles = []
             if measure("journeysUploaded"):
                 tiles += [kpi("bookings", "Bookings uploaded", sum(bookings), f"{bookings[-1]} on {_short(last)}"),
@@ -219,7 +229,7 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
         if shown("duties"):
             out["duties"] = duty_block([actor_id], strip_names=True)
         if shown("quality"):
-            out["quality"] = quality_block(q, pages)
+            out["quality"] = quality_block(q, pages, _n(counts, "pagesToReupload"))
         if shown("channels"):
             out["channels"] = channel_block(part("channels")["byPerson"].get(actor_id, {}))
         if shown("team"):
@@ -233,8 +243,8 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
     if view == "REVIEWER":
         mine = values.get(actor_id, {})
         own = backlog["byPerson"].get(actor_id, {})
-        counts = {"awaitingReview": _add_counts([backlog["byOutlet"].get(o, {}) for o in outlet_ids]).get(
-                      "awaitingReview", list(_ZERO)),
+        at_outlets = _add_counts([backlog["byOutlet"].get(o, {}) for o in outlet_ids])
+        counts = {"awaitingReview": at_outlets.get("awaitingReview", list(_ZERO)),
                   "awaitingDecision": own.get("awaitingDecision", list(_ZERO))}
         out["title"] = "My dashboard"
         if shown("kpis"):
@@ -275,6 +285,15 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
             block = duty_block([actor_id], strip_names=True)
             if block["rows"]:  # the duties planned and not set up yet are a PC's
                 out["duties"] = {**block, "planned": []}
+        # What comes in at the outlets I review: how it is uploaded, failures and duplicates.
+        if shown("quality"):
+            out["quality"] = quality_block(sum_outlets(part("quality")["byOutlet"]),
+                                           sum(total(by_outlet.get(o, {}), "pagesUploaded") for o in outlet_ids),
+                                           _n(at_outlets, "pagesToReupload"))
+        if shown("channels"):
+            ch = part("channels")["byOutlet"]
+            out["channels"] = {c: int(sum(ch.get(o, {}).get(c, {}).get(d, 0) for o in outlet_ids for d in iso))
+                               for c in ("direct", "bulk", "drive")}
         return out
 
     # ------------------------------------------------------------------ a TL, PM or Executive: the team
@@ -309,6 +328,8 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
                              f"{unit_total('deliveryFilesClosed', days=[last])} on {_short(last)}"))
         if measure("reviews"):
             tiles.append(kpi("reviews", "Files reviewed", unit_total("reviews"), f"{unit_total('reviews', days=[last])} on {_short(last)}"))
+        if measure("journeysClosed"):
+            tiles.append(kpi("journeysClosed", "Journeys closed", unit_total("journeysClosed"), "by Reviewer, TL or PM"))
         if measure("tasksClosed"):
             raised = part("tasks")["raisedByOutlet"]
             new = int(sum(raised.get(o, {}).get(d, 0) for o in outlet_ids for d in iso))
@@ -489,12 +510,8 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
     if shown("duties"):
         out["duties"] = duty_block([a for a in visible if a != actor_id], strip_names=False)
     if shown("quality"):
-        q_part = part("quality")["byOutlet"]
-        q: dict[str, int] = {}
-        for o in outlet_ids:
-            for k, v in q_part.get(o, {}).items():
-                q[k] = q.get(k, 0) + v
-        out["quality"] = quality_block(q, unit_total("pagesUploaded"))
+        out["quality"] = quality_block(sum_outlets(part("quality")["byOutlet"]), unit_total("pagesUploaded"),
+                                       _n(counts, "pagesToReupload"))
     if shown("channels"):
         ch = part("channels")["byOutlet"]
         out["channels"] = {c: int(sum(ch.get(o, {}).get(c, {}).get(d, 0) for o in outlet_ids for d in iso))
