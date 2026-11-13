@@ -5333,10 +5333,9 @@ _DRIVE_ROUND_SECONDS = 300
 
 
 def _drive_every(engine: Engine) -> None:
-    """Every five minutes, for every Project whose Google Drive is connected: the outlets'
-    folders are there, what came into Drive is recorded, the end-of-day run (21:00 IST) is
-    asked for once, what the reading decided is brought back, and once a day the folders of
-    journeys closed long enough go to the archive (2026-11-12, uc03_p2_drive_intake).
+    """Every five minutes, a clock for the Drive intake (uc03_p2_drive_intake.drive_round): the
+    daily run is asked for at each Project's time, and what the reading decided is brought back
+    from Verigence's own records. Drive itself is looked at only in a run (2026-11-13).
     Nothing is done while Google Drive is not set up."""
     from audit_core.uc03_p2_drive_intake import drive_round
 

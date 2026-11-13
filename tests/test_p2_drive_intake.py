@@ -677,6 +677,31 @@ def test_the_callback_keeps_the_sealed_token_and_makes_the_folders(s, monkeypatc
     assert s.fake.named("Aditya Motors - Cuttack")
 
 
+def test_the_clock_never_looks_at_drive_only_a_run_does(s, monkeypatch):
+    """Product owner 2026-11-13: "we don't need 5 mins timer ... lets keep it either on demand or
+    only at specified time"."""
+    outlet = _tree(s)
+    s.fake.put("docket.pdf", s.fake.folder("Akansh-456909", outlet), b"%PDF docket")
+    real = drive.connected_client
+
+    def no_drive(*args, **kwargs):
+        raise AssertionError("the clock opened Google Drive")
+
+    monkeypatch.setattr(drive, "connected_client", no_drive)
+    noon = datetime(2026, 11, 13, 6, 30, tzinfo=UTC)   # 12:00 IST: no run due
+    nine = datetime(2026, 11, 13, 15, 35, tzinfo=UTC)  # 21:05 IST: the daily run is due
+    assert drive.drive_round(s.engine, [s.t], worker_id="w1", now=noon)[s.t] == {"settled": {"folders": 0,
+                                                                                               "photos": 0,
+                                                                                               "runs": 0}}
+    assert "endOfDayRun" in drive.drive_round(s.engine, [s.t], worker_id="w1", now=nine)[s.t]
+    assert not _files(s)  # nothing recorded by the clock
+    # The run looks at Drive: it records the file and takes it.
+    monkeypatch.setattr(drive, "connected_client", real)
+    [run] = _rows(s, "SELECT run_id FROM auditcore.p2_drive_runs WHERE tenant_id=:t")
+    done = drive.run_drive_intake(s.engine, f"{s.t}:{run['run_id']}")
+    assert done["found"]["new"] == 1 and done["documents"] == 1 and "archive" in done
+
+
 def test_the_round_asks_for_the_end_of_day_run_once(s):
     _tree(s)
     nine = datetime(2026, 11, 12, 15, 35, tzinfo=UTC)

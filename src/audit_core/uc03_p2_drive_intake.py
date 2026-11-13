@@ -1264,6 +1264,10 @@ def run_drive_intake(engine: Engine, tag: str, tenant_ids: list[str] | None = No
             raise RuntimeError("The Project's Google Drive is not connected")
         client, link = linked
         ensure_tree(engine, tenant_id, client)
+        # Drive is looked at only in a run (product owner 2026-11-13: "we don't need 5 mins
+        # timer ... either on demand or only at specified time"): the sharing follows the
+        # PCs' mapping here, and what came into Drive is recorded here.
+        ensure_shares(engine, tenant_id, client)
         found = sync(engine, tenant_id, client, link)
     except Exception as exc:
         _set_run(engine, tenant_id, run_id, run_status="FAILED", finished_at_utc=datetime.now(UTC),
@@ -1304,16 +1308,25 @@ def run_drive_intake(engine: Engine, tag: str, tenant_ids: list[str] | None = No
     _set_run(engine, tenant_id, run_id, run_status="READING", summary={"found": found, "taken": counts})
     settle(engine, tenant_id, client)
     result = {"runId": str(run_id), "found": found, **counts}
+    if run["run_trigger"] == "END_OF_DAY":
+        # Once a day, with the daily run: the folders of journeys closed long enough go to
+        # the Archive folder (nothing is deleted).
+        try:
+            result["archive"] = archive_closed(engine, tenant_id, client)
+        except Exception:
+            logger.warning("p2_drive_archive_failed", tenant_id=tenant_id, exc_info=True)
     logger.info("p2_drive_run_taken", tenant_id=tenant_id, **result)
     return result
 
 
 # --------------------------------------------------------------------------- after the reading
 
-def settle(engine: Engine, tenant_id: str, client: DriveClient | None = None) -> dict[str, int]:
+def settle(engine: Engine, tenant_id: str, client: DriveClient | None = None, *,
+           open_drive: bool = True) -> dict[str, int]:
     """What the bulk upload decided, brought back to the record: a customer's folder learns
     the journey its files went to; photos that waited for it are added; a run whose files
-    are all settled is done."""
+    are all settled is done. ``open_drive=False`` (the worker's clock): only Verigence's own
+    records -- photos that wait are added at the next run."""
     done = {"folders": 0, "photos": 0, "runs": 0}
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
@@ -1341,7 +1354,7 @@ def settle(engine: Engine, tenant_id: str, client: DriveClient | None = None) ->
             text("SELECT * FROM auditcore.p2_drive_files WHERE tenant_id=:t AND file_status='WAITING' AND lane='PHOTO' "
                  "ORDER BY seen_at_utc LIMIT 500"), {"t": tenant_id},
         ).mappings().all()]
-    if waiting and client is None:
+    if waiting and client is None and open_drive:
         linked = connected_client(engine, tenant_id)
         client = linked[0] if linked else None
     for file in waiting if client is not None else []:
@@ -1632,10 +1645,11 @@ def end_of_day_due(now: datetime | None = None, at: time | None = None) -> str |
 
 def drive_round(engine: Engine, tenant_ids: list[str], *, worker_id: str | None = None,
                 now: datetime | None = None) -> dict[str, Any]:
-    """Every few minutes, for each Project whose Drive is connected: the outlets' folders are
-    there; what came into Drive is recorded (so the PC sees what waits before submitting);
-    the end-of-day run is asked for once; what the reading decided is brought back; and once
-    a day the folders of journeys closed long enough go to the archive."""
+    """The worker's clock, for each Project whose Drive is connected. It does not look at Drive
+    (product owner 2026-11-13: "we don't need 5 mins timer ... lets keep it either on demand or
+    only at specified time"): Drive is read only in a run -- a PC's Submit, a lead's "Take
+    files now", or the daily run at the Project's time, which this asks for once. Otherwise
+    it only brings back, from Verigence's own records, what the reading decided."""
     from audit_core.uc03_p2_runtime import claim_scheduled_run
 
     out: dict[str, Any] = {}
@@ -1643,13 +1657,12 @@ def drive_round(engine: Engine, tenant_ids: list[str], *, worker_id: str | None 
         return out
     for tenant_id in connected_tenants(engine, tenant_ids):
         try:
-            linked = connected_client(engine, tenant_id)
-            if linked is None:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                link = _connection_row(connection, tenant_id)
+            if link is None:
                 continue
-            client, link = linked
-            result: dict[str, Any] = {"tree": ensure_tree(engine, tenant_id, client),
-                                      "shares": ensure_shares(engine, tenant_id, client),
-                                      "found": sync(engine, tenant_id, client, link)}
+            result: dict[str, Any] = {}
             due = end_of_day_due(now, link["daily_run_time"]) if link["daily_run_enabled"] else None
             if due is not None:
                 with engine.begin() as connection:
@@ -1659,13 +1672,7 @@ def drive_round(engine: Engine, tenant_ids: list[str], *, worker_id: str | None 
                         run = request_run(connection, tenant_id=tenant_id, trigger="END_OF_DAY", actor_id=SYSTEM_ACTOR,
                                           role="SYSTEM", name="System - end of day")
                         result["endOfDayRun"] = str(run["run_id"])
-            result["settled"] = settle(engine, tenant_id, client)
-            with engine.begin() as connection:
-                set_tenant_context(connection, tenant_id)
-                archive = claim_scheduled_run(connection, tenant_id=tenant_id, run_name=ARCHIVE_RUN,
-                                              run_key=ist_today(now).isoformat(), claimed_by=worker_id)
-            if archive:
-                result["archive"] = archive_closed(engine, tenant_id, client, now)
+            result["settled"] = settle(engine, tenant_id, open_drive=False)
             out[tenant_id] = result
         except Exception as exc:
             logger.warning("p2_drive_round_failed", tenant_id=tenant_id, exc_info=True)
