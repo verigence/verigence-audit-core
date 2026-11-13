@@ -4,6 +4,11 @@ import jwt
 from jwt import PyJWKClient, PyJWKClientConnectionError
 from jwt.exceptions import PyJWTError
 
+# Allowance for the clocks of Security and this service disagreeing. Without it a token issued a
+# moment ago is "not yet valid (iat)" wherever this service's clock runs behind Security's (HR,
+# 12 Nov 2026: about 15 s behind, the first call after every sign-in refused with 401).
+CLOCK_SKEW_LEEWAY_SECONDS = 60
+
 
 class SecurityTokenError(RuntimeError):
     """Raised when a Security token cannot be trusted."""
@@ -151,6 +156,7 @@ class SecurityTokenValidator:
                 algorithms=[signing_key.algorithm_name],
                 issuer=self._issuer,
                 audience=self._audience,
+                leeway=CLOCK_SKEW_LEEWAY_SECONDS,
                 options={"require": required_claims},
             )
         except PyJWKClientConnectionError as exc:
