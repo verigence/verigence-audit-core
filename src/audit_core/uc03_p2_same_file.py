@@ -311,6 +311,9 @@ _SAME_CUSTOMER_SQL = f"""
     SELECT DISTINCT f.journey_id
     FROM auditcore.journey_document_extracted_fields f
     WHERE f.tenant_id = :tenant_id AND f.journey_id <> :journey_id
+      -- A value is needed to match a PAN or Aadhaar (both are never empty here: _valid_pan /
+      -- _valid_aadhaar); saying so lets the lookup use the cleaned-up value indexes (0220).
+      AND f.effective_value IS NOT NULL
       AND ((f.field_key = 'pan_number' AND CAST(:pan AS text) IS NOT NULL
             AND upper(regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^A-Za-z0-9]', '', 'g')) = :pan)
         OR (f.field_key = 'aadhaar_number' AND CAST(:aadhaar AS text) IS NOT NULL
