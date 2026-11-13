@@ -1432,27 +1432,32 @@ _P2_ONLY_REQUIREMENTS = (
 
 
 def _ensure_p2_requirement_rows(connection, *, tenant_id: str, journey_id: UUID) -> None:
-    for requirement_key, document_type_key in _P2_ONLY_REQUIREMENTS:
-        connection.execute(
-            text(
-                """
-                INSERT INTO auditcore.journey_document_requirements (
-                    tenant_id, journey_id, document_requirement_item_id,
-                    requirement_key, document_type_key, process_area,
-                    requirement_level, requirement_status, condition_snapshot
-                )
-                SELECT CAST(:t AS varchar), CAST(:j AS uuid), NULL, CAST(:rk AS varchar),
-                       CAST(:dt AS varchar), 'DELIVERY', 'OPTIONAL', 'PENDING', '{}'::jsonb
-                WHERE NOT EXISTS (
-                    SELECT 1 FROM auditcore.journey_document_requirements
-                    WHERE tenant_id=CAST(:t AS varchar) AND journey_id=CAST(:j AS uuid)
-                      AND document_type_key=CAST(:dt AS varchar)
-                )
-                ON CONFLICT (tenant_id, journey_id, requirement_key) DO NOTHING
-                """
-            ),
-            {"t": tenant_id, "j": journey_id, "rk": requirement_key, "dt": document_type_key},
-        )
+    # One statement for all of them (Neon cost review 2026-11-13: it ran once per row, six
+    # statements for every document sent to DI, almost always adding nothing).
+    keys = [requirement_key for requirement_key, _ in _P2_ONLY_REQUIREMENTS]
+    types = [document_type_key for _, document_type_key in _P2_ONLY_REQUIREMENTS]
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.journey_document_requirements (
+                tenant_id, journey_id, document_requirement_item_id,
+                requirement_key, document_type_key, process_area,
+                requirement_level, requirement_status, condition_snapshot
+            )
+            SELECT CAST(:t AS varchar), CAST(:j AS uuid), NULL, w.requirement_key,
+                   w.document_type_key, 'DELIVERY', 'OPTIONAL', 'PENDING', '{}'::jsonb
+            FROM unnest(CAST(:rks AS varchar[]), CAST(:dts AS varchar[]))
+                 AS w(requirement_key, document_type_key)
+            WHERE NOT EXISTS (
+                SELECT 1 FROM auditcore.journey_document_requirements r
+                WHERE r.tenant_id=CAST(:t AS varchar) AND r.journey_id=CAST(:j AS uuid)
+                  AND r.document_type_key=w.document_type_key
+            )
+            ON CONFLICT (tenant_id, journey_id, requirement_key) DO NOTHING
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "rks": keys, "dts": types},
+    )
 
 
 def _ensure_extra_requirement_rows(connection, *, tenant_id: str, journey_id: UUID) -> int:

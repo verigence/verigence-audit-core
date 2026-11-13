@@ -259,3 +259,46 @@ def test_breakdown_rows_keep_their_order():
     rows = [row("dealer", "a", 0, 9), row("dealer", "b", 2, 1), row("dealer", "c", 2, 5),
             row("dealer", "d", 0, 0)]
     assert [r["dealer_id"] for r in split_counts_with_breakdown(rows)["byDealer"]] == ["c", "b", "a", "d"]
+
+
+def test_p2_requirement_rows_are_one_per_document_type():
+    """_ensure_p2_requirement_rows adds them all in one statement, which sees none of its own
+    rows: that answers as the old row-by-row loop only while no two share a document type."""
+    from audit_core.uc03_p2_worker import _P2_ONLY_REQUIREMENTS
+
+    types = [document_type for _, document_type in _P2_ONLY_REQUIREMENTS]
+    assert len(types) == len(set(types))
+
+
+def test_p2_requirement_rows_added_once(uc03_create_booking_setup):  # noqa: F811
+    from audit_core.uc03_p2_worker import (
+        _P2_ONLY_REQUIREMENTS,
+        _ensure_p2_requirement_rows,
+    )
+
+    setup = uc03_create_booking_setup
+    _client, _base, journeys = _seed(setup)
+    tenant = setup["tenant_id"]
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, tenant)
+        # One of the document types already has a row of another key: no second row for it.
+        connection.execute(
+            text("DELETE FROM auditcore.journey_document_requirements WHERE tenant_id=:t AND journey_id=:j "
+                 "AND requirement_key LIKE 'p2\\_%'"), {"t": tenant, "j": journeys[0]})
+        connection.execute(
+            text("INSERT INTO auditcore.journey_document_requirements (tenant_id, journey_id, requirement_key, "
+                 "document_type_key, process_area, requirement_level, requirement_status, condition_snapshot) "
+                 "VALUES (:t, :j, 'catalogue_form_21', 'form_21', 'DELIVERY', 'OPTIONAL', 'PENDING', '{}')"),
+            {"t": tenant, "j": journeys[0]})
+        for _ in range(2):
+            _ensure_p2_requirement_rows(connection, tenant_id=tenant, journey_id=journeys[0])
+        rows = connection.execute(
+            text("SELECT requirement_key, document_type_key FROM auditcore.journey_document_requirements "
+                 "WHERE tenant_id=:t AND journey_id=:j AND document_type_key = ANY(:types)"),
+            {"t": tenant, "j": journeys[0], "types": [d for _, d in _P2_ONLY_REQUIREMENTS]}).all()
+    by_type = {}
+    for key, document_type in rows:
+        by_type.setdefault(document_type, []).append(key)
+    assert by_type["form_21"] == ["catalogue_form_21"]
+    assert all(len(keys) == 1 for keys in by_type.values())
+    assert set(by_type) == {d for _, d in _P2_ONLY_REQUIREMENTS}
