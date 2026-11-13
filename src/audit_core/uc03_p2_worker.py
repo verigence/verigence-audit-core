@@ -50,7 +50,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError
 from sqlalchemy import Connection, Engine, text
 
-from audit_core import sleep_window
+from audit_core import job_schedule, sleep_window
 from audit_core import uc03_p2_runtime as _runtime
 from audit_core.config import SettingsError, load_settings
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
@@ -250,7 +250,7 @@ _FACT_SWEEP_SECONDS = float(os.environ.get("P2_FACT_SWEEP_SECONDS", "30"))
 _FACT_SWEEP_WINDOW_MINUTES = int(os.environ.get("P2_FACT_SWEEP_WINDOW_MINUTES", "10"))
 # When (UTC, HH:MM) the nightly review of deliveries in progress is queued.
 # (A delivery review, not document processing: left as it was on 2026-10-22.)
-_NIGHTLY_REVIEW_UTC = os.environ.get("P2_NIGHTLY_REVIEW_UTC", "20:30")
+_NIGHTLY_REVIEW_UTC = job_schedule.time_utc("NIGHTLY_REVIEW")  # set on the SuperAdmin Jobs page
 
 
 # When (UTC, HH:MM) the day-end sweep clears the pages that ended FAILED from
@@ -4342,9 +4342,10 @@ def run_dayend_sweep(engine: Engine, tenant_id: str, now: datetime | None = None
         return None
 
 
-# The nightly data archive (product owner 7 Nov 2026): 21:30 UTC = 03:00 IST, after the day-end
-# sweep and the Analytics copy. Off with P2_DATA_ARCHIVE_UTC=off.
-_DATA_ARCHIVE_UTC = os.environ.get("P2_DATA_ARCHIVE_UTC", "21:30")
+# The nightly data archive (product owner 7 Nov 2026), after the day-end sweep: 03:00 IST at
+# first, 9:50 pm IST since 13 Nov 2026 and set on the SuperAdmin Jobs page
+# (audit_core.job_schedule). Off with P2_DATA_ARCHIVE_UTC=off.
+_DATA_ARCHIVE_UTC = job_schedule.time_utc("DATA_ARCHIVE")
 _last_data_archive: dict[str, str] = {}
 
 

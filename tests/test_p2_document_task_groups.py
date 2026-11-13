@@ -112,7 +112,7 @@ def test_rows_say_file_pages_and_reason_in_plain_words():
     assert quality == {
         "category": "IMAGE_QUALITY", "categoryLabel": "Image quality", "file": "bundle.pdf", "pages": [3, 5, 7],
         "reason": ("Page 3 is too faded (low contrast); pages 5 and 7 are blurred. Re-scan and upload again. "
-                   "These pages will be removed by the system at the day-end clean-up (02:00 IST). "
+                   "These pages will be removed by the system at the day-end clean-up (21:30 IST). "
                    "Please upload clearer copies. " + CLOSE_INSTRUCTION),
         "documentId": None,
     }
@@ -383,7 +383,7 @@ def test_the_task_list_carries_categories_and_grouped_counts(journey):
     assert rows[quality]["document"] == {
         "category": "IMAGE_QUALITY", "categoryLabel": "Image quality", "file": "scan.pdf", "pages": [2],
         "reason": ("Page 2 is blurred. Re-scan and upload again. This page will be removed by the system at "
-                       "the day-end clean-up (02:00 IST). Please upload a clearer copy. " + CLOSE_INSTRUCTION),
+                       "the day-end clean-up (21:30 IST). Please upload a clearer copy. " + CLOSE_INSTRUCTION),
             "documentId": None,
     }
     # Not document work: unchanged.

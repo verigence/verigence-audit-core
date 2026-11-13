@@ -489,7 +489,7 @@ def test_the_nightly_review_of_deliveries_is_left_alone(journey, monkeypatch, ca
     """The delivery review (P2_NIGHTLY_REVIEW_UTC) is not document processing
     and still runs, claimed once, in the same pass. The nightly SKU retry is
     switched off (product owner, 2026-10-22) and is not called."""
-    assert worker._NIGHTLY_REVIEW_UTC == "20:30"
+    assert worker._NIGHTLY_REVIEW_UTC == "16:00"  # 9:30 pm IST (audit_core.job_schedule)
     called = []
     from audit_core import uc03_p2_audit_rules as rules
 

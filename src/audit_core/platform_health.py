@@ -32,7 +32,7 @@ from uuid import uuid4
 import structlog
 from sqlalchemy import Engine, text
 
-from audit_core import sleep_window
+from audit_core import job_schedule, sleep_window
 
 logger = structlog.get_logger(__name__)
 
@@ -350,6 +350,7 @@ def _tick(engine: Engine, default_service: str, n: int, *, api: bool) -> None:
         return
     beats = n // BEAT_EVERY_SAMPLES
     _safe("beat", beat, engine, default_service)
+    _safe("job_times", job_schedule.refresh, engine)  # a time changed on the Jobs page, within a minute
     if api:
         _safe("db_minute", sample_db_minute, engine)
     if api and beats % DB_COUNTERS_EVERY_BEATS == 1:
