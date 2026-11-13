@@ -83,9 +83,9 @@ EXTERNAL: list[dict[str, Any]] = [
     {"name": "Heartbeat", "service": "Security", "when": "Every minute",
      "what": "Records that Security is running (System Health).",
      "note": "Not yet paused during the night's sleep."},
-    {"name": "Project sync", "service": "SevaSutra", "when": "Every 5 minutes",
+    {"name": "Project sync", "service": "SevaSutra", "when": "Daily, 08:10 IST",
      "what": "Brings SevaSutra's dealerships, outlets and role mappings in step with Project Administration.",
-     "note": "Not yet paused during the night's sleep."},
+     "note": "Also at sign-in to SevaSutra, and within a minute of Sync with SevaSutra in Project Administration."},
 ]
 
 
