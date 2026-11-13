@@ -127,3 +127,65 @@ def test_a_team_lead_reads_only_the_people_of_their_outlets(setup):
     tt._role(s, narrow, "TL", dealer=dealer2, outlet=outlet2)
     ids = {p["actorId"] for p in _build(s, narrow)["people"]}
     assert narrow in ids and elsewhere not in ids and s.journey.actor_id not in ids
+
+
+# --------------------------------------------------------------------------- SuperAdmin settings
+
+def _clear_settings(s):
+    with s.journey.engine.begin() as connection:
+        connection.exec_driver_sql("DELETE FROM platform_ops.performance_settings")
+
+
+def test_a_super_admin_chooses_what_the_view_shows(setup):
+    from fastapi.testclient import TestClient
+
+    from audit_core.dependencies import HumanAdminRequest, require_super_admin_request
+    from audit_core.main import app
+    from audit_core.security_integration import SecurityAdminContext
+
+    s = setup
+    _clear_settings(s)
+    add_batch_pages(s.journey, [("booking_form", "READY")])
+    tl = f"tl-{uuid4().hex[:6]}"
+    tt._role(s, tl, "TL")
+    app.dependency_overrides[require_super_admin_request] = lambda: HumanAdminRequest(
+        user_id="sa-1", bearer_token="t",
+        admin_context=SecurityAdminContext(user_id="sa-1", is_super_admin=True, admin_scopes=()))
+    try:
+        admin = TestClient(app, raise_server_exceptions=False)
+        page = admin.get("/v1/admin/performance-settings")
+        assert page.status_code == 200, page.text
+        assert all(item["shown"] for item in page.json()["items"])
+        assert {"activeMinutes", "duties", "peerComparison"} <= {i["key"] for i in page.json()["items"]}
+        assert admin.put("/v1/admin/performance-settings", json={"shown": {"nonsense": False}}).status_code == 422
+        changed = admin.put("/v1/admin/performance-settings",
+                            json={"shown": {"activeMinutes": False, "duties": False, "peerComparison": False}})
+        assert changed.status_code == 200, changed.text
+        assert {i["key"] for i in changed.json()["items"] if not i["shown"]} == {
+            "activeMinutes", "duties", "peerComparison"}
+        report = _build(s, tl)
+        assert "activeMinutes" not in [m["key"] for m in report["measures"]]
+        assert report["shows"] == {"duties": False, "peers": False}
+        assert report["peers"] == {} and report["schedules"] == [] and report["plannedDuties"] == []
+        mine = next(p for p in report["people"] if p["actorId"] == s.journey.actor_id)
+        assert "activeMinutes" not in mine["today"] and "activeMinutes" not in mine["series"]
+        assert mine["standing"]["filesUploaded"] is None and mine["dutiesWindow"] == {}
+        # Switched back on: shown again.
+        admin.put("/v1/admin/performance-settings", json={"shown": {"activeMinutes": True}})
+        assert "activeMinutes" in [m["key"] for m in _build(s, tl)["measures"]]
+    finally:
+        app.dependency_overrides.pop(require_super_admin_request, None)
+        _clear_settings(s)
+
+
+def test_journeys_closed_by_a_reviewer_count_on_the_reviewer(setup):
+    s = setup
+    reviewer, tl = f"rv-{uuid4().hex[:6]}", f"tl-{uuid4().hex[:6]}"
+    tt._role(s, reviewer, "REVIEWER", dealer=s.journey.dealer_id, outlet=s.journey.outlet_id)
+    tt._role(s, tl, "TL")
+    for _ in range(2):
+        tt._closure(s, tt._journey(s, str(s.journey.outlet_id), s.journey.actor_id), by=reviewer)
+    report = _build(s, tl)
+    assert "journeysClosed" in [m["key"] for m in report["measures"]]
+    people = {p["actorId"]: p for p in report["people"]}
+    assert people[reviewer]["today"]["journeysClosed"] == 2 and people[reviewer]["today"]["reviews"] == 0

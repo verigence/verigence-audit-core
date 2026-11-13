@@ -10,9 +10,10 @@ cash register, and some weekly; it should provision for all of those."
 
 For the day asked and the ``days`` before it (7 to 31), per person and per day:
 
-Output        filesUploaded, journeysUploaded (the PC who uploaded), tasksClosed (whoever
-              closed them), reviews (Booking / Delivery documents-reviewed marks, Journey
-              closures, and a TL's or PM's accept / reject of a closure)
+Output        filesUploaded, journeysUploaded (the PC who uploaded), journeysClosed (a PC's
+              delivery files closed; the Journeys a Reviewer, TL or PM closed), tasksClosed
+              (whoever closed them), reviews (Booking / Delivery documents-reviewed marks and
+              a TL's or PM's accept / reject of a closure)
 Quality       pagesRejected: pages of that day's uploads rejected on image quality
 Duties        every recurring task schedule of the Project (Daily Gate Pass today; a cash
               register or a weekly reconciliation appears on its own once its schedule is
@@ -42,10 +43,17 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import Connection, text
 
 from audit_core.authorization import AuthorizationError
-from audit_core.dependencies import get_connection, get_human_principal
+from audit_core.db import set_platform_super_admin_context
+from audit_core.dependencies import (
+    HumanAdminRequest,
+    get_connection,
+    get_human_principal,
+    require_super_admin_request,
+)
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
@@ -53,6 +61,7 @@ from audit_core.security_authorization import (
 )
 from audit_core.task_manager import known_names, normalise_role
 from audit_core.uc03_p2_access import authorize_p2
+from audit_core.uc03_p2_daily_report import delivery_files_closed
 from audit_core.uc03_p2_project_tracker import (
     _ADMIN_ROLES,
     _CLOSING_EVENTS,
@@ -75,6 +84,11 @@ _CACHE_SECONDS = 120.0
 MEASURES: tuple[dict[str, Any], ...] = (
     {"key": "filesUploaded", "label": "Files uploaded", "group": "OUTPUT", "roles": ["PC"]},
     {"key": "journeysUploaded", "label": "Journeys uploaded", "group": "OUTPUT", "roles": ["PC"]},
+    # Product owner 13 Nov 2026: "it should also have journeys closed". A PC's: their delivery
+    # files closed (all mandatory documents in, every document task closed); a Reviewer's, TL's or
+    # PM's: the Journeys they closed.
+    {"key": "journeysClosed", "label": "Journeys closed", "group": "OUTPUT",
+     "roles": ["PC", "REVIEWER", "TL", "PM", "EXECUTIVE"]},
     {"key": "reviews", "label": "Reviews", "group": "OUTPUT", "roles": ["REVIEWER", "TL", "PM", "EXECUTIVE"]},
     {"key": "tasksClosed", "label": "Tasks closed", "group": "OUTPUT",
      "roles": ["PC", "REVIEWER", "TL", "PM", "EXECUTIVE"]},
@@ -91,6 +105,23 @@ _LOWER = frozenset(m["key"] for m in MEASURES if m.get("lowerIsBetter"))
 PLANNED_DUTIES: tuple[dict[str, str], ...] = (
     {"title": "Cash register", "frequency": "DAILY"},
 )
+
+# What a SuperAdmin can switch off in the view (product owner 13 Nov 2026: "make the parameters
+# to be displayed configurable under Superadmin control, like utilization and all"): each
+# measure, the duties, and the comparison with peers. Anything not switched is shown.
+DUTIES_ITEM, PEERS_ITEM = "duties", "peerComparison"
+SETTING_ITEMS: tuple[dict[str, str], ...] = (
+    *({"key": m["key"], "label": m["label"], "group": m["group"]} for m in MEASURES),
+    {"key": DUTIES_ITEM, "label": "Daily and weekly duties", "group": "DUTIES"},
+    {"key": PEERS_ITEM, "label": "Comparison with peers", "group": "COMPARISON"},
+)
+
+
+def hidden_items(connection: Connection) -> set[str]:
+    """The items a SuperAdmin has switched off (one read of a table of a few rows)."""
+    return {str(r[0]) for r in connection.execute(
+        text("SELECT item_key FROM platform_ops.performance_settings WHERE NOT shown"))}
+
 
 # Within a tenth of the peers' median counts as "with peers".
 _BAND = 0.10
@@ -155,16 +186,26 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
           FROM auditcore.p2_stage_document_reviews
           WHERE tenant_id = :t AND reviewed_at_utc >= :s AND reviewed_at_utc < :e
           UNION ALL
-          SELECT closed_by_actor_id, (closed_at_utc AT TIME ZONE :tz)::date
-          FROM auditcore.p2_journey_closures
-          WHERE tenant_id = :t AND closed_at_utc >= :s AND closed_at_utc < :e
-          UNION ALL
           SELECT decided_by_actor_id, (decided_at_utc AT TIME ZONE :tz)::date
           FROM auditcore.p2_journey_closures
           WHERE tenant_id = :t AND decided_at_utc >= :s AND decided_at_utc < :e
             AND acceptance_status IN ('ACCEPTED', 'REJECTED')
         ) x GROUP BY 1, 2
     """), params).mappings().all(), "reviews")
+    put(connection.execute(text("""
+        SELECT closed_by_actor_id AS actor, (closed_at_utc AT TIME ZONE :tz)::date AS day, count(*) AS n
+        FROM auditcore.p2_journey_closures
+        WHERE tenant_id = :t AND closed_at_utc >= :s AND closed_at_utc < :e
+        GROUP BY 1, 2
+    """), params).mappings().all(), "journeysClosed")
+    # A PC's delivery files closed, by the Daily processing report's rule (one statement for the Project).
+    zone = _zone(tz)
+    for f in delivery_files_closed(connection, tenant_id=tenant_id, actor_id="", start=start, end=end, names={},
+                                   whole_project=True)["files"]:
+        if f["pcActorId"] and f["closedAtUtc"]:
+            day = datetime.fromisoformat(f["closedAtUtc"]).astimezone(zone).date().isoformat()
+            cell = values[str(f["pcActorId"])]["journeysClosed"]
+            cell[day] = cell.get(day, 0) + 1
     put(connection.execute(text("""
         SELECT actor_id AS actor, activity_date AS day, round(sum(active_seconds) / 60.0) AS n
         FROM auditcore.p2_user_activity_daily
@@ -329,40 +370,48 @@ def build_performance(
                 out[schedule_id] = total
         return out
 
+    hidden = hidden_items(connection)
+    shown_keys = [k for k in _KEYS if k not in hidden]
+    show_duties, show_peers = DUTIES_ITEM not in hidden, PEERS_ITEM not in hidden
     rows = []
     for actor in visible:
         person = people[actor]
         role = person["role"]
-        peer = peers.get(role, {})
-        today_values = {k: values.get(actor, {}).get(k, {}).get(target, 0) for k in _KEYS}
+        peer = peers.get(role, {}) if show_peers else {}
+        today_values = {k: values.get(actor, {}).get(k, {}).get(target, 0) for k in shown_keys}
         rows.append({
             "actorId": actor, "name": data["names"].get(actor), "role": role,
             "today": today_values,
-            "usual": {k: usual(actor, k) for k in _KEYS},
-            "series": {k: series(actor, k) for k in _KEYS},
+            "usual": {k: usual(actor, k) for k in shown_keys},
+            "series": {k: series(actor, k) for k in shown_keys},
             "standing": {k: standing(today_values[k], (peer.get("median") or {}).get(k), lower_is_better=k in _LOWER)
-                         if active(actor, target) else None for k in _KEYS},
+                         if active(actor, target) else None for k in shown_keys},
             "activeToday": active(actor, target),
-            "dutiesToday": duty_totals(actor, target),
-            "dutiesWindow": duty_totals(actor, None),
+            "dutiesToday": duty_totals(actor, target) if show_duties else {},
+            "dutiesWindow": duty_totals(actor, None) if show_duties else {},
         })
     rows.sort(key=lambda r: (r["role"] or "~", (r["name"] or r["actorId"]).lower()))
     return {
         "date": target, "first": first.isoformat(), "days": iso, "timezone": tz, "current": day == today,
         "asOfUtc": now.isoformat(), "own": own,
-        "measures": [dict(m) for m in MEASURES],
-        "schedules": data["schedules"],
+        "measures": [dict(m) for m in MEASURES if m["key"] in shown_keys],
+        "shows": {"duties": show_duties, "peers": show_peers},
+        "schedules": data["schedules"] if show_duties else [],
         "plannedDuties": [d for d in PLANNED_DUTIES
-                          if not any(s["title"].strip().lower() == d["title"].lower() for s in data["schedules"])],
-        "peers": peers,
+                          if not any(s["title"].strip().lower() == d["title"].lower() for s in data["schedules"])
+                          ] if show_duties else [],
+        "peers": {role: {**p, "median": {k: p["median"][k] for k in shown_keys},
+                         "usualMedian": {k: p["usualMedian"][k] for k in shown_keys}}
+                  for role, p in peers.items()} if show_peers else {},
         "people": rows,
         "notes": [
             ("Today's figure against the person's usual (their average over the earlier working days shown, "
             "Sundays left out) and against peers (the median, that day, of the people of the same role who "
             "did anything that day). Within a tenth of the median counts as 'with peers'."),
             ("Files and journeys uploaded count under the PC who uploaded them; tasks closed under whoever "
-            "closed them; reviews are Booking / Delivery documents-reviewed marks, Journey closures and a "
-            "TL's or PM's accept or reject of a closure. Pages rejected are pages of that day's uploads "
+            "closed them; journeys closed are a PC's delivery files closed (all mandatory documents in and "
+            "every document task closed) and the Journeys a Reviewer, TL or PM closed; reviews are Booking / "
+            "Delivery documents-reviewed marks and a TL's or PM's accept or reject of a closure. Pages rejected are pages of that day's uploads "
             "rejected on image quality (fewer is better)."),
             ("Duties are the recurring tasks of the Task Manager (daily, weekly or monthly): done on time, "
             "done late or not done. A new duty appears here once its schedule is created."),
@@ -397,3 +446,52 @@ def get_performance(
         day = datetime.now(UTC).astimezone(_zone(tz)).date()
     return build_performance(connection, tenant_id=tenant_id, actor_id=human_principal.subject, day=day,
                              days=days, admin=admin, own=not team)
+
+
+# --------------------------------------------------------------------------- SuperAdmin settings
+
+admin_router = APIRouter(tags=["performance-settings"])
+
+
+class PerformanceSettingsCommand(BaseModel):
+    shown: dict[str, bool]
+
+
+def _settings(connection: Connection) -> dict[str, Any]:
+    rows = {str(r["item_key"]): r for r in connection.execute(text(
+        "SELECT item_key, shown, updated_by, updated_at_utc FROM platform_ops.performance_settings")).mappings()}
+    return {"items": [
+        {**item, "shown": bool(rows[item["key"]]["shown"]) if item["key"] in rows else True,
+         "updatedAtUtc": rows[item["key"]]["updated_at_utc"].isoformat() if item["key"] in rows else None}
+        for item in SETTING_ITEMS]}
+
+
+@admin_router.get("/v1/admin/performance-settings")
+def get_performance_settings(
+    _admin: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    set_platform_super_admin_context(connection)
+    return _settings(connection)
+
+
+@admin_router.put("/v1/admin/performance-settings")
+def set_performance_settings(
+    command: PerformanceSettingsCommand,
+    admin: Annotated[HumanAdminRequest, Depends(require_super_admin_request)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Show or hide items of the Performance view, for every Project. Takes effect at once."""
+    known = {item["key"] for item in SETTING_ITEMS}
+    unknown = sorted(set(command.shown) - known)
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unknown item: {', '.join(unknown)}.")
+    set_platform_super_admin_context(connection)
+    for key, shown in command.shown.items():
+        connection.execute(text("""
+            INSERT INTO platform_ops.performance_settings (item_key, shown, updated_by)
+            VALUES (:k, :s, :by)
+            ON CONFLICT (item_key) DO UPDATE SET shown = EXCLUDED.shown, updated_by = EXCLUDED.updated_by,
+              updated_at_utc = now()
+        """), {"k": key, "s": shown, "by": admin.user_id})
+    return _settings(connection)
