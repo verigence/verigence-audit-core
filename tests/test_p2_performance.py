@@ -16,11 +16,13 @@ from audit_core.uc03_p2_object_keys import IST
 setup = gate_pass_tests.setup
 
 
-def _build(s, actor: str, *, own: bool = False, admin: bool = False, day: date | None = None):
+def _build(s, actor: str, *, own: bool = False, admin: bool = False, day: date | None = None,
+           section: str | None = None):
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
         return perf.build_performance(connection, tenant_id=s.journey.tenant_id, actor_id=actor,
-                                      day=day or datetime.now(IST).date(), own=own, admin=admin, use_cache=False)
+                                      day=day or datetime.now(IST).date(), own=own, admin=admin, use_cache=False,
+                                      section=section)
 
 
 def _uploads(s, actor: str, journey: str, files: int, at: datetime | None = None):
@@ -170,7 +172,7 @@ def test_a_super_admin_chooses_what_each_role_sees(setup):
         for_tl, for_pm = _build(s, tl), _build(s, pm)
         assert "activeMinutes" not in [m["key"] for m in for_tl["measures"]]
         assert "efficiency" not in for_tl and "pending" not in for_tl
-        assert [x["key"] for x in for_tl["sections"]] == ["flow", "trend", "duties"]
+        assert [x["key"] for x in for_tl["sections"]] == ["flow", "tasks", "trend", "duties", "report"]
         assert "activeMinutes" in [m["key"] for m in for_pm["measures"]]
         assert "efficiency" in for_pm and "pending" in for_pm
         mine = next(p for p in for_tl["people"] if p["actorId"] == s.journey.actor_id)
@@ -253,7 +255,8 @@ def test_pending_work_efficiency_delinquencies_and_bookings_deliveries(setup):
     tl = f"tl-{uuid4().hex[:6]}"
     tt._role(s, tl, "TL")
     report = _build(s, tl)
-    assert [x["key"] for x in report["sections"]] == ["pending", "flow", "trend", "efficiency", "duties"]
+    assert [x["key"] for x in report["sections"]] == ["pending", "flow", "tasks", "trend", "efficiency", "duties",
+                                                      "report"]
 
     pending = next(p for p in report["pending"]["people"] if p["actorId"] == me)["counts"]
     assert pending["deliveryFilesOpen"][2] == 1                       # the one uploaded five days ago
@@ -271,7 +274,43 @@ def test_pending_work_efficiency_delinquencies_and_bookings_deliveries(setup):
     flow = next(o for o in report["flow"]["outlets"] if o["outletId"] == outlet)["days"]
     assert flow[today.isoformat()]["deliveries"] == 2 and flow[today.isoformat()]["bookings"] == 1
 
+    # Tasks: new in the period, closed, and open / overdue now.
+    mine = next(p for p in report["tasks"]["people"] if p["actorId"] == me)
+    assert sum(mine["raised"]) >= 2 and mine["open"] >= 1 and mine["overdue"] >= 1
+
+    # The daily report of a person: what they did in the period, line by line.
+    line = next(p for p in report["report"]["people"] if p["actorId"] == me)
+    assert line["bookingFiles"] >= 1 and line["deliveryFiles"] >= 1
+    assert line["duties"] and line["duties"][0]["missed"] == 1
+
+    # Only the tab that is open is read and sent.
+    only = _build(s, tl, section="tasks")
+    assert "tasks" in only and "pending" not in only and "report" not in only and "flow" not in only
+
     # A PC's own view: their own pending work and delinquencies, no outlets.
     own = _build(s, me, own=True)
     assert own["pending"]["outlets"] == [] and [p["actorId"] for p in own["pending"]["people"]] == [me]
     assert "flow" not in own
+
+
+def test_backlog_counts_unreconciled_payments_and_a_date_range_is_accepted(setup):
+    s = setup
+    tt._exec(s, """
+        INSERT INTO auditcore.audit_findings (tenant_id, journey_id, finding_type_code, severity, finding_status, title,
+          description, created_by_actor_id, stage_code, rule_key)
+        VALUES (:t, :j, 'PAYMENT_UNVERIFIED', 'MEDIUM', 'OPEN', 'Payment not matched', 'x', 'system', 'DELIVERY', :k)
+    """, j=s.journey.journey_id, k=f"PAYMENT_BANK_UNMATCHED:{uuid4()}")
+    tl = f"tl-{uuid4().hex[:6]}"
+    tt._role(s, tl, "TL")
+    report = _build(s, tl, section="pending")
+    at_outlet = next(o for o in report["pending"]["outlets"] if o["outletId"] == str(s.journey.outlet_id))["counts"]
+    assert sum(at_outlet["paymentsNotReconciled"]) == 1
+    assert "paymentsNotReconciled" in [k["key"] for k in report["pending"]["kinds"]]
+    s.acting["subject"] = tl
+    today = datetime.now(IST).date()
+    url = f"/p2/v1/tenants/{s.journey.tenant_id}/reports/performance"
+    body = s.client.get(url, params={"from": (today - timedelta(days=2)).isoformat(), "date": today.isoformat(),
+                                     "section": "flow"})
+    assert body.status_code == 200, body.text
+    assert len(body.json()["days"]) == 3 and "flow" in body.json() and "pending" not in body.json()
+    assert s.client.get(url, params={"from": (today + timedelta(days=1)).isoformat()}).status_code == 422

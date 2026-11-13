@@ -77,7 +77,7 @@ from audit_core.uc03_p2_project_tracker import (
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-performance"])
 
 _READ_PERMISSION = "audit.journey.read"
-MIN_DAYS, MAX_DAYS, DEFAULT_DAYS = 7, 42, 14  # 42: six whole weeks for the week-to-week view
+MIN_DAYS, MAX_DAYS, DEFAULT_DAYS = 1, 92, 14  # a date range of a day up to about three months
 _CACHE_SECONDS = 120.0
 
 # The measures, in the order shown. ``roles``: whose work it is (the screen shows it for them).
@@ -128,11 +128,13 @@ DUTIES_ITEM, PEERS_ITEM = "duties", "peerComparison"
 # The sections of the screen (product owner 13 Nov 2026: pending work, PC efficiency, day to day
 # and week to week, delinquencies, bookings and deliveries).
 SECTIONS: tuple[dict[str, str], ...] = (
-    {"key": "pending", "label": "Pending work"},
+    {"key": "pending", "label": "Backlog"},
     {"key": "flow", "label": "Bookings and deliveries"},
+    {"key": "tasks", "label": "Tasks"},
     {"key": "trend", "label": "Day to day, week to week"},
     {"key": "efficiency", "label": "PC efficiency"},
     {"key": DUTIES_ITEM, "label": "Delinquencies (daily and weekly duties)"},
+    {"key": "report", "label": "Daily report"},
 )
 SETTING_ITEMS: tuple[dict[str, str], ...] = (
     *({"key": x["key"], "label": x["label"], "group": "SECTION"} for x in SECTIONS),
@@ -324,12 +326,7 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
             person["dealers"].add(str(r["dealer_id"]))
         else:
             person["outlets"].add(str(r["outlet_id"]))
-    from audit_core import uc03_p2_team_insights
-
-    insights = uc03_p2_team_insights.collect(connection, tenant_id=tenant_id, first=first, last=last, start=start,
-                                             end=end, tz=tz, zone=zone, now=now)
     return {"values": values, "duties": duties, "by_outlet": by_outlet, "outlet_duties": outlet_duties,
-            "insights": insights,
             "schedules": schedules, "people": people,
             "names": known_names(connection, tenant_id=tenant_id)}
 
@@ -351,45 +348,70 @@ def _cached(connection: Connection, *, tenant_id: str, first: date, last: date, 
     return data
 
 
-def _sections(data: dict[str, Any], *, rows: list[dict[str, Any]], outlets: list[dict[str, Any]], own: bool,
-              hidden: set[str], iso: list[str], people: dict[str, Any]) -> dict[str, Any]:
-    """The five things a lead manages by, for the people and outlets the caller reads, leaving out
-    what a SuperAdmin has switched off for their role."""
+def _sections(part: Any, data: dict[str, Any], *, rows: list[dict[str, Any]], outlets: list[dict[str, Any]],
+              own: bool, hidden: set[str], iso: list[str], people: dict[str, Any], only: str | None) -> dict[str, Any]:
+    """What a lead manages by, for the people and outlets the caller reads, leaving out what a
+    SuperAdmin has switched off for their role. ``only``: one section (the tab that is open), so
+    nothing else is read or sent."""
     from audit_core.uc03_p2_team_insights import BUCKETS, PENDING_KINDS
 
-    ins = data["insights"]
     values, duties = data["values"], data["duties"]
     visible = [r["actorId"] for r in rows]
     names = {r["actorId"]: r["name"] for r in rows}
     out: dict[str, Any] = {"sections": [x for x in SECTIONS if x["key"] not in hidden]}
 
-    if "pending" not in hidden:
-        # A person's pending work is their own; an outlet's is everything at the outlet.
+    def wanted(key: str) -> bool:
+        return key not in hidden and (only is None or only == key)
+
+    def place(o: dict[str, Any]) -> dict[str, Any]:
+        return {"outletId": str(o["outlet_id"]), "outletName": o["outlet_name"], "dealerId": str(o["dealer_id"]),
+                "dealerName": o["dealer_name"]}
+
+    if wanted("pending"):
+        backlog = part("backlog")
+        # A person's backlog is their own; an outlet's is everything at the outlet.
         kinds = [k for k in PENDING_KINDS if not own or k["key"] not in ("awaitingReview",)]
         out["pending"] = {
             "kinds": kinds, "buckets": list(BUCKETS),
-            "outlets": [] if own else [
-                {"outletId": str(o["outlet_id"]), "outletName": o["outlet_name"], "dealerId": str(o["dealer_id"]),
-                 "dealerName": o["dealer_name"], "counts": ins["pendingByOutlet"].get(str(o["outlet_id"]), {})}
-                for o in outlets],
+            "outlets": [] if own else [{**place(o), "counts": backlog["byOutlet"].get(str(o["outlet_id"]), {})}
+                                       for o in outlets],
             "people": [{"actorId": a, "name": names[a], "role": people[a]["role"],
-                        "counts": ins["pendingByPerson"].get(a, {})} for a in visible],
+                        "counts": backlog["byPerson"].get(a, {})} for a in visible],
         }
 
-    if "flow" not in hidden and not own:
+    if wanted("flow") and not own:
+        flow = part("flow")
         out["flow"] = {"outlets": [
-            {"outletId": str(o["outlet_id"]), "outletName": o["outlet_name"], "dealerId": str(o["dealer_id"]),
-             "dealerName": o["dealer_name"],
-             "days": {d: ins["flow"].get(str(o["outlet_id"]), {}).get(d) for d in iso
-                      if ins["flow"].get(str(o["outlet_id"]), {}).get(d)}}
+            {**place(o), "days": {d: flow.get(str(o["outlet_id"]), {}).get(d) for d in iso
+                                  if flow.get(str(o["outlet_id"]), {}).get(d)}}
             for o in outlets]}
 
-    if "efficiency" not in hidden:
+    if wanted("tasks"):
+        raised, backlog = part("tasks"), part("backlog")
+
+        def open_now(counts: dict[str, list[int]]) -> dict[str, int]:
+            return {"open": sum(counts.get("tasksOpen", [])), "overdue": sum(counts.get("tasksOverdue", []))}
+
+        by_outlet = data["by_outlet"]
+        out["tasks"] = {
+            "outlets": [] if own else [
+                {**place(o), "raised": [raised["raisedByOutlet"].get(str(o["outlet_id"]), {}).get(d, 0) for d in iso],
+                 "closed": [by_outlet.get(str(o["outlet_id"]), {}).get("tasksClosed", {}).get(d, 0) for d in iso],
+                 **open_now(backlog["byOutlet"].get(str(o["outlet_id"]), {}))} for o in outlets],
+            "people": [
+                {"actorId": a, "name": names[a], "role": people[a]["role"],
+                 "raised": [raised["raisedByPerson"].get(a, {}).get(d, 0) for d in iso],
+                 "closed": [values.get(a, {}).get("tasksClosed", {}).get(d, 0) for d in iso],
+                 **open_now(backlog["byPerson"].get(a, {}))} for a in visible],
+        }
+
+    if wanted("efficiency"):
+        eff = part("efficiency")
         table = []
         for a in visible:
             if people[a]["role"] != "PC":
                 continue
-            e = ins["efficiency"].get(a, {})
+            e = eff.get(a, {})
             v = values.get(a, {})
             pages = sum(v.get("pagesUploaded", {}).get(d, 0) for d in iso)
             rejected = sum(v.get("pagesRejected", {}).get(d, 0) for d in iso)
@@ -410,24 +432,46 @@ def _sections(data: dict[str, Any], *, rows: list[dict[str, Any]], outlets: list
             })
         out["efficiency"] = {"people": table}
 
-    if DUTIES_ITEM not in hidden:
+    def duty_lines(actor: str) -> list[dict[str, Any]]:
         lines = []
-        for a in visible:
-            for schedule_id, by_day in duties.get(a, {}).items():
-                total = {"due": 0, "onTime": 0, "late": 0, "notDone": 0, "pending": 0}
-                missed, late = [], []
-                for d in sorted(by_day):
-                    cell = by_day[d]
-                    for k in total:
-                        total[k] += cell[k]
-                    if cell["notDone"]:
-                        missed.append(d)
-                    if cell["late"]:
-                        late.append(d)
-                if total["due"]:
-                    lines.append({"actorId": a, "name": names[a], "role": people[a]["role"], "scheduleId": schedule_id,
-                                  **total, "missedDates": missed, "lateDates": late})
-        out["delinquency"] = {"lines": lines}
+        for schedule_id, by_day in duties.get(actor, {}).items():
+            total = {"due": 0, "onTime": 0, "late": 0, "notDone": 0, "pending": 0}
+            missed, late = [], []
+            for d in sorted(by_day):
+                cell = by_day[d]
+                for k in total:
+                    total[k] += cell[k]
+                if cell["notDone"]:
+                    missed.append(d)
+                if cell["late"]:
+                    late.append(d)
+            if total["due"]:
+                lines.append({"actorId": actor, "name": names[actor], "role": people[actor]["role"],
+                              "scheduleId": schedule_id, **total, "missedDates": missed, "lateDates": late})
+        return lines
+
+    if wanted(DUTIES_ITEM):
+        out["delinquency"] = {"lines": [line for a in visible for line in duty_lines(a)]}
+
+    if wanted("report"):
+        rep = part("report")
+
+        def total(actor: str, key: str, source: dict[str, Any]) -> int:
+            return int(sum(source.get(actor, {}).get(key, {}).get(d, 0) for d in iso))
+
+        out["report"] = {"people": [
+            {"actorId": a, "name": names[a], "role": people[a]["role"],
+             "bookingFiles": total(a, "bookingFiles", rep["counts"]),
+             "deliveryFiles": total(a, "deliveryFiles", rep["counts"]),
+             "filesReviewed": total(a, "reviews", values), "journeysClosed": total(a, "journeysClosed", values),
+             "sentBack": total(a, "sentBack", rep["counts"]), "breach": total(a, "breach", rep["counts"]),
+             "noBreach": total(a, "noBreach", rep["counts"]),
+             "paymentsVerified": total(a, "paymentsVerified", rep["counts"]),
+             "tasksClosed": total(a, "tasksClosed", values),
+             "duties": [{"scheduleId": x["scheduleId"], "due": x["due"], "done": x["onTime"] + x["late"],
+                         "missed": x["notDone"]} for x in duty_lines(a)] if DUTIES_ITEM not in hidden else [],
+             "other": [t for d in iso for t in rep["other"].get(a, {}).get(d, [])][:40]}
+            for a in visible]}
     return out
 
 
@@ -437,6 +481,38 @@ def _caller_roles(connection: Connection, tenant_id: str, actor_id: str) -> list
         WHERE tenant_id = :t AND security_actor_id = :a AND assignment_status = 'ACTIVE'
           AND effective_from <= now() AND (effective_to IS NULL OR effective_to >= now())
     """), {"t": tenant_id, "a": actor_id})]
+
+
+def _part(connection: Connection, name: str, *, tenant_id: str, first: date, last: date, tz: str, now: datetime,
+          use_cache: bool) -> Any:
+    """One part of the insights (backlog, efficiency, flow, tasks, report), read only when a
+    section that needs it is asked for, and kept two minutes like the rest (product owner 13 Nov
+    2026: "so many in one screen will kill the CPU and RAM, I don't want all to be shown in one")."""
+    from audit_core import uc03_p2_team_insights as insights
+
+    key = (tenant_id, f"{name}:{first.isoformat()}", last.isoformat())
+    if use_cache:
+        with _cache_lock:
+            hit = _cache.get(key)
+            if hit and _time.monotonic() - hit[0] < _CACHE_SECONDS:
+                return hit[1]
+    start, end = period_bounds(first, last, tz)
+    zone = _zone(tz)
+    if name == "backlog":
+        data = insights.backlog(connection, tenant_id=tenant_id, zone=zone, now=now)
+    elif name == "efficiency":
+        data = insights.efficiency(connection, tenant_id=tenant_id, start=start, end=end, now=now)
+    elif name == "flow":
+        data = insights.flow(connection, tenant_id=tenant_id, first=first, last=last, start=start, end=end, tz=tz,
+                             zone=zone, now=now)
+    elif name == "tasks":
+        data = insights.tasks(connection, tenant_id=tenant_id, start=start, end=end, tz=tz)
+    else:
+        data = insights.report(connection, tenant_id=tenant_id, start=start, end=end, tz=tz)
+    if use_cache:
+        with _cache_lock:
+            _cache[key] = (_time.monotonic(), data)
+    return data
 
 
 def standing(value: float, median: float | None, *, lower_is_better: bool = False) -> str | None:
@@ -453,7 +529,9 @@ def standing(value: float, median: float | None, *, lower_is_better: bool = Fals
 def build_performance(
     connection: Connection, *, tenant_id: str, actor_id: str, day: date, days: int = DEFAULT_DAYS,
     admin: bool = False, own: bool = False, now: datetime | None = None, use_cache: bool = True,
+    section: str | None = None,
 ) -> dict[str, Any]:
+    """``section``: the tab that is open -- only its part is read and sent. None: everything."""
     now = now or datetime.now(UTC)
     tz = connection.execute(
         text("SELECT timezone_name FROM auditcore.projects WHERE tenant_id = :t"), {"t": tenant_id},
@@ -625,7 +703,9 @@ def build_performance(
                          "usualMedian": {k: p["usualMedian"][k] for k in shown_keys}}
                   for role, p in peers.items()} if show_peers else {},
         "people": rows,
-        **_sections(data, rows=rows, outlets=outlets, own=own, hidden=hidden, iso=iso, people=people),
+        **_sections(lambda name: _part(connection, name, tenant_id=tenant_id, first=first, last=day, tz=tz, now=now,
+                                        use_cache=use_cache),
+                    data, rows=rows, outlets=outlets, own=own, hidden=hidden, iso=iso, people=people, only=section),
         "unitMeasures": [{k: v for k, v in m.items() if k != "setting"} for m in unit_measures],
         "outlets": outlet_units,
         "dealers": sorted(dealer_units, key=lambda d: (d["dealerName"] or "").lower()),
@@ -658,6 +738,8 @@ def get_performance(
     connection: Annotated[Connection, Depends(get_connection)],
     day: Annotated[date | None, Query(alias="date")] = None,
     days: Annotated[int, Query(ge=MIN_DAYS, le=MAX_DAYS)] = DEFAULT_DAYS,
+    first: Annotated[date | None, Query(alias="from")] = None,
+    section: Annotated[str | None, Query(pattern=r"^(pending|flow|tasks|trend|efficiency|duties|report)$")] = None,
 ) -> dict[str, Any]:
     access = authorize_p2(
         connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,
@@ -672,8 +754,13 @@ def get_performance(
             text("SELECT timezone_name FROM auditcore.projects WHERE tenant_id = :t"), {"t": tenant_id},
         ).scalar_one_or_none()
         day = datetime.now(UTC).astimezone(_zone(tz)).date()
+    if first is not None:
+        # A date range (product owner 13 Nov 2026: "first it should have date range"): from .. date.
+        if first > day:
+            raise HTTPException(status_code=422, detail="'from' is after 'date'.")
+        days = min(MAX_DAYS, (day - first).days + 1)
     return build_performance(connection, tenant_id=tenant_id, actor_id=human_principal.subject, day=day,
-                             days=days, admin=admin, own=not team)
+                             days=days, admin=admin, own=not team, section=section)
 
 
 # --------------------------------------------------------------------------- SuperAdmin settings

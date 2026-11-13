@@ -27,15 +27,18 @@ from typing import Any
 from sqlalchemy import Connection, text
 
 PENDING_KINDS: tuple[dict[str, str], ...] = (
+    {"key": "deliveriesNotUploaded", "label": "Deliveries not uploaded"},
     {"key": "deliveryFilesOpen", "label": "Delivery files not closed"},
     {"key": "missingDocuments", "label": "Held by missing documents"},
     {"key": "tasksOpen", "label": "Open tasks (PC)"},
     {"key": "tasksOverdue", "label": "Overdue tasks"},
+    {"key": "paymentsNotReconciled", "label": "Payments not reconciled"},
     {"key": "pagesToReupload", "label": "Pages to upload again"},
     {"key": "awaitingReview", "label": "Awaiting Reviewer"},
     {"key": "awaitingDecision", "label": "Awaiting TL / PM"},
 )
 BUCKETS = ("Today", "1-3 days", "4-7 days", "Older")
+_REGISTER_BACK_DAYS = 30  # deliveries on a gate register this far back still count as "not uploaded"
 _LOOK_BACK_DAYS = 120  # work older than this is not "pending": it is stale and belongs to a clean-up
 _OPEN_TASK_END = ("VERIFIED_COMPLETE", "CANCELLED", "FAILED", "DEAD_LETTER")
 
@@ -48,24 +51,11 @@ def _blank() -> dict[str, list[int]]:
     return {k["key"]: [0, 0, 0, 0] for k in PENDING_KINDS}
 
 
-def collect(connection: Connection, *, tenant_id: str, first: date, last: date, start: datetime, end: datetime,
-            tz: str, zone: Any, now: datetime) -> dict[str, Any]:
+def _delivery_state(connection: Connection, tenant_id: str, now: datetime) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Every Journey with a delivery upload (its first one, outlet, PC, documents still missing) and
+    the delivery files closed so far (the PC's rule)."""
     from audit_core.uc03_p2_daily_report import delivery_files_closed
-    from audit_core.uc03_p2_my_work import gate_register
 
-    today = now.astimezone(zone).date()
-    since = now - timedelta(days=_LOOK_BACK_DAYS)
-    by_outlet: dict[str, dict[str, list[int]]] = defaultdict(_blank)
-    by_person: dict[str, dict[str, list[int]]] = defaultdict(_blank)
-
-    def add(kind: str, outlet: Any, person: Any, at: datetime | None) -> None:
-        b = bucket((today - at.astimezone(zone).date()).days) if at else 3
-        if outlet:
-            by_outlet[str(outlet)][kind][b] += 1
-        if person:
-            by_person[str(person)][kind][b] += 1
-
-    # ---- delivery files: first delivery upload per Journey, and which are closed
     delivery = {str(r["journey_id"]): dict(r) for r in connection.execute(text("""
         SELECT q.journey_id, MIN(q.created_at_utc) AS first_upload, j.outlet_id, j.created_by_actor_id AS pc,
                COALESCE(jsonb_array_length(g.details->'missing'), 0) AS missing
@@ -78,6 +68,67 @@ def collect(connection: Connection, *, tenant_id: str, first: date, last: date, 
     """), {"t": tenant_id}).mappings()}
     closed_ever = delivery_files_closed(connection, tenant_id=tenant_id, actor_id="", names={},
                                         start=datetime(2000, 1, 1, tzinfo=UTC), end=now, whole_project=True)["files"]
+    return delivery, closed_ever
+
+
+def _register_outlets(connection: Connection, tenant_id: str) -> tuple[list[dict[str, Any]], date | None]:
+    """The outlets with a PC mapped (those that owe a gate register), and the day the register started."""
+    outlets = [dict(r) for r in connection.execute(text("""
+        SELECT o.outlet_id, o.outlet_classification FROM auditcore.dealer_outlets o
+        WHERE o.tenant_id = :t AND EXISTS (
+          SELECT 1 FROM auditcore.business_assignments ba
+          WHERE ba.tenant_id = o.tenant_id AND ba.outlet_id = o.outlet_id AND upper(ba.business_role_code) = 'PC'
+            AND ba.assignment_status = 'ACTIVE' AND ba.effective_from <= now()
+            AND (ba.effective_to IS NULL OR ba.effective_to >= now()))
+    """), {"t": tenant_id}).mappings()]
+    starts = connection.execute(text(
+        "SELECT starts_on FROM auditcore.p2_task_schedules WHERE tenant_id = :t AND system_kind = 'GATE_PASS'"),
+        {"t": tenant_id}).scalar_one_or_none()
+    return outlets, starts
+
+
+def backlog(connection: Connection, *, tenant_id: str, zone: Any, now: datetime) -> dict[str, Any]:
+    """What is waiting right now, by age, per outlet and per person."""
+    from audit_core.uc03_p2_my_work import gate_register
+
+    today = now.astimezone(zone).date()
+    since = now - timedelta(days=_LOOK_BACK_DAYS)
+    by_outlet: dict[str, dict[str, list[int]]] = defaultdict(_blank)
+    by_person: dict[str, dict[str, list[int]]] = defaultdict(_blank)
+
+    def add(kind: str, outlet: Any, person: Any, at: datetime | date | None, n: int = 1) -> None:
+        if at is None:
+            b = 3
+        else:
+            day = at.astimezone(zone).date() if isinstance(at, datetime) else at
+            b = bucket((today - day).days)
+        if outlet:
+            by_outlet[str(outlet)][kind][b] += n
+        if person:
+            by_person[str(person)][kind][b] += n
+
+    # ---- deliveries on the gate register, intimated to the PC and not uploaded (last 30 days)
+    outlets, starts = _register_outlets(connection, tenant_id)
+    first = today - timedelta(days=_REGISTER_BACK_DAYS)
+    if outlets and starts is not None and max(first, starts) <= today:
+        for oid, days in gate_register(connection, tenant_id, outlets, max(first, starts), today, now=now).items():
+            for d in days:
+                waiting = int(d["pendingWithPc"] or 0)
+                if d["gatePassId"] is not None and waiting > 0:
+                    add("deliveriesNotUploaded", oid, d["pcActorId"], date.fromisoformat(d["date"]), waiting)
+
+    # ---- payments not reconciled with the bank statement (open PAYMENT_UNVERIFIED findings)
+    for r in connection.execute(text("""
+        SELECT j.outlet_id AS outlet, j.created_by_actor_id AS person, f.created_at_utc
+        FROM auditcore.audit_findings f
+        JOIN auditcore.journeys j ON j.tenant_id = f.tenant_id AND j.journey_id = f.journey_id
+        WHERE f.tenant_id = :t AND f.finding_type_code = 'PAYMENT_UNVERIFIED' AND f.finding_status IN ('OPEN', 'ACKNOWLEDGED')
+          AND f.created_at_utc >= :since
+    """), {"t": tenant_id, "since": since}).mappings():
+        add("paymentsNotReconciled", r["outlet"], r["person"], r["created_at_utc"])
+
+    delivery, closed_ever = _delivery_state(connection, tenant_id, now)
+    # ---- delivery files uploaded and not closed
     closed_ids = {f["journeyId"] for f in closed_ever}
     reviewer_closed = {str(r[0]) for r in connection.execute(text(
         "SELECT journey_id FROM auditcore.p2_journey_closures WHERE tenant_id = :t AND acceptance_status <> 'REJECTED'"),
@@ -141,7 +192,12 @@ def collect(connection: Connection, *, tenant_id: str, first: date, last: date, 
     """), {"t": tenant_id}).mappings():
         add("awaitingDecision", r["outlet"], r["person"], r["closed_at_utc"])
 
-    # ---- efficiency of each PC over the window
+    return {"byOutlet": by_outlet, "byPerson": by_person}
+
+
+def efficiency(connection: Connection, *, tenant_id: str, start: datetime, end: datetime, now: datetime) -> dict[str, Any]:
+    """Per PC over the window: delivery files started and closed, days to close, tasks in time."""
+    delivery, closed_ever = _delivery_state(connection, tenant_id, now)
     eff: dict[str, dict[str, float]] = defaultdict(lambda: {
         "deliveryStarted": 0, "deliveryClosed": 0, "daysToCloseSum": 0.0, "tasksWithDue": 0, "tasksInTime": 0})
     for d in delivery.values():
@@ -168,12 +224,20 @@ def collect(connection: Connection, *, tenant_id: str, first: date, last: date, 
         cell["tasksWithDue"] += int(r["n"])
         cell["tasksInTime"] += int(r["in_time"])
 
-    # ---- bookings and deliveries per outlet and day; the gate register
+    return eff
+
+
+def flow(connection: Connection, *, tenant_id: str, first: date, last: date, start: datetime, end: datetime,
+         tz: str, zone: Any, now: datetime) -> dict[str, Any]:
+    """Bookings and deliveries uploaded per outlet and day; the gate register of each day."""
+    from audit_core.uc03_p2_my_work import gate_register
+
+    today = now.astimezone(zone).date()
     flow: dict[str, dict[str, dict[str, int]]] = defaultdict(dict)
 
     def cell_of(outlet: Any, day: str) -> dict[str, int]:
         return flow[str(outlet)].setdefault(day, {"bookings": 0, "deliveries": 0, "onRegister": 0, "inTool": 0,
-                                                    "notNotified": 0, "registerMissing": 0})
+                                                    "notNotified": 0, "notUploaded": 0, "registerMissing": 0})
 
     for r in connection.execute(text("""
         SELECT j.outlet_id AS outlet, x.day, count(*) FILTER (WHERE x.delivery) AS deliveries,
@@ -194,17 +258,7 @@ def collect(connection: Connection, *, tenant_id: str, first: date, last: date, 
         c = cell_of(r["outlet"], r["day"].isoformat())
         c["bookings"] += int(r["bookings"])
         c["deliveries"] += int(r["deliveries"])
-    outlets = [dict(r) for r in connection.execute(text("""
-        SELECT o.outlet_id, o.outlet_classification FROM auditcore.dealer_outlets o
-        WHERE o.tenant_id = :t AND EXISTS (
-          SELECT 1 FROM auditcore.business_assignments ba
-          WHERE ba.tenant_id = o.tenant_id AND ba.outlet_id = o.outlet_id AND upper(ba.business_role_code) = 'PC'
-            AND ba.assignment_status = 'ACTIVE' AND ba.effective_from <= now()
-            AND (ba.effective_to IS NULL OR ba.effective_to >= now()))
-    """), {"t": tenant_id}).mappings()]
-    starts = connection.execute(text(
-        "SELECT starts_on FROM auditcore.p2_task_schedules WHERE tenant_id = :t AND system_kind = 'GATE_PASS'"),
-        {"t": tenant_id}).scalar_one_or_none()
+    outlets, starts = _register_outlets(connection, tenant_id)
     if outlets and starts is not None and max(first, starts) <= min(last, today):
         for oid, days in gate_register(connection, tenant_id, outlets, max(first, starts), min(last, today),
                                        now=now).items():
@@ -216,4 +270,88 @@ def collect(connection: Connection, *, tenant_id: str, first: date, last: date, 
                 c["onRegister"] += int(d["total"] or 0)
                 c["inTool"] += int(d["uploadedInTool"] or 0)
                 c["notNotified"] += int(d["notIntimated"] or 0)
-    return {"pendingByOutlet": by_outlet, "pendingByPerson": by_person, "efficiency": eff, "flow": flow}
+                c["notUploaded"] += max(0, int(d["pendingWithPc"] or 0))
+    return flow
+
+
+def tasks(connection: Connection, *, tenant_id: str, start: datetime, end: datetime, tz: str) -> dict[str, Any]:
+    """New tasks per day: raised in the window, on the person they are for (the assignee, else the
+    Journey's PC) and at their outlet."""
+    by_person: dict[str, dict[str, int]] = defaultdict(dict)
+    by_outlet: dict[str, dict[str, int]] = defaultdict(dict)
+    for r in connection.execute(text("""
+        SELECT COALESCE(t.assigned_actor_id, j.created_by_actor_id) AS person, COALESCE(t.outlet_id, j.outlet_id) AS outlet,
+               (t.created_at_utc AT TIME ZONE :tz)::date AS day, count(*) AS n
+        FROM auditcore.p2_tasks t
+        LEFT JOIN auditcore.journeys j ON j.tenant_id = t.tenant_id AND j.journey_id = t.journey_id
+        WHERE t.tenant_id = :t AND t.created_at_utc >= :s AND t.created_at_utc < :e AND t.task_status <> 'CANCELLED'
+        GROUP BY 1, 2, 3
+    """), {"t": tenant_id, "s": start, "e": end, "tz": tz}).mappings():
+        day = r["day"].isoformat()
+        for owner, key in ((by_person, r["person"]), (by_outlet, r["outlet"])):
+            if key:
+                owner[str(key)][day] = owner[str(key)].get(day, 0) + int(r["n"])
+    return {"raisedByPerson": by_person, "raisedByOutlet": by_outlet}
+
+
+
+# The lines of a person's daily report that come from what they did on tasks.
+_REPORT_EVENTS = {"CONFIRM_BREACH": "breach", "MARK_FALSE_POSITIVE": "noBreach", "REJECT": "sentBack",
+                  "REJECT_CORRECTION": "sentBack", "REQUEST_CLARIFICATION": "sentBack"}
+
+
+def report(connection: Connection, *, tenant_id: str, start: datetime, end: datetime, tz: str) -> dict[str, Any]:
+    """Per person and day, for the daily report (product owner 13 Nov 2026, from a Team Lead's own
+    daily reporting): booking and delivery files updated, breach / no breach / sent back, payments
+    verified, and the Task Manager tasks they completed (their titles: the "other" work)."""
+    counts: dict[str, dict[str, dict[str, int]]] = defaultdict(lambda: defaultdict(dict))
+    other: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+
+    def put(person: Any, day: Any, key: str, n: int) -> None:
+        if person and n:
+            cell = counts[str(person)][key]
+            cell[day.isoformat()] = cell.get(day.isoformat(), 0) + int(n)
+
+    params = {"t": tenant_id, "s": start, "e": end, "tz": tz}
+    for r in connection.execute(text("""
+        SELECT x.person, x.day, count(*) FILTER (WHERE x.delivery) AS deliveries,
+               count(*) FILTER (WHERE NOT x.delivery) AS bookings
+        FROM (
+          SELECT ub.uploaded_by_actor_id AS person, ub.journey_id, (ub.created_at_utc AT TIME ZONE :tz)::date AS day,
+                 COALESCE(bool_or(q.business_stage = 'DELIVERY'), false) AS delivery
+          FROM auditcore.p2_upload_batches ub
+          LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id = ub.tenant_id AND q.batch_id = ub.batch_id
+          WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
+            AND ub.batch_status <> 'AWAITING_UPLOAD'
+            AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
+          GROUP BY 1, 2, 3
+        ) x GROUP BY 1, 2
+    """), params).mappings():
+        put(r["person"], r["day"], "bookingFiles", r["bookings"])
+        put(r["person"], r["day"], "deliveryFiles", r["deliveries"])
+    for r in connection.execute(text("""
+        SELECT actor_id AS person, (created_at_utc AT TIME ZONE :tz)::date AS day, event_type, count(*) AS n
+        FROM auditcore.p2_task_events
+        WHERE tenant_id = :t AND created_at_utc >= :s AND created_at_utc < :e AND actor_id IS NOT NULL
+          AND event_type = ANY(:events)
+        GROUP BY 1, 2, 3
+    """), {**params, "events": sorted(_REPORT_EVENTS)}).mappings():
+        put(r["person"], r["day"], _REPORT_EVENTS[r["event_type"]], r["n"])
+    for r in connection.execute(text("""
+        SELECT verified_by_actor_id AS person, (occurred_at_utc AT TIME ZONE :tz)::date AS day, count(*) AS n
+        FROM auditcore.payment_verification_events
+        WHERE tenant_id = :t AND occurred_at_utc >= :s AND occurred_at_utc < :e
+          AND upper(COALESCE(verified_by_role_code, '')) <> 'SYSTEM'
+        GROUP BY 1, 2
+    """), params).mappings():
+        put(r["person"], r["day"], "paymentsVerified", r["n"])
+    for r in connection.execute(text("""
+        SELECT t.completed_by_actor_id AS person, (t.action_completed_at_utc AT TIME ZONE :tz)::date AS day, t.title
+        FROM auditcore.p2_tasks t
+        WHERE t.tenant_id = :t AND t.scope_kind <> 'JOURNEY' AND t.completed_by_actor_id IS NOT NULL
+          AND t.action_completed_at_utc >= :s AND t.action_completed_at_utc < :e
+        ORDER BY t.action_completed_at_utc
+        LIMIT 2000
+    """), params).mappings():
+        other[str(r["person"])][r["day"].isoformat()].append(str(r["title"]))
+    return {"counts": counts, "other": other}
