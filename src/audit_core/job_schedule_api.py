@@ -74,9 +74,9 @@ for _job in RECURRING:
 
 # Jobs other modules run. Not set here; shown so nothing that runs on a clock is missing.
 EXTERNAL: list[dict[str, Any]] = [
-    {"name": "Analytics copy", "service": "Analytics (GitHub Actions)", "when": "Daily, 03:00 IST",
-     "what": "Copies the day's data into the Analytics tables.",
-     "note": "Set in the verigence-analytics repository; inside the night's sleep until it is moved."},
+    {"name": "Analytics copy", "service": "Analytics (GitHub Actions)", "when": "Daily, 08:30 IST",
+     "what": "Copies the previous day's data into the Analytics tables.",
+     "note": "Set in the verigence-analytics repository. In the morning, after the night's sleep (13 Nov 2026)."},
     {"name": "End-of-day retry", "service": "Document Intelligence", "when": "Daily, each Project's own time",
      "what": "Gives every document that failed during the day one more reading.",
      "note": "Set per Project in Document Intelligence."},
