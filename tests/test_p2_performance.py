@@ -189,3 +189,35 @@ def test_journeys_closed_by_a_reviewer_count_on_the_reviewer(setup):
     assert "journeysClosed" in [m["key"] for m in report["measures"]]
     people = {p["actorId"]: p for p in report["people"]}
     assert people[reviewer]["today"]["journeysClosed"] == 2 and people[reviewer]["today"]["reviews"] == 0
+
+
+def test_outlet_and_dealership_views_and_who_reads_whom(setup):
+    s = setup
+    outlet = str(s.journey.outlet_id)
+    second = tt._second_outlet(s)
+    other = f"pc-{uuid4().hex[:6]}"
+    tt._role(s, other, "PC", dealer=s.journey.dealer_id, outlet=second)
+    _uploads(s, s.journey.actor_id, tt._journey(s, outlet, s.journey.actor_id), 5)
+    _uploads(s, other, tt._journey(s, second, other), 1)
+    reviewer, tl, tl2, pm = (f"{r}-{uuid4().hex[:6]}" for r in ("rv", "tl", "tl", "pm"))
+    tt._role(s, reviewer, "REVIEWER", dealer=s.journey.dealer_id, outlet=s.journey.outlet_id)
+    tt._role(s, tl, "TL")
+    tt._role(s, tl2, "TL")
+    tt._role(s, pm, "PM")
+    report = _build(s, tl)
+    by_id = {o["outletId"]: o for o in report["outlets"]}
+    assert by_id[outlet]["today"]["filesUploaded"] == 5 and by_id[second]["today"]["filesUploaded"] == 1
+    assert by_id[outlet]["standing"]["filesUploaded"] == "above" and by_id[second]["standing"]["filesUploaded"] == "below"
+    [dealer] = [d for d in report["dealers"] if d["dealerId"] == str(s.journey.dealer_id)]
+    assert dealer["today"]["filesUploaded"] == 6 and dealer["outlets"] == 2
+    assert "activeMinutes" not in [m["key"] for m in report["unitMeasures"]]
+    # A Team Lead reads PCs and Reviewers, not the other Team Leads; a PM reads the Team Leads too.
+    seen = {p["actorId"] for p in report["people"]}
+    assert {s.journey.actor_id, other, reviewer, tl} <= seen and tl2 not in seen and pm not in seen
+    seen_by_pm = {p["actorId"] for p in _build(s, pm)["people"]}
+    assert {tl, tl2, reviewer} <= seen_by_pm
+    mine = next(p for p in report["people"] if p["actorId"] == s.journey.actor_id)
+    assert mine["outletIds"] == [outlet]
+    # A PC's own view carries no outlets or dealerships.
+    own = _build(s, s.journey.actor_id, own=True)
+    assert own["outlets"] == [] and own["dealers"] == []

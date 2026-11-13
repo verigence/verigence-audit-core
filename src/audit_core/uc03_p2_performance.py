@@ -96,6 +96,21 @@ MEASURES: tuple[dict[str, Any], ...] = (
     {"key": "activeMinutes", "label": "Active time", "group": "UTILISATION", "unit": "MINUTES",
      "roles": ["PC", "REVIEWER", "TL", "PM", "EXECUTIVE"]},
 )
+# The measures of an outlet or a dealership: the same facts by the outlet they belong to. Active
+# time is a person's, not an outlet's; a PC's delivery files closed and a Reviewer's closures are
+# two different things at an outlet, so they are shown apart.
+UNIT_MEASURES: tuple[dict[str, Any], ...] = (
+    {"key": "filesUploaded", "label": "Files uploaded", "group": "OUTPUT"},
+    {"key": "journeysUploaded", "label": "Journeys uploaded", "group": "OUTPUT"},
+    {"key": "deliveryFilesClosed", "label": "Delivery files closed", "group": "OUTPUT", "setting": "journeysClosed"},
+    {"key": "journeysClosed", "label": "Journeys closed by Reviewer", "group": "OUTPUT"},
+    {"key": "reviews", "label": "Reviews", "group": "OUTPUT"},
+    {"key": "tasksClosed", "label": "Tasks closed", "group": "OUTPUT"},
+    {"key": "pagesRejected", "label": "Pages rejected", "group": "QUALITY", "lowerIsBetter": True},
+)
+# Whose work a lead reads (product owner 13 Nov 2026: "for TL and up, they also want to see how
+# Reviewers are working and same for PM how TL are working"): the roles below their own.
+_ROLE_RANK = {"PC": 0, "REVIEWER": 1, "CRM": 1, "TL": 2, "PM": 3, "EXECUTIVE": 4}
 _KEYS = tuple(m["key"] for m in MEASURES)
 _LOWER = frozenset(m["key"] for m in MEASURES if m.get("lowerIsBetter"))
 
@@ -145,58 +160,74 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
     start, end = period_bounds(first, last, tz)
     params = {"t": tenant_id, "s": start, "e": end, "tz": tz}
     values: dict[str, dict[str, dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
+    # The same facts by the outlet they belong to (the Journey's or the task's outlet), whoever did
+    # them: the outlet and dealership views (product owner 13 Nov 2026: "I need to see dealership,
+    # PC, outlet views").
+    by_outlet: dict[str, dict[str, dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
 
     def put(rows: Any, key: str, column: str = "n") -> None:
         for r in rows:
+            day = r["day"].isoformat()
+            amount = float(r[column] or 0)
             if r["actor"]:
                 cell = values[str(r["actor"])][key]
-                day = r["day"].isoformat()
-                cell[day] = cell.get(day, 0) + float(r[column] or 0)
+                cell[day] = cell.get(day, 0) + amount
+            if r.get("outlet"):
+                cell = by_outlet[str(r["outlet"])][key]
+                cell[day] = cell.get(day, 0) + amount
 
     uploads = connection.execute(text("""
-        SELECT uploaded_by_actor_id AS actor, (created_at_utc AT TIME ZONE :tz)::date AS day,
-               count(*) AS files, count(DISTINCT journey_id) AS journeys
-        FROM auditcore.p2_upload_batches
-        WHERE tenant_id = :t AND created_at_utc >= :s AND created_at_utc < :e
-          AND batch_status <> 'AWAITING_UPLOAD'
-          AND NOT (batch_status = 'CANCELLED' AND COALESCE(page_count, 0) = 0)
-        GROUP BY 1, 2
+        SELECT ub.uploaded_by_actor_id AS actor, (ub.created_at_utc AT TIME ZONE :tz)::date AS day, j.outlet_id AS outlet,
+               count(*) AS files, count(DISTINCT ub.journey_id) AS journeys
+        FROM auditcore.p2_upload_batches ub
+        JOIN auditcore.journeys j ON j.tenant_id = ub.tenant_id AND j.journey_id = ub.journey_id
+        WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
+          AND ub.batch_status <> 'AWAITING_UPLOAD'
+          AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
+        GROUP BY 1, 2, 3
     """), params).mappings().all()
     put(uploads, "filesUploaded", "files")
     put(uploads, "journeysUploaded", "journeys")
     put(connection.execute(text("""
-        SELECT ub.uploaded_by_actor_id AS actor, (ub.created_at_utc AT TIME ZONE :tz)::date AS day,
+        SELECT ub.uploaded_by_actor_id AS actor, (ub.created_at_utc AT TIME ZONE :tz)::date AS day, j.outlet_id AS outlet,
                sum(COALESCE(cardinality(q.page_numbers), 1)) AS n
         FROM auditcore.p2_upload_batches ub
+        JOIN auditcore.journeys j ON j.tenant_id = ub.tenant_id AND j.journey_id = ub.journey_id
         JOIN auditcore.p2_document_queue q ON q.tenant_id = ub.tenant_id AND q.batch_id = ub.batch_id
         WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
           AND q.last_error LIKE 'DI\\_QUALITY\\_%' AND q.queue_status IN ('FAILED', 'DEAD_LETTER', 'CANCELLED')
-        GROUP BY 1, 2
+        GROUP BY 1, 2, 3
     """), params).mappings().all(), "pagesRejected")
     put(connection.execute(text("""
-        SELECT actor_id AS actor, (created_at_utc AT TIME ZONE :tz)::date AS day, count(DISTINCT task_id) AS n
-        FROM auditcore.p2_task_events
-        WHERE tenant_id = :t AND created_at_utc >= :s AND created_at_utc < :e
-          AND actor_id IS NOT NULL AND upper(actor_id) <> 'SYSTEM' AND event_type = ANY(:closing)
-        GROUP BY 1, 2
+        SELECT te.actor_id AS actor, (te.created_at_utc AT TIME ZONE :tz)::date AS day,
+               COALESCE(tk.outlet_id, j.outlet_id) AS outlet, count(DISTINCT te.task_id) AS n
+        FROM auditcore.p2_task_events te
+        JOIN auditcore.p2_tasks tk ON tk.tenant_id = te.tenant_id AND tk.task_id = te.task_id
+        LEFT JOIN auditcore.journeys j ON j.tenant_id = tk.tenant_id AND j.journey_id = tk.journey_id
+        WHERE te.tenant_id = :t AND te.created_at_utc >= :s AND te.created_at_utc < :e
+          AND te.actor_id IS NOT NULL AND upper(te.actor_id) <> 'SYSTEM' AND te.event_type = ANY(:closing)
+        GROUP BY 1, 2, 3
     """), {**params, "closing": sorted(_CLOSING_EVENTS)}).mappings().all(), "tasksClosed")
     put(connection.execute(text("""
-        SELECT actor, day, count(*) AS n FROM (
-          SELECT reviewed_by_actor_id AS actor, (reviewed_at_utc AT TIME ZONE :tz)::date AS day
+        SELECT actor, day, outlet, count(*) AS n FROM (
+          SELECT reviewed_by_actor_id AS actor, (reviewed_at_utc AT TIME ZONE :tz)::date AS day, outlet_id AS outlet
           FROM auditcore.p2_stage_document_reviews
           WHERE tenant_id = :t AND reviewed_at_utc >= :s AND reviewed_at_utc < :e
           UNION ALL
-          SELECT decided_by_actor_id, (decided_at_utc AT TIME ZONE :tz)::date
-          FROM auditcore.p2_journey_closures
-          WHERE tenant_id = :t AND decided_at_utc >= :s AND decided_at_utc < :e
-            AND acceptance_status IN ('ACCEPTED', 'REJECTED')
-        ) x GROUP BY 1, 2
+          SELECT c.decided_by_actor_id, (c.decided_at_utc AT TIME ZONE :tz)::date, j.outlet_id
+          FROM auditcore.p2_journey_closures c
+          JOIN auditcore.journeys j ON j.tenant_id = c.tenant_id AND j.journey_id = c.journey_id
+          WHERE c.tenant_id = :t AND c.decided_at_utc >= :s AND c.decided_at_utc < :e
+            AND c.acceptance_status IN ('ACCEPTED', 'REJECTED')
+        ) x GROUP BY 1, 2, 3
     """), params).mappings().all(), "reviews")
     put(connection.execute(text("""
-        SELECT closed_by_actor_id AS actor, (closed_at_utc AT TIME ZONE :tz)::date AS day, count(*) AS n
-        FROM auditcore.p2_journey_closures
-        WHERE tenant_id = :t AND closed_at_utc >= :s AND closed_at_utc < :e
-        GROUP BY 1, 2
+        SELECT c.closed_by_actor_id AS actor, (c.closed_at_utc AT TIME ZONE :tz)::date AS day, j.outlet_id AS outlet,
+               count(*) AS n
+        FROM auditcore.p2_journey_closures c
+        JOIN auditcore.journeys j ON j.tenant_id = c.tenant_id AND j.journey_id = c.journey_id
+        WHERE c.tenant_id = :t AND c.closed_at_utc >= :s AND c.closed_at_utc < :e
+        GROUP BY 1, 2, 3
     """), params).mappings().all(), "journeysClosed")
     # A PC's delivery files closed, by the Daily processing report's rule (one statement for the Project).
     zone = _zone(tz)
@@ -206,6 +237,9 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
             day = datetime.fromisoformat(f["closedAtUtc"]).astimezone(zone).date().isoformat()
             cell = values[str(f["pcActorId"])]["journeysClosed"]
             cell[day] = cell.get(day, 0) + 1
+            if f.get("outletId"):
+                cell = by_outlet[str(f["outletId"])]["deliveryFilesClosed"]
+                cell[day] = cell.get(day, 0) + 1
     put(connection.execute(text("""
         SELECT actor_id AS actor, activity_date AS day, round(sum(active_seconds) / 60.0) AS n
         FROM auditcore.p2_user_activity_daily
@@ -215,8 +249,10 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
 
     # Duties: every occurrence of every recurring schedule in the window, by state.
     duties: dict[str, dict[str, dict[str, dict[str, int]]]] = defaultdict(lambda: defaultdict(dict))
+    outlet_duties: dict[str, dict[str, dict[str, dict[str, int]]]] = defaultdict(lambda: defaultdict(dict))
     for r in connection.execute(text("""
         SELECT COALESCE(t.assigned_actor_id, t.completed_by_actor_id) AS actor, t.schedule_id, t.occurrence_date AS day,
+               t.outlet_id AS outlet,
                CASE
                  WHEN d.done_at IS NOT NULL AND (t.completion_result->>'outcome' = 'DONE_LATE'
                       OR (t.due_at_utc IS NOT NULL AND d.done_at > t.due_at_utc)) THEN 'late'
@@ -230,13 +266,14 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
             AS done_at) d
         WHERE t.tenant_id = :t AND t.schedule_id IS NOT NULL AND t.occurrence_date BETWEEN :first AND :last
           AND t.task_status NOT IN ('CANCELLED', 'DEAD_LETTER')
-        GROUP BY 1, 2, 3, 4
+        GROUP BY 1, 2, 3, 4, 5
     """), {"t": tenant_id, "first": first, "last": last, "now": now}).mappings():
-        if r["actor"]:
-            cell = duties[str(r["actor"])][str(r["schedule_id"])].setdefault(
-                r["day"].isoformat(), {"due": 0, "onTime": 0, "late": 0, "notDone": 0, "pending": 0})
-            cell["due"] += int(r["n"])
-            cell[r["state"]] += int(r["n"])
+        for owner, key in ((duties, r["actor"]), (outlet_duties, r["outlet"])):
+            if key:
+                cell = owner[str(key)][str(r["schedule_id"])].setdefault(
+                    r["day"].isoformat(), {"due": 0, "onTime": 0, "late": 0, "notDone": 0, "pending": 0})
+                cell["due"] += int(r["n"])
+                cell[r["state"]] += int(r["n"])
 
     schedules = [
         {"scheduleId": str(r["schedule_id"]), "title": r["title"], "frequency": r["frequency"],
@@ -266,7 +303,8 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
             person["dealers"].add(str(r["dealer_id"]))
         else:
             person["outlets"].add(str(r["outlet_id"]))
-    return {"values": values, "duties": duties, "schedules": schedules, "people": people,
+    return {"values": values, "duties": duties, "by_outlet": by_outlet, "outlet_duties": outlet_duties,
+            "schedules": schedules, "people": people,
             "names": known_names(connection, tenant_id=tenant_id)}
 
 
@@ -285,6 +323,14 @@ def _cached(connection: Connection, *, tenant_id: str, first: date, last: date, 
                 _cache.clear()
             _cache[key] = (_time.monotonic(), data)
     return data
+
+
+def _caller_roles(connection: Connection, tenant_id: str, actor_id: str) -> list[str]:
+    return [normalise_role(r[0]) or "" for r in connection.execute(text("""
+        SELECT DISTINCT upper(business_role_code) FROM auditcore.business_assignments
+        WHERE tenant_id = :t AND security_actor_id = :a AND assignment_status = 'ACTIVE'
+          AND effective_from <= now() AND (effective_to IS NULL OR effective_to >= now())
+    """), {"t": tenant_id, "a": actor_id})]
 
 
 def standing(value: float, median: float | None, *, lower_is_better: bool = False) -> str | None:
@@ -348,15 +394,20 @@ def build_performance(
                                 if seen and usual_days else None) for k in _KEYS},
         }
 
-    # Whom the caller reads: their own row; or the people of their outlets.
+    # Whom the caller reads: their own row; or the people of their outlets whose role is below
+    # their own (a TL: PCs and Reviewers; a PM: those and the TLs; an Executive: the PMs too).
+    outlets: list[dict[str, Any]] = []
     if own:
         visible = [actor_id] if actor_id in people else []
     else:
         wide, outlets = _scope(connection, tenant_id=tenant_id, actor_id=actor_id, admin=admin)
         outlet_ids = {str(o["outlet_id"]) for o in outlets}
         dealer_ids = {str(o["dealer_id"]) for o in outlets}
+        rank = 99 if admin else max(
+            [_ROLE_RANK.get(r, 0) for r in _caller_roles(connection, tenant_id, actor_id)] or [0])
         visible = [a for a, p in people.items()
-                   if wide or p["outlets"] & outlet_ids or p["dealers"] & dealer_ids]
+                   if (wide or p["outlets"] & outlet_ids or p["dealers"] & dealer_ids)
+                   and (_ROLE_RANK.get(p["role"], 0) < rank or a == actor_id)]
 
     def duty_totals(actor: str, only: str | None) -> dict[str, Any]:
         out: dict[str, Any] = {}
@@ -391,6 +442,66 @@ def build_performance(
             "dutiesWindow": duty_totals(actor, None) if show_duties else {},
         })
     rows.sort(key=lambda r: (r["role"] or "~", (r["name"] or r["actorId"]).lower()))
+
+    # ---- outlets and dealerships (not in a team member's own view)
+    unit_measures = [m for m in UNIT_MEASURES if m.get("setting", m["key"]) not in hidden]
+    unit_keys = [m["key"] for m in unit_measures]
+    unit_lower = {m["key"] for m in unit_measures if m.get("lowerIsBetter")}
+    by_outlet, outlet_duties = data["by_outlet"], data["outlet_duties"]
+
+    def unit_figures(outlet_list: list[str]) -> dict[str, Any]:
+        def cell(key: str, d: str) -> float:
+            return sum(by_outlet.get(o, {}).get(key, {}).get(d, 0) for o in outlet_list)
+
+        def duty(only: str | None) -> dict[str, int]:
+            total = {"due": 0, "onTime": 0, "late": 0, "notDone": 0, "pending": 0}
+            for o in outlet_list:
+                for by_day in outlet_duties.get(o, {}).values():
+                    for d, c in by_day.items():
+                        if only is None or d == only:
+                            for k in total:
+                                total[k] += c[k]
+            return total
+
+        today_values = {k: cell(k, target) for k in unit_keys}
+        return {
+            "today": today_values,
+            "usual": {k: (round(sum(cell(k, d) for d in usual_days) / len(usual_days), 1) if usual_days else None)
+                      for k in unit_keys},
+            "series": {k: [cell(k, d) for d in iso] for k in unit_keys},
+            "activeToday": any(v > 0 for v in today_values.values()),
+            "dutiesToday": duty(target) if show_duties else None,
+            "dutiesWindow": duty(None) if show_duties else None,
+        }
+
+    def with_standing(units: list[dict[str, Any]]) -> None:
+        present = [u for u in units if u["activeToday"]]
+        medians = {k: (statistics.median(u["today"][k] for u in present) if len(present) > 1 else None)
+                   for k in unit_keys}
+        for u in units:
+            u["standing"] = {k: (standing(u["today"][k], medians[k], lower_is_better=k in unit_lower)
+                                 if show_peers and u["activeToday"] else None) for k in unit_keys}
+
+    mapped: dict[str, list[str]] = defaultdict(list)
+    for row in rows:
+        row["outletIds"] = sorted(people[row["actorId"]]["outlets"])
+        for o in row["outletIds"]:
+            mapped[o].append(row["actorId"])
+    outlet_units, dealer_units = [], []
+    dealers_seen: dict[str, dict[str, Any]] = {}
+    for o in outlets:
+        oid, did = str(o["outlet_id"]), str(o["dealer_id"])
+        outlet_units.append({"outletId": oid, "outletName": o["outlet_name"], "dealerId": did,
+                             "dealerName": o["dealer_name"], "classification": o.get("outlet_classification"),
+                             "people": len(mapped.get(oid, [])), **unit_figures([oid])})
+        dealers_seen.setdefault(did, {"dealerId": did, "dealerName": o["dealer_name"], "outletIds": []})[
+            "outletIds"].append(oid)
+    for dealer in dealers_seen.values():
+        dealer_units.append({**dealer, "outlets": len(dealer["outletIds"]),
+                             "people": len({a for o in dealer["outletIds"] for a in mapped.get(o, [])}),
+                             **unit_figures(dealer["outletIds"])})
+    with_standing(outlet_units)
+    with_standing(dealer_units)
     return {
         "date": target, "first": first.isoformat(), "days": iso, "timezone": tz, "current": day == today,
         "asOfUtc": now.isoformat(), "own": own,
@@ -404,7 +515,13 @@ def build_performance(
                          "usualMedian": {k: p["usualMedian"][k] for k in shown_keys}}
                   for role, p in peers.items()} if show_peers else {},
         "people": rows,
+        "unitMeasures": [{k: v for k, v in m.items() if k != "setting"} for m in unit_measures],
+        "outlets": outlet_units,
+        "dealers": sorted(dealer_units, key=lambda d: (d["dealerName"] or "").lower()),
         "notes": [
+            ("Dealership and outlet figures are the same facts counted by the outlet the Journey or task belongs "
+             "to, whoever did them; an outlet is compared with the other outlets that had anything that day, a "
+             "dealership with the other dealerships."),
             ("Today's figure against the person's usual (their average over the earlier working days shown, "
             "Sundays left out) and against peers (the median, that day, of the people of the same role who "
             "did anything that day). Within a tenth of the median counts as 'with peers'."),
