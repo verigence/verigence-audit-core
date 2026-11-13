@@ -32,6 +32,7 @@ WIDGETS: tuple[dict[str, str], ...] = (
     {"key": "w.trend", "label": "Dashboard: day by day / week by week chart"},
     {"key": "w.tasks", "label": "Dashboard: tasks new, closed and open"},
     {"key": "w.team", "label": "Dashboard: scorecards (people, outlets, dealerships)"},
+    {"key": "w.efficiency", "label": "Dashboard: PC efficiency"},
     {"key": "w.duties", "label": "Dashboard: daily and weekly duties"},
     {"key": "w.quality", "label": "Dashboard: quality and duplicates"},
     {"key": "w.channels", "label": "Dashboard: how files are uploaded"},
@@ -43,6 +44,20 @@ _TEAM_KINDS = (*_PC_KINDS, "awaitingReview", "awaitingDecision")
 # A kind counted inside another (an overdue task is an open task): shown under it, not added to it.
 _WITHIN = {"missingDocuments": "deliveryFilesOpen", "tasksOverdue": "tasksOpen"}
 _ZERO = [0, 0, 0, 0]
+# A PC's efficiency (product owner 13 Nov 2026: "can we have the efficiency calculated for each
+# PC"): the plain average of four shares, each out of 100, leaving out a share with nothing to
+# measure in the period. No weights (he asked for a weighted score later).
+EFFICIENCY_PARTS = (
+    ("closedShare", "Delivery files closed, of those started"),
+    ("firstTime", "Pages right first time"),
+    ("inTime", "Tasks closed in time"),
+    ("dutiesOnTime", "Duties done on time"),
+)
+EFFICIENCY_NOTE = ("Efficiency is the plain average of four shares: delivery files closed of those started in the period, "
+                   "pages right first time, tasks closed by their due time, and duties done on time. A share with nothing "
+                   "to measure in the period is left out.")
+# What waits on a person or an outlet, counted once (an overdue task is already an open task).
+_BACKLOG_ONCE = ("deliveriesNotUploaded", "deliveryFilesOpen", "tasksOpen", "pagesToReupload", "paymentsNotReconciled")
 _QUALITY_REASONS = (("blurred", "Blurred"), ("faded", "Faded"), ("tooSmall", "Too small"), ("otherQuality", "Other"))
 
 
@@ -186,6 +201,36 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
         rows = [r for r in rows if r["peers"] is not None]
         return {"title": "Me and my peers, a working day", "people": group["people"], "rows": rows} if rows else None
 
+    def efficiency_of(a: str, eff: dict[str, Any], quality_by: dict[str, Any]) -> dict[str, Any]:
+        v, e, q = values.get(a, {}), eff.get(a, {}), quality_by.get(a, {})
+        pages = total(v, "pagesUploaded")
+        rejected = sum(q.get(k, 0) for k, _ in _QUALITY_REASONS)
+        started, closed = int(e.get("deliveryStarted", 0)), int(e.get("deliveryClosed", 0))
+        due, in_time = int(e.get("tasksWithDue", 0)), int(e.get("tasksInTime", 0))
+        duty_due = duty_on = 0
+        for by_day in duties.get(a, {}).values():
+            for cell in by_day.values():
+                duty_due += cell["due"] - cell["pending"]
+                duty_on += cell["onTime"]
+        closed_share = _pct(closed, started)
+        parts = {"closedShare": min(100, closed_share) if closed_share is not None else None,
+                 "firstTime": _pct(pages - rejected, pages), "inTime": _pct(in_time, due),
+                 "dutiesOnTime": _pct(duty_on, duty_due)}
+        have = [x for x in parts.values() if x is not None]
+        worked = sum(1 for d in iso if any(v.get(k, {}).get(d, 0) > 0 for k in ("filesUploaded", "tasksClosed")))
+        return {"score": round(sum(have) / len(have)) if have else None, **parts,
+                "daysToClose": round(e.get("daysToCloseSum", 0) / closed, 1) if closed else None,
+                "perDay": round(total(v, "journeysUploaded") / worked, 1) if worked else None, "daysWorked": worked,
+                "detail": {"closedShare": f"{closed} closed, {started} started", "firstTime": f"{rejected} of {int(pages)} pages rejected",
+                           "inTime": f"{in_time} of {due} tasks with a due time", "dutiesOnTime": f"{duty_on} of {duty_due} duties"}}
+
+    def backlog_values(c: dict[str, list[int]], kinds: tuple[str, ...]) -> dict[str, int]:
+        return {**{k: _n(c, k) for k in kinds}, "old": sum(_old(c, k) for k in _BACKLOG_ONCE)}
+
+    def backlog_columns(kinds: tuple[str, ...]) -> list[dict[str, str]]:
+        return [*({"key": k, "label": _KIND_LABEL[k], "kind": "alert" if k == "tasksOverdue" else "num"} for k in kinds),
+                {"key": "old", "label": "Waiting over 3 days", "kind": "alert"}]
+
     out: dict[str, Any] = {"view": view, "period": period, "days": iso,
                            "widgets": [w["key"][2:] for w in WIDGETS if w["key"] not in hidden]}
 
@@ -232,6 +277,17 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
             out["quality"] = quality_block(q, pages, _n(counts, "pagesToReupload"))
         if shown("channels"):
             out["channels"] = channel_block(part("channels")["byPerson"].get(actor_id, {}))
+        if shown("efficiency"):
+            eff, quality_by = part("efficiency"), part("quality")["byPerson"]
+            me = efficiency_of(actor_id, eff, quality_by)
+            others = [x for x in (efficiency_of(a, eff, quality_by)["score"] for a, p in people.items()
+                                  if p["role"] == "PC" and a != actor_id) if x is not None]
+            out["efficiency"] = {"note": EFFICIENCY_NOTE, "mine": {
+                "score": me["score"], "daysToClose": me["daysToClose"], "perDay": me["perDay"], "daysWorked": me["daysWorked"],
+                "parts": [{"key": k, "label": label, "value": me[k], "detail": me["detail"][k]} for k, label in EFFICIENCY_PARTS],
+                "peers": (sorted(others)[len(others) // 2] if len(others) % 2 else
+                          round((sorted(others)[len(others) // 2 - 1] + sorted(others)[len(others) // 2]) / 2))
+                if len(others) >= 2 and "peerComparison" not in hidden else None}}
         if shown("team"):
             block = peer_block("PC", (("journeysUploaded", "Journeys uploaded"), ("journeysClosed", "Delivery files closed"),
                                       ("tasksClosed", "Tasks closed"), ("pagesRejected", "Pages rejected")))
@@ -315,6 +371,35 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
     pcs = by_role.get("PC", [])
     out["title"] = "Team dashboard"
 
+    by_person = shown("team") or shown("efficiency")
+    eff = part("efficiency") if by_person else {}
+    quality_by = part("quality")["byPerson"] if by_person else {}
+    dealer_outlets: dict[str, list[str]] = {}
+    dealer_name: dict[str, str] = {}
+    for o in outlets:
+        dealer_outlets.setdefault(str(o["dealer_id"]), []).append(str(o["outlet_id"]))
+        dealer_name[str(o["dealer_id"])] = o["dealer_name"]
+
+    def where(a: str) -> list[str]:
+        p = people[a]
+        if p["wide"]:
+            return outlet_ids
+        ids = set(p["outlets"]) | {o for d in p["dealers"] for o in dealer_outlets.get(d, [])}
+        return [o for o in outlet_ids if o in ids]
+
+    def where_text(a: str) -> str:
+        ids = where(a)
+        if people[a]["wide"] or len(ids) == len(outlet_ids) > 3:
+            return "All outlets"
+        return ", ".join(outlet_name[o] for o in ids[:2]) + (f" +{len(ids) - 2}" if len(ids) > 2 else "")
+
+    def columns(*cols: tuple[str, str, str, str | None]) -> list[dict[str, str]]:
+        return [{"key": k, "label": label, "kind": kind} for k, label, kind, needs in cols if needs is None or measure(needs)]
+
+    def active_hours(a: str) -> float:
+        return round(total(values.get(a, {}), "activeMinutes") / 60, 1)
+
+
     if shown("kpis"):
         tiles = []
         if measure("journeysUploaded"):
@@ -341,6 +426,37 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
 
     if shown("pending"):
         out["pending"] = pending_block("Pending now", counts, _TEAM_KINDS)
+        # The backlog of each PC, outlet and dealership (product owner 13 Nov 2026: "and backlogs").
+        cards = []
+        if pcs:
+            cards.append({"key": "pcs", "title": "PCs", "sort": "old", "columns": backlog_columns(_PC_KINDS), "rows": [
+                {"id": a, "name": name_of(a), "sub": where_text(a), "values": backlog_values(backlog["byPerson"].get(a, {}), _PC_KINDS)}
+                for a in pcs]})
+        if outlets:
+            cards.append({"key": "outlets", "title": "Outlets", "sort": "old", "columns": backlog_columns(_TEAM_KINDS), "rows": [
+                {"id": str(o["outlet_id"]), "name": o["outlet_name"], "sub": o["dealer_name"],
+                 "values": backlog_values(backlog["byOutlet"].get(str(o["outlet_id"]), {}), _TEAM_KINDS)} for o in outlets]})
+        if len(dealer_outlets) > 1:
+            cards.append({"key": "dealers", "title": "Dealerships", "sort": "old", "columns": backlog_columns(_TEAM_KINDS), "rows": [
+                {"id": d, "name": dealer_name[d], "sub": _plural(len(ids), "outlet"),
+                 "values": backlog_values(_add_counts([backlog["byOutlet"].get(o, {}) for o in ids]), _TEAM_KINDS)}
+                for d, ids in dealer_outlets.items()]})
+        out["pending"]["cards"] = cards
+
+    if shown("efficiency") and pcs:
+        rows = []
+        for a in pcs:
+            e = efficiency_of(a, eff, quality_by)
+            rows.append({"id": a, "name": name_of(a), "sub": where_text(a), "spark": series(values.get(a, {}), "journeysUploaded"),
+                         "values": {k: e[k] for k in ("score", "closedShare", "firstTime", "inTime", "dutiesOnTime", "daysToClose",
+                                                       "perDay", "daysWorked")}})
+        out["efficiency"] = {"note": EFFICIENCY_NOTE, "card": {
+            "key": "efficiency", "title": "PCs", "sort": "score", "spark": "Journeys uploaded, day by day", "columns": [
+                {"key": "score", "label": "Efficiency", "kind": "score"},
+                *({"key": k, "label": label, "kind": "pct"} for k, label in EFFICIENCY_PARTS),
+                {"key": "daysToClose", "label": "Days to close a delivery file", "kind": "num"},
+                {"key": "perDay", "label": "Journeys a working day", "kind": "num"},
+                {"key": "daysWorked", "label": "Days worked", "kind": "num"}], "rows": rows}}
 
     if shown("attention"):
         lines = []
@@ -391,33 +507,6 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
 
     if shown("team"):
         cards: list[dict[str, Any]] = []
-        eff = part("efficiency")
-        quality_by = part("quality")["byPerson"]
-        dealer_outlets: dict[str, list[str]] = {}
-        dealer_name: dict[str, str] = {}
-        for o in outlets:
-            dealer_outlets.setdefault(str(o["dealer_id"]), []).append(str(o["outlet_id"]))
-            dealer_name[str(o["dealer_id"])] = o["dealer_name"]
-
-        def where(a: str) -> list[str]:
-            p = people[a]
-            if p["wide"]:
-                return outlet_ids
-            ids = set(p["outlets"]) | {o for d in p["dealers"] for o in dealer_outlets.get(d, [])}
-            return [o for o in outlet_ids if o in ids]
-
-        def where_text(a: str) -> str:
-            ids = where(a)
-            if people[a]["wide"] or len(ids) == len(outlet_ids) > 3:
-                return "All outlets"
-            return ", ".join(outlet_name[o] for o in ids[:2]) + (f" +{len(ids) - 2}" if len(ids) > 2 else "")
-
-        def columns(*cols: tuple[str, str, str, str | None]) -> list[dict[str, str]]:
-            return [{"key": k, "label": label, "kind": kind} for k, label, kind, needs in cols if needs is None or measure(needs)]
-
-        def active_hours(a: str) -> float:
-            return round(total(values.get(a, {}), "activeMinutes") / 60, 1)
-
         if pcs:
             rows = []
             for a in pcs:

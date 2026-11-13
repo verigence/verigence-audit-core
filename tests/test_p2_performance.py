@@ -395,6 +395,11 @@ def test_the_dashboard_of_each_role(setup):
         assert duty["notDone"] == 1 and next(d for d in duty["days"] if d["date"] == yesterday)["notDone"] == 1
         assert [p["title"] for p in board["duties"]["planned"]] == [d["title"] for d in perf.PLANNED_DUTIES]
         assert sum(board["trend"]["series"][1]["data"]) == 3 and "scorecards" not in board and "attention" not in board
+        # My efficiency: the average of the shares there is something to measure for.
+        parts = {x["key"]: x["value"] for x in board["efficiency"]["mine"]["parts"]}
+        assert parts["firstTime"] == 100 and parts["dutiesOnTime"] == 0 and parts["inTime"] is None
+        have = [v for v in parts.values() if v is not None]
+        assert board["efficiency"]["mine"]["score"] == round(sum(have) / len(have))
 
         # ---- the Reviewer: my reviews, what waits at my outlets
         theirs = _build(s, reviewer, own=True, section="dashboard")["dashboard"]
@@ -420,6 +425,14 @@ def test_the_dashboard_of_each_role(setup):
         assert row["values"]["deliveries"] == 3 and row["values"]["overdue"] == 2 and row["values"]["dutiesMissed"] == 1
         assert len(row["spark"]) == len(team["days"])
         assert next(r for r in cards["reviewers"]["rows"] if r["id"] == reviewer)["values"]["closed"] == 1
+        # The backlog of each PC and outlet, and each PC's efficiency.
+        backlog_cards = {c["key"]: c for c in team["pending"]["cards"]}
+        mine_waiting = next(r for r in backlog_cards["pcs"]["rows"] if r["id"] == me)["values"]
+        assert mine_waiting["deliveryFilesOpen"] >= 1 and mine_waiting["tasksOverdue"] == 2 and mine_waiting["old"] >= 2
+        at_outlet = next(r for r in backlog_cards["outlets"]["rows"] if r["id"] == outlet)["values"]
+        assert at_outlet["deliveryFilesOpen"] >= 1 and at_outlet["awaitingDecision"] == 1 and "awaitingReview" in at_outlet
+        score_row = next(r for r in team["efficiency"]["card"]["rows"] if r["id"] == me)
+        assert score_row["values"]["score"] == board["efficiency"]["mine"]["score"] and team["efficiency"]["note"]
         assert any("Duty missed" in line["text"] for line in team["attention"]["lines"])
         assert team["duties"]["rows"][0]["missedBy"][0]["dates"] == [yesterday]
         assert sum(team["tasks"]["raised"]) >= 2 and team["tasks"]["overdue"] >= 1
@@ -433,12 +446,12 @@ def test_the_dashboard_of_each_role(setup):
         assert over_http.json()["dashboard"]["view"] == "TEAM" and over_http.json()["sections"]
 
         # ---- the SuperAdmin hides widgets and measures per role
-        _hide(s, "PC:w.pending", "PC:w.duties", "TL:w.team", "TL:w.attention", "PM:activeMinutes")
+        _hide(s, "PC:w.pending", "PC:w.duties", "TL:w.team", "TL:w.attention", "TL:w.efficiency", "PM:activeMinutes")
         mine = _build(s, me, own=True, section="dashboard")["dashboard"]
         assert "pending" not in mine and "duties" not in mine and "kpis" in mine
         assert "pending" not in mine["widgets"] and "trend" in mine["widgets"]
         team = _build(s, tl, section="dashboard")["dashboard"]
-        assert "scorecards" not in team and "attention" not in team and "pending" in team
+        assert "scorecards" not in team and "attention" not in team and "efficiency" not in team and "pending" in team
         for_pm = _build(s, pm, section="dashboard")["dashboard"]
         pcs = next(c for c in for_pm["scorecards"] if c["key"] == "pcs")
         assert "hours" not in [c["key"] for c in pcs["columns"]] and "attention" in for_pm
