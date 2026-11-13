@@ -50,14 +50,15 @@ from audit_core.uc03_p2_document_task_groups import (
 )
 from audit_core.uc03_p2_journey_views import (
     ALL_VIEWS,
-    BREAKDOWN_SQL,
     COUNTS_SQL,
+    COUNTS_WITH_BREAKDOWN_SQL,
     SCOPED_SQL,
     SUGGEST_LIMIT,
     SUGGEST_SQL,
     counts_from_row,
     masked_mobile,
     scope_params,
+    split_counts_with_breakdown,
     suggestion_ready,
     view_sql,
 )
@@ -918,33 +919,13 @@ def journey_view_counts(
         "date_floor": programme_date_floor() or date(1900, 1, 1),
         "timezone": _project_timezone(connection, tenant_id),
     }
-    counts = counts_from_row(connection.execute(text(COUNTS_SQL), params).mappings().one())
-    result: dict[str, Any] = {"counts": counts}
     if breakdown:
-        def rows(key_columns: str, group_by: str) -> list[dict[str, Any]]:
-            sql = BREAKDOWN_SQL.format(key_columns=key_columns, group_by=group_by)
-            out = []
-            for row in connection.execute(text(sql), params).mappings().all():
-                item = dict(row)
-                for key in ("total", "open", "booking_open", "delivery_open", "needs_tl", "overdue",
-                            "high_risk", "stuck", "closed", "bookings_in_month", "deliveries_in_month"):
-                    item[key] = int(item[key] or 0)
-                out.append(item)
-            return out
-
-        result["byDealer"] = [
-            {**r, "dealer_id": str(r["dealer_id"])}
-            for r in rows("s.dealer_id, MAX(s.dealer_name) AS dealer_name", "s.dealer_id")
-        ]
-        result["byOutlet"] = [
-            {**r, "outlet_id": str(r["outlet_id"])}
-            # The Outlet's Dealership too, so a Dealership's Outlets can be offered on their own.
-            for r in rows("s.outlet_id, MAX(s.outlet_name) AS outlet_name, MAX(s.outlet_code) AS outlet_code, "
-                          "MAX(CAST(s.dealer_id AS text)) AS dealer_id", "s.outlet_id")
-        ]
-        result["byPc"] = rows("s.created_by_actor_id AS pc_actor_id, MAX(s.pc_name) AS pc_name",
-                              "s.created_by_actor_id")
-    return result
+        # One read of the scope for the counts and all three breakdowns.
+        return split_counts_with_breakdown(
+            connection.execute(text(COUNTS_WITH_BREAKDOWN_SQL), params).mappings().all()
+        )
+    counts = counts_from_row(connection.execute(text(COUNTS_SQL), params).mappings().one())
+    return {"counts": counts}
 
 
 @router.get("/journeys:suggest")
@@ -3444,6 +3425,88 @@ def _journey_assignees(connection: Connection, *, tenant_id: str, journey_id: UU
     return items
 
 
+# The P2 worklist query of list_tasks (parameters: tenant_id, journey_id, status, actor_id,
+# view, role, roles). Kept apart so tests can check it against the query it replaced.
+_P2_TASK_LIST_SQL = f"""
+            -- The 500 tasks of the queue are chosen first from the task rows alone; the
+            -- Journey's customer, outlet, vehicle, closure and the comment count are then
+            -- read for those 500 only (Neon cost review 2026-11-13: joining them for every
+            -- matching task before the LIMIT read ~3,500 rows' worth for a Team Lead).
+            WITH page AS (
+            SELECT t.tenant_id, t.task_id
+            FROM auditcore.p2_tasks t
+            WHERE t.tenant_id=:tenant_id
+              AND (CAST(:journey_id AS uuid) IS NULL OR t.journey_id=CAST(:journey_id AS uuid))
+              AND (CAST(:role AS varchar) IS NULL OR t.assigned_role_code=ANY(CAST(:roles AS varchar[]))
+                   OR (t.origin_kind='HUMAN' AND t.raised_by_actor_id=:actor_id)
+                   OR CAST(:view AS varchar)='worked')
+              -- The Team Lead's tasks about the Reviewer's own work (the closure to accept, the
+              -- Reviewer's corrections) are not on the Reviewer's queue.
+              AND NOT (t.task_type IN ('CLOSURE_ACCEPTANCE', 'REVIEWER_CORRECTIONS_INFO')
+                       AND upper(COALESCE(CAST(:role AS varchar), ''))='REVIEWER')
+              AND (
+                -- "Worked on" (product owner 2026-11-04): every task the caller acted on in the
+                -- last 30 days, closed or awaiting closure, whatever its role.
+                (CAST(:view AS varchar)='worked' AND EXISTS (
+                    SELECT 1 FROM auditcore.p2_task_events we
+                    WHERE we.tenant_id=t.tenant_id AND we.task_id=t.task_id AND we.actor_id=:actor_id
+                      AND we.created_at_utc > now() - interval '30 days'))
+                OR (CAST(:status AS varchar) IS NOT NULL AND t.task_status=CAST(:status AS varchar))
+                OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='open'
+                    AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER'))
+                OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='done'
+                    AND t.task_status='VERIFIED_COMPLETE'
+                    AND t.verified_at_utc > now() - interval '14 days')
+                OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='all')
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM auditcore.journeys j
+                JOIN auditcore.business_assignments ba
+                  ON ba.tenant_id=j.tenant_id
+                 AND ba.security_actor_id=:actor_id
+                 AND ba.assignment_status='ACTIVE'
+                 AND ba.effective_from <= now()
+                 AND (ba.effective_to IS NULL OR ba.effective_to >= now())
+                 AND (
+                   ba.dealer_id IS NULL
+                   OR (
+                     ba.dealer_id=j.dealer_id
+                     AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id)
+                   )
+                 )
+                WHERE j.tenant_id=t.tenant_id AND j.journey_id=t.journey_id
+              )
+            ORDER BY t.due_at_utc NULLS LAST, t.created_at_utc, t.task_id
+            LIMIT 500
+            )
+            SELECT t.task_id, t.journey_id, t.root_task_id, t.parent_task_id,
+                   t.round_number, t.task_type, t.category, t.origin_kind,
+                   t.source_type, t.source_code, t.title, t.description, t.reference,
+                   t.severity, t.priority, t.assigned_role_code, t.assigned_actor_id,
+                   t.raised_by_actor_id, t.raised_by_role_code, t.allowed_actions,
+                   t.completion_protocol, t.task_status, t.due_at_utc,
+                   t.created_at_utc, t.updated_at_utc, t.verified_at_utc,
+                   t.completion_result,
+                   COALESCE(c.legal_name, c.display_name) AS customer_name,
+                   o.outlet_name, jr.journey_reference,
+                   {closure_columns_sql("jr")},
+                   NULLIF(concat_ws(' · ', NULLIF(jp.model_name_snapshot,''),
+                                           NULLIF(jp.variant_name_snapshot,'')), '') AS vehicle,
+                   (SELECT COUNT(*) FROM auditcore.p2_task_events ev
+                     WHERE ev.tenant_id=t.tenant_id AND ev.task_id=t.task_id
+                       AND ev.comment IS NOT NULL) AS comment_count
+            FROM page pg
+            JOIN auditcore.p2_tasks t ON t.tenant_id=pg.tenant_id AND t.task_id=pg.task_id
+            JOIN auditcore.journeys jr ON jr.tenant_id=t.tenant_id AND jr.journey_id=t.journey_id
+            LEFT JOIN auditcore.customers c ON c.tenant_id=jr.tenant_id AND c.customer_id=jr.customer_id
+            LEFT JOIN auditcore.dealer_outlets o
+              ON o.tenant_id=jr.tenant_id AND o.dealer_id=jr.dealer_id AND o.outlet_id=jr.outlet_id
+            LEFT JOIN auditcore.journey_products jp ON jp.tenant_id=t.tenant_id AND jp.journey_id=t.journey_id
+            ORDER BY t.due_at_utc NULLS LAST, t.created_at_utc, t.task_id
+            """
+
+
 @router.get("/tasks")
 def list_tasks(
     tenant_id: str,
@@ -3493,76 +3556,7 @@ def list_tasks(
     # including historical backfill. Reading that mirror avoids duplicate
     # tasks and preserves the old task engine's task-specific completion hooks.
     p2_rows = connection.execute(
-        text(
-            f"""
-            SELECT t.task_id, t.journey_id, t.root_task_id, t.parent_task_id,
-                   t.round_number, t.task_type, t.category, t.origin_kind,
-                   t.source_type, t.source_code, t.title, t.description, t.reference,
-                   t.severity, t.priority, t.assigned_role_code, t.assigned_actor_id,
-                   t.raised_by_actor_id, t.raised_by_role_code, t.allowed_actions,
-                   t.completion_protocol, t.task_status, t.due_at_utc,
-                   t.created_at_utc, t.updated_at_utc, t.verified_at_utc,
-                   t.completion_result,
-                   COALESCE(c.legal_name, c.display_name) AS customer_name,
-                   o.outlet_name, jr.journey_reference,
-                   {closure_columns_sql("jr")},
-                   NULLIF(concat_ws(' · ', NULLIF(jp.model_name_snapshot,''),
-                                           NULLIF(jp.variant_name_snapshot,'')), '') AS vehicle,
-                   (SELECT COUNT(*) FROM auditcore.p2_task_events ev
-                     WHERE ev.tenant_id=t.tenant_id AND ev.task_id=t.task_id
-                       AND ev.comment IS NOT NULL) AS comment_count
-            FROM auditcore.p2_tasks t
-            JOIN auditcore.journeys jr ON jr.tenant_id=t.tenant_id AND jr.journey_id=t.journey_id
-            LEFT JOIN auditcore.customers c ON c.tenant_id=jr.tenant_id AND c.customer_id=jr.customer_id
-            LEFT JOIN auditcore.dealer_outlets o
-              ON o.tenant_id=jr.tenant_id AND o.dealer_id=jr.dealer_id AND o.outlet_id=jr.outlet_id
-            LEFT JOIN auditcore.journey_products jp ON jp.tenant_id=t.tenant_id AND jp.journey_id=t.journey_id
-            WHERE t.tenant_id=:tenant_id
-              AND (CAST(:journey_id AS uuid) IS NULL OR t.journey_id=CAST(:journey_id AS uuid))
-              AND (CAST(:role AS varchar) IS NULL OR t.assigned_role_code=ANY(CAST(:roles AS varchar[]))
-                   OR (t.origin_kind='HUMAN' AND t.raised_by_actor_id=:actor_id)
-                   OR CAST(:view AS varchar)='worked')
-              -- The Team Lead's tasks about the Reviewer's own work (the closure to accept, the
-              -- Reviewer's corrections) are not on the Reviewer's queue.
-              AND NOT (t.task_type IN ('CLOSURE_ACCEPTANCE', 'REVIEWER_CORRECTIONS_INFO')
-                       AND upper(COALESCE(CAST(:role AS varchar), ''))='REVIEWER')
-              AND (
-                -- "Worked on" (product owner 2026-11-04): every task the caller acted on in the
-                -- last 30 days, closed or awaiting closure, whatever its role.
-                (CAST(:view AS varchar)='worked' AND EXISTS (
-                    SELECT 1 FROM auditcore.p2_task_events we
-                    WHERE we.tenant_id=t.tenant_id AND we.task_id=t.task_id AND we.actor_id=:actor_id
-                      AND we.created_at_utc > now() - interval '30 days'))
-                OR (CAST(:status AS varchar) IS NOT NULL AND t.task_status=CAST(:status AS varchar))
-                OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='open'
-                    AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER'))
-                OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='done'
-                    AND t.task_status='VERIFIED_COMPLETE'
-                    AND t.verified_at_utc > now() - interval '14 days')
-                OR (CAST(:status AS varchar) IS NULL AND CAST(:view AS varchar)='all')
-              )
-              AND EXISTS (
-                SELECT 1
-                FROM auditcore.journeys j
-                JOIN auditcore.business_assignments ba
-                  ON ba.tenant_id=j.tenant_id
-                 AND ba.security_actor_id=:actor_id
-                 AND ba.assignment_status='ACTIVE'
-                 AND ba.effective_from <= now()
-                 AND (ba.effective_to IS NULL OR ba.effective_to >= now())
-                 AND (
-                   ba.dealer_id IS NULL
-                   OR (
-                     ba.dealer_id=j.dealer_id
-                     AND (ba.outlet_id IS NULL OR ba.outlet_id=j.outlet_id)
-                   )
-                 )
-                WHERE j.tenant_id=t.tenant_id AND j.journey_id=t.journey_id
-              )
-            ORDER BY t.due_at_utc NULLS LAST, t.created_at_utc
-            LIMIT 500
-            """
-        ),
+        text(_P2_TASK_LIST_SQL),
         {
             "tenant_id": tenant_id,
             "journey_id": journey_id,
