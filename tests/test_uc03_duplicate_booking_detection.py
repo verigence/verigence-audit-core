@@ -941,3 +941,198 @@ def test_the_same_customers_other_booking_is_not_a_duplicate(two_journeys) -> No
         "DO UPDATE SET business_status = 'BOOKING_CANCELLED'"), {"t": c.tenant_id, "j": c.journey_b})
     _sync_both(c)
     assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+
+
+# ── only the journeys that can pair are read (2026-11-13) ────────────────────
+# The check used to read every other journey of the Project and compare here;
+# it now reads only those sharing something a basis needs. These tests hold the
+# two to the same answer.
+
+def _add_field(c, *, journey_id, document_type_key, field_key, value, confidence) -> None:
+    """One more reading of a field, beside whatever the journey already carries."""
+    c.execute(
+        text(
+            """
+            INSERT INTO auditcore.journey_document_extracted_fields (
+                tenant_id, journey_id, evidence_id, di_document_id,
+                source_fact_ref, source_fact_version, stage_code,
+                source_document_type_key, source_canonical_field_id, field_key,
+                extracted_value, effective_value, confidence_score, is_modified
+            ) VALUES (:t, :j, NULL, :doc, NULL, 1, 'BOOKING', :dtk, NULL, :fk,
+                      CAST(:v AS jsonb), CAST(:v AS jsonb), :conf, false)
+            """
+        ),
+        {"t": c.tenant_id, "j": journey_id, "doc": uuid4(), "dtk": document_type_key,
+         "fk": field_key, "v": json.dumps(value), "conf": confidence},
+    )
+
+
+@pytest.fixture
+def many_journeys():
+    """Forty journeys under one tenant, rolled back at the end."""
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        pytest.skip("DATABASE_URL is required for duplicate-booking integration tests")
+    engine = create_engine(database_url)
+    suffix = uuid4().hex[:10]
+    tenant_id = f"tenant-dbd-{suffix}"
+    connection = engine.connect()
+    transaction = connection.begin()
+    try:
+        c = connection
+        category_id = c.execute(
+            text("INSERT INTO auditcore.product_categories (category_code, category_name) "
+                 "VALUES (:c, 'V') RETURNING product_category_id"), {"c": f"DBD-CAT-{suffix}"},
+        ).scalar_one()
+        oem_id = c.execute(
+            text("INSERT INTO auditcore.oems (oem_code, oem_name) VALUES (:c, 'O') RETURNING oem_id"),
+            {"c": f"DBD-OEM-{suffix}"},
+        ).scalar_one()
+        c.execute(
+            text("""INSERT INTO auditcore.projects
+                (tenant_id, project_code, project_name, oem_id, product_category_id,
+                 effective_start_date, timezone_name, project_status)
+                VALUES (:t, :pc, 'DBD', :o, :cat, CURRENT_DATE - 1, 'Asia/Kolkata', 'ACTIVE')"""),
+            {"t": tenant_id, "pc": f"DBD-{suffix}", "o": oem_id, "cat": category_id},
+        )
+        dealer_id = c.execute(
+            text("INSERT INTO auditcore.dealers (tenant_id, dealer_code, dealer_name) "
+                 "VALUES (:t, :c, 'D') RETURNING dealer_id"), {"t": tenant_id, "c": f"DBD-D-{suffix}"},
+        ).scalar_one()
+        outlet_id = c.execute(
+            text("INSERT INTO auditcore.dealer_outlets (tenant_id, dealer_id, outlet_code, outlet_name) "
+                 "VALUES (:t, :d, :c, 'O') RETURNING outlet_id"),
+            {"t": tenant_id, "d": dealer_id, "c": f"DBD-O-{suffix}"},
+        ).scalar_one()
+        journeys = []
+        for index in range(40):
+            customer_id = c.execute(
+                text("""INSERT INTO auditcore.customers
+                    (tenant_id, dealer_id, outlet_id, customer_type_code, display_name)
+                    VALUES (:t, :d, :o, 'INDIVIDUAL', 'C') RETURNING customer_id"""),
+                {"t": tenant_id, "d": dealer_id, "o": outlet_id},
+            ).scalar_one()
+            journeys.append(c.execute(
+                text("""INSERT INTO auditcore.journeys
+                    (tenant_id, dealer_id, outlet_id, customer_id, journey_reference)
+                    VALUES (:t, :d, :o, :cu, :r) RETURNING journey_id"""),
+                {"t": tenant_id, "d": dealer_id, "o": outlet_id, "cu": customer_id,
+                 "r": f"DBD-J-{suffix}-{index}"},
+            ).scalar_one())
+        c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        c.tenant_id = tenant_id  # type: ignore[attr-defined]
+        c.journeys = journeys  # type: ignore[attr-defined]
+        yield c
+    finally:
+        transaction.rollback()
+        connection.close()
+        engine.dispose()
+
+
+# The same few people written the many ways documents carry them, so that
+# every basis pairs some journeys and most journeys pair with nobody.
+_WAYS = {
+    "pan_number": ["ABCDE1234F", "abcde 1234 f", "ABCDE-1234-F", "PQRSX1234K", "ZZZZZ9999Z", "NA", "Not available"],
+    "aadhaar_number": ["234567890123", "2345 6789 0123", 234567890123, "345678901234", "0000 0000 0000",
+                       "२३४५६७८९०१२३"],
+    "customer_phone": ["+91 98765 43210", "09876543210", 9876543210, "98765-43210", "7654321098", "9999999999",
+                       "9876543210.50", ["9876543210"], "९८७६५४३२१०", "9८76543210"],
+    "address_pincode": [751001, "751001", "751 001", "Pin: 751001", "751002", 753001, "000000", "७५१००१"],
+    "aadhaar_name": ["Mr. Sanjay Kumar Mohanty", "Sanjaya Kumar Mohanty", "SANJAY K. MOHANTY", "Priya Nair",
+                     "Sukanti Sahoo", "Ghanashyam Sahoo", "ghanasyam sahoo", "Smt. Sukanti   Sahoo",
+                     "Anil Sharma", "Sunil Sharma", "NA"],
+    "pan_name": ["SANJAY KUMAR MOHANTY", "Ghanashyam  Sahoo", "Umakant Sahoo", "Priya Nair"],
+    "customer_name": ["Sanjay Mohanty", "Priya N", "Sukanti Sahoo"],
+    "aadhaar_relationship_name": ["S/O Ghanashyam Sahoo", "W/O Ghanashyam Sahoo", "S/O: Umakant Sahoo",
+                                  "D/O Sanjay Kumar Mohanty", "Father - Anil Sharma"],
+    "pan_relationship_name": ["Ghanashyam Sahoo", "SANJAY KUMAR MOHANTY", "Umakanta Sahoo"],
+    "aadhaar_address": ["Plot 12, Saheed Nagar, Bhubaneswar 751001", "At/Po Khordha, Odisha"],
+}
+_DOCUMENT_OF = {
+    "pan_number": "pan_card", "pan_name": "pan_card", "pan_relationship_name": "pan_card",
+    "customer_phone": "booking_form", "customer_name": "customer_kyc",
+}
+_GSTINS = ["21ABCDE1234F1Z5", "21 abcde1234f 1z5", "21-ABCDE-1234-F-1-Z-5", "27PQRSX5678K1Z2", "No"]
+
+
+def _fill_at_random(c, seed: int) -> None:
+    import random
+
+    rng = random.Random(seed)
+    for journey_id in c.journeys:
+        for field_key, ways in _WAYS.items():
+            if rng.random() < 0.45:
+                _add_field(c, journey_id=journey_id, document_type_key=_DOCUMENT_OF.get(field_key, "aadhaar"),
+                           field_key=field_key, value=rng.choice(ways), confidence=0.95)
+                # A weaker reading beside it: it may share a number or a name
+                # with another booking, and must pair nothing -- only the
+                # strongest reading of a field speaks for the booking.
+                if rng.random() < 0.3:
+                    _add_field(c, journey_id=journey_id, document_type_key=_DOCUMENT_OF.get(field_key, "aadhaar"),
+                               field_key=field_key, value=rng.choice(ways), confidence=0.40)
+        if rng.random() < 0.25:
+            _set_buyer_gstin(c, journey_id=journey_id, gstin=rng.choice(_GSTINS))
+
+
+def _pairs(signals, candidates) -> dict:
+    return {
+        candidate["journey_id"]: (basis, candidate)
+        for candidate in candidates
+        if (basis := dbd._match_basis(signals, candidate)) is not None
+    }
+
+
+def _clear_readings(c) -> None:
+    for table in ("journey_document_extracted_fields", "invoice_review_values", "evidence"):
+        c.execute(text(f"DELETE FROM auditcore.{table} WHERE tenant_id = :t"), {"t": c.tenant_id})
+
+
+def test_reading_only_the_journeys_that_can_pair_finds_every_pair(many_journeys) -> None:
+    c = many_journeys
+    paired = read_fewer = compared = 0
+    bases: set[str] = set()
+    for seed in range(1, 9):
+        _clear_readings(c)
+        _fill_at_random(c, seed)
+        for journey_id in c.journeys:
+            signals = dbd._identity_signals(c, tenant_id=c.tenant_id, journey_id=journey_id)
+            if signals is None:
+                continue
+            everyone = dbd._signals_of_journeys(
+                c, tenant_id=c.tenant_id, journey_ids=[j for j in c.journeys if j != journey_id])
+            read = dbd._candidate_journeys(c, tenant_id=c.tenant_id, journey_id=journey_id, signals=signals)
+
+            # The same pairs, on the same bases, from the same values.
+            assert _pairs(signals, read) == _pairs(signals, everyone)
+            assert {r["journey_id"] for r in read} <= {e["journey_id"] for e in everyone}
+            compared += 1
+            paired += len(_pairs(signals, everyone))
+            read_fewer += len(read) < len(everyone)
+            bases.update(basis for basis, _ in _pairs(signals, everyone).values())
+    # The data pairs journeys on every basis, and for most journeys fewer are read.
+    assert bases >= {"PAN", "AADHAAR", "MOBILE", "GST", "CUSTOMER_MATCHES_RELATIVE", "NAME_AND_ADDRESS",
+                     "SURNAME_AND_PINCODE"}
+    assert paired > 300 and read_fewer > compared * 0.9
+
+
+def test_a_project_with_other_customers_is_still_checked_when_none_can_pair(two_journeys) -> None:
+    """Nothing shared, so no other journey is read -- and the rule still reports
+    that it compared (PASS), not that there was nobody to compare with (SKIPPED)."""
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="pan_card", field_key="pan_number", value="AAAAA1111A")
+    _set_field(c, journey_id=c.journey_b, document_type_key="pan_card", field_key="pan_number", value="BBBBB2222B")
+
+    signals = dbd._identity_signals(c, tenant_id=c.tenant_id, journey_id=c.journey_a)
+    assert dbd._candidate_journeys(c, tenant_id=c.tenant_id, journey_id=c.journey_a, signals=signals) == []
+    result = dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
+    assert result == {"raised": 0, "resolved": 0, "examined": 1}
+
+
+def test_nobody_to_compare_with_is_still_reported_as_such(two_journeys) -> None:
+    """The other booking carries placeholders only: it identifies nobody."""
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="pan_card", field_key="pan_number", value="AAAAA1111A")
+    _set_field(c, journey_id=c.journey_b, document_type_key="pan_card", field_key="pan_number", value="NA")
+
+    result = dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
+    assert result == {"raised": 0, "resolved": 0, "examined": 0}
