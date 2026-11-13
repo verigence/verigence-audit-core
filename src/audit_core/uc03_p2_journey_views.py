@@ -353,6 +353,78 @@ BREAKDOWN_SQL = "WITH " + SCOPED_SQL + """
 """
 
 
+# The figures one breakdown row carries, in BREAKDOWN_SQL's order.
+BREAKDOWN_FIGURES = ("total", "open", "booking_open", "delivery_open", "needs_tl", "overdue",
+                     "high_risk", "stuck", "closed", "bookings_in_month", "deliveries_in_month")
+
+# The tab counts and the three breakdowns (per Dealership, Outlet and PC) from one read of
+# the scoped journeys (Neon cost review 2026-11-13): COUNTS_SQL and BREAKDOWN_SQL three times
+# each built the whole scope again, four reads of every journey's tasks, pages and findings
+# per request. The row with no grouping (part='all') holds COUNTS_SQL's figures; the others
+# hold BREAKDOWN_SQL's for their key, with the two figures BREAKDOWN_SQL ordered by.
+COUNTS_WITH_BREAKDOWN_SQL = "WITH " + SCOPED_SQL + """
+    SELECT
+      CASE WHEN GROUPING(s.dealer_id, s.outlet_id, s.created_by_actor_id) = 7 THEN 'all'
+           WHEN GROUPING(s.dealer_id) = 0 THEN 'dealer'
+           WHEN GROUPING(s.outlet_id) = 0 THEN 'outlet'
+           ELSE 'pc' END AS part,
+      s.dealer_id, MAX(s.dealer_name) AS dealer_name,
+      s.outlet_id, MAX(s.outlet_name) AS outlet_name, MAX(s.outlet_code) AS outlet_code,
+      MAX(CAST(s.dealer_id AS text)) AS outlet_dealer_id,
+      s.created_by_actor_id AS pc_actor_id, MAX(s.pc_name) AS pc_name,
+      COUNT(*) AS total,
+      COUNT(*) FILTER (WHERE s.is_closed) AS closed,
+      COUNT(*) FILTER (WHERE NOT s.is_closed) AS open,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND NOT s.in_delivery) AS booking_open,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND s.in_delivery) AS delivery_open,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND s.pc_task) AS needs_action,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND s.processing AND NOT s.pc_task) AS processing,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND s.tl_task AND NOT s.pc_task) AS with_tl,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND s.tl_task) AS needs_tl,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND s.high_risk) AS high_risk,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND s.overdue) AS overdue,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND s.stuck) AS stuck,
+      COUNT(*) FILTER (WHERE s.booking_month = CAST(:month AS varchar)) AS bookings_in_month,
+      COUNT(*) FILTER (WHERE s.delivery_month = CAST(:month AS varchar)) AS deliveries_in_month,
+      COUNT(*) FILTER (WHERE NOT s.is_closed AND (s.overdue OR s.high_risk)) AS attention
+    FROM scoped s
+    GROUP BY GROUPING SETS ((), (s.dealer_id), (s.outlet_id), (s.created_by_actor_id))
+"""
+
+
+def split_counts_with_breakdown(rows: list[Any]) -> dict[str, Any]:
+    """COUNTS_WITH_BREAKDOWN_SQL's rows as journeys:counts answers them: ``counts`` as
+    COUNTS_SQL gives them, ``byDealer`` / ``byOutlet`` / ``byPc`` as BREAKDOWN_SQL gives
+    them, each ordered as BREAKDOWN_SQL orders them (most needing attention, then most open)."""
+    counts: dict[str, int] = {}
+    parts: dict[str, list[tuple[tuple[int, int], dict[str, Any]]]] = {"dealer": [], "outlet": [], "pc": []}
+    for row in rows:
+        data = dict(row)
+        if data["part"] == "all":
+            counts = counts_from_row({
+                "all_count": data["total"],
+                **{key: data[key] for key in (
+                    "closed", "open", "booking_open", "delivery_open", "needs_action", "processing",
+                    "with_tl", "needs_tl", "high_risk", "overdue", "stuck",
+                    "bookings_in_month", "deliveries_in_month")},
+            })
+            continue
+        figures = {key: int(data[key] or 0) for key in BREAKDOWN_FIGURES}
+        if data["part"] == "dealer":
+            item = {"dealer_id": str(data["dealer_id"]), "dealer_name": data["dealer_name"], **figures}
+        elif data["part"] == "outlet":
+            item = {"outlet_id": str(data["outlet_id"]), "outlet_name": data["outlet_name"],
+                    "outlet_code": data["outlet_code"], "dealer_id": data["outlet_dealer_id"], **figures}
+        else:
+            item = {"pc_actor_id": data["pc_actor_id"], "pc_name": data["pc_name"], **figures}
+        parts[data["part"]].append(((int(data["attention"] or 0), figures["open"]), item))
+    ordered = {
+        part: [item for _, item in sorted(items, key=lambda pair: pair[0], reverse=True)]
+        for part, items in parts.items()
+    }
+    return {"counts": counts, "byDealer": ordered["dealer"], "byOutlet": ordered["outlet"],
+            "byPc": ordered["pc"]}
+
 _MOBILE_CHARACTERS = re.compile(r"^[0-9+\-\s().]+$")
 
 
