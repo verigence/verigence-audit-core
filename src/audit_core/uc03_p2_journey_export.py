@@ -256,8 +256,8 @@ def column_notes() -> list[tuple[str, str]]:
                                 "Amt To Be Received (blank when none). Elsewhere: accessories billed over the "
                                 "price master's standard accessories kit (0 when not more; blank when no "
                                 "accessories are billed)")),
-        ("DMS Booking Synced", "The day (IST) a DMS booking dump uploaded by a TL / Reviewer first had this "
-                               "journey; blank when no dump has it yet"),
+        ("DMS Booking Synced", ("The day (IST) a DMS booking dump uploaded by a TL / Reviewer first had this "
+                                "journey; blank when no dump has it yet")),
         ("DMS Delivery Synced", "The day (IST) a DMS delivery dump first had this journey; blank when none has"),
     ]
     return notes

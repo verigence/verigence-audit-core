@@ -8,7 +8,7 @@ from datetime import date, datetime
 
 # Excel cells carry no zone: naive datetimes are what openpyxl reads.
 # ruff: noqa: DTZ001
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from audit_core import uc03_p2_dms_dumps as m
 
@@ -121,3 +121,88 @@ def test_dump_locations_place_rows_on_outlets() -> None:
     assert m.outlet_for("BHUBANESHW", outlets) == "b"
     assert m.outlet_for("PURI_BY_PASS_SH", outlets) == "c"
     assert m.outlet_for("CSA_SEC_10_SH", outlets) is None
+
+
+# --------------------------------------------------------------------------- with the database
+
+import json
+from uuid import uuid4
+
+import pytest
+from conftest import delete_tenant_data
+from p2_support import (
+    add_extracted_field,
+    create_p2_journey,
+    database_engine,
+)
+from sqlalchemy import text
+
+from audit_core.db import set_tenant_context
+
+
+@pytest.fixture
+def journey():
+    engine = database_engine()
+    created = create_p2_journey(engine, prefix="dms")
+    yield created
+    delete_tenant_data(engine, created.tenant_id)
+
+
+def _store(journey, kind: str, rows: list[dict]) -> str:
+    dump_id = str(uuid4())
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("""
+            INSERT INTO auditcore.p2_dms_dumps (tenant_id, dump_id, dump_kind, dealer_id, business_date, period_month,
+              file_name, file_format, row_count, uploaded_by)
+            VALUES (:t, :id, :k, :d, CURRENT_DATE, date_trunc('month', CURRENT_DATE)::date, 'f.xlsx', 'X', :n, 'tl')
+        """), {"t": journey.tenant_id, "id": dump_id, "k": kind, "d": str(journey.dealer_id), "n": len(rows)})
+        for n, row in enumerate(rows, start=1):
+            connection.execute(text("""
+                INSERT INTO auditcore.p2_dms_dump_rows (tenant_id, dump_id, row_no, dump_kind, dealer_id, booking_number,
+                  dms_booking_number, customer_name, mobile, chassis, model, stage, event_date, raw)
+                VALUES (:t, :id, :n, :k, :d, :b, :o, :c, :m, :ch, :model, :stage, CURRENT_DATE, CAST(:raw AS jsonb))
+            """), {"t": journey.tenant_id, "id": dump_id, "n": n, "k": kind, "d": str(journey.dealer_id),
+                   "b": row.get("booking_number"), "o": row.get("dms_booking_number"), "c": row.get("customer_name"),
+                   "m": row.get("mobile"), "ch": row.get("chassis"), "model": row.get("model"), "stage": row.get("stage"),
+                   "raw": json.dumps({})})
+    return dump_id
+
+
+def test_a_dump_is_matched_marked_reported_and_shown_on_the_calendar(journey) -> None:
+    add_extracted_field(journey, di_document_id=uuid4(), field_key="booking_reference_number", value="B-13455387")
+    add_extracted_field(journey, di_document_id=uuid4(), field_key="vin_number", value="MA1NS2NP1T2K61232",
+                        document_type="customer_invoice_dms")
+    booking = _store(journey, m.BOOKING, [
+        {"booking_number": "B-13455387", "dms_booking_number": "OTF27A090950", "customer_name": "P2 Customer"},
+        {"booking_number": "B-99999999", "dms_booking_number": "OTF27A000001", "customer_name": "Someone Else"},
+        {"booking_number": "B-88888888", "customer_name": "Gone", "stage": "Cancellation"},
+    ])
+    delivery = _store(journey, m.DELIVERY, [{"chassis": "T2K61232", "customer_name": "P2 Customer"}])
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert m.match_dump(connection, tenant_id=journey.tenant_id, dump_id=booking) == {
+            m.MATCHED: 1, m.NOT_IN_TOOL: 0, m.MISSING: 1, m.CANCELLED: 1}
+        # Found, but no delivery file on the journey yet.
+        assert m.match_dump(connection, tenant_id=journey.tenant_id, dump_id=delivery)[m.NOT_IN_TOOL] == 1
+        # Checking again changes nothing and keeps the first sync time.
+        first = connection.execute(text("SELECT dms_booking_synced_at FROM auditcore.p2_journey_dms_sync "
+                                        "WHERE journey_id = :j"), {"j": journey.journey_id}).scalar_one()
+        m.match_dump(connection, tenant_id=journey.tenant_id, dump_id=booking)
+        sync = connection.execute(text("SELECT * FROM auditcore.p2_journey_dms_sync WHERE journey_id = :j"),
+                                  {"j": journey.journey_id}).mappings().one()
+        assert sync["dms_booking_synced_at"] == first and sync["dms_booking_dump_id"] is not None
+        assert sync["dms_delivery_synced_at"] is not None
+        today_db = connection.execute(text("SELECT CURRENT_DATE")).scalar_one()
+        data = m.build_report(connection, tenant_id=journey.tenant_id, dealer_ids=[str(journey.dealer_id)],
+                              first=today_db.replace(day=1))
+        book = load_workbook(io.BytesIO(data))
+        assert book.sheetnames[:3] == ["Summary", "Booking dump variance", "Delivery dump variance"]
+        missing = [r for r in book["Booking dump variance"].iter_rows(values_only=True)][1:]
+        assert [r[8] for r in missing] == ["Someone Else"]  # the cancelled booking is not missing
+        assert [r[4] for r in book["Delivery dump variance"].iter_rows(values_only=True)][1:] == [
+            "Booking on file, delivery not uploaded"]
+        calendar = m.dump_calendar(connection, tenant_id=journey.tenant_id, dealer_ids=[str(journey.dealer_id)],
+                                   first=today_db.replace(day=1), today=today_db)
+        today = next(d for d in calendar["dealers"][0]["days"] if d["date"] == today_db.isoformat())
+        assert today["booking"]["status"] == "UPLOADED" and today["booking"]["missing"] == 1
