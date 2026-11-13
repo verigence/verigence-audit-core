@@ -1,6 +1,9 @@
 import os
 
 os.environ.setdefault("APP_ENV", "test")
+# The night's sleep is by the clock (audit_core.sleep_window): a test run at 2 am
+# must behave as one run at noon. Tests of the sleep set the window themselves.
+os.environ["VERIGENCE_SLEEP_WINDOW_IST"] = "off"
 
 
 def _refuse_non_local_database() -> None:

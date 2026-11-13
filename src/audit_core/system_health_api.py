@@ -39,6 +39,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import Connection, text
 
+from audit_core import sleep_window
 from audit_core.db import set_platform_super_admin_context
 from audit_core.dependencies import (
     HumanAdminRequest,
@@ -176,7 +177,9 @@ def services_health(connection: Connection, since: datetime, now: datetime,
         hourly.setdefault(r["service_name"], []).append(
             {"hour": _iso(r["hour"]), "total": int(r["total"]), "4xx": int(r["c4"]), "5xx": int(r["c5"])})
 
-    alive_after = now - timedelta(seconds=ALIVE_SECONDS)
+    # Asleep at night a service does not beat (audit_core.sleep_window): it is still running.
+    alive_after = sleep_window.alive_cutoff(now, ALIVE_SECONDS)
+    beating_after = now - timedelta(seconds=ALIVE_SECONDS)
     by_service: dict[str, list[dict[str, Any]]] = {}
     for b in boots:
         by_service.setdefault(b["service_name"], []).append(dict(b))
@@ -199,6 +202,7 @@ def services_health(connection: Connection, since: datetime, now: datetime,
             "service": name,
             "status": "UP" if alive else ("DOWN" if rows else "NO_HEARTBEAT"),
             "replicasAlive": len(alive),
+            "asleep": bool(alive) and all(b["last_seen_at_utc"] < beating_after for b in alive),
             "lastSeenAtUtc": _iso(last_seen),
             "currentVersion": (max(alive, key=lambda b: b["started_at_utc"])["version"] if alive else None),
             "upSinceUtc": _iso(min((b["started_at_utc"] for b in alive), default=None)),

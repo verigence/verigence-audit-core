@@ -30,6 +30,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import Connection, text
 
+from audit_core import sleep_window
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_engine, get_human_principal
 from audit_core.security import HumanPrincipal
@@ -105,9 +106,21 @@ class _Listener:
     def stop(self) -> None:
         self._stop.set()
 
+    def _resting(self) -> bool:
+        """Asleep with no screen open (audit_core.sleep_window): the LISTEN
+        connection is let go, or reconnecting it would start the database
+        again every time it stopped. The first screen opened brings it back."""
+        if not sleep_window.asleep():
+            return False
+        with self._lock:
+            return not self._subscribers
+
     def _run(self) -> None:
         backoff = 1.0
         while not self._stop.is_set():
+            if self._resting():
+                self._stop.wait(2.0)
+                continue
             try:
                 connection = self._connect()
             except Exception:
@@ -120,7 +133,7 @@ class _Listener:
                 self.connected.set()
                 backoff = 1.0
                 self._wake()  # anything missed while reconnecting
-                while not self._stop.is_set():
+                while not self._stop.is_set() and not self._resting():
                     keys: list[Key] = []
                     for notify in connection.notifies(timeout=1.0):
                         tenant_id, _, journey_id = str(notify.payload).partition("|")
