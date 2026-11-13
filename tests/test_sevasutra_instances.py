@@ -191,3 +191,37 @@ def test_attach_an_existing_sevasutra_dealership(projects):
     assert feed[service].instance.dealerCode == demo
     with engine.begin() as c:
         c.execute(text("DELETE FROM auditcore.sevasutra_free_dealerships WHERE dealer_code = :c"), {"c": demo})
+
+
+
+# ── "Sync with SevaSutra" (product owner 2026-11-13) ────────────────────────
+
+def test_a_super_admin_asks_for_a_sync_and_sevasutra_reads_when_it_was_asked(monkeypatch):
+    from audit_core import sevasutra_instances
+    from audit_core.dependencies import get_engine, require_super_admin_request
+
+    def no_database():
+        raise AssertionError("the sync request must not touch the database")
+
+    monkeypatch.setattr(sevasutra_instances, "_sync_request", {"requestedAtUtc": None, "requestedBy": None})
+    app.dependency_overrides[get_engine] = no_database
+    client = TestClient(app, raise_server_exceptions=False)
+
+    _service("sevasutra")
+    assert client.get("/v1/service/sevasutra/sync-request").json() == {"requestedAtUtc": None, "requestedBy": None}
+
+    app.dependency_overrides[require_super_admin_request] = lambda: HumanAdminRequest(
+        user_id="sa-1", bearer_token="t",
+        admin_context=SecurityAdminContext(user_id="sa-1", is_super_admin=True, admin_scopes=()))
+    pressed = client.post("/v1/sevasutra/sync-request")
+    assert pressed.status_code == 200, pressed.text
+    at = pressed.json()["requestedAtUtc"]
+    assert at and pressed.json()["requestedBy"] == "sa-1"
+
+    asked = client.get("/v1/service/sevasutra/sync-request").json()
+    assert asked == {"requestedAtUtc": at, "requestedBy": None}  # SevaSutra is told when, not who
+
+    _service("someone-else")
+    assert client.get("/v1/service/sevasutra/sync-request").status_code == 403
+    app.dependency_overrides.pop(require_super_admin_request, None)
+    assert client.post("/v1/sevasutra/sync-request").status_code in (401, 403)
