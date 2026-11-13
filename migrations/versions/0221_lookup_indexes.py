@@ -1,4 +1,4 @@
-"""0220_lookup_indexes -- indexes for the discount scheme and same-customer lookups.
+"""0221_lookup_indexes -- indexes for the discount scheme and same-customer lookups.
 
 Product owner, 13 Nov 2026: fix the slow queries found in the Neon cost review.
 Measured on the live database (Mahindra Orissa):
@@ -16,8 +16,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0220_lookup_indexes"
-down_revision = "0219_list_query_indexes"
+revision = "0221_lookup_indexes"
+down_revision = "0220_performance_indexes"
 branch_labels = None
 depends_on = None
 
