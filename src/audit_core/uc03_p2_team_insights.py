@@ -315,13 +315,17 @@ def channels(connection: Connection, *, tenant_id: str, start: datetime, end: da
         SELECT x.person, x.outlet, x.day, COALESCE(x.channel, 'direct') AS channel, count(*) AS n
         FROM (
           SELECT ub.uploaded_by_actor_id AS person, j.outlet_id AS outlet,
-                 (ub.created_at_utc AT TIME ZONE :tz)::date AS day,
-                 (SELECT CASE WHEN count(*) = 0 THEN NULL WHEN bool_or(bu.source = 'DRIVE') THEN 'drive' ELSE 'bulk' END
-                  FROM auditcore.p2_bulk_files bf
-                  JOIN auditcore.p2_bulk_uploads bu ON bu.tenant_id = bf.tenant_id AND bu.bulk_id = bf.bulk_id
-                  WHERE bf.tenant_id = ub.tenant_id AND bf.batch_id = ub.batch_id) AS channel
+                 (ub.created_at_utc AT TIME ZONE :tz)::date AS day, c.channel
           FROM auditcore.p2_upload_batches ub
           JOIN auditcore.journeys j ON j.tenant_id = ub.tenant_id AND j.journey_id = ub.journey_id
+          -- The bulk files read once and joined (not once per upload: that grew with the period).
+          LEFT JOIN (
+            SELECT bf.batch_id, CASE WHEN bool_or(bu.source = 'DRIVE') THEN 'drive' ELSE 'bulk' END AS channel
+            FROM auditcore.p2_bulk_files bf
+            JOIN auditcore.p2_bulk_uploads bu ON bu.tenant_id = bf.tenant_id AND bu.bulk_id = bf.bulk_id
+            WHERE bf.tenant_id = :t AND bf.batch_id IS NOT NULL
+            GROUP BY bf.batch_id
+          ) c ON c.batch_id = ub.batch_id
           WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
             AND ub.batch_status <> 'AWAITING_UPLOAD'
             AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
