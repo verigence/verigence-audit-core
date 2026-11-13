@@ -62,6 +62,8 @@ from audit_core.security_authorization import (
 from audit_core.task_manager import known_names, normalise_role
 from audit_core.uc03_p2_access import authorize_p2
 from audit_core.uc03_p2_daily_report import delivery_files_closed
+from audit_core.uc03_p2_dashboard import WIDGETS as DASHBOARD_WIDGETS
+from audit_core.uc03_p2_dashboard import build as build_dashboard
 from audit_core.uc03_p2_project_tracker import (
     _ADMIN_ROLES,
     _CLOSING_EVENTS,
@@ -141,6 +143,7 @@ SETTING_ITEMS: tuple[dict[str, str], ...] = (
     *({"key": x["key"], "label": x["label"], "group": "SECTION"} for x in SECTIONS),
     *({"key": m["key"], "label": m["label"], "group": m["group"]} for m in MEASURES),
     {"key": PEERS_ITEM, "label": "Comparison with peers", "group": "COMPARISON"},
+    *({"key": w["key"], "label": w["label"], "group": "DASHBOARD"} for w in DASHBOARD_WIDGETS),
 )
 # Each item is switched per role (product owner 13 Nov 2026: "I want superadmin to be able to
 # control what TL can see and what PM can see"). Stored as "<ROLE>:<item>"; an item with no role
@@ -381,7 +384,7 @@ def _sections(part: Any, data: dict[str, Any], *, rows: list[dict[str, Any]], ou
         }
 
     if wanted("flow") and not own:
-        flow = part("flow")
+        flow = part("flow")["byOutlet"]
         out["flow"] = {"outlets": [
             {**place(o), "days": {d: flow.get(str(o["outlet_id"]), {}).get(d) for d in iso
                                   if flow.get(str(o["outlet_id"]), {}).get(d)}}
@@ -507,10 +510,16 @@ def _part(connection: Connection, name: str, *, tenant_id: str, first: date, las
                 return hit[1]
     start, end = period_bounds(first, last, tz)
     zone = _zone(tz)
-    if name == "backlog":
-        data = insights.backlog(connection, tenant_id=tenant_id, zone=zone, now=now)
-    elif name == "efficiency":
-        data = insights.efficiency(connection, tenant_id=tenant_id, start=start, end=end, now=now)
+    if name == "deliveryState":
+        data = insights._delivery_state(connection, tenant_id, now)
+    elif name in ("backlog", "efficiency"):
+        # Both start from the same two reads (every delivery file and the files closed): read once.
+        state = _part(connection, "deliveryState", tenant_id=tenant_id, first=first, last=last, tz=tz, now=now,
+                      use_cache=use_cache)
+        if name == "backlog":
+            data = insights.backlog(connection, tenant_id=tenant_id, zone=zone, now=now, state=state)
+        else:
+            data = insights.efficiency(connection, tenant_id=tenant_id, start=start, end=end, now=now, state=state)
     elif name == "flow":
         data = insights.flow(connection, tenant_id=tenant_id, first=first, last=last, start=start, end=end, tz=tz,
                              zone=zone, now=now)
@@ -593,6 +602,7 @@ def build_performance(
     # their own (a TL: PCs and Reviewers; a PM: those and the TLs; an Executive: the PMs too).
     outlets: list[dict[str, Any]] = []
     caller_role: str | None = None  # an administrator: everything is shown
+    rank = 0
     if own:
         visible = [actor_id] if actor_id in people else []
         caller_role = people.get(actor_id, {}).get("role") or "PC"
@@ -621,6 +631,26 @@ def build_performance(
         return out
 
     hidden = hidden_items(connection, caller_role)
+    if section == "dashboard":
+        # The dashboard of the caller's role: one lean answer, shaped from the cached parts.
+        def part(name: str) -> Any:
+            return _part(connection, name, tenant_id=tenant_id, first=first, last=day, tz=tz, now=now,
+                         use_cache=use_cache)
+
+        view = "TEAM" if not own else "REVIEWER" if caller_role in ("REVIEWER", "CRM") else "PC"
+        if view == "REVIEWER":  # a Reviewer's queue is the outlets they are mapped to
+            _, outlets = _scope(connection, tenant_id=tenant_id, actor_id=actor_id, admin=False)
+        return {
+            "date": target, "first": first.isoformat(), "days": iso, "timezone": tz, "current": day == today,
+            "asOfUtc": now.isoformat(), "own": own, "role": caller_role,
+            "sections": [x for x in SECTIONS if x["key"] not in hidden],
+            "dashboard": build_dashboard(part, data, view=view, actor_id=actor_id, visible=visible,
+                                         names=data["names"], people=people, outlets=outlets, iso=iso,
+                                         usual_days=usual_days, hidden=hidden, rank=rank, peers=peers,
+                                         planned=[d for d in PLANNED_DUTIES if not any(
+                                             s["title"].strip().lower() == d["title"].lower()
+                                             for s in data["schedules"])]),
+        }
     shown_keys = [k for k in _KEYS if k not in hidden]
     show_duties, show_peers = DUTIES_ITEM not in hidden, PEERS_ITEM not in hidden
     rows = []
@@ -750,7 +780,7 @@ def get_performance(
     day: Annotated[date | None, Query(alias="date")] = None,
     days: Annotated[int, Query(ge=MIN_DAYS, le=MAX_DAYS)] = DEFAULT_DAYS,
     first: Annotated[date | None, Query(alias="from")] = None,
-    section: Annotated[str | None, Query(pattern=r"^(pending|flow|uploads|quality|tasks|trend|efficiency|duties)$")] = None,
+    section: Annotated[str | None, Query(pattern=r"^(dashboard|pending|flow|uploads|quality|tasks|trend|efficiency|duties)$")] = None,
 ) -> dict[str, Any]:
     access = authorize_p2(
         connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,

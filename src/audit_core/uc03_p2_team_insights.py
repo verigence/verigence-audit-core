@@ -87,7 +87,7 @@ def _register_outlets(connection: Connection, tenant_id: str) -> tuple[list[dict
     return outlets, starts
 
 
-def backlog(connection: Connection, *, tenant_id: str, zone: Any, now: datetime) -> dict[str, Any]:
+def backlog(connection: Connection, *, tenant_id: str, zone: Any, now: datetime, state: Any = None) -> dict[str, Any]:
     """What is waiting right now, by age, per outlet and per person."""
     from audit_core.uc03_p2_my_work import gate_register
 
@@ -127,7 +127,7 @@ def backlog(connection: Connection, *, tenant_id: str, zone: Any, now: datetime)
     """), {"t": tenant_id, "since": since}).mappings():
         add("paymentsNotReconciled", r["outlet"], r["person"], r["created_at_utc"])
 
-    delivery, closed_ever = _delivery_state(connection, tenant_id, now)
+    delivery, closed_ever = state or _delivery_state(connection, tenant_id, now)
     # ---- delivery files uploaded and not closed
     closed_ids = {f["journeyId"] for f in closed_ever}
     reviewer_closed = {str(r[0]) for r in connection.execute(text(
@@ -195,9 +195,10 @@ def backlog(connection: Connection, *, tenant_id: str, zone: Any, now: datetime)
     return {"byOutlet": by_outlet, "byPerson": by_person}
 
 
-def efficiency(connection: Connection, *, tenant_id: str, start: datetime, end: datetime, now: datetime) -> dict[str, Any]:
+def efficiency(connection: Connection, *, tenant_id: str, start: datetime, end: datetime, now: datetime,
+               state: Any = None) -> dict[str, Any]:
     """Per PC over the window: delivery files started and closed, days to close, tasks in time."""
-    delivery, closed_ever = _delivery_state(connection, tenant_id, now)
+    delivery, closed_ever = state or _delivery_state(connection, tenant_id, now)
     eff: dict[str, dict[str, float]] = defaultdict(lambda: {
         "deliveryStarted": 0, "deliveryClosed": 0, "daysToCloseSum": 0.0, "tasksWithDue": 0, "tasksInTime": 0})
     for d in delivery.values():
@@ -239,25 +240,30 @@ def flow(connection: Connection, *, tenant_id: str, first: date, last: date, sta
         return flow[str(outlet)].setdefault(day, {"bookings": 0, "deliveries": 0, "onRegister": 0, "inTool": 0,
                                                     "notNotified": 0, "notUploaded": 0, "registerMissing": 0})
 
+    by_person: dict[str, dict[str, dict[str, int]]] = defaultdict(dict)
     for r in connection.execute(text("""
-        SELECT j.outlet_id AS outlet, x.day, count(*) FILTER (WHERE x.delivery) AS deliveries,
+        SELECT j.outlet_id AS outlet, x.person, x.day, count(*) FILTER (WHERE x.delivery) AS deliveries,
                count(*) FILTER (WHERE NOT x.delivery) AS bookings
         FROM (
-          SELECT ub.journey_id, (ub.created_at_utc AT TIME ZONE :tz)::date AS day,
+          SELECT ub.journey_id, ub.uploaded_by_actor_id AS person, (ub.created_at_utc AT TIME ZONE :tz)::date AS day,
                  COALESCE(bool_or(q.business_stage = 'DELIVERY'), false) AS delivery
           FROM auditcore.p2_upload_batches ub
           LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id = ub.tenant_id AND q.batch_id = ub.batch_id
           WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
             AND ub.batch_status <> 'AWAITING_UPLOAD'
             AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
-          GROUP BY 1, 2
+          GROUP BY 1, 2, 3
         ) x
         JOIN auditcore.journeys j ON j.tenant_id = :t AND j.journey_id = x.journey_id
-        GROUP BY 1, 2
+        GROUP BY 1, 2, 3
     """), {"t": tenant_id, "s": start, "e": end, "tz": tz}).mappings():
         c = cell_of(r["outlet"], r["day"].isoformat())
         c["bookings"] += int(r["bookings"])
         c["deliveries"] += int(r["deliveries"])
+        if r["person"]:
+            mine = by_person[str(r["person"])].setdefault(r["day"].isoformat(), {"bookings": 0, "deliveries": 0})
+            mine["bookings"] += int(r["bookings"])
+            mine["deliveries"] += int(r["deliveries"])
     outlets, starts = _register_outlets(connection, tenant_id)
     if outlets and starts is not None and max(first, starts) <= min(last, today):
         for oid, days in gate_register(connection, tenant_id, outlets, max(first, starts), min(last, today),
@@ -271,7 +277,7 @@ def flow(connection: Connection, *, tenant_id: str, first: date, last: date, sta
                 c["inTool"] += int(d["uploadedInTool"] or 0)
                 c["notNotified"] += int(d["notIntimated"] or 0)
                 c["notUploaded"] += max(0, int(d["pendingWithPc"] or 0))
-    return flow
+    return {"byOutlet": flow, "byPerson": by_person}
 
 
 def tasks(connection: Connection, *, tenant_id: str, start: datetime, end: datetime, tz: str) -> dict[str, Any]:

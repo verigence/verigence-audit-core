@@ -342,3 +342,101 @@ def test_duplicates_and_quality_issues(setup):
     assert (mine["blurred"], mine["faded"], mine["duplicatePages"], mine["pagesUploaded"]) == (1, 1, 1, 4)
     at_outlet = next(o for o in report["quality"]["outlets"] if o["outletId"] == str(s.journey.outlet_id))
     assert at_outlet["blurred"] == 1 and at_outlet["pagesUploaded"] == 4
+
+
+def _hide(s, *keys: str):
+    with s.journey.engine.begin() as connection:
+        for key in keys:
+            connection.exec_driver_sql(
+                "INSERT INTO platform_ops.performance_settings (item_key, shown, updated_by) VALUES (%s, false, 'sa-1') "
+                "ON CONFLICT (item_key) DO UPDATE SET shown = false", (key,))
+
+
+def test_the_dashboard_of_each_role(setup):
+    """A PC and a Reviewer read their own work; a TL the team, a PM the Team Leads too; a
+    SuperAdmin shows or hides each widget per role."""
+    s = setup
+    _clear_settings(s)
+    outlet = str(s.journey.outlet_id)
+    me = s.journey.actor_id
+    today = datetime.now(IST).date()
+    now = datetime.now(UTC)
+    gate_pass_tests._delivery_file(s, journeys=2, pages=2)                  # two deliveries of mine today
+    _uploads(s, me, tt._journey(s, outlet, me), 1)                           # and a booking
+    old = tt._journey(s, outlet, me)
+    batch, _rows = add_batch_pages(SimpleNamespace(**{**s.journey.__dict__, "journey_id": old}), [("gate_pass", "READY")])
+    tt._exec(s, "UPDATE auditcore.p2_document_queue SET business_stage='DELIVERY', created_at_utc=:at "
+                "WHERE tenant_id=:t AND batch_id=:b", at=now - timedelta(days=5), b=batch)
+    tt._exec(s, "UPDATE auditcore.p2_upload_batches SET created_at_utc=:at WHERE tenant_id=:t AND batch_id=:b",
+             at=now - timedelta(days=5), b=batch)
+    tt._task(s, role="PC", journey=old, actor=me, created=now - timedelta(days=6), due=now - timedelta(days=5))
+    schedule = tt._gate_schedule(s, today - timedelta(days=10))
+    tt._task(s, role="PC", actor=me, scope="OUTLET", outlet=outlet, schedule=schedule,
+             occurrence=today - timedelta(days=1), status="READY", created=now - timedelta(days=1, hours=3),
+             due=now - timedelta(hours=2))
+    reviewer, tl, pm = (f"{r}-{uuid4().hex[:6]}" for r in ("rv", "tl", "pm"))
+    tt._role(s, reviewer, "REVIEWER", dealer=s.journey.dealer_id, outlet=s.journey.outlet_id)
+    tt._role(s, tl, "TL")
+    tt._role(s, pm, "PM")
+    tt._closure(s, tt._journey(s, outlet, me), by=reviewer)
+    yesterday = (today - timedelta(days=1)).isoformat()
+    try:
+        # ---- the PC: what I did, what waits for me, my duty day by day
+        mine = _build(s, me, own=True, section="dashboard")
+        assert "people" not in mine and "pending" not in mine          # one lean answer
+        board = mine["dashboard"]
+        assert board["view"] == "PC" and board["title"] == "My dashboard"
+        tiles = {t["key"]: t for t in board["kpis"]["tiles"]}
+        assert tiles["bookings"]["value"] == 1 and tiles["deliveries"]["value"] == 3
+        waiting = {k["key"]: k for k in board["pending"]["kinds"]}
+        assert waiting["deliveryFilesOpen"]["buckets"][2] == 1 and waiting["tasksOverdue"]["buckets"][2] == 1
+        assert "awaitingReview" not in waiting
+        [duty] = board["duties"]["rows"]
+        assert duty["notDone"] == 1 and next(d for d in duty["days"] if d["date"] == yesterday)["notDone"] == 1
+        assert [p["title"] for p in board["duties"]["planned"]] == [d["title"] for d in perf.PLANNED_DUTIES]
+        assert sum(board["trend"]["series"][1]["data"]) == 3 and "scorecards" not in board and "attention" not in board
+
+        # ---- the Reviewer: my reviews, what waits at my outlets
+        theirs = _build(s, reviewer, own=True, section="dashboard")["dashboard"]
+        assert theirs["view"] == "REVIEWER"
+        assert {t["key"]: t["value"] for t in theirs["kpis"]["tiles"]}["closed"] == 1
+        assert [k["key"] for k in theirs["pending"]["kinds"]] == ["awaitingReview", "awaitingDecision"]
+        assert theirs["pending"]["kinds"][1]["total"] == 1             # my closure is with the TL / PM
+
+        # ---- the Team Lead: the team, by name
+        team = _build(s, tl, section="dashboard")["dashboard"]
+        assert team["view"] == "TEAM"
+        tiles = {t["key"]: t for t in team["kpis"]["tiles"]}
+        assert tiles["bookings"]["value"] >= 1 and tiles["deliveries"]["value"] >= 3
+        assert {k["key"] for k in team["pending"]["kinds"]} >= {"deliveryFilesOpen", "awaitingReview", "paymentsNotReconciled"}
+        cards = {c["key"]: c for c in team["scorecards"]}
+        assert {"pcs", "reviewers", "outlets"} <= set(cards) and "leads" not in cards
+        row = next(r for r in cards["pcs"]["rows"] if r["id"] == me)
+        # Overdue: the task five days late and yesterday's duty, which is an overdue task too.
+        assert row["values"]["deliveries"] == 3 and row["values"]["overdue"] == 2 and row["values"]["dutiesMissed"] == 1
+        assert len(row["spark"]) == len(team["days"])
+        assert next(r for r in cards["reviewers"]["rows"] if r["id"] == reviewer)["values"]["closed"] == 1
+        assert any("Duty missed" in line["text"] for line in team["attention"]["lines"])
+        assert team["duties"]["rows"][0]["missedBy"][0]["dates"] == [yesterday]
+        assert sum(team["tasks"]["raised"]) >= 2 and team["tasks"]["overdue"] >= 1
+        assert set(team["channels"]) == {"direct", "bulk", "drive"} and team["quality"]["pagesUploaded"] > 0
+
+        # ---- a PM also reads the Team Leads
+        assert "leads" in {c["key"] for c in _build(s, pm, section="dashboard")["dashboard"]["scorecards"]}
+        s.acting["subject"] = tl
+        over_http = s.client.get(f"/p2/v1/tenants/{s.journey.tenant_id}/reports/performance", params={"section": "dashboard"})
+        assert over_http.status_code == 200, over_http.text
+        assert over_http.json()["dashboard"]["view"] == "TEAM" and over_http.json()["sections"]
+
+        # ---- the SuperAdmin hides widgets and measures per role
+        _hide(s, "PC:w.pending", "PC:w.duties", "TL:w.team", "TL:w.attention", "PM:activeMinutes")
+        mine = _build(s, me, own=True, section="dashboard")["dashboard"]
+        assert "pending" not in mine and "duties" not in mine and "kpis" in mine
+        assert "pending" not in mine["widgets"] and "trend" in mine["widgets"]
+        team = _build(s, tl, section="dashboard")["dashboard"]
+        assert "scorecards" not in team and "attention" not in team and "pending" in team
+        for_pm = _build(s, pm, section="dashboard")["dashboard"]
+        pcs = next(c for c in for_pm["scorecards"] if c["key"] == "pcs")
+        assert "hours" not in [c["key"] for c in pcs["columns"]] and "attention" in for_pm
+    finally:
+        _clear_settings(s)
