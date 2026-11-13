@@ -25,6 +25,8 @@ from uuid import UUID
 import structlog
 from sqlalchemy import Connection, text
 
+from audit_core import job_schedule
+
 
 def record_activity(
     connection: Connection,
@@ -294,11 +296,13 @@ def hhmm(value: str, default: str) -> str:
     return default
 
 
-# When (UTC, HH:MM) the day-end sweep runs (product owner 2026-10-22, moved
-# the same day): 02:00 IST = 20:30 UTC, the evening of the previous UTC day.
-# P2_DAYEND_SWEEP_UTC overrides it. The PC's messages quote this time in IST.
-DAYEND_SWEEP_DEFAULT_UTC = "20:30"
-DAYEND_SWEEP_UTC = hhmm(os.environ.get("P2_DAYEND_SWEEP_UTC", DAYEND_SWEEP_DEFAULT_UTC), DAYEND_SWEEP_DEFAULT_UTC)
+# When (UTC, HH:MM) the day-end sweep runs. 02:00 IST from 2026-10-22; since
+# 2026-11-13 9:30 pm IST (16:00 UTC) with every other daily job before 10 pm,
+# so the night's work is through by midnight and the system sleeps -- and a
+# SuperAdmin sets it on the Jobs page (audit_core.job_schedule, which hands a
+# change to this name). The PC's messages quote this time in IST.
+DAYEND_SWEEP_DEFAULT_UTC = job_schedule.ist_to_utc(job_schedule.DAILY_JOBS["DAYEND_CLEANUP"].default_ist)
+DAYEND_SWEEP_UTC = job_schedule.time_utc("DAYEND_CLEANUP")
 
 
 def dayend_sweep_ist() -> str:

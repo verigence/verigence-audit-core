@@ -39,6 +39,14 @@ from audit_core.uc03_p2_page_removal import sweep_failed_pages
 from audit_core.uc03_p2_task_producer import sync_processing_failure_tasks
 
 DAY = datetime(2026, 10, 22, 20, 30, tzinfo=UTC)  # 02:00 IST on the 23rd; claimed as "2026-10-22"
+
+
+@pytest.fixture(autouse=True)
+def _the_sweep_at_two_in_the_morning(monkeypatch):
+    """These tests follow one night with the sweep at 02:00 IST (20:30 UTC), the time it had
+    until 13 Nov 2026. It now runs at 9:30 pm by default and a SuperAdmin sets it
+    (tests/test_job_schedule.py); what it does at its time is the same."""
+    monkeypatch.setattr(runtime, "DAYEND_SWEEP_UTC", "20:30")
 AI_FAILED = "AI reading failed — tried 3 times (at once, then 10 and 20 minutes later). Please upload this page again."
 
 
@@ -462,7 +470,7 @@ def _claims(journey):
 
 
 def test_it_runs_once_a_night_from_the_configured_time(journey, monkeypatch):
-    assert worker._DAYEND_SWEEP_DEFAULT_UTC == runtime.DAYEND_SWEEP_DEFAULT_UTC == "20:30"
+    assert worker._DAYEND_SWEEP_DEFAULT_UTC == runtime.DAYEND_SWEEP_DEFAULT_UTC == "16:00"  # 9:30 pm IST
     assert runtime.DAYEND_SWEEP_UTC == "20:30" and runtime.dayend_sweep_ist() == "02:00 IST"
     # 20:30 UTC on the 22nd is 02:00 IST on the 23rd: the night is named by the UTC date it starts on.
     assert DAY.astimezone(timezone_ist()).strftime("%Y-%m-%d %H:%M") == "2026-10-23 02:00"
@@ -794,7 +802,7 @@ def test_the_nightly_review_at_the_same_time_leaves_swept_pages_and_their_tasks_
                                                  now=DAY + timedelta(days=2)) == {"reconciled": 0, "journeys": 0}
     assert _page(journey, rows[1]["queue_id"]) == before
     assert _task(journey, batch_id)["task_status"] == "READY"
-    assert worker._NIGHTLY_REVIEW_UTC == "20:30" and runtime.DAYEND_SWEEP_UTC == "20:30"
+    assert worker._NIGHTLY_REVIEW_UTC == "16:00" and runtime.DAYEND_SWEEP_UTC == "20:30"
     assert _claims(journey) == ["2026-10-22"]
 
 

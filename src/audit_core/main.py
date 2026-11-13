@@ -20,6 +20,7 @@ from audit_core.feedback import router as feedback_router
 from audit_core.hr_employment_api import router as people_employment_router
 from audit_core.hr_work_context import router as hr_work_context_router
 from audit_core.insurance_tradein import router as insurance_tradein_router
+from audit_core.job_schedule_api import router as job_schedule_router
 from audit_core.journey_housekeeping import router as journey_housekeeping_router
 from audit_core.journeys import router as journey_router
 from audit_core.logging_config import configure_logging
@@ -347,6 +348,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_upload_pause_router)
     application.include_router(uc03_p2_upload_pause_admin_router)
     application.include_router(data_archive_router)
+    application.include_router(job_schedule_router)
     application.include_router(activity_settings_admin_router)
     application.include_router(uc03_p2_daily_report_router)
     application.include_router(uc03_p2_location_checks_router)
