@@ -265,6 +265,9 @@ def test_work_on_the_way_as_the_window_opens_is_finished_before_the_worker_sleep
         stop.set()  # the first sleep: end the test here
 
     monkeypatch.setattr(sleep_window, "WINDOW", ALL_DAY)
+    # No scheduled run is due, whatever the hour the tests run at: with one due (by the wall
+    # clock, from about 21:30 IST) the worker rightly stays up and this loop never ended.
+    monkeypatch.setattr(worker, "_scheduled_run_due", lambda: False)
     monkeypatch.setattr(worker, "process_work", process)
     monkeypatch.setattr(worker, "_POLL_SECONDS", 0.05)
     monkeypatch.setattr(worker, "_NIGHT_BUSY_LOOK_SECONDS", 0.0)
