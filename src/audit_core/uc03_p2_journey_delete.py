@@ -196,6 +196,7 @@ def _check_and_record(
     role: str,
     skip_guards: bool = False,
     details: dict[str, Any] | None = None,
+    allow_reviewed: bool = False,
 ) -> dict[str, Any]:
     """Check the journey may be deleted, collect what to remove and write the
     record, on a connection whose tenant context is set. The same guards for a
@@ -218,7 +219,8 @@ def _check_and_record(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).scalars().all()
-    if reviewed and not skip_guards:
+    # A duplicate booking is deleted even when reviewed (product owner 2026-11-14: one rule).
+    if reviewed and not skip_guards and not allow_reviewed:
         stages = " and ".join(str(stage).title() for stage in reviewed)
         raise ConflictError(
             error_code="VAC-CONFLICT-004",
@@ -634,6 +636,7 @@ def system_delete_journey(
     on_deleted: Callable[[Connection], None] | None = None,
     before_record: Callable[[Connection, bool], None] | None = None,
     record_details: Callable[[Connection], dict[str, Any]] | None = None,
+    allow_reviewed: bool = False,
 ) -> DeleteJourneyResult:
     """Delete a journey with no human principal. Must not be called inside an
     open transaction: Document Intelligence and R2 are called between the
@@ -673,6 +676,7 @@ def system_delete_journey(
         started = _check_and_record(
             connection, tenant_id=tenant_id, journey_id=journey_id, reason=reason[:2000],
             correlation_id=correlation_id, actor_id=SYSTEM_ACTOR, role=SYSTEM_ROLE, skip_guards=continuing,
+            allow_reviewed=allow_reviewed,
             details=record_details(connection) if record_details is not None else None,
         )
     di_done, object_count = _remove(

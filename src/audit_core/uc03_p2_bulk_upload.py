@@ -672,7 +672,7 @@ def find_booking(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
         return None
     ids = [UUID(str(v)) for v in connection.execute(
         text(_SAME_CUSTOMER_SQL), {"tenant_id": tenant_id, "journey_id": journey_id, "pan": me.pan,
-                                   "aadhaar": me.aadhaar},
+                                   "aadhaar": me.aadhaar, "mobile": None, "gstin": None, "dealer_id": None},
     ).scalars().all()]
     others = _identities(connection, tenant_id=tenant_id, journey_ids=ids)
     busy = reading_for_bulk(connection, tenant_id=tenant_id, journey_ids=list(others))

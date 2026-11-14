@@ -157,7 +157,21 @@ def _pair(tenant: P2Journey, **new_overrides):
     new = _journey(tenant, ref=f"NEW-{uuid4().hex[:6]}", created=now - timedelta(minutes=5), pc="New PC")
     _file(old)
     _file(new, **new_overrides)
+    # 2026-11-14: the journey with more pages is kept (the newer on a tie). The earlier one
+    # holds more here, so the new file is the copy, as these tests were written.
+    for number in (1, 2, 3):
+        add_page(old, page_number=number, status="READY")
+    _no_stored_pages(old)
     return old, new
+
+
+def _no_stored_pages(journey: P2Journey) -> None:
+    """Pages counted but never carried (judged another file's), so a deleted copy has nothing to copy."""
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_upload_batches SET identity_status='FOREIGN' "
+                                "WHERE tenant_id=:t AND journey_id=:j"),
+                           {"t": journey.tenant_id, "j": journey.journey_id})
 
 
 def _quiet(journey: P2Journey, minutes: int = 60) -> None:
@@ -316,9 +330,9 @@ def test_same_file_with_an_individual_pan_is_deleted_and_alerted(tenant):
     assert alert["expires_at_utc"] > alert["published_at_utc"]
     assert "was deleted" in alert["body"] and "New PC" in alert["body"]
     fields = {f["field"]: f for f in alert["payload"]["matchedFields"]}
-    assert set(fields) == {"pan", "mobile", "name", "model", "outlet", "bookingReference"}
+    # 2026-11-14, one rule: the identity values that matched, the model and the outlet.
+    assert set(fields) == {"pan", "mobile", "model", "outlet"}
     assert fields["pan"]["newValue"] == "XXXXXX234F"
-    assert fields["bookingReference"]["exact"] and fields["bookingReference"]["newValue"] == BOOKING_REF
     # The PC who entered the new file is named by id, so their own screen beeps (2026-10-31).
     with new.engine.begin() as connection:
         set_tenant_context(connection, new.tenant_id)
@@ -334,7 +348,7 @@ def test_same_file_with_an_individual_pan_is_deleted_and_alerted(tenant):
         ).mappings().one()
     assert record["deleted_by_actor_id"] == "SYSTEM" and record["deleted_by_role"] == "SYSTEM"
     assert record["deletion_status"] == "COMPLETED"
-    assert record["reason"].startswith("Same file uploaded again: matches OLD-")
+    assert record["reason"].startswith("Duplicate booking: the same model") and "OLD-" in record["reason"]
     # What the Deleted tab shows (2026-11-02): PAN and mobile in full, the booking number, the copy kept.
     assert record["deletion_kind"] == "SAME_FILE"
     assert record["customer_pan"] == INDIVIDUAL_PAN and record["customer_mobile"] == "9876543210"
@@ -344,8 +358,8 @@ def test_same_file_with_an_individual_pan_is_deleted_and_alerted(tenant):
 
 
 @pytest.mark.parametrize("differs", [
-    {"pan": "ABCPE9999F"}, {"mobile": "9000000001"}, {"name": "Sunil Kumar Mallick"}, {"model": "SCORPIO N"},
-    {"model": None}, {"booking_ref": "BK/0013"},
+    # Two people (a PAN read on both and different), another model, or no model to compare.
+    {"pan": "ABCPE9999F"}, {"model": "SCORPIO N"}, {"model": None},
 ])
 def test_one_value_different_is_not_the_same_file(tenant, differs):
     _, new = _pair(tenant, **differs)
@@ -353,19 +367,88 @@ def test_one_value_different_is_not_the_same_file(tenant, differs):
     assert _alerts(new) == [] and _queued(new) == []
 
 
-def test_company_pan_is_alerted_but_kept(tenant):
+@pytest.mark.parametrize("differs", [
+    # 2026-11-14, one rule: the name, the booking reference number and the mobile no longer
+    # decide it -- the same PAN and model are enough.
+    {"mobile": "9000000001"}, {"name": "Sunil Kumar Mallick"}, {"booking_ref": "BK/0013"}, {"booking_ref": None},
+])
+def test_the_same_pan_and_model_is_one_booking_whatever_else_differs(tenant, differs):
+    _, new = _pair(tenant, **differs)
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    _quiet(new)
+    assert _delete(new) == "DELETED" and not _exists(new)
+
+
+def test_the_same_mobile_and_model_alone_is_one_booking(tenant):
+    """No PAN or Aadhaar on the copy: the same mobile and model are enough (2026-11-14)."""
+    _, new = _pair(tenant, pan=None)
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+
+
+def test_the_same_gstin_and_model_is_one_booking(tenant):
+    now = datetime.now(UTC)
+    old = _journey(tenant, ref="OLD-GST", created=now - timedelta(days=1))
+    new = _journey(tenant, ref="NEW-GST", created=now)
+    for journey in (old, new):
+        _file(journey, pan=None, mobile=None, name="Sarthak Motors Pvt Ltd")
+        doc = uuid4()
+        add_evidence(journey, di_document_id=doc, document_type_key="gst_certificate")
+        add_extracted_field(journey, di_document_id=doc, field_key="gstin", value="21AAICS1234F1Z5")
+    add_page(old, status="READY")
+    add_page(old, page_number=2, status="READY")
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    fields = {f["field"] for f in _alerts(new)[0]["payload"]["matchedFields"]}
+    assert "gstin" in fields
+
+
+def test_company_pan_is_deleted_too(tenant):
+    """2026-11-14: a company's booking is no exception any more."""
     now = datetime.now(UTC)
     old = _journey(tenant, ref="OLD-CO", created=now - timedelta(days=1))
     new = _journey(tenant, ref="NEW-CO", created=now)
     _file(old, pan=COMPANY_PAN, name="Sarthak Motors Pvt Ltd")
     _file(new, pan=COMPANY_PAN, name="Sarthak Motors Private Limited")
-    assert _detect(new)["outcomes"] == ["KEPT_NOT_INDIVIDUAL"]
+    add_page(old, status="READY")
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+
+
+def test_the_newer_file_is_kept_on_a_tie_and_the_previous_booking_deleted(tenant):
+    """"new file has pages equal to or more than first file: delete the previous booking and add
+    new journey" (2026-11-14)."""
+    now = datetime.now(UTC)
+    old = _journey(tenant, ref="TIE-OLD", created=now - timedelta(days=3))
+    new = _journey(tenant, ref="TIE-NEW", created=now - timedelta(minutes=5))
+    _file(old)
+    _file(new)
+    for journey in (old, new):
+        _page(journey, sha="f" * 64)  # the same page on both: nothing to copy
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
     [alert] = _alerts(new)
-    assert alert["alert_status"] == "PUBLISHED" and "kept for review" in alert["body"]
-    assert _queued(new) == [] and _exists(new)
+    assert alert["subject_journey_id"] == old.journey_id and alert["related_journey_id"] == new.journey_id
+    _quiet(old)
+    assert _delete(old) == "DELETED"
+    assert not _exists(old) and _exists(new)
 
 
-def test_reviewed_new_file_is_kept(tenant):
+def test_another_outlet_of_the_same_dealership_is_deleted_too(tenant):
+    old, new = _cross_pair(tenant)
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    _quiet(new)
+    assert _delete(new) == "DELETED" and _exists(old)
+
+
+def test_different_vins_are_two_vehicles(tenant):
+    old, new = _pair(tenant)
+    for journey, vin in ((old, "MA1TJ2YD6T6J00001"), (new, "MA1TJ2YD6T6J00002")):
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            connection.execute(text("INSERT INTO auditcore.journey_classifications (tenant_id, journey_id, vin_used, "
+                                    "customer_type) VALUES (:t, :j, :v, 'INDIVIDUAL')"),
+                               {"t": journey.tenant_id, "j": journey.journey_id, "v": vin})
+    assert _detect(new).get("raised", 0) == 0
+
+
+def test_reviewed_new_file_is_deleted(tenant):
     _, new = _pair(tenant)
     with new.engine.begin() as connection:
         set_tenant_context(connection, new.tenant_id)
@@ -375,12 +458,13 @@ def test_reviewed_new_file_is_kept(tenant):
                  "VALUES (:t, :j, 'BOOKING', 'rev', 'REVIEWER', 1, :d, :o)"),
             {"t": new.tenant_id, "j": new.journey_id, "d": new.dealer_id, "o": new.outlet_id},
         )
-    assert _detect(new)["outcomes"] == ["KEPT_REVIEWED"]
-    assert _queued(new) == [] and _exists(new)
-    assert "already marked reviewed" in _alerts(new)[0]["body"]
+    # 2026-11-14: a reviewer's review does not keep a duplicate booking.
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    _quiet(new)
+    assert _delete(new) == "DELETED" and not _exists(new)
 
 
-def test_reviewed_after_queueing_is_kept_by_the_delete_guard(tenant):
+def test_reviewed_after_queueing_is_still_deleted(tenant):
     _, new = _pair(tenant)
     _detect(new)
     with new.engine.begin() as connection:
@@ -391,9 +475,9 @@ def test_reviewed_after_queueing_is_kept_by_the_delete_guard(tenant):
                  "VALUES (:t, :j, 'BOOKING', 'rev', 'REVIEWER', 1, :d, :o)"),
             {"t": new.tenant_id, "j": new.journey_id, "d": new.dealer_id, "o": new.outlet_id},
         )
-    assert _delete(new) == "KEPT_REVIEWED"
-    assert _exists(new)
-    assert _alerts(new)[0]["outcome"] == "KEPT_REVIEWED"
+    _quiet(new)
+    assert _delete(new) == "DELETED"
+    assert not _exists(new)
 
 
 def test_closed_older_journey_is_not_paired(tenant):
@@ -409,18 +493,18 @@ def test_closed_older_journey_is_not_paired(tenant):
     assert _alerts(new) == []
 
 
-def test_the_older_journeys_run_flags_the_newer_one_and_ties_break_on_journey_id(tenant):
+def test_either_journeys_run_flags_the_same_copy_and_ties_break_on_journey_id(tenant):
     at = datetime.now(UTC) - timedelta(hours=1)
     first = _journey(tenant, ref="TIE-A", created=at)
     second = _journey(tenant, ref="TIE-B", created=at)
     _file(first)
     _file(second)
-    newer, older = sorted((first, second), key=lambda j: str(j.journey_id), reverse=True)
-    # Whichever journey's check runs, the one with the larger journey_id is the new file.
-    assert _detect(older)["raised"] == 1
-    assert [a["subject_journey_id"] for a in _alerts(older)] == [newer.journey_id]
-    assert _detect(newer)["raised"] == 0
-    assert len(_alerts(older)) == 1
+    larger, smaller = sorted((first, second), key=lambda j: str(j.journey_id), reverse=True)
+    # The same pages and the same time: the larger journey_id counts as the newer and is kept.
+    assert _detect(larger)["raised"] == 1
+    assert [a["subject_journey_id"] for a in _alerts(larger)] == [smaller.journey_id]
+    assert _detect(smaller)["raised"] == 0
+    assert len(_alerts(larger)) == 1
 
 
 def test_recomputing_does_not_alert_twice(tenant):
@@ -637,7 +721,7 @@ def test_an_older_pair_is_acted_on_too(tenant):
     _file(new)
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
     [work] = _queued(new)
-    assert work["journey_id"] == new.journey_id
+    assert work["journey_id"] == old.journey_id  # the same pages: the newer is kept (2026-11-14)
 
 
 # 2. a company booking with the signatory's personal PAN
@@ -649,35 +733,6 @@ def test_looks_like_company():
         assert looks_like_company(name), name
     for name in ("Amit Kumar Sahoo", "Sunil Mallick", "Coral Das"):
         assert not looks_like_company(name), name
-
-
-def test_a_company_pan_on_any_document_keeps_the_new_file(tenant):
-    old, new = _pair(tenant)
-    other = uuid4()
-    add_evidence(old, di_document_id=other, document_type_key="booking_form")
-    add_extracted_field(old, di_document_id=other, field_key="pan_number", value="AAACS1234K", confidence=40.0)
-    assert _detect(new)["outcomes"] == ["KEPT_NOT_INDIVIDUAL"]
-    [alert] = _alerts(new)
-    assert "a company or firm PAN is on file" in alert["body"] and _queued(new) == []
-
-
-def test_a_gstin_keeps_the_new_file(tenant):
-    _, new = _pair(tenant)
-    doc = uuid4()
-    add_evidence(new, di_document_id=doc, document_type_key="gst_certificate")
-    add_extracted_field(new, di_document_id=doc, field_key="gstin", value="21AAKFS1234M1ZV")  # a firm's GSTIN, not on the customer's own PAN
-    assert _detect(new)["outcomes"] == ["KEPT_NOT_INDIVIDUAL"]
-    assert "a GSTIN is on file" in _alerts(new)[0]["body"]
-
-
-def test_a_firm_name_keeps_the_new_file(tenant):
-    now = datetime.now(UTC)
-    old = _journey(tenant, ref="FIRM-OLD", created=now - timedelta(days=1))
-    new = _journey(tenant, ref="FIRM-NEW", created=now)
-    _file(old, name="M/S Shree Shyam Enterprises")
-    _file(new, name="M/S Shree Shyam Enterprises")
-    assert _detect(new)["outcomes"] == ["KEPT_NOT_INDIVIDUAL"]
-    assert "company's or firm's" in _alerts(new)[0]["body"]
 
 
 # 3. re-checked at delete time
@@ -711,14 +766,6 @@ def test_a_value_changed_since_keeps_the_new_file(tenant):
                                 "WHERE tenant_id=:t AND journey_id=:j"), {"t": new.tenant_id, "j": new.journey_id})
     assert _delete(new) == "KEPT_CHANGED" and _exists(new)
     assert "no longer match" in _alerts(new)[0]["body"]
-
-
-def test_a_gstin_uploaded_since_keeps_the_new_file(tenant):
-    _, new = _ready_to_delete(tenant)
-    doc = uuid4()
-    add_evidence(new, di_document_id=doc, document_type_key="gst_certificate")
-    add_extracted_field(new, di_document_id=doc, field_key="gstin", value="21AAKFS1234M1ZV")  # a firm's GSTIN, not on the customer's own PAN
-    assert _delete(new) == "KEPT_CHANGED" and _exists(new)
 
 
 # 4. values of removed documents
@@ -854,17 +901,16 @@ def test_a_sole_proprietors_gstin_on_their_own_pan_is_not_a_company(tenant):
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
 
 
-def test_a_page_the_earlier_one_lacks_but_not_settled_as_the_customers_keeps_the_copy(tenant):
-    """Nothing is deleted that could be lost (2026-11-03): a new page of a file whose person
-    is not settled keeps the copy for review."""
+def test_a_page_the_earlier_one_lacks_not_settled_as_the_customers_is_carried(tenant):
+    """2026-11-14, one rule: a page of the copy not judged yet is carried to the kept booking (it
+    was uploaded to this customer's booking); the copy is deleted."""
     old, new = _pair(tenant)
     _same_pages(old, new)
     _page(old, sha=uuid4().hex, kind="booking_form")                # the earlier journey is the fuller
     _page(old, sha=uuid4().hex, kind="payment_receipt")
     _page(new, sha=uuid4().hex, kind="tax_invoice_tally", identity="UNKNOWN")
-    assert _detect(new)["outcomes"] == ["KEPT_OWN_DOCUMENTS"]
-    [alert] = _alerts(new)
-    assert "not yet settled as the customer's" in alert["body"] and _queued(new) == []
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    assert _alerts(new)[0]["payload"]["carryDocuments"] == ["tax_invoice_tally"]
 
 
 def test_documents_only_on_reads_kinds(tenant):
@@ -932,50 +978,12 @@ def test_same_booking_reference_differently_written_is_deleted(tenant):
     assert not _exists(new) and _exists(old)
 
 
-def test_a_different_booking_reference_is_not_a_duplicate(tenant):
-    _, new = _pair(tenant, booking_ref="BK/0099")
-    assert _detect(new).get("raised", 0) == 0
-    assert _alerts(new) == [] and _queued(new) == []
-
-
-def test_no_booking_reference_on_one_copy_is_alerted_and_kept(tenant):
-    old, new = _pair(tenant, booking_ref=None)
-    assert _detect(new)["outcomes"] == ["KEPT_NO_BOOKING_REFERENCE"]
-    [alert] = _alerts(new)
-    assert alert["alert_status"] == "PUBLISHED" and alert["outcome"] == "KEPT_NO_BOOKING_REFERENCE"
-    assert "kept for review: the booking reference number was not read on the new file" in alert["body"]
-    assert "booking reference number" not in alert["body"].split(" on ")[-1]  # not listed as matched
-    assert _queued(new) == [] and _exists(new)
-    # Read later and the same: the copy is deleted after all, under the same alert.
-    form = uuid4()
-    add_evidence(new, di_document_id=form, document_type_key="booking_docket")
-    add_extracted_field(new, di_document_id=form, field_key="booking_reference_number", value="BK 12",
-                        document_type="booking_docket")
-    add_evidence(old, di_document_id=uuid4(), document_type_key="payment_receipt")  # as many documents on each
-    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
-    [alert] = _alerts(new)
-    assert alert["alert_status"] == "PENDING" and len(_queued(new)) == 1
-    _quiet(new)
-    assert _delete(new) == "DELETED" and _exists(old)
-
-
-def test_no_booking_reference_at_delete_time_keeps_the_copy(tenant):
-    _, new = _ready_to_delete(tenant)
-    with new.engine.begin() as connection:  # the booking form removed since
-        set_tenant_context(connection, new.tenant_id)
-        connection.execute(text("UPDATE auditcore.evidence SET association_status='VOIDED' WHERE tenant_id=:t "
-                                "AND journey_id=:j AND document_type_key='booking_form'"),
-                           {"t": new.tenant_id, "j": new.journey_id})
-    _quiet(new)
-    assert _delete(new) == "KEPT_CHANGED" and _exists(new)
-    assert "booking reference number was not read" in _alerts(new)[0]["body"]
-
-
-def test_the_journey_with_more_documents_is_kept_even_when_it_is_the_newer(tenant):
-    """Product owner 2026-11-04: "keep deleting the files where we have less number of documents"."""
+def test_the_journey_with_more_pages_is_kept_even_when_it_is_the_older(tenant):
+    """2026-11-14: the journey with more pages is kept; here the newer holds more."""
     old, new = _pair(tenant)
     _same_pages(old, new)
-    _page(new, sha=uuid4().hex, kind="tax_invoice_tally")      # the newer upload holds one more document
+    for _ in range(4):
+        _page(new, sha=uuid4().hex, kind="tax_invoice_tally")  # the newer upload holds more pages
     _quiet(old)
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
     [alert] = _alerts(new)
@@ -987,11 +995,11 @@ def test_the_journey_with_more_documents_is_kept_even_when_it_is_the_newer(tenan
 
 def test_a_copy_that_gains_documents_before_the_delete_is_kept(tenant):
     _, new = _ready_to_delete(tenant)
-    _page(new, sha=uuid4().hex, kind="tax_invoice_tally")      # pages still arriving
-    _page(new, sha=uuid4().hex, kind="insurance_cover")
+    for _ in range(5):
+        _page(new, sha=uuid4().hex, kind="tax_invoice_tally")  # pages still arriving
     _quiet(new)
     assert _delete(new) == "KEPT_CHANGED" and _exists(new)
-    assert "now holds more documents" in _alerts(new)[0]["body"]
+    assert "now holds more pages" in _alerts(new)[0]["body"]
 
 
 def test_another_dealership_is_never_the_same_file(tenant):
@@ -1025,6 +1033,8 @@ def test_an_aadhaar_only_match_is_deleted_and_recorded_masked(tenant):
     new = _journey(tenant, ref="AAD-NEW", created=now - timedelta(minutes=5))
     _file(old, pan=None, aadhaar=AADHAAR)
     _file(new, pan=None, aadhaar="234567891234")
+    add_page(old, status="READY")  # the earlier one holds more pages: the new file is the copy
+    _no_stored_pages(old)
     _quiet(new)
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
     payload = _alerts(new)[0]["payload"]
@@ -1052,6 +1062,8 @@ def test_the_deleted_tab_lists_deleted_copies_within_the_callers_scope(tenant):
     new = _journey(tenant, ref=f"NEW-{uuid4().hex[:6]}", created=now - timedelta(minutes=5), pc="New PC")
     _file(old, aadhaar=AADHAAR)
     _file(new, aadhaar=AADHAAR)
+    add_page(old, status="READY")
+    _no_stored_pages(old)
     _quiet(new)
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
     assert _delete(new) == "DELETED"
@@ -1119,6 +1131,11 @@ def _cross_pair(tenant: P2Journey, *, other_dealer: bool = False, **new_override
     new = _journey(elsewhere, ref=f"NEW-{uuid4().hex[:6]}", created=now - timedelta(minutes=5), pc="New PC")
     _file(old)
     _file(new, **new_overrides)
+    # 2026-11-14: the journey with more pages is kept (the newer on a tie). The earlier one
+    # holds more here, so the new file is the copy, as these tests were written.
+    for number in (1, 2, 3):
+        add_page(old, page_number=number, status="READY")
+    _no_stored_pages(old)
     return old, new
 
 
@@ -1138,7 +1155,9 @@ def test_cross_outlet_rule_without_a_database():
     assert matched_fields(_identity(outlet_id=a), base) is not None
 
 
-@pytest.mark.parametrize("other_dealer", [False, True])
+# Another outlet of the same dealership is deleted since 2026-11-14
+# (test_another_outlet_of_the_same_dealership_is_deleted_too); another dealership is alerted.
+@pytest.mark.parametrize("other_dealer", [True])
 def test_a_duplicate_booking_across_outlets_is_alerted_and_nothing_deleted(tenant, other_dealer):
     old, new = _cross_pair(tenant, other_dealer=other_dealer, booking_ref="OTHER/77", name="A K Sahoo")
     result = _detect(new)
@@ -1181,31 +1200,6 @@ def _assign(journey: P2Journey, actor: str, role: str, *, outlet_id: UUID | None
              "o": outlet_id})
 
 
-def test_the_same_dealership_alert_is_for_both_outlets_pcs_reviewers_and_team_leads(tenant):
-    old, new = _cross_pair(tenant)
-    _detect(new)
-    _assign(old, "pc-old", "PC", outlet_id=old.outlet_id)
-    _assign(new, "pc-new", "PC", outlet_id=new.outlet_id)
-    _assign(old, "tl-all", "TL", outlet_id=None)                      # Project-wide
-    _assign(old, "rv-old", "REVIEWER", outlet_id=old.outlet_id)
-    elsewhere = _other_outlet(tenant)
-    _assign(elsewhere, "pc-elsewhere", "PC", outlet_id=elsewhere.outlet_id)
-    _assign(old, "pm-old", "PM", outlet_id=old.outlet_id)
-
-    def kinds(actor: str) -> list[str]:
-        with tenant.engine.begin() as connection:
-            set_tenant_context(connection, tenant.tenant_id)
-            response = list_tenant_alerts(tenant_id=tenant.tenant_id, human_principal=SimpleNamespace(subject=actor),
-                                          authorization_client=AllowAllAuthorization(role_key="PC"),
-                                          connection=connection)
-            return [a.kind for a in response.items]
-
-    for actor in ("pc-old", "pc-new", "tl-all", "rv-old"):
-        assert kinds(actor) == [SAME_DEALERSHIP_KIND], actor
-    for actor in ("pc-elsewhere", "pm-old", "nobody"):
-        assert kinds(actor) == [], actor
-
-
 def _kinds_seen_by(tenant: P2Journey, actor: str) -> list[str]:
     with tenant.engine.begin() as connection:
         set_tenant_context(connection, tenant.tenant_id)
@@ -1223,19 +1217,6 @@ def test_the_cross_dealership_alert_is_on_every_screen(tenant):
     _assign(tenant, "pm-any", "PM", outlet_id=tenant.outlet_id)
     for actor in ("pc-elsewhere", "pm-any", "nobody-assigned"):
         assert _kinds_seen_by(tenant, actor) == [CROSS_OUTLET_KIND], actor
-
-
-def test_the_same_dealership_alert_stays_up_while_both_bookings_are_open(tenant):
-    old, new = _cross_pair(tenant)
-    _detect(new)
-    _assign(old, "pc-old", "PC", outlet_id=old.outlet_id)
-    with tenant.engine.begin() as connection:  # past the 24 hours of an ordinary alert
-        set_tenant_context(connection, tenant.tenant_id)
-        connection.execute(text("UPDATE auditcore.p2_tenant_alerts SET expires_at_utc = now() - interval '1 hour' "
-                                "WHERE tenant_id=:t"), {"t": tenant.tenant_id})
-    assert _kinds_seen_by(tenant, "pc-old") == [SAME_DEALERSHIP_KIND]
-    _stage(new, "BOOKING_CANCELLED")
-    assert _kinds_seen_by(tenant, "pc-old") == []
 
 
 # ── 2026-11-03: carry what only the copy holds, by page fingerprint ──────────
@@ -1308,13 +1289,15 @@ def test_a_page_only_the_copy_holds_goes_to_the_earlier_journey_before_the_delet
             {"t": old.tenant_id, "j": old.journey_id, "k": str(copied["batch_id"])}).scalar_one() == 1
 
 
-def test_a_copy_holding_another_customers_file_is_kept(tenant):
+def test_a_copy_holding_another_customers_file_is_deleted_without_carrying_it(tenant):
+    """2026-11-14: another customer's file is not copied to this customer's booking, and no
+    longer keeps the copy."""
     old, new = _pair(tenant)
     _same_pages(old, new)
     _page(old, sha=uuid4().hex, kind="booking_form")                # the earlier journey is the fuller
     _page(new, sha=uuid4().hex, kind="pan_card", identity="FOREIGN")
-    assert _detect(new)["outcomes"] == ["KEPT_OWN_DOCUMENTS"]
-    assert "another customer's file" in _alerts(new)[0]["body"]
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    assert "carryDocuments" not in _alerts(new)[0]["payload"]
 
 
 # ── one sale uploaded twice, known by its dealer receipt (2026-11-12) ─────────
@@ -1330,34 +1313,6 @@ def _invoice(journey: P2Journey, number: str) -> None:
     add_evidence(journey, di_document_id=doc, document_type_key="customer_invoice_dms")
     add_extracted_field(journey, di_document_id=doc, field_key="invoice_number", value=number,
                         document_type="customer_invoice_dms")
-
-
-def test_the_same_receipt_is_the_same_sale_without_a_database():
-    from audit_core.uc03_p2_same_file import (
-        same_file_fields,
-        same_sale_fields,
-        two_vehicles,
-    )
-
-    receipt = frozenset({"BRMM262704861"})
-    # AVINASH PATRA: the mobile and the booking number each misread by one digit on one copy.
-    booking = _identity(mobile="9338696711", booking_refs=frozenset({"OR26110204479797"}), receipt_numbers=receipt,
-                        model_name="Maxx HD 1.7L LX")
-    delivery = _identity(mobile="9338676711", booking_refs=frozenset({"OR26110204479497"}), receipt_numbers=receipt,
-                         model_name="BOL MAXX PUP HD 1.7L LX", vin="MA1RE2TTKT5K40074",
-                         invoice_numbers=frozenset({"INV27P000427"}))
-    assert matched_fields(delivery, booking) is None
-    fields = {f["field"]: f for f in same_file_fields(delivery, booking)}
-    assert fields["receipt"]["exact"] and not fields["mobile"]["exact"] and not fields["bookingReference"]["exact"]
-    # No receipt in common, another person, or two vehicles: not the same sale.
-    assert same_sale_fields(delivery, _identity(receipt_numbers=frozenset({"BRMM262704862"}))) is None
-    assert same_sale_fields(delivery, _identity(pan="ABCPE9999F", receipt_numbers=receipt)) is None
-    other_car = _identity(receipt_numbers=receipt, vin="MA1RE2TTKT5K40075")
-    assert two_vehicles(delivery, other_car) and same_sale_fields(delivery, other_car) is None
-    same_car = _identity(receipt_numbers=receipt, vin="MA1RE2TTKT5K40074", invoice_numbers=frozenset({"INV21Q000186"}))
-    assert same_sale_fields(delivery, same_car) is not None  # one VIN: an invoice misread does not split it
-    assert two_vehicles(_identity(invoice_numbers=frozenset({"INV1000001"})),
-                        _identity(invoice_numbers=frozenset({"INV1000002"})))
 
 
 def test_a_booking_file_then_its_delivery_file_become_one_journey(tenant):
@@ -1381,18 +1336,6 @@ def test_a_booking_file_then_its_delivery_file_become_one_journey(tenant):
     assert {f["field"] for f in alert["payload"]["matchedFields"]} >= {"pan", "receipt"}
     assert _delete(booking) == "DELETED"
     assert not _exists(booking) and _exists(delivery)
-
-
-def test_the_same_receipt_on_two_vehicles_is_two_sales(tenant):
-    now = datetime.now(UTC)
-    first = _journey(tenant, ref="CAR-ONE", created=now - timedelta(days=1))
-    second = _journey(tenant, ref="CAR-TWO", created=now - timedelta(minutes=5))
-    _file(first, booking_ref="OR1")
-    _file(second, booking_ref="OR2")
-    for journey, invoice in ((first, "INV27P000001"), (second, "INV27P000002")):
-        _receipt(journey, "BRMM/2627/04861")
-        _invoice(journey, invoice)
-    assert _detect(second).get("raised", 0) == 0 and _alerts(second) == []
 
 
 def test_the_settle_job_finds_old_pairs_and_its_dry_run_changes_nothing(tenant):
@@ -1424,9 +1367,10 @@ def test_exactly_the_same_documents_of_a_company_are_deleted(tenant):
     _file(old, pan=COMPANY_PAN, name="Sarthak Motors Pvt Ltd")
     _file(new, pan=COMPANY_PAN, name="Sarthak Motors Pvt Ltd")
     _same_pages(old, new, n=2)
-    _quiet(new)
+    _quiet(old)
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
-    assert _delete(new) == "DELETED" and not _exists(new) and _exists(old)
+    # The same pages: the newer is kept, the previous booking deleted (2026-11-14).
+    assert _delete(old) == "DELETED" and not _exists(old) and _exists(new)
 
 
 def test_exactly_the_same_documents_without_a_booking_number_are_deleted(tenant):
@@ -1435,19 +1379,6 @@ def test_exactly_the_same_documents_without_a_booking_number_are_deleted(tenant)
     _quiet(new)
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
     assert _delete(new) == "DELETED"
-
-
-def test_a_company_copy_with_a_document_of_its_own_is_still_kept(tenant):
-    now = datetime.now(UTC)
-    old = _journey(tenant, ref="CO2-OLD", created=now - timedelta(days=5))
-    new = _journey(tenant, ref="CO2-NEW", created=now - timedelta(minutes=30))
-    _file(old, pan=COMPANY_PAN, name="Sarthak Motors Pvt Ltd")
-    _file(new, pan=COMPANY_PAN, name="Sarthak Motors Pvt Ltd")
-    _same_pages(old, new)
-    # Each holds a page the other does not (two invoices): not exactly the same documents.
-    _page(old, sha=uuid4().hex, kind="customer_invoice_dms")
-    _page(new, sha=uuid4().hex, kind="customer_invoice_dms")
-    assert _detect(new)["outcomes"] == ["KEPT_NOT_INDIVIDUAL"] and _queued(new) == []
 
 
 def test_a_deleted_copy_counts_under_the_pc_who_uploaded_it(tenant):
@@ -1468,20 +1399,6 @@ def test_a_deleted_copy_counts_under_the_pc_who_uploaded_it(tenant):
                                                 start=now - timedelta(days=30), end=now - timedelta(hours=1))
     assert [r["journey_id"] for r in rows] == [new.journey_id] and str(rows[0]["outlet_id"]) == str(new.outlet_id)
     assert none_before == []
-
-
-def test_a_company_copy_kept_earlier_is_deleted_once_its_documents_are_the_same(tenant):
-    now = datetime.now(UTC)
-    old = _journey(tenant, ref="CO3-OLD", created=now - timedelta(days=5))
-    new = _journey(tenant, ref="CO3-NEW", created=now - timedelta(minutes=30))
-    _file(old, pan=COMPANY_PAN, name="Sarthak Motors Pvt Ltd")
-    _file(new, pan=COMPANY_PAN, name="Sarthak Motors Pvt Ltd")
-    assert _detect(new)["outcomes"] == ["KEPT_NOT_INDIVIDUAL"]  # no pages yet to compare
-    _same_pages(old, new)
-    _quiet(new)
-    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
-    [alert] = _alerts(new)
-    assert alert["outcome"] == "PENDING_DELETE" and len(_queued(new)) == 1
 
 
 def test_a_rephotographed_document_the_earlier_journey_holds_is_not_carried(tenant, monkeypatch):
@@ -1513,13 +1430,6 @@ def test_a_receipt_is_carried_only_when_its_number_is_new(tenant, number, carrie
     _detect(new)
     payload = _alerts(new)[0]["payload"]
     assert ("dealer_receipt" in payload.get("carryDocuments", [])) is carried
-
-
-def test_two_vehicles_are_never_the_same_file(tenant):
-    old, new = _pair(tenant)
-    _invoice(old, "INV27P000001")
-    _invoice(new, "INV27P000002")
-    assert _detect(new).get("raised", 0) == 0 and _alerts(new) == []
 
 
 def _batches_copied(journey: P2Journey) -> list[dict]:
