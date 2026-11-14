@@ -12,6 +12,12 @@ deleted, and both show under Duplicate bookings -- exactly as a new upload is ha
 company's file with documents of its own, a reviewed copy, or one holding a document that
 cannot be carried is kept and alerted, as always.
 
+Product owner 2026-11-14 (one rule, uc03_p2_same_file): every journey of a dealership sharing
+a PAN, an Aadhaar, a mobile, a GSTIN or a dealer receipt number with another journey of the
+same dealership is checked again ("check all in duplicate bookings having same PAN or same
+aadhar"); the copy with fewer pages (the older on a tie) is deleted after what only it holds
+is copied over. Nothing keeps it any more but two people, two vehicles or a closed journey.
+
 Worker job ``SAME_SALE_SETTLE``: tag ``<tenant_id>:<label>``; reports the journey
 references to look at, or none for every such journey. A DRY RUN unless the label ends
 with "-commit": the check runs inside a transaction that is rolled back, and the outcome
@@ -35,13 +41,17 @@ JOB = "SAME_SALE_SETTLE"
 _CANDIDATES_SQL = """
     WITH k AS (
         SELECT DISTINCT f.journey_id,
-               f.field_key || ':' || CASE
+               CASE WHEN f.field_key IN ('buyer_gstin', 'customer_gstin') THEN 'gstin' ELSE f.field_key END
+               || ':' || CASE
                    WHEN f.field_key = 'aadhaar_number'
                        THEN regexp_replace(f.effective_value #>> '{}', '[^0-9]', '', 'g')
+                   WHEN f.field_key = 'customer_phone'
+                       THEN right(regexp_replace(f.effective_value #>> '{}', '[^0-9]', '', 'g'), 10)
                    ELSE regexp_replace(upper(f.effective_value #>> '{}'), '[^A-Z0-9]', '', 'g') END AS code
         FROM auditcore.journey_document_extracted_fields f
         WHERE f.tenant_id = :t AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
-          AND (f.field_key IN ('pan_number', 'aadhaar_number')
+          AND (f.field_key IN ('pan_number', 'aadhaar_number', 'customer_phone', 'gstin', 'buyer_gstin',
+                               'customer_gstin')
                OR (f.field_key = 'receipt_number' AND f.source_document_type_key = 'dealer_receipt'))
           AND EXISTS (SELECT 1 FROM auditcore.evidence e
                       WHERE e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
@@ -51,7 +61,7 @@ _CANDIDATES_SQL = """
     FROM k a
     JOIN k b ON a.code = b.code AND a.journey_id <> b.journey_id AND length(a.code) >= 14
     JOIN auditcore.journeys j ON j.tenant_id = :t AND j.journey_id = a.journey_id
-    JOIN auditcore.journeys o ON o.tenant_id = :t AND o.journey_id = b.journey_id AND o.outlet_id = j.outlet_id
+    JOIN auditcore.journeys o ON o.tenant_id = :t AND o.journey_id = b.journey_id AND o.dealer_id = j.dealer_id
     ORDER BY j.created_at_utc
 """
 

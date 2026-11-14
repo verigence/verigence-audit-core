@@ -1,5 +1,30 @@
 """The same file uploaded again, and a duplicate booking across outlets.
 
+ONE RULE (product owner 2026-11-14, in place of the conditions below, which kept
+letting duplicates through: "when we see there is same model, same PAN, same
+mobile number, same GSTIN or same Aadhaar, then only one thing should happen
+and new file has pages equal to or more than first file: delete the previous
+booking and add new journey"):
+
+    Two open journeys of one dealership (any of its outlets) are one booking
+    when they have the same model and the same PAN, Aadhaar, mobile or GSTIN
+    (any one). The journey with more pages is kept -- the newer one on a tie --
+    and the other is deleted, after the documents only it holds are copied to
+    the kept one (by page fingerprint, as before). Nothing else is asked: not
+    the customer name, the booking reference number, the receipt, whether a
+    reviewer reviewed it, or whether the buyer is a company.
+
+    What still stops it, because it says two people or two vehicles, or the
+    booking is finished:
+      - a PAN, or an Aadhaar, read on both and different (two people);
+      - VINs read on both and different (two vehicles);
+      - either journey closed (delivered, cancelled, no delivery).
+    Another dealership: never deleted (each dealership's own booking); the red
+    alert stays. While the copy still has pages being read, the delete waits.
+
+The notes below describe the earlier rules; where they disagree with the rule
+above, the rule above holds.
+
 Product owner 2026-11-04 (enhancements to the rules below, which all still hold):
     - The same file at ONE OUTLET (PAN/Aadhaar + mobile + model + outlet, and,
       as before, the customer name and the booking reference number): the
@@ -165,7 +190,7 @@ from audit_core.uc03_p2_names import (
     same_person,
 )
 from audit_core.uc03_p2_runtime import enqueue_work
-from audit_core.uc03_sku_words import generation_key
+from audit_core.uc03_sku_words import generation_key, normalized_key
 
 logger = structlog.get_logger(__name__)
 
@@ -252,7 +277,8 @@ _IDENTITY_SQL = f"""
                ) AS row_rank
         FROM auditcore.journey_document_extracted_fields f
         WHERE f.tenant_id = :tenant_id AND f.journey_id = ANY(:journey_ids)
-          AND f.field_key IN ('pan_number', 'aadhaar_number', 'customer_phone')
+          AND f.field_key IN ('pan_number', 'aadhaar_number', 'customer_phone', 'gstin', 'buyer_gstin',
+                              'customer_gstin')
           AND f.effective_value IS NOT NULL
           AND {_ON_ACTIVE_DOCUMENT}
     )
@@ -265,6 +291,9 @@ _IDENTITY_SQL = f"""
              WHERE r.journey_id = j.journey_id AND r.field_key = 'aadhaar_number' AND r.row_rank = 1) AS aadhaar,
            (SELECT r.value FROM ranked r
              WHERE r.journey_id = j.journey_id AND r.field_key = 'customer_phone' AND r.row_rank = 1) AS phone,
+           (SELECT array_agg(r.value) FROM ranked r
+             WHERE r.journey_id = j.journey_id AND r.field_key IN ('gstin', 'buyer_gstin', 'customer_gstin')
+               AND r.row_rank = 1) AS gstins,
            CASE WHEN c.legal_name_status = 'VERIFIED' THEN c.legal_name END AS customer_name,
            s.model_id, jp.model_name_snapshot AS model_name, jp.variant_name_snapshot AS variant_name,
            (SELECT array_agg(f.effective_value #>> '{{}}'
@@ -317,7 +346,14 @@ _SAME_CUSTOMER_SQL = f"""
       AND ((f.field_key = 'pan_number' AND CAST(:pan AS text) IS NOT NULL
             AND upper(regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^A-Za-z0-9]', '', 'g')) = :pan)
         OR (f.field_key = 'aadhaar_number' AND CAST(:aadhaar AS text) IS NOT NULL
-            AND regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^0-9]', '', 'g') = :aadhaar))
+            AND regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^0-9]', '', 'g') = :aadhaar)
+        -- 2026-11-14: the same mobile or GSTIN is enough too (one dealership's journeys).
+        OR (f.field_key = 'customer_phone' AND CAST(:mobile AS text) IS NOT NULL
+            AND right(regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^0-9]', '', 'g'), 10) = :mobile
+            AND EXISTS (SELECT 1 FROM auditcore.journeys oj WHERE oj.tenant_id = f.tenant_id
+                        AND oj.journey_id = f.journey_id AND oj.dealer_id = CAST(:dealer_id AS uuid)))
+        OR (f.field_key IN ('gstin', 'buyer_gstin', 'customer_gstin') AND CAST(:gstin AS text) IS NOT NULL
+            AND upper(regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^A-Za-z0-9]', '', 'g')) = :gstin))
       AND {_ON_ACTIVE_DOCUMENT}
 """
 
@@ -365,10 +401,12 @@ class FileIdentity:
     receipt_numbers: frozenset[str] = frozenset()
     invoice_numbers: frozenset[str] = frozenset()
     vin: str | None = None
+    # 2026-11-14: the buyer's GSTIN (a valid one; "No" or a bare number is none).
+    gstin: str | None = None
 
     @property
     def model_key(self) -> str:
-        return generation_key(self.model_name) if self.model_name and self.model_name.strip() else ""
+        return model_family(self.model_name) if self.model_name and self.model_name.strip() else ""
 
     @property
     def complete(self) -> bool:
@@ -386,10 +424,52 @@ class FileIdentity:
         return (self.created_at, str(self.journey_id))
 
 
+# The model families of the OEM master (product_models), longest first, read at most every ten
+# minutes; and nameplates the master writes as part of another (2026-11-14).
+_FAMILY_SECONDS = 600
+_EXTRA_FAMILIES = ("BOLEROCAMPER", "BOLEROPICKUP", "MAXXHD", "MAXXCITY")
+_families: tuple[float, tuple[str, ...]] = (0.0, ())
+
+
+def _load_families(connection: Connection) -> None:
+    global _families
+    import time
+
+    if _families[1] and time.monotonic() - _families[0] < _FAMILY_SECONDS:
+        return
+    try:
+        names = connection.execute(text("SELECT DISTINCT model_name FROM auditcore.product_models")).scalars().all()
+    except Exception:
+        logger.warning("p2_same_file_model_families_unread", exc_info=True)
+        return
+    keys = {key for name in names if (key := generation_key(name)) and len(key) >= 3} | set(_EXTRA_FAMILIES)
+    _families = (time.monotonic(), tuple(sorted(keys, key=lambda k: (-len(k), k))))
+
+
+def model_family(model_name: str | None) -> str:
+    """The model as one family (product owner 2026-11-14: the same booking showed "MAHINDRA BOLERO
+    NEO" on one copy and "BOLERO NEO" on the other; "XUV 3XO" and "MAHINDRA XUV 3XO"; "BOL MAXX PUP
+    HD 1.7 VXI" and "MAXX HD 1.7 VXI"; "SCORPIO N Z8S" and "SCORPIO-N Z8L"): the brand word and the
+    generation words dropped, then the longest model of the OEM master the name starts with --
+    "THAR ROXX" stays apart from "THAR", "BOLERO NEO" from "BOLERO", "XUV3XO EV" from "XUV3XO". A name
+    the master does not know is its own family (generation_key), as before."""
+    key = normalized_key(model_name)
+    key = key.removeprefix("MAHINDRA")
+    if key.startswith("NEW") and len(key) > 5:
+        key = key[3:]
+    key = re.sub(r"^BOL(?:ERO)?(?=MAXX)", "", key)
+    key = re.sub(r"^MAXX(?:PUP|PIKUP|PICKUP)", "MAXX", key)
+    for family in _families[1]:
+        if key.startswith(family):
+            return family
+    return generation_key(key) if key else ""
+
+
 def _identities(connection: Connection, *, tenant_id: str, journey_ids: Iterable[UUID]) -> dict[UUID, FileIdentity]:
     ids = list(journey_ids)
     if not ids:
         return {}
+    _load_families(connection)
     rows = connection.execute(
         text(_IDENTITY_SQL), {"tenant_id": tenant_id, "journey_ids": ids},
     ).mappings().all()
@@ -423,6 +503,7 @@ def _identities(connection: Connection, *, tenant_id: str, journey_ids: Iterable
             receipt_numbers=_document_numbers(row["receipt_numbers"]),
             invoice_numbers=_document_numbers(row["invoice_numbers"]),
             vin=(str(row["vin"]).strip().upper() or None) if row["vin"] else None,
+            gstin=next((g for g in (_valid_gstin(v) for v in row["gstins"] or []) if g), None),
         )
     return out
 
@@ -656,12 +737,79 @@ def same_sale_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str
     return fields
 
 
-def same_file_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
-    """One booking entered twice (matched_fields) or one sale uploaded twice (same_sale_fields);
-    never two vehicles (different VINs, or vehicle invoices with no number in common)."""
-    if two_vehicles(new, existing):
+def one_booking_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
+    """The one rule (product owner 2026-11-14): one dealership, the same model, and the same
+    PAN, Aadhaar, mobile or GSTIN -- any one. Never when a PAN or an Aadhaar is read on both and
+    differs (two people) or the VINs are read on both and differ (two vehicles). The fields that
+    matched, for the alert and the Deleted tab; None otherwise."""
+    if not (new.dealer_id and new.dealer_id == existing.dealer_id):
         return None
-    return matched_fields(new, existing) or same_sale_fields(new, existing)
+    if (new.pan and existing.pan and new.pan != existing.pan) or (
+            new.aadhaar and existing.aadhaar and new.aadhaar != existing.aadhaar):
+        return None
+    if new.vin and existing.vin and new.vin != existing.vin:
+        return None
+    if not same_model(new, existing):
+        return None
+    fields: list[dict[str, Any]] = []
+    if new.pan and new.pan == existing.pan:
+        fields.append({"field": "pan", "label": "PAN", "newValue": _masked(new.pan),
+                       "existingValue": _masked(existing.pan), "exact": True})
+    if new.aadhaar and new.aadhaar == existing.aadhaar:
+        fields.append({"field": "aadhaar", "label": "Aadhaar", "newValue": mask_aadhaar(new.aadhaar),
+                       "existingValue": mask_aadhaar(existing.aadhaar), "exact": True})
+    if new.mobile and new.mobile == existing.mobile:
+        fields.append({"field": "mobile", "label": "Mobile", "newValue": _masked(new.mobile),
+                       "existingValue": _masked(existing.mobile), "exact": True})
+    if new.gstin and new.gstin == existing.gstin:
+        fields.append({"field": "gstin", "label": "GSTIN", "newValue": new.gstin,
+                       "existingValue": existing.gstin, "exact": True})
+    if not fields:
+        return None
+    fields += [
+        {"field": "model", "label": "Model", "newValue": new.model_name, "existingValue": existing.model_name,
+         "exact": bool(new.model_id and new.model_id == existing.model_id) or new.model_name == existing.model_name},
+        {"field": "outlet", "label": "Outlet", "newValue": _place(new.dealer_name, new.outlet_name),
+         "existingValue": _place(existing.dealer_name, existing.outlet_name), "exact": same_outlet(new, existing)},
+    ]
+    return fields
+
+
+def same_file_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
+    """One booking uploaded twice: the one rule (one_booking_fields, 2026-11-14). The earlier
+    conditions (matched_fields: the name and booking reference number; same_sale_fields: the
+    receipt) no longer decide it -- requiring them is what kept letting duplicates through.
+    The same receipt number still finds one sale whose model was written differently on the
+    booking form and on the invoice (same_sale_fields, 2026-11-12): more duplicates, not fewer."""
+    return one_booking_fields(new, existing) or same_sale_fields(new, existing)
+
+
+def page_counts(connection: Connection, *, tenant_id: str, journey_ids: Iterable[UUID]) -> dict[UUID, int]:
+    """Pages on file per journey (not cancelled): the copy kept is the one with more (2026-11-14)."""
+    ids = list(journey_ids)
+    return {UUID(str(j)): int(n) for j, n in connection.execute(
+        text("SELECT journey_id, count(*) FROM auditcore.p2_document_queue WHERE tenant_id=:t "
+             "AND journey_id = ANY(:ids) AND unit_kind='PAGE' AND queue_status <> 'CANCELLED' GROUP BY journey_id"),
+        {"t": tenant_id, "ids": ids},
+    ).all()}
+
+
+def kept_of(group: list[FileIdentity], pages: dict[UUID, int]) -> FileIdentity:
+    """The journey kept: more pages; on a tie the newer one ("new file has pages equal to or more
+    than first file: delete the previous booking", 2026-11-14)."""
+    return max(group, key=lambda identity: (pages.get(identity.journey_id, 0), identity.order_key))
+
+
+def pages_in_flight(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """Pages of the journey still being read: the delete waits for them, so what they hold can be
+    copied to the kept journey."""
+    from audit_core.uc03_p2_journey_views import _IN_FLIGHT
+
+    return bool(connection.execute(
+        text("SELECT EXISTS (SELECT 1 FROM auditcore.p2_document_queue WHERE tenant_id=:t AND journey_id=:j "
+             "AND queue_status = ANY(:statuses))"),
+        {"t": tenant_id, "j": journey_id, "statuses": list(_IN_FLIGHT)},
+    ).scalar_one())
 
 
 def booking_identified(new: FileIdentity, existing: FileIdentity) -> bool:
@@ -876,8 +1024,6 @@ def documents_only_on(connection: Connection, *, tenant_id: str, new_journey_id:
 _RECEIPT_KINDS = frozenset({"dealer_receipt", "payment_receipt"})
 # A page not typed yet is carried: nothing says the earlier journey has it.
 _UNTYPED_KINDS = frozenset({"document", "unknown", "other", "unclassified"})
-# The customer's own files (file identity): only their documents are carried to the earlier journey.
-_CARRIED_IDENTITY = "BELONGS"
 _GONE_UNITS = ("CANCELLED", "MERGED")
 
 
@@ -929,25 +1075,24 @@ def carry_plan(connection: Connection, *, tenant_id: str, new: FileIdentity, exi
         ),
         {"t": tenant_id, "j": new.journey_id},
     ).mappings().all()]
-    if any(r["identity_status"] == "FOREIGN" for r in rows):
-        return CarryPlan(kinds=(), units=(), unsure=f"it holds another customer's file, which {ref} must not get")
+    del ref  # 2026-11-14: nothing keeps the copy any more; the reasons below are gone
     pages = [r for r in rows if r["unit_kind"] == "PAGE"]
     fresh = [p for p in pages if not p["page_sha256"] or str(p["page_sha256"]) not in on_existing]
     if not fresh:
         return CarryPlan(kinds=(), units=(), unsure=None, identical=bool(pages))  # the same set of documents
-    unsettled = [p for p in fresh if p["identity_status"] != _CARRIED_IDENTITY]
-    if unsettled:
-        return CarryPlan(kinds=(), units=(), unsure=(
-            f"{len(unsettled)} page(s) {ref} does not have, not yet settled as the customer's"))
     # The unit that holds each new page: the document it was merged into, or the page itself.
+    # Product owner 2026-11-14 (one rule, nothing keeps the copy): another customer's file
+    # (FOREIGN) is not carried to this customer's booking; a file not judged yet is carried (it
+    # was uploaded to this customer's booking); a page with no stored document (its reading
+    # failed) has nothing to copy. The delete itself waits while pages are still being read.
     units: dict[str, dict[str, Any]] = {}
     by_id = {str(r["queue_id"]): r for r in rows}
     for page in fresh:
+        if page["identity_status"] == "FOREIGN":
+            continue
         unit = by_id.get(str(page["merged_into_queue_id"])) if page["merged_into_queue_id"] else page
         if unit is None or unit["queue_status"] in _GONE_UNITS or not unit["page_object_key"]:
-            return CarryPlan(kinds=(), units=(), unsure=(
-                f"page {page['page_number']} of {page['original_filename'] or 'a file'}, which {ref} does not have, "
-                "has no stored document to copy yet"))
+            continue
         units[str(unit["queue_id"])] = {**unit, "document_type_key": unit["document_type_key"]
                                         or unit["classified_document_type"] or "document"}
     # Only what the earlier journey does not have (product owner 2026-11-12: "add additional
@@ -1073,21 +1218,11 @@ def _raise(
 ) -> str | None:
     """The alert for one new file, and its delete queued; None when this
     file was already handled (the marker)."""
-    kept_reason = business_reason(connection, tenant_id=tenant_id, files=[new, existing])
-    plan = CarryPlan(kinds=(), units=(), unsure=None)
-    if _reviewed(connection, tenant_id=tenant_id, journey_id=new.journey_id):
-        outcome, kept_reason = KEPT_REVIEWED, None
-    elif identical_documents(connection, tenant_id=tenant_id, new=new, existing=existing):
-        # Exactly the same documents: deleted whatever else is said (2026-11-12).
-        outcome, kept_reason = PENDING_DELETE, None
-    elif kept_reason:
-        outcome = KEPT_NOT_INDIVIDUAL
-    elif not booking_identified(new, existing):
-        outcome, kept_reason = KEPT_NO_BOOKING_REFERENCE, _no_booking_reference_reason(new, existing)
-    elif (plan := carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing)).unsure:
-        outcome, kept_reason = KEPT_OWN_DOCUMENTS, plan.unsure
-    else:
-        outcome = PENDING_DELETE
+    # One rule (2026-11-14): the copy is deleted -- not kept as reviewed, a company's, without a
+    # booking reference number, or for documents only it holds (those are copied over first).
+    kept_reason: str | None = None
+    plan = carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing)
+    outcome = PENDING_DELETE
     payload = {
         "customerName": new.name,
         "model": new.model_name,
@@ -1139,7 +1274,9 @@ def _raise(
              # 2026-11-03: kept for what it alone held, now carried to the earlier journey;
              # 2026-11-12: kept as a company's, or changed at delete time, and now found to be
              # exactly the same documents (or the same again).
-             "was": [KEPT_NO_BOOKING_REFERENCE, KEPT_OWN_DOCUMENTS, KEPT_NOT_INDIVIDUAL, KEPT_CHANGED]},
+             # 2026-11-14: every kept copy, under the one rule.
+             "was": [KEPT_NO_BOOKING_REFERENCE, KEPT_OWN_DOCUMENTS, KEPT_NOT_INDIVIDUAL, KEPT_CHANGED,
+                     KEPT_REVIEWED, KEPT_CLOSED]},
         ).scalar_one_or_none()
     if alert_id is None:
         return None
@@ -1228,12 +1365,13 @@ def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correla
     # The customer, mobile and model are enough to look (a duplicate across outlets needs no
     # name); the same file still needs everything (matched_fields).
     # A journey known only by its PAN / Aadhaar and receipt can still be the same sale.
-    if me is None or me.closed or not (me.pan or me.aadhaar):
+    if me is None or me.closed or not (me.pan or me.aadhaar or me.mobile or me.gstin):
         return {"examined": 0, "raised": 0}
     candidate_ids = [
         UUID(str(v)) for v in connection.execute(
             text(_SAME_CUSTOMER_SQL),
-            {"tenant_id": tenant_id, "journey_id": journey_id, "pan": me.pan, "aadhaar": me.aadhaar},
+            {"tenant_id": tenant_id, "journey_id": journey_id, "pan": me.pan, "aadhaar": me.aadhaar,
+             "mobile": me.mobile, "gstin": me.gstin, "dealer_id": str(me.dealer_id) if me.dealer_id else None},
         ).scalars().all()
     ]
     others = _identities(connection, tenant_id=tenant_id, journey_ids=candidate_ids)
@@ -1250,7 +1388,10 @@ def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correla
     ).scalar_one()
     # Another outlet: a duplicate booking across outlets, alert only (2026-11-03). The newer
     # journey is named against the earliest booking at another outlet.
-    across = [o for o in others.values() if not o.closed and cross_outlet_fields(me, o) is not None]
+    # One dealership's journeys are settled by the one rule below (2026-11-14); only another
+    # dealership's booking of the same customer is alerted.
+    across = [o for o in others.values() if not o.closed and o.dealer_id != me.dealer_id
+              and cross_outlet_fields(me, o) is not None]
     flagged = 0
     if across:
         pair = sorted([me, *across], key=lambda identity: identity.order_key)
@@ -1272,10 +1413,9 @@ def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correla
     if not matches:
         return {"examined": len(others), "raised": 0, "acrossOutlets": flagged}
     group = [me, *matches]
-    # Product owner 2026-11-04: the journey with more documents is kept (the earlier on a tie);
-    # every other one is the copy, deleted once what only it holds is carried over.
-    counts = document_counts(connection, tenant_id=tenant_id, journey_ids=[g.journey_id for g in group])
-    original = min(group, key=lambda identity: (-counts.get(identity.journey_id, 0), identity.order_key))
+    # Product owner 2026-11-14: the journey with more pages is kept (the newer on a tie); every
+    # other one is the copy, deleted once what only it holds is copied over.
+    original = kept_of(group, page_counts(connection, tenant_id=tenant_id, journey_ids=[g.journey_id for g in group]))
     outcomes: list[str] = []
     for new in sorted(group, key=lambda identity: identity.order_key):
         if new is original:
@@ -1330,12 +1470,11 @@ def recheck_before_delete(
     connection: Connection, *, tenant_id: str, new_journey_id: UUID, existing_journey_id: UUID | None,
     existing_reference: str | None,
 ) -> None:
-    """At delete time, in the deletion record's transaction (review of #594):
-    the earlier journey is locked and must still exist and be open, the two
-    must still agree on all four values, and nothing may say the booking is a
-    company's, and (2026-11-02) the booking reference number must be read on
-    both and the same. Raises SameFileNoLongerHolds with the reason,
-    NotFoundError when the new journey itself is gone."""
+    """At delete time, in the deletion record's transaction (review of #594): the kept journey
+    is locked and must still exist and be open, the two must still be one booking by the one
+    rule (2026-11-14), and the copy must still have fewer pages (or as many, being the older).
+    Raises SameFileNoLongerHolds with the reason, UploadInProgress while the copy's pages are
+    still being read, NotFoundError when the copy itself is gone."""
     ref = existing_reference or "the earlier journey"
     if existing_journey_id is None:
         raise SameFileNoLongerHolds("the earlier journey is not known")
@@ -1355,21 +1494,13 @@ def recheck_before_delete(
     if new.closed:
         raise SameFileNoLongerHolds("it is already closed")
     if same_file_fields(new, existing) is None:
-        raise SameFileNoLongerHolds(
-            f"its PAN / Aadhaar, mobile, model, customer name, booking reference number or receipt "
-            f"no longer match {ref}")
-    counts = document_counts(connection, tenant_id=tenant_id, journey_ids=[new_journey_id, existing_journey_id])
-    if counts.get(new_journey_id, 0) > counts.get(existing_journey_id, 0):
-        # the copy now holds more documents (pages still arriving): the other one is the copy
-        raise SameFileNoLongerHolds(f"it now holds more documents than {ref}")
-    if identical_documents(connection, tenant_id=tenant_id, new=new, existing=existing):
-        return  # exactly the same documents (2026-11-12)
-    if not booking_identified(new, existing):
-        raise SameFileNoLongerHolds(_no_booking_reference_reason(new, existing))
-    reason = business_reason(connection, tenant_id=tenant_id, files=[new, existing]) or _own_documents_reason(
-        connection, tenant_id=tenant_id, new=new, existing=existing)
-    if reason:
-        raise SameFileNoLongerHolds(reason)
+        raise SameFileNoLongerHolds(f"its model, or its PAN / Aadhaar / mobile / GSTIN, no longer match {ref}")
+    pages = page_counts(connection, tenant_id=tenant_id, journey_ids=[new_journey_id, existing_journey_id])
+    if kept_of([new, existing], pages) is new:
+        # the copy now holds more pages (pages still arriving): the other one is the copy
+        raise SameFileNoLongerHolds(f"it now holds more pages than {ref}")
+    if pages_in_flight(connection, tenant_id=tenant_id, journey_id=new_journey_id):
+        raise UploadInProgress(300)
 
 
 def deletion_details(connection: Connection, *, tenant_id: str, new_journey_id: UUID,
@@ -1447,8 +1578,8 @@ def run_same_file_delete(
         raise UploadInProgress(wait + 30)
     existing_ref = (dict(alert["payload"] or {}).get("existingJourney") or {}).get("reference")
     existing_id = UUID(str(alert["related_journey_id"])) if alert["related_journey_id"] else None
-    reason = (f"Same file uploaded again: matches {existing_ref or 'an earlier journey'} on PAN / Aadhaar, "
-              "mobile, model, customer name and booking reference number")
+    reason = (f"Duplicate booking: the same model and the same PAN, Aadhaar, mobile or GSTIN as "
+              f"{existing_ref or 'another journey'}, which has more pages and is kept")
 
     def publish(outcome: str, kept_reason: str | None = None) -> Callable[[Connection], None]:
         return lambda connection: publish_alert(connection, tenant_id=tenant_id, journey_id=journey_id,
@@ -1493,7 +1624,7 @@ def run_same_file_delete(
         system_delete_journey(
             engine, tenant_id=tenant_id, journey_id=journey_id, reason=reason, correlation_id=correlation_id,
             security_client=security_client, v2_client=v2_client, storage=storage,
-            on_deleted=deleted, before_record=check,
+            on_deleted=deleted, before_record=check, allow_reviewed=True,
             record_details=lambda connection: deletion_details(
                 connection, tenant_id=tenant_id, new_journey_id=journey_id, existing_journey_id=existing_id),
         )
