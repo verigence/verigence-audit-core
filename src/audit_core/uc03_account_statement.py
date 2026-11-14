@@ -264,6 +264,7 @@ _DISCOUNTS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 # The total the statement prints for what the customer owes (product owner,
 # 2026-10-26: every dealer's statement has one): "Net Value" (Aditya, Shivnath),
 # "NET RECEIVABLE (A+B)" (Utkal) -- and "Final price", which he also named.
+_CHARGER_ADJUSTMENT = re.compile(r".*\bCHARGER\b.*\bSTOCK ?IN\b.*|.*\bSTOCK ?IN\b.*\bCHARGER\b.*")
 _PRINTED_TOTAL = re.compile(r"(NET VALUE|FINAL PRICE|NET RECEIVABLE( \(A ?\+ ?B\))?|ON ?ROAD PRICE)( .*)?")
 # The form's own summary rows: figures the dealer wrote from the rows above
 # them, never a charge or a receipt, so they are not "unmapped" and are not
@@ -515,6 +516,13 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             give("COMMERCIAL", charge, amount, _other_charge_row(label) if charge == "other_charges" else "")
             continue
         discount = next((k for k, pattern in _DISCOUNTS if pattern.fullmatch(label)), None)
+        if discount is not None and _CHARGER_ADJUSTMENT.fullmatch(label):
+            # "CASH DISCOUNT (11.2kw Charger Stock In)" Rs 71,429 (ADI-BM-261114-008,
+            # recheck 2026-11-14): the charger's value settled with the customer,
+            # not a discount the dealer gave.
+            out.unmapped.append({"label": label, "amount": amount,
+                                 "why": "charger settlement written on a discount row, not a discount"})
+            continue
         if discount is not None:
             give("DISCOUNT", discount, amount)
             continue
@@ -1087,6 +1095,9 @@ class Copy:
     full: bool
     # the vehicle invoice agrees with this copy's ex-showroom (cost sheets)
     billed: bool = False
+    # the dealer's DMS printout of the deal: its ex-showroom in paise and its
+    # "Scheme Discount" / "Corporate" before GST (see _pre_gst)
+    pre_gst: bool = False
 
 
 @dataclass
@@ -1123,32 +1134,64 @@ def _newest_first(copies: list[Copy]) -> list[Copy]:
     return sorted(copies, key=order, reverse=True)
 
 
+_EX_SHOWROOM = ("COMMERCIAL", "ex_showroom_price")
+# What a DMS printout gives before GST: the ex-showroom net of the scheme's
+# GST, the scheme ("Scheme Discount", the consumer offer with the kit) and the
+# corporate offer (Rs 4,576 = 5,400 / 1.18). Its "Other Discount" is the
+# dealer's discount as the NDC writes it (Rs 10,000 on both, ADI-RD-261104-018).
+_BEFORE_GST_FIGURES = frozenset({
+    _EX_SHOWROOM, ("DISCOUNT", "CASH_DISCOUNT"), ("DISCOUNT", "CORPORATE_PRIVILEGE")})
+# Two prices this far apart are two vehicles, never a quotation and its final sheet.
+_ANOTHER_VEHICLE_RATIO = Decimal("1.6")
+
+
+def _another_vehicle(copy: Copy, primary: Copy) -> bool:
+    mine, theirs = copy.figures.get(_EX_SHOWROOM), primary.figures.get(_EX_SHOWROOM)
+    if not mine or not theirs or mine <= 0 or theirs <= 0:
+        return False
+    return max(mine, theirs) / min(mine, theirs) >= _ANOTHER_VEHICLE_RATIO
+
+
 def combine_copies(copies: list[Copy]) -> Combined:
     """Each figure from the copy that gives it (see the section comment)."""
     out = Combined()
     if not copies:
         return out
     ordered = _newest_first(copies)
-    primary = next((c for c in ordered if c.full), ordered[0])
+    full = [c for c in ordered if c.full]
+    primary = next((c for c in full if not c.pre_gst), full[0] if full else ordered[0])
     out.primary = primary.document
+    # A copy pricing another vehicle (a customer ledger of two vehicles,
+    # ADI-RD-261113-019: Rs 19,39,939 against the deal's 9,62,500) is no copy
+    # of this deal: none of its figures is taken or compared.
+    ordered = [c for c in ordered if c is primary or not _another_vehicle(c, primary)]
     other_full = [c for c in ordered if c.full and c is not primary]
     pages = [c for c in ordered if not c.full and c is not primary]
     keys = list(dict.fromkeys(k for c in ordered for k in c.figures))
     used = {id(primary.document): primary.document}
+
+    def counts(copy: Copy, key: tuple[str, str]) -> bool:
+        # A DMS printout's figures before GST are not the deal's when a copy
+        # at the deal's own prices stands (recheck 2026-11-14: its "Scheme
+        # Discount" Rs 22,881 = (consumer offer + kit) / 1.18 had withdrawn the
+        # NDC's Rs 22,000 and read as excess): never taken, never a difference.
+        return key in copy.figures and not (copy.pre_gst and not primary.pre_gst and key in _BEFORE_GST_FIGURES)
+
+    keys = [k for k in keys if any(counts(c, k) for c in ordered)]
     for key in keys:
         if key in primary.figures:
             chosen: Copy | None = primary
-        elif any(key in c.figures for c in other_full):
+        elif any(counts(c, key) for c in other_full):
             chosen = None  # the latest full copy no longer prints it
         else:
-            chosen = next(c for c in pages if key in c.figures)
+            chosen = next(c for c in pages if counts(c, key))
         taken = chosen.figures[key] if chosen is not None else None
         if chosen is not None and taken is not None:
             out.figures[key] = taken
             out.origin[key] = chosen.document
             used.setdefault(id(chosen.document), chosen.document)
         for copy in ordered:
-            if copy is chosen or key not in copy.figures:
+            if copy is chosen or not counts(copy, key):
                 continue
             if taken is None or abs(copy.figures[key] - taken) > TOLERANCE:
                 out.differences.append({
@@ -1170,6 +1213,21 @@ def _statement_figures(read: StatementRead) -> dict[tuple[str, str], Decimal]:
     return figures
 
 
+_DMS_SCHEME = re.compile(r"(SCHEME|OTHER|TOTAL) DISCOUNT|AUTO CARD( / LOYALTY CARD)?|ROUND OFF")
+
+
+def _pre_gst(rows: list[dict[str, Any]], read: StatementRead) -> bool:
+    """The dealer's DMS printout of the deal ("Ex-Showroom 19,39,938.57",
+    "Scheme Discount", "Other Discount", "Round Off"): its ex-showroom is in
+    paise, a price no NDC writes, and it carries the DMS's own labels. Its
+    scheme and corporate figures are before GST (product owner 2026-11-14,
+    "excess discount report is so vague and wrong": 8 rows of the recheck)."""
+    price = read.components.get("ex_showroom_price")
+    if price is None or price == price.to_integral_value():
+        return False
+    return any(_DMS_SCHEME.fullmatch(_label(row.get("particulars_raw"))) for row in rows)
+
+
 def combine_statements(
     forms: list[tuple[dict[str, Any], list[dict[str, Any]]]],
 ) -> tuple[StatementRead | None, Combined]:
@@ -1179,8 +1237,9 @@ def combine_statements(
     copies = [
         Copy(document=document, day=_copy_day(document["fields"], _STATEMENT_DATE_FIELDS),
              figures=_statement_figures(reads[id(document)]),
-             full="ex_showroom_price" in reads[id(document)].components)
-        for document, _ in forms
+             full="ex_showroom_price" in reads[id(document)].components,
+             pre_gst=_pre_gst(rows, reads[id(document)]))
+        for document, rows in forms
     ]
     combined = combine_copies(copies)
     if combined.primary is None:

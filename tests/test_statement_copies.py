@@ -330,3 +330,56 @@ def test_the_restore_job_is_a_one_shot_kind() -> None:
 
     target, args = _one_shot_target("STATEMENT_COPY_RESTORE", None, "t:x", [])
     assert target is run_statement_copy_restore and args == (None, "t:x", [])
+
+
+DMS_PRINTOUT = [
+    {"particulars_raw": "Ex-Showroom", "debit_amount": 958381.45},
+    {"particulars_raw": "Round Off", "debit_amount": 0.55},
+    {"particulars_raw": "Other Discount", "credit_amount": 10000},
+    {"particulars_raw": "Scheme Discount", "credit_amount": 22881},
+]
+ADITYA_NDC = [
+    {"particulars_raw": "EX-SHOW ROOM PRICE OF VEHICLE", "debit_amount": 962500},
+    {"particulars_raw": "LESS: CONSUMER OFFER (IF APPLICABLE)", "credit_amount": 22000},
+    {"particulars_raw": "**CASH DISCOUNT", "credit_amount": 10000},
+]
+
+
+def test_a_dms_printout_before_gst_never_stands_over_the_ndc() -> None:
+    """Recheck 2026-11-14 (ADI-RD-261104-018): the DMS printout, linked last,
+    stood as the statement; its "Scheme Discount" Rs 22,881 (the consumer offer
+    and the kit, Rs 27,000, before GST) withdrew the NDC's Rs 22,000 and read
+    as excess. The NDC stands; the printout's figures before GST are neither
+    taken nor listed as differences; its "Other Discount" is the NDC's."""
+    ndc = _doc(ADITYA_NDC, day="2026-10-13")
+    dms = _doc(DMS_PRINTOUT, day="2026-10-13", minutes=30)
+    read, copies = module.combine_statements([ndc, dms])
+    assert copies.primary is ndc[0]
+    assert read.components["ex_showroom_price"] == D(962500)
+    assert read.discounts == {"CASH_DISCOUNT": D(22000), "ADDITIONAL_DISCOUNT": D(10000)}
+    assert copies.differences == []
+    # Alone, the printout is still read.
+    alone, _ = module.combine_statements([dms])
+    assert alone.discounts["CASH_DISCOUNT"] == D(22881)
+
+
+def test_a_ledger_of_two_vehicles_is_no_copy_of_the_deal() -> None:
+    """ADI-RD-261113-019: the customer's DMS ledger covered two vehicles
+    (ex-showroom Rs 19,39,938.57); its doubled discounts read as this deal's."""
+    two = [{"particulars_raw": "Ex-Showroom", "debit_amount": 1939938.57},
+           {"particulars_raw": "Other Discount", "credit_amount": 20000},
+           {"particulars_raw": "Scheme Discount", "credit_amount": 45762}]
+    ndc = _doc([*ADITYA_NDC[:2], {"particulars_raw": "**CASH DISCOUNT", "credit_amount": 5000}], day="2026-10-13")
+    read, copies = module.combine_statements([ndc, _doc(two, day="2026-10-13", minutes=30)])
+    assert copies.primary is ndc[0]
+    assert read.discounts == {"CASH_DISCOUNT": D(22000), "ADDITIONAL_DISCOUNT": D(5000)}
+    assert copies.differences == []
+
+
+def test_a_charger_settled_on_a_discount_row_is_no_discount() -> None:
+    """ADI-BM-261114-008: "CASH DISCOUNT (11.2kw Charger Stock In)" Rs 71,429."""
+    read = module.read_statement([
+        {"particulars_raw": "EX-SHOW ROOM PRICE OF VEHICLE", "debit_amount": 3010000},
+        {"particulars_raw": "**CASH DISCOUNT (11.2kw Charger Stock In)", "credit_amount": 71429}])
+    assert "ADDITIONAL_DISCOUNT" not in read.discounts
+    assert any("charger" in u["why"] for u in read.unmapped)
