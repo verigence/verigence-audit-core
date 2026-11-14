@@ -2063,6 +2063,15 @@ def _discount_applications(connection: Connection, params: dict[str, Any]) -> li
                    CASE WHEN da.details->'reconciliation' IS NOT NULL
                         THEN da.details->'reconciliation'->'grid'->>'buffer'
                         ELSE da.details->'grid'->>'buffer' END AS grid_buffer,
+                   -- The grid tier the dealer discount was judged at and the tiers of its grid
+                   -- line, so a dealer discount within a higher tier reads "over unless insurance
+                   -- / EW was in-house", not excess (product owner 2026-11-14).
+                   CASE WHEN da.details->'reconciliation' IS NOT NULL
+                        THEN da.details->'reconciliation'->'grid'->>'tier'
+                        ELSE da.details->'grid'->>'tier' END AS grid_tier,
+                   CASE WHEN da.details->'reconciliation' IS NOT NULL
+                        THEN da.details->'reconciliation'->'grid'->'tiers'
+                        ELSE da.details->'grid'->'tiers' END AS grid_tiers,
                    ds.scheme_code, ds.scheme_name, ds.scheme_category,
                    dsv.version_no AS scheme_version, dsv.effective_from, dsv.effective_to,
                    dsv.combinability_code
@@ -2685,6 +2694,7 @@ def _benefit_row(
                             else row.get("grid_buffer")) if row.get("eligibility_result") == "ELIGIBLE_UNCLAIMED"
         else None,
         "evidenceStatus": row.get("evidence_status"),
+        **({"grid": _grid_tiers(row)} if key == "ADDITIONAL_DISCOUNT" and _grid_tiers(row) else {}),
         "proof": {
             "documentType": proof_type,
             "document": _document_label(proof_type),
@@ -2702,6 +2712,21 @@ def _benefit_row(
             ["INVOICES_DISAGREE"] if key in disagreeing or invoice_disagrees else []),
         "sources": _source_list(per_source + own),
     }
+
+
+def _grid_tiers(row: dict[str, Any]) -> dict[str, Any] | None:
+    """The dealer grid tier a dealer discount was judged at and its line's
+    tiers (BASE / WITH_INSURANCE / WITH_EW_INSURANCE), or None for a grid
+    line with no tiers (the September grids)."""
+    tiers = row.get("grid_tiers")
+    if isinstance(tiers, str):
+        try:
+            tiers = json.loads(tiers)
+        except ValueError:
+            tiers = None
+    if not isinstance(tiers, dict) or not tiers or not row.get("grid_tier"):
+        return None
+    return {"tier": row["grid_tier"], "tiers": {k: _money(v) for k, v in tiers.items()}}
 
 
 def _discount_entitled(key: str, row: dict[str, Any]) -> Any:

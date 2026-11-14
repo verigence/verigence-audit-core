@@ -608,6 +608,10 @@ def excess_discount(facts: _Facts) -> RuleOutcome:
         if item["status"] == dg.KIT_AS_CASH:
             continue  # the same line's assessment after the kit follows
         row, given, entitled = item["row"], item["given"], item["entitled"]
+        if item["status"] == dg.IF_NOT_INHOUSE:
+            # Within a higher grid tier (in-house insurance / EW): not counted
+            # as excess (product owner 2026-11-14), nor against the others.
+            entitled = given
         total_given += given
         total_entitled += entitled
         if item["status"] == dg.OVER:
