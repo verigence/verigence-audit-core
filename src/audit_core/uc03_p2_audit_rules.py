@@ -674,6 +674,13 @@ def cash_above_limit(facts: _Facts) -> RuleOutcome:
     ), {"findingTitle": "Cash receipt above the statutory limit", "paymentIds": [r["paymentId"] for r in over]})
 
 
+# A receipt up to one day before the booking docket is an observation, not a
+# finding (product owner 2026-11-14): the token is taken on the day and the
+# docket entered in the DMS the day after. 327 open findings on 14 Nov were
+# mostly that one day.
+_PAYMENT_BEFORE_BOOKING_GRACE_DAYS = 1
+
+
 def payment_before_booking(facts: _Facts) -> RuleOutcome:
     code = "PAYMENT_BEFORE_BOOKING"
     if not facts.receipts:
@@ -681,13 +688,26 @@ def payment_before_booking(facts: _Facts) -> RuleOutcome:
     booked = facts.booking_date
     if booked is None:
         return RuleOutcome(code, "SKIPPED", "The booking date has not been read yet.")
-    early = [r for r in facts.receipts if r["date"] and r["date"] < booked]
+    before = [r for r in facts.receipts if r["date"] and r["date"] < booked]
+    early = [r for r in before if (booked - r["date"]).days > _PAYMENT_BEFORE_BOOKING_GRACE_DAYS]
+    observed = [r for r in before if r not in early]
+
+    def _lines(rows: list[dict[str, Any]]) -> str:
+        return "; ".join(f"{_rupees(r['amount'])} on {_when(r['date'])}"
+                         + (f" (receipt {r['receiptNumber']})" if r["receiptNumber"] else "") for r in rows)
+
+    note = (f" Observation: {_lines(observed)} received the day before the booking docket, within the one day "
+            "allowed.") if observed else ""
+    observation = {"observations": [r["paymentId"] for r in observed]} if observed else {}
     if not early:
+        if observed:
+            return RuleOutcome(code, "PASS", f"No payment more than a day before the booking on {_when(booked)}."
+                               + note, observation)
         return RuleOutcome(code, "PASS", f"Every payment is dated on or after the booking on {_when(booked)}.")
-    lines = "; ".join(f"{_rupees(r['amount'])} on {_when(r['date'])}"
-                      + (f" (receipt {r['receiptNumber']})" if r["receiptNumber"] else "") for r in early)
-    return RuleOutcome(code, "FAIL", f"{lines}: dated before the booking on {_when(booked)}.",
-                       {"findingTitle": "Payment dated before the booking", "paymentIds": [r["paymentId"] for r in early]})
+    return RuleOutcome(code, "FAIL", f"{_lines(early)}: dated more than a day before the booking on "
+                       f"{_when(booked)}." + note,
+                       {"findingTitle": "Payment dated before the booking",
+                        "paymentIds": [r["paymentId"] for r in early], **observation})
 
 
 def booking_date_unusable(facts: _Facts) -> RuleOutcome:
