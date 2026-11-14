@@ -580,9 +580,25 @@ def mask_aadhaar(value: Any) -> str | None:
     return f"XXXX XXXX {digits[-4:]}" if len(digits) >= 4 else None
 
 
+# Words written before the number on a booking form ("OTF No. 15940", "Booking No-019669"):
+# not part of the number.
+_OTF_LABEL_WORDS = frozenset({"OTF", "NO", "SR", "NUMBER", "NUM", "REF", "BOOKING", "BKG"})
+
+
+def _otf_core(code: str) -> str:
+    """A normalised booking reference number without its label words: "OTF-NO-19669" is "19669"."""
+    return "-".join(t for t in code.split("-") if t not in _OTF_LABEL_WORDS)
+
+
 def booking_reference_shared(left: FileIdentity, right: FileIdentity) -> bool:
-    """Both copies carry the same booking reference number."""
-    return bool(left.booking_refs & right.booking_refs)
+    """Both copies carry the same booking reference number (the OTF), label words aside. A
+    duplicate booking is deleted only then (product owner 2026-11-14: "delete should happen only
+    for journey which has same OTF" -- one customer can have several bookings, and then only the
+    OTF differs)."""
+    if left.booking_refs & right.booking_refs:
+        return True
+    cores = {c for code in left.booking_refs if (c := _otf_core(code)) and any(ch.isdigit() for ch in c)}
+    return bool(cores & {_otf_core(code) for code in right.booking_refs})
 
 
 def same_outlet(left: FileIdentity, right: FileIdentity) -> bool:
@@ -862,6 +878,15 @@ def document_counts(connection: Connection, *, tenant_id: str, journey_ids: Iter
              "AND association_status='ACTIVE' GROUP BY journey_id"),
         {"t": tenant_id, "ids": ids},
     ).all()}
+
+
+def _otf_reason(new: FileIdentity, existing: FileIdentity) -> str:
+    """Why a duplicate booking is kept: no OTF in common (2026-11-14)."""
+    if new.booking_refs and existing.booking_refs:
+        return (f"the OTF differs ({new.booking_ref_display or 'new file'} against "
+                f"{existing.booking_ref_display or existing.reference or 'the earlier journey'}): the customer "
+                "may have two bookings, so the Team Lead decides")
+    return _no_booking_reference_reason(new, existing) + ", so it is not deleted; the Team Lead decides"
 
 
 def _no_booking_reference_reason(new: FileIdentity, existing: FileIdentity) -> str:
@@ -1254,11 +1279,17 @@ def _raise(
 ) -> str | None:
     """The alert for one new file, and its delete queued; None when this
     file was already handled (the marker)."""
-    # One rule (2026-11-14): the copy is deleted -- not kept as reviewed, a company's, without a
-    # booking reference number, or for documents only it holds (those are copied over first).
+    # One rule (2026-11-14): the copy is deleted -- not kept as reviewed, a company's, or for
+    # documents only it holds (those are copied over first) -- but only when both carry the same
+    # booking reference number, the OTF (product owner 2026-11-14: "Duplicate booking you keep
+    # finding with the rules you defined.. but delete should happen only for journey which has
+    # same OTF"). Otherwise it is flagged and kept for the Team Lead.
     kept_reason: str | None = None
     plan = carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing)
     outcome = PENDING_DELETE
+    if not booking_reference_shared(new, existing):
+        outcome = KEPT_NO_BOOKING_REFERENCE
+        kept_reason = _otf_reason(new, existing)
     payload = {
         "customerName": new.name,
         "model": new.model_name,
@@ -1533,6 +1564,8 @@ def recheck_before_delete(
         raise SameFileNoLongerHolds("it is already closed")
     if same_file_fields(new, existing) is None:
         raise SameFileNoLongerHolds(f"its model, or its PAN / Aadhaar / mobile / GSTIN, no longer match {ref}")
+    if not booking_reference_shared(new, existing):
+        raise SameFileNoLongerHolds(_otf_reason(new, existing))
     pages = page_counts(connection, tenant_id=tenant_id, journey_ids=[new_journey_id, existing_journey_id])
     if kept_of([new, existing], pages) is new:
         # the copy now holds more pages (pages still arriving): the other one is the copy

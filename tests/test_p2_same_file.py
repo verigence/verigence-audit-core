@@ -37,6 +37,7 @@ from audit_core.uc03_p2_same_file import (
     CROSS_OUTLET_KIND,
     CROSS_OUTLET_TITLE,
     DELETE_WORK_TYPE,
+    KEPT_NO_BOOKING_REFERENCE,
     SAME_DEALERSHIP_KIND,
     SAME_DEALERSHIP_TITLE,
     FileIdentity,
@@ -373,15 +374,27 @@ def test_one_value_different_is_not_the_same_file(tenant, differs):
 
 
 @pytest.mark.parametrize("differs", [
-    # 2026-11-14, one rule: the name, the booking reference number and the mobile no longer
-    # decide it -- the same PAN and model are enough.
-    {"mobile": "9000000001"}, {"name": "Sunil Kumar Mallick"}, {"booking_ref": "BK/0013"}, {"booking_ref": None},
+    # 2026-11-14, one rule: the name and the mobile do not decide it -- the same PAN, model and
+    # OTF are enough.
+    {"mobile": "9000000001"}, {"name": "Sunil Kumar Mallick"}, {"booking_ref": "BOOKING NO. BK/0012"},
 ])
 def test_the_same_pan_and_model_is_one_booking_whatever_else_differs(tenant, differs):
     _, new = _pair(tenant, **differs)
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
     _quiet(new)
     assert _delete(new) == "DELETED" and not _exists(new)
+
+
+@pytest.mark.parametrize("differs", [{"booking_ref": "BK/0013"}, {"booking_ref": None}])
+def test_a_duplicate_without_the_same_otf_is_flagged_never_deleted(tenant, differs):
+    """Product owner 2026-11-14: "Duplicate booking you keep finding with the rules you defined..
+    but delete should happen only for journey which has same OTF" -- one customer can have
+    several bookings, and then only the OTF differs."""
+    _, new = _pair(tenant, **differs)
+    assert _detect(new)["outcomes"] == [KEPT_NO_BOOKING_REFERENCE]
+    [alert] = _alerts(new)
+    assert alert["outcome"] == KEPT_NO_BOOKING_REFERENCE and "Team Lead decides" in alert["body"]
+    assert _queued(new) == [] and _exists(new)
 
 
 def test_the_same_mobile_and_model_alone_is_one_booking(tenant):
@@ -1340,11 +1353,12 @@ def test_a_booking_file_then_its_delivery_file_become_one_journey(tenant):
     [alert] = _alerts(delivery)
     # The delivery file holds more documents: it is kept, the booking file is the copy.
     assert alert["subject_journey_id"] == booking.journey_id and alert["related_journey_id"] == delivery.journey_id
-    assert alert["outcome"] == "PENDING_DELETE"
-    # 2026-11-14: one model family ("Maxx HD" and "BOL MAXX PUP HD") and the same PAN.
+    # 2026-11-14: one model family ("Maxx HD" and "BOL MAXX PUP HD") and the same PAN find it, but
+    # the OTF read differs by a digit: flagged for the Team Lead, never deleted ("delete should
+    # happen only for journey which has same OTF").
     assert {f["field"] for f in alert["payload"]["matchedFields"]} >= {"pan", "model"}
-    assert _delete(booking) == "DELETED"
-    assert not _exists(booking) and _exists(delivery)
+    assert alert["outcome"] == KEPT_NO_BOOKING_REFERENCE and "the OTF differs" in alert["body"]
+    assert _queued(booking) == [] and _exists(booking) and _exists(delivery)
 
 
 def test_the_settle_job_finds_old_pairs_and_its_dry_run_changes_nothing(tenant):
@@ -1360,12 +1374,28 @@ def test_the_settle_job_finds_old_pairs_and_its_dry_run_changes_nothing(tenant):
     _invoice(delivery, "INV27P000427")
 
     dry = run_same_sale_settle(tenant.engine, f"{tenant.tenant_id}:settle", [])
-    assert dry["commit"] is False and dry["toDelete"] == 1
-    assert dry["pairs"] == [{"copy": "OLD-BOOKING", "kept": "OLD-DELIVERY", "outcome": "PENDING_DELETE"}]
-    assert _alerts(delivery) == [] and _queued(delivery) == []
+    # Another OTF on each (2026-11-14): found and flagged, never deleted.
+    assert dry["commit"] is False and dry["toDelete"] == 0 and dry["kept"] == 1
+    assert dry["pairs"][0]["outcome"] == KEPT_NO_BOOKING_REFERENCE
+    assert _alerts(delivery) == [] and _alerts(booking) == []
 
     done = run_same_sale_settle(tenant.engine, f"{tenant.tenant_id}:settle-commit", [])
-    assert done["toDelete"] == 1 and len(_queued(delivery)) == 1
+    assert done["toDelete"] == 0 and _queued(booking) == [] and len(_alerts(booking)) == 1
+
+
+def test_the_settle_job_deletes_a_pair_with_the_same_otf(tenant):
+    from audit_core.uc03_same_sale_settle import run_same_sale_settle
+
+    now = datetime.now(UTC)
+    booking = _journey(tenant, ref="OTF-BOOKING", created=now - timedelta(days=10))
+    delivery = _journey(tenant, ref="OTF-DELIVERY", created=now - timedelta(days=8))
+    _file(booking, mobile="+91 93386 96711", booking_ref="OTF NO-19669")
+    _file(delivery, mobile="+91 93386 96711", booking_ref="019669")
+    _receipt(booking, "BRMM/2627/04861")
+    _receipt(delivery, "BRMM/2627/04861")
+    _invoice(delivery, "INV27P000427")
+    done = run_same_sale_settle(tenant.engine, f"{tenant.tenant_id}:settle-commit", [])
+    assert done["toDelete"] == 1 and len(_queued(booking)) == 1
 
 
 # ── exactly the same documents are deleted whatever else is said (2026-11-12) ──
@@ -1382,12 +1412,14 @@ def test_exactly_the_same_documents_of_a_company_are_deleted(tenant):
     assert _delete(old) == "DELETED" and not _exists(old) and _exists(new)
 
 
-def test_exactly_the_same_documents_without_a_booking_number_are_deleted(tenant):
+def test_exactly_the_same_documents_without_a_booking_number_are_kept_for_the_team_lead(tenant):
+    """2026-11-14: no OTF read on the copy -- flagged, not deleted ("delete should happen only
+    for journey which has same OTF")."""
     old, new = _pair(tenant, booking_ref=None)
     _same_pages(old, new)
     _quiet(new)
-    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
-    assert _delete(new) == "DELETED"
+    assert _detect(new)["outcomes"] == [KEPT_NO_BOOKING_REFERENCE]
+    assert _queued(new) == [] and _exists(new)
 
 
 def test_a_deleted_copy_counts_under_the_pc_who_uploaded_it(tenant):

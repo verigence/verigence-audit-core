@@ -741,11 +741,26 @@ def find_booking_by_number(connection: Connection, *, tenant_id: str, journey_id
     return candidates[0] if len(candidates) == 1 else None
 
 
+def _folder_numbers(connection: Connection, tenant_id: str, journey_id: UUID) -> frozenset[str]:
+    """The booking numbers the drop's folder names gave this journey's files, normalised."""
+    from audit_core.uc03_p2_same_file import normalize_booking_reference
+
+    return frozenset(code for raw in connection.execute(
+        text("SELECT DISTINCT booking_number FROM auditcore.p2_bulk_files WHERE tenant_id=:t AND journey_id=:j "
+             "AND booking_number IS NOT NULL"), {"t": tenant_id, "j": journey_id},
+    ).scalars().all() if (code := normalize_booking_reference(raw)))
+
+
 def run_bulk_settle(engine: Engine, tag: str, tenant_ids: list[str] | None = None) -> dict[str, Any]:
     """BULK_SETTLE: each journey of the drop that has finished reading joins the customer's
     booking (its new pages carried, the journey deleted) or stays as the new booking."""
     from audit_core.uc03_p2_journey_delete import system_delete_journey
-    from audit_core.uc03_p2_same_file import _identities, carry_documents, carry_plan
+    from audit_core.uc03_p2_same_file import (
+        _identities,
+        booking_reference_shared,
+        carry_documents,
+        carry_plan,
+    )
     from audit_core.uc03_p2_storage import get_p2_document_storage
     from audit_core.uc03_p2_worker import (
         get_di_capture_v2_client,
@@ -770,6 +785,13 @@ def run_bulk_settle(engine: Engine, tag: str, tenant_ids: list[str] | None = Non
             me = _identities(connection, tenant_id=tenant_id, journey_ids=[journey_id]).get(journey_id)
             unsure = (carry_plan(connection, tenant_id=tenant_id, new=me, existing=target).unsure
                       if target is not None and me is not None else None)
+            # Joined (and the read journey deleted) only on the same OTF (product owner 2026-11-14:
+            # "delete should happen only for journey which has same OTF"); otherwise it stays a
+            # booking of its own, which the duplicate-booking check flags for the Team Lead.
+            if target is not None and me is not None and not unsure and not (
+                    booking_reference_shared(me, target)
+                    or _folder_numbers(connection, tenant_id, journey_id) & target.booking_refs):
+                unsure = "no booking reference number (OTF) in common"
         files_sql = ("UPDATE auditcore.p2_bulk_files SET outcome=:o, placed_journey_id=:p, placed_reference=:r, "
                      "detail=:d, updated_at_utc=now() WHERE tenant_id=:t AND journey_id=:j AND outcome='READING'")
         if target is None or me is None:
