@@ -1,4 +1,4 @@
-"""0225_bank_statements -- the dealership's own bank account statements, reconciled
+"""0226_bank_statements -- the dealership's own bank account statements, reconciled
 against the payment receipts on file (product owner 2026-11-14).
 
 "bank statement payment reconcile ... this could be per outlet or per dealership, file
@@ -48,8 +48,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0225_bank_statements"
-down_revision = "0224_pinned_model_names"
+revision = "0226_bank_statements"
+down_revision = "0225_worker_job_heartbeat"
 branch_labels = None
 depends_on = None
 
