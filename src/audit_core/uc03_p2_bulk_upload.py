@@ -446,10 +446,11 @@ def _earlier_copy(connection: Connection, tenant_id: str, sha: str, file_id: Any
             FROM auditcore.p2_upload_batches b
             JOIN auditcore.journeys j ON j.tenant_id=b.tenant_id AND j.journey_id=b.journey_id
             WHERE b.tenant_id=:t AND b.sha256=:s AND b.batch_status <> 'CANCELLED'
+              AND b.batch_id <> :own   -- this file's own upload, from a run that was interrupted
             ORDER BY b.created_at_utc LIMIT 1
             """
         ),
-        {"t": tenant_id, "s": sha},
+        {"t": tenant_id, "s": sha, "own": uuid5(NAMESPACE_URL, f"verigence:p2-bulk:{file_id}")},
     ).mappings().first()
     if row:
         return dict(row)

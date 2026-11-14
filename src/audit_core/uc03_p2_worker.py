@@ -5333,11 +5333,73 @@ _ONE_SHOT_VARIABLES = {
 }
 _JOB_POLL_SECONDS = 60
 _JOB_DETAIL_MAX = 200_000
+# A running job beats a heartbeat (2026-11-14): a deploy restarts the worker and the job's
+# thread dies with it, and its row used to stay RUNNING for ever (a PC's drop stuck half read
+# from 13 Nov). A job whose heartbeat stops for _JOB_STALE_SECONDS, or that runs past its time
+# limit, is taken again when it is safe to run twice (_RESUMABLE_JOBS), up to _JOB_MAX_ATTEMPTS
+# times, and is otherwise closed as interrupted so it never sits RUNNING unseen.
+_JOB_HEARTBEAT_SECONDS = 30
+_JOB_STALE_SECONDS = 300
+_JOB_MAX_ATTEMPTS = 3
+_RESUMABLE_JOBS: dict[str, int] = {"BULK_UPLOAD": 45 * 60, "BULK_SETTLE": 15 * 60, "DRIVE_RUN": 45 * 60}
+_JOB_TIME_LIMIT_SECONDS = 6 * 3600
+
+
+def _beat(engine: Engine, job_id: str, done: threading.Event) -> None:
+    while not done.wait(_JOB_HEARTBEAT_SECONDS):
+        try:
+            with engine.begin() as connection:
+                set_platform_super_admin_context(connection)
+                connection.execute(
+                    text("UPDATE auditcore.p2_worker_jobs SET heartbeat_at_utc = now() "
+                         "WHERE job_id = CAST(:id AS uuid) AND status = 'RUNNING'"), {"id": job_id})
+        except Exception:  # a missed beat is retried on the next one
+            logger.warning("p2_worker_job_heartbeat_failed", job_id=job_id, exc_info=True)
+
+
+def reclaim_stalled_jobs(engine: Engine) -> dict[str, int]:
+    """Running jobs that are no longer running: a stopped heartbeat (the worker restarted) or
+    past their time limit. A resumable one goes back to PENDING (its next attempt), anything
+    else -- or one out of attempts -- is closed FAILED as interrupted."""
+    with engine.begin() as connection:
+        set_platform_super_admin_context(connection)
+        rows = connection.execute(text("""
+            SELECT job_id, job_kind, attempts,
+                   EXTRACT(EPOCH FROM now() - COALESCE(heartbeat_at_utc, started_at_utc)) AS quiet,
+                   EXTRACT(EPOCH FROM now() - started_at_utc) AS ran
+            FROM auditcore.p2_worker_jobs WHERE status = 'RUNNING' FOR UPDATE SKIP LOCKED
+        """)).mappings().all()
+        resumed = closed = 0
+        for row in rows:
+            limit = _RESUMABLE_JOBS.get(row["job_kind"], _JOB_TIME_LIMIT_SECONDS)
+            stale = float(row["quiet"] or 0) > _JOB_STALE_SECONDS
+            overdue = float(row["ran"] or 0) > limit
+            if not (stale or overdue):
+                continue
+            why = ("the worker stopped while it ran (a restart or deploy)" if stale
+                   else f"it ran past its time limit of {limit // 60} minutes")
+            if row["job_kind"] in _RESUMABLE_JOBS and int(row["attempts"] or 0) < _JOB_MAX_ATTEMPTS:
+                connection.execute(
+                    text("UPDATE auditcore.p2_worker_jobs SET status = 'PENDING', worker_id = NULL, "
+                         "heartbeat_at_utc = NULL, detail = :d WHERE job_id = :id"),
+                    {"id": row["job_id"], "d": f"Taken again: {why}"})
+                resumed += 1
+            else:
+                connection.execute(
+                    text("UPDATE auditcore.p2_worker_jobs SET status = 'FAILED', finished_at_utc = now(), "
+                         "detail = :d WHERE job_id = :id"),
+                    {"id": row["job_id"], "d": f"Interrupted: {why}"})
+                closed += 1
+    if resumed or closed:
+        logger.warning("p2_worker_jobs_reclaimed", resumed=resumed, closed=closed)
+    return {"resumed": resumed, "closed": closed}
 
 
 def _run_job(engine: Engine, job: dict[str, Any]) -> None:
     job_id = str(job["job_id"])
     status, detail = "DONE", None
+    done = threading.Event()
+    threading.Thread(target=_beat, args=(engine, job_id, done), name="job-heartbeat", daemon=True).start()
     try:
         target, args = _one_shot_target(job["job_kind"], engine, job["tag"], list(job["reports"] or []))
         logger.info("p2_worker_job_started", job_id=job_id, kind=job["job_kind"], tag=job["tag"])
@@ -5349,12 +5411,15 @@ def _run_job(engine: Engine, job: dict[str, Any]) -> None:
     except Exception as exc:  # recorded on the job row
         status, detail = "FAILED", f"{type(exc).__name__}: {exc}"[:1000]
         logger.warning("p2_worker_job_failed", job_id=job_id, kind=job["job_kind"], exc_info=True)
+    finally:
+        done.set()
     with engine.begin() as connection:
         set_platform_super_admin_context(connection)
+        # Only this run's row: a run taken again elsewhere after a time limit keeps its own.
         connection.execute(
             text("UPDATE auditcore.p2_worker_jobs SET status = :s, finished_at_utc = now(), detail = :d "
-                 "WHERE job_id = CAST(:id AS uuid)"),
-            {"s": status, "d": detail, "id": job_id},
+                 "WHERE job_id = CAST(:id AS uuid) AND COALESCE(worker_id, :w) = :w AND status = 'RUNNING'"),
+            {"s": status, "d": detail, "id": job_id, "w": _WORKER_ID},
         )
     logger.info("p2_worker_job_finished", job_id=job_id, kind=job["job_kind"], status=status)
 
@@ -5364,7 +5429,8 @@ def claim_worker_jobs(engine: Engine) -> list[dict[str, Any]]:
     with engine.begin() as connection:
         set_platform_super_admin_context(connection)
         return [dict(r) for r in connection.execute(text("""
-            UPDATE auditcore.p2_worker_jobs SET status = 'RUNNING', started_at_utc = now(), worker_id = :w
+            UPDATE auditcore.p2_worker_jobs SET status = 'RUNNING', started_at_utc = now(), worker_id = :w,
+                   heartbeat_at_utc = now(), attempts = attempts + 1
             WHERE job_id IN (SELECT job_id FROM auditcore.p2_worker_jobs WHERE status = 'PENDING'
                              ORDER BY requested_at_utc FOR UPDATE SKIP LOCKED LIMIT 5)
             RETURNING job_id, job_kind, tag, reports
@@ -5377,6 +5443,10 @@ def _watch_worker_jobs(engine: Engine) -> None:
     while not _stopping.is_set():
         if _asleep_nap():
             continue
+        try:
+            reclaim_stalled_jobs(engine)
+        except Exception:
+            logger.warning("p2_worker_jobs_reclaim_failed", exc_info=True)
         try:
             for job in claim_worker_jobs(engine):
                 threading.Thread(target=_run_job, args=(engine, job), name=f"job-{job['job_kind'].lower()}",
