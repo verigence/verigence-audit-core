@@ -283,7 +283,12 @@ def test_model_family_and_masked_names():
     # Pinned on both sides: the master model decides, not the spelling.
     model = uuid4()
     assert matched_fields(_identity(model_id=model, model_name="X"), _identity(model_id=model, model_name="Y"))
-    assert matched_fields(_identity(model_id=uuid4(), model_name="THAR"), _identity(model_id=model, model_name="THAR")) is None
+    # Two master models of one nameplate ("SCORPIO N" and "NEW SCORPIO N", 2026-11-14) are one model;
+    # two nameplates are not.
+    assert matched_fields(_identity(model_id=uuid4(), model_name="NEW SCORPIO N"),
+                          _identity(model_id=model, model_name="SCORPIO N")) is not None
+    assert matched_fields(_identity(model_id=uuid4(), model_name="THAR ROXX"),
+                          _identity(model_id=model, model_name="THAR")) is None
 
 
 def test_pan_holder_type():
