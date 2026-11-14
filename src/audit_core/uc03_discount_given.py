@@ -153,6 +153,10 @@ def entitled(row: dict[str, Any]) -> Decimal:
     return amount or Decimal(0)
 
 
+def _rupees(amount: Decimal) -> str:
+    return f"Rs {amount:,.0f}"
+
+
 def is_over(given_amount: Decimal, entitled_amount: Decimal) -> bool:
     return given_amount - entitled_amount > LINE_TOLERANCE
 
@@ -200,6 +204,35 @@ def standards_known(view: dict[str, Any]) -> bool:
 
 # Statuses of a discount line (the tab's and the rules' one reading).
 OVER, UNDER, UNKNOWN, KIT_AS_CASH = "OVER_ENTITLEMENT", "UNDER_ENTITLEMENT", "ENTITLEMENT_UNKNOWN", "KIT_AS_CASH"
+# A dealer discount above the grid tier it was judged at but within a higher
+# tier of the same grid line: over only if the insurance (and EW) were not
+# in-house. Product owner 2026-11-14 ("seems all excess discount findings are
+# wrong reads"): 43 of the 155 rows were the dealer's "Other Discount" at the
+# with-insurance figure on a deal judged at the base tier, mostly because
+# the PC marked the insurance Self while the policy read "Insurance by:
+# Dealer". Listed apart with the figure the in-house tier allows, never
+# counted as excess.
+IF_NOT_INHOUSE = "OVER_UNLESS_INHOUSE"
+_TIER_ORDER = ("BASE", "WITH_INSURANCE", "WITH_EW_INSURANCE")
+_TIER_WORDS = {"WITH_INSURANCE": "the insurance was in-house",
+               "WITH_EW_INSURANCE": "the insurance and the extended warranty were in-house"}
+
+
+def higher_tier_covering(row: dict[str, Any], amount: Decimal) -> tuple[str, Decimal] | None:
+    """The first grid tier above the one the dealer discount was judged at
+    whose allowance covers ``amount`` (within the line tolerance), or None."""
+    if row.get("key") != DEALER_DISCOUNT_KEY:
+        return None
+    grid = row.get("grid") or {}
+    tiers = grid.get("tiers") or {}
+    tier = grid.get("tier")
+    if tier not in _TIER_ORDER:
+        return None
+    for higher in _TIER_ORDER[_TIER_ORDER.index(tier) + 1:]:
+        allowance = _dec(tiers.get(higher))
+        if allowance is not None and amount - allowance <= LINE_TOLERANCE:
+            return higher, allowance
+    return None
 
 
 def kit_available(discounts: list[dict[str, Any]]) -> Decimal:
@@ -223,13 +256,18 @@ def assess(discounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     * ENTITLEMENT_UNKNOWN: no master to compare with (``unknown_reason``);
     * KIT_AS_CASH: the part of the consumer offer the unused accessories kit
       covers -- reported with the kit amount, never as excess;
+    * OVER_UNLESS_INHOUSE: a dealer discount above the grid tier it was
+      judged at but within a higher tier of its grid line -- over only if
+      the insurance / EW were not in-house, never counted as excess
+      (2026-11-14);
     * OVER_ENTITLEMENT: given above the entitlement (the kit, when it was
       given as cash, counted with it) by more than the line tolerance;
     * UNDER_ENTITLEMENT: given below it by more than the tolerance;
     * WITHIN: within the tolerance.
 
     Each item: row, given, column, status, entitled (with the kit where it
-    counted), variance (the excess, the kit part, or the shortfall), kit, reason."""
+    counted), variance (the excess, the kit part, or the shortfall), kit, reason
+    (and ifInhouse: the higher tier's allowance, on OVER_UNLESS_INHOUSE)."""
     kit_left = kit_available(discounts)
     out: list[dict[str, Any]] = []
     for row in discounts:
@@ -254,6 +292,13 @@ def assess(discounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             extra -= kit_used
             if extra <= LINE_TOLERANCE:
                 continue
+        covering = higher_tier_covering(row, amount) if extra > LINE_TOLERANCE else None
+        if covering is not None:
+            tier, allowance = covering
+            out.append({**base, "status": IF_NOT_INHOUSE, "entitled": entitled_amount, "variance": extra,
+                        "ifInhouse": allowance,
+                        "reason": f"within the grid's {_rupees(allowance)} if {_TIER_WORDS[tier]}"})
+            continue
         if extra > LINE_TOLERANCE:
             status = OVER
         elif -extra > LINE_TOLERANCE:
@@ -266,6 +311,7 @@ def assess(discounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 __all__ = [
     "GIVEN_COLUMNS",
+    "IF_NOT_INHOUSE",
     "KIT_AS_CASH",
     "LINE_TOLERANCE",
     "OVER",
@@ -277,6 +323,7 @@ __all__ = [
     "given",
     "given_document",
     "has_figure",
+    "higher_tier_covering",
     "is_over",
     "kit_available",
     "standards_known",

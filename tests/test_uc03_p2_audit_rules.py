@@ -229,6 +229,30 @@ def test_a_discount_with_no_master_behind_it_raises_no_excess_discount(journey):
     assert result["KIT_GIVEN_AS_CASH"].outcome == "PASS"
 
 
+def test_a_dealer_discount_within_a_higher_grid_tier_raises_no_excess_discount(journey):
+    """Product owner 2026-11-14: the dealer's Rs 7,000 on a deal judged at the
+    grid's base tier (Rs 5,000; Rs 7,000 with in-house insurance) is over only
+    if the insurance was not in-house -- listed apart, no excess discount."""
+    import json as _json
+
+    _line(journey, "ex_showroom_price", "1000000", "1000000")
+    _source(journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "1000000")
+    grid = {"tier": "BASE", "tiers": {"BASE": "5000.00", "WITH_INSURANCE": "7000.00", "WITH_EW_INSURANCE": "7000.00"},
+            "buffer": "5000.00"}
+    _sql(journey, "INSERT INTO auditcore.discount_applications (tenant_id, journey_id, discount_key, "
+                  "standard_eligible_amount, eligibility_result, actual_source_kind, details) "
+                  "VALUES (:t, :j, 'ADDITIONAL_DISCOUNT', 5000, 'ELIGIBLE', 'EVIDENCE', CAST(:d AS jsonb))",
+         d=_json.dumps({"reconciliation": {"grid": grid, "source": "DEALER_DISCOUNT_GRID"}}))
+    _source(journey, "DISCOUNT", "ADDITIONAL_DISCOUNT", "tax_invoice_tally", "7000")
+    assert _run(journey, "BOOKING")["EXCESS_DISCOUNT"].outcome == "PASS"
+    # Above every tier it is an excess discount, judged at the base tier.
+    _sql(journey, "UPDATE auditcore.commercial_line_source_values SET amount=10000 WHERE tenant_id=:t "
+                  "AND component_key='ADDITIONAL_DISCOUNT'")
+    excess = _run(journey, "BOOKING")["EXCESS_DISCOUNT"]
+    assert excess.outcome == "FAIL"
+    assert excess.details["discounts"][0]["entitled"] == "5000.00"
+
+
 def test_a_line_awaiting_its_own_document_is_not_undercharged(journey):
     """2026-10-20 (R2): an accessory invoice on file says nothing about the
     RTO charges; the road tax + registration line awaits the RTO challan (at

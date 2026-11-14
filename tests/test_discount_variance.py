@@ -369,3 +369,35 @@ def test_the_statement_is_named_first_as_the_source_of_a_figure():
     row = discount_variance_rows(_view([{**_d("CORPORATE_PRIVILEGE", "0", "17999.72", eligibility="NOT_ELIGIBLE",
                                               sources=named), "fromStatement": True}]))[0]
     assert row["givenDocument"] == "Cost sheet (no NDC on file)"
+
+
+def test_a_dealer_discount_within_a_higher_grid_tier_is_over_only_if_not_inhouse():
+    """Product owner 2026-11-14 ("seems all excess discount findings are wrong
+    reads"): UTK-SU-261020-005 gave "Other Discount (if any) DLR" Rs 7,000 on a
+    MAXX HD judged at the base tier (Rs 5,000; with insurance Rs 7,000). It is
+    over only if the insurance was not in-house: listed apart, not excess."""
+    from audit_core.uc03_discount_variance import IF_NOT_INHOUSE
+
+    grid = {"tier": "BASE", "tiers": {"BASE": "5000.00", "WITH_INSURANCE": "7000.00", "WITH_EW_INSURANCE": "7000.00"}}
+    dealer = {**_d("ADDITIONAL_DISCOUNT", "5000", "7000", billed_from="document", eligibility="ELIGIBLE"),
+              "grid": grid}
+    row = discount_variance_rows(_view([dealer]))[0]
+    assert (row["status"], row["entitled"], row["variance"], row["ifInhouse"]) == (
+        IF_NOT_INHOUSE, "5000", "2000", "7000.00")
+    assert "insurance was in-house" in row["reason"]
+    # Within the with-EW tier only: in-house insurance and EW.
+    ew = {**dealer, "grid": {"tier": "BASE", "tiers": {"BASE": "5000", "WITH_INSURANCE": "5000",
+                                                       "WITH_EW_INSURANCE": "7000"}}}
+    assert "extended warranty" in discount_variance_rows(_view([ew]))[0]["reason"]
+    # Above every tier: excess, as before.
+    above = {**dealer, "billed": "10000", "current": "10000"}
+    assert discount_variance_rows(_view([above]))[0]["status"] == OVER
+    # Judged at the top tier already, or a grid line with no tiers: excess.
+    top = {**dealer, "grid": {**grid, "tier": "WITH_EW_INSURANCE"}, "entitled": "7000", "billed": "9000",
+           "current": "9000"}
+    assert discount_variance_rows(_view([top]))[0]["status"] == OVER
+    flat = {k: v for k, v in dealer.items() if k != "grid"}
+    assert discount_variance_rows(_view([flat]))[0]["status"] == OVER
+    # Only the dealer discount reads the grid.
+    cash = {**_d("CASH_DISCOUNT", "5000", "7000"), "grid": grid}
+    assert discount_variance_rows(_view([cash]))[0]["status"] == OVER
