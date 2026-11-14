@@ -26,6 +26,8 @@ from typing import Any
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_p2_project_tracker import _CLOSING_EVENTS as _TASK_CLOSING
+
 PENDING_KINDS: tuple[dict[str, str], ...] = (
     {"key": "deliveriesNotUploaded", "label": "Deliveries not uploaded"},
     {"key": "deliveryFilesOpen", "label": "Delivery files not closed"},
@@ -197,7 +199,8 @@ def backlog(connection: Connection, *, tenant_id: str, zone: Any, now: datetime,
 
 def efficiency(connection: Connection, *, tenant_id: str, start: datetime, end: datetime, now: datetime,
                state: Any = None) -> dict[str, Any]:
-    """Per PC over the window: delivery files started and closed, days to close, tasks in time."""
+    """Per person over the window: delivery files started and closed (a PC), days to close, and the
+    tasks due in the window that were closed by their due time."""
     delivery, closed_ever = state or _delivery_state(connection, tenant_id, now)
     eff: dict[str, dict[str, float]] = defaultdict(lambda: {
         "deliveryStarted": 0, "deliveryClosed": 0, "daysToCloseSum": 0.0, "tasksWithDue": 0, "tasksInTime": 0})
@@ -213,17 +216,67 @@ def efficiency(connection: Connection, *, tenant_id: str, start: datetime, end: 
         began = delivery.get(f["journeyId"], {}).get("first_upload")
         if began is not None:
             cell["daysToCloseSum"] += max(0.0, (at - began).total_seconds() / 86400)
+    # Tasks in time (product owner 2026-11-14: "how you calculated 100% tasks closed on time"). The
+    # old count read only tasks with completed_by_actor_id set -- 139 of ~15,000; most tasks close by
+    # verification with no closer recorded, and a task still open past its due time was never counted.
+    # Now: every task whose due time fell in the window (and has passed), or that was closed in the
+    # window before its due time, counts once, for its owner:
+    # the assignee; else, for a PC task, the Journey's PC; else whoever closed it; else, still open,
+    # the people of that role mapped to its outlet. In time = closed by the due time; closed late or
+    # still open is late. A cancelled task is nobody's to do; a duty (a scheduled task) is counted
+    # under duties, not here.
     for r in connection.execute(text("""
-        SELECT t.completed_by_actor_id AS person, count(*) AS n,
-               count(*) FILTER (WHERE t.action_completed_at_utc <= t.due_at_utc) AS in_time
-        FROM auditcore.p2_tasks t
-        WHERE t.tenant_id = :t AND t.action_completed_at_utc >= :s AND t.action_completed_at_utc < :e
-          AND t.due_at_utc IS NOT NULL AND t.completed_by_actor_id IS NOT NULL
+        WITH task AS (
+          SELECT t.task_id, t.due_at_utc, upper(COALESCE(t.assigned_role_code, '')) AS role,
+                 t.assigned_actor_id, j.created_by_actor_id AS pc, j.dealer_id,
+                 COALESCE(t.outlet_id, j.outlet_id) AS outlet_id,
+                 CASE WHEN t.task_status = 'VERIFIED_COMPLETE' OR t.action_completed_at_utc IS NOT NULL
+                      THEN COALESCE(t.action_completed_at_utc, t.verified_at_utc, t.updated_at_utc) END AS done_at
+          FROM auditcore.p2_tasks t
+          LEFT JOIN auditcore.journeys j ON j.tenant_id = t.tenant_id AND j.journey_id = t.journey_id
+          WHERE t.tenant_id = :t AND t.due_at_utc IS NOT NULL AND t.schedule_id IS NULL
+            AND t.task_status NOT IN ('CANCELLED', 'DEAD_LETTER')
+            AND t.due_at_utc >= :s  -- both cases below are due on or after the start
+        ), due AS (
+          SELECT * FROM task
+          WHERE (due_at_utc >= :s AND due_at_utc < LEAST(:e, :now))
+             OR (done_at >= :s AND done_at < :e AND done_at <= due_at_utc)
+        ), closer AS (
+          SELECT DISTINCT ON (te.task_id) te.task_id, te.actor_id
+          FROM auditcore.p2_task_events te JOIN due d ON d.task_id = te.task_id
+          WHERE te.tenant_id = :t AND te.actor_id IS NOT NULL AND upper(te.actor_id) <> 'SYSTEM'
+            AND te.event_type = ANY(:closing)
+          ORDER BY te.task_id, te.created_at_utc DESC
+        ), owner AS (
+          SELECT d.task_id, d.due_at_utc, d.done_at,
+                 COALESCE(d.assigned_actor_id::text, CASE WHEN d.role = 'PC' THEN d.pc::text END,
+                          CASE WHEN d.done_at IS NOT NULL THEN c.actor_id::text END) AS person,
+                 d.role, d.dealer_id, d.outlet_id
+          FROM due d LEFT JOIN closer c ON c.task_id = d.task_id
+        )
+        SELECT x.person, count(*) AS n,
+               count(*) FILTER (WHERE x.done_at IS NOT NULL AND x.done_at <= x.due_at_utc) AS in_time,
+               count(*) FILTER (WHERE x.done_at IS NULL) AS open_late
+        FROM (
+          SELECT o.person, o.task_id, o.due_at_utc, o.done_at FROM owner o WHERE o.person IS NOT NULL
+          UNION
+          SELECT ba.security_actor_id::text, o.task_id, o.due_at_utc, o.done_at
+          FROM owner o
+          JOIN auditcore.business_assignments ba
+            ON ba.tenant_id = :t AND ba.assignment_status = 'ACTIVE'
+           AND ba.effective_from <= :now AND (ba.effective_to IS NULL OR ba.effective_to >= :now)
+           AND (upper(ba.business_role_code) = o.role
+                OR (o.role = 'REVIEWER' AND upper(ba.business_role_code) = 'CRM'))
+           AND (ba.dealer_id IS NULL OR (ba.dealer_id = o.dealer_id
+                                         AND (ba.outlet_id IS NULL OR ba.outlet_id = o.outlet_id)))
+          WHERE o.person IS NULL AND o.role <> ''
+        ) x
         GROUP BY 1
-    """), {"t": tenant_id, "s": start, "e": end}).mappings():
+    """), {"t": tenant_id, "s": start, "e": end, "now": now, "closing": sorted(_TASK_CLOSING)}).mappings():
         cell = eff[str(r["person"])]
         cell["tasksWithDue"] += int(r["n"])
         cell["tasksInTime"] += int(r["in_time"])
+        cell["tasksOpenLate"] = cell.get("tasksOpenLate", 0) + int(r["open_late"])
 
     return eff
 

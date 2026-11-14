@@ -50,12 +50,17 @@ _ZERO = [0, 0, 0, 0]
 EFFICIENCY_PARTS = (
     ("closedShare", "Delivery files closed, of those started"),
     ("firstTime", "Pages right first time"),
-    ("inTime", "Tasks closed in time"),
+    ("inTime", "Tasks due in the period closed by their due time"),
     ("dutiesOnTime", "Duties done on time"),
 )
 EFFICIENCY_NOTE = ("Efficiency is the plain average of four shares: delivery files closed of those started in the period, "
                    "pages right first time, tasks closed by their due time, and duties done on time. A share with nothing "
-                   "to measure in the period is left out.")
+                   "to measure in the period is left out. Tasks: every task whose due time fell in the period counts, "
+                   "for its owner (the PC of its Journey, or the Reviewer of its outlet); closed after the due time or "
+                   "still open is late. A Reviewer's efficiency is the average of their task and duty shares.")
+# A Reviewer's efficiency: the shares that apply to their work (product owner 2026-11-14: "why no
+# reviewer is being shown in reports to TL").
+REVIEWER_PARTS = (("inTime", "Tasks due in the period closed by their due time"), ("dutiesOnTime", "Duties done on time"))
 # What waits on a person or an outlet, counted once (an overdue task is already an open task).
 _BACKLOG_ONCE = ("deliveriesNotUploaded", "deliveryFilesOpen", "tasksOpen", "pagesToReupload", "paymentsNotReconciled")
 _QUALITY_REASONS = (("blurred", "Blurred"), ("faded", "Faded"), ("tooSmall", "Too small"), ("otherQuality", "Other"))
@@ -222,7 +227,8 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
                 "daysToClose": round(e.get("daysToCloseSum", 0) / closed, 1) if closed else None,
                 "perDay": round(total(v, "journeysUploaded") / worked, 1) if worked else None, "daysWorked": worked,
                 "detail": {"closedShare": f"{closed} closed, {started} started", "firstTime": f"{rejected} of {int(pages)} pages rejected",
-                           "inTime": f"{in_time} of {due} tasks with a due time", "dutiesOnTime": f"{duty_on} of {duty_due} duties"}}
+                           "inTime": f"{in_time} of {due} tasks due, {int(e.get('tasksOpenLate', 0))} still open",
+                           "dutiesOnTime": f"{duty_on} of {duty_due} duties"}}
 
     def backlog_values(c: dict[str, list[int]], kinds: tuple[str, ...]) -> dict[str, int]:
         return {**{k: _n(c, k) for k in kinds}, "old": sum(_old(c, k) for k in _BACKLOG_ONCE)}
@@ -367,8 +373,11 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
     by_role: dict[str, list[str]] = {}
     for a in visible:
         if a != actor_id:
-            by_role.setdefault(people[a]["role"], []).append(a)
+            # A CRM reviews as a Reviewer does (the same dashboard view), so they are read together.
+            role = "REVIEWER" if people[a]["role"] == "CRM" else people[a]["role"]
+            by_role.setdefault(role, []).append(a)
     pcs = by_role.get("PC", [])
+    reviewers = by_role.get("REVIEWER", [])
     out["title"] = "Team dashboard"
 
     by_person = shown("team") or shown("efficiency")
@@ -432,6 +441,23 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
             cards.append({"key": "pcs", "title": "PCs", "sort": "old", "columns": backlog_columns(_PC_KINDS), "rows": [
                 {"id": a, "name": name_of(a), "sub": where_text(a), "values": backlog_values(backlog["byPerson"].get(a, {}), _PC_KINDS)}
                 for a in pcs]})
+        if reviewers:
+            # A Reviewer's backlog: what waits for review at the outlets they cover, and their
+            # closures waiting for a TL / PM decision.
+            rev_cols = [{"key": "awaitingReview", "label": _KIND_LABEL["awaitingReview"], "kind": "num"},
+                        {"key": "old", "label": "Waiting over 3 days", "kind": "alert"},
+                        {"key": "withLead", "label": "Their closures with TL / PM", "kind": "num"},
+                        {"key": "tasksOpen", "label": _KIND_LABEL["tasksOpen"], "kind": "num"},
+                        {"key": "tasksOverdue", "label": _KIND_LABEL["tasksOverdue"], "kind": "alert"}]
+            rev_rows = []
+            for a in reviewers:
+                theirs = _add_counts([backlog["byOutlet"].get(o, {}) for o in where(a)])
+                own_counts = backlog["byPerson"].get(a, {})
+                rev_rows.append({"id": a, "name": name_of(a), "sub": where_text(a), "values": {
+                    "awaitingReview": _n(theirs, "awaitingReview"), "old": _old(theirs, "awaitingReview"),
+                    "withLead": _n(own_counts, "awaitingDecision"), "tasksOpen": _n(own_counts, "tasksOpen"),
+                    "tasksOverdue": _n(own_counts, "tasksOverdue")}})
+            cards.append({"key": "reviewers", "title": "Reviewers", "sort": "old", "columns": rev_cols, "rows": rev_rows})
         if outlets:
             cards.append({"key": "outlets", "title": "Outlets", "sort": "old", "columns": backlog_columns(_TEAM_KINDS), "rows": [
                 {"id": str(o["outlet_id"]), "name": o["outlet_name"], "sub": o["dealer_name"],
@@ -443,7 +469,8 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
                 for d, ids in dealer_outlets.items()]})
         out["pending"]["cards"] = cards
 
-    if shown("efficiency") and pcs:
+    if shown("efficiency") and (pcs or reviewers):
+        eff_cards: list[dict[str, Any]] = []
         rows = []
         for a in pcs:
             e = efficiency_of(a, eff, quality_by)
@@ -457,6 +484,30 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
                 {"key": "daysToClose", "label": "Days to close a delivery file", "kind": "num"},
                 {"key": "perDay", "label": "Journeys a working day", "kind": "num"},
                 {"key": "daysWorked", "label": "Days worked", "kind": "num"}], "rows": rows}}
+        if rows:
+            eff_cards.append(out["efficiency"]["card"])
+        if reviewers:
+            rev_rows = []
+            for a in reviewers:
+                e = efficiency_of(a, eff, quality_by)
+                parts = [e[k] for k, _ in REVIEWER_PARTS if e[k] is not None]
+                v = values.get(a, {})
+                theirs = _add_counts([backlog["byOutlet"].get(o, {}) for o in where(a)])
+                rev_rows.append({"id": a, "name": name_of(a), "sub": where_text(a), "spark": series(v, "reviews"), "values": {
+                    "score": round(sum(parts) / len(parts)) if parts else None, "inTime": e["inTime"],
+                    "dutiesOnTime": e["dutiesOnTime"], "reviews": int(total(v, "reviews")),
+                    "closed": int(total(v, "journeysClosed")), "waitingOld": _old(theirs, "awaitingReview"),
+                    "hours": active_hours(a)}})
+            eff_cards.append({"key": "reviewers", "title": "Reviewers", "sort": "score", "spark": "Files reviewed, day by day",
+                              "columns": [{"key": "score", "label": "Efficiency", "kind": "score"},
+                                          *({"key": k, "label": label, "kind": "pct"} for k, label in REVIEWER_PARTS),
+                                          {"key": "reviews", "label": "Files reviewed", "kind": "num"},
+                                          {"key": "closed", "label": "Journeys closed", "kind": "num"},
+                                          {"key": "waitingOld", "label": "Waiting for review over 3 days at their outlets",
+                                           "kind": "alert"},
+                                          {"key": "hours", "label": "Active hours", "kind": "num"}], "rows": rev_rows})
+        out["efficiency"]["card"] = eff_cards[0]
+        out["efficiency"]["cards"] = eff_cards
 
     if shown("attention"):
         lines = []
@@ -533,7 +584,7 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
                               ("overdue", "Overdue tasks", "alert", None),
                               ("dutiesMissed", "Duty days missed", "alert", "duties"),
                               ("firstTime", "Pages right first time", "pct", "pagesRejected"),
-                              ("inTime", "Tasks closed in time", "pct", "tasksClosed"),
+                              ("inTime", "Tasks closed by due time", "pct", "tasksClosed"),
                               ("hours", "Active hours", "num", "activeMinutes")), "rows": rows})
 
         def lead_card(key: str, title: str, actors: list[str], spark_label: str) -> None:

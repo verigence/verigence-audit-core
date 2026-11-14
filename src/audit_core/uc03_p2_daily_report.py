@@ -193,7 +193,15 @@ def _add(total: dict[str, Any], part: dict[str, Any]) -> None:
 
 
 def _pc_names(connection: Connection, *, tenant_id: str) -> dict[str, str]:
-    """A PC's name is what their app recorded when they started a journey."""
+    """A PC's name is what their app recorded when they started a journey; anyone else (a Reviewer,
+    a Team Lead, who start no journeys) by the name Security holds for them -- before 2026-11-14 a
+    Reviewer's row in Work done showed as an account id."""
+    from audit_core.task_manager import known_names
+
+    return {**known_names(connection, tenant_id=tenant_id), **_journey_names(connection, tenant_id=tenant_id)}
+
+
+def _journey_names(connection: Connection, *, tenant_id: str) -> dict[str, str]:
     return dict(connection.execute(
         text(
             """
@@ -902,7 +910,7 @@ def _team_work(
         person["firstAt"] = person["firstAt"].isoformat() if person["firstAt"] else None
         person["lastAt"] = person["lastAt"].isoformat() if person["lastAt"] else None
         out.append(person)
-    order = {"PC": 0, "TL": 1, "PM": 2}
+    order = {"PC": 0, "REVIEWER": 1, "CRM": 1, "TL": 2, "PM": 3}
     out.sort(key=lambda p: (order.get(p["role"] or "", 9), -p["tasksWorked"], p["name"] or p["actorId"]))
     return {
         "people": out,
