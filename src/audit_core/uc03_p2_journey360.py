@@ -3549,6 +3549,26 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     # Tie each counted receipt to its statement credit: a match the
     # reconciliation already recorded first, else read straight off the
     # statement entries on file.
+    # The dealership's own account statements (Data uploads, 2026-11-14) decide
+    # a receipt the Journey's statement does not: found there, not found, or
+    # several possible credits -- only for receipts dated within an uploaded
+    # statement's period +/- 5 days.
+    from audit_core.uc03_p2_bank_statements import journey_bank_matches
+
+    dealer_matches = journey_bank_matches(connection, tenant_id=tenant_id, journey_id=journey_id)
+
+    def dealer_verdict(key: str) -> dict[str, Any] | None:
+        found = dealer_matches.get(key)
+        if found is None or found["outcome"] not in ("MATCHED", "NOT_FOUND", "AMBIGUOUS"):
+            return None
+        status = {"MATCHED": "MATCHED", "NOT_FOUND": "UNMATCHED", "AMBIGUOUS": "AMBIGUOUS"}[found["outcome"]]
+        return {"status": status, "method": "DEALER_STATEMENT" if status == "MATCHED" else None,
+                "documentId": None, "statementId": str(found["statement_id"]) if found["statement_id"] else None,
+                "date": found["txn_date"].isoformat() if found.get("txn_date") else None,
+                "reference": found.get("reference") or found.get("narration"),
+                "account": " ".join(x for x in (found.get("bank_name"), found.get("account_number")) if x) or None,
+                "basis": found.get("match_basis"), "recorded": True, "dealerStatement": True}
+
     for item in items:
         if not item["counted"]:
             item["bankStatement"] = None
@@ -3559,9 +3579,10 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
             item["bankMatch"] = "NOT_APPLICABLE"
             continue
         if not lines:
-            item["bankStatement"] = {"status": "NO_STATEMENT", "method": None, "documentId": None,
-                                     "date": None, "reference": None, "recorded": False}
-            item["bankMatch"] = "NO_STATEMENT"
+            verdict = dealer_verdict(item["paymentId"])
+            item["bankStatement"] = verdict or {"status": "NO_STATEMENT", "method": None, "documentId": None,
+                                                "date": None, "reference": None, "recorded": False}
+            item["bankMatch"] = item["bankStatement"]["status"]
             continue
         line, method, recorded = None, "NONE", False
         known = stored.get(item["paymentId"])
@@ -3578,6 +3599,11 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
             status = "MATCHED"
         else:
             status = "AMBIGUOUS" if method == "AMBIGUOUS" else "UNMATCHED"
+        verdict = dealer_verdict(item["paymentId"]) if line is None else None
+        if verdict is not None and verdict["status"] == "MATCHED":
+            item["bankStatement"] = verdict
+            item["bankMatch"] = "MATCHED"
+            continue
         item["bankStatement"] = {
             "status": status, "method": method if line is not None else None,
             "documentId": line["documentId"] if line else None, "date": line["date"] if line else None,
@@ -3601,6 +3627,9 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
             "notCountedReason": None, "duplicateOf": None, "bankMatch": None, "bankStatement": None,
             "fromLedger": True,
         })
+        verdict = dealer_verdict(items[-1]["paymentId"])
+        if verdict is not None:
+            items[-1]["bankStatement"], items[-1]["bankMatch"] = verdict, verdict["status"]
 
     # One split of the money received (2026-11-02): the customer's receipts,
     # and the loan -- its linked receipt plus a disbursement on the finance
