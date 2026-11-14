@@ -206,3 +206,10 @@ def test_a_dump_is_matched_marked_reported_and_shown_on_the_calendar(journey) ->
                                    first=today_db.replace(day=1), today=today_db)
         today = next(d for d in calendar["dealers"][0]["days"] if d["date"] == today_db.isoformat())
         assert today["booking"]["status"] == "UPLOADED" and today["booking"]["missing"] == 1
+
+
+def test_a_team_lead_s_bundle_is_enough_to_upload() -> None:
+    """A Team Lead's bundle has audit.work.update and no audit.journey.update: asking for
+    journey.update alone refused every TL upload (2026-11-14, VAC-AUTH-002)."""
+    assert "audit.work.update" in m._UPDATE and "audit.journey.update" in m._UPDATE
+    assert set(m.UPLOAD_ROLES) == {"TL", "REVIEWER"}

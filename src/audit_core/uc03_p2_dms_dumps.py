@@ -67,15 +67,19 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
-from audit_core.uc03_p2_access import authorize_p2
+from audit_core.uc03_p2_access import authorize_p2_any
 from audit_core.uc03_p2_names import same_person
 
 logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-dms-dumps"])
 
-_READ = "audit.journey.read"
-_UPDATE = "audit.journey.update"
+_READ: tuple[str, ...] = ("audit.journey.read",)
+# A Reviewer's bundle carries audit.journey.update, a Team Lead's audit.work.update and not
+# journey.update (uc03_p2_access, 2026-10-20). Asking for journey.update alone refused every
+# Team Lead's upload (2026-11-14, VAC-AUTH-002 on all six files): either one will do; who may
+# upload is then decided by the role (UPLOAD_ROLES).
+_UPDATE: tuple[str, ...] = ("audit.journey.update", "audit.work.update")
 _ADMIN_ROLES = ("SUPER_ADMIN", "TENANT_ADMIN")
 # Who uploads (product owner: "this task can be done by Reviewer or TL").
 UPLOAD_ROLES = ("TL", "REVIEWER")
@@ -518,9 +522,9 @@ def _roles(connection: Connection, tenant_id: str, actor_id: str) -> set[str]:
 
 
 def _access(connection: Connection, tenant_id: str, principal: HumanPrincipal, client: SecurityAuthorizationClient,
-            permission: str, roles: tuple[str, ...]) -> set[str]:
-    access = authorize_p2(connection, tenant_id=tenant_id, journey_id=None, human_principal=principal,
-                          authorization_client=client, permission_key=permission)
+            permissions: tuple[str, ...], roles: tuple[str, ...]) -> set[str]:
+    access = authorize_p2_any(connection, tenant_id=tenant_id, journey_id=None, human_principal=principal,
+                              authorization_client=client, permission_keys=permissions)
     if (access.functional_role or "").upper() in _ADMIN_ROLES:
         return {"ADMIN"}
     held = _roles(connection, tenant_id, principal.subject)
