@@ -19,7 +19,7 @@ from test_uc03_p2_hero_counts import _seed, _task
 
 from audit_core.db import set_tenant_context
 from audit_core.task_closure_roles import roles_closable_by
-from audit_core.uc03_p2_api import _P2_TASK_LIST_SQL
+from audit_core.uc03_p2_api import _P2_TASK_LIST_SQL, _P2_TASK_TOTALS_SQL
 from audit_core.uc03_p2_journey_views import (
     BREAKDOWN_FIGURES,
     BREAKDOWN_SQL,
@@ -302,3 +302,23 @@ def test_p2_requirement_rows_added_once(uc03_create_booking_setup):  # noqa: F81
     assert by_type["form_21"] == ["catalogue_form_21"]
     assert all(len(keys) == 1 for keys in by_type.values())
     assert set(by_type) == {d for _, d in _P2_ONLY_REQUIREMENTS}
+
+
+def test_the_queue_totals_count_the_tasks_the_list_lists(uc03_create_booking_setup):  # noqa: F811
+    """The Task Queue's totals are the queue's, not the length of the capped list (product owner
+    2026-11-14: "500 / 500 overdue" with 3,675 open): same filter, no cap."""
+    setup = uc03_create_booking_setup
+    _client, _base, journeys = _seed(setup)
+    rng = random.Random(20261114)
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        _more_tasks(connection, setup, journeys, rng)
+        for role in (None, "PC", "TL", "REVIEWER"):
+            params = {"tenant_id": setup["tenant_id"], "journey_id": None, "status": None,
+                      "actor_id": setup["actor_id"], "view": "open", "role": role, "roles": roles_closable_by(role)}
+            listed = _rows(connection, _P2_TASK_LIST_SQL, params)
+            totals = connection.execute(text(_P2_TASK_TOTALS_SQL), params).mappings().one()
+            assert totals["open_total"] == len(listed), role
+            overdue = sum(1 for r in listed if r["due_at_utc"] is not None
+                          and r["due_at_utc"] < connection.execute(text("SELECT now()")).scalar_one())
+            assert totals["overdue_total"] == overdue, role

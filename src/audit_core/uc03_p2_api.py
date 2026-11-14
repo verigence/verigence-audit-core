@@ -3436,14 +3436,10 @@ def _journey_assignees(connection: Connection, *, tenant_id: str, journey_id: UU
 
 # The P2 worklist query of list_tasks (parameters: tenant_id, journey_id, status, actor_id,
 # view, role, roles). Kept apart so tests can check it against the query it replaced.
-_P2_TASK_LIST_SQL = f"""
-            -- The 500 tasks of the queue are chosen first from the task rows alone; the
-            -- Journey's customer, outlet, vehicle, closure and the comment count are then
-            -- read for those 500 only (Neon cost review 2026-11-13: joining them for every
-            -- matching task before the LIMIT read ~3,500 rows' worth for a Team Lead).
-            WITH page AS (
-            SELECT t.tenant_id, t.task_id
-            FROM auditcore.p2_tasks t
+# Which tasks are on the caller's queue: one definition, used by the list (its first 500)
+# and by the queue's true totals (product owner 2026-11-14: the TL overview showed "500 /
+# 500 overdue" -- the length of the capped list -- with 3,675 open and 3,185 overdue).
+_P2_TASK_FILTER_SQL = """            FROM auditcore.p2_tasks t
             WHERE t.tenant_id=:tenant_id
               AND (CAST(:journey_id AS uuid) IS NULL OR t.journey_id=CAST(:journey_id AS uuid))
               AND (CAST(:role AS varchar) IS NULL OR t.assigned_role_code=ANY(CAST(:roles AS varchar[]))
@@ -3486,7 +3482,22 @@ _P2_TASK_LIST_SQL = f"""
                  )
                 WHERE j.tenant_id=t.tenant_id AND j.journey_id=t.journey_id
               )
-            ORDER BY t.due_at_utc NULLS LAST, t.created_at_utc, t.task_id
+"""
+
+# The queue's true size and how many are overdue, before the list's cap of 500.
+_P2_TASK_TOTALS_SQL = f"""
+            SELECT count(*) AS open_total, count(*) FILTER (WHERE t.due_at_utc < now()) AS overdue_total
+            {_P2_TASK_FILTER_SQL}
+"""
+
+_P2_TASK_LIST_SQL = f"""
+            -- The 500 tasks of the queue are chosen first from the task rows alone; the
+            -- Journey's customer, outlet, vehicle, closure and the comment count are then
+            -- read for those 500 only (Neon cost review 2026-11-13: joining them for every
+            -- matching task before the LIMIT read ~3,500 rows' worth for a Team Lead).
+            WITH page AS (
+            SELECT t.tenant_id, t.task_id
+{_P2_TASK_FILTER_SQL}            ORDER BY t.due_at_utc NULLS LAST, t.created_at_utc, t.task_id
             LIMIT 500
             )
             SELECT t.task_id, t.journey_id, t.root_task_id, t.parent_task_id,
@@ -3564,19 +3575,17 @@ def list_tasks(
     # every legacy workflow task into work_items/work_item_task_detail,
     # including historical backfill. Reading that mirror avoids duplicate
     # tasks and preserves the old task engine's task-specific completion hooks.
-    p2_rows = connection.execute(
-        text(_P2_TASK_LIST_SQL),
-        {
-            "tenant_id": tenant_id,
-            "journey_id": journey_id,
-            "status": status,
-            "actor_id": human_principal.subject,
-            "view": view if view in _TASK_VIEWS else "open",
-            "role": role,
-            # A Reviewer's queue carries the Team Lead's tasks too (task_closure_roles).
-            "roles": roles_closable_by(role),
-        },
-    ).mappings().all()
+    task_params = {
+        "tenant_id": tenant_id,
+        "journey_id": journey_id,
+        "status": status,
+        "actor_id": human_principal.subject,
+        "view": view if view in _TASK_VIEWS else "open",
+        "role": role,
+        # A Reviewer's queue carries the Team Lead's tasks too (task_closure_roles).
+        "roles": roles_closable_by(role),
+    }
+    p2_rows = connection.execute(text(_P2_TASK_LIST_SQL), task_params).mappings().all()
 
     legacy_mode = "all" if includeLegacy else ("none" if includeLegacy is False else "unprocessed")
     view_mode = view if view in _TASK_VIEWS else "open"
@@ -3784,6 +3793,8 @@ def list_tasks(
 
     items.sort(key=_safe_sort)
     counts = {"ALL": len(items), "DOCUMENTS": 0, "MANUAL_VERIFICATION": 0}
+    # The whole queue, not the 500 listed (the list is capped; its length is not the queue).
+    totals = connection.execute(text(_P2_TASK_TOTALS_SQL), task_params).mappings().one()
     registry = get_registry()
     for item in items:
         task_type = str(item.get("task_type") or "")
@@ -3807,6 +3818,8 @@ def list_tasks(
     return {
         "items": items[:500],
         "counts": counts,
+        "total": {"open": int(totals["open_total"]) + len(legacy_rows), "overdue": int(totals["overdue_total"]),
+                  "listed": min(len(items), 500)},
         "documentCounts": document_counts,
         "documentCountsByJourney": document_counts_by_journey,
         "sources": {
