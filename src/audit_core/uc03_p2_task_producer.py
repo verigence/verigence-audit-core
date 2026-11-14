@@ -29,12 +29,10 @@ from sqlalchemy import Connection, text
 
 from audit_core.uc03_p2_document_health import TL_AFTER_SECONDS
 from audit_core.uc03_p2_names import (
-    dealership_word,
     display_name,
     is_firm_name,
     is_masked,
     masked_matches,
-    same_dealership_group,
     same_organisation,
     same_person,
 )
@@ -2099,49 +2097,46 @@ def sync_name_consistency_tasks(
             )
             counts[outcome] = counts.get(outcome, 0) + 1
 
-    # -- the dealership. The booking form is the OEM's form and often names
-    # the OEM (Mahindra), not the dealership (Aditya Motors), so a document
-    # naming the OEM is not compared (2026-09-30). The reference is the
-    # booking form when it names a dealership, else the earliest dealer
-    # document; every other dealer document must name the same dealership.
+    # -- the dealership. Each dealer document is compared with the Journey's
+    # dealership on the dealer master, never with another document (product
+    # owner 2026-11-14: "receipts are fine why the dealership issue"). The
+    # reference used to be the booking docket's dealer name, the worst-read
+    # field of all ("indra", "Operative", "SPORT UTILITY VEHICLES", "MOBILES
+    # PVT. LTD.", the customer's company): one misread docket put every
+    # correct receipt, invoice and NDC of the booking on a "names another
+    # dealership" task -- 133 of 141 open on 14 Nov were that. A document is
+    # the wrong one only when its name reads as another organisation
+    # ("MINERVA AUTOMOBILES PVT. LTD.", "THE NEW INDIA ASSURANCE CO. LTD.");
+    # a place, an address or a cut word is a misread and raises nothing.
+    # The OEM's own name (the booking form is the OEM's form) is not compared.
+    from audit_core.uc03_receipt_issuer import _dealership_names, names_the_dealership
+
     oem = connection.execute(
         text("SELECT o.oem_code, o.oem_name FROM auditcore.projects p JOIN auditcore.oems o ON o.oem_id=p.oem_id "
              "WHERE p.tenant_id=:t LIMIT 1"),
         {"t": tenant_id},
     ).mappings().first()
     oem_names = [n for n in ((oem or {}).get("oem_code"), (oem or {}).get("oem_name")) if n]
-    dealers = [
-        d for d in _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id, pairs=rules.dealer_name_checked)
-        if not any(same_organisation(d["name"], name) for name in oem_names)
-    ]
-    anchor = next((d for d in reversed(dealers) if d["pair"].startswith("booking_form.")), dealers[0] if dealers else None)
-    # Variants of one dealership's name ("Shivnath Group" / "Shivnath Motors
-    # (India) Pvt Ltd") are the same dealership for now (product owner
-    # 2026-10-30), anchored on the tenant's own dealer master.
-    master_words = [
-        w for w in (dealership_word(n) for n in connection.execute(
-            text("SELECT dealer_name FROM auditcore.dealers WHERE tenant_id=:t"), {"t": tenant_id},
-        ).scalars().all()) if w
-    ] if anchor is not None else []
-    if anchor is not None:
-        anchor_template = registry.template_for_di_type(anchor["diType"], stage=anchor["stage"])
-        for document in dealers:
-            if (document["documentId"] == anchor["documentId"]
-                    or same_organisation(document["name"], anchor["name"])
-                    or same_dealership_group(document["name"], anchor["name"], master_words)):
+    dealership = _dealership_names(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if dealership:
+        for document in _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                         pairs=rules.dealer_name_checked):
+            if any(same_organisation(document["name"], name) for name in oem_names):
+                continue
+            if names_the_dealership(document["name"], dealership) is not False:
                 continue
             template = registry.template_for_di_type(document["diType"], stage=document["stage"])
             raise_task(
                 document, kind="dealer",
                 title=f"Replace the {template.display_name}: it names another dealership",
                 description=(
-                    f"The {template.display_name} names the dealership {display_name(document['name'])}, but the "
-                    f"{anchor_template.display_name} names {display_name(anchor['name'])}. Wrong document uploaded: "
-                    f"please delete it and upload the {template.display_name} issued by this dealership. If the name "
-                    f"was only misread, correct it on the document instead."
+                    f"The {template.display_name} names {display_name(document['name'])}, but this booking is with "
+                    f"{display_name(dealership[0])}. Wrong document uploaded: please delete it and upload the "
+                    f"{template.display_name} issued by {display_name(dealership[0])}. If the name was only "
+                    f"misread, correct it on the document instead."
                 ),
-                reference={"documentName": display_name(document["name"]), "dealerName": display_name(anchor["name"]),
-                           "referenceDocumentId": anchor["documentId"], "referenceTemplateKey": anchor_template.key},
+                reference={"documentName": display_name(document["name"]),
+                           "dealerName": display_name(dealership[0])},
             )
 
     closed = _resolve_prefix_except(

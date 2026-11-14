@@ -89,6 +89,63 @@ def issued_by_dealership(issuer: Any, dealership_names: list[Any]) -> bool | Non
     return False
 
 
+# A name reads as an organisation of its own when it carries a legal form or
+# a trade word: "MINERVA AUTOMOBILES PVT. LTD.", "THE NEW INDIA ASSURANCE CO.
+# LTD.", "BSS TAX CONSULTANCY LLP". A place, an address, a heading or a cut
+# word ("BHUBANESWAR", "AT-PO - BARBIL ...", "SPORT UTILITY VEHICLES",
+# "Operative", "indra") is a misread of the field, not another dealership.
+_ORGANISATION_WORDS = frozenset({
+    "pvt", "private", "ltd", "limited", "llp", "company", "corporation", "corp", "inc",
+    "motors", "motor", "automobiles", "automobile", "automotive", "automotives", "autos",
+    "insurance", "assurance", "consultancy", "consultants", "advertisers", "exports", "logistics",
+})
+_FIRM = re.compile(r"^\s*(m\s*/\s*s\b|messrs\b)", re.IGNORECASE)
+
+
+def _fragment_of(word: str, whole: str) -> bool:
+    """A word cut at the page edge or a line break: "kal" of "utkal",
+    "mobiles" of "automobiles"."""
+    return len(word) >= 3 and word != whole and (whole.endswith(word) or whole.startswith(word))
+
+
+# A long word survives two letters misread ("Auditia" for Aditya, "Sidhnath"
+# for Shivnath, 0.75+); another dealership's own word sits far below (0.33 at
+# most across the live names).
+_LONG_WORD, _SAME_LONG_WORD = 6, 0.74
+
+
+def _misread_of(word: str, mine: str) -> bool:
+    ratio = SequenceMatcher(None, word, mine).ratio()
+    return ratio >= _SAME_WORD or (min(len(word), len(mine)) >= _LONG_WORD and ratio >= _SAME_LONG_WORD)
+
+
+def names_the_dealership(name: Any, dealership_names: list[Any]) -> bool | None:
+    """Whether a dealer name read on a document names the Journey's dealership
+    (product owner 2026-11-14: "receipts are fine why the dealership issue").
+
+    True when it carries one of the dealership's own words, read with a letter
+    wrong or cut ("Utkala", "KAL AUTOMOBILES"); False only when it reads as an
+    organisation of its own ("MINERVA AUTOMOBILES PVT. LTD."); None when it
+    cannot be told -- no own word on the master, or the name is a misread of
+    the field (a place, an address, a heading, generic words only)."""
+    own = own_words(dealership_names)
+    words = _words(name)
+    if not own or not words:
+        return None
+    for word in words:
+        if word in own or any(_misread_of(word, mine) or _fragment_of(word, mine) for mine in own):
+            return True
+    distinctive = [w for w in words if w not in _GENERIC_WORDS
+                   and not any(_fragment_of(w, g) for g in _GENERIC_WORDS)]
+    if not distinctive:
+        return None  # "AUTOMOBILES PVT. LTD.", "MOBILES PVT. LTD.": the dealership's own word cut off
+    from audit_core.uc03_p2_names import is_firm_name
+
+    if _FIRM.search(str(name)) or any(w in _ORGANISATION_WORDS for w in words) or is_firm_name(name):
+        return False
+    return None
+
+
 def _dealership_names(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[Any]:
     row = connection.execute(
         text(

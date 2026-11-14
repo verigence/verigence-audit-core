@@ -181,7 +181,8 @@ def test_without_kyc_nothing_is_compared(journey):
     assert _sync(journey) == {}
 
 
-def test_dealer_documents_must_name_the_booking_forms_dealership(journey):
+def test_dealer_documents_must_name_the_journeys_dealership(journey):
+    _master_dealer(journey, "Sarthak Motors")
     add_ready_document(journey, "booking_form", customer_name="Anita Sahoo", dealer_name="Sarthak Motors Pvt Ltd")
     add_ready_document(journey, "dealer_receipt", customer_name="Anita Sahoo", dealer_name="SARTHAK MOTORS",
                        amount_paid="21000")
@@ -190,8 +191,7 @@ def test_dealer_documents_must_name_the_booking_forms_dealership(journey):
     assert _sync(journey) == {"RAISED": 1}
     (task,) = _tasks(journey)
     assert task["title"] == "Replace the Customer Invoice (DMS): it names another dealership"
-    assert "names the dealership Utkal Automobiles" in task["description"]
-    assert "Booking Docket names Sarthak Motors Pvt Ltd" in task["description"]
+    assert "names Utkal Automobiles, but this booking is with Sarthak Motors" in task["description"]
     assert task["reference"]["documentId"] == str(other)
     assert task["reference"]["sourceCode"] == "WRONG_DEALER_NAME"
 
@@ -199,8 +199,8 @@ def test_dealer_documents_must_name_the_booking_forms_dealership(journey):
 def test_the_oems_name_on_the_booking_form_is_not_a_dealership(journey):
     """2026-09-30: the booking form is the OEM's form and names Mahindra; the
     receipts and invoice name the dealership (Aditya Motors). No task: the
-    OEM's name is skipped and the dealer documents agree among themselves.
-    One naming another dealership is still caught, against the receipt."""
+    OEM's name is skipped. One naming another dealership is still caught."""
+    _master_dealer(journey, "Aditya Motors")
     with journey.engine.begin() as connection:
         connection.execute(text("UPDATE auditcore.oems SET oem_name='Mahindra & Mahindra Ltd' WHERE oem_id="
                                 "(SELECT oem_id FROM auditcore.projects WHERE tenant_id=:t)"), {"t": journey.tenant_id})
@@ -215,7 +215,30 @@ def test_the_oems_name_on_the_booking_form_is_not_a_dealership(journey):
     assert _sync(journey) == {"RAISED": 1}
     (task,) = _tasks(journey)
     assert task["reference"]["documentId"] == str(other)
-    assert "but the Booking Payment Receipt names ADITYA MOTORS" in task["description"]
+    assert "but this booking is with Aditya Motors" in task["description"]
+
+
+def test_a_misread_booking_docket_puts_no_receipt_on_a_task(journey):
+    """Product owner 2026-11-14: "receipts are fine why the dealership issue".
+    The docket's dealer name read as "SPORT UTILITY VEHICLES" made every
+    Utkal receipt "name another dealership". Each document is now compared
+    with the Journey's dealership: the receipts name it, and the misread
+    docket (a heading, not an organisation) raises nothing either."""
+    _master_dealer(journey, "Utkal Mahindra")
+    add_ready_document(journey, "booking_form", customer_name="Anita Sahoo", dealer_name="SPORT UTILITY VEHICLES")
+    add_ready_document(journey, "dealer_receipt", customer_name="Anita Sahoo",
+                       dealer_name="Utkal Automobiles Pvt. Ltd.", amount_paid="21000")
+    add_ready_document(journey, "payment_receipt", customer_name="Anita Sahoo",
+                       dealer_name="UTKAL AUTOMOBILES PRIVATE LIMITED", amount_paid="50000")
+    add_ready_document(journey, "customer_ledger", customer_name="Anita Sahoo", dealer_name="MOBILES PVT. LTD.")
+    assert _sync(journey) == {}
+    # A docket naming another organisation (the customer's company read as the
+    # dealer) is the one document on a task -- not the receipts.
+    docket = add_ready_document(journey, "booking_form", customer_name="Anita Sahoo",
+                                dealer_name="M/s. Sri Sai Metal and Logistic Pvt Ltd")
+    assert _sync(journey) == {"RAISED": 1}
+    (task,) = _tasks(journey)
+    assert task["reference"]["documentId"] == str(docket)
 
 
 def test_the_verified_kyc_name_stays_the_reference_when_another_persons_kyc_arrives(journey):
@@ -534,13 +557,13 @@ def test_another_firm_is_still_the_wrong_dealer_document(journey):
     assert task["reference"]["documentId"] == str(other)
 
 
-def test_a_dealership_word_outside_the_master_is_not_grouped(journey):
-    """Only the tenant's own dealerships are grouped: two names sharing a
-    first word the master does not hold are still compared as before."""
+def test_another_dealership_is_caught_against_the_master_whatever_the_booking_form_says(journey):
+    """The dealer master, not the booking form, is the reference (2026-11-14):
+    a booking form and an invoice that agree on another dealership are both
+    the wrong documents."""
     _master_dealer(journey, "Aditya Motors")
-    add_ready_document(journey, "booking_form", customer_name="Anita Sahoo", dealer_name="Sarthak Motors")
+    form = add_ready_document(journey, "booking_form", customer_name="Anita Sahoo", dealer_name="Sarthak Motors")
     other = add_ready_document(journey, "customer_invoice_dms", buyer_name="Anita Sahoo",
                                seller_name="Sarthak Agencies", invoice_number="I1")
-    assert _sync(journey) == {"RAISED": 1}
-    (task,) = _tasks(journey)
-    assert task["reference"]["documentId"] == str(other)
+    assert _sync(journey) == {"RAISED": 2}
+    assert {t["reference"]["documentId"] for t in _tasks(journey)} == {str(form), str(other)}
