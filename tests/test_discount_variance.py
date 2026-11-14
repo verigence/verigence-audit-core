@@ -49,7 +49,8 @@ def test_a_discount_given_above_its_entitlement_is_over():
         {"document": "Tax invoice", "documentType": "tax_invoice_tally", "amount": "35000.00"}])]))
     assert rows == [{"key": "CORPORATE", "label": "Corporate", "status": OVER, "entitled": "20000",
                      "invoice": "35000.00", "variance": "15000.00", "givenFrom": "billed",
-                     "givenDocument": "Tax invoice"}]
+                     "givenDocument": "Tax invoice",
+                     "readings": [{"document": "Tax invoice", "amount": "35000.00"}], "offer": None}]
 
 
 def test_a_discount_nothing_gives_a_figure_on_is_no_discount():
@@ -401,3 +402,27 @@ def test_a_dealer_discount_within_a_higher_grid_tier_is_over_only_if_not_inhouse
     # Only the dealer discount reads the grid.
     cash = {**_d("CASH_DISCOUNT", "5000", "7000"), "grid": grid}
     assert discount_variance_rows(_view([cash]))[0]["status"] == OVER
+
+
+def test_a_statement_figure_the_tally_ledger_contradicts_is_listed_apart_not_as_excess():
+    """Recheck 2026-11-14 ("pls recheck all excess discount journeys"):
+    UTK-SB-261114-012's NDC "Other Discount (if any) Special" read Rs 71,000
+    while its Tally ledger posts "Dealer Discount 5CRN" Rs 7,000. Which figure
+    is right is a question for the documents: both are listed, never excess."""
+    from audit_core.uc03_discount_variance import FIGURES_DISAGREE
+
+    sources = [{"document": "NDC (Account Statement)", "documentType": "account_statement", "amount": "71000"},
+               {"document": "Customer ledger (Tally)", "documentType": "customer_ledger_tally", "amount": "7000"}]
+    grid = {"tier": "WITH_INSURANCE", "tiers": {"BASE": "5000", "WITH_INSURANCE": "7000", "WITH_EW_INSURANCE": "10000"}}
+    dealer = {**_d("ADDITIONAL_DISCOUNT", "7000", "71000", billed_from="document", eligibility="ELIGIBLE",
+                   sources=sources), "grid": grid}
+    row = discount_variance_rows(_view([dealer]))[0]
+    assert (row["status"], row["ledger"], row["variance"]) == (FIGURES_DISAGREE, "7000", "64000")
+    assert "Tally ledger Rs 7,000" in row["reason"]
+    # The row says what each document read and what the master offers.
+    assert row["readings"] == [{"document": "NDC (Account Statement)", "amount": "71000"},
+                               {"document": "Customer ledger (Tally)", "amount": "7000"}]
+    assert row["offer"]["source"] == "Dealer discount grid" and row["offer"]["tiers"]["WITH_EW_INSURANCE"] == "10000"
+    # The ledger agreeing with the statement: excess, as before.
+    agreeing = [{**sources[0]}, {**sources[1], "amount": "71000"}]
+    assert discount_variance_rows(_view([{**dealer, "sources": agreeing}]))[0]["status"] == OVER

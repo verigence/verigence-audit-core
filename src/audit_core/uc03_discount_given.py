@@ -213,6 +213,13 @@ OVER, UNDER, UNKNOWN, KIT_AS_CASH = "OVER_ENTITLEMENT", "UNDER_ENTITLEMENT", "EN
 # Dealer". Listed apart with the figure the in-house tier allows, never
 # counted as excess.
 IF_NOT_INHOUSE = "OVER_UNLESS_INHOUSE"
+# The dealer's statement and its Tally ledger give different amounts for the
+# discount (UTK-SB-261114-012: NDC "Other Discount Special" read Rs 71,000,
+# the ledger's credit note Rs 7,000): which is right is a question for the
+# documents, not an excess -- listed apart with both figures (product owner
+# 2026-11-14, "pls recheck all excess discount journeys").
+FIGURES_DISAGREE = "FIGURES_DISAGREE"
+_TALLY_NORM = _norm_type("customer_ledger_tally")
 _TIER_ORDER = ("BASE", "WITH_INSURANCE", "WITH_EW_INSURANCE")
 _TIER_WORDS = {"WITH_INSURANCE": "the insurance was in-house",
                "WITH_EW_INSURANCE": "the insurance and the extended warranty were in-house"}
@@ -233,6 +240,17 @@ def higher_tier_covering(row: dict[str, Any], amount: Decimal) -> tuple[str, Dec
         if allowance is not None and amount - allowance <= LINE_TOLERANCE:
             return higher, allowance
     return None
+
+
+def disagreeing_figures(row: dict[str, Any], amount: Decimal) -> Decimal | None:
+    """The Tally ledger's amount for this benefit when it differs from the
+    statement's given ``amount`` by more than the line tolerance, else None."""
+    ledger = [_dec(s.get("amount")) for s in row.get("sources") or []
+              if _norm_type(s.get("documentType")) == _TALLY_NORM and _dec(s.get("amount")) is not None]
+    statement = [s for s in row.get("sources") or [] if _norm_type(s.get("documentType")) in _STATEMENT_NORM]
+    if not ledger or not statement or any(abs(v - amount) <= LINE_TOLERANCE for v in ledger):
+        return None
+    return ledger[0]
 
 
 def kit_available(discounts: list[dict[str, Any]]) -> Decimal:
@@ -260,6 +278,9 @@ def assess(discounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
       judged at but within a higher tier of its grid line -- over only if
       the insurance / EW were not in-house, never counted as excess
       (2026-11-14);
+    * FIGURES_DISAGREE: given above the entitlement on the statement while
+      the Tally ledger gives another amount -- listed apart with both,
+      never counted as excess (2026-11-14);
     * OVER_ENTITLEMENT: given above the entitlement (the kit, when it was
       given as cash, counted with it) by more than the line tolerance;
     * UNDER_ENTITLEMENT: given below it by more than the tolerance;
@@ -283,6 +304,12 @@ def assess(discounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         entitled_amount = entitled(row)
         extra = amount - entitled_amount
+        other = disagreeing_figures(row, amount) if column == "billed" and extra > LINE_TOLERANCE else None
+        if other is not None:
+            out.append({**base, "status": FIGURES_DISAGREE, "entitled": entitled_amount, "variance": extra,
+                        "ledger": other,
+                        "reason": f"the statement gives {_rupees(amount)}, the Tally ledger {_rupees(other)}"})
+            continue
         if row.get("key") == CASH_KEY and extra > LINE_TOLERANCE and kit_left > 0:
             kit_used = min(extra, kit_left)
             kit_left -= kit_used
@@ -310,6 +337,7 @@ def assess(discounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 __all__ = [
+    "FIGURES_DISAGREE",
     "GIVEN_COLUMNS",
     "IF_NOT_INHOUSE",
     "KIT_AS_CASH",
@@ -318,6 +346,7 @@ __all__ = [
     "UNDER",
     "UNKNOWN",
     "assess",
+    "disagreeing_figures",
     "entitled",
     "entitlement_unknown",
     "given",

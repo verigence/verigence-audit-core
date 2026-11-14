@@ -52,6 +52,7 @@ _READ_PERMISSION = "audit.journey.read"
 TOLERANCE = dg.LINE_TOLERANCE
 OVER, UNDER, UNKNOWN, KIT_AS_CASH = dg.OVER, dg.UNDER, dg.UNKNOWN, dg.KIT_AS_CASH
 IF_NOT_INHOUSE = dg.IF_NOT_INHOUSE
+FIGURES_DISAGREE = dg.FIGURES_DISAGREE
 
 
 def _vehicle_price_read(view: dict[str, Any]) -> bool:
@@ -69,6 +70,22 @@ def _tallied(view: dict[str, Any]) -> bool:
         # invoice is read into its Deal, so none is required here.
         return True
     return bool(summary.get("vehicleInvoiceOnFile")) and _vehicle_price_read(view)
+
+
+def _readings(row: dict[str, Any]) -> list[dict[str, Any]]:
+    return [{"document": s.get("document"), "amount": s.get("amount")}
+            for s in row.get("sources") or [] if s.get("amount") is not None]
+
+
+def _offer(row: dict[str, Any], item: dict[str, Any]) -> dict[str, Any] | None:
+    grid = row.get("grid") or {}
+    scheme = row.get("scheme") or {}
+    if grid or row.get("key") == "ADDITIONAL_DISCOUNT":
+        return {"source": "Dealer discount grid", "tier": grid.get("tier"), "tiers": grid.get("tiers")}
+    if scheme:
+        return {"source": scheme.get("name") or scheme.get("code"), "code": scheme.get("code"),
+                "eligibility": row.get("eligibility"), "kit": None if item.get("kit") is None else str(item["kit"])}
+    return None
 
 
 def discount_variance_rows(view: dict[str, Any]) -> list[dict[str, Any]]:
@@ -96,8 +113,14 @@ def discount_variance_rows(view: dict[str, Any]) -> list[dict[str, Any]]:
             "variance": None if item["variance"] is None else str(item["variance"]),
             "givenFrom": item["column"], "givenDocument": dg.given_document(row, item["column"]),
             **({"kit": str(item["kit"])} if item["kit"] is not None else {}),
-            **({"reason": item["reason"]} if item["status"] in (UNKNOWN, IF_NOT_INHOUSE) else {}),
+            **({"reason": item["reason"]} if item["status"] in (UNKNOWN, IF_NOT_INHOUSE, FIGURES_DISAGREE) else {}),
             **({"ifInhouse": str(item["ifInhouse"])} if item.get("ifInhouse") is not None else {}),
+            **({"ledger": str(item["ledger"])} if item.get("ledger") is not None else {}),
+            # What each document gives for this benefit and what the master
+            # offers (product owner 2026-11-14: "check what is read, what is the
+            # offer"), so a row says what it rests on.
+            "readings": _readings(row),
+            "offer": _offer(row, item),
         })
     return rows
 
@@ -131,7 +154,8 @@ _REPORT_SQL = """
            (e.item->>'invoice')::numeric AS invoice, (e.item->>'variance')::numeric AS variance,
            e.item->>'givenFrom' AS given_from, e.item->>'givenDocument' AS given_document,
            (e.item->>'kit')::numeric AS kit, e.item->>'reason' AS reason,
-           (e.item->>'ifInhouse')::numeric AS if_inhouse
+           (e.item->>'ifInhouse')::numeric AS if_inhouse,
+           (e.item->>'ledger')::numeric AS ledger, e.item->'readings' AS readings, e.item->'offer' AS offer
     FROM auditcore.p2_journey_runtime r
     JOIN auditcore.journeys j ON j.tenant_id = r.tenant_id AND j.journey_id = r.journey_id
     CROSS JOIN LATERAL jsonb_array_elements(COALESCE(r.discount_variance, '[]'::jsonb)) AS e(item)
@@ -158,8 +182,8 @@ _REPORT_SQL = """
     -- Over-grants first, so a long list of under-grants never crowds them out
     -- of the limit (2026-10-31); then under, then entitlement unknown.
     ORDER BY CASE e.item->>'status' WHEN 'OVER_ENTITLEMENT' THEN 0 WHEN 'KIT_AS_CASH' THEN 1
-                                    WHEN 'OVER_UNLESS_INHOUSE' THEN 2
-                                    WHEN 'UNDER_ENTITLEMENT' THEN 3 ELSE 4 END,
+                                    WHEN 'OVER_UNLESS_INHOUSE' THEN 2 WHEN 'FIGURES_DISAGREE' THEN 3
+                                    WHEN 'UNDER_ENTITLEMENT' THEN 4 ELSE 5 END,
              abs(COALESCE((e.item->>'variance')::numeric, 0)) DESC, j.journey_reference, e.item->>'key'
     LIMIT :limit
 """
@@ -189,6 +213,8 @@ def discount_variance_report(
         "givenFrom": r["given_from"], "givenDocument": r["given_document"],
         "kit": None if r["kit"] is None else str(r["kit"]), "reason": r["reason"],
         "ifInhouse": None if r["if_inhouse"] is None else str(r["if_inhouse"]),
+        "ledger": None if r["ledger"] is None else str(r["ledger"]),
+        "readings": r["readings"] or [], "offer": r["offer"],
     } for r in rows]
     pending = connection.execute(
         text(
@@ -209,6 +235,7 @@ def discount_variance_report(
             "unknown": sum(1 for i in items if i["status"] == UNKNOWN),
             "kitAsCash": sum(1 for i in items if i["status"] == KIT_AS_CASH),
             "unlessInhouse": sum(1 for i in items if i["status"] == IF_NOT_INHOUSE),
+            "figuresDisagree": sum(1 for i in items if i["status"] == FIGURES_DISAGREE),
             "journeys": len({i["journeyId"] for i in items}),
         },
         "notYetCalculated": int(pending),
@@ -227,7 +254,7 @@ def read_discount_variance(
     outlet_id: UUID | None = None,
     dealer_id: UUID | None = None,
     limit: Annotated[int, Query(ge=1, le=5000)] = 500,
-    status: Annotated[str | None, Query(pattern="^(OVER_ENTITLEMENT|UNDER_ENTITLEMENT|ENTITLEMENT_UNKNOWN|KIT_AS_CASH|OVER_UNLESS_INHOUSE)$")] = None,
+    status: Annotated[str | None, Query(pattern="^(OVER_ENTITLEMENT|UNDER_ENTITLEMENT|ENTITLEMENT_UNKNOWN|KIT_AS_CASH|OVER_UNLESS_INHOUSE|FIGURES_DISAGREE)$")] = None,
 ) -> dict[str, Any]:
     """Discounts given above or below the entitlement, with the discount
     category, PC, outlet, customer and car model and the document each figure
