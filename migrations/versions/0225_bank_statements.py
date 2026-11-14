@@ -32,6 +32,15 @@ and only those bookings and journey need to be verified."
                               re-decides the dealership's receipts; rows no longer in any
                               statement's range are kept, marked not current.
 
+- p2_journey_bank_status     per Journey: its bank receipts (every counted non-cash
+                              receipt, any date), how much is found in the bank and how
+                              much is left; BANK_VERIFIED once every one is found (product
+                              owner: "if all got verified, status of that journey should be
+                              updated to bank verified"), with the day it first was.
+
+A receipt found in the bank also gets a VERIFIED payment_verification_events row (the
+payment's own verification status).
+
 Tenant row security as every Audit Core table; the runtime role may read, add and update,
 never delete.
 """
@@ -45,7 +54,7 @@ branch_labels = None
 depends_on = None
 
 _RUNTIME_ROLE = "audit_core_runtime"
-_TABLES = ("p2_bank_statements", "p2_bank_statement_txns", "p2_bank_receipt_matches")
+_TABLES = ("p2_bank_statements", "p2_bank_statement_txns", "p2_bank_receipt_matches", "p2_journey_bank_status")
 
 
 def _secure(table: str) -> None:
@@ -164,6 +173,25 @@ def upgrade() -> None:
     op.execute(
         "CREATE INDEX IF NOT EXISTS ix_p2_bank_receipt_matches_payment ON auditcore.p2_bank_receipt_matches "
         "(tenant_id, payment_id) WHERE payment_id IS NOT NULL"
+    )
+    op.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auditcore.p2_journey_bank_status (
+            tenant_id          varchar(128)  NOT NULL,
+            journey_id         uuid          NOT NULL,
+            dealer_id          uuid          NOT NULL,
+            status             varchar(16)   NOT NULL
+                                 CHECK (status IN ('BANK_VERIFIED', 'PARTIAL', 'NOT_VERIFIED', 'CASH_ONLY')),
+            receipts           integer       NOT NULL DEFAULT 0,
+            bank_receipts      numeric(16,2) NOT NULL DEFAULT 0,
+            verified           numeric(16,2) NOT NULL DEFAULT 0,
+            left_to_verify     numeric(16,2) NOT NULL DEFAULT 0,
+            cash               numeric(16,2) NOT NULL DEFAULT 0,
+            bank_verified_at   timestamptz,
+            updated_at_utc     timestamptz   NOT NULL DEFAULT now(),
+            PRIMARY KEY (tenant_id, journey_id)
+        )
+        """
     )
     for table in _TABLES:
         _secure(table)

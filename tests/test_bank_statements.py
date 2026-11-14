@@ -18,7 +18,7 @@ from audit_core.bank_statement_parsers import (
     read_statement,
     references_in,
 )
-from audit_core.uc03_p2_bank_statements import journey_rollup
+from audit_core.uc03_p2_bank_statements import journey_bank_status, journey_rollup
 
 # --------------------------------------------------------------------------- reading
 
@@ -282,3 +282,15 @@ def test_journey_rollup_fully_partly_and_left() -> None:
     assert rollup["J1"]["status"] == "PARTIAL"
     assert (rollup["J1"]["verified"], rollup["J1"]["left"]) == (Decimal(21000), Decimal(300000))
     assert rollup["J2"]["status"] == "CASH_ONLY"
+
+
+def test_a_journey_is_bank_verified_when_every_bank_receipt_is_found_and_cash_does_not_hold_it_back() -> None:
+    receipts = [{"payment_id": "a", "amount": 21000, "mode": "OTHERS"},
+                {"payment_id": "b", "amount": 500000, "mode": "RTGS"},
+                {"payment_id": "c", "amount": 30000, "mode": "CASH"}]
+    assert journey_bank_status(receipts, {"a": "MATCHED", "b": "MATCHED"})["status"] == "BANK_VERIFIED"
+    partial = journey_bank_status(receipts, {"a": "MATCHED", "b": "NOT_FOUND"})
+    assert (partial["status"], partial["left"]) == ("PARTIAL", Decimal(500000))
+    # a receipt never covered by any statement is not verified either
+    assert journey_bank_status(receipts, {"a": "MATCHED"})["status"] == "PARTIAL"
+    assert journey_bank_status(receipts[2:], {})["status"] == "CASH_ONLY"

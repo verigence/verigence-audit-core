@@ -3681,6 +3681,11 @@ def payments_section(connection: Connection, *, tenant_id: str, journey_id: UUID
     in kind, refunds, and the total. The bank letter's line shows only when
     the letter is the loan counted."""
     view = payments(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # Bank verified (product owner 2026-11-14): every bank receipt found in the
+    # dealership's bank statements.
+    from audit_core.uc03_p2_bank_statements import journey_bank_summary
+
+    view["bankVerification"] = journey_bank_summary(connection, tenant_id=tenant_id, journey_id=journey_id)
     paid = deal(connection, tenant_id=tenant_id, journey_id=journey_id)["summary"]["paid"]
     view.update({
         "loanDisbursed": paid["loan"],

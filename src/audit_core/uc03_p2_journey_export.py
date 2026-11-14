@@ -147,7 +147,9 @@ PAYMENT_COLUMNS = ("Total Amt To Be Received", "Total Amt Received", "Payment Va
 # standard kit (product owner 2026-11-11).
 NOTE_COLUMNS = ("Booking Date Source", "Insurance Policy No", "Insurance Add-ons", "Accessories Add-on",
                 # whether the dealer's DMS booking / delivery dump has the journey (product owner 2026-11-13)
-                "DMS Booking Synced", "DMS Delivery Synced")
+                "DMS Booking Synced", "DMS Delivery Synced",
+                # the dealership bank statements' verdict (product owner 2026-11-14)
+                "Bank Verification", "Bank Verified On")
 # The accessories lines of the Deal (the standard kit and what is billed on it).
 _ACCESSORY_KEYS = frozenset({"accessories_cost", "essential_kit_amount", "genuine_accessories_amount",
                              "non_genuine_accessories_amount"})
@@ -259,6 +261,10 @@ def column_notes() -> list[tuple[str, str]]:
         ("DMS Booking Synced", ("The day (IST) a DMS booking dump uploaded by a TL / Reviewer first had this "
                                 "journey; blank when no dump has it yet")),
         ("DMS Delivery Synced", "The day (IST) a DMS delivery dump first had this journey; blank when none has"),
+        ("Bank Verification", ("Bank verified when every bank receipt of the journey is found in the dealership's "
+                               "uploaded bank statements; Partly verified / Not verified otherwise; blank when no "
+                               "statement has covered its receipts. Cash receipts do not hold it back")),
+        ("Bank Verified On", "The day (IST) the journey first became Bank verified"),
     ]
     return notes
 
@@ -525,6 +531,10 @@ def identity_row(base: dict[str, Any], *, deal: dict[str, Any], vehicle: dict[st
         "Insurance Add-ons": _add_on_text(policy.get("addOns")),
         "DMS Booking Synced": base.get("dms_booking_synced"),
         "DMS Delivery Synced": base.get("dms_delivery_synced"),
+        "Bank Verification": {"BANK_VERIFIED": "Bank verified", "PARTIAL": "Partly verified",
+                              "NOT_VERIFIED": "Not verified", "CASH_ONLY": "Cash only"}.get(
+                                  str(base.get("bank_status") or ""), None),
+        "Bank Verified On": base.get("bank_verified_on"),
     }
 
 
@@ -620,7 +630,9 @@ base AS (
            END AS booking_date_source,
            COALESCE(dv.actual_delivered_at::date, gp.delivery_date) AS delivery_day,
            CAST(sy.dms_booking_synced_at AT TIME ZONE 'Asia/Kolkata' AS date) AS dms_booking_synced,
-           CAST(sy.dms_delivery_synced_at AT TIME ZONE 'Asia/Kolkata' AS date) AS dms_delivery_synced
+           CAST(sy.dms_delivery_synced_at AT TIME ZONE 'Asia/Kolkata' AS date) AS dms_delivery_synced,
+           bs.status AS bank_status,
+           CAST(bs.bank_verified_at AT TIME ZONE 'Asia/Kolkata' AS date) AS bank_verified_on
     FROM scoped j
     JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
     JOIN auditcore.dealer_outlets o ON o.tenant_id=j.tenant_id AND o.outlet_id=j.outlet_id
@@ -628,6 +640,7 @@ base AS (
     LEFT JOIN auditcore.deliveries dv ON dv.tenant_id=j.tenant_id AND dv.journey_id=j.journey_id
     LEFT JOIN first_booking_upload up ON up.journey_id=j.journey_id
     LEFT JOIN auditcore.p2_journey_dms_sync sy ON sy.tenant_id=j.tenant_id AND sy.journey_id=j.journey_id
+    LEFT JOIN auditcore.p2_journey_bank_status bs ON bs.tenant_id=j.tenant_id AND bs.journey_id=j.journey_id
     LEFT JOIN LATERAL (
         SELECT CAST(f.effective_value #>> '{}' AS date) AS delivery_date
         FROM auditcore.journey_document_extracted_fields f

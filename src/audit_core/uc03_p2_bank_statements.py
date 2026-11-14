@@ -20,8 +20,14 @@ in its period +/- 5 days and their verdicts, the Journeys fully / partly / not v
 with the amount verified and left, and the credits no receipt stands for -- marking those
 that name a customer on file (money received, no receipt in Verigence).
 
-Who: as the DMS dumps (uc03_p2_dms_dumps) -- a Team Lead or Reviewer uploads; Team Leads,
-Reviewers, Project Managers and Executives read.
+Who: anyone on the Project (product owner 2026-11-14: "bankstatements can be uploaded by
+anyone"), for the dealerships they are mapped to.
+
+Status (product owner 2026-11-14: "if payment receipt is verified, its status to be updated,
+and if all got verified, status of that journey should be updated to bank verified"): a
+receipt found in the bank gets a VERIFIED payment verification (and its open "payment not
+evidenced in a bank statement" finding is resolved); a Journey whose every bank receipt (any
+date) is found is BANK_VERIFIED. Cash receipts, deposited in batches, do not hold it back.
 """
 from __future__ import annotations
 
@@ -51,12 +57,10 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.uc03_p2_access import authorize_p2_any
 from audit_core.uc03_p2_dms_dumps import (
+    _ADMIN_ROLES,
     _READ,
-    _UPDATE,
-    READ_ROLES,
-    UPLOAD_ROLES,
-    _access,
     _dealers,
     _month,
     _name_of,
@@ -92,6 +96,14 @@ JOURNEY_LABELS = {
     JOURNEY_VERIFIED: "Fully verified", JOURNEY_PARTIAL: "Partly verified", JOURNEY_NOT_VERIFIED: "Not verified",
     JOURNEY_CASH_ONLY: "Cash only",
 }
+
+
+def _access(connection: Connection, tenant_id: str, principal: HumanPrincipal,
+            client: SecurityAuthorizationClient) -> set[str]:
+    """Anyone on the Project may upload and read; administrators see every dealership."""
+    access = authorize_p2_any(connection, tenant_id=tenant_id, journey_id=None, human_principal=principal,
+                              authorization_client=client, permission_keys=_READ)
+    return {"ADMIN"} if (access.functional_role or "").upper() in _ADMIN_ROLES else {"MEMBER"}
 
 
 def _dec(value: Any) -> Decimal:
@@ -338,10 +350,127 @@ def reconcile_dealer(connection: Connection, *, tenant_id: str, dealer_id: str) 
                  "WHERE tenant_id = :t AND statement_id = :s"),
             {"t": tenant_id, "s": str(statement["statement_id"]), "c": json.dumps(counts)},
         )
+    _record_verifications(connection, tenant_id, results, credits)
+    _journey_status(connection, tenant_id, dealer_id, sorted({r.receipt.journey_id for r in results}))
     logger.info("bank_reconciliation_run", tenant_id=tenant_id, dealer_id=dealer_id, statements=len(statements),
                 receipts=len(results), matched=sum(1 for r in results if r.outcome == br.MATCHED),
                 credits=len(credits))
     return {"statements": len(statements), "receipts": len(results)}
+
+
+_SYSTEM_ACTOR = "system:dealer-bank-statement"
+
+
+def _record_verifications(connection: Connection, tenant_id: str, results: list[br.ReceiptResult],
+                          credits: list[br.Credit]) -> None:
+    """A receipt found in the bank is verified (its payment's own status), once; its open
+    'payment not evidenced in a bank statement' finding is resolved."""
+    from audit_core.uc03_payment_reconciliation import _RULE_PREFIX, _resolve_flag
+
+    by_key = {c.key: c for c in credits}
+    found = [r for r in results if r.outcome == br.MATCHED and r.receipt.source == "RECEIPT"]
+    if not found:
+        return
+    already = set(connection.execute(
+        text("SELECT CAST(payment_id AS text) FROM auditcore.payment_verification_events "
+             "WHERE tenant_id = :t AND verification_result = 'VERIFIED' AND CAST(payment_id AS text) = ANY(:ps)"),
+        {"t": tenant_id, "ps": [r.receipt.key for r in found]},
+    ).scalars().all())
+    rows = []
+    for r in found:
+        if r.receipt.key in already:
+            continue
+        credit = by_key.get(r.credit_keys[0]) if r.credit_keys else None
+        note = (f"Found in the dealership's bank statement ({credit.bank or 'bank'}, credit of "
+                f"{credit.txn_date:%d %b %Y}, matched on {BASIS_LABELS.get(r.basis or '', r.basis)})."
+                if credit and credit.txn_date else "Found in the dealership's bank statement.")
+        rows.append({"t": tenant_id, "j": r.receipt.journey_id, "p": r.receipt.key, "n": note[:500],
+                     "a": _SYSTEM_ACTOR, "c": f"bank-statement:{r.credit_keys[0] if r.credit_keys else ''}"[:120]})
+    if rows:
+        connection.execute(
+            text("""
+                INSERT INTO auditcore.payment_verification_events (tenant_id, journey_id, payment_id,
+                  verification_result, verification_notes, verified_by_actor_id, verified_by_role_code, correlation_id)
+                VALUES (:t, CAST(:j AS uuid), CAST(:p AS uuid), 'VERIFIED', :n, :a, 'SYSTEM', :c)
+            """),
+            rows,
+        )
+    for r in found:
+        try:
+            with connection.begin_nested():
+                _resolve_flag(connection, tenant_id=tenant_id, journey_id=UUID(r.receipt.journey_id),
+                              rule_key=f"{_RULE_PREFIX}:{r.receipt.key}", correlation_id="dealer-bank-statement")
+        except Exception:
+            logger.warning("bank_reconciliation_flag_not_resolved", payment_id=r.receipt.key, exc_info=True)
+
+
+_JOURNEY_RECEIPTS_SQL = """
+    SELECT p.payment_id, p.journey_id, p.amount, p.receipt_number, p.receipt_date, p.payment_reference,
+           COALESCE(p.payment_mode_code, p.payment_method_code) AS mode
+    FROM auditcore.payments p
+    JOIN auditcore.evidence e
+      ON e.tenant_id = p.tenant_id AND e.journey_id = p.journey_id AND e.di_document_id = p.source_di_document_id
+    WHERE p.tenant_id = :t AND CAST(p.journey_id AS text) = ANY(:js) AND p.amount > 0
+      AND p.status_source = 'EVIDENCE' AND e.association_status = 'ACTIVE'
+    ORDER BY p.journey_id, p.receipt_date NULLS LAST, p.created_at_utc, p.payment_id
+"""
+
+
+def journey_bank_status(receipts: list[dict[str, Any]], outcomes: dict[str, str]) -> dict[str, Any]:
+    """One Journey's bank verification over every receipt it counts (any date): BANK_VERIFIED
+    once each bank receipt is found; cash not found does not hold it back."""
+    bank = verified = cash = Decimal(0)
+    for r in receipts:
+        amount = _dec(r["amount"])
+        outcome = outcomes.get(str(r["payment_id"]))
+        if br.mode_class(r["mode"]) == "CASH" and outcome != br.MATCHED:
+            cash += amount
+            continue
+        bank += amount
+        if outcome == br.MATCHED:
+            verified += amount
+    left = bank - verified
+    status = ("CASH_ONLY" if bank == 0 else "BANK_VERIFIED" if left <= 0 else
+              "PARTIAL" if verified > 0 else "NOT_VERIFIED")
+    return {"status": status, "receipts": len(receipts), "bank": bank, "verified": verified, "left": left,
+            "cash": cash}
+
+
+def _journey_status(connection: Connection, tenant_id: str, dealer_id: str, journey_ids: list[str]) -> None:
+    if not journey_ids:
+        return
+    from audit_core.uc03_p2_journey360 import _duplicate_receipts
+
+    rows = connection.execute(text(_JOURNEY_RECEIPTS_SQL), {"t": tenant_id, "js": journey_ids}).mappings().all()
+    outcomes = {r["receipt_key"]: r["outcome"] for r in connection.execute(
+        text("SELECT receipt_key, outcome FROM auditcore.p2_bank_receipt_matches "
+             "WHERE tenant_id = :t AND is_current AND CAST(journey_id AS text) = ANY(:js)"),
+        {"t": tenant_id, "js": journey_ids},
+    ).mappings()}
+    by_journey: dict[str, list[Any]] = {j: [] for j in journey_ids}
+    for r in rows:
+        by_journey.setdefault(str(r["journey_id"]), []).append(r)
+    updates = []
+    for jid, journey_rows in by_journey.items():
+        duplicates = _duplicate_receipts(journey_rows)
+        status = journey_bank_status([r for r in journey_rows if r["payment_id"] not in duplicates], outcomes)
+        updates.append({"t": tenant_id, "j": jid, "d": dealer_id, "s": status["status"], "n": status["receipts"],
+                        "b": status["bank"], "v": status["verified"], "l": status["left"], "c": status["cash"]})
+    connection.execute(
+        text("""
+            INSERT INTO auditcore.p2_journey_bank_status (tenant_id, journey_id, dealer_id, status, receipts,
+              bank_receipts, verified, left_to_verify, cash, bank_verified_at, updated_at_utc)
+            VALUES (:t, CAST(:j AS uuid), CAST(:d AS uuid), :s, :n, :b, :v, :l, :c,
+                    CASE WHEN :s = 'BANK_VERIFIED' THEN now() END, now())
+            ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
+              status = EXCLUDED.status, receipts = EXCLUDED.receipts, bank_receipts = EXCLUDED.bank_receipts,
+              verified = EXCLUDED.verified, left_to_verify = EXCLUDED.left_to_verify, cash = EXCLUDED.cash,
+              bank_verified_at = CASE WHEN EXCLUDED.status = 'BANK_VERIFIED'
+                                      THEN COALESCE(auditcore.p2_journey_bank_status.bank_verified_at, now()) END,
+              updated_at_utc = now()
+        """),
+        updates,
+    )
 
 
 def _receipt_number(result: br.ReceiptResult) -> str | None:
@@ -445,12 +574,12 @@ def bank_statement_setup(
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
     """The dealerships (with their outlets) the caller covers, and whether they may upload."""
-    held = _access(connection, tenant_id, principal, client, _READ, READ_ROLES)
+    held = _access(connection, tenant_id, principal, client)
     admin = "ADMIN" in held
     dealers = _dealers(connection, tenant_id, principal.subject, admin)
     outlets = _outlets(connection, tenant_id, [d["dealerId"] for d in dealers])
     return {"dealers": [{**d, "outlets": outlets.get(d["dealerId"], [])} for d in dealers],
-            "canUpload": admin or bool(held & set(UPLOAD_ROLES)), "today": _today(connection, tenant_id).isoformat(),
+            "canUpload": True, "today": _today(connection, tenant_id).isoformat(),
             "windowDays": br.WINDOW_DAYS, "formats": [".pdf", ".xlsx", ".xls", ".csv"]}
 
 
@@ -503,7 +632,7 @@ def upload_bank_statement(
 ) -> dict[str, Any]:
     """One account statement of a dealership (or of one of its outlets): PDF, Excel or CSV,
     any bank. Read, stored, and the dealership's receipts reconciled at once."""
-    held = _access(connection, tenant_id, principal, client, _UPDATE, UPLOAD_ROLES)
+    held = _access(connection, tenant_id, principal, client)
     admin = "ADMIN" in held
     if str(dealerId) not in {d["dealerId"] for d in _dealers(connection, tenant_id, principal.subject, admin)}:
         raise HTTPException(status_code=403, detail="That dealership is not one you cover.")
@@ -587,7 +716,7 @@ def list_bank_statements(
 ) -> dict[str, Any]:
     """The statements whose period touches the month (current by default), newest first;
     replaced ones kept and marked."""
-    held = _access(connection, tenant_id, principal, client, _READ, READ_ROLES)
+    held = _access(connection, tenant_id, principal, client)
     first = _month(month, _today(connection, tenant_id))
     dealer_ids = [d["dealerId"] for d in _dealers(connection, tenant_id, principal.subject, "ADMIN" in held)]
     rows = connection.execute(
@@ -666,6 +795,11 @@ def statement_detail(connection: Connection, tenant_id: str, statement: dict[str
             outcome=m["outcome"], basis=m["match_basis"]))
     rollup = journey_rollup(results)
     meta = {r["journeyId"]: r for r in receipts}
+    overall = {str(r["journey_id"]): r for r in connection.execute(
+        text("SELECT journey_id, status, verified, left_to_verify, bank_verified_at FROM auditcore.p2_journey_bank_status "
+             "WHERE tenant_id = :t AND CAST(journey_id AS text) = ANY(:js)"),
+        {"t": tenant_id, "js": list(rollup)},
+    ).mappings()} if rollup else {}
     journeys = sorted(({
         "journeyId": jid, "journeyReference": meta[jid]["journeyReference"], "customer": meta[jid]["customer"],
         "outletName": meta[jid]["outletName"], "receipts": j["receipts"],
@@ -673,6 +807,9 @@ def statement_detail(connection: Connection, tenant_id: str, statement: dict[str
         "notFound": _money(j["notFound"]), "ambiguous": _money(j["ambiguous"]),
         "outsideDates": _money(j["outsideDates"]), "cash": _money(j["cash"]),
         "card": _money(j["card"]), "status": j["status"], "statusLabel": JOURNEY_LABELS[j["status"]],
+        "bankVerified": (overall.get(jid) or {}).get("status") == "BANK_VERIFIED",
+        "journeyBankStatus": (overall.get(jid) or {}).get("status"),
+        "journeyLeft": _money((overall.get(jid) or {}).get("left_to_verify")) if overall.get(jid) else None,
     } for jid, j in rollup.items()), key=lambda x: ({JOURNEY_NOT_VERIFIED: 0, JOURNEY_PARTIAL: 1,
                                                     JOURNEY_VERIFIED: 2, JOURNEY_CASH_ONLY: 3}[x["status"]],
                                                    -Decimal(x["left"]), x["journeyReference"] or ""))
@@ -718,7 +855,7 @@ def read_bank_statement(
     outcome: Annotated[str | None, Query(pattern="^(MATCHED|AMBIGUOUS|NOT_FOUND|OUTSIDE_DATES|CASH|CARD)$")] = None,
 ) -> dict[str, Any]:
     """One statement: its reconciliation -- receipts, Journeys, and every transaction read."""
-    held = _access(connection, tenant_id, principal, client, _READ, READ_ROLES)
+    held = _access(connection, tenant_id, principal, client)
     statement = _read_statement(connection, tenant_id, statement_id)
     if statement["dealerId"] not in {d["dealerId"] for d in _dealers(connection, tenant_id, principal.subject,
                                                                        "ADMIN" in held)}:
@@ -738,8 +875,11 @@ def rematch_bank_statement(
     connection: Annotated[Connection, Depends(get_connection)],
 ) -> dict[str, Any]:
     """Reconcile the dealership again (receipts uploaded since are checked)."""
-    _access(connection, tenant_id, principal, client, _UPDATE, UPLOAD_ROLES)
+    held = _access(connection, tenant_id, principal, client)
     statement = _read_statement(connection, tenant_id, statement_id)
+    if statement["dealerId"] not in {d["dealerId"] for d in _dealers(connection, tenant_id, principal.subject,
+                                                                       "ADMIN" in held)}:
+        raise HTTPException(status_code=403, detail="That dealership is not one you cover.")
     reconcile_dealer(connection, tenant_id=tenant_id, dealer_id=statement["dealerId"])
     return _read_statement(connection, tenant_id, statement_id)
 
@@ -777,7 +917,7 @@ def build_report(connection: Connection, *, tenant_id: str, statements: list[dic
     summary.freeze_panes = "A2"
     journeys_sheet = sheet_with("Journeys", ["Statement", "Journey", "Customer", "Outlet", "Status", "Receipts",
                                              "Bank receipts", "Verified", "Left", "Not found", "Several possible",
-                                             "Outside statement dates", "Cash", "Card"])
+                                             "Outside statement dates", "Cash", "Card", "Journey bank status"])
     receipts_sheet = sheet_with("Receipts", ["Statement", "Journey", "Customer", "Outlet", "Receipt date",
                                              "Receipt no.", "Amount", "Mode", "Reference", "Source", "Result",
                                              "Matched on", "Bank credit date", "Bank credit narration", "Note"])
@@ -806,7 +946,10 @@ def build_report(connection: Connection, *, tenant_id: str, statements: list[dic
             journeys_sheet.append([label, j["journeyReference"], j["customer"], j["outletName"], j["statusLabel"],
                                    j["receipts"], num(j["bankReceipts"]), num(j["verified"]), num(j["left"]),
                                    num(j["notFound"]), num(j["ambiguous"]), num(j["outsideDates"]),
-                                   num(j["cash"]), num(j["card"])])
+                                   num(j["cash"]), num(j["card"]),
+                                   "Bank verified" if j.get("bankVerified") else
+                                   {"PARTIAL": "Partly verified", "NOT_VERIFIED": "Not verified",
+                                    "CASH_ONLY": "Cash only"}.get(j.get("journeyBankStatus") or "", None)])
         for r in detail["receipts"]:
             first = r["credits"][0] if r["credits"] else {}
             receipts_sheet.append([label, r["journeyReference"], r["customer"], r["outletName"], r["receiptDate"],
@@ -849,7 +992,7 @@ def export_bank_statement_report(
 ) -> StreamingResponse:
     """Export to Excel: one statement's (or the month's current statements') reconciliation
     -- Summary, Journeys, Receipts, Not found in bank, Bank credits, Credits not identified."""
-    held = _access(connection, tenant_id, principal, client, _READ, READ_ROLES)
+    held = _access(connection, tenant_id, principal, client)
     dealer_ids = {d["dealerId"] for d in _dealers(connection, tenant_id, principal.subject, "ADMIN" in held)}
     if statement_id is not None:
         statements = [_read_statement(connection, tenant_id, statement_id)]
@@ -898,5 +1041,23 @@ def journey_bank_matches(connection: Connection, *, tenant_id: str, journey_id: 
     return {r["receipt_key"]: dict(r) for r in rows}
 
 
-__all__ = ["build_report", "journey_bank_matches", "journey_rollup", "reconcile_dealer", "router",
+def journey_bank_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    """The Journey's bank verification (BANK_VERIFIED / PARTIAL / NOT_VERIFIED / CASH_ONLY)."""
+    try:
+        with connection.begin_nested():
+            row = connection.execute(
+                text("SELECT * FROM auditcore.p2_journey_bank_status WHERE tenant_id = :t AND journey_id = :j"),
+                {"t": tenant_id, "j": str(journey_id)},
+            ).mappings().one_or_none()
+    except Exception:  # noqa: BLE001 -- the table may not exist yet on an old database
+        return None
+    if row is None:
+        return None
+    return {"status": row["status"], "bankVerified": row["status"] == "BANK_VERIFIED",
+            "bankReceipts": _money(row["bank_receipts"]), "verified": _money(row["verified"]),
+            "left": _money(row["left_to_verify"]), "cash": _money(row["cash"]),
+            "bankVerifiedAtUtc": row["bank_verified_at"].isoformat() if row["bank_verified_at"] else None}
+
+
+__all__ = ["build_report", "journey_bank_matches", "journey_bank_status", "journey_bank_summary", "journey_rollup", "reconcile_dealer", "router",
            "statement_detail"]
