@@ -294,6 +294,10 @@ _IDENTITY_SQL = f"""
            (SELECT array_agg(r.value) FROM ranked r
              WHERE r.journey_id = j.journey_id AND r.field_key IN ('gstin', 'buyer_gstin', 'customer_gstin')
                AND r.row_rank = 1) AS gstins,
+           (SELECT array_agg(DISTINCT r.value) FROM ranked r
+             WHERE r.journey_id = j.journey_id AND r.field_key = 'pan_number') AS pan_values,
+           (SELECT array_agg(DISTINCT r.value) FROM ranked r
+             WHERE r.journey_id = j.journey_id AND r.field_key = 'aadhaar_number') AS aadhaar_values,
            CASE WHEN c.legal_name_status = 'VERIFIED' THEN c.legal_name END AS customer_name,
            s.model_id, jp.model_name_snapshot AS model_name, jp.variant_name_snapshot AS variant_name,
            (SELECT array_agg(f.effective_value #>> '{{}}'
@@ -344,9 +348,11 @@ _SAME_CUSTOMER_SQL = f"""
       -- _valid_aadhaar); saying so lets the lookup use the cleaned-up value indexes (0220).
       AND f.effective_value IS NOT NULL
       AND ((f.field_key = 'pan_number' AND CAST(:pan AS text) IS NOT NULL
-            AND upper(regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^A-Za-z0-9]', '', 'g')) = :pan)
+            AND upper(regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^A-Za-z0-9]', '', 'g'))
+                = ANY(CAST(string_to_array(:pan, ',') AS text[])))
         OR (f.field_key = 'aadhaar_number' AND CAST(:aadhaar AS text) IS NOT NULL
-            AND regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^0-9]', '', 'g') = :aadhaar)
+            AND regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^0-9]', '', 'g')
+                = ANY(CAST(string_to_array(:aadhaar, ',') AS text[])))
         -- 2026-11-14: the same mobile or GSTIN is enough too (one dealership's journeys).
         OR (f.field_key = 'customer_phone' AND CAST(:mobile AS text) IS NOT NULL
             AND right(regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^0-9]', '', 'g'), 10) = :mobile
@@ -403,6 +409,11 @@ class FileIdentity:
     vin: str | None = None
     # 2026-11-14: the buyer's GSTIN (a valid one; "No" or a bare number is none).
     gstin: str | None = None
+    # 2026-11-14: every PAN and Aadhaar read on its documents still on file. A file can hold a
+    # co-applicant's or guarantor's Aadhaar, or a firm's PAN beside the proprietor's: comparing the
+    # one read with the highest confidence called the same customer two people.
+    pans: frozenset[str] = frozenset()
+    aadhaars: frozenset[str] = frozenset()
 
     @property
     def model_key(self) -> str:
@@ -504,6 +515,8 @@ def _identities(connection: Connection, *, tenant_id: str, journey_ids: Iterable
             invoice_numbers=_document_numbers(row["invoice_numbers"]),
             vin=(str(row["vin"]).strip().upper() or None) if row["vin"] else None,
             gstin=next((g for g in (_valid_gstin(v) for v in row["gstins"] or []) if g), None),
+            pans=frozenset(p for p in (_valid_pan(v) for v in row["pan_values"] or []) if p),
+            aadhaars=frozenset(a for a in (_valid_aadhaar(v) for v in row["aadhaar_values"] or []) if a),
         )
     return out
 
@@ -576,14 +589,31 @@ def same_outlet(left: FileIdentity, right: FileIdentity) -> bool:
     return not (left.outlet_id and right.outlet_id and left.outlet_id != right.outlet_id)
 
 
+def _all_pans(identity: FileIdentity) -> frozenset[str]:
+    return identity.pans | ({identity.pan} if identity.pan else set())
+
+
+def _all_aadhaars(identity: FileIdentity) -> frozenset[str]:
+    return identity.aadhaars | ({identity.aadhaar} if identity.aadhaar else set())
+
+
+def two_people(new: FileIdentity, existing: FileIdentity) -> bool:
+    """Two people (2026-11-14, every value on file counts): PANs read on both with none in
+    common; or Aadhaars read on both with none in common and no PAN in common either (a shared
+    PAN is the customer; another Aadhaar beside it is a co-applicant's, a guarantor's or a misread)."""
+    pans_new, pans_old = _all_pans(new), _all_pans(existing)
+    if pans_new and pans_old and not pans_new & pans_old:
+        return True
+    aadhaar_new, aadhaar_old = _all_aadhaars(new), _all_aadhaars(existing)
+    return bool(aadhaar_new and aadhaar_old and not aadhaar_new & aadhaar_old and not pans_new & pans_old)
+
+
 def same_customer(new: FileIdentity, existing: FileIdentity) -> tuple[bool, bool] | None:
-    """(same PAN, same Aadhaar) when the two are one customer: either one equal, and
-    neither read on both and different; None otherwise."""
-    same_pan = bool(new.pan and new.pan == existing.pan)
-    same_aadhaar = bool(new.aadhaar and new.aadhaar == existing.aadhaar)
-    if not (same_pan or same_aadhaar):
-        return None
-    if (new.pan and existing.pan and not same_pan) or (new.aadhaar and existing.aadhaar and not same_aadhaar):
+    """(same PAN, same Aadhaar) when the two are one customer: a PAN or an Aadhaar in common
+    (any one read on the file, 2026-11-14), and not two people (two_people); None otherwise."""
+    same_pan = bool(_all_pans(new) & _all_pans(existing))
+    same_aadhaar = bool(_all_aadhaars(new) & _all_aadhaars(existing))
+    if not (same_pan or same_aadhaar) or two_people(new, existing):
         return None
     return same_pan, same_aadhaar
 
@@ -746,20 +776,21 @@ def one_booking_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[s
     matched, for the alert and the Deleted tab; None otherwise."""
     if not (new.dealer_id and new.dealer_id == existing.dealer_id):
         return None
-    if (new.pan and existing.pan and new.pan != existing.pan) or (
-            new.aadhaar and existing.aadhaar and new.aadhaar != existing.aadhaar):
+    if two_people(new, existing):
         return None
     if new.vin and existing.vin and new.vin != existing.vin:
         return None
-    if not same_model(new, existing):
+    # The same chassis is the same vehicle, whatever the model text says (2026-11-14).
+    same_vehicle = bool(new.vin and new.vin == existing.vin)
+    if not (same_vehicle or same_model(new, existing)):
         return None
     fields: list[dict[str, Any]] = []
-    if new.pan and new.pan == existing.pan:
-        fields.append({"field": "pan", "label": "PAN", "newValue": _masked(new.pan),
-                       "existingValue": _masked(existing.pan), "exact": True})
-    if new.aadhaar and new.aadhaar == existing.aadhaar:
-        fields.append({"field": "aadhaar", "label": "Aadhaar", "newValue": mask_aadhaar(new.aadhaar),
-                       "existingValue": mask_aadhaar(existing.aadhaar), "exact": True})
+    if shared_pan := sorted(_all_pans(new) & _all_pans(existing)):
+        fields.append({"field": "pan", "label": "PAN", "newValue": _masked(shared_pan[0]),
+                       "existingValue": _masked(shared_pan[0]), "exact": True})
+    if shared_aadhaar := sorted(_all_aadhaars(new) & _all_aadhaars(existing)):
+        fields.append({"field": "aadhaar", "label": "Aadhaar", "newValue": mask_aadhaar(shared_aadhaar[0]),
+                       "existingValue": mask_aadhaar(shared_aadhaar[0]), "exact": True})
     if new.mobile and new.mobile == existing.mobile:
         fields.append({"field": "mobile", "label": "Mobile", "newValue": _masked(new.mobile),
                        "existingValue": _masked(existing.mobile), "exact": True})
@@ -768,6 +799,9 @@ def one_booking_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[s
                        "existingValue": existing.gstin, "exact": True})
     if not fields:
         return None
+    if same_vehicle:
+        fields.append({"field": "vin", "label": "VIN", "newValue": new.vin, "existingValue": existing.vin,
+                       "exact": True})
     fields += [
         {"field": "model", "label": "Model", "newValue": new.model_name, "existingValue": existing.model_name,
          "exact": bool(new.model_id and new.model_id == existing.model_id) or new.model_name == existing.model_name},
@@ -1367,12 +1401,14 @@ def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correla
     # The customer, mobile and model are enough to look (a duplicate across outlets needs no
     # name); the same file still needs everything (matched_fields).
     # A journey known only by its PAN / Aadhaar and receipt can still be the same sale.
-    if me is None or me.closed or not (me.pan or me.aadhaar or me.mobile or me.gstin):
+    if me is None or me.closed or not (_all_pans(me) or _all_aadhaars(me) or me.mobile or me.gstin):
         return {"examined": 0, "raised": 0}
     candidate_ids = [
         UUID(str(v)) for v in connection.execute(
             text(_SAME_CUSTOMER_SQL),
-            {"tenant_id": tenant_id, "journey_id": journey_id, "pan": me.pan, "aadhaar": me.aadhaar,
+            # Every PAN / Aadhaar on the file, comma-separated (2026-11-14).
+            {"tenant_id": tenant_id, "journey_id": journey_id, "pan": ",".join(sorted(_all_pans(me))) or None,
+             "aadhaar": ",".join(sorted(_all_aadhaars(me))) or None,
              "mobile": me.mobile, "gstin": me.gstin, "dealer_id": str(me.dealer_id) if me.dealer_id else None},
         ).scalars().all()
     ]

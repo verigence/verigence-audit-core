@@ -962,8 +962,11 @@ def test_pan_or_aadhaar_is_enough_but_a_different_one_is_another_person():
     assert fields is not None and fields[0]["field"] == "aadhaar" and fields[0]["newValue"] == "XXXX XXXX 1234"
     # PAN on one copy only, the Aadhaar on both: the Aadhaar decides.
     assert matched_fields(_identity(aadhaar="234567891234"), base) is not None
-    # The same PAN but different Aadhaar numbers: two people.
-    assert matched_fields(_identity(aadhaar="234567899999"), _identity(aadhaar="234567891234")) is None
+    # The same PAN but different Aadhaar numbers: one customer since 2026-11-14 (the other Aadhaar is a
+    # co-applicant's or a misread); different PANs and different Aadhaars: two people.
+    assert matched_fields(_identity(aadhaar="234567899999"), _identity(aadhaar="234567891234")) is not None
+    assert matched_fields(_identity(pan="ABCPE9999F", aadhaar="234567899999"),
+                          _identity(aadhaar="234567891234")) is None
     # Neither identity: nothing.
     assert matched_fields(_identity(pan=None), _identity(pan=None)) is None
 
@@ -1466,3 +1469,48 @@ def test_one_model_written_two_ways_is_one_family(tenant, left, right, same):
         rule._families = (0.0, ())
         rule._load_families(connection)
     assert (rule.model_family(left) == rule.model_family(right)) is same
+
+
+def _kyc(journey: P2Journey, *, pan: str | None = None, aadhaar: str | None = None) -> None:
+    """Another KYC document on the file: a co-applicant's Aadhaar, a firm's PAN."""
+    doc = uuid4()
+    add_evidence(journey, di_document_id=doc, document_type_key="aadhaar" if aadhaar else "pan_card")
+    if pan:
+        add_extracted_field(journey, di_document_id=doc, field_key="pan_number", value=pan, document_type="pan_card")
+    if aadhaar:
+        add_extracted_field(journey, di_document_id=doc, field_key="aadhaar_number", value=aadhaar,
+                            document_type="aadhaar")
+
+
+def test_a_co_applicants_aadhaar_beside_the_same_pan_is_still_one_customer(tenant):
+    """2026-11-14 (UTK-JP-261104-001 / UTK-JI-261026-007): the same PAN, and a different Aadhaar on
+    the file -- a co-applicant's or a misread -- is not two people."""
+    _, new = _pair(tenant, aadhaar="2345 6789 1234")
+    _kyc(new, aadhaar="9876 5432 1098")
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+
+
+def test_a_firms_pan_beside_the_proprietors_is_still_one_customer(tenant):
+    """2026-11-14 (ADI-RD-261022-021 / ADI-RD-261102-016): a firm's PAN read on one file next to the
+    proprietor's, which the other file holds."""
+    _, new = _pair(tenant)
+    _kyc(new, pan="AAFCJ2048H")
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+
+
+def test_no_pan_in_common_is_still_two_people(tenant):
+    _, new = _pair(tenant, pan="ABCPE9999F")
+    _kyc(new, pan="ABCPE8888F")
+    assert _detect(new).get("raised", 0) == 0
+
+
+def test_the_same_chassis_is_one_vehicle_whatever_the_model_text(tenant):
+    old, new = _pair(tenant, model="BOLERO NEO")
+    for journey in (old, new):
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            connection.execute(text("INSERT INTO auditcore.journey_classifications (tenant_id, journey_id, vin_used, "
+                                    "customer_type) VALUES (:t, :j, 'MA1XL2TVXT5J27592', 'INDIVIDUAL')"),
+                               {"t": journey.tenant_id, "j": journey.journey_id})
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    assert "vin" in {f["field"] for f in _alerts(new)[0]["payload"]["matchedFields"]}
