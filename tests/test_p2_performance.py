@@ -265,7 +265,8 @@ def test_pending_work_efficiency_delinquencies_and_bookings_deliveries(setup):
     assert at_outlet["deliveryFilesOpen"][2] == 1
 
     eff = next(e for e in report["efficiency"]["people"] if e["actorId"] == me)
-    assert eff["deliveryStarted"] >= 1 and eff["tasksWithDue"] == 1 and eff["tasksInTimeShare"] == 100
+    # The overdue open task is late; the one closed before its due time is in time; the duty is a duty.
+    assert eff["deliveryStarted"] >= 1 and eff["tasksWithDue"] == 2 and eff["tasksInTimeShare"] == 50
     assert eff["firstTimeRight"] == 100 and eff["journeysPerDay"] is not None
 
     line = next(x for x in report["delinquency"]["lines"] if x["actorId"] == me)
@@ -428,7 +429,9 @@ def test_the_dashboard_of_each_role(setup):
         assert sum(board["trend"]["series"][1]["data"]) == 3 and "scorecards" not in board and "attention" not in board
         # My efficiency: the average of the shares there is something to measure for.
         parts = {x["key"]: x["value"] for x in board["efficiency"]["mine"]["parts"]}
-        assert parts["firstTime"] == 100 and parts["dutiesOnTime"] == 0 and parts["inTime"] is None
+        # The task overdue since five days, still open, is late (2026-11-14: it used to be left out,
+        # which read as 100% in time).
+        assert parts["firstTime"] == 100 and parts["dutiesOnTime"] == 0 and parts["inTime"] == 0
         have = [v for v in parts.values() if v is not None]
         assert board["efficiency"]["mine"]["score"] == round(sum(have) / len(have))
 
@@ -464,6 +467,14 @@ def test_the_dashboard_of_each_role(setup):
         assert at_outlet["deliveryFilesOpen"] >= 1 and at_outlet["awaitingDecision"] == 1 and "awaitingReview" in at_outlet
         score_row = next(r for r in team["efficiency"]["card"]["rows"] if r["id"] == me)
         assert score_row["values"]["score"] == board["efficiency"]["mine"]["score"] and team["efficiency"]["note"]
+        # The Reviewers are in the TL's backlog and efficiency too (product owner 2026-11-14: "why no
+        # reviewer is being shown in reports to TL").
+        assert "reviewers" in backlog_cards
+        assert any(r["id"] == reviewer for r in backlog_cards["reviewers"]["rows"])
+        eff_cards = {c["key"]: c for c in team["efficiency"]["cards"]}
+        assert set(eff_cards) == {"efficiency", "reviewers"}
+        rev = next(r for r in eff_cards["reviewers"]["rows"] if r["id"] == reviewer)["values"]
+        assert rev["closed"] == 1 and "inTime" in rev and "waitingOld" in rev
         assert any("Duty missed" in line["text"] for line in team["attention"]["lines"])
         assert team["duties"]["rows"][0]["missedBy"][0]["dates"] == [yesterday]
         assert sum(team["tasks"]["raised"]) >= 2 and team["tasks"]["overdue"] >= 1
@@ -488,3 +499,35 @@ def test_the_dashboard_of_each_role(setup):
         assert "hours" not in [c["key"] for c in pcs["columns"]] and "attention" in for_pm
     finally:
         _clear_settings(s)
+
+
+def test_tasks_in_time_count_every_task_due_and_its_owner(setup):
+    """Product owner 2026-11-14: "how you calculated 100% tasks closed on time". A task counts for its
+    owner when its due time passed in the period: the Journey's PC for a PC task (no closer is recorded
+    when a task closes by verification), the Reviewer of the outlet for an open Reviewer task, a CRM
+    as a Reviewer. Closed late or still open is late."""
+    s = setup
+    outlet = str(s.journey.outlet_id)
+    me = s.journey.actor_id
+    now = datetime.now(UTC)
+    journey = tt._journey(s, outlet, me)
+    reviewer, crm, tl = (f"{r}-{uuid4().hex[:6]}" for r in ("rv", "crm", "tl"))
+    tt._role(s, reviewer, "REVIEWER", dealer=s.journey.dealer_id, outlet=s.journey.outlet_id)
+    tt._role(s, crm, "CRM", dealer=s.journey.dealer_id)
+    tt._role(s, tl, "TL")
+    # PC tasks, none with a closer recorded: closed in time, closed late, open past due.
+    tt._task(s, role="PC", journey=journey, status="VERIFIED_COMPLETE", created=now - timedelta(days=2),
+             done=now - timedelta(days=1, hours=2), due=now - timedelta(days=1))
+    tt._task(s, role="PC", journey=journey, status="VERIFIED_COMPLETE", created=now - timedelta(days=3),
+             done=now - timedelta(days=1), due=now - timedelta(days=2))
+    tt._task(s, role="PC", journey=journey, created=now - timedelta(days=3), due=now - timedelta(days=2))
+    tt._task(s, role="PC", journey=journey, status="CANCELLED", created=now - timedelta(days=3), due=now - timedelta(days=2))
+    # A Reviewer task open past due: the Reviewer's and the CRM's of that outlet.
+    tt._task(s, role="REVIEWER", journey=journey, created=now - timedelta(days=2), due=now - timedelta(days=1))
+    report = _build(s, tl)
+    eff = {e["actorId"]: e for e in report["efficiency"]["people"]}
+    assert eff[me]["tasksWithDue"] == 3 and eff[me]["tasksInTime"] == 1 and eff[me]["tasksInTimeShare"] == 33
+    board = _build(s, tl, section="dashboard")["dashboard"]
+    rev_card = next(c for c in board["efficiency"]["cards"] if c["key"] == "reviewers")
+    rows = {r["id"]: r["values"] for r in rev_card["rows"]}
+    assert rows[reviewer]["inTime"] == 0 and rows[crm]["inTime"] == 0     # the CRM is read as a Reviewer
