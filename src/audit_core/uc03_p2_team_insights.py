@@ -340,6 +340,100 @@ def channels(connection: Connection, *, tenant_id: str, start: datetime, end: da
 
 
 
+# The bulk / Drive channel of an upload batch: the bulk files read once and joined.
+_BATCH_CHANNEL_SQL = """
+    SELECT bf.batch_id, CASE WHEN bool_or(bu.source = 'DRIVE') THEN 'drive' ELSE 'bulk' END AS channel
+    FROM auditcore.p2_bulk_files bf
+    JOIN auditcore.p2_bulk_uploads bu ON bu.tenant_id = bf.tenant_id AND bu.bulk_id = bf.bulk_id
+    WHERE bf.tenant_id = :t AND bf.batch_id IS NOT NULL
+    GROUP BY bf.batch_id
+"""
+
+
+def channel_issues(connection: Connection, *, tenant_id: str, start: datetime, end: datetime) -> dict[str, Any]:
+    """Per person and outlet, for each way files came in (direct, bulk, Drive), the duplicates and the
+    files with errors of the window (product owner 14 Nov 2026: "for each PC I don't see the count of
+    file upload channel wise and corresponding duplicacy and errors").
+
+    duplicates  files found to be a copy: a bulk / Drive file set aside as an exact duplicate, and a
+                journey deleted as the same file uploaded again (by the channel it came in on: a bulk
+                or Drive file was read on it, else direct)
+    errors      files with a page that failed or was not read in time, or rejected on image quality,
+                or whose upload failed; and a bulk / Drive file that failed before it was read
+
+    Neither is part of the channel's files: a copy is not kept, and a file with an error is counted
+    once whatever the number of its pages that failed."""
+    from audit_core.uc03_p2_runtime import swept_pending_sql
+    from audit_core.uc03_p2_same_file import (
+        DELETION_KIND,
+        DUPLICATE_UPLOADS_COUNTED_FROM,
+    )
+
+    def blank() -> dict[str, dict[str, int]]:
+        return {"duplicates": dict.fromkeys(CHANNELS, 0), "errors": dict.fromkeys(CHANNELS, 0)}
+
+    by_person: dict[str, dict[str, dict[str, int]]] = defaultdict(blank)
+    by_outlet: dict[str, dict[str, dict[str, int]]] = defaultdict(blank)
+
+    def add(person: Any, outlet: Any, key: str, channel: str, n: int) -> None:
+        for owner, who in ((by_person, person), (by_outlet, outlet)):
+            if who and n:
+                owner[str(who)][key][channel if channel in CHANNELS else "direct"] += n
+
+    params = {"t": tenant_id, "s": start, "e": end}
+    # Files with errors, by the batch's channel: one read of the window's batches, the queue
+    # checked per batch on its (tenant_id, batch_id) rows.
+    for r in connection.execute(text(f"""
+        SELECT ub.uploaded_by_actor_id AS person, j.outlet_id AS outlet,
+               COALESCE(c.channel, 'direct') AS channel, count(*) AS n
+        FROM auditcore.p2_upload_batches ub
+        JOIN auditcore.journeys j ON j.tenant_id = ub.tenant_id AND j.journey_id = ub.journey_id
+        LEFT JOIN ({_BATCH_CHANNEL_SQL}) c ON c.batch_id = ub.batch_id
+        WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
+          AND ub.batch_status <> 'AWAITING_UPLOAD'
+          AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
+          AND (ub.batch_status = 'FAILED' OR EXISTS (
+                SELECT 1 FROM auditcore.p2_document_queue q
+                WHERE q.tenant_id = ub.tenant_id AND q.batch_id = ub.batch_id
+                  AND (q.queue_status IN ('FAILED', 'DEAD_LETTER')
+                       OR (q.queue_status = 'CANCELLED' AND q.last_error LIKE 'DI\\_QUALITY\\_%')
+                       OR {swept_pending_sql("q")})))
+        GROUP BY 1, 2, 3
+    """), params).mappings():
+        add(r["person"], r["outlet"], "errors", r["channel"], int(r["n"]))
+    # Bulk / Drive files set aside as exact duplicates, or failed before a batch was made.
+    for r in connection.execute(text("""
+        SELECT bu.uploaded_by_actor_id AS person, bu.outlet_id AS outlet,
+               CASE WHEN bu.source = 'DRIVE' THEN 'drive' ELSE 'bulk' END AS channel,
+               count(*) FILTER (WHERE bf.outcome = 'EXACT_DUPLICATE') AS duplicates,
+               count(*) FILTER (WHERE bf.outcome = 'FAILED' AND bf.batch_id IS NULL) AS errors
+        FROM auditcore.p2_bulk_files bf
+        JOIN auditcore.p2_bulk_uploads bu ON bu.tenant_id = bf.tenant_id AND bu.bulk_id = bf.bulk_id
+        WHERE bf.tenant_id = :t AND bf.created_at_utc >= :s AND bf.created_at_utc < :e
+          AND bf.outcome IN ('EXACT_DUPLICATE', 'FAILED')
+        GROUP BY 1, 2, 3
+    """), params).mappings():
+        add(r["person"], r["outlet"], "duplicates", r["channel"], int(r["duplicates"]))
+        add(r["person"], r["outlet"], "errors", r["channel"], int(r["errors"]))
+    # Journeys deleted as the same file uploaded again, by the channel they came in on.
+    for r in connection.execute(text("""
+        SELECT d.pc_actor_id AS person, d.outlet_id AS outlet,
+               COALESCE((SELECT CASE WHEN bool_or(bu.source = 'DRIVE') THEN 'drive' ELSE 'bulk' END
+                         FROM auditcore.p2_bulk_files bf
+                         JOIN auditcore.p2_bulk_uploads bu ON bu.tenant_id = bf.tenant_id AND bu.bulk_id = bf.bulk_id
+                         WHERE bf.tenant_id = d.tenant_id AND bf.journey_id = d.journey_id
+                         HAVING count(*) > 0), 'direct') AS channel,
+               count(*) AS n
+        FROM auditcore.p2_journey_deletions d
+        WHERE d.tenant_id = :t AND d.deletion_kind = :kind AND d.deletion_status = 'COMPLETED'
+          AND d.journey_created_at_utc >= GREATEST(CAST(:s AS timestamptz), CAST(:from_ AS timestamptz))
+          AND d.journey_created_at_utc < :e
+        GROUP BY 1, 2, 3
+    """), {**params, "kind": DELETION_KIND, "from_": DUPLICATE_UPLOADS_COUNTED_FROM}).mappings():
+        add(r["person"], r["outlet"], "duplicates", r["channel"], int(r["n"]))
+    return {"byPerson": by_person, "byOutlet": by_outlet}
+
+
 QUALITY_KEYS = ("blurred", "faded", "tooSmall", "otherQuality", "duplicatePages", "duplicateFiles")
 
 
