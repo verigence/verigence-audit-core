@@ -244,7 +244,7 @@ def test_run_rule_engine_phase_records_pass_fail_skipped(monkeypatch, rule_engin
     monkeypatch.setattr(findings, "_build_security_oauth_client", lambda: _FakeSecurityClient())
 
     class _FakeClient:
-        def evaluate_phase(self, *, token, tenant_id, subject_id, phase):
+        def evaluate_phase(self, *, token, tenant_id, subject_id, phase, documents=None):
             return RuleEnginePhaseResult(
                 phase=phase,
                 audit_run_id="run-1",

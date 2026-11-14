@@ -171,7 +171,12 @@ class RuleEngineClient:
         tenant_id: str,
         subject_id: str,
         phase: str,
+        documents: list[dict[str, Any]] | None = None,
     ) -> RuleEnginePhaseResult:
+        """``documents`` (2026-11-14): the case's documents as Audit Core holds
+        them -- its document types, the values people corrected, only the
+        documents on the Journey. Given, the rules read these, not Document
+        Intelligence's index."""
         if not token:
             raise ValueError("rule-engine bearer token is required")
         normalised_phase = phase.strip().upper()
@@ -187,7 +192,8 @@ class RuleEngineClient:
             path,
             operation=f"evaluate_{normalised_phase.lower()}",
             token=token,
-            json={"includeSkipped": False, "failFast": False},
+            json={"includeSkipped": False, "failFast": False,
+                  **({"documents": documents} if documents is not None else {})},
         )
         return _phase_result(normalised_phase, payload)
 

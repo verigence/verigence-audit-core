@@ -511,6 +511,7 @@ def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stag
         _build_security_oauth_client,
         _materialize_anomalies,
         _resolve_di_subject_id,
+        case_documents,
     )
     from audit_core.uc03_rule_execution_log import record_executions_bulk
 
@@ -538,12 +539,16 @@ def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stag
         with engine.begin() as connection:
             set_tenant_context(connection, tenant_id)
             subject_id = _resolve_di_subject_id(connection, tenant_id=tenant_id, journey_id=journey_id)
+            documents = case_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
         if subject_id is None:
             return write_all("WAITING_FOR_FACTS", "No documents have been processed for this Journey yet.")
         # One evaluation per run (2026-10-29, rule storm): the phase result
         # names the rules it skipped, so the second, readiness() evaluation
         # that only told PASS from not-ready is gone. The catalogue is cached.
-        result = client.evaluate_phase(token=token, tenant_id=tenant_id, subject_id=str(subject_id), phase=stage)
+        # The Journey's documents as Audit Core holds them (2026-11-14): the
+        # values people corrected and only the documents on the booking.
+        result = client.evaluate_phase(token=token, tenant_id=tenant_id, subject_id=str(subject_id), phase=stage,
+                                       documents=documents)
         catalog = cached_rule_catalog(client, token=token, tenant_id=tenant_id)
     except Exception as exc:
         raise ControlUnitError(f"Rule Engine evaluation failed: {exc.__class__.__name__}") from exc

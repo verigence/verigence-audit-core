@@ -17,6 +17,8 @@ The nightly reconciliation batch remains the safety net for anything missed here
 from __future__ import annotations
 
 import os
+import re
+from typing import Any
 from uuid import UUID
 
 import structlog
@@ -103,6 +105,62 @@ def _resolve_di_subject_id(
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
     ).scalar_one_or_none()
+
+
+# Audit Core's own document types, in the Rule Engine's words: the booking
+# form Audit Core types booking_docket, the receipt it types payment_receipt.
+_RULE_ENGINE_TYPE = {"booking_docket": "booking_form", "payment_receipt": "dealer_receipt"}
+
+
+def case_documents(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """The Journey's documents as Audit Core holds them, for the Rule Engine
+    (product owner 2026-11-14: "why despite changing the date ... tasks are not
+    getting closed"). The rules read Document Intelligence's index: a value a
+    PC corrected here (a gate pass date misread 2023-11-13, corrected to
+    2026-11-13) never reached them, so the finding stood and the task came back
+    after every re-check -- and a document taken off the booking was still
+    compared, as was every other booking of the same customer. These are the
+    documents on this Journey only (ACTIVE), their types as Audit Core set
+    them, every field at its effective value (the correction, else the read)."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT e.di_document_id, e.document_type_key,
+                   jsonb_object_agg(f.field_key, f.effective_value)
+                     FILTER (WHERE f.field_key IS NOT NULL) AS fields
+            FROM auditcore.evidence e
+            LEFT JOIN auditcore.journey_document_extracted_fields f
+              ON f.tenant_id = e.tenant_id AND f.journey_id = e.journey_id
+             AND f.di_document_id = e.di_document_id
+            WHERE e.tenant_id = :t AND e.journey_id = :j AND e.association_status = 'ACTIVE'
+              AND e.di_document_id IS NOT NULL AND e.document_type_key IS NOT NULL
+            GROUP BY e.di_document_id, e.document_type_key
+            ORDER BY e.di_document_id
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    return [
+        {"documentId": str(row["di_document_id"]),
+         "documentTypeKey": _RULE_ENGINE_TYPE.get(row["document_type_key"], row["document_type_key"]),
+         "fields": {k: _iso_date(v) if "date" in k else v for k, v in (row["fields"] or {}).items()}}
+        for row in rows
+    ]
+
+
+_DMY = re.compile(r"^\s*(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})\s*$")
+
+
+def _iso_date(value: Any) -> Any:
+    """A date a person typed day-first ("08/02/2026") as the Rule Engine reads
+    dates (ISO); anything else as it is."""
+    match = _DMY.match(value) if isinstance(value, str) else None
+    if match is None:
+        return value
+    day, month, year = (int(g) for g in match.groups())
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return value
+    return f"{year:04d}-{month:02d}-{day:02d}"
 
 
 def _finding_title(anomaly: RuleEngineAnomaly) -> str:
@@ -231,6 +289,7 @@ def run_rule_engine_phase(
             subject_id = _resolve_di_subject_id(
                 connection, tenant_id=tenant_id, journey_id=journey_id
             )
+            documents = case_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
         if subject_id is None:
             logger.info(
                 "uc03_rule_engine_no_di_subject",
@@ -245,6 +304,7 @@ def run_rule_engine_phase(
             tenant_id=tenant_id,
             subject_id=str(subject_id),
             phase=phase,
+            documents=documents,
         )
 
         # The phase result names the rules it skipped (2026-10-29): no second,
