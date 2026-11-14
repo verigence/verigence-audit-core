@@ -331,7 +331,7 @@ def test_duplicates_and_errors_by_upload_channel(setup):
     """Each PC's files per channel with that channel's duplicates and files with errors (2026-11-14)."""
     s = setup
     _ok, _ = add_batch_pages(s.journey, [("booking_form", "READY")])                       # direct, clean
-    _bad_direct, rows = add_batch_pages(s.journey, [("booking_form", "FAILED"), ("booking_form", "READY")])
+    _bad_direct, _rows = add_batch_pages(s.journey, [("booking_form", "FAILED"), ("booking_form", "READY")])
     bulk, _ = add_batch_pages(s.journey, [("booking_form", "READY")])
     drive, drive_rows = add_batch_pages(s.journey, [("booking_form", "CANCELLED")])
     tt._exec(s, "UPDATE auditcore.p2_document_queue SET last_error='DI_QUALITY_IMAGE_BLUR_SCORE' "
