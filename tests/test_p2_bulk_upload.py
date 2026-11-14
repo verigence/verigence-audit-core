@@ -323,3 +323,23 @@ def test_the_rule_run_asks_for_the_drop_to_be_settled_and_the_same_file_rule_lea
                                         correlation_id="t").get("bulk") in (True, None)
         assert c.execute(text("SELECT count(*) FROM auditcore.p2_worker_jobs WHERE job_kind='BULK_SETTLE' "
                               "AND tag=:t AND status='PENDING'"), {"t": f"{s.journey.tenant_id}:{bulk_id}"}).scalar_one() == 1
+
+
+def test_a_drop_cut_short_by_a_restart_runs_again_cleanly(s):
+    """2026-11-14: a deploy stopped a drop half placed; the job is taken again (uc03_p2_worker).
+    Running it again places what was left, reuses the journey and upload already made, and does
+    not take a file's own upload for an earlier copy of it."""
+    bulk_id = _drop(s, {"Asha Das KYC.pdf": b"%PDF asha", "Ravi Sen KYC.pdf": b"%PDF ravi"})
+    _run_upload(s, bulk_id)
+    first = {f["original_filename"]: f for f in _files(s, bulk_id)}
+    # As if the worker stopped after Asha's upload was stored but before the file was marked.
+    with s.journey.engine.begin() as c:
+        set_tenant_context(c, s.journey.tenant_id)
+        c.execute(text("UPDATE auditcore.p2_bulk_files SET outcome='PENDING', journey_id=NULL, batch_id=NULL "
+                       "WHERE tenant_id=:t AND bulk_id=:b"), {"t": s.journey.tenant_id, "b": bulk_id})
+        c.execute(text("UPDATE auditcore.p2_bulk_uploads SET status='PROCESSING' WHERE tenant_id=:t AND bulk_id=:b"),
+                  {"t": s.journey.tenant_id, "b": bulk_id})
+    _run_upload(s, bulk_id)
+    again = {f["original_filename"]: f for f in _files(s, bulk_id)}
+    assert {f["outcome"] for f in again.values()} == {"READING"}
+    assert all(again[n]["journey_id"] == first[n]["journey_id"] for n in again)
