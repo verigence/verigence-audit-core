@@ -385,7 +385,8 @@ def raise_or_refresh(
     elif status == "VERIFYING":
         submitted = result.get("submittedAt")
         submitted_at = datetime.fromisoformat(submitted) if submitted else None
-        if evaluation_started_at is not None and (submitted_at is None or evaluation_started_at > submitted_at):
+        if (evaluation_started_at is not None and (submitted_at is None or evaluation_started_at > submitted_at)
+                and not _documents_in_flight(connection, tenant_id=tenant_id, journey_id=journey_id)):
             new_status, outcome = "RETURNED", "RETURNED"
     elif status == "CANCELLED":
         return task_id, "CANCELLED"
@@ -424,6 +425,23 @@ def raise_or_refresh(
         actor_id="SYSTEM", actor_role_code="SYSTEM", details={"reason": description},
     )
     return task_id, outcome if outcome != "UNCHANGED" else "UPDATED"
+
+
+def _documents_in_flight(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """Pages of the Journey still being read (product owner 2026-11-14: "PC
+    closes the task but it is not getting closed or submitted for review").
+    A PC uploads the missing document and submits the task; the evaluation
+    that ran two seconds later -- the upload still being read -- found the
+    document still missing and returned the task. While anything the PC sent
+    is still being read, a submitted task stays with the system (VERIFYING):
+    the evaluation after the read decides."""
+    from audit_core.uc03_p2_journey_views import _IN_FLIGHT
+
+    return bool(connection.execute(
+        text("SELECT EXISTS (SELECT 1 FROM auditcore.p2_document_queue WHERE tenant_id=:t AND journey_id=:j "
+             "AND queue_status = ANY(:statuses))"),
+        {"t": tenant_id, "j": journey_id, "statuses": list(_IN_FLIGHT)},
+    ).scalar_one())
 
 
 def close_tasks_for_finding(connection: Connection, *, tenant_id: str, finding_id: UUID, verdict: str,
@@ -1736,7 +1754,9 @@ def _named_documents(connection: Connection, *, tenant_id: str, journey_id: UUID
         text(
             """
             SELECT e.di_document_id, e.document_type_key, e.process_area, e.linked_at_utc,
-                   f.field_key, f.effective_value
+                   f.field_key, f.effective_value,
+                   (f.is_modified OR f.reviewed_by_actor_id IS NOT NULL) AS confirmed,
+                   greatest(f.modified_at_utc, f.reviewed_at_utc) AS confirmed_at
             FROM auditcore.evidence e
             JOIN auditcore.journey_document_extracted_fields f
               ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
@@ -1754,6 +1774,7 @@ def _named_documents(connection: Connection, *, tenant_id: str, journey_id: UUID
             "documentId": str(row["di_document_id"]), "diType": str(row["document_type_key"]),
             "stage": str(row["process_area"] or "").upper() or None, "fieldKey": str(row["field_key"]),
             "pair": wanted[f"{row['document_type_key']}.{row['field_key']}"], "name": row["effective_value"],
+            "confirmed": bool(row["confirmed"]), "confirmedAt": row["confirmed_at"],
         }
         for row in rows
         if isinstance(row["effective_value"], str) and row["effective_value"].strip()
@@ -1861,6 +1882,37 @@ def _verified_by_a_person(connection: Connection, *, tenant_id: str, journey_id:
     return bool(text_) and "system" not in text_ and "worker" not in text_
 
 
+def _reference_kyc(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                   references: list[dict[str, Any]], rules: Any) -> dict[str, Any] | None:
+    """The KYC document whose name is the customer's (product owner
+    2026-11-14: compare with a fixed reference, never let one misread decide).
+
+    1. A KYC whose name a person corrected or confirmed -- the latest such.
+    2. Else the KYC most of the booking's documents agree with; a tie keeps the
+       first KYC read (the 29 Oct rule: a later PAN does not switch the
+       reference). One misread KYC no longer puts every correct document of
+       the booking on a "Customer name differs" task when another KYC and the
+       documents agree."""
+    if not references:
+        return None
+    confirmed = [doc for doc in references if doc.get("confirmed")]
+    if confirmed:
+        return max(confirmed, key=lambda doc: doc.get("confirmedAt") or datetime.min.replace(tzinfo=UTC))
+    readable = [doc for doc in references if not is_masked(doc["name"])]
+    if len(readable) < 2:
+        return references[0]
+    others = _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
+                              pairs=rules.customer_name_checked)
+
+    def support(candidate: dict[str, Any]) -> int:
+        return sum(same_person(doc["name"], candidate["name"])
+                   for doc in [*others, *references] if doc["documentId"] != candidate["documentId"])
+
+    first = readable[0]
+    best = max(readable, key=support)
+    return best if support(best) > support(first) else references[0]
+
+
 def customer_name_check(
     connection: Connection,
     *,
@@ -1907,7 +1959,8 @@ def customer_name_check(
             and not _verified_by_a_person(connection, tenant_id=tenant_id, journey_id=journey_id):
         verified = None
     if verified is None:
-        kyc = references[0] if references else None
+        kyc = _reference_kyc(connection, tenant_id=tenant_id, journey_id=journey_id,
+                             references=references, rules=rules)
     else:
         kyc = {
             "name": verified["legal_name"],

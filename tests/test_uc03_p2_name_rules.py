@@ -272,6 +272,41 @@ def test_a_later_pan_does_not_switch_the_reference(journey):
     assert "customer per the Aadhaar is ANITA SAHOO" in task["description"]
 
 
+def test_a_misread_first_kyc_does_not_flag_every_document(journey):
+    """Product owner 2026-11-14: one misread KYC put every correct document of
+    the booking on "Customer name differs". The first KYC read as "BRAHMANANDA
+    MAHARI"; the PAN, the booking form and the invoice all name Brahmananda
+    Mohanty. The KYC most documents agree with is the reference; the misread
+    one is the odd one out."""
+    aadhaar = add_ready_document(journey, "aadhaar", aadhaar_name="BRAHMANANDA MAHARI")
+    add_ready_document(journey, "pan_card", pan_number="FGHIJ5678K", pan_name="BRAHMANANDA MOHANTY")
+    add_ready_document(journey, "booking_form", customer_name="Brahmananda Mohanty", dealer_name="Sarthak Motors")
+    add_ready_document(journey, "insurance_cover", insured_name="Brahmananda Mohanty", policy_number="P1")
+    assert _sync(journey) == {"RAISED": 1}
+    (task,) = _tasks(journey)
+    assert task["reference"]["documentIds"] == [str(aadhaar)]
+    assert "customer per the PAN Card is BRAHMANANDA MOHANTY" in task["description"]
+
+
+def test_a_kyc_name_a_person_corrected_is_the_reference(journey):
+    """The PC's word settles it: the KYC whose name a person corrected is the
+    customer's, whatever the other documents read."""
+    aadhaar = add_ready_document(journey, "aadhaar", aadhaar_name="ANITA SAHU")
+    add_ready_document(journey, "pan_card", pan_number="FGHIJ5678K", pan_name="RAJESH KUMAR")
+    add_ready_document(journey, "booking_form", customer_name="Rajesh Kumar", dealer_name="Sarthak Motors")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text(
+            "UPDATE auditcore.journey_document_extracted_fields SET modified_value='\"ANITA SAHOO\"'::jsonb, "
+            "effective_value='\"ANITA SAHOO\"'::jsonb, is_modified=true, modified_by_actor_id='pc-1', "
+            "modified_at_utc=now() WHERE tenant_id=:t AND di_document_id=:d AND field_key='aadhaar_name'"),
+            {"t": journey.tenant_id, "d": aadhaar})
+    assert _sync(journey) == {"RAISED": 1}
+    (task,) = _tasks(journey)
+    assert task["reference"]["referenceDocumentId"] == str(aadhaar)
+    assert "customer per the Aadhaar is ANITA SAHOO" in task["description"]
+
+
 def test_several_documents_in_another_name_are_one_task(journey):
     add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="BISWABHANU BISWAL")
     a = add_ready_document(journey, "insurance_cover", insured_name="Anita Sahoo", policy_number="P1")

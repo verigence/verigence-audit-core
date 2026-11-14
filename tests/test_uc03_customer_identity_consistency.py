@@ -812,9 +812,12 @@ def test_a_document_is_never_newly_held_by_the_current_rule_alone(journey) -> No
                    "WHERE tenant_id=:t AND di_document_id=:d"), {"t": c.tenant_id, "d": stray})  # read first
     _hold(c, stray)
     result = _sync(c)
-    assert result["raised"] == 0
     assert [_status(c, d) for d in (pan, aadhaar, form)] == ["PASSED", "PASSED", "PASSED"]
-    assert _status(c, stray) == "PASSED"  # the current rule's reference: released, not flagged by it
+    # 2026-11-14: the reference is the KYC most documents agree with, not the
+    # first read -- the stray KYC form in another name is now the odd one out
+    # by both rules, and only it is held.
+    assert result["raised"] == 1
+    assert _status(c, stray) != "PASSED"
 
 
 # ── a hold that moves asks for the booking to be built again (2026-11-01) ───

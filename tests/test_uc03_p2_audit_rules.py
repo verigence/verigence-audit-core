@@ -565,9 +565,26 @@ def test_cash_limit_tcs_and_payment_before_booking(journey):
     result = _run(journey, "BOOKING")
     assert result["CASH_ABOVE_LIMIT"].outcome == "FAIL" and "₹2,50,000 in cash" in result["CASH_ABOVE_LIMIT"].reason
     assert result["PAYMENT_BEFORE_BOOKING"].outcome == "FAIL"
-    assert "₹10,000 on 01 Sep 2026 (receipt R-0): dated before the booking on 10 Sep 2026" in result["PAYMENT_BEFORE_BOOKING"].reason
+    assert "₹10,000 on 01 Sep 2026 (receipt R-0): dated more than a day before the booking on 10 Sep 2026" in \
+        result["PAYMENT_BEFORE_BOOKING"].reason
     assert result["TCS_SHORT"].outcome == "FAIL"
     assert "less than 1% of the ex-showroom price ₹15,00,000 (₹15,000): ₹10,000 short" in result["TCS_SHORT"].reason
+
+
+def test_a_payment_one_day_before_the_booking_docket_is_an_observation(journey):
+    """Product owner 2026-11-14: the token is taken the day before the docket
+    is entered in the DMS -- up to one day before is an observation, not a
+    finding; more than a day stays a finding."""
+    add_ready_document(journey, "booking_form", booking_date="2026-09-10")
+    _receipt(journey, "21000", date(2026, 9, 9), "R-9")
+    outcome = _run(journey, "BOOKING")["PAYMENT_BEFORE_BOOKING"]
+    assert outcome.outcome == "PASS"
+    assert "Observation: ₹21,000 on 09 Sep 2026 (receipt R-9) received the day before" in outcome.reason
+    assert len(outcome.details["observations"]) == 1
+    _receipt(journey, "5000", date(2026, 9, 8), "R-8")
+    outcome = _run(journey, "BOOKING")["PAYMENT_BEFORE_BOOKING"]
+    assert outcome.outcome == "FAIL" and "₹5,000 on 08 Sep 2026 (receipt R-8): dated more than a day" in outcome.reason
+    assert "R-9" not in outcome.reason.split("Observation")[0]
 
 
 def test_a_figure_that_cannot_be_right_for_a_car_raises_a_task() -> None:

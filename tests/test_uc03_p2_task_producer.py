@@ -134,6 +134,28 @@ def test_only_evaluations_after_the_action_can_return_a_task(journey):
     assert _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_status"] == "RETURNED"
 
 
+def test_a_submitted_task_waits_while_the_upload_is_still_being_read(journey):
+    """Product owner 2026-11-14: "PC closes the task but it is not getting
+    closed or submitted for review". The PC uploaded the missing document and
+    submitted; the evaluation two seconds later -- the upload still being
+    read -- returned the task. It now stays VERIFYING until the read is done;
+    the evaluation after it decides."""
+    from p2_support import add_batch_pages
+
+    _fail(journey, "PRICE_BOOKING_VS_INVOICE")
+    task_id = _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_id"]
+    assert _act(journey, task_id, "REVIEW_DOCUMENT")["status"] == "VERIFYING"
+    add_batch_pages(journey, [(None, "EXTRACTING")])
+    _fail(journey, "PRICE_BOOKING_VS_INVOICE")
+    assert _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_status"] == "VERIFYING"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_document_queue SET queue_status='READY' WHERE tenant_id=:t"),
+                           {"t": journey.tenant_id})
+    _fail(journey, "PRICE_BOOKING_VS_INVOICE")
+    assert _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_status"] == "RETURNED"
+
+
 def test_tl_can_accept_an_exception_for_the_same_values_only(journey):
     _fail(journey, "PRICE_BOOKING_VS_INVOICE")
     task_id = _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_id"]
