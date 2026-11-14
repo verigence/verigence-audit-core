@@ -117,8 +117,9 @@ class FakeRuleEngine:
         self.fail = fail
         self.calls = 0
 
-    def evaluate_phase(self, *, token, tenant_id, subject_id, phase):
+    def evaluate_phase(self, *, token, tenant_id, subject_id, phase, documents=None):
         self.calls += 1
+        self.documents = documents
         if self.fail:
             raise self.fail
         return SimpleNamespace(
@@ -177,6 +178,43 @@ def test_rule_engine_results_become_ledger_states(journey, monkeypatch):
     assert "date_of_birth" in state["KYC_DOB_AADHAAR_VS_PAN"]["status_reason"]
     # enabled for Booking in the catalog but not evaluated by this Rule Engine
     assert state["BOOKING_AMOUNT_ZERO"]["control_status"] == "NOT_APPLICABLE"
+
+
+def test_the_rule_engine_reads_the_journeys_documents_as_corrected(journey, monkeypatch):
+    """Product owner 2026-11-14: a gate pass date misread 2023-11-13 and
+    corrected to 2026-11-13 kept failing, because the rules read Document
+    Intelligence's index. The Journey's documents go with the request: the
+    corrected value, Audit Core's type in the Rule Engine's words, and only
+    the documents on this booking."""
+    gate = add_ready_document(journey, "gate_pass", delivery_date="2023-11-13")
+    docket = add_ready_document(journey, "booking_docket", booking_date="2026-10-01")
+    gone = add_ready_document(journey, "customer_invoice_dms", invoice_date="2026-11-10", invoice_number="I1")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text(
+            "UPDATE auditcore.journey_document_extracted_fields SET modified_value='\"2026-11-13\"'::jsonb, "
+            "effective_value='\"2026-11-13\"'::jsonb, is_modified=true, modified_by_actor_id='pc-1', "
+            "modified_at_utc=now() WHERE tenant_id=:t "
+            "AND di_document_id=:d AND field_key='delivery_date'"), {"t": journey.tenant_id, "d": gate})
+        connection.execute(text("UPDATE auditcore.evidence SET association_status='SUPERSEDED' WHERE tenant_id=:t "
+                                "AND di_document_id=:d"), {"t": journey.tenant_id, "d": gone})
+    double = FakeRuleEngine()
+    _wire_rule_engine(monkeypatch, double)
+    _evaluate(journey, "RULE_ENGINE:BOOKING")
+    sent = {d["documentId"]: d for d in double.documents}
+    assert set(sent) == {str(gate), str(docket)}
+    assert sent[str(gate)]["documentTypeKey"] == "gate_pass"
+    assert sent[str(gate)]["fields"]["delivery_date"] == "2026-11-13"
+    assert sent[str(docket)]["documentTypeKey"] == "booking_form"
+
+
+def test_a_day_first_date_goes_to_the_rule_engine_as_iso():
+    from audit_core.uc03_rule_engine_findings import _iso_date
+
+    assert _iso_date("08/02/2026") == "2026-02-08"
+    assert _iso_date("2026-11-13") == "2026-11-13"
+    assert _iso_date("13-11-2026") == "2026-11-13"
+    assert _iso_date(None) is None and _iso_date("99/99/2026") == "99/99/2026"
 
 
 def test_rule_engine_outage_is_retry_pending_never_clean(journey, monkeypatch):
@@ -277,7 +315,7 @@ def test_rule_engine_pass_resolves_the_stale_finding(journey, monkeypatch):
 class RetiredRuleEngine(FakeRuleEngine):
     """Still evaluates a rule the catalogue retired in favour of a native check."""
 
-    def evaluate_phase(self, *, token, tenant_id, subject_id, phase):
+    def evaluate_phase(self, *, token, tenant_id, subject_id, phase, documents=None):
         result = super().evaluate_phase(token=token, tenant_id=tenant_id, subject_id=subject_id, phase=phase)
         retired = SimpleNamespace(rule_code="DISCOUNT_BOOKING_EXCEEDS_APPROVAL", severity="CRITICAL",
                                   category="DISCOUNT", detail="Booking promised discount exceeds approved amount",
@@ -398,7 +436,7 @@ def test_a_stronger_duplicate_match_replaces_the_finding_the_control_and_task_fo
 class ChassisEmptyRuleEngine(FakeRuleEngine):
     """The Rule Engine reports "chassis number empty" whether or not a gate pass is on file."""
 
-    def evaluate_phase(self, *, token, tenant_id, subject_id, phase):
+    def evaluate_phase(self, *, token, tenant_id, subject_id, phase, documents=None):
         return SimpleNamespace(audit_run_id="run-2", verdict="ANOMALIES", anomalies=(
             SimpleNamespace(rule_code="GATE_PASS_CHASSIS_EMPTY", severity="MEDIUM", category="PROCESS",
                             detail="Chassis number is empty", left_value=None, right_value=None),))
