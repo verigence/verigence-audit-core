@@ -196,11 +196,16 @@ def test_an_exact_copy_of_an_uploaded_file_is_not_read_again(s):
     assert listed["status"] == "DONE" and listed["summary"] == {"EXACT_DUPLICATE": 2}
 
 
-def _identity(journey: P2Journey, *, pan: str = PAN, model: str = "THAR") -> None:
+def _identity(journey: P2Journey, *, pan: str = PAN, model: str = "THAR", otf: str | None = None) -> None:
     doc = uuid4()
     add_evidence(journey, di_document_id=doc, document_type_key="pan_card")
     add_extracted_field(journey, di_document_id=doc, field_key="pan_number", value=pan, document_type="pan_card")
     add_extracted_field(journey, di_document_id=doc, field_key="customer_phone", value="9876543210")
+    if otf:
+        form = uuid4()
+        add_evidence(journey, di_document_id=form, document_type_key="booking_form")
+        add_extracted_field(journey, di_document_id=form, field_key="booking_reference_number", value=otf,
+                            document_type="booking_form")
     with journey.engine.begin() as c:
         set_tenant_context(c, journey.tenant_id)
         c.execute(text("INSERT INTO auditcore.journey_products (tenant_id, journey_id, model_name_snapshot) "
@@ -243,7 +248,7 @@ def _exists(s, journey_id) -> bool:
 
 def test_a_delivery_file_joins_the_customers_booking_and_its_new_pages_are_carried(s):
     booking = s.journey                      # the customer's booking, its KYC already read
-    _identity(booking)
+    _identity(booking, otf="B-13324474")
     shared = uuid4().hex
     _read(s, booking.journey_id, shas=[shared], kinds=["pan_card"])
     bulk_id = _drop(s, {"Asha Das delivery.pdf": b"%PDF delivery file"})
@@ -251,7 +256,7 @@ def test_a_delivery_file_joins_the_customers_booking_and_its_new_pages_are_carri
     [file] = _files(s, bulk_id)
     read_on = _read(s, file["journey_id"], shas=[shared, uuid4().hex],  # the KYC again, and the invoice
                     kinds=["pan_card", "tax_invoice_tally"])
-    _identity(read_on)
+    _identity(read_on, otf="B-13324474")  # the same OTF: joined (2026-11-14, delete only on the same OTF)
     # Still reading: not settled yet.
     with s.journey.engine.begin() as c:
         set_tenant_context(c, s.journey.tenant_id)
@@ -274,6 +279,22 @@ def test_a_delivery_file_joins_the_customers_booking_and_its_new_pages_are_carri
                                  "AND client_upload_id LIKE 'dup-merge-%'"),
                             {"t": s.journey.tenant_id, "j": booking.journey_id}).scalar_one()
     assert carried == 1  # only the invoice page; the KYC page was already there
+
+
+def test_a_file_of_the_customer_with_another_otf_is_not_joined(s):
+    """Product owner 2026-11-14: one customer can have several bookings; then only the OTF
+    differs. The read journey stays a booking of its own and is never deleted."""
+    booking = s.journey
+    _identity(booking, otf="B-13324474")
+    bulk_id = _drop(s, {"Asha Das second.pdf": b"%PDF second booking"})
+    _run_upload(s, bulk_id)
+    [file] = _files(s, bulk_id)
+    read_on = _read(s, file["journey_id"], shas=[uuid4().hex], kinds=["tax_invoice_tally"])
+    _identity(read_on, otf="B-13324999")
+    _settle(s, bulk_id)
+    [file] = _files(s, bulk_id)
+    assert file["outcome"] == "KEPT_FOR_REVIEW" and "OTF" in file["detail"]
+    assert _exists(s, file["journey_id"]) and _exists(s, booking.journey_id)
 
 
 def test_a_file_with_no_booking_of_its_customer_stays_a_new_booking(s):
