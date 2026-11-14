@@ -18,7 +18,7 @@ from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 import structlog
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import Connection, Engine, text
 
@@ -576,6 +576,8 @@ def list_p2_journeys(
     month_basis: str | None = None,
     dealer_id: UUID | None = None,
     kind: str | None = None,
+    date_from: Annotated[date | None, Query(alias="from")] = None,
+    date_to: Annotated[date | None, Query(alias="to")] = None,
 ) -> dict[str, Any]:
     """Bookings / Journey 360 list, one page of one tab (uc03_p2_journey_views):
     ``view`` names the tab (``state`` open / closed / all is the older
@@ -829,7 +831,8 @@ def list_p2_journeys(
         {
             "tenant_id": tenant_id,
             "actor_id": human_principal.subject,
-            **scope_params(search=q, dealer_id=dealer_id, outlet_id=outlet_id, pc_actor_id=pc_actor_id, kind=kind),
+            **scope_params(search=q, dealer_id=dealer_id, outlet_id=outlet_id, pc_actor_id=pc_actor_id, kind=kind,
+                         date_from=date_from, date_to=date_to),
             "date_floor": programme_date_floor() or date(1900, 1, 1),
             "limit": page_size + 1,
             "offset": max(offset, 0),
@@ -900,6 +903,8 @@ def journey_view_counts(
     month_basis: str | None = None,
     dealer_id: UUID | None = None,
     kind: str | None = None,
+    date_from: Annotated[date | None, Query(alias="from")] = None,
+    date_to: Annotated[date | None, Query(alias="to")] = None,
 ) -> dict[str, Any]:
     """How many journeys each list tab holds, under the same filters as the
     list. ``breakdown`` adds open / needs TL / overdue / high-risk / stuck
@@ -913,7 +918,8 @@ def journey_view_counts(
     params = {
         "tenant_id": tenant_id,
         "actor_id": human_principal.subject,
-        **scope_params(search=q, dealer_id=dealer_id, outlet_id=outlet_id, pc_actor_id=pc_actor_id, kind=kind),
+        **scope_params(search=q, dealer_id=dealer_id, outlet_id=outlet_id, pc_actor_id=pc_actor_id, kind=kind,
+                         date_from=date_from, date_to=date_to),
         "month": month if month and re.fullmatch(r"\d{4}-\d{2}", month) else None,
         "month_basis": _month_basis(month_basis),
         "date_floor": programme_date_floor() or date(1900, 1, 1),
@@ -943,6 +949,8 @@ def journey_suggestions(
     outlet_id: UUID | None = None,
     pc_actor_id: str | None = None,
     kind: str | None = None,
+    date_from: Annotated[date | None, Query(alias="from")] = None,
+    date_to: Annotated[date | None, Query(alias="to")] = None,
     limit: int = SUGGEST_LIMIT,
 ) -> dict[str, Any]:
     """Search as you type (product owner 2026-11-09): up to ``limit`` (8) journeys
@@ -961,7 +969,8 @@ def journey_suggestions(
         {
             "tenant_id": tenant_id,
             "actor_id": human_principal.subject,
-            **scope_params(search=q, dealer_id=dealer_id, outlet_id=outlet_id, pc_actor_id=pc_actor_id, kind=kind),
+            **scope_params(search=q, dealer_id=dealer_id, outlet_id=outlet_id, pc_actor_id=pc_actor_id, kind=kind,
+                         date_from=date_from, date_to=date_to),
             "month": month if month and re.fullmatch(r"\d{4}-\d{2}", month) else None,
             "month_basis": _month_basis(month_basis),
             "date_floor": programme_date_floor() or date(1900, 1, 1),

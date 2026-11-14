@@ -64,6 +64,7 @@ matching as the list, at most a few journeys, newest first.
 from __future__ import annotations
 
 import re
+from datetime import date
 from typing import Any
 
 from audit_core.uc03_p2_runtime import swept_pending_sql
@@ -142,8 +143,19 @@ def _business_dates_lateral(condition: str) -> str:
 
 # The booking / delivery dates are only worked out when a filter reads them (the
 # calendar month, or Bookings only / Deliveries only).
-_DATES_WHEN_FILTERED = "(CAST(:month_basis AS varchar) = 'business' OR CAST(:kind AS varchar) IS NOT NULL)"
+_DATES_WHEN_FILTERED = ("(CAST(:month_basis AS varchar) = 'business' OR CAST(:kind AS varchar) IS NOT NULL "
+                        "OR CAST(:date_from AS date) IS NOT NULL)")
 _BUSINESS_MONTH = "(CAST(:month AS varchar) IS NOT NULL AND CAST(:month_basis AS varchar) = 'business')"
+# A date range (product owner 2026-11-14: "Journeys should have date range"): a journey is in it when
+# its booking date or its delivery date is (the business dates, as the calendar month's). Takes the
+# place of the month when both are given.
+_RANGE = "(CAST(:date_from AS date) IS NOT NULL)"
+
+
+def _in_period(column: str) -> str:
+    """The booking / delivery date ``column`` in the date range, else in the business month."""
+    return (f"(({_RANGE} AND {column} BETWEEN CAST(:date_from AS date) AND CAST(:date_to AS date))"
+            f" OR (NOT {_RANGE} AND {_BUSINESS_MONTH} AND to_char({column}, 'YYYY-MM') = CAST(:month AS varchar)))")
 
 # The caller's scope, the filters and the search, over j / c / d / o / jp / bm and phone_hits.
 _SCOPE_WHERE_SQL = f"""j.tenant_id = :tenant_id
@@ -158,7 +170,8 @@ _SCOPE_WHERE_SQL = f"""j.tenant_id = :tenant_id
           AND (CAST(:dealer_id AS uuid) IS NULL OR j.dealer_id = CAST(:dealer_id AS uuid))
           AND (CAST(:outlet_id AS uuid) IS NULL OR j.outlet_id = CAST(:outlet_id AS uuid))
           AND (CAST(:pc_actor_id AS varchar) IS NULL OR j.created_by_actor_id = CAST(:pc_actor_id AS varchar))
-          AND (CAST(:month AS varchar) IS NULL
+          AND (NOT {_RANGE} OR {_in_period("bm.booking_date")} OR {_in_period("bm.delivery_date")})
+          AND (CAST(:month AS varchar) IS NULL OR {_RANGE}
                OR (COALESCE(CAST(:month_basis AS varchar), '') <> 'business'
                    AND to_char(j.created_at_utc AT TIME ZONE :timezone, 'YYYY-MM') = CAST(:month AS varchar))
                OR (CAST(:month_basis AS varchar) = 'business'
@@ -169,9 +182,9 @@ _SCOPE_WHERE_SQL = f"""j.tenant_id = :tenant_id
           -- month when one is chosen, the bookings_in_month / deliveries_in_month figures.
           AND (CAST(:kind AS varchar) IS NULL
                OR (CAST(:kind AS varchar) = 'booking'
-                   AND (NOT {_BUSINESS_MONTH} OR to_char(bm.booking_date, 'YYYY-MM') = CAST(:month AS varchar)))
+                   AND (NOT ({_BUSINESS_MONTH} OR {_RANGE}) OR {_in_period("bm.booking_date")}))
                OR (CAST(:kind AS varchar) = 'delivery' AND bm.delivery_date IS NOT NULL
-                   AND (NOT {_BUSINESS_MONTH} OR to_char(bm.delivery_date, 'YYYY-MM') = CAST(:month AS varchar))))
+                   AND (NOT ({_BUSINESS_MONTH} OR {_RANGE}) OR {_in_period("bm.delivery_date")})))
           AND (
             :search = ''
             OR c.display_name ILIKE '%' || :search || '%'
@@ -245,6 +258,8 @@ SCOPED_SQL = f"""
                j.created_by_display_name AS pc_name,
                to_char(bm.booking_date, 'YYYY-MM') AS booking_month,
                to_char(bm.delivery_date, 'YYYY-MM') AS delivery_month,
+               {_in_period("bm.booking_date")} AS booking_in_period,
+               {_in_period("bm.delivery_date")} AS delivery_in_period,
                (fin.journey_id IS NOT NULL) AS is_closed,
                COALESCE(ot.pc_task, false) AS pc_task,
                COALESCE(ot.tl_task, false) AS tl_task,
@@ -328,8 +343,8 @@ COUNTS_SQL = "WITH " + SCOPED_SQL + """
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.high_risk) AS high_risk,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.overdue) AS overdue,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.stuck) AS stuck,
-      COUNT(*) FILTER (WHERE s.booking_month = CAST(:month AS varchar)) AS bookings_in_month,
-      COUNT(*) FILTER (WHERE s.delivery_month = CAST(:month AS varchar)) AS deliveries_in_month
+      COUNT(*) FILTER (WHERE s.booking_in_period) AS bookings_in_month,
+      COUNT(*) FILTER (WHERE s.delivery_in_period) AS deliveries_in_month
     FROM scoped s
 """
 
@@ -344,8 +359,8 @@ BREAKDOWN_SQL = "WITH " + SCOPED_SQL + """
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.high_risk) AS high_risk,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.stuck) AS stuck,
       COUNT(*) FILTER (WHERE s.is_closed) AS closed,
-      COUNT(*) FILTER (WHERE s.booking_month = CAST(:month AS varchar)) AS bookings_in_month,
-      COUNT(*) FILTER (WHERE s.delivery_month = CAST(:month AS varchar)) AS deliveries_in_month
+      COUNT(*) FILTER (WHERE s.booking_in_period) AS bookings_in_month,
+      COUNT(*) FILTER (WHERE s.delivery_in_period) AS deliveries_in_month
     FROM scoped s
     GROUP BY {group_by}
     ORDER BY COUNT(*) FILTER (WHERE NOT s.is_closed AND (s.overdue OR s.high_risk)) DESC,
@@ -384,8 +399,8 @@ COUNTS_WITH_BREAKDOWN_SQL = "WITH " + SCOPED_SQL + """
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.high_risk) AS high_risk,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.overdue) AS overdue,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.stuck) AS stuck,
-      COUNT(*) FILTER (WHERE s.booking_month = CAST(:month AS varchar)) AS bookings_in_month,
-      COUNT(*) FILTER (WHERE s.delivery_month = CAST(:month AS varchar)) AS deliveries_in_month,
+      COUNT(*) FILTER (WHERE s.booking_in_period) AS bookings_in_month,
+      COUNT(*) FILTER (WHERE s.delivery_in_period) AS deliveries_in_month,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND (s.overdue OR s.high_risk)) AS attention
     FROM scoped s
     GROUP BY GROUPING SETS ((), (s.dealer_id), (s.outlet_id), (s.created_by_actor_id))
@@ -457,10 +472,17 @@ def scope_params(
     outlet_id: Any = None,
     pc_actor_id: str | None = None,
     kind: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
 ) -> dict[str, Any]:
-    """The search and filter parameters SCOPED_SQL / SUGGEST_SQL read, from the request's own."""
+    """The search and filter parameters SCOPED_SQL / SUGGEST_SQL read, from the request's own.
+    ``date_from`` / ``date_to`` (both, from not after to): the business-date range, in place of
+    the month."""
     text_ = (search or "").strip()
+    ranged = date_from is not None and date_to is not None and date_from <= date_to
     return {
+        "date_from": date_from if ranged else None,
+        "date_to": date_to if ranged else None,
         "search": text_,
         "mobile_pattern": mobile_search_pattern(text_),
         "dealer_id": str(dealer_id) if dealer_id else None,

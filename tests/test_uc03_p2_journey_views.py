@@ -127,3 +127,11 @@ def test_calendar_month_by_booking_date_and_delivery_date(uc03_create_booking_se
     assert counts["byOutlet"][0]["bookings_in_month"] == 2
     # Without the basis the month is still the month the journey was started.
     assert ids_of(month="2026-09") == set()
+    # A date range (2026-11-14): by booking date or delivery date, in place of the month.
+    assert ids_of(**{"from": "2026-09-01", "to": "2026-09-15"}) == {booking}
+    assert ids_of(**{"from": "2026-09-20", "to": "2026-09-30", "month": "2026-01"}) == {booking_complete, delivery}
+    assert ids_of(**{"from": "2026-08-01", "to": "2026-09-30", "kind": "delivery"}) == {delivery}
+    ranged = client.get(f"{base}/journeys:counts",
+                        params={"from": "2026-08-15", "to": "2026-09-30", "breakdown": "true"}).json()
+    assert ranged["counts"]["all"] == 3
+    assert (ranged["counts"]["bookings_in_month"], ranged["counts"]["deliveries_in_month"]) == (3, 1)

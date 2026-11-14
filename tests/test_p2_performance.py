@@ -327,6 +327,37 @@ def test_how_the_upload_options_are_used(setup):
     assert sum(at_outlet["drive"]) == 1
 
 
+def test_duplicates_and_errors_by_upload_channel(setup):
+    """Each PC's files per channel with that channel's duplicates and files with errors (2026-11-14)."""
+    s = setup
+    _ok, _ = add_batch_pages(s.journey, [("booking_form", "READY")])                       # direct, clean
+    _bad_direct, _rows = add_batch_pages(s.journey, [("booking_form", "FAILED"), ("booking_form", "READY")])
+    bulk, _ = add_batch_pages(s.journey, [("booking_form", "READY")])
+    drive, drive_rows = add_batch_pages(s.journey, [("booking_form", "CANCELLED")])
+    tt._exec(s, "UPDATE auditcore.p2_document_queue SET last_error='DI_QUALITY_IMAGE_BLUR_SCORE' "
+                "WHERE tenant_id=:t AND queue_id=:q", q=drive_rows[0]["queue_id"])
+    tt._bulk_source(s, bulk, "WEB")
+    tt._bulk_source(s, drive, "DRIVE")
+    # A bulk file set aside as an exact copy, and one that failed before it was read.
+    bulk_id = tt._exec(s, "SELECT bulk_id FROM auditcore.p2_bulk_files WHERE tenant_id=:t AND batch_id=:b",
+                       b=bulk).scalar_one()
+    for outcome in ("EXACT_DUPLICATE", "FAILED"):
+        tt._exec(s, """
+            INSERT INTO auditcore.p2_bulk_files (tenant_id, bulk_id, original_filename, content_type, size_bytes,
+              object_key, upload_status, outcome)
+            VALUES (:t, :b, 'y.pdf', 'application/pdf', 1, :k, 'UPLOADED', :o)
+        """, b=bulk_id, k=f"bulk/{uuid4()}", o=outcome)
+    tl = f"tl-{uuid4().hex[:6]}"
+    tt._role(s, tl, "TL")
+    report = _build(s, tl, section="uploads")
+    mine = next(p for p in report["uploads"]["people"] if p["actorId"] == s.journey.actor_id)
+    assert (sum(mine["direct"]), sum(mine["bulk"]), sum(mine["drive"])) == (2, 1, 1)
+    assert mine["duplicates"] == {"direct": 0, "bulk": 1, "drive": 0}
+    assert mine["errors"] == {"direct": 1, "bulk": 1, "drive": 1}
+    at_outlet = next(o for o in report["uploads"]["outlets"] if o["outletId"] == str(s.journey.outlet_id))
+    assert at_outlet["errors"]["direct"] == 1 and at_outlet["duplicates"]["bulk"] == 1
+
+
 def test_duplicates_and_quality_issues(setup):
     s = setup
     _batch, rows = add_batch_pages(s.journey, [("booking_form", "FAILED"), ("booking_form", "FAILED"),

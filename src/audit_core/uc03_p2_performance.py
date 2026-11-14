@@ -392,15 +392,23 @@ def _sections(part: Any, data: dict[str, Any], *, rows: list[dict[str, Any]], ou
 
     if wanted("uploads"):
         ch = part("channels")
+        # Duplicates and files with errors per channel (product owner 2026-11-14), totals of the period.
+        issues = part("channelIssues")
+        no_issues = {"duplicates": dict.fromkeys(("direct", "bulk", "drive"), 0),
+                     "errors": dict.fromkeys(("direct", "bulk", "drive"), 0)}
 
-        def by_channel(source: dict[str, Any]) -> dict[str, list[int]]:
-            return {c: [source.get(c, {}).get(d, 0) for d in iso] for c in ("direct", "bulk", "drive")}
+        def by_channel(source: dict[str, Any], problems: dict[str, Any]) -> dict[str, Any]:
+            return {**{c: [source.get(c, {}).get(d, 0) for d in iso] for c in ("direct", "bulk", "drive")},
+                    "duplicates": dict(problems["duplicates"]), "errors": dict(problems["errors"])}
 
         out["uploads"] = {
-            "outlets": [] if own else [{**place(o), **by_channel(ch["byOutlet"].get(str(o["outlet_id"]), {}))}
-                                       for o in outlets],
+            "outlets": [] if own else [
+                {**place(o), **by_channel(ch["byOutlet"].get(str(o["outlet_id"]), {}),
+                                          issues["byOutlet"].get(str(o["outlet_id"]), no_issues))}
+                for o in outlets],
             "people": [{"actorId": a, "name": names[a], "role": people[a]["role"],
-                        **by_channel(ch["byPerson"].get(a, {}))} for a in visible if people[a]["role"] == "PC"],
+                        **by_channel(ch["byPerson"].get(a, {}), issues["byPerson"].get(a, no_issues))}
+                       for a in visible if people[a]["role"] == "PC"],
         }
 
     if wanted("quality"):
@@ -527,6 +535,8 @@ def _part(connection: Connection, name: str, *, tenant_id: str, first: date, las
         data = insights.tasks(connection, tenant_id=tenant_id, start=start, end=end, tz=tz)
     elif name == "quality":
         data = insights.quality(connection, tenant_id=tenant_id, start=start, end=end)
+    elif name == "channelIssues":
+        data = insights.channel_issues(connection, tenant_id=tenant_id, start=start, end=end)
     else:
         data = insights.channels(connection, tenant_id=tenant_id, start=start, end=end, tz=tz)
     if use_cache:
