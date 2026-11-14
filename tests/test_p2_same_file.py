@@ -1333,7 +1333,8 @@ def test_a_booking_file_then_its_delivery_file_become_one_journey(tenant):
     # The delivery file holds more documents: it is kept, the booking file is the copy.
     assert alert["subject_journey_id"] == booking.journey_id and alert["related_journey_id"] == delivery.journey_id
     assert alert["outcome"] == "PENDING_DELETE"
-    assert {f["field"] for f in alert["payload"]["matchedFields"]} >= {"pan", "receipt"}
+    # 2026-11-14: one model family ("Maxx HD" and "BOL MAXX PUP HD") and the same PAN.
+    assert {f["field"] for f in alert["payload"]["matchedFields"]} >= {"pan", "model"}
     assert _delete(booking) == "DELETED"
     assert not _exists(booking) and _exists(delivery)
 
@@ -1434,3 +1435,29 @@ def test_a_receipt_is_carried_only_when_its_number_is_new(tenant, number, carrie
 
 def _batches_copied(journey: P2Journey) -> list[dict]:
     return [b for b in _batches(journey) if str(b["client_upload_id"] or "").startswith("dup-merge-")]
+
+
+@pytest.mark.parametrize(("left", "right", "same"), [
+    # Product owner 2026-11-14: the same booking, the model written two ways.
+    ("MAHINDRA BOLERO NEO", "BOLERO NEO", True), ("XUV 3XO", "MAHINDRA XUV 3XO", True),
+    ("BOL MAXX PUP HD 1.7 VXI", "MAXX HD 1.7 VXI", True), ("SCORPIO N", "SCORPIO-N", True),
+    ("BOLERO", "MAHINDRA BOLERO B6 BSVI", True), ("THAR OGY", "THAR", True),
+    # Different models stay apart.
+    ("THAR ROXX", "THAR", False), ("BOLERO NEO", "BOLERO", False), ("XUV3XO EV", "XUV 3XO", False),
+    ("BOLERO CAMPER GOLD ZX D", "MAHINDRA BOLERO NEO", False), ("XEV 9S", "XUV 7S", False),
+])
+def test_one_model_written_two_ways_is_one_family(tenant, left, right, same):
+    from audit_core import uc03_p2_same_file as rule
+
+    with tenant.engine.begin() as connection:
+        for name in ("BOLERO", "BOLERO NEO", "MAXX HD", "NEW SCORPIO N", "NEW THAR 2WD & 4WD", "THAR ROXX",
+                     "XUV3XO", "XUV3XO EV", "XEV9S"):
+            if not connection.execute(text("SELECT 1 FROM auditcore.product_models WHERE model_name=:n"),
+                                      {"n": name}).first():
+                oem = connection.execute(text("INSERT INTO auditcore.oems (oem_code, oem_name) VALUES (:c, 'O') "
+                                              "RETURNING oem_id"), {"c": f"FAM-{uuid4().hex[:8]}"}).scalar_one()
+                connection.execute(text("INSERT INTO auditcore.product_models (oem_id, model_code, model_name) "
+                                        "VALUES (:o, :c, :n)"), {"o": oem, "c": f"FAM-{uuid4().hex[:8]}", "n": name})
+        rule._families = (0.0, ())
+        rule._load_families(connection)
+    assert (rule.model_family(left) == rule.model_family(right)) is same

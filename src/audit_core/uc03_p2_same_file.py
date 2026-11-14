@@ -190,7 +190,7 @@ from audit_core.uc03_p2_names import (
     same_person,
 )
 from audit_core.uc03_p2_runtime import enqueue_work
-from audit_core.uc03_sku_words import generation_key
+from audit_core.uc03_sku_words import generation_key, normalized_key
 
 logger = structlog.get_logger(__name__)
 
@@ -406,7 +406,7 @@ class FileIdentity:
 
     @property
     def model_key(self) -> str:
-        return generation_key(self.model_name) if self.model_name and self.model_name.strip() else ""
+        return model_family(self.model_name) if self.model_name and self.model_name.strip() else ""
 
     @property
     def complete(self) -> bool:
@@ -424,10 +424,52 @@ class FileIdentity:
         return (self.created_at, str(self.journey_id))
 
 
+# The model families of the OEM master (product_models), longest first, read at most every ten
+# minutes; and nameplates the master writes as part of another (2026-11-14).
+_FAMILY_SECONDS = 600
+_EXTRA_FAMILIES = ("BOLEROCAMPER", "BOLEROPICKUP", "MAXXHD", "MAXXCITY")
+_families: tuple[float, tuple[str, ...]] = (0.0, ())
+
+
+def _load_families(connection: Connection) -> None:
+    global _families
+    import time
+
+    if _families[1] and time.monotonic() - _families[0] < _FAMILY_SECONDS:
+        return
+    try:
+        names = connection.execute(text("SELECT DISTINCT model_name FROM auditcore.product_models")).scalars().all()
+    except Exception:
+        logger.warning("p2_same_file_model_families_unread", exc_info=True)
+        return
+    keys = {key for name in names if (key := generation_key(name)) and len(key) >= 3} | set(_EXTRA_FAMILIES)
+    _families = (time.monotonic(), tuple(sorted(keys, key=lambda k: (-len(k), k))))
+
+
+def model_family(model_name: str | None) -> str:
+    """The model as one family (product owner 2026-11-14: the same booking showed "MAHINDRA BOLERO
+    NEO" on one copy and "BOLERO NEO" on the other; "XUV 3XO" and "MAHINDRA XUV 3XO"; "BOL MAXX PUP
+    HD 1.7 VXI" and "MAXX HD 1.7 VXI"; "SCORPIO N Z8S" and "SCORPIO-N Z8L"): the brand word and the
+    generation words dropped, then the longest model of the OEM master the name starts with --
+    "THAR ROXX" stays apart from "THAR", "BOLERO NEO" from "BOLERO", "XUV3XO EV" from "XUV3XO". A name
+    the master does not know is its own family (generation_key), as before."""
+    key = normalized_key(model_name)
+    key = key.removeprefix("MAHINDRA")
+    if key.startswith("NEW") and len(key) > 5:
+        key = key[3:]
+    key = re.sub(r"^BOL(?:ERO)?(?=MAXX)", "", key)
+    key = re.sub(r"^MAXX(?:PUP|PIKUP|PICKUP)", "MAXX", key)
+    for family in _families[1]:
+        if key.startswith(family):
+            return family
+    return generation_key(key) if key else ""
+
+
 def _identities(connection: Connection, *, tenant_id: str, journey_ids: Iterable[UUID]) -> dict[UUID, FileIdentity]:
     ids = list(journey_ids)
     if not ids:
         return {}
+    _load_families(connection)
     rows = connection.execute(
         text(_IDENTITY_SQL), {"tenant_id": tenant_id, "journey_ids": ids},
     ).mappings().all()
