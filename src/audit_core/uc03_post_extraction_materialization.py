@@ -105,10 +105,20 @@ def _materialize_product(
                 'EVIDENCE'
             )
             ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
-                model_name_snapshot=COALESCE(EXCLUDED.model_name_snapshot, auditcore.journey_products.model_name_snapshot),
-                variant_name_snapshot=COALESCE(EXCLUDED.variant_name_snapshot, auditcore.journey_products.variant_name_snapshot),
+                -- Once a SKU is pinned the model and variant are the master's (product owner
+                -- 2026-11-14: "its deterministic... its all SKU"): the text read off a document
+                -- never writes over them again, as in uc03_work_item_enrichment.
+                model_name_snapshot=CASE
+                    WHEN auditcore.journey_products.product_sku_id IS NULL
+                    THEN COALESCE(EXCLUDED.model_name_snapshot, auditcore.journey_products.model_name_snapshot)
+                    ELSE auditcore.journey_products.model_name_snapshot END,
+                variant_name_snapshot=CASE
+                    WHEN auditcore.journey_products.product_sku_id IS NULL
+                    THEN COALESCE(EXCLUDED.variant_name_snapshot, auditcore.journey_products.variant_name_snapshot)
+                    ELSE auditcore.journey_products.variant_name_snapshot END,
                 colour_name_snapshot=COALESCE(EXCLUDED.colour_name_snapshot, auditcore.journey_products.colour_name_snapshot),
-                selection_source='EVIDENCE',
+                selection_source=CASE WHEN auditcore.journey_products.product_sku_id IS NULL THEN 'EVIDENCE'
+                                      ELSE auditcore.journey_products.selection_source END,
                 updated_at_utc=now()
             """
         ),

@@ -547,8 +547,10 @@ def same_name(left: str | None, right: str | None) -> bool:
 
 
 def same_model(left: FileIdentity, right: FileIdentity) -> bool:
-    if left.model_id and right.model_id:
-        return left.model_id == right.model_id
+    """The same SKU model, or one family (model_family): the master holds "SCORPIO N" and "NEW
+    SCORPIO N", "THAR" and "NEW THAR 2WD & 4WD" as separate models of one nameplate (2026-11-14)."""
+    if left.model_id and right.model_id and left.model_id == right.model_id:
+        return True
     return bool(left.model_key) and left.model_key == right.model_key
 
 
