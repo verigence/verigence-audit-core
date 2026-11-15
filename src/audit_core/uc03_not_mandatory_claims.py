@@ -315,6 +315,23 @@ def _decide_waiver(connection: Connection, *, tenant_id: str, journey_id: UUID, 
     )
     outcome = ACCEPTED if status == "ACCEPTED" else REJECTED
     if waiver["source_task_id"] is not None:
+        # A claim made on a per-document task of before 2026-11-15 parked that task
+        # with the Reviewer; it closes with the decision (a rejected document is asked
+        # for again on the journey's one missing-documents task, not on this one).
+        connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_tasks
+                SET task_status='VERIFIED_COMPLETE', verified_at_utc=now(), updated_at_utc=now(),
+                    completion_result=COALESCE(completion_result, '{}'::jsonb) || CAST(:r AS jsonb)
+                WHERE tenant_id=:t AND task_id=:id AND task_status='AWAITING_REQUESTER_REVIEW'
+                  AND reference ? 'requirementKey'
+                """
+            ),
+            {"t": tenant_id, "id": waiver["source_task_id"],
+             "r": _json({"outcome": outcome, "decidedBy": actor_id, "decidedRole": role,
+                         "decisionReason": reason or None, "mergedInto": f"document-missing:{journey_id}"})},
+        )
         record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id, task_id=waiver["source_task_id"],
                           event_type="ACCEPT" if status == "ACCEPTED" else "RETURNED", actor_id=actor_id,
                           actor_role_code=role, comment=reason or None,

@@ -175,3 +175,29 @@ def test_dealer_not_provided_and_temporary_registration_are_system_remarks(journ
         remarks = system_remarks(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)["remarks"]
     [remark] = [r for r in remarks if r["code"] == "TEMPORARY_REGISTRATION"]
     assert "OD02T1234" in remark["text"] and "Reviewer" in remark["text"]
+
+
+def test_a_claim_on_a_per_document_task_of_before_closes_that_task_with_the_decision(journey):
+    """The 50 claims pending on 2026-11-15 were made on per-document tasks, parked
+    with the Reviewer; deciding the claim (a waiver row) closes that task too."""
+    from audit_core.uc03_p2_tasks import submit_action
+
+    _delivery_started(journey)
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        old_id, _ = raise_or_refresh(
+            c, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+            dedupe_key=f"document-missing:{journey.journey_id}:rto_challan", task_type="DOCUMENT_MISSING",
+            source_type="DOCUMENT", source_code="DOCUMENT_MISSING", title="Upload the RTO Challan", description="x",
+            reference={"sourceCode": "DOCUMENT_MISSING", "requirementKey": "rto_challan", "stage": "DELIVERY"},
+            severity="HIGH", registry=get_registry())
+        submit_action(c, tenant_id=journey.tenant_id, task_id=old_id, action="CLOSE_TASK", actor_id=journey.actor_id,
+                      actor_role_code="PC", comment=f"{NOT_REQUIRED}: customer registers the vehicle himself",
+                      details={"choice": NOT_REQUIRED})
+    status = lambda: _sql(journey, "SELECT task_status FROM auditcore.p2_tasks WHERE task_id=:id",
+                          id=old_id).scalar_one()
+    assert status() == "AWAITING_REQUESTER_REVIEW"
+    _decide(journey, "rto_challan", "REJECT", reason="Dealer registers every vehicle; upload the challan")
+    assert status() == "VERIFIED_COMPLETE"
+    _sync(journey)
+    assert "Dealer registers every vehicle" in missing_document_lines(journey)["rto_challan"]["reason"]
