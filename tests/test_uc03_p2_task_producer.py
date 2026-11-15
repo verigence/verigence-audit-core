@@ -100,38 +100,37 @@ def test_indian_money_formatting():
 
 
 def test_failing_control_raises_one_self_contained_task(journey):
-    add_ready_document(journey, "booking_form", total_price="2450000")
-    assert _fail(journey, "PRICE_BOOKING_VS_INVOICE") == {"RAISED": 1}
-    task = _task(journey, "control:PRICE_BOOKING_VS_INVOICE")
-    assert task["title"] == "Review total price: Booking Docket vs Customer Invoice (DMS)"
+    add_ready_document(journey, "customer_invoice_dms", grand_total_amount="2450000", invoice_number="I1")
+    assert _fail(journey, "PRICE_INVOICE_VS_LEDGER") == {"RAISED": 1}
+    task = _task(journey, "control:PRICE_INVOICE_VS_LEDGER")
+    assert task["title"].startswith("Review grand total amount: Customer Invoice (DMS) vs")
     assert "₹24,50,000" in task["description"] and "₹25,10,000" in task["description"]
-    assert task["reference"]["sourceCode"] == "PRICE_BOOKING_VS_INVOICE"
-    assert len(task["reference"]["documentIds"]) == 1  # the booking docket on file
-    assert task["priority"] == "NORMAL" and task["due_at_utc"] is not None
+    assert task["reference"]["sourceCode"] == "PRICE_INVOICE_VS_LEDGER"
+    assert len(task["reference"]["documentIds"]) == 1  # the invoice on file
     assert "CORRECT_EXTRACTED_FIELD" in task["allowed_actions"]
     # retries and repeated evaluations never duplicate it
-    assert _fail(journey, "PRICE_BOOKING_VS_INVOICE") == {"UNCHANGED": 1}
+    assert _fail(journey, "PRICE_INVOICE_VS_LEDGER") == {"UNCHANGED": 1}
 
 
 def test_passing_control_verifies_the_task_and_recurrence_reopens_it(journey):
-    _fail(journey, "PRICE_BOOKING_VS_INVOICE")
-    assert _pass(journey, "PRICE_BOOKING_VS_INVOICE") == {"VERIFIED": 1}
-    assert _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_status"] == "VERIFIED_COMPLETE"
-    assert _fail(journey, "PRICE_BOOKING_VS_INVOICE", right="2600000") == {"REOPENED": 1}
-    task = _task(journey, "control:PRICE_BOOKING_VS_INVOICE")
+    _fail(journey, "PRICE_INVOICE_VS_LEDGER")
+    assert _pass(journey, "PRICE_INVOICE_VS_LEDGER") == {"VERIFIED": 1}
+    assert _task(journey, "control:PRICE_INVOICE_VS_LEDGER")["task_status"] == "VERIFIED_COMPLETE"
+    assert _fail(journey, "PRICE_INVOICE_VS_LEDGER", right="2600000") == {"REOPENED": 1}
+    task = _task(journey, "control:PRICE_INVOICE_VS_LEDGER")
     assert (task["task_status"], task["round_number"]) == ("READY", 2)
 
 
 def test_only_evaluations_after_the_action_can_return_a_task(journey):
-    _fail(journey, "PRICE_BOOKING_VS_INVOICE")
-    task_id = _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_id"]
+    _fail(journey, "PRICE_INVOICE_VS_LEDGER")
+    task_id = _task(journey, "control:PRICE_INVOICE_VS_LEDGER")["task_id"]
     stale_start = datetime.now(UTC) - timedelta(seconds=5)
     assert _act(journey, task_id, "REVIEW_DOCUMENT")["status"] == "VERIFYING"
 
-    _fail(journey, "PRICE_BOOKING_VS_INVOICE", started=stale_start)
-    assert _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_status"] == "VERIFYING"
-    _fail(journey, "PRICE_BOOKING_VS_INVOICE")
-    assert _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_status"] == "RETURNED"
+    _fail(journey, "PRICE_INVOICE_VS_LEDGER", started=stale_start)
+    assert _task(journey, "control:PRICE_INVOICE_VS_LEDGER")["task_status"] == "VERIFYING"
+    _fail(journey, "PRICE_INVOICE_VS_LEDGER")
+    assert _task(journey, "control:PRICE_INVOICE_VS_LEDGER")["task_status"] == "RETURNED"
 
 
 def test_a_submitted_task_waits_while_the_upload_is_still_being_read(journey):
@@ -142,31 +141,31 @@ def test_a_submitted_task_waits_while_the_upload_is_still_being_read(journey):
     the evaluation after it decides."""
     from p2_support import add_batch_pages
 
-    _fail(journey, "PRICE_BOOKING_VS_INVOICE")
-    task_id = _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_id"]
+    _fail(journey, "PRICE_INVOICE_VS_LEDGER")
+    task_id = _task(journey, "control:PRICE_INVOICE_VS_LEDGER")["task_id"]
     assert _act(journey, task_id, "REVIEW_DOCUMENT")["status"] == "VERIFYING"
     add_batch_pages(journey, [(None, "EXTRACTING")])
-    _fail(journey, "PRICE_BOOKING_VS_INVOICE")
-    assert _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_status"] == "VERIFYING"
+    _fail(journey, "PRICE_INVOICE_VS_LEDGER")
+    assert _task(journey, "control:PRICE_INVOICE_VS_LEDGER")["task_status"] == "VERIFYING"
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(text("UPDATE auditcore.p2_document_queue SET queue_status='READY' WHERE tenant_id=:t"),
                            {"t": journey.tenant_id})
-    _fail(journey, "PRICE_BOOKING_VS_INVOICE")
-    assert _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_status"] == "RETURNED"
+    _fail(journey, "PRICE_INVOICE_VS_LEDGER")
+    assert _task(journey, "control:PRICE_INVOICE_VS_LEDGER")["task_status"] == "RETURNED"
 
 
 def test_tl_can_accept_an_exception_for_the_same_values_only(journey):
-    _fail(journey, "PRICE_BOOKING_VS_INVOICE")
-    task_id = _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_id"]
+    _fail(journey, "PRICE_INVOICE_VS_LEDGER")
+    task_id = _task(journey, "control:PRICE_INVOICE_VS_LEDGER")["task_id"]
     with pytest.raises(ValueError):
         _act(journey, task_id, "ACCEPT_EXCEPTION", role="PC", comment="fine")
     with pytest.raises(ValueError):
         _act(journey, task_id, "ACCEPT_EXCEPTION", role="TL")  # comment required
     assert _act(journey, task_id, "ACCEPT_EXCEPTION", role="TL", comment="OEM price revision")["outcome"] == \
         "EXCEPTION_ACCEPTED"
-    assert _fail(journey, "PRICE_BOOKING_VS_INVOICE") == {"ACCEPTED_EXCEPTION": 1}
-    assert _fail(journey, "PRICE_BOOKING_VS_INVOICE", right="2700000") == {"REOPENED": 1}
+    assert _fail(journey, "PRICE_INVOICE_VS_LEDGER") == {"ACCEPTED_EXCEPTION": 1}
+    assert _fail(journey, "PRICE_INVOICE_VS_LEDGER", right="2700000") == {"REOPENED": 1}
 
 
 def test_low_confidence_fields_raise_a_review_task_that_closes_after_confirmation(journey):
@@ -255,6 +254,18 @@ def test_a_misread_date_and_a_low_confidence_value_share_one_task(journey):
     assert task["severity"] == "HIGH"
     assert "Receipt date read as 'not a date', which is not a date" in task["description"]
     assert "Receipt number (60%)" in task["description"]
+
+
+def test_a_check_of_the_booking_form_against_another_document_raises_no_task(journey):
+    """Product owner 2026-11-15: the booking form's comparisons with other
+    documents raise no tasks; one left open is cancelled."""
+    add_ready_document(journey, "booking_form", total_price="2450000")
+    assert _fail(journey, "PRICE_BOOKING_VS_INVOICE") == {"SUPPRESSED": 1}
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert connection.execute(
+            text("SELECT count(*) FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_status <> 'CANCELLED'"),
+            {"t": journey.tenant_id}).scalar_one() == 0
 
 
 def test_a_booking_form_without_a_booking_date_raises_a_critical_task_that_opens_the_field(journey):
@@ -595,15 +606,15 @@ def _wait(journey, code, reason="No standard price on record yet: the model must
 def test_a_waiting_check_closes_its_task_and_a_new_failure_reopens_it(journey):
     """SHI-SS-261031-007: "Ex-showroom Rs 5,000 short" stayed open once the
     model had no price list and the check could not run."""
-    assert _fail(journey, "PRICE_BOOKING_VS_INVOICE") == {"RAISED": 1}
-    assert _wait(journey, "PRICE_BOOKING_VS_INVOICE") == {"CLOSED_WAITING": 1}
-    task = _task(journey, "control:PRICE_BOOKING_VS_INVOICE")
+    assert _fail(journey, "PRICE_INVOICE_VS_LEDGER") == {"RAISED": 1}
+    assert _wait(journey, "PRICE_INVOICE_VS_LEDGER") == {"CLOSED_WAITING": 1}
+    task = _task(journey, "control:PRICE_INVOICE_VS_LEDGER")
     assert task["task_status"] == "VERIFIED_COMPLETE"
     assert task["completion_result"]["machineVerification"] == "WAITING_FOR_FACTS"
     assert task["completion_result"]["waitingFor"].startswith("No standard price on record yet")
-    assert _wait(journey, "PRICE_BOOKING_VS_INVOICE") == {}  # nothing open: nothing to close
-    assert _fail(journey, "PRICE_BOOKING_VS_INVOICE", right="2600000") == {"REOPENED": 1}
-    assert _task(journey, "control:PRICE_BOOKING_VS_INVOICE")["task_status"] == "READY"
+    assert _wait(journey, "PRICE_INVOICE_VS_LEDGER") == {}  # nothing open: nothing to close
+    assert _fail(journey, "PRICE_INVOICE_VS_LEDGER", right="2600000") == {"REOPENED": 1}
+    assert _task(journey, "control:PRICE_INVOICE_VS_LEDGER")["task_status"] == "READY"
 
 
 def test_a_waiting_that_is_the_ask_keeps_its_task(journey):

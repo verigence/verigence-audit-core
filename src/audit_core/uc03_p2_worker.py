@@ -5310,6 +5310,9 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
                                           "run_reviewer_corrections_backfill"),
         # Cash transactions raise no tasks (product owner, 2026-10-31).
         "CASH_TASK_CLEANUP": ("audit_core.uc03_cash_task_cleanup", "run_cash_task_cleanup"),
+        # The booking form raises no tasks (product owner, 2026-11-15).
+        "BOOKING_FORM_TASK_CLEANUP": ("audit_core.uc03_booking_form_task_cleanup",
+                                      "run_booking_form_task_cleanup"),
         # Audit tasks that named no document, and documents the old name check
         # held out of their bookings (2026-11-01): see uc03_audit_task_cleanup.
         "AUDIT_TASK_CLEANUP": ("audit_core.uc03_audit_task_cleanup", "run_audit_task_cleanup"),

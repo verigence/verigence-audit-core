@@ -280,6 +280,42 @@ OWN_TASK_RESULT = {
 }
 
 
+# Tasks due to the booking form that are no longer raised (product owner
+# 2026-11-15: "lets remove all the tasks due to booking forms", then "Correct
+# the booking date on the Booking Docket ... SKU questions raised from the
+# booking form's price or vehicle ... Upload the Booking Docket ... Check N
+# fields on Booking Docket -- lets keep these only"). Gone: every check that
+# compares the booking form with another document, a wrong customer or dealer
+# name on it, and its figures not read. Kept: the booking date to enter or
+# correct, the SKU questions from its price or vehicle, "Upload the Booking
+# Docket" and the field checks on it. Payment dated before the booking is a
+# payment check and stays (2026-11-14 rule).
+BOOKING_FORM_TYPES = frozenset({"booking_form", "booking_docket"})
+BOOKING_FORM_TASK_CODES = frozenset({
+    "PRICE_BOOKING_VS_INVOICE", "MODEL_VARIANT_BOOKING_VS_INVOICE", "CUSTOMER_NAME_BOOKING_VS_INVOICE",
+    "KYC_NAME_VS_BOOKING", "ACCESSORY_BOOKING_VS_INVOICE", "DISCOUNT_INVOICE_VS_BOOKING",
+    "INVOICE_DATE_BEFORE_BOOKING", "BOOKING_TO_DELIVERY_EXCESS", "BOOKING_AMOUNT_ZERO",
+    "BOOKING_RECEIPT_SUM_VS_BOOKING_FORM",
+})
+BOOKING_FORM_TASK_RESULT = {
+    "outcome": "CHECK_RETIRED",
+    "reason": "Checks of the booking form against other documents raise no tasks (product owner, 2026-11-15)",
+}
+
+
+def about_the_booking_form(source_code: str | None, reference: dict[str, Any] | None) -> bool:
+    """Whether a task is one of the booking form's retired tasks: a check of
+    the booking form against another document, or a wrong customer / dealer
+    name on the booking form itself."""
+    if source_code in BOOKING_FORM_TASK_CODES:
+        return True
+    if source_code in ("WRONG_DEALER_NAME", "WRONG_CUSTOMER_NAME"):
+        reference = reference or {}
+        types = {str(reference[k]) for k in ("templateKey", "documentType", "diType") if reference.get(k)}
+        return bool(types) and types <= BOOKING_FORM_TYPES
+    return False
+
+
 def cancel_suppressed_task(connection: Connection, *, tenant_id: str, journey_id: UUID,
                            dedupe_key: str, result: dict[str, Any] | None = None) -> UUID | None:
     """Cancel the open task under ``dedupe_key`` as a check that raises no
@@ -331,6 +367,9 @@ def raise_or_refresh(
     if source_code in SUPPRESSED_TASK_CODES:
         return cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
                                       dedupe_key=dedupe_key), "SUPPRESSED"
+    if about_the_booking_form(source_code, reference):
+        return cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                      dedupe_key=dedupe_key, result=BOOKING_FORM_TASK_RESULT), "SUPPRESSED"
     template = registry.tasks[task_type]
     priority = _PRIORITY_BY_SEVERITY.get(severity, "NORMAL")
     reference = {**reference, "issueHash": _issue_hash(reference)}
@@ -570,6 +609,12 @@ def apply_control_transitions(
             # Cash transactions raise no tasks (product owner, 2026-10-31):
             # whatever the result, no task; one left open is cancelled.
             cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key)
+            counts["SUPPRESSED"] = counts.get("SUPPRESSED", 0) + 1
+            continue
+        if control.code in BOOKING_FORM_TASK_CODES:
+            # The booking form raises no tasks (product owner, 2026-11-15).
+            cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                                   result=BOOKING_FORM_TASK_RESULT)
             counts["SUPPRESSED"] = counts.get("SUPPRESSED", 0) + 1
             continue
         if control.code in OWN_TASK_CODES:
@@ -2126,7 +2171,9 @@ def sync_name_consistency_tasks(
     check = customer_name_check(connection, tenant_id=tenant_id, journey_id=journey_id, registry=registry)
     if check is not None:
         kyc, kyc_template, gst_names = check["kyc"], check["kycTemplate"], check["gstNames"]
-        mismatched = check["mismatched"]
+        # The booking form raises no tasks (2026-11-15): a booking docket in
+        # another name is not listed.
+        mismatched = [d for d in check["mismatched"] if d.get("diType") not in BOOKING_FORM_TYPES]
         # A genuine mismatch is one PC task per Journey (product owner
         # 2026-10-29): one task naming every document in another name,
         # instead of a task per document (141 open on 89 Journeys, up to 8 on
@@ -2185,6 +2232,8 @@ def sync_name_consistency_tasks(
     if dealership:
         for document in _named_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
                                          pairs=rules.dealer_name_checked):
+            if document.get("diType") in BOOKING_FORM_TYPES:
+                continue  # the booking form raises no tasks (2026-11-15)
             if any(same_organisation(document["name"], name) for name in oem_names):
                 continue
             if names_the_dealership(document["name"], dealership) is not False:

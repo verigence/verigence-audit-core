@@ -233,12 +233,10 @@ def test_a_misread_booking_docket_puts_no_receipt_on_a_task(journey):
     add_ready_document(journey, "customer_ledger", customer_name="Anita Sahoo", dealer_name="MOBILES PVT. LTD.")
     assert _sync(journey) == {}
     # A docket naming another organisation (the customer's company read as the
-    # dealer) is the one document on a task -- not the receipts.
-    docket = add_ready_document(journey, "booking_form", customer_name="Anita Sahoo",
-                                dealer_name="M/s. Sri Sai Metal and Logistic Pvt Ltd")
-    assert _sync(journey) == {"RAISED": 1}
-    (task,) = _tasks(journey)
-    assert task["reference"]["documentId"] == str(docket)
+    # dealer) raises nothing either: the booking form raises no tasks (2026-11-15).
+    add_ready_document(journey, "booking_form", customer_name="Anita Sahoo",
+                       dealer_name="M/s. Sri Sai Metal and Logistic Pvt Ltd")
+    assert _sync(journey) == {}
 
 
 def test_the_verified_kyc_name_stays_the_reference_when_another_persons_kyc_arrives(journey):
@@ -310,7 +308,9 @@ def test_a_kyc_name_a_person_corrected_is_the_reference(journey):
 def test_several_documents_in_another_name_are_one_task(journey):
     add_ready_document(journey, "pan_card", pan_number="ABCDE1234F", pan_name="BISWABHANU BISWAL")
     a = add_ready_document(journey, "insurance_cover", insured_name="Anita Sahoo", policy_number="P1")
-    b = add_ready_document(journey, "booking_form", customer_name="Rajesh Kumar", dealer_name="Sarthak Motors")
+    b = add_ready_document(journey, "customer_invoice_dms", buyer_name="Rajesh Kumar", invoice_number="I1")
+    # The booking form raises no tasks (2026-11-15): one in another name is not listed.
+    add_ready_document(journey, "booking_form", customer_name="Suresh Das", dealer_name="Sarthak Motors")
     assert _sync(journey) == {"RAISED": 1}
     (task,) = _tasks(journey)
     assert set(task["reference"]["documentIds"]) == {str(a), str(b)}
@@ -394,14 +394,14 @@ def test_under_a_gst_certificate_another_persons_kyc_is_not_the_proprietors(jour
     tapan = add_ready_document(journey, "pan_card", pan_number="AVFPP9596G", pan_name="TAPAN KUMAR PATRA")
     tapan_aadhaar = add_ready_document(journey, "aadhaar", aadhaar_number="5845 3895 7247",
                                        aadhaar_name="TAPAN KUMAR PATRA")
-    docket = add_ready_document(journey, "booking_form", customer_name="TAPAN KUMAR PATRA",
-                                dealer_name="Sarthak Motors")
+    add_ready_document(journey, "booking_form", customer_name="TAPAN KUMAR PATRA", dealer_name="Sarthak Motors")
     if not strict:
         assert _sync(journey) == {}  # the rule as it was
         return
     assert _sync(journey) == {"RAISED": 1}
     (task,) = _tasks(journey)
-    assert set(task["reference"]["documentIds"]) == {str(tapan), str(tapan_aadhaar), str(docket)}
+    # The booking form raises no tasks (2026-11-15): the docket is not listed.
+    assert set(task["reference"]["documentIds"]) == {str(tapan), str(tapan_aadhaar)}
     assert task["reference"]["customerName"] == "AZIZUR REHAMAN"
 
 
@@ -594,11 +594,11 @@ def test_another_firm_is_still_the_wrong_dealer_document(journey):
 
 def test_another_dealership_is_caught_against_the_master_whatever_the_booking_form_says(journey):
     """The dealer master, not the booking form, is the reference (2026-11-14):
-    a booking form and an invoice that agree on another dealership are both
-    the wrong documents."""
+    an invoice that agrees with the booking form on another dealership is the
+    wrong document; the booking form itself raises no tasks (2026-11-15)."""
     _master_dealer(journey, "Aditya Motors")
-    form = add_ready_document(journey, "booking_form", customer_name="Anita Sahoo", dealer_name="Sarthak Motors")
+    add_ready_document(journey, "booking_form", customer_name="Anita Sahoo", dealer_name="Sarthak Motors")
     other = add_ready_document(journey, "customer_invoice_dms", buyer_name="Anita Sahoo",
                                seller_name="Sarthak Agencies", invoice_number="I1")
-    assert _sync(journey) == {"RAISED": 2}
-    assert {t["reference"]["documentId"] for t in _tasks(journey)} == {str(form), str(other)}
+    assert _sync(journey) == {"RAISED": 1}
+    assert {t["reference"]["documentId"] for t in _tasks(journey)} == {str(other)}

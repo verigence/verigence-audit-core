@@ -50,8 +50,6 @@ _RECEIPT = (_f("amount", "amount_paid", amount=True), _f("date", "receipt_date")
             _f("receipt number", "receipt_number"), _f("payment mode", "payment_mode"))
 _INVOICE = (_f("grand total", "grand_total_amount", amount=True), _f("invoice number", "invoice_number"),
             _f("invoice date", "invoice_date"))
-_BOOKING = (_f("booking date", "booking_date"), _f("customer name", "customer_name"),
-            _f("mobile", "customer_phone"), _f("model", "vehicle_model"))
 
 KEY_FIGURES: dict[str, tuple[Figure, ...]] = {
     "dealer_receipt": _RECEIPT,
@@ -69,8 +67,8 @@ KEY_FIGURES: dict[str, tuple[Figure, ...]] = {
     "accessory_invoice_tally": _INVOICE,
     "ew_invoice": _INVOICE,
     "rsa_invoice": _INVOICE,
-    "booking_docket": _BOOKING,
-    "booking_form": _BOOKING,
+    # The booking form raises no tasks (product owner 2026-11-15): its figures
+    # not read are not asked for.
     "pan_card": (_f("PAN", "pan_number"),),
     "aadhaar": (_f("Aadhaar number", "aadhaar_number"),),
 }
