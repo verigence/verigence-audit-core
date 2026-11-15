@@ -51,7 +51,8 @@ def test_one_figure_under_either_of_its_names_is_enough():
 def test_every_figure_listed_for_each_type():
     assert {f.label for f in KEY_FIGURES["insurance_cover"]} == {
         "premium", "policy number", "insurer", "policy start date", "chassis number"}
-    assert {f.label for f in KEY_FIGURES["booking_docket"]} == {"booking date", "customer name", "mobile", "model"}
+    # The booking form raises no tasks (2026-11-15): none of its figures is asked for.
+    assert "booking_docket" not in KEY_FIGURES and "booking_form" not in KEY_FIGURES
     assert _labels("unknown_type", {}) == []
 
 
