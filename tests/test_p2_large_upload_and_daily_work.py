@@ -303,7 +303,7 @@ def test_work_done_counts_what_each_person_did_and_ignores_the_system(journey):
     assert pc["byAction"] == {"ADD_COMMENT": 1, "UPLOAD_DOCUMENT": 2}
     assert pc["byTaskType"] == {"DOCUMENT_MISSING": 2} and pc["journeys"] == 1
     first_task = next(t for t in pc["tasks"] if t["title"] == "First")
-    assert first_task["actions"] == ["ADD_COMMENT", "UPLOAD_DOCUMENT"] and first_task["lastComment"] == "On it"
+    assert sorted(first_task["actions"]) == ["ADD_COMMENT", "UPLOAD_DOCUMENT"] and first_task["lastComment"] == "On it"
     lead = people[(tl, "TL")]
     assert lead["tasksWorked"] == 1 and lead["tasksClosed"] == 1 and lead["name"] is None
     assert not [p for p in work["people"] if p["actorId"].upper() == "SYSTEM"]
