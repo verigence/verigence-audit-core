@@ -1598,6 +1598,12 @@ def load_ledger_documents(
         details = _discount_detail_rows(doc["fields"])
         if details:
             doc["fields"]["line_items"] = [*line_rows(doc["fields"].get("line_items")), *details]
+        if document_type == ACCOUNT_STATEMENT_TYPE:
+            # a thousands comma read as a "1" (7,000 read 71000), put back only
+            # when the dealer's printed totals then add up (uc03_statement_misreads)
+            from audit_core.uc03_statement_misreads import repair_comma_misreads
+
+            doc["fields"], doc["commaMisreads"] = repair_comma_misreads(doc["fields"])
     return list(documents.values())
 
 
