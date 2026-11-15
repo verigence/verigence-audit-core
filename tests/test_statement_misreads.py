@@ -54,3 +54,41 @@ def test_no_repair_when_it_does_not_add_up():
     wrong = {**JASMITA, "total_receipts": "1167000"}
     fields, repaired = repair_comma_misreads(wrong)
     assert repaired == [] and fields is wrong
+
+
+# UTK-SB-261030-009: the closing "/-" read as a "1" on the three discounts
+SLASH = {
+    "total_cost": "1154657",
+    "total_receipts": "1154657",
+    "line_items": [
+        {"particulars_raw": "Vehicle cost", "debit_amount": 1029901},
+        {"particulars_raw": "Insurance amount", "debit_amount": 34993},
+        {"particulars_raw": "Registration", "debit_amount": 61634},
+        {"particulars_raw": "Accessories", "debit_amount": 28129},
+        {"particulars_raw": "Finance D/O MMFSL MR No. 08228", "credit_amount": 624491},
+        {"particulars_raw": "MR No. 01287", "credit_amount": 21000},
+        {"particulars_raw": "MR No. 08303", "credit_amount": 199000},
+        {"particulars_raw": "MR No. 08310", "credit_amount": 100000},
+        {"particulars_raw": "MR No. 08735", "credit_amount": 30000},
+        {"particulars_raw": "MR No.", "credit_amount": 50000},
+        {"particulars_raw": "MR No.", "credit_amount": 73166},
+        {"particulars_raw": "Scheme Discount", "credit_amount": 30001},
+        {"particulars_raw": "Exchange Loyality", "credit_amount": 20001},
+        {"particulars_raw": "Other Discount (if any)", "credit_amount": 70001},
+    ],
+}
+
+
+def test_slash_readings():
+    from audit_core.uc03_statement_misreads import slash_readings
+    assert slash_readings(Decimal(70001)) == [Decimal(7000), Decimal(70000)]
+    assert slash_readings(Decimal(624491)) == []
+    assert slash_readings(Decimal(73166)) == []
+
+
+def test_slash_dash_read_as_one_put_back():
+    assert statement_differences(SLASH)
+    fields, repaired = repair_comma_misreads(SLASH)
+    assert statement_differences(fields) == []
+    # 30001 and 20001 are within the Rs 10 the totals allow; 70001 is not
+    assert {r["row"]: r["amount"] for r in repaired} == {"Other Discount (if any)": "7000"}
