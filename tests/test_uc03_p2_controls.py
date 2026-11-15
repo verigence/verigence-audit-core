@@ -551,3 +551,35 @@ def test_a_failed_page_closed_by_the_system_still_needs_attention(journey):
     _quality_task(journey, pages[1]["queue_id"], status="VERIFIED_COMPLETE", outcome="RESOLVED_BY_SYSTEM")
     _evaluate(journey, "P2:DERIVED")
     assert _states(journey)["DL_V2_DOCUMENT_PROCESSING_FAILED"]["control_status"] == "FAIL"
+
+
+class DeliveryOrderMissingRuleEngine(ChassisEmptyRuleEngine):
+    """Since 13 Nov 2026 16:00 UTC the invoice-project checks fail on every Journey."""
+
+    def evaluate_phase(self, *, token, tenant_id, subject_id, phase, documents=None):
+        return SimpleNamespace(audit_run_id="run-3", verdict="ANOMALIES", anomalies=(
+            SimpleNamespace(rule_code="DELIVERY_ORDER_MISSING", severity="MEDIUM", category="PROCESS",
+                            detail="Delivery order missing", left_value=None, right_value=None),))
+
+    def list_rules(self, *, token, tenant_id):
+        return (SimpleNamespace(rule_code="DELIVERY_ORDER_MISSING", phases=("DELIVERY",)),)
+
+
+def test_an_invoice_project_check_does_not_apply_where_the_ndc_is_the_deal(journey, monkeypatch):
+    """Product owner 2026-11-15: the NDC is the source of every comparison; the
+    Rule Engine's invoice checks and its document-presence checks (which repeat
+    the native checklist) raised 3,831 PC tasks in a day on Mahindra Orissa."""
+    from audit_core.uc03_deal_source_policy import POLICY_ACCOUNT_STATEMENT
+
+    _wire_rule_engine(monkeypatch, DeliveryOrderMissingRuleEngine())
+    add_ready_document(journey, "booking_form", customer_name="RAVI KUMAR")
+    _evaluate(journey, "RULE_ENGINE:DELIVERY")
+    assert _states(journey)["DELIVERY_ORDER_MISSING"]["control_status"] == "FAIL"  # an invoice Project: checked
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        c.execute(text("UPDATE auditcore.projects SET deal_source_policy=:p WHERE tenant_id=:t"),
+                  {"p": POLICY_ACCOUNT_STATEMENT, "t": journey.tenant_id})
+    _evaluate(journey, "RULE_ENGINE:DELIVERY", force=True)
+    state = _states(journey)["DELIVERY_ORDER_MISSING"]
+    assert state["control_status"] == "NOT_APPLICABLE"
+    assert state["status_reason"].startswith("Not checked for a Project whose Deal is the NDC")

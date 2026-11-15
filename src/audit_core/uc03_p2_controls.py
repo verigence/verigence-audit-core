@@ -446,6 +446,28 @@ def _evaluate_native(engine: Engine, *, tenant_id: str, journey_id: UUID, stage:
     return transitions
 
 
+def _not_under_the_ndc(connection: Connection, *, tenant_id: str, controls: list[Any]) -> dict[str, str]:
+    """The Rule Engine checks that do not apply to a Project whose Deal is the
+    NDC (account statement), with why. Product owner 2026-11-15 ("NDC should
+    be the source for all comparisons, Tally and DMS invoice should be read but
+    no addition or additional line to be picked from them"; "can we work on it
+    now", on switching off the checks that do not fit): a check pricing the
+    booking or the invoice against the invoice, the Tally or the ledger is no
+    comparison of this Project, and a document-presence check repeats the
+    native document checklist, which knows when a DO, a PO or an invoice is
+    needed. From 13 Nov 2026 16:00 UTC these checks, until then always
+    skipped, failed on every Journey and raised 3,831 PC tasks in a day. Their
+    state is NOT_APPLICABLE, so their open findings and tasks close."""
+    marked = [c for c in controls if getattr(c, "not_under_ndc", None)]
+    if not marked:
+        return {}
+    from audit_core.uc03_deal_source_policy import account_statement_is_source_of_truth
+
+    if not account_statement_is_source_of_truth(connection, tenant_id=tenant_id):
+        return {}
+    return {c.code: f"Not checked for a Project whose Deal is the NDC: {c.not_under_ndc}" for c in marked}
+
+
 def _presence_checks_without_their_document(
     connection: Connection, *, tenant_id: str, journey_id: UUID, controls: list[Any], registry: Registry,
 ) -> dict[str, str]:
@@ -568,6 +590,7 @@ def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stag
         set_tenant_context(connection, tenant_id)
         absent = _presence_checks_without_their_document(connection, tenant_id=tenant_id, journey_id=journey_id,
                                                          controls=controls, registry=registry)
+        absent.update(_not_under_the_ndc(connection, tenant_id=tenant_id, controls=controls))
     anomalies = {a.rule_code: a for a in result.anomalies if a.rule_code not in absent}
     not_ready = {n.rule_code: n.reason for n in getattr(result, "skipped", ())}
     # Every rule of this phase the run neither failed nor skipped passed.

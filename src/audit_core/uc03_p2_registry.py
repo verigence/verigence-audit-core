@@ -153,6 +153,9 @@ class ControlTemplate:
     page_statuses: tuple[str, ...] = ()
     event: str | None = None
     rule_engine_phases: tuple[str, ...] = ()
+    # Why the control does not apply to a Project whose Deal is the NDC
+    # (account statement), or None when it does (2026-11-15).
+    not_under_ndc: str | None = None
 
     def applies_to_stage(self, stage: str) -> bool:
         return not self.phases or stage in self.phases
@@ -394,6 +397,7 @@ def build_registry(
             page_statuses=_tuple(raw.get("page_statuses")),
             event=raw.get("event"),
             rule_engine_phases=_tuple(raw.get("rule_engine_phases")),
+            not_under_ndc=raw.get("not_under_ndc"),
         )
 
     tasks = {

@@ -483,6 +483,7 @@ controls:
       owner: TL
   ACCESSORY_BOOKING_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the NDC prices the deal; invoices and the Tally are read, never compared as the deal price"
     mode: EXTERNAL
     category: ACCESSORY
     phases:
@@ -519,6 +520,7 @@ controls:
       owner: PC
   ACCESSORY_DMS_VS_TALLY:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the NDC prices the deal; invoices and the Tally are read, never compared as the deal price"
     mode: EXTERNAL
     category: ACCESSORY
     phases:
@@ -643,6 +645,7 @@ controls:
       owner: PC
   CORPORATE_PO_AMOUNT_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the NDC prices the deal; invoices and the Tally are read, never compared as the deal price"
     mode: EXTERNAL
     category: CORPORATE
     phases:
@@ -661,6 +664,7 @@ controls:
       owner: PC
   CORPORATE_PO_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the native document checklist asks for this document only when the deal needs it"
     mode: EXTERNAL
     category: CORPORATE
     phases:
@@ -677,6 +681,7 @@ controls:
       owner: PC
   CUSTOMER_LEDGER_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the native document checklist asks for this document only when the deal needs it"
     mode: EXTERNAL
     category: COMPLETENESS
     phases:
@@ -693,6 +698,7 @@ controls:
       owner: PC
   CUSTOMER_NAME_BOOKING_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "customer names are checked natively (customer identity rules)"
     mode: EXTERNAL
     category: VEHICLE
     phases:
@@ -729,6 +735,7 @@ controls:
       owner: PC
   DELIVERY_ORDER_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the native document checklist asks for this document only when the deal needs it"
     mode: EXTERNAL
     category: PROCESS
     phases:
@@ -760,6 +767,7 @@ controls:
       owner: PC
   DISCOUNT_INVOICE_DMS_VS_TALLY:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the NDC prices the deal; invoices and the Tally are read, never compared as the deal price"
     mode: EXTERNAL
     category: DISCOUNT
     phases:
@@ -777,6 +785,7 @@ controls:
       owner: PC
   DISCOUNT_INVOICE_VS_BOOKING:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the NDC prices the deal; invoices and the Tally are read, never compared as the deal price"
     mode: EXTERNAL
     category: DISCOUNT
     phases:
@@ -863,6 +872,7 @@ controls:
       owner: PC
   GATE_PASS_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the native document checklist asks for this document only when the deal needs it"
     mode: EXTERNAL
     category: COMPLETENESS
     phases:
@@ -878,6 +888,7 @@ controls:
       owner: PC
   INSURANCE_COVER_NOTE_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the native document checklist asks for this document only when the deal needs it"
     mode: EXTERNAL
     category: INSURANCE
     phases:
@@ -944,6 +955,7 @@ controls:
       owner: PC
   INVOICE_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the native document checklist asks for this document only when the deal needs it"
     mode: EXTERNAL
     category: COMPLETENESS
     phases:
@@ -976,6 +988,7 @@ controls:
       owner: PC
   KYC_NAME_VS_BOOKING:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "customer names are checked natively (customer identity rules)"
     mode: EXTERNAL
     category: KYC
     phases:
@@ -993,6 +1006,7 @@ controls:
       owner: PC
   KYC_NAME_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "customer names are checked natively (customer identity rules)"
     mode: EXTERNAL
     category: KYC
     phases:
@@ -1010,6 +1024,7 @@ controls:
       owner: PC
   MODEL_VARIANT_BOOKING_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the model is resolved natively from the documents (SKU)"
     mode: EXTERNAL
     category: VEHICLE
     phases:
@@ -1047,6 +1062,7 @@ controls:
       owner: PC
   PAYMENT_SUM_VS_LEDGER:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "payments are verified natively against the ledger and the NDC"
     mode: EXTERNAL
     category: PRICE
     phases:
@@ -1064,6 +1080,7 @@ controls:
       owner: PC
   PRICE_BOOKING_VS_INVOICE:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the NDC prices the deal; invoices and the Tally are read, never compared as the deal price"
     mode: EXTERNAL
     category: PRICE
     phases:
@@ -1081,6 +1098,7 @@ controls:
       owner: PC
   PRICE_INVOICE_DMS_VS_TALLY:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the NDC prices the deal; invoices and the Tally are read, never compared as the deal price"
     mode: EXTERNAL
     category: PRICE
     phases:
@@ -1098,6 +1116,7 @@ controls:
       owner: PC
   PRICE_INVOICE_VS_LEDGER:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the NDC prices the deal; invoices and the Tally are read, never compared as the deal price"
     mode: EXTERNAL
     category: PRICE
     phases:
@@ -1115,6 +1134,7 @@ controls:
       owner: PC
   RTO_CHALLAN_MISSING:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the native document checklist asks for this document only when the deal needs it"
     mode: EXTERNAL
     category: RTO
     phases:
@@ -1130,6 +1150,7 @@ controls:
       owner: PC
   TALLY_ACCESSORY_INVOICE_VS_DMS:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the NDC prices the deal; invoices and the Tally are read, never compared as the deal price"
     mode: EXTERNAL
     category: TALLY_DMS
     phases:
@@ -1147,6 +1168,7 @@ controls:
       owner: PC
   TALLY_VEHICLE_INVOICE_VS_DMS:
     executor: EXTERNAL_RULE_ENGINE
+    not_under_ndc: "the NDC prices the deal; invoices and the Tally are read, never compared as the deal price"
     mode: EXTERNAL
     category: TALLY_DMS
     phases:
