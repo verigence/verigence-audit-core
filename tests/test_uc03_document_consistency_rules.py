@@ -134,3 +134,24 @@ def test_a_project_with_the_rule_engine_off_sends_nothing(journey):
             "INSERT INTO auditcore.tenant_rule_config (tenant_id, rule_engine_enabled) VALUES (:t, false) "
             "ON CONFLICT (tenant_id) DO UPDATE SET rule_engine_enabled=false"), {"t": journey.tenant_id})
     assert not rule_engine_enabled(journey.engine, tenant_id=journey.tenant_id)
+
+
+def test_turning_the_rule_engine_off_runs_its_unit_again_on_unchanged_facts(journey):
+    """2026-11-15: 2,769 Rule Engine tasks stayed open after the switch-off because
+    their journeys' facts had not changed, so the unit was never run again."""
+    from audit_core.uc03_p2_controls import _unit_fingerprint
+
+    def fingerprint(unit: str) -> str:
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            return _unit_fingerprint(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                                     unit=unit)
+
+    on_external, on_native = fingerprint("RULE_ENGINE:DELIVERY"), fingerprint("NATIVE:DELIVERY")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text(
+            "INSERT INTO auditcore.tenant_rule_config (tenant_id, rule_engine_enabled) VALUES (:t, false) "
+            "ON CONFLICT (tenant_id) DO UPDATE SET rule_engine_enabled=false"), {"t": journey.tenant_id})
+    assert fingerprint("RULE_ENGINE:DELIVERY") != on_external
+    assert fingerprint("NATIVE:DELIVERY") == on_native
