@@ -1554,6 +1554,10 @@ def self_insurance_declared(facts: _Facts) -> RuleOutcome:
 
 # Journey-wide checks run with the Booking unit (always evaluated); checks
 # that need a delivery run with the Delivery unit.
+from audit_core import (
+    uc03_document_consistency_rules as _document_consistency,
+)
+
 _BOOKING_RULES = (
     booking_date_unusable,
     deal_undercharged, excess_discount, kit_given_as_cash, tcs_short, tcs_excess, figure_implausible,
@@ -1569,6 +1573,8 @@ _DELIVERY_RULES = (
     trade_in_not_resold, trade_in_sold_at_loss, post_delivery_refund,
     accessories_fitted_unconfirmed, accessory_fitted_unbilled,
     delivery_not_completed_in_time,
+    # Moved from the Rule Engine (product owner 2026-11-15, uc03_document_consistency_rules).
+    *_document_consistency.DELIVERY_CHECKS,
 )
 RULE_CODES = {
     "BOOKING": tuple(r.__name__.upper() for r in _BOOKING_RULES),
@@ -1585,6 +1591,7 @@ _FINDING_TYPES = {
     "DELIVERY_NOT_COMPLETED_IN_TIME": "DELIVERY_EXCEPTION",
     "ACCESSORY_FITTED_UNBILLED": "PROCESS_NON_COMPLIANCE",
     "SELF_INSURANCE_DECLARED": "COMMERCIAL_EXCEPTION",
+    **{code: "PROCESS_NON_COMPLIANCE" for code in _document_consistency.CODES},
 }
 _DEFAULT_FINDING_TYPE = "PAYMENT_EXCEPTION"
 

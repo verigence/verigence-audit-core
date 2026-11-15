@@ -62,8 +62,12 @@ class TenantAlertsResponse(BaseModel):
     serverTimeUtc: datetime
 
 
-def _for_audience(payload: dict[str, Any], held: dict[str, set[str]] | None) -> bool:
-    """An alert with an audience is for those who hold one of its roles at one of its outlets."""
+def _for_audience(payload: dict[str, Any], held: dict[str, set[str]] | None, actor_id: str | None = None) -> bool:
+    """An alert with an audience is for those who hold one of its roles at one of its outlets,
+    or, when it names people (``audienceActorIds``, 2026-11-15), for those people only."""
+    people = payload.get("audienceActorIds")
+    if people:
+        return actor_id is not None and str(actor_id) in {str(p) for p in people}
     outlets = payload.get("audienceOutletIds")
     if not outlets:
         return True
@@ -81,7 +85,7 @@ def roles_by_outlet(connection: Connection, *, tenant_id: str, actor_id: str) ->
 
 
 def active_alerts(connection: Connection, *, tenant_id: str, since: datetime | None = None,
-                  held: dict[str, set[str]] | None = None) -> list[TenantAlert]:
+                  held: dict[str, set[str]] | None = None, actor_id: str | None = None) -> list[TenantAlert]:
     from audit_core.uc03_p2_same_file import _CLOSED_SQL
 
     rows = connection.execute(
@@ -120,7 +124,7 @@ def active_alerts(connection: Connection, *, tenant_id: str, since: datetime | N
             expiresAtUtc=row["expires_at_utc"],
         )
         for row in rows
-        if _for_audience(dict(row["payload"] or {}), held)
+        if _for_audience(dict(row["payload"] or {}), held, actor_id)
     ]
 
 
@@ -139,5 +143,6 @@ def list_tenant_alerts(
     set_tenant_context(connection, tenant_id)
     now = connection.execute(text("SELECT now()")).scalar_one()
     held = roles_by_outlet(connection, tenant_id=tenant_id, actor_id=human_principal.subject)
-    return TenantAlertsResponse(items=active_alerts(connection, tenant_id=tenant_id, since=since, held=held),
+    return TenantAlertsResponse(items=active_alerts(connection, tenant_id=tenant_id, since=since, held=held,
+                                                    actor_id=human_principal.subject),
                                 serverTimeUtc=now)

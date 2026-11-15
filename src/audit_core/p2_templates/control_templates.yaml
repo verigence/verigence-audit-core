@@ -501,22 +501,22 @@ controls:
       type: RULE_DISCREPANCY_REVIEW
       owner: PC
   ACCESSORY_DATE_VS_DELIVERY:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: ACCESSORY
+    # Moved from the Rule Engine (product owner 2026-11-15, uc03_document_consistency_rules).
+    executor: NATIVE
+    mode: RERUN
     phases:
     - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    operands:
-      left: accessory_invoice_dms.invoice_date
-      right: gate_pass.delivery_date
-    depends_on_documents:
-    - accessory_invoice_dms
-    - gate_pass
+    category: ACCESSORY
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
     task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
+      type: FINDING_REVIEW
+      owner: TL
   ACCESSORY_DMS_VS_TALLY:
     executor: EXTERNAL_RULE_ENGINE
     mode: EXTERNAL
@@ -535,22 +535,22 @@ controls:
       type: RULE_DISCREPANCY_REVIEW
       owner: PC
   ACCESSORY_VIN_VS_VEHICLE_VIN:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: ACCESSORY
+    # Moved from the Rule Engine (product owner 2026-11-15, uc03_document_consistency_rules).
+    executor: NATIVE
+    mode: RERUN
     phases:
     - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    operands:
-      left: accessory_invoice_dms.chassis_number
-      right: customer_invoice_dms.chassis_number
-    depends_on_documents:
-    - accessory_invoice_dms
-    - customer_invoice_dms
+    category: ACCESSORY
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
     task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
+      type: FINDING_REVIEW
+      owner: TL
   BOOKING_AMOUNT_ZERO:
     executor: EXTERNAL_RULE_ENGINE
     mode: EXTERNAL
@@ -587,78 +587,73 @@ controls:
       type: RULE_DISCREPANCY_REVIEW
       owner: PC
   CHASSIS_INVOICE_VS_DO:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
+    # Moved from the Rule Engine (product owner 2026-11-15, uc03_document_consistency_rules).
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
     category: VEHICLE
-    phases:
-    - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    operands:
-      left: customer_invoice_dms.chassis_number
-      right: delivery_order_cover.chassis_number
-    depends_on_documents:
-    - customer_invoice_dms
-    - delivery_order_cover
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
     task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
+      type: FINDING_REVIEW
+      owner: TL
   CORPORATE_GSTIN_CERT_VS_INVOICE:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: CORPORATE
+    # Moved from the Rule Engine (product owner 2026-11-15, uc03_document_consistency_rules).
+    executor: NATIVE
+    mode: RERUN
     phases:
     - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    - CORPORATE
-    operands:
-      left: gst_certificate.gstin
-      right: customer_invoice_dms.buyer_gstin
-    depends_on_documents:
-    - gst_certificate
-    - customer_invoice_dms
+    category: CORPORATE
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
     task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
+      type: FINDING_REVIEW
+      owner: TL
   CORPORATE_NAME_CERT_VS_INVOICE:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: CORPORATE
+    # Moved from the Rule Engine (product owner 2026-11-15, uc03_document_consistency_rules).
+    executor: NATIVE
+    mode: RERUN
     phases:
-    - BOOKING
     - DELIVERY
-    rule_engine_phases:
-    - BOOKING
-    - DELIVERY
-    - CORPORATE
-    operands:
-      left: gst_certificate.legal_name
-      right: customer_invoice_dms.buyer_name
-    depends_on_documents:
-    - gst_certificate
-    - customer_invoice_dms
+    category: CORPORATE
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
     task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
+      type: FINDING_REVIEW
+      owner: TL
   CORPORATE_PO_AMOUNT_VS_INVOICE:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: CORPORATE
+    # Moved from the Rule Engine (product owner 2026-11-15, uc03_document_consistency_rules).
+    executor: NATIVE
+    mode: RERUN
     phases:
     - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    - CORPORATE
-    operands:
-      left: purchase_order.po_amount
-      right: customer_invoice_dms.grand_total_amount
-    depends_on_documents:
-    - purchase_order
-    - customer_invoice_dms
+    category: CORPORATE
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
     task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
+      type: FINDING_REVIEW
+      owner: TL
   CORPORATE_PO_MISSING:
     executor: EXTERNAL_RULE_ENGINE
     mode: EXTERNAL
@@ -711,22 +706,22 @@ controls:
       type: RULE_DISCREPANCY_REVIEW
       owner: PC
   DEBIT_NOTE_INSURANCE_VS_COVER_NOTE:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: DEBIT_NOTE
+    # Moved from the Rule Engine (product owner 2026-11-15, uc03_document_consistency_rules).
+    executor: NATIVE
+    mode: RERUN
     phases:
     - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    operands:
-      left: debit_note.insurance_amount
-      right: insurance_cover.premium_amount
-    depends_on_documents:
-    - debit_note
-    - insurance_cover
+    category: DEBIT_NOTE
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
     task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
+      type: FINDING_REVIEW
+      owner: TL
   DELIVERY_ORDER_MISSING:
     executor: EXTERNAL_RULE_ENGINE
     mode: EXTERNAL
@@ -795,56 +790,56 @@ controls:
       type: RULE_DISCREPANCY_REVIEW
       owner: PC
   DO_DATE_AFTER_GATE:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: DATE
+    # Moved from the Rule Engine (product owner 2026-11-15, uc03_document_consistency_rules).
+    executor: NATIVE
+    mode: RERUN
     phases:
     - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    operands:
-      left: delivery_order_cover.delivery_date
-      right: gate_pass.delivery_date
-    depends_on_documents:
-    - delivery_order_cover
-    - gate_pass
+    category: DATE
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
     task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
+      type: FINDING_REVIEW
+      owner: TL
   EXCHANGE_VALUE_VS_INVOICE_CREDIT:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
+    # Moved from the Rule Engine (product owner 2026-11-15, uc03_document_consistency_rules).
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
     category: EXCHANGE
-    phases:
-    - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    - EXCHANGE
-    operands:
-      left: valuation_report.final_offer_value
-      right: _reconciliation.discount:EXCHANGE:actual
-    depends_on_documents:
-    - valuation_report
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
     task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
+      type: FINDING_REVIEW
+      owner: TL
   GATE_DATE_BEFORE_INVOICE:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: DATE
+    # Moved from the Rule Engine (product owner 2026-11-15, uc03_document_consistency_rules).
+    executor: NATIVE
+    mode: RERUN
     phases:
     - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    operands:
-      left: gate_pass.delivery_date
-      right: customer_invoice_dms.invoice_date
-    depends_on_documents:
-    - gate_pass
-    - customer_invoice_dms
+    category: DATE
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
     task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
+      type: FINDING_REVIEW
+      owner: TL
   GATE_PASS_CHASSIS_EMPTY:
     executor: EXTERNAL_RULE_ENGINE
     mode: EXTERNAL
@@ -909,39 +904,39 @@ controls:
       type: RULE_DISCREPANCY_REVIEW
       owner: PC
   INSURANCE_START_AFTER_DELIVERY:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
+    # Moved from the Rule Engine (product owner 2026-11-15, uc03_document_consistency_rules).
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - DELIVERY
     category: INSURANCE
-    phases:
-    - DELIVERY
-    rule_engine_phases:
-    - DELIVERY
-    operands:
-      left: insurance_cover.policy_start_date
-      right: gate_pass.delivery_date
-    depends_on_documents:
-    - insurance_cover
-    - gate_pass
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
     task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
+      type: FINDING_REVIEW
+      owner: TL
   INVOICE_DATE_BEFORE_BOOKING:
-    executor: EXTERNAL_RULE_ENGINE
-    mode: EXTERNAL
-    category: DATE
+    # Moved from the Rule Engine (product owner 2026-11-15, uc03_document_consistency_rules).
+    executor: NATIVE
+    mode: RERUN
     phases:
-    - BOOKING
-    rule_engine_phases:
-    - BOOKING
-    operands:
-      left: customer_invoice_dms.invoice_date
-      right: booking_form.booking_date
-    depends_on_documents:
-    - customer_invoice_dms
-    - booking_docket
+    - DELIVERY
+    category: DATE
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: VIOLATION
+    severity: MEDIUM
+    owner: TL
+    resolution: ADJUDICATED
     task:
-      type: RULE_DISCREPANCY_REVIEW
-      owner: PC
+      type: FINDING_REVIEW
+      owner: TL
   INVOICE_MISSING:
     executor: EXTERNAL_RULE_ENGINE
     mode: EXTERNAL

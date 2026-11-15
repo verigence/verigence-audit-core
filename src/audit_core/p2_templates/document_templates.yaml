@@ -1390,8 +1390,9 @@ document_types:
     di_types:
     - valuation_report
     stage: DELIVERY
-    requirement: CONDITIONAL
-    condition: exchangeBenefit
+    # Optional (product owner 2026-11-15: "exchange valuation is never provided to us"):
+    # read and checked when it is on file, never asked for.
+    requirement: OPTIONAL
     accepted_early: true
     pages:
       shape: MULTI_PAGE

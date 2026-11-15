@@ -391,8 +391,13 @@ def raise_or_refresh(
     elif status == "CANCELLED":
         return task_id, "CANCELLED"
 
+    # A check that moved to another executor keeps its code, and so its task
+    # (2026-11-15: twelve Rule Engine checks now run in Audit Core): the task
+    # takes the template the check raises now -- its type, owner and actions.
+    retyped = existing["task_type"] != task_type
     content_changed = (
-        existing["title"] != title[:300]
+        retyped
+        or existing["title"] != title[:300]
         or existing["description"] != description
         or (existing["reference"] or {}).get("issueHash") != reference["issueHash"]
     )
@@ -404,6 +409,8 @@ def raise_or_refresh(
             UPDATE auditcore.p2_tasks
             SET title=:title, description=:description, reference=CAST(:reference AS jsonb),
                 severity=:severity, priority=:priority, task_status=:status,
+                task_type=:type, category=:category, assigned_role_code=:owner,
+                allowed_actions=CASE WHEN :retyped THEN CAST(:actions AS jsonb) ELSE allowed_actions END,
                 round_number=round_number + CASE WHEN :reopened THEN 1 ELSE 0 END,
                 due_at_utc=CASE WHEN :reopened THEN :due ELSE due_at_utc END,
                 verified_at_utc=CASE WHEN :reopened THEN NULL ELSE verified_at_utc END,
@@ -416,6 +423,10 @@ def raise_or_refresh(
             "reference": _json(reference), "severity": severity, "priority": priority,
             "status": new_status, "reopened": outcome == "REOPENED",
             "due": now + timedelta(hours=_SLA_HOURS[priority]),
+            "type": task_type if retyped else existing["task_type"],
+            "category": template.category if retyped else existing["category"],
+            "owner": template.owner if retyped else existing["assigned_role_code"],
+            "retyped": retyped, "actions": _json(list(template.actions)),
         },
     )
     record_task_event(
