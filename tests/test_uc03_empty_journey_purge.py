@@ -1,4 +1,4 @@
-"""Empty journeys are deleted after 7 days (product owner 2026-11-15); on a real Postgres."""
+"""Empty journeys are deleted after their first day (product owner 2026-11-15); on a real Postgres."""
 from __future__ import annotations
 
 import pytest
@@ -30,10 +30,10 @@ def _age(journey, days: int) -> str:
             {"d": days, "t": journey.tenant_id, "j": journey.journey_id}).scalar_one()
 
 
-def test_an_empty_journey_is_kept_for_seven_days_then_selected(journey):
-    reference = _age(journey, 3)
+def test_an_empty_journey_is_kept_for_its_first_day_then_selected(journey):
+    reference = _age(journey, 0)
     assert empty_journeys(journey.engine, tenant_id=journey.tenant_id) == []
-    _age(journey, 8)
+    _age(journey, 2)
     assert empty_journeys(journey.engine, tenant_id=journey.tenant_id) == [reference]
     assert empty_journeys(journey.engine, tenant_id=journey.tenant_id, references=["OTHER-1"]) == []
 

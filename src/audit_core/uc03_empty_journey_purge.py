@@ -6,9 +6,9 @@ A journey is empty when no document of it is on file (no ACTIVE evidence) and
 nothing of it is still being read. Its tasks -- mostly "send the pages again"
 for an upload that was never readable -- go with it.
 
-A PC is given 7 days from the journey's creation to send a readable copy: a
-younger empty journey is kept (its resubmit task is the PC's prompt), so a
-booking opened today is never deleted from under the PC.
+A journey is kept for its first day (product owner 2026-11-15: "delete empty
+journey or journey even 1 day old"), and while any page of it is still being
+read, so a booking opened today is never deleted from under the PC.
 
 The deletion is the system journey delete (Document Intelligence, R2, Audit
 Core, recorded in ``p2_journey_deletions`` with the reason), through
@@ -35,8 +35,8 @@ from audit_core.uc03_p2_journey_views import _IN_FLIGHT
 
 logger = structlog.get_logger(__name__)
 
-REASON = "Empty journey removed on the product owner's instruction: no document was ever read for it in 7 days"
-GRACE_DAYS = 7
+REASON = "Empty journey removed on the product owner's instruction: no document was ever read for it"
+GRACE_DAYS = 1
 
 _EMPTY_SQL = """
     SELECT j.journey_reference FROM auditcore.journeys j
