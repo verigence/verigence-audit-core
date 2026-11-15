@@ -10,8 +10,9 @@ from audit_core.errors import BusinessValidationError
 
 _PROJECT_WIDE_ONLY_ROLES = frozenset({"TL", "PM", "Executive", "CLIENT"})
 # Outlet-scoped roles: one or more Dealer Outlets, no Dealer-only scope. ANALYST is SevaSutra's on-site
-# auditor and is scoped to Outlets exactly as a PC is (product owner, 9 Nov 2026).
-_OUTLET_SCOPED_ROLES = frozenset({"PC", "ANALYST"})
+# auditor and is scoped to Outlets exactly as a PC is (product owner, 9 Nov 2026). UPLOADER is the
+# dealership's own person who scans papers for SevaSutra at the Outlets they work at (15 Nov 2026).
+_OUTLET_SCOPED_ROLES = frozenset({"PC", "ANALYST", "UPLOADER"})
 # CRM and REVIEWER share one scope shape: Project-wide, Dealer-scoped,
 # Outlet-scoped, or a union of selected Dealers and Outlets. A Reviewer sits at
 # one physical location and covers several Outlets at once, so the union is the
@@ -19,10 +20,11 @@ _OUTLET_SCOPED_ROLES = frozenset({"PC", "ANALYST"})
 # permission bundle Security resolves -- `audit.journey.update` -- not the
 # business scope (AUDIT_CORE_DEFAULT_ROLE_BUNDLES_v1.1 section 8).
 _FLEXIBLE_SCOPE_ROLES = frozenset({"CRM", "REVIEWER"})
-# ANALYST and CLIENT are SevaSutra's (workshop audit) operating roles, held in Security like the others:
-# ANALYST captures and audits at its Outlets; CLIENT is for people who are not JBR employees and sees
-# SevaSutra's analytics only, Project-wide (Security migrations 0052 and 0056).
-_SUPPORTED_ROLES = frozenset({"PC", "TL", "PM", "CRM", "Executive", "REVIEWER", "ANALYST", "CLIENT"})
+# ANALYST, CLIENT and UPLOADER are SevaSutra's (workshop audit) operating roles, held in Security like the
+# others: ANALYST captures and audits at its Outlets; CLIENT is for people who are not JBR employees and sees
+# SevaSutra's analytics only, Project-wide; UPLOADER is not a JBR employee either (a Service Advisor, a gate
+# guard) and only scans papers at its Outlets (Security migrations 0052, 0056 and 0059).
+_SUPPORTED_ROLES = frozenset({"PC", "TL", "PM", "CRM", "Executive", "REVIEWER", "ANALYST", "CLIENT", "UPLOADER"})
 
 
 def install_role_mapping_policy(role_mappings: Any) -> None:
