@@ -59,9 +59,11 @@ SCRAPPAGE_REGISTRATION_TASK = "SCRAPPAGE_REGISTRATION_CONCESSION"
 # Corrections made before a page was read again that the new reading does not
 # carry (2026-11-10, uc03_reread_corrections): the PC re-checks and closes it.
 CORRECTIONS_RECHECK_TASK = "CORRECTIONS_RECHECK"
+# The PC's answer to "Is this a BH registration?" (2026-11-15, uc03_registration_closures).
+BH_QUESTION_TASK = "REGISTRATION_BH_CONFIRM"
 CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK, COST_SHEET_DIFFERENCE_TASK, COPIES_DIFFERENCE_TASK,
                               REVIEWER_CORRECTIONS_TASK, KEY_FIGURES_TASK, ADDS_UP_TASK,
-                              SCRAPPAGE_REGISTRATION_TASK, CORRECTIONS_RECHECK_TASK})
+                              SCRAPPAGE_REGISTRATION_TASK, CORRECTIONS_RECHECK_TASK, BH_QUESTION_TASK})
 # "Upload the ..." tasks (a conditional document, or the booking docket) close
 # by hand too (product owner 2026-11-02): a single page uploaded for them is
 # often refused for scan quality and never read, so the machine check cannot
@@ -452,6 +454,13 @@ def submit_action(
     assigned_actor_id = task.get("assigned_actor_id")
     assigned_role_code = str(task.get("assigned_role_code") or "")
     supervisory = action == "ACCEPT_EXCEPTION"
+    # A temporary registration: a Team Lead or Reviewer closes the PC's RTO
+    # challan task with its number (product owner 2026-11-15).
+    from audit_core import uc03_registration_closures as registration_closures
+
+    choice = str((details or {}).get("choice") or "")
+    temporary_registration = (action == CLOSE_TASK and task["task_type"] == MISSING_DOCUMENT_TASK
+                              and registration_closures.is_temporary_registration_close(task, choice))
     # An observation (accessories fitted? who paid?) is keyed
     # in by whoever knows: the PC it is assigned to, or a TL / PM.
     observation = task["task_type"] == _OBSERVATION_TASK and actor_role_code in _EXCEPTION_ROLES
@@ -461,6 +470,10 @@ def submit_action(
             raise TaskPermissionError("Only a Team Lead or Project Manager can accept an exception")
     elif observation:
         pass
+    elif temporary_registration:
+        if str(actor_role_code or "").upper() not in registration_closures.TEMPORARY_REGISTRATION_ROLES:
+            raise TaskPermissionError("Only a Team Lead or Reviewer closes the RTO challan task as a temporary "
+                                      "registration")
     elif task["task_type"] == REVIEWER_CORRECTIONS_TASK and str(actor_role_code or "").upper() not in {"TL", "PM"}:
         # It tells the Team Lead what the Reviewer changed: not the Reviewer's to close.
         raise TaskPermissionError("Only a Team Lead or Project Manager can close the Reviewer's corrections task")
@@ -478,8 +491,19 @@ def submit_action(
         # Checked here, on the server, before anything is written: the web
         # page asks for the comment too, but is not what enforces it.
         comment = (comment or "").strip()
+        if task["task_type"] == BH_QUESTION_TASK:
+            # Answered with one of two buttons; no comment needed.
+            if choice not in registration_closures.BH_CHOICES:
+                raise ValueError("Answer \"BH registration\" or \"Not a BH registration\".")
+            comment = comment or choice
         if not comment:
             raise ValueError("Write a comment to close this task, for example that the document was uploaded.")
+        if task["task_type"] == MISSING_DOCUMENT_TASK and choice:
+            try:
+                registration_closures.check_close_choice(task, choice=choice, actor_role_code=actor_role_code,
+                                                         comment=comment)
+            except PermissionError as refused:
+                raise TaskPermissionError(str(refused)) from refused
 
     if action == CLOSE_TASK and task["task_type"] == MISSING_DOCUMENT_TASK:
         # The NDC / cost sheet cannot be claimed "not required" (product owner

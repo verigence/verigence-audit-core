@@ -787,6 +787,8 @@ _TASK_TYPE_FINDING_CLASS: dict[str, str] = {
     # concession -- for information, the PC checks it against the CoD.
     "SCRAPPAGE_REGISTRATION_CONCESSION": "DATA_GAP",
     "CORRECTIONS_RECHECK": "DATA_GAP",
+    # 2026-11-15: is a registration far below the standard a BH registration?
+    "REGISTRATION_BH_CONFIRM": "DATA_GAP",
     "ACCOUNT_STATEMENT_TALLY_DEVIATION": "DATA_GAP",
     # 2026-10-20: an invoice whose own figures do not add up, or whose taxes
     # were not read (uc03_invoice_materialization) -- the PC re-checks it.

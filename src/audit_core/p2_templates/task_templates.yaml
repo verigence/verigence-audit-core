@@ -542,6 +542,20 @@ task_types:
     - REVIEW_DOCUMENT
     - CLOSE_TASK
     - ADD_COMMENT
+  # A registration charged at less than half its standard (2026-11-15,
+  # uc03_registration_closures): the PC answers "BH registration" or "Not a BH
+  # registration" with one button.
+  REGISTRATION_BH_CONFIRM:
+    category: CROSS_DOCUMENT_REVIEW
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - CLOSE_TASK
+    - ADD_COMMENT
+  # No longer raised (2026-11-15): the concession is a System remark.
   SCRAPPAGE_REGISTRATION_CONCESSION:
     category: CROSS_DOCUMENT_REVIEW
     owner: PC
