@@ -29,10 +29,12 @@ from audit_core.uc03_account_statement import (
     combined_tally_rows,
     line_rows,
     load_ledger_documents,
+    read_tally_lines,
     statement_kind,
     statement_total,
     sync_account_statement,
     tally_deviations,
+    tally_line_deviations,
     tally_postings,
 )
 from audit_core.uc03_deal_source_policy import account_statement_is_source_of_truth
@@ -124,7 +126,10 @@ def rebuild_journey(
     tallies = [(d, rows) for d, rows, kind in parsed if kind == KIND_TALLY]
     # Every copy on file, as the sync reads them (combine_statements).
     statement, copies = combine_statements([(d, rows) for d, rows, kind in parsed if kind == KIND_FORM])
-    deviations = (tally_deviations(statement, tally_postings(combined_tally_rows(tallies)))
+    tally_rows = combined_tally_rows(tallies) if tallies else []
+    # Every line the customer ledger posts, as the sync checks it (2026-11-15).
+    deviations = (tally_deviations(statement, tally_postings(tally_rows))
+                  + tally_line_deviations(statement, read_tally_lines(tally_rows))
                   if statement and tallies else [])
     item: dict[str, Any] = {
         "statements": len(forms), "tallies": len(tallies),
