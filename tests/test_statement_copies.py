@@ -345,6 +345,17 @@ ADITYA_NDC = [
 ]
 
 
+def test_a_dms_printout_adds_no_line_to_the_ndc() -> None:
+    """Product owner 2026-11-15: the DMS printout / customer ledger is read
+    but no additional line is picked from it: the NDC without a dealer
+    discount row takes none from the printout's "Other Discount"."""
+    ndc = _doc(ADITYA_NDC[:2], day="2026-10-13")
+    read, copies = module.combine_statements([ndc, _doc(DMS_PRINTOUT, day="2026-10-13", minutes=30)])
+    assert copies.primary is ndc[0]
+    assert read.discounts == {"CASH_DISCOUNT": D(22000)}
+    assert copies.differences == []
+
+
 def test_a_dms_printout_before_gst_never_stands_over_the_ndc() -> None:
     """Recheck 2026-11-14 (ADI-RD-261104-018): the DMS printout, linked last,
     stood as the statement; its "Scheme Discount" Rs 22,881 (the consumer offer

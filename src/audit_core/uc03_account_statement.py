@@ -985,6 +985,60 @@ def tally_deviations(statement: StatementRead, tally: dict[str, Decimal]) -> lis
     return out
 
 
+# The customer ledger's line -> the statement lines it is checked against.
+_TALLY_LINE_ON_STATEMENT: dict[str, tuple[str, ...]] = {
+    "road_tax_registration": ("registration_charges", "road_tax_amount", "road_tax_registration"),
+    "accessories_cost": ("accessories_cost",),
+    "fastag_amount": ("fastag_amount",),
+    "extended_warranty_amount": ("extended_warranty_amount",),
+    "rsa_amount": ("rsa_amount",),
+    "other_charges": ("other_charges",),
+}
+_TALLY_LINE_WORDS = {
+    "road_tax_registration": "RTO / registration", "accessories_cost": "accessories", "fastag_amount": "FASTag",
+    "extended_warranty_amount": "extended warranty", "rsa_amount": "RSA", "other_charges": "other charges",
+}
+
+
+def tally_line_deviations(statement: StatementRead, lines: TallyLines) -> list[dict[str, Any]]:
+    """Every line item the customer ledger posts, checked against the NDC
+    (product owner 2026-11-15: "customer ledger needs to be used for
+    verification, if any line item disagrees that is where we need to raise an
+    task or manual check"; the NDC stays the source of every comparison and
+    nothing is taken from the ledger). A charge the ledger debits at another
+    amount than the NDC prices it, and a benefit its credit note or discount
+    journal gives at another amount than the NDC, is a deviation. A charge
+    only the ledger posts (an add-on billed apart) disagrees with nothing.
+    The ledger's vehicle, financer and insurance postings are checked by
+    tally_deviations."""
+    out: list[dict[str, Any]] = []
+    for key, amount in sorted(lines.components.items()):
+        if key not in _TALLY_LINE_ON_STATEMENT or amount <= 0:
+            continue
+        printed = [statement.components[k] for k in _TALLY_LINE_ON_STATEMENT[key] if k in statement.components]
+        if not printed:
+            continue  # posted by the ledger only (an add-on billed apart): nothing to disagree with
+        ndc = sum(printed, Decimal(0))
+        accepted = {ndc}
+        if key == "accessories_cost":
+            # the free kit is taken off the NDC's accessories, not the ledger's
+            accepted.add(ndc + statement.discounts.get(FREE_ACCESSORIES_KEY, Decimal(0)))
+        if all(abs(amount - value) > TOLERANCE for value in accepted):
+            out.append({"line": _TALLY_LINE_WORDS[key], "tally": amount, "statement": ndc})
+    ndc_given = sum(statement.discounts.values(), Decimal(0))
+    ledger_given = sum(lines.discounts.values(), Decimal(0))
+    for key, amount in sorted(lines.discounts.items()):
+        ndc = statement.discounts.get(key)
+        if ndc is None and not statement.discounts:
+            continue  # a benefit the NDC does not give: shown as the ledger's, never the deal's
+        if ndc is not None and abs(amount - ndc) <= TOLERANCE:
+            continue
+        if abs(ledger_given - ndc_given) <= TOLERANCE:
+            continue  # the same benefits, named otherwise
+        out.append({"line": f"discount {key.lower().replace('_', ' ')}", "tally": amount, "statement": ndc})
+    return out
+
+
 # ── the cost sheet (pure) ────────────────────────────────────────────────────
 # Cost sheet field (DI cost_sheet schema 1.0) -> the Deal line it prices.
 _COST_SHEET_COMPONENTS: tuple[tuple[str, str], ...] = (
@@ -1135,12 +1189,6 @@ def _newest_first(copies: list[Copy]) -> list[Copy]:
 
 
 _EX_SHOWROOM = ("COMMERCIAL", "ex_showroom_price")
-# What a DMS printout gives before GST: the ex-showroom net of the scheme's
-# GST, the scheme ("Scheme Discount", the consumer offer with the kit) and the
-# corporate offer (Rs 4,576 = 5,400 / 1.18). Its "Other Discount" is the
-# dealer's discount as the NDC writes it (Rs 10,000 on both, ADI-RD-261104-018).
-_BEFORE_GST_FIGURES = frozenset({
-    _EX_SHOWROOM, ("DISCOUNT", "CASH_DISCOUNT"), ("DISCOUNT", "CORPORATE_PRIVILEGE")})
 # Two prices this far apart are two vehicles, never a quotation and its final sheet.
 _ANOTHER_VEHICLE_RATIO = Decimal("1.6")
 
@@ -1171,11 +1219,14 @@ def combine_copies(copies: list[Copy]) -> Combined:
     used = {id(primary.document): primary.document}
 
     def counts(copy: Copy, key: tuple[str, str]) -> bool:
-        # A DMS printout's figures before GST are not the deal's when a copy
-        # at the deal's own prices stands (recheck 2026-11-14: its "Scheme
-        # Discount" Rs 22,881 = (consumer offer + kit) / 1.18 had withdrawn the
-        # NDC's Rs 22,000 and read as excess): never taken, never a difference.
-        return key in copy.figures and not (copy.pre_gst and not primary.pre_gst and key in _BEFORE_GST_FIGURES)
+        # The DMS printout / DMS customer ledger is read, but adds nothing to
+        # the NDC (product owner 2026-11-15: "NDC should be the source for all
+        # comparisons, Tally and DMS invoice should be read but no addition or
+        # additional line to be picked from them. customer ledger"; recheck
+        # 2026-11-14: its "Scheme Discount" Rs 22,881 = (consumer offer + kit)
+        # / 1.18 had withdrawn the NDC's Rs 22,000 and read as excess): none of
+        # its figures is taken or listed as a difference while an NDC stands.
+        return key in copy.figures and not (copy.pre_gst and not primary.pre_gst)
 
     keys = [k for k in keys if any(counts(c, k) for c in ordered)]
     for key in keys:
@@ -2080,7 +2131,9 @@ def sync_account_statement(
     # The Tally ledger validates the statement.
     deviations: list[dict[str, Any]] = []
     if statement is not None and tallies:
-        deviations = tally_deviations(statement, tally_postings(combined_tally_rows(tallies)))
+        rows = combined_tally_rows(tallies)
+        deviations = tally_deviations(statement, tally_postings(rows)) + tally_line_deviations(
+            statement, read_tally_lines(rows))
     if deviations:
         _raise_task(
             connection, tenant_id=tenant_id, journey_id=journey_id, task_type=TALLY_DEVIATION_TASK,
@@ -2171,6 +2224,7 @@ __all__ = [
     "sync_account_statement",
     "sync_if_source_of_truth",
     "tally_deviations",
+    "tally_line_deviations",
     "tally_postings",
     "unread_statements",
 ]

@@ -1315,3 +1315,26 @@ def test_one_broken_row_does_not_lose_the_statement() -> None:
         ("Vehicle cost", 1081500, None), ("TCS", 10718, None), ("other charges", 6000, None),
         ("Finance D/O", None, 1075545)]
     assert line_rows("not a statement at all") == []
+
+
+def test_every_line_the_customer_ledger_posts_is_checked_against_the_ndc() -> None:
+    """Product owner 2026-11-15: "customer ledger needs to be used for
+    verification, if any line item disagrees that is where we need to raise an
+    task or manual check". UTK-SB-261114-012: the NDC's dealer discount
+    Rs 71,000 against the ledger's credit note Rs 7,000."""
+    from audit_core.uc03_account_statement import TallyLines, tally_line_deviations
+
+    statement = read_statement([{"particulars_raw": "Ex Showroom", "debit_amount": 1029901},
+                                {"particulars_raw": "Registration", "debit_amount": 61634},
+                                {"particulars_raw": "Cash discount", "credit_amount": 71000},
+                                {"particulars_raw": "ACCESSORIES 20785 - Scheme 20000/-", "debit_amount": 785}])
+    agreeing = TallyLines(components={"road_tax_registration": D(61634), "accessories_cost": D(20785),
+                                      "fastag_amount": D(500)},  # FASTag billed apart: only the ledger posts it
+                          discounts={"ADDITIONAL_DISCOUNT": D(71000)})
+    assert tally_line_deviations(statement, agreeing) == []
+    disagreeing = TallyLines(components={"road_tax_registration": D(64000), "fastag_amount": D(500)},
+                             discounts={"ADDITIONAL_DISCOUNT": D(7000)})
+    assert [(d["line"], d["tally"], d["statement"]) for d in tally_line_deviations(statement, disagreeing)] == [
+        ("RTO / registration", D(64000), D(61634)),
+        ("discount additional discount", D(7000), D(71000)),
+    ]
