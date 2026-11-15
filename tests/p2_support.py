@@ -385,3 +385,35 @@ def one_page_pdf(width: int = 200) -> bytes:
     buffer = io.BytesIO()
     writer.write(buffer)
     return buffer.getvalue()
+
+
+def missing_document_lines(journey) -> dict[str, dict]:
+    """The journey's ONE missing-documents task (2026-11-15), one entry per document
+    it still asks for: {requirementKey: {taskId, taskStatus, title, label, reason, stage}}."""
+    from sqlalchemy import text as _text
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        row = connection.execute(
+            _text("SELECT task_id, task_status, title, reference FROM auditcore.p2_tasks "
+                  "WHERE tenant_id=:t AND journey_id=:j AND dedupe_key=:k "
+                  "AND task_status IN ('READY','IN_PROGRESS','RETURNED','ACTION_COMPLETED','VERIFYING')"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "k": f"document-missing:{journey.journey_id}"},
+        ).mappings().one_or_none()
+    if row is None:
+        return {}
+    return {item["key"]: {"taskId": row["task_id"], "taskStatus": row["task_status"], "title": row["title"], **item}
+            for item in (row["reference"] or {}).get("items") or []}
+
+
+def answer_missing_document(journey, key: str, choice: str, *, comment: str | None = None,
+                            role: str = "PC", actor_id: str | None = None) -> dict:
+    """Answer one document of the journey's missing-documents task."""
+    from audit_core.uc03_p2_tasks import submit_action
+
+    task_id = missing_document_lines(journey)[key]["taskId"]
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return submit_action(connection, tenant_id=journey.tenant_id, task_id=task_id, action="CLOSE_TASK",
+                             actor_id=actor_id or journey.actor_id, actor_role_code=role,
+                             comment=comment or choice, details={"choice": choice, "requirementKey": key})

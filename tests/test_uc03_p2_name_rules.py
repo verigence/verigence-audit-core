@@ -130,7 +130,7 @@ def test_documents_in_another_customers_name_raise_a_high_document_missing_task(
     assert task["severity"] == "HIGH" and task["priority"] == "HIGH"
     assert task["assigned_role_code"] == "PC"
     assert task["title"] == "Customer name differs on 1 document"
-    assert "Insurance Cover Note: Anita Sahoo" in task["description"]
+    assert "Insurance Cover Note or Policy: Anita Sahoo" in task["description"]
     assert "customer per the PAN Card is BISWABHANU BISWAL" in task["description"]
     assert task["reference"]["documentIds"] == [str(wrong)]
     assert task["reference"]["sourceCode"] == "WRONG_CUSTOMER_NAME"

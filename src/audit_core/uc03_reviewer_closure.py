@@ -144,10 +144,12 @@ def closure_items(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     items: list[dict[str, Any]] = []
     missing_keys: set[str] = set()
     for doc in required_documents(connection, tenant_id=tenant_id, journey_id=journey_id):
-        if doc["onFile"]:
+        claim = accepted.get(str(doc["key"]))
+        # An accepted "not mandatory" claim counts the document as received (2026-11-15,
+        # p2_document_waivers); the closure still lists it, answered by the claim.
+        if doc["onFile"] and not claim:
             continue
         missing_keys.add(str(doc["key"]))
-        claim = accepted.get(str(doc["key"]))
         prefill = None
         if claim:
             prefill = (f"Not mandatory for this journey. PC: {claim['pcReason']}. Accepted by the "

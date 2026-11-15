@@ -16,6 +16,7 @@ from p2_support import (
     add_receipt_payment,
     create_p2_journey,
     database_engine,
+    missing_document_lines,
     set_minimum_booking_amount,
 )
 from sqlalchemy import text
@@ -131,18 +132,19 @@ def test_invoice_evidence_makes_conditional_documents_mandatory(journey):
     # (product owner 2026-10-31: there is no separate Tally accessory invoice).
     assert {"FINANCE_APPROVAL", "ACCESSORY_INVOICE"} == missing
 
-    tasks = {t["reference"]["requirementKey"]: t for t in _tasks(journey, "DOCUMENT_MISSING")}
-    assert set(tasks) == missing
-    letter = tasks["FINANCE_APPROVAL"]
-    assert letter["assigned_role_code"] == "PC"
-    assert letter["title"] == "Upload the Delivery Order (Financier) or Bank Approval Letter"
-    assert set(letter["reference"]["templateKeys"]) == {"delivery_order_cover", "bank_approval_letter"}
-    assert "HDFC BANK LTD" in letter["description"]  # the RTO names the financier
-    accessory = tasks["ACCESSORY_INVOICE"]
-    assert accessory["title"] == "Upload the Accessory Invoice"
-    assert set(accessory["reference"]["templateKeys"]) == {"accessory_invoice_dms", "accessory_invoice_tally"}
+    # ONE task for the journey, a line per missing document (product owner 2026-11-15).
+    lines = missing_document_lines(journey)
+    assert set(lines) == missing
+    [task] = _tasks(journey, "DOCUMENT_MISSING")
+    assert task["assigned_role_code"] == "PC"
+    assert task["title"] == ("Upload 2 missing documents: Accessory Invoice, "
+                             "Delivery Order (Financier) or Bank Approval Letter")
+    letter = lines["FINANCE_APPROVAL"]
+    assert set(letter["templates"]) == {"delivery_order_cover", "bank_approval_letter"}
+    assert "HDFC BANK LTD" in letter["reason"]  # the RTO names the financier
+    assert set(lines["ACCESSORY_INVOICE"]["templates"]) == {"accessory_invoice_dms", "accessory_invoice_tally"}
     _settle(journey)
-    assert len(_tasks(journey, "DOCUMENT_MISSING")) == 2  # deduplicated, not raised again
+    assert len(_tasks(journey, "DOCUMENT_MISSING")) == 1  # deduplicated, not raised again
 
     # the missing documents arrive -- only the bank approval letter of the
     # two, and only a Tally-format accessory invoice -- and each task closes itself
@@ -189,8 +191,7 @@ def test_dealer_insurance_expects_the_debit_note_without_raising_a_task(journey)
     assert items["debit_note"]["raisesMissingTask"] is False
     assert items["debit_note"]["conditions"] == ["insuranceByDealer"]
     # ... and never a task
-    raised = {t["reference"]["requirementKey"] for t in _tasks(journey, "DOCUMENT_MISSING")}
-    assert "debit_note" not in raised
+    assert "debit_note" not in missing_document_lines(journey)
 
 
 def test_self_insurance_does_not_expect_the_debit_note_at_all(journey):
@@ -214,15 +215,13 @@ def test_a_conditional_document_without_the_flag_still_raises_its_task(journey):
 
     _, items = _delivery_requirements(journey)
     assert items["ACCESSORY_INVOICE"]["raisesMissingTask"] is True
-    raised = {t["reference"]["requirementKey"] for t in _tasks(journey, "DOCUMENT_MISSING")}
-    assert "ACCESSORY_INVOICE" in raised
+    assert "ACCESSORY_INVOICE" in missing_document_lines(journey)
     # The RSA and extended warranty invoices are not mandatory (product owner
     # 2026-11-11): charged or not, neither is ever asked for.
     add_ready_document(journey, "customer_ledger", rsa_amount="1500", additional_warranty_amount="9999",
                        process_area="DELIVERY")
     _settle(journey)
-    raised = {t["reference"]["requirementKey"] for t in _tasks(journey, "DOCUMENT_MISSING")}
-    assert not {"rsa_invoice", "ew_invoice"} & raised
+    assert not {"rsa_invoice", "ew_invoice"} & set(missing_document_lines(journey))
 
 
 def test_a_delivery_document_is_not_asked_for_while_the_journey_is_at_booking(journey):
@@ -239,17 +238,15 @@ def test_a_delivery_document_is_not_asked_for_while_the_journey_is_at_booking(jo
     assert not [t for t in _tasks(journey, "DOCUMENT_MISSING") if t["task_status"] != "VERIFIED_COMPLETE"]
     add_ready_document(journey, "customer_invoice_dms", accessories_cost="12500", process_area="DELIVERY")
     _settle(journey)
-    raised = {t["reference"]["requirementKey"] for t in _tasks(journey, "DOCUMENT_MISSING")
-              if t["task_status"] != "VERIFIED_COMPLETE"}
-    assert "ACCESSORY_INVOICE" in raised
+    assert "ACCESSORY_INVOICE" in missing_document_lines(journey)
 
 
 def test_a_task_closes_when_the_evidence_no_longer_applies(journey):
     invoice = add_ready_document(journey, "customer_invoice_dms", accessories_cost="12500", process_area="DELIVERY")
     _settle(journey)
-    # The delivery has no NDC or cost sheet either: that is asked for beside it (2026-11-11).
-    tasks = {t["reference"]["requirementKey"]: t for t in _tasks(journey, "DOCUMENT_MISSING")}
-    assert set(tasks) == {"ACCESSORY_INVOICE", "DEALER_STATEMENT"}
+    # The five mandatory delivery documents are asked for beside it (2026-11-15).
+    lines = missing_document_lines(journey)
+    assert {"ACCESSORY_INVOICE", "DEALER_STATEMENT"} <= set(lines)
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         connection.execute(
@@ -258,9 +255,9 @@ def test_a_task_closes_when_the_evidence_no_longer_applies(journey):
             {"t": journey.tenant_id, "d": invoice},
         )
     _settle(journey)
-    tasks = {t["reference"]["requirementKey"]: t for t in _tasks(journey, "DOCUMENT_MISSING")}
-    assert tasks["ACCESSORY_INVOICE"]["task_status"] == "VERIFIED_COMPLETE"
-    assert tasks["DEALER_STATEMENT"]["task_status"] == "READY"
+    lines = missing_document_lines(journey)
+    assert "ACCESSORY_INVOICE" not in lines
+    assert lines["DEALER_STATEMENT"]["taskStatus"] == "READY"
 
 
 def test_delivery_completes_from_rules_and_waits_for_the_tl_review(journey):

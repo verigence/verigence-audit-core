@@ -218,29 +218,67 @@ def test_the_pc_closes_the_booking_docket_task_as_not_required_and_the_sync_leav
     assert _row(journey, key)["task_status"] == "VERIFIED_COMPLETE"
 
 
+def _raise_one_task(journey, keys=("ew_invoice", "rsa_invoice")):
+    """The journey's ONE missing-documents task (2026-11-15) with these documents as its lines."""
+    from audit_core.uc03_p2_registry import get_registry
+    from audit_core.uc03_p2_task_producer import raise_or_refresh
+
+    labels = {"rsa_invoice": "RSA Invoice", "ew_invoice": "EW Invoice"}
+    items = [{"key": k, "label": labels[k], "reason": "Sold on the booking docket.", "stage": "DELIVERY",
+              "templates": [k], "conditions": [], "notRequiredAllowed": True} for k in keys]
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return raise_or_refresh(
+            connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+            dedupe_key=f"document-missing-test:{journey.journey_id}", task_type="DOCUMENT_MISSING",
+            source_type="DOCUMENT", source_code="DOCUMENT_MISSING", title="Upload 2 missing documents",
+            description="x", reference={"sourceCode": "DOCUMENT_MISSING", "items": items,
+                                        "requirementKeys": list(keys), "fields": sorted(keys)},
+            severity="HIGH", registry=get_registry(),
+        )[0]
+
+
+def _answer(journey, task_id, key, comment, choice="Document not required to be uploaded"):
+    from audit_core.uc03_p2_tasks import submit_action
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return submit_action(connection, tenant_id=journey.tenant_id, task_id=task_id, action="CLOSE_TASK",
+                             actor_id=journey.actor_id, actor_role_code="PC", comment=comment,
+                             details={"choice": choice, "requirementKey": key})
+
+
+def _claims(journey) -> dict[str, dict]:
+    from audit_core.uc03_not_mandatory_claims import claims
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return {c["requirementKey"]: c for c in claims(connection, tenant_id=journey.tenant_id,
+                                                         journey_id=journey.journey_id)}
+
+
 def test_not_mandatory_claims_go_to_the_reviewer_combined_and_a_rejection_returns_to_the_pc(journey):
-    """Product owner 2026-11-04: the PC closes a mandatory-document task as not
+    """Product owner 2026-11-04: the PC answers a mandatory document as not
     mandatory with a reason; all such claims go to the Reviewer combined; a
-    rejected one is back with the PC."""
+    rejected one is back with the PC. Since 2026-11-15 they are lines of the
+    journey's one missing-documents task."""
     from fastapi import HTTPException
 
     choice = "Document not required to be uploaded"
-    rsa = f"document-missing:{journey.journey_id}:rsa_invoice"
-    ew = f"document-missing:{journey.journey_id}:ew_invoice"
-    _raise_missing(journey, rsa)
-    _raise_missing(journey, ew, title="Upload the EW Invoice")
-    rsa_id, ew_id = _row(journey, rsa)["task_id"], _row(journey, ew)["task_id"]
+    task_id = _raise_one_task(journey)
 
     with pytest.raises(ValueError, match="not mandatory"):
-        _close(journey, rsa_id, choice, choice=choice)          # the choice alone is no reason
-    assert _row(journey, rsa)["task_status"] == "READY"
+        _answer(journey, task_id, "rsa_invoice", choice)          # the choice alone is no reason
+    assert _claims(journey) == {}
 
-    _close(journey, rsa_id, f"{choice}: RSA is bundled free by the OEM this month", choice=choice)
-    _close(journey, ew_id, f"{choice}: customer declined extended warranty", choice=choice)
+    _answer(journey, task_id, "rsa_invoice", f"{choice}: RSA is bundled free by the OEM this month")
+    _answer(journey, task_id, "ew_invoice", f"{choice}: customer declined extended warranty")
     review = _review_task(journey)
     assert review["assigned_role_code"] == "REVIEWER" and review["task_status"] in ("READY", "IN_PROGRESS")
-    assert sorted(c["document"] for c in review["reference"]["claims"]) == ["Upload the EW Invoice",
-                                                                             "Upload the RSA Invoice"]
+    assert sorted(c["document"] for c in review["reference"]["claims"]) == ["EW Invoice", "RSA Invoice"]
+    claimed = _claims(journey)
+    assert claimed["rsa_invoice"]["pcReason"] == "RSA is bundled free by the OEM this month"
+    rsa_id, ew_id = claimed["rsa_invoice"]["taskId"], claimed["ew_invoice"]["taskId"]
 
     with pytest.raises(HTTPException) as no_reason:
         _decide(journey, ew_id, "REJECT", reason="no")
@@ -251,19 +289,21 @@ def test_not_mandatory_claims_go_to_the_reviewer_combined_and_a_rejection_return
 
     _decide(journey, rsa_id, "ACCEPT", reason="OEM scheme letter seen")
     _decide(journey, ew_id, "REJECT", reason="EW is on the invoice; upload the EW invoice")
-    assert _row(journey, rsa)["task_status"] == "VERIFIED_COMPLETE"
-    returned = _row(journey, ew)
-    assert (returned["task_status"], returned["round_number"]) == ("RETURNED", 2)
-    assert returned["completion_result"]["decisionReason"] == "EW is on the invoice; upload the EW invoice"
+    decided = _claims(journey)
+    assert decided["rsa_invoice"]["state"] == "ACCEPTED"
+    assert (decided["ew_invoice"]["state"], decided["ew_invoice"]["decisionReason"]) == (
+        "REJECTED", "EW is on the invoice; upload the EW invoice")
     assert _review_task(journey)["task_status"] == "VERIFIED_COMPLETE"   # nothing pending: closed
+    with pytest.raises(HTTPException) as twice:
+        _decide(journey, rsa_id, "REJECT", reason="changed my mind about it")
+    assert twice.value.status_code == 409
 
-    # The PC answers the returned task again; the Reviewer's task opens again with it.
-    _close(journey, ew_id, f"{choice}: EW line on the invoice was reversed by credit note", choice=choice)
+    # The PC answers the rejected document again; the Reviewer's task opens again with it.
+    _answer(journey, task_id, "ew_invoice", f"{choice}: EW line on the invoice was reversed by credit note")
     review = _review_task(journey)
     assert review["task_status"] not in ("VERIFIED_COMPLETE",)
-    assert [c["document"] for c in review["reference"]["claims"]] == ["Upload the EW Invoice"]
-    # The producer's next run leaves the accepted claim closed.
-    assert _raise_missing(journey, rsa) == "ACCEPTED_EXCEPTION"
+    assert [c["document"] for c in review["reference"]["claims"]] == ["EW Invoice"]
+    assert _claims(journey)["ew_invoice"]["round"] == 2
 
 
 def test_a_wrong_name_task_still_cannot_be_closed_by_hand(journey):

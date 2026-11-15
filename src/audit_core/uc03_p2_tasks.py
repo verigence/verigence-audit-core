@@ -463,11 +463,16 @@ def submit_action(
     supervisory = action == "ACCEPT_EXCEPTION"
     # A temporary registration: a Team Lead or Reviewer closes the PC's RTO
     # challan task with its number (product owner 2026-11-15).
+    from audit_core import uc03_document_waivers as waivers
     from audit_core import uc03_registration_closures as registration_closures
 
     choice = str((details or {}).get("choice") or "")
+    # One missing-documents task per journey (2026-11-15): the answer names its document.
+    consolidated = task["task_type"] == MISSING_DOCUMENT_TASK and waivers.is_consolidated(task)
+    line = ({"reference": {"requirementKey": str((details or {}).get("requirementKey") or "")}}
+            if consolidated else task)
     temporary_registration = (action == CLOSE_TASK and task["task_type"] == MISSING_DOCUMENT_TASK
-                              and registration_closures.is_temporary_registration_close(task, choice))
+                              and registration_closures.is_temporary_registration_close(line, choice))
     # An observation (accessories fitted? who paid?) is keyed
     # in by whoever knows: the PC it is assigned to, or a TL / PM.
     observation = task["task_type"] == _OBSERVATION_TASK and actor_role_code in _EXCEPTION_ROLES
@@ -505,7 +510,7 @@ def submit_action(
             comment = comment or choice
         if not comment:
             raise ValueError("Write a comment to close this task, for example that the document was uploaded.")
-        if task["task_type"] == MISSING_DOCUMENT_TASK and choice:
+        if task["task_type"] == MISSING_DOCUMENT_TASK and choice and not consolidated:
             try:
                 registration_closures.check_close_choice(task, choice=choice, actor_role_code=actor_role_code,
                                                          comment=comment)
@@ -516,12 +521,12 @@ def submit_action(
         # The NDC / cost sheet cannot be claimed "not required" (product owner
         # 2026-11-11: "NDC has to come and there is no escape route for it").
         from audit_core.uc03_not_mandatory_claims import is_claim as _is_claim
-        from audit_core.uc03_p2_task_producer import ALWAYS_ASKED_REQUIREMENTS
+        from audit_core.uc03_p2_task_producer import NEVER_WAIVED_AS_NOT_REQUIRED
 
         reference = task.get("reference") or {}
         if isinstance(reference, str):
             reference = json.loads(reference or "{}")
-        if (str(reference.get("requirementKey") or "") in ALWAYS_ASKED_REQUIREMENTS
+        if (not consolidated and str(reference.get("requirementKey") or "") in NEVER_WAIVED_AS_NOT_REQUIRED
                 and _is_claim(str((details or {}).get("choice") or ""))):
             raise ValueError("The NDC / cost sheet is mandatory for every delivery and cannot be marked as not "
                              "required. Upload it; the Deal waits for it.")
@@ -543,6 +548,13 @@ def submit_action(
         return closure.escalate(connection, tenant_id=tenant_id, task=task, actor_id=actor_id,
                                 actor_role_code=actor_role_code, comment=comment)
 
+    if action == CLOSE_TASK and consolidated:
+        try:
+            return waivers.answer(connection, tenant_id=tenant_id, task=task, details=details, comment=comment,
+                                  actor_id=actor_id, actor_role_code=actor_role_code)
+        except PermissionError as refused:
+            raise TaskPermissionError(str(refused)) from refused
+
     if action == CLOSE_TASK and task["task_type"] == MISSING_DOCUMENT_TASK:
         # "Document not required to be uploaded" is the PC's claim, decided by
         # the Reviewer (product owner 2026-11-04, uc03_not_mandatory_claims).
@@ -551,6 +563,12 @@ def submit_action(
         if is_claim(str((details or {}).get("choice") or "")):
             return submit_claim(connection, tenant_id=tenant_id, task=task, actor_id=actor_id,
                                 actor_role_code=actor_role_code, comment=comment)
+        if choice in waivers.CHOICES:
+            # An answer on a per-document task of before 2026-11-15 is kept as the
+            # document's answer too (remarks; the one task does not ask again).
+            waivers.record_legacy_answer(connection, tenant_id=tenant_id, task=task, choice=choice,
+                                         status="ACCEPTED", reason=(comment or "").strip(), actor_id=actor_id,
+                                         actor_role_code=actor_role_code)
 
     if action == CLOSE_TASK:
         _close_quality_task(
