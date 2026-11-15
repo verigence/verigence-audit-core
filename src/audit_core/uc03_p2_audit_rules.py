@@ -517,6 +517,12 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
     explained: list[dict[str, Any]] = []
     concession_total = Decimal(0)
     short: list[dict[str, Any]] = []
+    # A registration charged at less than half its standard may be a BH-series
+    # registration: the PC is asked (product owner 2026-11-15,
+    # uc03_registration_closures).
+    from audit_core.uc03_registration_closures import is_low as registration_is_low
+
+    low_registration: list[dict[str, Any]] = []
     for group in facts.sheet["categories"]:
         for row in group["components"]:
             # 2026-10-20: measured on the figure the deal stands at (the
@@ -540,6 +546,11 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
                                       "scrappage": scrappage})
                     concession_total += line["concession"]
                     continue
+                if registration_is_low(standard=standard, charged=charged):
+                    low_registration.append({"key": row["key"], "label": row["label"], "standard": str(standard),
+                                             "charged": str(charged)})
+                    asked = "less than half the standard: the PC is asked whether it is a BH registration"
+                    note = f"{note}; {asked}" if note else asked
             if gap > _LINE_TOLERANCE:
                 short.append({"key": row["key"], "label": row["label"], "standard": str(standard),
                               "charged": str(charged), "short": str(gap),
@@ -578,6 +589,7 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
         "netCurrent": str(net_current) if net_current is not None else None,
         "netShort": str(net_gap) if net_gap is not None else None,
         **concession_details,
+        "lowRegistration": low_registration,
     })
 
 
@@ -1693,6 +1705,11 @@ def run_p2_audit_rules(
 
             refresh_pc_task(connection, tenant_id=tenant_id, journey_id=journey_id,
                             explained=list(result.details.get("scrappageConcession") or []))
+            # A registration far below the standard: is it BH? (2026-11-15)
+            from audit_core.uc03_registration_closures import refresh_bh_task
+
+            refresh_bh_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                            lines=list(result.details.get("lowRegistration") or []))
         record_execution(
             connection, tenant_id=tenant_id, journey_id=journey_id, rule_code=code,
             triggering_event=triggering_event, outcome=result.outcome, reason=result.reason,

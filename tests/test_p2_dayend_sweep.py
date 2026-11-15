@@ -928,10 +928,11 @@ def test_the_action_belongs_to_the_image_quality_and_large_upload_tasks_only(jou
     # and a document's key figure not read, when it is not printed on it;
     # 2026-11-05: and an NDC / cost sheet whose rows do not add up;
     # 2026-11-09: and the registration lower by the scrappage concession;
-    # 2026-11-10: and corrections a page read again does not carry.)
+    # 2026-11-10: and corrections a page read again does not carry;
+    # 2026-11-15: and the BH registration question.)
     assert sorted(name for name, template in tasks.items() if CLOSE in template.actions) == [
         "CORRECTIONS_RECHECK", "COST_SHEET_NDC_DIFFERENCE", "DOCUMENT_KEY_FIGURES_NOT_READ", "NDC_COPIES_DIFFERENCE",
-        "PC_LARGE_UPLOAD_REVIEW", "PC_PAGE_QUALITY_REJECTED", "REVIEWER_CORRECTIONS_INFO",
+        "PC_LARGE_UPLOAD_REVIEW", "PC_PAGE_QUALITY_REJECTED", "REGISTRATION_BH_CONFIRM", "REVIEWER_CORRECTIONS_INFO",
         "SCRAPPAGE_REGISTRATION_CONCESSION", "STATEMENT_ROWS_DO_NOT_ADD_UP"]
     # The file's other failed page keeps its own, unchanged task and cannot use it.
     batch_id, rows = _file(journey, [("booking_form", "READY"), (None, "FAILED"), (None, "FAILED")])

@@ -14,8 +14,8 @@ do that and let PC know it". So, for each registration line of the deal:
 - the shortfall is 25% of the line's standard, within Rs 100, and the deal
   has scrappage on record (a Certificate of Deposit on file, or a scrappage
   bonus given): the shortfall is the concession. The line's standard is taken
-  as 75% of the master's, it is not a shortfall, and the PC gets one
-  information task saying so (closed with a comment);
+  as 75% of the master's, it is not a shortfall, and the journey's System
+  remarks say so (2026-11-15; until then the PC got an information task);
 - the shortfall is 25% within Rs 100 but no scrappage is on record: it stays
   a shortfall, with the note that it matches the concession and no
   Certificate of Deposit or scrappage benefit is on file;
@@ -85,34 +85,22 @@ def _task_key(journey_id: UUID | str) -> str:
 
 def refresh_pc_task(connection: Connection, *, tenant_id: str, journey_id: UUID,
                     explained: list[dict[str, Any]]) -> None:
-    """Tell the PC (one information task per journey) that the registration
-    was taken as lower by the scrappage concession; resolve it once no line
-    is explained that way any more."""
-    from audit_core.uc03_p2_registry import get_registry
-    from audit_core.uc03_p2_task_producer import raise_or_refresh, resolve_if_open
+    """The concession is no longer a PC task (product owner 2026-11-15: "it
+    should come up in the journey observation or system remarks"): Journey
+    360's System remarks show it (uc03_system_remarks). An information task
+    still open from before is closed, saying where the note went."""
+    from audit_core.uc03_p2_task_producer import resolve_if_open
 
-    if not explained:
-        resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id,
-                        dedupe_key=_task_key(journey_id), evidence={"scrappageConcession": []})
-        return
-    lines = "; ".join(
-        f"{e['label']}: {_rupees(Decimal(e['charged']))} charged against the standard "
-        f"{_rupees(Decimal(e['standard']))}, {_rupees(Decimal(e['short']))} lower = the 25% concession "
-        f"{_rupees(Decimal(e['concession']))} (within Rs 100)"
+    resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=_task_key(journey_id),
+                    evidence={"scrappageConcession": [{k: str(v) for k, v in e.items()} for e in explained],
+                              "movedTo": "System remarks (product owner 2026-11-15)"})
+
+
+def concession_remarks(explained: list[dict[str, Any]]) -> list[str]:
+    """The concession in words, one line per registration line."""
+    return [
+        f"{e['label']}: {_rupees(Decimal(str(e['charged'])))} charged against the standard "
+        f"{_rupees(Decimal(str(e['standard'])))} is the 25% scrappage concession "
+        f"({_rupees(Decimal(str(e['concession'])))}); not counted as an undercharge. {POLICY}."
         for e in explained
-    )
-    why = str(explained[0]["scrappage"] or "")
-    why = why[:1].upper() + why[1:]
-    raise_or_refresh(
-        connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=_task_key(journey_id),
-        task_type=TASK_TYPE, source_type="RESOLVER", source_code=TASK_TYPE,
-        title="Registration lower by the scrappage concession",
-        description=(
-            f"For information: {lines}. {why}. Under the {POLICY}, so the "
-            "difference is not counted as an undercharge. Check the registration was made against this "
-            "Certificate of Deposit and close this task with a comment."
-        ),
-        reference={"sourceCode": TASK_TYPE,
-                   "lines": [{k: str(v) for k, v in e.items()} for e in explained]},
-        severity="MEDIUM", registry=get_registry(),
-    )
+    ]

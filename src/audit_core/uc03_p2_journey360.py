@@ -71,8 +71,8 @@ from audit_core.uc03_p2_stage import (
 # servable for older clients but are no longer advertised: the Vehicle tab
 # carries the delivery, the Audit trail carries every event and duration.
 SECTIONS = (
-    "deal", "invoices", "addons", "documents", "payments", "vehicle", "tradein", "customer", "registration",
-    "compliance", "audit",
+    "deal", "remarks", "invoices", "addons", "documents", "payments", "vehicle", "tradein", "customer",
+    "registration", "compliance", "audit",
 )
 
 _OPEN_TASK_EXCLUDED = "('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')"
@@ -1283,6 +1283,12 @@ def _bh_series(connection: Connection, *, tenant_id: str, journey_id: UUID) -> b
         {"t": tenant_id, "j": journey_id, "bh": _BH_NUMBER},
     ).scalar_one()
     if found:
+        return True
+    # The PC answered the BH question "BH registration" (product owner
+    # 2026-11-15, uc03_registration_closures).
+    from audit_core.uc03_registration_closures import confirmed_bh
+
+    if confirmed_bh(connection, tenant_id=tenant_id, journey_id=journey_id):
         return True
     challans = connection.execute(
         text(
@@ -4946,8 +4952,16 @@ def audit(connection: Connection, *, tenant_id: str, journey_id: UUID, limit: in
     }
 
 
+def _remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    from audit_core.uc03_system_remarks import system_remarks
+
+    return system_remarks(connection, tenant_id=tenant_id, journey_id=journey_id)
+
+
 BUILDERS = {
     "deal": deal_section,
+    # What the system noted on the journey instead of raising a task (product owner 2026-11-15).
+    "remarks": _remarks,
     "invoices": invoices,
     "addons": addons,
     "documents": documents,

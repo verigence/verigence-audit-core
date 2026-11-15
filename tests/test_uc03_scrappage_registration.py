@@ -1,6 +1,7 @@
 """Registration on a scrappage deal (product owner 2026-11-09): a registration
 shortfall that is exactly the 25% scrappage concession (within Rs 100) is not
-an undercharge, and the PC is told; on a real Postgres."""
+an undercharge, and the journey's System remarks say so (2026-11-15: no
+longer a PC task); on a real Postgres."""
 from __future__ import annotations
 
 from decimal import Decimal
@@ -14,6 +15,7 @@ from sqlalchemy import text
 from audit_core.db import set_tenant_context
 from audit_core.uc03_p2_audit_rules import run_p2_audit_rules
 from audit_core.uc03_scrappage_registration import assess_line
+from audit_core.uc03_system_remarks import system_remarks
 
 # ── the line on its own ──────────────────────────────────────────────────────
 
@@ -81,7 +83,7 @@ def _deal(journey, *, registration_charged: str) -> None:
     _line(journey, "registration_charges", "80000", registration_charged)
 
 
-def test_on_a_scrappage_deal_the_concession_is_not_an_undercharge_and_the_pc_is_told(journey):
+def test_on_a_scrappage_deal_the_concession_is_not_an_undercharge_and_is_a_system_remark(journey):
     _deal(journey, registration_charged="60000")  # 25% of 80,000 = 20,000
     add_ready_document(journey, "scrappage_certificate_of_deposit")
 
@@ -90,9 +92,26 @@ def test_on_a_scrappage_deal_the_concession_is_not_an_undercharge_and_the_pc_is_
     assert "25% scrappage concession" in under.reason
     [explained] = under.details["scrappageConcession"]
     assert explained["concession"] == "20000.00"
-    task = _pc_task(journey)
-    assert task["assigned_role_code"] == "PC" and task["task_status"] == "READY"
-    assert "Certificate of Deposit is on file" in task["description"]
+    # Product owner 2026-11-15: a remark on the journey, not a PC task.
+    assert _pc_task(journey) is None
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        remarks = system_remarks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    [remark] = [r for r in remarks["remarks"] if r["code"] == "SCRAPPAGE_CONCESSION"]
+    assert "25% scrappage concession" in remark["text"] and "not counted as an undercharge" in remark["text"]
+
+
+def test_an_information_task_raised_before_is_closed_saying_where_the_note_went(journey):
+    _deal(journey, registration_charged="60000")
+    add_ready_document(journey, "scrappage_certificate_of_deposit")
+    _sql(journey, "INSERT INTO auditcore.p2_tasks (tenant_id, journey_id, task_type, category, origin_kind, "
+                  "source_type, source_code, dedupe_key, title, description, reference, severity, priority, "
+                  "assigned_role_code, allowed_actions, completion_protocol) VALUES (:t, :j, "
+                  "'SCRAPPAGE_REGISTRATION_CONCESSION', 'CROSS_DOCUMENT_REVIEW', 'SYSTEM', 'RESOLVER', "
+                  "'SCRAPPAGE_REGISTRATION_CONCESSION', :k, 'Registration lower', 'x', '{}', 'MEDIUM', 'NORMAL', "
+                  "'PC', '[]', 'MACHINE_VERIFIED')", k=f"scrappage-registration:{journey.journey_id}")
+    _run(journey)
+    assert _pc_task(journey)["task_status"] == "VERIFIED_COMPLETE"
 
 
 def test_without_scrappage_on_file_a_25_percent_shortfall_stays_and_says_why(journey):
