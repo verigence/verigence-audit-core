@@ -817,8 +817,21 @@ def _set_unit(connection: Connection, *, tenant_id: str, journey_id: UUID, unit:
     )
 
 
+def _rule_engine_off(connection: Connection, *, tenant_id: str) -> bool:
+    return connection.execute(
+        text("SELECT rule_engine_enabled FROM auditcore.tenant_rule_config WHERE tenant_id=:t"), {"t": tenant_id},
+    ).scalar_one_or_none() is False
+
+
 def _unit_fingerprint(connection: Connection, *, tenant_id: str, journey_id: UUID, unit: str) -> str:
     facts = fact_fingerprint(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if unit.startswith("RULE_ENGINE:") and _rule_engine_off(connection, tenant_id=tenant_id):
+        # Turning the Rule Engine off is an input of its unit (2026-11-15): the
+        # next run writes NOT_APPLICABLE and closes the Rule Engine's findings and
+        # tasks, even on a journey whose facts did not change since its last run.
+        import hashlib
+
+        return hashlib.sha256(f"{facts}|rule-engine-off".encode()).hexdigest()
     if unit != "P2:DERIVED":
         return facts
     # Derived controls also read gates, page outcomes and the execution log.
