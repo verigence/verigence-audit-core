@@ -3,7 +3,7 @@ review decision 1), corrected where the Rule Engine compared them wrongly; on a
 real Postgres."""
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from conftest import delete_tenant_data
@@ -37,7 +37,7 @@ def _iso(day: date) -> str:
     return day.isoformat()
 
 
-TODAY = date.today()
+TODAY = datetime.now(UTC).date()
 
 
 def test_each_moved_check_is_a_native_delivery_control():
