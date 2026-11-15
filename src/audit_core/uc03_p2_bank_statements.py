@@ -455,13 +455,14 @@ def _journey_status(connection: Connection, tenant_id: str, dealer_id: str, jour
         duplicates = _duplicate_receipts(journey_rows)
         status = journey_bank_status([r for r in journey_rows if r["payment_id"] not in duplicates], outcomes)
         updates.append({"t": tenant_id, "j": jid, "d": dealer_id, "s": status["status"], "n": status["receipts"],
-                        "b": status["bank"], "v": status["verified"], "l": status["left"], "c": status["cash"]})
+                        "b": status["bank"], "v": status["verified"], "l": status["left"], "c": status["cash"],
+                        "bv": status["status"] == "BANK_VERIFIED"})
     connection.execute(
         text("""
             INSERT INTO auditcore.p2_journey_bank_status (tenant_id, journey_id, dealer_id, status, receipts,
               bank_receipts, verified, left_to_verify, cash, bank_verified_at, updated_at_utc)
             VALUES (:t, CAST(:j AS uuid), CAST(:d AS uuid), :s, :n, :b, :v, :l, :c,
-                    CASE WHEN :s = 'BANK_VERIFIED' THEN now() END, now())
+                    CASE WHEN :bv THEN now() END, now())
             ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
               status = EXCLUDED.status, receipts = EXCLUDED.receipts, bank_receipts = EXCLUDED.bank_receipts,
               verified = EXCLUDED.verified, left_to_verify = EXCLUDED.left_to_verify, cash = EXCLUDED.cash,
