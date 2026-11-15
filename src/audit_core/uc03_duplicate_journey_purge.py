@@ -98,6 +98,7 @@ def run_duplicate_journey_purge(
     security_client: Any = None,
     v2_client: Any = None,
     storage: Any = None,
+    reason: str = REASON,
 ) -> dict[str, Any]:
     tenant_id, commit = parse_tag(tag)
     references = _references(reports)
@@ -164,7 +165,7 @@ def run_duplicate_journey_purge(
 
         try:
             result = system_delete_journey(
-                engine, tenant_id=tenant_id, journey_id=journey_id, reason=REASON,
+                engine, tenant_id=tenant_id, journey_id=journey_id, reason=reason,
                 correlation_id=correlation_id, security_client=security_client,
                 v2_client=v2_client, storage=storage,
                 on_deleted=recheck,

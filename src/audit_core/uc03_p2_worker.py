@@ -5183,6 +5183,10 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # the tag names (2026-10-31): see uc03_duplicate_journey_purge.
         from audit_core.uc03_duplicate_journey_purge import run_duplicate_journey_purge
         return run_duplicate_journey_purge, (engine, tag, reports)
+    if kind == "EMPTY_JOURNEY_PURGE":
+        # Journeys nothing was read for in 7 days (2026-11-15): see uc03_empty_journey_purge.
+        from audit_core.uc03_empty_journey_purge import run_empty_journey_purge
+        return run_empty_journey_purge, (engine, tag, reports)
     if kind == "FILE_IDENTITY_SCAN":
         # Whose each uploaded file is, for the one tenant the tag names
         # (2026-10-31): see uc03_file_identity_scan. Never deletes.
