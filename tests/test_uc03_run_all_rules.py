@@ -7,6 +7,7 @@ import pytest
 from conftest import delete_tenant_data
 from sqlalchemy import create_engine, text
 
+from audit_core.uc03_document_consistency_rules import CODES as CONSISTENCY_CODES
 from audit_core.uc03_run_all_rules import _run_audit_core_rules_for_stage
 
 
@@ -145,5 +146,7 @@ def test_run_all_rules_for_delivery_stage_only_runs_delivery_scoped_rules(
         "DO_PAYMENT_NOT_RECEIVED", "DO_SHORT_PAYMENT", "TRADE_IN_NOT_RESOLD", "TRADE_IN_SOLD_AT_LOSS",
         "POST_DELIVERY_REFUND",
         "ACCESSORIES_FITTED_UNCONFIRMED", "ACCESSORY_FITTED_UNBILLED", "DELIVERY_NOT_COMPLETED_IN_TIME",
+        # Moved from the Rule Engine (2026-11-15, uc03_document_consistency_rules).
+        *CONSISTENCY_CODES,
     }
     assert all(r.stage == "DELIVERY" for r in results)
