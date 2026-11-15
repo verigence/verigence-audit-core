@@ -1461,7 +1461,10 @@ def delivery_not_completed_in_time(facts: _Facts) -> RuleOutcome:
     return RuleOutcome(code, "FAIL", (
         f"Delivery not completed {(facts.today - clock['date']).days} days after the {clock['document']} dated "
         f"{_when(clock['date'])}. Pending: {summary}."
-    ), {"findingTitle": "Delivery not completed in time: " + summary[:200], "pending": pending,
+    # A stable title (2026-11-15): the pending list moved with every PC task
+    # opened or closed, so the title -- part of the issue a Team Lead accepts
+    # -- changed and an accepted exception reopened. The list stays in the reason.
+    ), {"findingTitle": "Delivery not completed in time", "pending": pending,
         "clockDocument": clock["document"], "clockDate": clock["date"].isoformat()})
 
 
