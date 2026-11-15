@@ -437,7 +437,14 @@ def submit_action(
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     task = _task(connection, tenant_id=tenant_id, task_id=task_id)
+    from audit_core import uc03_task_closure as closure
+
+    if action == closure.ESCALATE_ACTION and not closure.can_escalate(task, actor_role_code):
+        # The PC explains and sends the task to the Team Lead (2026-11-15).
+        raise TaskStateError("This task can be sent to the Team Lead once the re-check has returned it.")
     allowed = list(task["allowed_actions"] or [])
+    if action == closure.ESCALATE_ACTION:
+        allowed.append(action)
     if action == CLOSE_TASK and task["task_type"] == MISSING_DOCUMENT_TASK and closes_by_hand(task):
         allowed.append(CLOSE_TASK)
     if action not in allowed:
@@ -531,6 +538,10 @@ def submit_action(
         comment=comment,
         details=details,
     )
+
+    if action == closure.ESCALATE_ACTION:
+        return closure.escalate(connection, tenant_id=tenant_id, task=task, actor_id=actor_id,
+                                actor_role_code=actor_role_code, comment=comment)
 
     if action == CLOSE_TASK and task["task_type"] == MISSING_DOCUMENT_TASK:
         # "Document not required to be uploaded" is the PC's claim, decided by
