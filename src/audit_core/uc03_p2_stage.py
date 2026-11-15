@@ -943,6 +943,7 @@ def requirement_items(
     made mandatory by evidence, and optional ones. Templates sharing a
     group are one requirement met by any of them."""
     items: dict[str, dict[str, Any]] = {}
+    waivers = document_waivers(connection, tenant_id=tenant_id, journey_id=journey_id)
     for template in registry.documents.values():
         if template.stage != stage or template.is_supporting:
             continue
@@ -975,13 +976,30 @@ def requirement_items(
             item["reason"] = item["reason"] or reasons[condition]
     for item in items.values():
         item["label"] = GROUP_LABELS.get(item["key"]) or " or ".join(item["labels"])
+        # A person's answer for the document (2026-11-15, p2_document_waivers):
+        # an accepted one counts as received; a claim waits for the Reviewer.
+        waiver = waivers.get(item["key"])
+        item["waiver"] = waiver
+        if waiver and waiver["status"] == "ACCEPTED" and not item["received"]:
+            item["received"] = True
+            item["receivedBy"] = waiver["choice"]
     return list(items.values())
+
+
+def document_waivers(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, dict[str, Any]]:
+    """The journey's per-document answers (uc03_document_waivers), by requirement key."""
+    return {str(r["requirement_key"]): dict(r) for r in connection.execute(
+        text("SELECT waiver_id, requirement_key, choice, status, reason, claimed_role, decided_role, decision_reason, "
+             "round FROM auditcore.p2_document_waivers WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()}
 
 
 # A group that is one document under two system names is asked for by its one
 # name (product owner, 2026-10-31: "Upload the Accessory Invoice", not "... (DMS)
 # or ... (Tally)").
-GROUP_LABELS = {"ACCESSORY_INVOICE": "Accessory Invoice", "DEALER_STATEMENT": "Dealer statement (NDC / cost sheet)"}
+GROUP_LABELS = {"ACCESSORY_INVOICE": "Accessory Invoice", "DEALER_STATEMENT": "Dealer statement (NDC / cost sheet)",
+                "VEHICLE_INVOICE": "Vehicle invoice (DMS or Tally)", "GATE_PASS": "Gate pass"}
 
 
 def vehicle_proof(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:

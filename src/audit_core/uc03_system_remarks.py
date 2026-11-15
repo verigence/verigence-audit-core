@@ -81,37 +81,40 @@ def _bh_remark(connection: Connection, *, tenant_id: str, journey_id: UUID) -> l
 
 
 def _closure_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """A missing document answered "Dealer not provided" or "Temporary registration"
+    (p2_document_waivers since 2026-11-15; the answers on the earlier per-document
+    tasks were carried over by migration 0229)."""
     rows = connection.execute(
         text(
             """
-            SELECT reference->>'requirementKey' AS requirement, completion_result
-            FROM auditcore.p2_tasks
-            WHERE tenant_id=:t AND journey_id=:j AND task_type='DOCUMENT_MISSING'
-              AND task_status='VERIFIED_COMPLETE' AND completion_result->>'choice' = ANY(:choices)
-            ORDER BY verified_at_utc
+            SELECT requirement_key AS requirement, choice, reason, claimed_role, claimed_at_utc
+            FROM auditcore.p2_document_waivers
+            WHERE tenant_id=:t AND journey_id=:j AND status='ACCEPTED' AND choice = ANY(:choices)
+            ORDER BY claimed_at_utc, requirement_key
             """
         ),
         {"t": tenant_id, "j": journey_id, "choices": [DEALER_NOT_PROVIDED, TEMPORARY_REGISTRATION]},
     ).mappings().all()
     remarks: list[dict[str, Any]] = []
     for row in rows:
-        result = dict(row["completion_result"] or {})
-        reason = str(result.get("reason") or "")
-        document = _DOCUMENT_LABEL.get(str(row["requirement"] or ""), "Document")
-        if result.get("choice") == DEALER_NOT_PROVIDED:
+        reason = str(row["reason"] or "")
+        requirement = str(row["requirement"] or "")
+        at = row["claimed_at_utc"].isoformat() if row["claimed_at_utc"] else None
+        role = row["claimed_role"]
+        document = _DOCUMENT_LABEL.get(requirement, "Document")
+        if row["choice"] == DEALER_NOT_PROVIDED:
             remarks.append(_remark("DEALER_NOT_PROVIDED", f"{document}: dealer not provided",
                                    f"The customer bought it, but the dealership does not issue the "
-                                   f"{_IN_SENTENCE.get(str(row['requirement'] or ''), 'document')}; the PC closed the task as \"Dealer not "
-                                   f"provided\". Comment: {reason}", "Task",
-                                   at=result.get("closedAt"), by=result.get("closedRole")))
+                                   f"{_IN_SENTENCE.get(requirement, 'document')}; the PC answered \"Dealer not "
+                                   f"provided\". Comment: {reason}", "Task", at=at, by=role))
         else:
             number = temporary_number(reason)
             said = f"Delivered on temporary registration {number}." if number else "Delivered on temporary registration."
             closer = {"TL": "Team Lead", "PM": "Project Manager", "REVIEWER": "Reviewer"}.get(
-                str(result.get("closedRole") or "").upper(), "Team Lead")
+                str(role or "").upper(), "Team Lead")
             remarks.append(_remark("TEMPORARY_REGISTRATION", "Temporary registration",
-                                   f"{said} The RTO challan task was closed by the {closer}. Comment: {reason}",
-                                   "Task", at=result.get("closedAt"), by=result.get("closedRole")))
+                                   f"{said} The RTO challan was answered for by the {closer}. Comment: {reason}",
+                                   "Task", at=at, by=role))
     return remarks
 
 

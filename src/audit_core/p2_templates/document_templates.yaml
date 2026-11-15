@@ -543,8 +543,10 @@ document_types:
     di_types:
     - customer_invoice_dms
     stage: DELIVERY
+    # Mandatory at delivery (product owner 2026-11-15): one of the group is enough.
     requirement: REQUIRED
     condition: null
+    group: VEHICLE_INVOICE
     accepted_early: true
     pages: *id001
     extraction:
@@ -599,8 +601,10 @@ document_types:
     di_types:
     - tax_invoice_tally
     stage: DELIVERY
-    requirement: OPTIONAL
+    # Mandatory at delivery (product owner 2026-11-15): one of the group is enough.
+    requirement: REQUIRED
     condition: null
+    group: VEHICLE_INVOICE
     accepted_early: true
     pages: *id001
     extraction:
@@ -635,7 +639,7 @@ document_types:
     - DEAL
     - VEHICLE
   insurance_cover:
-    display_name: Insurance Cover Note
+    display_name: Insurance Cover Note or Policy
     di_types:
     - insurance_cover
     stage: DELIVERY
@@ -748,8 +752,10 @@ document_types:
     di_types:
     - rto_challan
     stage: DELIVERY
-    requirement: CONDITIONAL
-    condition: registrationByDealer
+    # Mandatory at delivery (product owner 2026-11-15); a temporary registration is
+    # closed by a TL or Reviewer with its number.
+    requirement: REQUIRED
+    condition: null
     accepted_early: true
     pages:
       shape: SINGLE
@@ -888,8 +894,10 @@ document_types:
     di_types:
     - gate_pass
     stage: DELIVERY
-    requirement: OPTIONAL
+    # Mandatory at delivery (product owner 2026-11-15): one of the group is enough.
+    requirement: REQUIRED
     condition: null
+    group: GATE_PASS
     accepted_early: true
     pages:
       shape: SINGLE
@@ -1455,7 +1463,9 @@ document_types:
     di_types:
     - delivery_receipt
     stage: DELIVERY
-    requirement: OPTIONAL
+    # A delivery receipt with a date is the gate pass (2026-11-12): one of the group is enough.
+    requirement: REQUIRED
+    group: GATE_PASS
     condition: null
     accepted_early: true
     pages:

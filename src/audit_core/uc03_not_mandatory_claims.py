@@ -110,6 +110,10 @@ def submit_claim(
         ),
         {"t": tenant_id, "id": task["task_id"], "actor": actor_id, "result": _json(result)},
     )
+    from audit_core.uc03_document_waivers import record_legacy_answer
+
+    record_legacy_answer(connection, tenant_id=tenant_id, task=task, choice=NOT_MANDATORY_CHOICE, status="CLAIMED",
+                         reason=reason, actor_id=actor_id, actor_role_code=actor_role_code)
     journey_id = UUID(str(task["journey_id"]))
     refresh_review_task(connection, tenant_id=tenant_id, journey_id=journey_id)
     return {"taskId": str(task["task_id"]), "status": "AWAITING_REQUESTER_REVIEW", "outcome": CLAIMED}
@@ -118,14 +122,50 @@ def submit_claim(
 # --------------------------------------------------------------------------- reading claims
 
 def claims(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
-    """Every missing-document task on the journey that carries a "not mandatory" claim,
-    pending or decided, oldest first."""
+    """Every "not mandatory" claim on the journey, pending or decided, oldest first.
+
+    Since 2026-11-15 a claim is a row of p2_document_waivers (one missing-documents
+    task per journey, uc03_document_waivers); its id is the waiver id, kept under
+    "taskId" so the Reviewer's panel and the decision endpoint did not change."""
     rows = connection.execute(
         text(
             """
-            SELECT task_id, title, task_status, round_number, reference, completion_result, updated_at_utc
+            SELECT waiver_id, requirement_key, label, stage, status, round, reason, claimed_by, claimed_at_utc,
+                   decided_by, decided_role, decided_at_utc, decision_reason
+            FROM auditcore.p2_document_waivers
+            WHERE tenant_id=:t AND journey_id=:j AND choice=:choice
+            ORDER BY claimed_at_utc, waiver_id
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "choice": NOT_MANDATORY_CHOICE},
+    ).mappings().all()
+    state = {"CLAIMED": "PENDING", "ACCEPTED": "ACCEPTED", "REJECTED": "REJECTED"}
+    return [*_task_claims(connection, tenant_id=tenant_id, journey_id=journey_id), *[{
+        "taskId": str(r["waiver_id"]),
+        "requirementKey": r["requirement_key"],
+        "document": r["label"] or r["requirement_key"],
+        "stage": r["stage"],
+        "state": state[r["status"]],
+        "round": int(r["round"]),
+        "pcReason": r["reason"],
+        "claimedBy": r["claimed_by"],
+        "claimedAt": r["claimed_at_utc"].isoformat() if r["claimed_at_utc"] else None,
+        "decidedBy": r["decided_by"],
+        "decidedRole": r["decided_role"],
+        "decidedAt": r["decided_at_utc"].isoformat() if r["decided_at_utc"] else None,
+        "decisionReason": r["decision_reason"],
+    } for r in rows]]
+
+
+def _task_claims(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """A claim kept on its task: the booking form task (BOOKING_FORM_MISSING). The
+    per-document tasks of before 2026-11-15 are waiver rows (migration 0229)."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT task_id, title, task_status, round_number, reference, completion_result
             FROM auditcore.p2_tasks
-            WHERE tenant_id=:t AND journey_id=:j AND task_type='DOCUMENT_MISSING'
+            WHERE tenant_id=:t AND journey_id=:j AND task_type='DOCUMENT_MISSING' AND source_code <> 'DOCUMENT_MISSING'
               AND completion_result->>'outcome' IN ('NOT_MANDATORY_CLAIMED','NOT_MANDATORY_ACCEPTED',
                                                     'NOT_MANDATORY_REJECTED')
             ORDER BY created_at_utc, task_id
@@ -136,26 +176,16 @@ def claims(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[
     out = []
     for r in rows:
         ref, res = dict(r["reference"] or {}), dict(r["completion_result"] or {})
-        outcome = res.get("outcome")
-        # A rejected claim the PC has not answered again is back with the PC.
         state = {"NOT_MANDATORY_CLAIMED": "PENDING", "NOT_MANDATORY_ACCEPTED": "ACCEPTED",
-                 "NOT_MANDATORY_REJECTED": "REJECTED"}[outcome]
+                 "NOT_MANDATORY_REJECTED": "REJECTED"}[res.get("outcome")]
         if state == "PENDING" and r["task_status"] != "AWAITING_REQUESTER_REVIEW":
             continue
         out.append({
-            "taskId": str(r["task_id"]),
-            "requirementKey": ref.get("requirementKey"),
-            "document": r["title"],
-            "stage": ref.get("stage"),
-            "state": state,
-            "round": int(r["round_number"]),
-            "pcReason": res.get("claimReason"),
-            "claimedBy": res.get("claimedBy"),
-            "claimedAt": res.get("claimedAt"),
-            "decidedBy": res.get("decidedBy"),
-            "decidedRole": res.get("decidedRole"),
-            "decidedAt": res.get("decidedAt"),
-            "decisionReason": res.get("decisionReason"),
+            "taskId": str(r["task_id"]), "requirementKey": ref.get("requirementKey"), "document": r["title"],
+            "stage": ref.get("stage"), "state": state, "round": int(r["round_number"]),
+            "pcReason": res.get("claimReason"), "claimedBy": res.get("claimedBy"), "claimedAt": res.get("claimedAt"),
+            "decidedBy": res.get("decidedBy"), "decidedRole": res.get("decidedRole"),
+            "decidedAt": res.get("decidedAt"), "decisionReason": res.get("decisionReason"),
         })
     return out
 
@@ -176,7 +206,7 @@ def refresh_review_task(connection: Connection, *, tenant_id: str, journey_id: U
         connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=review_key(journey_id),
         task_type=CLAIM_REVIEW_TASK, source_type="HUMAN_ACTION", source_code=CLAIM_REVIEW_TASK,
         title=f"PC says {count} document{'s are' if count != 1 else ' is'} not mandatory",
-        description=(f"The PC closed {count} missing-document task{'s' if count != 1 else ''} as not mandatory: "
+        description=(f"The PC answered {count} missing document{'s' if count != 1 else ''} as not mandatory: "
                      f"{listed}. Accept or reject each one; a rejected one goes back to the PC with your reason."),
         reference={"sourceCode": CLAIM_REVIEW_TASK, "claims": pending,
                    # In the issue hash: a new claim reopens a task already closed.
@@ -201,6 +231,16 @@ def decide_claim(
     reason = (reason or "").strip()
     if decision == "REJECT" and len(reason) < MIN_REASON:
         raise HTTPException(status_code=422, detail="Say why the document is mandatory (at least 10 characters).")
+    if decision not in ("ACCEPT", "REJECT"):
+        raise HTTPException(status_code=422, detail="decision is ACCEPT or REJECT.")
+    waiver = connection.execute(
+        text("SELECT * FROM auditcore.p2_document_waivers WHERE tenant_id=:t AND waiver_id=:id AND journey_id=:j "
+             "FOR UPDATE"),
+        {"t": tenant_id, "id": task_id, "j": journey_id},
+    ).mappings().one_or_none()
+    if waiver is not None:
+        return _decide_waiver(connection, tenant_id=tenant_id, journey_id=journey_id, waiver=waiver,
+                              decision=decision, reason=reason, actor_id=actor_id, role=role)
     task = connection.execute(
         text("SELECT * FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_id=:id AND journey_id=:j FOR UPDATE"),
         {"t": tenant_id, "id": task_id, "j": journey_id},
@@ -237,11 +277,52 @@ def decide_claim(
         event, status = "RETURNED", "RETURNED"
     else:
         raise HTTPException(status_code=422, detail="decision is ACCEPT or REJECT.")
+    connection.execute(
+        text("UPDATE auditcore.p2_document_waivers SET status=:s, decided_by=:a, decided_role=:r, "
+             "decided_at_utc=now(), decision_reason=:why, updated_at_utc=now() "
+             "WHERE tenant_id=:t AND source_task_id=:id AND status='CLAIMED'"),
+        {"t": tenant_id, "id": task_id, "s": "ACCEPTED" if decision == "ACCEPT" else "REJECTED", "a": actor_id,
+         "r": role, "why": reason or None},
+    )
     record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id, task_id=task_id, event_type=event,
                       actor_id=actor_id, actor_role_code=role, comment=reason or None,
                       details={"claim": result["outcome"]})
     refresh_review_task(connection, tenant_id=tenant_id, journey_id=journey_id)
     return {"taskId": str(task_id), "status": status, "outcome": result["outcome"]}
+
+
+def _decide_waiver(connection: Connection, *, tenant_id: str, journey_id: UUID, waiver: Any, decision: str,
+                   reason: str, actor_id: str, role: str) -> dict[str, Any]:
+    """Accept: the document counts as received. Reject: it is asked for again on the
+    journey's missing-documents task, with the Reviewer's reason."""
+    from audit_core.uc03_p2_task_producer import sync_document_missing_tasks
+    from audit_core.uc03_p2_tasks import record_task_event
+
+    if waiver["status"] != "CLAIMED":
+        raise HTTPException(status_code=409, detail="This claim is not waiting for a decision.")
+    status = "ACCEPTED" if decision == "ACCEPT" else "REJECTED"
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_document_waivers
+            SET status=:status, decided_by=:actor, decided_role=:role, decided_at_utc=now(),
+                decision_reason=:reason, updated_at_utc=now()
+            WHERE tenant_id=:t AND waiver_id=:id
+            """
+        ),
+        {"t": tenant_id, "id": waiver["waiver_id"], "status": status, "actor": actor_id, "role": role,
+         "reason": reason or None},
+    )
+    outcome = ACCEPTED if status == "ACCEPTED" else REJECTED
+    if waiver["source_task_id"] is not None:
+        record_task_event(connection, tenant_id=tenant_id, journey_id=journey_id, task_id=waiver["source_task_id"],
+                          event_type="ACCEPT" if status == "ACCEPTED" else "RETURNED", actor_id=actor_id,
+                          actor_role_code=role, comment=reason or None,
+                          details={"claim": outcome, "requirementKey": waiver["requirement_key"]})
+    refresh_review_task(connection, tenant_id=tenant_id, journey_id=journey_id)
+    sync_document_missing_tasks(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                evaluation_started_at=datetime.now(UTC))
+    return {"taskId": str(waiver["waiver_id"]), "status": status, "outcome": outcome}
 
 
 # --------------------------------------------------------------------------- endpoints

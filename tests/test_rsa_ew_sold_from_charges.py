@@ -16,7 +16,12 @@ from uuid import uuid4
 
 import pytest
 from conftest import delete_tenant_data
-from p2_support import add_ready_document, create_p2_journey, database_engine
+from p2_support import (
+    add_ready_document,
+    create_p2_journey,
+    database_engine,
+    missing_document_lines,
+)
 from sqlalchemy import text
 
 from audit_core import uc03_booking_rebuild as rebuild
@@ -148,14 +153,19 @@ def test_the_legacy_requirement_resolver_follows_the_same_rule(journey):
 
 
 def _open_missing_tasks(journey) -> list[str]:
+    """Every document still asked for: an old per-document task, or a line of the one task (2026-11-15)."""
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        return sorted(connection.execute(
+        old = connection.execute(
             text("SELECT reference->>'requirementKey' FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j "
-                 "AND task_type='DOCUMENT_MISSING' AND task_status IN "
+                 "AND task_type='DOCUMENT_MISSING' AND reference ? 'requirementKey' AND task_status IN "
                  "('READY','IN_PROGRESS','RETURNED','ACTION_COMPLETED','VERIFYING')"),
             {"t": journey.tenant_id, "j": journey.journey_id},
-        ).scalars().all())
+        ).scalars().all()
+    return sorted([*old, *missing_document_lines(journey)])
+
+
+_ALWAYS_ASKED = {"DEALER_STATEMENT", "VEHICLE_INVOICE", "insurance_cover", "GATE_PASS", "rto_challan"}
 
 
 def _raise_old_task(journey, requirement_key: str, label: str) -> None:
@@ -195,8 +205,8 @@ def test_an_open_task_raised_from_the_booking_form_closes_on_settle(journey):
     assert _open_missing_tasks(journey) == ["ew_invoice", "rsa_invoice"]
 
     _settle(journey)
-    # The RSA and EW invoice tasks close; the delivery has no NDC or cost sheet, which is asked for (2026-11-11).
-    assert _open_missing_tasks(journey) == ["DEALER_STATEMENT"]
+    # The RSA and EW invoice tasks close; the five mandatory delivery documents are asked for (2026-11-15).
+    assert set(_open_missing_tasks(journey)) == _ALWAYS_ASKED - {"GATE_PASS"}
 
 
 def test_a_charge_on_the_ledger_raises_no_task_and_an_open_one_closes(journey):
@@ -207,12 +217,12 @@ def test_a_charge_on_the_ledger_raises_no_task_and_an_open_one_closes(journey):
     add_ready_document(journey, "customer_ledger", process_area="DELIVERY", rsa_amount="1500",
                        additional_warranty_amount="9999")
     _settle(journey)
-    assert _open_missing_tasks(journey) == []
+    assert set(_open_missing_tasks(journey)) == _ALWAYS_ASKED - {"DEALER_STATEMENT"}
     _raise_old_task(journey, "rsa_invoice", "RSA Invoice")
     _raise_old_task(journey, "ew_invoice", "Extended Warranty Invoice")
-    assert _open_missing_tasks(journey) == ["ew_invoice", "rsa_invoice"]
+    assert {"ew_invoice", "rsa_invoice"} <= set(_open_missing_tasks(journey))
     _settle(journey)
-    assert _open_missing_tasks(journey) == []
+    assert set(_open_missing_tasks(journey)) == _ALWAYS_ASKED - {"DEALER_STATEMENT"}
 
 
 def test_the_rebuild_job_can_be_limited_to_one_project(journey):

@@ -75,7 +75,10 @@ def _act(journey, task_id, *, role: str, choice: str, comment: str | None = None
         set_tenant_context(connection, journey.tenant_id)
         return submit_action(connection, tenant_id=journey.tenant_id, task_id=task_id, action="CLOSE_TASK",
                              actor_id=str(uuid4()), actor_role_code=role, comment=comment or choice,
-                             details={"choice": choice})
+                             details={"choice": choice, "requirementKey": _REQUIREMENT.get(task_id)})
+
+
+_REQUIREMENT: dict = {}
 
 
 def _line(journey, key: str, standard: str, actual: str) -> None:
@@ -93,15 +96,29 @@ def _bh_task(journey):
 
 
 def _missing_document_task(journey, requirement: str) -> UUID:
-    return UUID(str(_sql(
+    """The journey's ONE missing-documents task (2026-11-15), carrying this document as its line."""
+    items = [{"key": requirement, "label": requirement, "reason": "x", "stage": "DELIVERY", "templates": [],
+              "conditions": [], "notRequiredAllowed": True},
+             {"key": "insurance_cover", "label": "Insurance", "reason": "x", "stage": "DELIVERY", "templates": [],
+              "conditions": [], "notRequiredAllowed": True}]
+    task_id = UUID(str(_sql(
         journey,
         "INSERT INTO auditcore.p2_tasks (tenant_id, journey_id, task_type, category, origin_kind, source_type, "
         "source_code, dedupe_key, title, description, reference, severity, priority, assigned_role_code, "
         "allowed_actions, completion_protocol) VALUES (:t, :j, 'DOCUMENT_MISSING', 'DOCUMENT_COLLECTION', "
-        "'SYSTEM', 'REQUIREMENT', 'DOCUMENT_MISSING', :k, 'Upload the document', 'x', CAST(:ref AS jsonb), "
+        "'SYSTEM', 'REQUIREMENT', 'DOCUMENT_MISSING', :k, 'Upload the documents', 'x', CAST(:ref AS jsonb), "
         "'HIGH', 'HIGH', 'PC', '[\"UPLOAD_DOCUMENT\", \"ADD_COMMENT\"]', 'MACHINE_VERIFIED') RETURNING task_id",
-        k=f"missing:{journey.journey_id}:{requirement}", ref=json.dumps({"requirementKey": requirement}),
+        k=f"document-missing-test:{journey.journey_id}:{requirement}",
+        ref=json.dumps({"sourceCode": "DOCUMENT_MISSING", "items": items,
+                        "requirementKeys": [i["key"] for i in items]}),
     ).scalar_one()))
+    _REQUIREMENT[task_id] = requirement
+    return task_id
+
+
+def _answered(journey, requirement: str) -> str | None:
+    return _sql(journey, "SELECT status FROM auditcore.p2_document_waivers WHERE tenant_id=:t AND journey_id=:j "
+                         "AND requirement_key=:k", k=requirement).scalar_one_or_none()
 
 
 def _status(journey, task_id: UUID) -> str:
@@ -164,11 +181,11 @@ def test_a_team_lead_closes_the_rto_challan_task_with_the_temporary_registration
     with pytest.raises(ValueError, match="temporary registration number"):
         _act(journey, task_id, role="TL", choice=TEMPORARY_REGISTRATION,
              comment=f"{TEMPORARY_REGISTRATION}: permanent number awaited")
-    assert _status(journey, task_id) == "READY"
+    assert _status(journey, task_id) == "READY" and _answered(journey, "rto_challan") is None
 
     _act(journey, task_id, role="TL", choice=TEMPORARY_REGISTRATION,
          comment=f"{TEMPORARY_REGISTRATION}: OD02T1234, permanent number awaited")
-    assert _status(journey, task_id) == "VERIFIED_COMPLETE"
+    assert _answered(journey, "rto_challan") == "ACCEPTED"
     [remark] = [r for r in _remarks(journey) if r["code"] == "TEMPORARY_REGISTRATION"]
     assert "temporary registration OD02T1234" in remark["text"] and "Team Lead" in remark["text"]
 
@@ -177,14 +194,14 @@ def test_a_reviewer_may_close_it_too(journey):
     task_id = _missing_document_task(journey, "rto_challan")
     _act(journey, task_id, role="REVIEWER", choice=TEMPORARY_REGISTRATION,
          comment=f"{TEMPORARY_REGISTRATION}: T0925OD1234A")
-    assert _status(journey, task_id) == "VERIFIED_COMPLETE"
+    assert _answered(journey, "rto_challan") == "ACCEPTED"
 
 
 def test_the_pc_closes_the_rsa_invoice_task_as_dealer_not_provided(journey):
     task_id = _missing_document_task(journey, "rsa_invoice")
     _act(journey, task_id, role="PC", choice=DEALER_NOT_PROVIDED,
          comment=f"{DEALER_NOT_PROVIDED}: dealership issues no separate RSA invoice")
-    assert _status(journey, task_id) == "VERIFIED_COMPLETE"
+    assert _answered(journey, "rsa_invoice") == "ACCEPTED"
     [remark] = [r for r in _remarks(journey) if r["code"] == "DEALER_NOT_PROVIDED"]
     assert remark["title"] == "RSA invoice: dealer not provided"
     assert "does not issue the RSA invoice" in remark["text"]
@@ -194,7 +211,7 @@ def test_dealer_not_provided_is_only_for_the_ew_and_rsa_invoices(journey):
     task_id = _missing_document_task(journey, "rto_challan")
     with pytest.raises(ValueError, match="extended warranty or RSA"):
         _act(journey, task_id, role="PC", choice=DEALER_NOT_PROVIDED)
-    assert _status(journey, task_id) == "READY"
+    assert _status(journey, task_id) == "READY" and _answered(journey, "rto_challan") is None
 
 
 def test_products_not_taken_are_remarks(journey, monkeypatch):

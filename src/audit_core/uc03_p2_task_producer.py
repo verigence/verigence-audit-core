@@ -1525,7 +1525,12 @@ def sync_booking_date_task(
 # delivery without one had no task at all: 179 delivered deals had no vehicle
 # price from an NDC or cost sheet. Its task is a missing-document task like
 # the others, in the same Missing documents group and report.
-ALWAYS_ASKED_REQUIREMENTS = frozenset({"DEALER_STATEMENT"})
+# Mandatory at every delivery (product owner 2026-11-15): asked for with no
+# condition once delivery has started. The NDC / cost sheet since 2026-11-11.
+ALWAYS_ASKED_REQUIREMENTS = frozenset({"DEALER_STATEMENT", "VEHICLE_INVOICE", "insurance_cover", "GATE_PASS",
+                                       "rto_challan"})
+# The NDC / cost sheet can never be claimed "not required" (2026-11-11).
+NEVER_WAIVED_AS_NOT_REQUIRED = frozenset({"DEALER_STATEMENT"})
 
 
 def sync_document_missing_tasks(
@@ -1536,7 +1541,7 @@ def sync_document_missing_tasks(
     registry: Registry | None = None,
     evaluation_started_at: datetime | None = None,
 ) -> dict[str, int]:
-    """One Document Missing task (PC) per conditional document that
+    """ONE Document Missing task (PC) per journey listing every document that
     evidence made mandatory and that is not in yet -- e.g. a corporate
     discount on the booking form or invoice asks for the Corporate ID. The
     task closes itself when the document is read, or when the evidence no
@@ -1561,10 +1566,14 @@ def sync_document_missing_tasks(
 
     registry = registry or get_registry()
     reasons = condition_reasons(connection, tenant_id=tenant_id, journey_id=journey_id)
-    wanted: set[str] = set()
     counts: dict[str, int] = {}
     stages = ("BOOKING", "DELIVERY") if delivery_has_started(
         connection, tenant_id=tenant_id, journey_id=journey_id) else ("BOOKING",)
+    # ONE task for every document still missing (product owner 2026-11-15:
+    # "missing docs should be one task not one for each"); a document a person
+    # answered for (p2_document_waivers) is not asked again, a "not required"
+    # claim waits with the Reviewer, a rejected one is asked again with why.
+    missing: list[dict[str, Any]] = []
     for stage in stages:
         for item in requirement_items(connection, registry, tenant_id=tenant_id, journey_id=journey_id,
                                       stage=stage, reasons=reasons):
@@ -1573,34 +1582,47 @@ def sync_document_missing_tasks(
                 continue
             if not always and not item.get("raisesMissingTask", True):
                 continue
-            key = f"document-missing:{journey_id}:{item['key']}"
-            wanted.add(key)
-            if item["key"] not in item["templates"]:
-                _adopt_member_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, key=key,
-                                    templates=item["templates"])
+            waiver = item.get("waiver") or {}
+            if waiver.get("status") == "CLAIMED":
+                continue
             conditions = ", ".join(CONDITION_TEXT.get(c, c) for c in item["conditions"])
-            _, outcome = raise_or_refresh(
-                connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
-                task_type="DOCUMENT_MISSING", source_type="DOCUMENT", source_code="DOCUMENT_MISSING",
-                title=f"Upload the {item['label']}",
-                description=(
-                    (f"The {item['label']} is mandatory for every delivery: the Deal is read from it and "
-                     "waits until it is on file. Upload it; this task closes itself once it is read.")
-                    if always else
-                    (f"{item['reason']} The {item['label']} is therefore mandatory for this "
-                     f"{'booking' if stage == 'BOOKING' else 'delivery'} ({conditions}). "
-                     "Upload it; this task closes itself once it is read.")),
-                reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "DOCUMENT_MISSING",
-                           "requirementKey": item["key"], "templateKeys": item["templates"],
-                           "conditions": item["conditions"], "stage": stage},
-                severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
-            )
-            counts[outcome] = counts.get(outcome, 0) + 1
-    deferred = {"documentReceivedOrNotRequired": True, "deferredUntil": "DELIVERY_STARTED"} \
-        if "DELIVERY" not in stages else {"documentReceivedOrNotRequired": True}
+            why = ("Mandatory for every delivery." if always else
+                   f"{item['reason']} Mandatory for this {'booking' if stage == 'BOOKING' else 'delivery'} "
+                   f"({conditions}).")
+            if waiver.get("status") == "REJECTED":
+                why += f" The Reviewer did not accept \"not required\": {waiver.get('decision_reason') or ''}".rstrip()
+            missing.append({"key": item["key"], "label": item["label"], "reason": why, "stage": stage,
+                            "templates": item["templates"], "conditions": item["conditions"],
+                            "notRequiredAllowed": item["key"] not in NEVER_WAIVED_AS_NOT_REQUIRED})
+    key = f"document-missing:{journey_id}"
+    if missing:
+        labels = [m["label"] for m in missing]
+        title = (f"Upload the {labels[0]}" if len(labels) == 1
+                 else f"Upload {len(labels)} missing documents: {', '.join(labels)}")
+        description = (" ".join(f"{m['label']}: {m['reason']}" for m in missing)
+                       + " Upload them; each comes off this task once it is read. A document that cannot come can "
+                         "be answered for on its own line.")
+        _, outcome = raise_or_refresh(
+            connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+            task_type="DOCUMENT_MISSING", source_type="DOCUMENT", source_code="DOCUMENT_MISSING",
+            title=title, description=description,
+            reference={"generatedBy": "SYSTEM", "sourceType": "DOCUMENT", "sourceCode": "DOCUMENT_MISSING",
+                       "items": missing, "requirementKeys": [m["key"] for m in missing],
+                       # In the issue hash: a document added to the list reopens the task.
+                       "fields": sorted(m["key"] for m in missing)},
+            severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
+        )
+        counts[outcome] = counts.get(outcome, 0) + 1
+    else:
+        if resolve_if_open(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                           evidence={"documentReceivedOrNotRequired": True,
+                                     "verifiedAt": datetime.now(UTC).isoformat()}):
+            counts["VERIFIED"] = counts.get("VERIFIED", 0) + 1
+    # The per-document tasks of before 2026-11-15 close: the one task carries them.
     closed = _resolve_prefix_except(
         connection, tenant_id=tenant_id, journey_id=journey_id, prefix=f"document-missing:{journey_id}:",
-        keep=wanted, evidence={**deferred, "verifiedAt": datetime.now(UTC).isoformat()},
+        keep=set(), evidence={"documentReceivedOrNotRequired": True, "mergedInto": key,
+                              "verifiedAt": datetime.now(UTC).isoformat()},
     )
     if closed:
         counts["VERIFIED"] = counts.get("VERIFIED", 0) + closed
