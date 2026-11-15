@@ -51,7 +51,7 @@ class SevaSutraOutlet(BaseModel):
 class SevaSutraAssignment(BaseModel):
     securityUserId: str
     roleCode: str
-    # Empty for a Project-wide role; the Outlets for an Outlet-scoped one (ANALYST, PC).
+    # Empty for a Project-wide role; the Outlets for an Outlet-scoped one (ANALYST, PC, UPLOADER).
     outletIds: list[UUID]
     dealerIds: list[UUID]
 

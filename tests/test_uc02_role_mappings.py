@@ -631,3 +631,30 @@ def test_sevasutra_analyst_is_outlet_scoped_and_client_project_wide(role_mapping
     )
     assert project_client.status_code == 200
     assert project_client.json()["mapping"]["operatingRole"] == "CLIENT"
+
+
+def test_sevasutra_uploader_is_outlet_scoped(role_mapping_setup) -> None:
+    """The Uploader (product owner, 15 Nov 2026): the dealership's own person who scans papers for SevaSutra,
+    not a JBR employee, mapped to the Outlets they work at -- scoped exactly as a PC is."""
+    setup = role_mapping_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    tenant = setup["tenant_a"]
+
+    no_outlet = client.put(
+        f"/v1/tenants/{tenant}/role-mappings/uploader-1",
+        headers={"Idempotency-Key": "uploader-none"},
+        json={"operatingRole": "UPLOADER", "dealerIds": [], "outletIds": []},
+    )
+    assert no_outlet.status_code == 422
+    uploader = client.put(
+        f"/v1/tenants/{tenant}/role-mappings/uploader-1",
+        headers={"Idempotency-Key": "uploader-ok"},
+        json={"operatingRole": "UPLOADER", "dealerIds": [], "outletIds": [setup["outlet_onsite"]]},
+    )
+    assert uploader.status_code == 200
+    assert uploader.json()["mapping"] == {
+        "userId": "uploader-1",
+        "operatingRole": "UPLOADER",
+        "dealerIds": [],
+        "outletIds": [setup["outlet_onsite"]],
+    }
