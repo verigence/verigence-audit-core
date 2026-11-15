@@ -499,6 +499,18 @@ def _presence_checks_without_their_document(
     return out
 
 
+def rule_engine_enabled(engine: Engine, *, tenant_id: str) -> bool:
+    """Whether the Project's journeys go to the Rule Engine
+    (tenant_rule_config.rule_engine_enabled; on unless the Project turns it off)."""
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        value = connection.execute(
+            text("SELECT rule_engine_enabled FROM auditcore.tenant_rule_config WHERE tenant_id=:t"),
+            {"t": tenant_id},
+        ).scalar_one_or_none()
+    return value is not False
+
+
 def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stage: str,
                        correlation_id: str, registry: Registry) -> list[Transition]:
     from audit_core.rule_engine_client import (
@@ -528,6 +540,22 @@ def _evaluate_external(engine: Engine, *, tenant_id: str, journey_id: UUID, stag
                 )
                 for control in controls
             ]
+
+    if not rule_engine_enabled(engine, tenant_id=tenant_id):
+        # The Project's checks run in Audit Core (product owner 2026-11-15):
+        # nothing is sent; every Rule Engine control is not applicable, so its
+        # open tasks close, and its open findings are resolved.
+        transitions = write_all("NOT_APPLICABLE", "Checked by Audit Core for this Project; the Rule Engine is "
+                                                  "not used (product owner 2026-11-15).")
+        from audit_core.uc03_document_consistency_rules import CODES as moved
+
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            _resolve_stale_rule_engine_findings(
+                connection, tenant_id=tenant_id, journey_id=journey_id, stage=stage,
+                codes=sorted({c.code for c in controls} | set(moved)), correlation_id=correlation_id,
+            )
+        return transitions
 
     client = build_rule_engine_client()
     security = _build_security_oauth_client()
