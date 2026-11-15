@@ -278,9 +278,8 @@ def assess(discounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
       judged at but within a higher tier of its grid line -- over only if
       the insurance / EW were not in-house, never counted as excess
       (2026-11-14);
-    * FIGURES_DISAGREE: given above the entitlement on the statement while
-      the Tally ledger gives another amount -- listed apart with both,
-      never counted as excess (2026-11-14);
+    (a Tally ledger giving another amount than the NDC is carried as
+    ``ledger`` on the row: the NDC decides, 2026-11-15);
     * OVER_ENTITLEMENT: given above the entitlement (the kit, when it was
       given as cash, counted with it) by more than the line tolerance;
     * UNDER_ENTITLEMENT: given below it by more than the tolerance;
@@ -304,12 +303,12 @@ def assess(discounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         entitled_amount = entitled(row)
         extra = amount - entitled_amount
+        # The NDC decides (product owner 2026-11-15: "NDC should be the source
+        # for all comparisons"): a Tally ledger giving another amount is shown
+        # beside the row, never a status of its own.
         other = disagreeing_figures(row, amount) if column == "billed" and extra > LINE_TOLERANCE else None
         if other is not None:
-            out.append({**base, "status": FIGURES_DISAGREE, "entitled": entitled_amount, "variance": extra,
-                        "ledger": other,
-                        "reason": f"the statement gives {_rupees(amount)}, the Tally ledger {_rupees(other)}"})
-            continue
+            base = {**base, "ledger": other}
         if row.get("key") == CASH_KEY and extra > LINE_TOLERANCE and kit_left > 0:
             kit_used = min(extra, kit_left)
             kit_left -= kit_used
