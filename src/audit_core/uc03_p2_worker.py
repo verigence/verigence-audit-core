@@ -4459,6 +4459,17 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
                 logger.info("p2_not_read_in_time", tenant_id=tenant_id, pages=failed)
         except Exception:
             logger.warning("p2_watchdog_failed", tenant_id=tenant_id, exc_info=True)
+        # Each PC's own stuck or failed pages, as one alert to that PC (2026-11-15).
+        try:
+            from audit_core.uc03_p2_document_alerts import publish_document_alerts
+
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                alerted = publish_document_alerts(connection, tenant_id=tenant_id)
+            if any(alerted.values()):
+                logger.info("p2_document_alerts", tenant_id=tenant_id, **alerted)
+        except Exception:
+            logger.warning("p2_document_alerts_failed", tenant_id=tenant_id, exc_info=True)
     run_dayend_sweep(engine, tenant_id)
     run_data_archive(engine, tenant_id)
     if now - _last_task_manager_at.get(tenant_id, 0.0) >= _TASK_MANAGER_SECONDS:
