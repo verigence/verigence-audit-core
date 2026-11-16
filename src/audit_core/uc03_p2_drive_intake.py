@@ -1581,6 +1581,13 @@ def run_report(connection: Connection, *, tenant_id: str, run_id: Any, detail: b
     out = {"run": _public_run(dict(run)), "totals": totals}
     if not detail:
         return out
+    out["customers"] = _customers(connection, tenant_id, rows, tasks)
+    return out
+
+
+def _customers(connection: Connection, tenant_id: str, rows: list[dict[str, Any]],
+               tasks: dict[str, int]) -> list[dict[str, Any]]:
+    """The files, one entry per customer's folder (its outlet, booking and tasks)."""
     names = {str(o["outlet_id"]): o for o in outlets_with_pcs(connection, tenant_id)}
     customers: dict[tuple[str, str], dict[str, Any]] = {}
     for r in rows:
@@ -1600,8 +1607,31 @@ def run_report(connection: Connection, *, tenant_id: str, run_id: Any, detail: b
         node["pagesRead"] += r["pagesRead"]
         node["pagesToRescan"] += sum(len(x["pages"]) for x in r["rescan"])
         node["files"].append(_public_file(r))
-    out["customers"] = list(customers.values())
-    return out
+    return list(customers.values())
+
+
+def search_customers(connection: Connection, *, tenant_id: str, query: str, outlets: set[str] | None,
+                     limit: int = 50) -> dict[str, Any]:
+    """The customer folders matching a customer name or an OTF / booking number (product
+    owner 2026-11-16: "provide search option, search by customer, or OTF number"), over
+    every day and run: the folder name (Name-OTF), the OTF read from it, the booking the
+    files were placed on, or a file's name. ``outlets`` None: every outlet."""
+    words = [w for w in re.split(r"[\s\-_/]+", query.strip()) if w]
+    if not words or len(query.strip()) < 2:
+        return {"query": query, "customers": [], "truncated": False}
+    clauses, params = [], {"t": tenant_id}
+    for i, word in enumerate(words[:5]):
+        params[f"w{i}"] = f"%{word}%"
+        clauses.append(f"(cf.folder_name ILIKE :w{i} OR cf.booking_number ILIKE :w{i} "
+                       f"OR b.placed_reference ILIKE :w{i} OR f.file_name ILIKE :w{i})")
+    files = [dict(r) for r in connection.execute(
+        text(_FILE_SQL + " WHERE f.tenant_id=:t AND f.outlet_id IS NOT NULL AND " + " AND ".join(clauses)
+             + " ORDER BY cf.folder_name, f.upload_date DESC, f.file_name LIMIT 1000"),
+        params,
+    ).mappings().all() if outlets is None or str(r["outlet_id"]) in outlets]
+    rows, tasks, _ = _figures(connection, tenant_id, files, since=None)
+    customers = _customers(connection, tenant_id, rows, tasks)
+    return {"query": query, "customers": customers[:limit], "truncated": len(customers) > limit}
 
 
 def _public_file(r: dict[str, Any]) -> dict[str, Any]:
@@ -2075,6 +2105,21 @@ def get_drive_run(
         if not report["customers"] and report["run"]["requestedBy"] != principal.subject:
             raise HTTPException(status_code=404, detail="Drive run not found.")
     return report
+
+
+@router.get("/tenants/{tenant_id}/drive/search")
+def search_drive(
+    tenant_id: str,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    q: Annotated[str, Query(min_length=1, max_length=80)],
+) -> dict[str, Any]:
+    """Customer folders by customer name or OTF number, every day and run, in the
+    caller's outlets."""
+    who = _caller(connection, tenant_id, principal, client, _READ)
+    return search_customers(connection, tenant_id=tenant_id, query=q,
+                            outlets=None if who["admin"] else set(who["outlets"]))
 
 
 @router.get("/tenants/{tenant_id}/drive/files")
