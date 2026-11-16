@@ -158,6 +158,9 @@ from audit_core.uc03_p2_location_checks import (
 from audit_core.uc03_p2_location_checks import (
     router as uc03_p2_location_checks_router,
 )
+from audit_core.uc03_p2_location_tracking import (
+    router as uc03_p2_location_tracking_router,
+)
 from audit_core.uc03_p2_missing_documents import (
     router as uc03_p2_missing_documents_router,
 )
@@ -363,6 +366,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_daily_report_router)
     application.include_router(uc03_p2_location_checks_router)
     application.include_router(uc03_p2_location_checks_admin_router)
+    application.include_router(uc03_p2_location_tracking_router)
     application.include_router(uc03_p2_access_locations_router)
     application.include_router(uc03_p2_access_locations_admin_router)
     application.include_router(onboarding_router)

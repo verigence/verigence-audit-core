@@ -24,7 +24,15 @@ device is never trusted. The result:
     DENIED / UNAVAILABLE the device gave no location (permission refused, timed out)
 
 Every check is logged in ``p2_location_checks`` (append-only). Only a person
-whose operating role in the Project is PC is checked. Outside 10:00-19:30 IST
+whose operating role in the Project is PC is checked here; the phone's
+background tracking (uc03_p2_location_tracking, 2026-11-16) covers everyone
+who marks attendance and logs its readings in the same table.
+
+A reading the device could not send at once (no network) is kept on the device
+and sent later with ``queued: true``; it is then judged at the moment it was
+read (``capturedAt``), not when it arrived, if that moment is at most
+QUEUED_MAX_AGE old (product owner 2026-11-16: "offline check for the location
+on the mobile device"). ``clientCheckId`` makes a resend harmless. Outside 10:00-19:30 IST
 nothing is recorded, nor more than MAX_CHECKS_PER_HOUR in one clock hour (two
 open tabs must not double the checks): the answer then says ``recorded: false``.
 """
@@ -34,6 +42,7 @@ import math
 from collections import defaultdict
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal
+from itertools import pairwise
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -82,6 +91,11 @@ WINDOW_END = time(19, 30)
 # A check the app started just before 19:30 may arrive a moment after it.
 _WINDOW_GRACE = timedelta(minutes=5)
 MAX_CHECKS_PER_HOUR = 3
+# A reading kept on the device while it was offline is accepted for this long.
+QUEUED_MAX_AGE = timedelta(hours=48)
+# A device clock a little ahead of the server's is not a reading from the future.
+_CLOCK_SKEW = timedelta(minutes=2)
+TRIGGERS = ("FOREGROUND", "BACKGROUND")
 
 _EARTH_RADIUS_M = 6_371_000.0
 _ITEMS_PER_PERSON = 200
@@ -142,9 +156,12 @@ def in_window(now: datetime) -> bool:
     return start <= local < end
 
 
-def pc_outlets_with_coordinates(connection: Connection, *, tenant_id: str, actor_id: str) -> list[dict[str, Any]]:
-    """Every outlet the person is assigned to as PC in the Project (a dealer-wide or
-    Project-wide assignment covers its outlets), with coordinates."""
+def pc_outlets_with_coordinates(
+    connection: Connection, *, tenant_id: str, actor_id: str, role: str | None = "PC",
+) -> list[dict[str, Any]]:
+    """Every outlet the person is assigned to in the Project, as PC (or in any role
+    when ``role`` is None), with coordinates. A dealer-wide or Project-wide
+    assignment covers its outlets."""
     rows = connection.execute(
         text(
             f"""
@@ -155,12 +172,13 @@ def pc_outlets_with_coordinates(connection: Connection, *, tenant_id: str, actor
              AND (ba.dealer_id IS NULL
                   OR (o.dealer_id = ba.dealer_id AND (ba.outlet_id IS NULL OR o.outlet_id = ba.outlet_id)))
             JOIN auditcore.dealers d ON d.tenant_id = o.tenant_id AND d.dealer_id = o.dealer_id
-            WHERE ba.tenant_id = :t AND ba.security_actor_id = :a AND upper(ba.business_role_code) = 'PC'
+            WHERE ba.tenant_id = :t AND ba.security_actor_id = :a
+              AND (CAST(:role AS varchar) IS NULL OR upper(ba.business_role_code) = :role)
               AND {_ACTIVE}
               AND o.latitude IS NOT NULL AND o.longitude IS NOT NULL
             """
         ),
-        {"t": tenant_id, "a": actor_id},
+        {"t": tenant_id, "a": actor_id, "role": role},
     ).mappings().all()
     return [dict(row) for row in rows]
 
@@ -180,18 +198,27 @@ class LocationCheckCommand(BaseModel):
     source: Literal["NATIVE", "BROWSER"]
     deviceType: Literal["WEB", "MOBILE_WEB", "ANDROID", "IOS"] | None = None
     detail: str | None = Field(default=None, max_length=300)
+    # The device's own id for this reading: a reading sent twice is logged once.
+    clientCheckId: str | None = Field(default=None, min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_.:-]+$")
+    # Kept on the device (no network) and sent later: judged at capturedAt.
+    queued: bool = False
 
     @model_validator(mode="after")
     def _located_has_coordinates(self) -> LocationCheckCommand:
         if self.outcome == LOCATED and (self.latitude is None or self.longitude is None):
             raise ValueError("A located check needs latitude and longitude.")
+        if self.queued and self.capturedAt is None:
+            raise ValueError("A queued check needs capturedAt.")
         return self
 
 
 class LocationCheckResult(BaseModel):
     recorded: bool
-    # Why nothing was recorded: OUTSIDE_HOURS or HOURLY_LIMIT.
+    # Why nothing was recorded: OUTSIDE_HOURS, HOURLY_LIMIT or TOO_OLD (a queued reading
+    # older than QUEUED_MAX_AGE).
     reason: str | None = None
+    # The same clientCheckId was logged before: this is that check.
+    duplicate: bool = False
     checkId: str | None = None
     status: str | None = None
     distanceM: float | None = None
@@ -203,20 +230,68 @@ class LocationCheckResult(BaseModel):
     checkedAtUtc: datetime | None = None
 
 
+def check_moment(command: LocationCheckCommand, now: datetime) -> datetime | None:
+    """When the check counts as made: now, or for a queued reading the moment it was
+    read. None: a queued reading too old to accept."""
+    if not command.queued or command.capturedAt is None:
+        return now
+    captured = command.capturedAt if command.capturedAt.tzinfo else command.capturedAt.replace(tzinfo=UTC)
+    if captured > now + _CLOCK_SKEW:
+        return now
+    if now - captured > QUEUED_MAX_AGE:
+        return None
+    return min(captured, now)
+
+
+def _existing_check(
+    connection: Connection, *, tenant_id: str, actor_id: str, client_check_id: str,
+) -> LocationCheckResult | None:
+    row = connection.execute(
+        text(
+            "SELECT check_id, check_status, distance_m, nearest_outlet_id, nearest_outlet_name, accuracy_m, "
+            "checked_at_utc FROM auditcore.p2_location_checks "
+            "WHERE tenant_id = :t AND actor_id = :a AND client_check_id = :c"
+        ),
+        {"t": tenant_id, "a": actor_id, "c": client_check_id},
+    ).mappings().one_or_none()
+    if row is None:
+        return None
+    return LocationCheckResult(
+        recorded=True, duplicate=True, checkId=str(row["check_id"]), status=row["check_status"],
+        distanceM=_number(row["distance_m"]),
+        outletId=str(row["nearest_outlet_id"]) if row["nearest_outlet_id"] else None,
+        outletName=row["nearest_outlet_name"], accuracyM=_number(row["accuracy_m"]),
+        checkedAtUtc=row["checked_at_utc"],
+    )
+
+
 def record_location_check(
     connection: Connection, *, tenant_id: str, actor_id: str, command: LocationCheckCommand,
-    now: datetime | None = None,
+    now: datetime | None = None, trigger: str = "FOREGROUND", role: str | None = "PC",
 ) -> LocationCheckResult:
-    """Classify and log one check. The tenant context is already set and the caller is a PC."""
+    """Classify and log one check. The tenant context is already set and the caller may
+    be checked (a PC for the DealGuard checks; anyone with a tracking key for the
+    phone's background readings, judged against their outlets in any role)."""
+    if trigger not in TRIGGERS:
+        raise ValueError(f"Unknown trigger {trigger!r}")
     now = now or connection.execute(text("SELECT now()")).scalar_one()
-    if not in_window(now):
-        return LocationCheckResult(recorded=False, reason="OUTSIDE_HOURS")
-    # One check at a time per person, so two tabs cannot both pass the hourly count.
+    # One check at a time per person, so two tabs (or a tab and the phone's service)
+    # cannot both pass the hourly count, and a resend cannot be logged twice.
     connection.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
         {"k": f"p2-location-check:{tenant_id}:{actor_id}"},
     )
-    local = now.astimezone(IST)
+    if command.clientCheckId:
+        existing = _existing_check(connection, tenant_id=tenant_id, actor_id=actor_id,
+                                   client_check_id=command.clientCheckId)
+        if existing is not None:
+            return existing
+    moment = check_moment(command, now)
+    if moment is None:
+        return LocationCheckResult(recorded=False, reason="TOO_OLD")
+    if not in_window(moment):
+        return LocationCheckResult(recorded=False, reason="OUTSIDE_HOURS")
+    local = moment.astimezone(IST)
     hour_start = local.replace(minute=0, second=0, microsecond=0)
     done = connection.execute(
         text(
@@ -232,7 +307,7 @@ def record_location_check(
     outlet: dict[str, Any] | None = None
     if command.outcome == LOCATED:
         assert command.latitude is not None and command.longitude is not None
-        outlets = pc_outlets_with_coordinates(connection, tenant_id=tenant_id, actor_id=actor_id)
+        outlets = pc_outlets_with_coordinates(connection, tenant_id=tenant_id, actor_id=actor_id, role=role)
         result = classify(latitude=command.latitude, longitude=command.longitude,
                           accuracy_m=command.accuracyM, outlets=outlets)
         status, distance, outlet = result["status"], result["distance_m"], result["outlet"]
@@ -244,22 +319,24 @@ def record_location_check(
         text(
             """
             INSERT INTO auditcore.p2_location_checks (
-                tenant_id, actor_id, checked_at_utc, captured_at_utc, check_status, latitude, longitude,
-                accuracy_m, distance_m, nearest_outlet_id, nearest_outlet_name, location_source, device_type,
-                client_detail
-            ) VALUES (:t, :a, :now, :captured, :status, :lat, :lon, :acc, :dist, :outlet_id, :outlet_name,
-                      :source, :device, :detail)
+                tenant_id, actor_id, checked_at_utc, received_at_utc, captured_at_utc, check_status, latitude,
+                longitude, accuracy_m, distance_m, nearest_outlet_id, nearest_outlet_name, location_source,
+                device_type, client_detail, check_trigger, queued, client_check_id
+            ) VALUES (:t, :a, :moment, :now, :captured, :status, :lat, :lon, :acc, :dist, :outlet_id, :outlet_name,
+                      :source, :device, :detail, :trigger, :queued, :client_id)
             RETURNING check_id, checked_at_utc
             """
         ),
         {
-            "t": tenant_id, "a": actor_id, "now": now, "captured": command.capturedAt, "status": status,
+            "t": tenant_id, "a": actor_id, "moment": moment, "now": now, "captured": command.capturedAt,
+            "status": status,
             "lat": round(command.latitude, 6) if located and command.latitude is not None else None,
             "lon": round(command.longitude, 6) if located and command.longitude is not None else None,
             "acc": round(command.accuracyM, 1) if command.accuracyM is not None else None,
             "dist": distance, "outlet_id": outlet["outlet_id"] if outlet else None, "outlet_name": label,
             "source": command.source, "device": command.deviceType,
             "detail": (command.detail or "").strip()[:300] or None,
+            "trigger": trigger, "queued": bool(command.queued), "client_id": command.clientCheckId,
         },
     ).mappings().one()
     return LocationCheckResult(
@@ -327,16 +404,92 @@ def _number(value: Any) -> float | None:
     return float(value) if value is not None else None
 
 
+# Why a person shows no usable check on a day (product owner 2026-11-16: "why i
+# didnt see the location check for all the PC"). Every PC of the Project is listed,
+# checked or not, with the reason.
+NOT_ON_DEALGUARD = "NOT_ON_DEALGUARD"  # no DealGuard use between 10:00 and 19:30, no phone tracking
+NO_CHECK_RECEIVED = "NO_CHECK_RECEIVED"  # on DealGuard in the window, yet no check arrived
+DESKTOP_NO_GPS = "DESKTOP_NO_GPS"  # most readings too inaccurate to place anyone (a desktop's Wi-Fi / IP)
+LOCATION_OFF = "LOCATION_OFF"  # most checks came back with no location (permission off, timed out)
+TRACKING_GAP = "TRACKING_GAP"  # the phone's tracking went quiet for an hour or more
+# A person's readings are mostly unusable when at least this share of at least this many checks are.
+_UNUSABLE_SHARE = 0.5
+_UNUSABLE_MIN_CHECKS = 3
+_UNUSABLE = frozenset({"UNCLEAR", "DENIED", "UNAVAILABLE"})
+# The phone's tracking reads every 20 minutes; an hour without a reading is a gap.
+TRACKING_INTERVAL_MINUTES = 20
+_GAP_MINUTES = 60
+_WINDOW_HOURS = tuple(range(WINDOW_START.hour, WINDOW_END.hour + (1 if WINDOW_END.minute else 0)))
+
+
+def _project_pcs(connection: Connection, *, tenant_id: str, visible: set[str] | None) -> set[str]:
+    """The PCs of the Project with an active assignment, as the viewer sees them."""
+    pcs = set(connection.execute(
+        text(f"SELECT DISTINCT ba.security_actor_id FROM auditcore.business_assignments ba "
+             f"WHERE ba.tenant_id = :t AND upper(ba.business_role_code) = 'PC' AND {_ACTIVE}"),
+        {"t": tenant_id},
+    ).scalars().all())
+    return pcs if visible is None else pcs & visible
+
+
+def window_hours_of(minute_states: str | None) -> set[int]:
+    """The clock hours (IST) inside 10:00-19:30 in which the person used DealGuard: a
+    minute that was active (A) or had a click or key (K)."""
+    if not minute_states or len(minute_states) != 1440:
+        return set()
+    end_minute = WINDOW_END.hour * 60 + WINDOW_END.minute
+    hours: set[int] = set()
+    for hour in _WINDOW_HOURS:
+        first = hour * 60
+        last = min(first + 60, end_minute)
+        if any(c in "AK" for c in minute_states[first:last]):
+            hours.add(hour)
+    return hours
+
+
+def _active_hours(connection: Connection, *, tenant_id: str, day: date, actors: set[str]) -> dict[str, set[int]]:
+    if not actors:
+        return {}
+    out: dict[str, set[int]] = defaultdict(set)
+    for row in connection.execute(
+        text("SELECT actor_id, minute_states FROM auditcore.p2_user_activity_daily "
+             "WHERE tenant_id = :t AND activity_date = :d AND actor_id = ANY(CAST(:a AS varchar[]))"),
+        {"t": tenant_id, "d": day, "a": sorted(actors)},
+    ).mappings():
+        out[str(row["actor_id"])] |= window_hours_of(row["minute_states"])
+    return out
+
+
+def reading_issue(counts: dict[str, int], checks: int) -> str | None:
+    """DESKTOP_NO_GPS / LOCATION_OFF when most of the checks could not place the person."""
+    unusable = sum(counts.get(status, 0) for status in _UNUSABLE)
+    if checks < _UNUSABLE_MIN_CHECKS or unusable / checks < _UNUSABLE_SHARE:
+        return None
+    no_location = counts.get("DENIED", 0) + counts.get("UNAVAILABLE", 0)
+    return DESKTOP_NO_GPS if counts.get("UNCLEAR", 0) >= no_location else LOCATION_OFF
+
+
+def longest_gap_minutes(moments: list[datetime]) -> int | None:
+    """The longest stretch between two consecutive readings, in whole minutes."""
+    ordered = sorted(moments)
+    if len(ordered) < 2:
+        return None
+    return int(max((b - a).total_seconds() for a, b in pairwise(ordered)) // 60)
+
+
 def build_location_log(
     connection: Connection, *, tenant_id: str, day: date, away_only: bool, visible: set[str] | None,
 ) -> dict[str, Any]:
-    """The day's checks per PC: how many, how many AWAY, the last one, and the list."""
+    """The day's checks per person: every PC of the Project (checked or not, with the
+    reason when not), and anyone else the phone's tracking read; how many checks, how
+    many AWAY, the hours covered against the hours on DealGuard, and the list."""
     start = datetime.combine(day, time(0, 0), IST)
     rows = connection.execute(
         text(
             """
-            SELECT check_id, actor_id, checked_at_utc, captured_at_utc, check_status, accuracy_m, distance_m,
-                   nearest_outlet_id, nearest_outlet_name, location_source, device_type
+            SELECT check_id, actor_id, checked_at_utc, captured_at_utc, received_at_utc, check_status, accuracy_m,
+                   distance_m, nearest_outlet_id, nearest_outlet_name, location_source, device_type,
+                   check_trigger, queued
             FROM auditcore.p2_location_checks
             WHERE tenant_id = :t AND checked_at_utc >= :s AND checked_at_utc < :e
             ORDER BY actor_id, checked_at_utc DESC
@@ -347,6 +500,15 @@ def build_location_log(
     names = known_names(connection, tenant_id=tenant_id)
     people: dict[str, dict[str, Any]] = {}
     totals: dict[str, int] = defaultdict(int)
+    hours_checked: dict[str, set[int]] = defaultdict(set)
+    background: dict[str, list[datetime]] = defaultdict(list)
+
+    def person_of(actor: str) -> dict[str, Any]:
+        return people.setdefault(actor, {
+            "actorId": actor, "name": names.get(actor), "checks": 0,
+            "counts": dict.fromkeys(STATUSES, 0), "last": None, "items": [],
+        })
+
     for row in rows:
         actor = str(row["actor_id"])
         if visible is not None and actor not in visible:
@@ -356,6 +518,7 @@ def build_location_log(
             "checkId": str(row["check_id"]),
             "checkedAtUtc": row["checked_at_utc"],
             "capturedAtUtc": row["captured_at_utc"],
+            "receivedAtUtc": row["received_at_utc"],
             "status": status,
             "distanceM": _number(row["distance_m"]),
             "accuracyM": _number(row["accuracy_m"]),
@@ -363,30 +526,69 @@ def build_location_log(
             "outletName": row["nearest_outlet_name"],
             "source": row["location_source"],
             "deviceType": row["device_type"],
+            "trigger": row["check_trigger"],
+            "queued": bool(row["queued"]),
         }
-        person = people.setdefault(actor, {
-            "actorId": actor, "name": names.get(actor), "checks": 0,
-            "counts": dict.fromkeys(STATUSES, 0), "last": item, "items": [],
-        })
+        person = person_of(actor)
+        if person["last"] is None:
+            person["last"] = item  # rows come newest first
         person["checks"] += 1
         person["counts"][status] = person["counts"].get(status, 0) + 1
         totals["checks"] += 1
         totals[status] += 1
+        hours_checked[actor].add(row["checked_at_utc"].astimezone(IST).hour)
+        if row["check_trigger"] == "BACKGROUND":
+            background[actor].append(row["checked_at_utc"])
         if (not away_only or status == "AWAY") and len(person["items"]) < _ITEMS_PER_PERSON:
             person["items"].append(item)
-    listed = [p for p in people.values() if not away_only or p["counts"]["AWAY"]]
-    for person in listed:
+
+    pcs = _project_pcs(connection, tenant_id=tenant_id, visible=visible)
+    for actor in pcs:
+        person_of(actor)
+    active = _active_hours(connection, tenant_id=tenant_id, day=day, actors=set(people))
+    for actor, person in people.items():
+        checked = hours_checked.get(actor, set())
+        on_dealguard = active.get(actor, set())
         person["away"] = person["counts"]["AWAY"]
-    listed.sort(key=lambda p: (-p["away"], (p["name"] or p["actorId"]).lower()))
+        person["isPc"] = actor in pcs
+        person["hoursChecked"] = len(checked)
+        person["hoursOnDealGuard"] = len(on_dealguard)
+        # Hours on DealGuard in the window with no check at all: what the catch-up
+        # (a missed moment taken when the screen is next open) is meant to close.
+        person["hoursMissed"] = len(on_dealguard - checked)
+        person["background"] = actor in background
+        person["lastBackgroundAtUtc"] = max(background[actor]) if actor in background else None
+        gap = longest_gap_minutes(background.get(actor, []))
+        person["longestGapMinutes"] = gap
+        if person["checks"] == 0:
+            issue = NO_CHECK_RECEIVED if on_dealguard else NOT_ON_DEALGUARD
+        else:
+            issue = reading_issue(person["counts"], person["checks"])
+            if issue is None and gap is not None and gap >= _GAP_MINUTES:
+                issue = TRACKING_GAP
+        person["issue"] = issue
+
+    listed = [p for p in people.values() if not away_only or p["counts"]["AWAY"]]
+    listed.sort(key=lambda p: (-p["away"], p["checks"] == 0, p["issue"] is None,
+                               (p["name"] or p["actorId"]).lower()))
+    checked_people = [p for p in people.values() if p["checks"]]
     return {
         "day": day.isoformat(),
         "timezone": "Asia/Kolkata",
         "awayOnly": away_only,
         "radiusM": GEOFENCE_RADIUS_M,
         "accuracyLimitM": ACCURACY_LIMIT_M,
+        "trackingIntervalMinutes": TRACKING_INTERVAL_MINUTES,
         "window": {"from": WINDOW_START.strftime("%H:%M"), "to": WINDOW_END.strftime("%H:%M")},
-        "totals": {"pcs": len(people), "checks": totals["checks"],
-                   **{status: totals[status] for status in STATUSES}},
+        "totals": {"pcs": len(checked_people), "checks": totals["checks"],
+                   **{status: totals[status] for status in STATUSES},
+                   "pcsInProject": len(pcs),
+                   "pcsChecked": sum(1 for p in checked_people if p["isPc"]),
+                   "notChecked": sum(1 for p in people.values() if not p["checks"]),
+                   "withIssue": sum(1 for p in people.values() if p["issue"]),
+                   "background": sum(1 for p in people.values() if p["background"]),
+                   "queued": sum(1 for r in rows if r["queued"] and (visible is None
+                                                                     or str(r["actor_id"]) in visible))},
         "people": listed,
     }
 
@@ -552,6 +754,7 @@ def build_away_report(
         for p in people.values()
     ]
     by_pc.sort(key=lambda p: (-p["instances"], -p["furthestKm"], (p["name"] or p["actorId"]).lower()))
+    unplaced = _unplaced(connection, tenant_id=tenant_id, start=start, end=end, visible=visible)
     return {
         "from": date_from.isoformat(),
         "to": date_to.isoformat(),
@@ -568,7 +771,44 @@ def build_away_report(
         "byPc": by_pc,
         "instances": instances,
         "truncated": len(rows) > len(instances),
+        # People whose checks mostly could not place them: they can never show up as
+        # away, whatever their real position (2026-11-16).
+        "unplaced": unplaced,
     }
+
+
+def _unplaced(
+    connection: Connection, *, tenant_id: str, start: datetime, end: datetime, visible: set[str] | None,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        text(
+            """
+            SELECT actor_id, check_status, count(*) AS n
+            FROM auditcore.p2_location_checks
+            WHERE tenant_id = :t AND checked_at_utc >= :s AND checked_at_utc < :e
+              AND (CAST(:everyone AS boolean) OR actor_id = ANY(CAST(:actors AS varchar[])))
+            GROUP BY actor_id, check_status
+            """
+        ),
+        {"t": tenant_id, "s": start, "e": end, "everyone": visible is None, "actors": sorted(visible or ())},
+    ).mappings().all()
+    counts: dict[str, dict[str, int]] = defaultdict(dict)
+    for row in rows:
+        counts[str(row["actor_id"])][str(row["check_status"])] = int(row["n"])
+    names = known_names(connection, tenant_id=tenant_id) if counts else {}
+    out = []
+    for actor, by_status in counts.items():
+        checks = sum(by_status.values())
+        issue = reading_issue(by_status, checks)
+        if issue is None:
+            continue
+        out.append({
+            "actorId": actor, "name": names.get(actor), "checks": checks, "issue": issue,
+            "unclear": by_status.get("UNCLEAR", 0),
+            "noLocation": by_status.get("DENIED", 0) + by_status.get("UNAVAILABLE", 0),
+        })
+    out.sort(key=lambda p: (-(p["unclear"] + p["noLocation"]), (p["name"] or p["actorId"]).lower()))
+    return out
 
 
 _MinKm = Annotated[float, Query(alias="minKm", gt=0, le=1000)]
