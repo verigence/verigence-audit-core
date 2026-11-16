@@ -108,6 +108,11 @@ _WHITESPACE_ONLY = re.compile(r"\s+")
 # of Bhadrak, at "90%"). A merely similar address is not one of the rules and
 # no longer pairs two bookings.
 _SEVERITY_BY_BASIS: dict[str, str] = {
+    # The booking's own numbers (closing list item 6, 2026-11-16): the same
+    # vehicle, booking number or receipt number on two live bookings.
+    "VIN": "CRITICAL",
+    "OTF": "CRITICAL",
+    "RECEIPT": "CRITICAL",
     "PAN": "CRITICAL",
     "AADHAAR": "CRITICAL",
     "CUSTOMER_MATCHES_RELATIVE": "MEDIUM",
@@ -131,6 +136,9 @@ _SEVERITY_BY_BASIS: dict[str, str] = {
 # surname+pincode or a merely-similar address are the weakest signals,
 # common enough to collide between unrelated people.
 _CONFIDENCE_PERCENT_BY_BASIS: dict[str, int] = {
+    "VIN": 99,
+    "OTF": 99,
+    "RECEIPT": 95,
     "PAN": 99,
     "AADHAAR": 99,
     "CUSTOMER_MATCHES_RELATIVE": 60,
@@ -152,6 +160,9 @@ _CONFIDENCE_LABEL_BY_SEVERITY: dict[str, str] = {
 }
 
 _BASIS_LABEL: dict[str, str] = {
+    "VIN": "same vehicle (VIN / chassis)",
+    "OTF": "same booking number (OTF)",
+    "RECEIPT": "same receipt number",
     "PAN": "PAN",
     "AADHAAR": "Aadhaar",
     "CUSTOMER_MATCHES_RELATIVE": "customer name matches a relative on the other booking",
@@ -748,6 +759,9 @@ _MATCH_FIELD_LABEL: dict[str, str] = {
 }
 # Which signals each basis actually compared, in the order they were compared.
 _BASIS_FIELDS: dict[str, tuple[str, ...]] = {
+    "VIN": (),
+    "OTF": (),
+    "RECEIPT": (),
     "PAN": ("pan",),
     "AADHAAR": ("aadhaar",),
     "CUSTOMER_MATCHES_RELATIVE": ("name", "relative_name"),
@@ -895,6 +909,75 @@ def different_bookings(left: dict[str, set[str]], right: dict[str, set[str]], *,
     if (left["B"] and right["B"]) or (left["C"] and right["C"]):
         return True
     return by_model and bool(left.get("M") and right.get("M") and not left["M"] & right["M"])
+
+
+# The booking's own numbers on another live booking (closing list item 6,
+# product owner 2026-11-16, check catalogue C1/C2): the same vehicle (its VIN,
+# or the chassis ending a document prints), the same booking number (OTF) or
+# the same receipt number. 15 Nov: 39 receipt numbers on 78 journeys and 3 VIN
+# pairs were never flagged -- the detector compared only the customer. A
+# booking or receipt number is a dealership's own series: matched within the
+# dealership; a VIN anywhere in the Project.
+_NUMBER_BASES = (("C", "VIN"), ("B", "OTF"), ("R", "RECEIPT"))
+_SHARED_NUMBERS_SQL = """
+    SELECT DISTINCT v.journey_id, v.kind, v.number
+    FROM (
+        SELECT f.journey_id, j.dealer_id,
+               CASE
+                 WHEN e.document_type_key IN ('booking_docket', 'booking_form')
+                      AND f.field_key = 'booking_reference_number' THEN 'B'
+                 WHEN e.document_type_key IN ('dealer_receipt', 'payment_receipt')
+                      AND f.field_key = 'receipt_number' THEN 'R'
+                 ELSE 'C'
+               END AS kind,
+               upper(regexp_replace(f.effective_value #>> '{}', '[^A-Za-z0-9]', '', 'g')) AS number
+        FROM auditcore.journey_document_extracted_fields f
+        JOIN auditcore.evidence e
+          ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id AND e.di_document_id = f.di_document_id
+         AND e.association_status = 'ACTIVE'
+        JOIN auditcore.journeys j ON j.tenant_id = f.tenant_id AND j.journey_id = f.journey_id
+        WHERE f.tenant_id = :tenant_id AND f.journey_id <> :journey_id
+          AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+          AND (
+            (e.document_type_key IN ('booking_docket', 'booking_form') AND f.field_key = 'booking_reference_number')
+            OR (e.document_type_key IN ('dealer_receipt', 'payment_receipt') AND f.field_key = 'receipt_number')
+            OR (e.document_type_key IN ('customer_invoice_dms', 'tax_invoice_tally', 'insurance_cover',
+                                        'vehicle_rc', 'rto_challan')
+                AND f.field_key IN ('chassis_number', 'vin_number'))
+          )
+          AND """ + _NOT_TAKEN_OUT + """
+    ) v
+    WHERE (v.kind = 'C' AND right(v.number, :tail) = ANY(:chassis))
+       OR (v.kind = 'B' AND v.number = ANY(:bookings) AND v.dealer_id IS NOT DISTINCT FROM :dealer_id)
+       OR (v.kind = 'R' AND v.number = ANY(:receipts) AND v.dealer_id IS NOT DISTINCT FROM :dealer_id)
+"""
+
+
+def shared_numbers(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                   own: dict[str, set[str]]) -> dict[UUID, tuple[str, str]]:
+    """The other journeys that carry one of this booking's own numbers: for
+    each, (the strongest basis, the number shared)."""
+    if not (own["C"] or own["B"] or own["R"]):
+        return {}
+    dealer_id = connection.execute(
+        text("SELECT dealer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one_or_none()
+    rows = connection.execute(
+        text(_SHARED_NUMBERS_SQL),
+        {"tenant_id": tenant_id, "journey_id": journey_id, "tail": _CHASSIS_TAIL, "dealer_id": dealer_id,
+         "chassis": sorted(own["C"]), "bookings": sorted(own["B"]), "receipts": sorted(own["R"])},
+    ).mappings().all()
+    rank = {kind: i for i, (kind, _) in enumerate(_NUMBER_BASES)}
+    basis_of = dict(_NUMBER_BASES)
+    out: dict[UUID, tuple[str, str]] = {}
+    for row in sorted(rows, key=lambda r: rank[r["kind"]]):
+        number = str(row["number"] or "")
+        if len(number) < _MIN_NUMBER_LENGTH:
+            continue
+        shown = number[-_CHASSIS_TAIL:] if row["kind"] == "C" else number
+        out.setdefault(row["journey_id"], (basis_of[row["kind"]], shown))
+    return out
 
 
 def _withdrawn(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
@@ -1114,6 +1197,32 @@ def _resolve_reverse_finding(
     return len(rows)
 
 
+_NUMBER_TITLES = {
+    "VIN": "The same vehicle is on another booking",
+    "OTF": "The same booking number is on another booking",
+    "RECEIPT": "The same receipt number is on another booking",
+}
+
+
+def _number_title(basis: str) -> str:
+    return _NUMBER_TITLES[basis]
+
+
+def _number_description(connection: Connection, *, tenant_id: str, basis: str, number: str,
+                        other_journey_id: UUID, identity: str | None) -> str:
+    other = connection.execute(
+        text("SELECT journey_reference FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": tenant_id, "j": other_journey_id},
+    ).scalar_one_or_none() or "another booking"
+    what = {"VIN": f"Chassis ...{number}", "OTF": f"Booking number {number}", "RECEIPT": f"Receipt {number}"}[basis]
+    why = {"VIN": "A vehicle is sold once: confirm which booking holds it.",
+           "OTF": "A booking number names one booking: confirm which one it is.",
+           "RECEIPT": "One payment must not count on two bookings: confirm which booking it belongs to."}[basis]
+    who = (f" The customer is the same ({_BASIS_LABEL[identity]}): merge the bookings."
+           if identity else " The customers differ: check with the dealership.")
+    return f"{what} is also on {other}. {why}{who}"
+
+
 def sync_duplicate_booking_detection(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
 ) -> dict[str, Any]:
@@ -1129,7 +1238,8 @@ def sync_duplicate_booking_detection(
         # buyer GSTIN of "No" fell into this branch, and an early return here
         # would have left every wrong pairing open for ever with no way to
         # clear it but by hand. Fall through with no candidates instead.
-        comparing = signals is not None and not _withdrawn(connection, tenant_id=tenant_id, journey_id=journey_id)
+        withdrawn = _withdrawn(connection, tenant_id=tenant_id, journey_id=journey_id)
+        comparing = signals is not None and not withdrawn
         candidates = (
             _candidate_journeys(connection, tenant_id=tenant_id, journey_id=journey_id, signals=signals)
             if comparing else []
@@ -1139,18 +1249,36 @@ def sync_duplicate_booking_detection(
             {"t": tenant_id, "j": journey_id},
         ).scalar_one()
 
+        # The booking's own numbers on another booking pair them too, whatever
+        # the customer (closing list item 6, 2026-11-16).
+        own_numbers = _booking_numbers(connection, tenant_id=tenant_id, journey_id=journey_id)
+        by_number = {} if withdrawn else shared_numbers(
+            connection, tenant_id=tenant_id, journey_id=journey_id, own=own_numbers)
+        by_id = {c["journey_id"]: c for c in candidates}
+        missing = [jid for jid in by_number if jid not in by_id]
+        if missing:
+            for found in _signals_of_journeys(connection, tenant_id=tenant_id, journey_ids=missing):
+                by_id[found["journey_id"]] = found
+            for row in connection.execute(
+                text("SELECT journey_id, created_at_utc, dealer_id FROM auditcore.journeys "
+                     "WHERE tenant_id=:t AND journey_id = ANY(:ids)"),
+                {"t": tenant_id, "ids": [jid for jid in missing if jid not in by_id]},
+            ).mappings().all():
+                by_id[row["journey_id"]] = {"journey_id": row["journey_id"], "created_at_utc": row["created_at_utc"],
+                                            "dealer_id": row["dealer_id"]}
+
         raised = 0
         current_rule_keys: set[str] = set()
-        own_numbers: dict[str, set[str]] | None = None
-        for candidate in candidates:
-            basis = _match_basis(signals, candidate)
+        for candidate in by_id.values():
+            identity = (_match_basis(signals, candidate)
+                        if signals is not None and "pan" in candidate else None)
+            number = by_number.get(candidate["journey_id"])
+            basis = number[0] if number else identity
             if basis is None:
                 continue
             if _withdrawn(connection, tenant_id=tenant_id, journey_id=candidate["journey_id"]):
                 continue  # cancelled or closed as a duplicate: never paired
-            if own_numbers is None:
-                own_numbers = _booking_numbers(connection, tenant_id=tenant_id, journey_id=journey_id)
-            if different_bookings(own_numbers, _booking_numbers(
+            if number is None and different_bookings(own_numbers, _booking_numbers(
                     connection, tenant_id=tenant_id, journey_id=candidate["journey_id"]),
                     by_model=basis in _SAME_CUSTOMER_BASES):
                 continue  # the same customer's other booking; any open finding resolves below
@@ -1220,8 +1348,11 @@ def sync_duplicate_booking_detection(
                 rule_key=rule_key,
                 finding_type=_FINDING_TYPE,
                 severity=_SEVERITY_BY_BASIS[basis],
-                title="Possible duplicate booking for the same customer",
+                title=_number_title(basis) if number else "Possible duplicate booking for the same customer",
                 description=(
+                    _number_description(connection, tenant_id=tenant_id, basis=basis, number=number[1],
+                                        other_journey_id=candidate["journey_id"], identity=identity)
+                    if number else
                     f"This customer appears to match an earlier booking on this "
                     f"tenant ({_BASIS_LABEL[basis]} match). Confirm whether this "
                     "is a genuine repeat customer or a duplicate entry."
@@ -1237,7 +1368,11 @@ def sync_duplicate_booking_detection(
                     "matchConfidenceLabel": _CONFIDENCE_LABEL_BY_SEVERITY[_SEVERITY_BY_BASIS[basis]],
                     # The evidence, so the pair can be judged without opening
                     # both journeys (2026-10-23).
-                    "matchedFields": _matched_fields(basis, signals, candidate),
+                    "matchedFields": ([{"field": basis.lower(), "label": _BASIS_LABEL[basis],
+                                        "thisValue": number[1], "otherValue": number[1], "exact": True}]
+                                      if number else _matched_fields(basis, signals, candidate)),
+                    "sameCustomer": None if number is None else identity is not None,
+                    "customerBasis": identity if number else None,
                 },
             )
             raised += 1
