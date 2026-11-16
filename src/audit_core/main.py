@@ -140,6 +140,9 @@ from audit_core.uc03_p2_bulk_upload import router as uc03_p2_bulk_upload_router
 from audit_core.uc03_p2_daily_report import router as uc03_p2_daily_report_router
 from audit_core.uc03_p2_deal_actions import router as uc03_p2_deal_router
 from audit_core.uc03_p2_dms_dumps import router as uc03_p2_dms_dumps_router
+from audit_core.uc03_p2_dms_outlet_report import (
+    router as uc03_p2_dms_outlet_report_router,
+)
 from audit_core.uc03_p2_documents import router as uc03_p2_documents_router
 from audit_core.uc03_p2_drive_intake import router as uc03_p2_drive_intake_router
 from audit_core.uc03_p2_gate_pass import router as uc03_p2_gate_pass_router
@@ -367,6 +370,8 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_journey_export_router)
     application.include_router(uc03_p2_my_work_router)
     application.include_router(uc03_p2_project_tracker_router)
+    # Before the dumps' router: /dms-dumps/outlet-report would otherwise match /dms-dumps/{dump_id}.
+    application.include_router(uc03_p2_dms_outlet_report_router)
     application.include_router(uc03_p2_dms_dumps_router)
     application.include_router(uc03_p2_bank_statements_router)
     application.include_router(uc03_p2_performance_router)
