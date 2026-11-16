@@ -199,10 +199,13 @@ def _loan_amounts(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     return amounts
 
 
-def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+def unreceipted_postings(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, list[dict[str, Any]]]:
     """The customer ledger's money-in postings, and the NDC's received lines,
-    that no receipt on file stands for and that are not the loan, each with
-    its page as its document."""
+    that no receipt on file stands for, each with its page as its document:
+    ``customer`` -- not the loan (``ledger_receipts``); ``loan`` -- the loan
+    (an amount equal to a loan figure known for the booking, or the
+    financier's journal credit), received with no receipt on file (product
+    owner 2026-11-16: no task for it, a system remark)."""
     from audit_core.uc03_account_statement import (
         KIND_TALLY,
         combined_tally_rows,
@@ -218,10 +221,11 @@ def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID)
     ndc_lines, ndc_total, ndc_document = journey_statement_received_lines(
         connection, tenant_id=tenant_id, journey_id=journey_id)
     if not tallies and not ndc_lines:
-        return []
+        return {"customer": [], "loan": []}
     receipts = _on_file(connection, tenant_id=tenant_id, journey_id=journey_id)
     loans: list[Decimal] | None = None
     out: list[dict[str, Any]] = []
+    loan_out: list[dict[str, Any]] = []
 
     def not_the_loan(posting: dict[str, Any]) -> bool:
         nonlocal loans
@@ -235,12 +239,12 @@ def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID)
         origin = max((d for d, _ in tallies), key=lambda d: (
             d.get("linkedAtUtc").timestamp() if hasattr(d.get("linkedAtUtc"), "timestamp") else 0.0))
         for posting in _match(money_in(combined_tally_rows(tallies)), receipts):
-            if _JOURNAL_VOUCHER.fullmatch(posting["voucherType"]) \
-                    and _FINANCIER.fullmatch(_label(posting["particulars"])):
-                continue
-            if not_the_loan(posting):
-                out.append({**posting, "documentId": str(origin["documentId"]),
-                            "documentLabel": "Customer ledger (no receipt on file)"})
+            located = {**posting, "documentId": str(origin["documentId"])}
+            if (_JOURNAL_VOUCHER.fullmatch(posting["voucherType"])
+                    and _FINANCIER.fullmatch(_label(posting["particulars"]))) or not not_the_loan(posting):
+                loan_out.append({**located, "documentLabel": "Customer ledger"})
+            else:
+                out.append({**located, "documentLabel": "Customer ledger (no receipt on file)"})
     if ndc_lines:
         # The NDC's received lines no receipt on file and no ledger posting
         # already counted stands for (product owner 2026-11-04): each money
@@ -256,7 +260,26 @@ def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID)
         # (a receipt matched within 1% of its NDC line leaves that 1% of slack)
         if sum((p["amount"] for p in left), Decimal(0)) <= ndc_total - on_file + max(_NDC_TOLERANCE, on_file / 100):
             out.extend({**p, "documentId": ndc_document, "documentLabel": "NDC (no receipt on file)"} for p in left)
-    return out
+        # The loan on the NDC with no receipt on file, unless the ledger
+        # already showed the same credit.
+        shown = taken + [{"receipt_number": p["number"], "receipt_date": p["date"], "amount": p["amount"]}
+                         for p in loan_out]
+        loan_out.extend({**p, "documentId": ndc_document, "documentLabel": "NDC"}
+                        for p in _match(ndc_lines, shown) if not not_the_loan(p))
+    return {"customer": out, "loan": loan_out}
+
+
+def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """The customer ledger's money-in postings, and the NDC's received lines,
+    that no receipt on file stands for and that are not the loan, each with
+    its page as its document."""
+    return unreceipted_postings(connection, tenant_id=tenant_id, journey_id=journey_id)["customer"]
+
+
+def loan_without_receipt(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """The loan the NDC or the customer ledger shows received, with no
+    payment receipt on file for it."""
+    return unreceipted_postings(connection, tenant_id=tenant_id, journey_id=journey_id)["loan"]
 
 
 # Rows of a ledger printout that repeat the postings above them.
@@ -343,5 +366,7 @@ __all__ = [
     "ledger_financier_credit",
     "ledger_loan_credit",
     "ledger_receipts",
+    "loan_without_receipt",
     "money_in",
+    "unreceipted_postings",
 ]
