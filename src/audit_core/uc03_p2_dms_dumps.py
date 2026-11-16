@@ -579,13 +579,6 @@ def _name_of(connection: Connection, actor_id: str) -> str | None:
 
 # --------------------------------------------------------------------------- matching a stored dump
 
-def _outlets_of(connection: Connection, tenant_id: str, dealer_id: str) -> list[dict[str, Any]]:
-    return [dict(r) for r in connection.execute(
-        text("SELECT outlet_id, outlet_name FROM auditcore.dealer_outlets WHERE tenant_id = :t AND dealer_id = :d"),
-        {"t": tenant_id, "d": dealer_id},
-    ).mappings()]
-
-
 def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict[str, int]:
     """Match (again) every row of one dump, store the outcome and mark the Journeys found."""
     dump = connection.execute(
@@ -594,7 +587,10 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
     ).mappings().one()
     kind, dealer_id = dump["dump_kind"], dump["dealer_id"]
     index = build_index(connection, tenant_id=tenant_id, dealer_id=dealer_id)
-    outlets = _outlets_of(connection, tenant_id, str(dealer_id))
+    # The dealership's DMS location names (p2_dms_outlet_map, 2026-11-16), else the outlet names.
+    from audit_core.uc03_p2_dms_outlet_report import outlet_map, resolve_outlet
+
+    outlets = outlet_map(connection, tenant_id, str(dealer_id))
     rows = connection.execute(
         text("SELECT * FROM auditcore.p2_dms_dump_rows WHERE tenant_id = :t AND dump_id = :id ORDER BY row_no"),
         {"t": tenant_id, "id": str(dump_id)},
@@ -607,7 +603,7 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
         outcome = outcome_of(kind, dict(row), journey)
         counts[outcome] += 1
         outlet_id = (str(journey["outletId"]) if journey and journey["outletId"]
-                     else outlet_for(row["outlet_label"], outlets))
+                     else resolve_outlet(row["outlet_label"], outlets))
         updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": jid, "b": basis, "o": outcome,
                         "ol": outlet_id})
         if jid and outcome != CANCELLED:
