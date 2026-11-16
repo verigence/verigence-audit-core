@@ -111,7 +111,7 @@ def get_delete_storage() -> P2DocumentStorage:
 
 
 _SNAPSHOT_SQL = """
-    SELECT j.customer_id, j.journey_reference, COALESCE(c.legal_name, c.display_name) AS customer_name,
+    SELECT j.customer_id, j.journey_reference, auditcore.shown_name(c.legal_name, c.display_name) AS customer_name,
            j.dealer_id, d.dealer_name, j.outlet_id, o.outlet_name, o.outlet_code,
            j.created_by_actor_id AS pc_actor_id, j.created_by_display_name AS pc_name,
            NULLIF(concat_ws(' · ',

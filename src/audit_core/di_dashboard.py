@@ -272,7 +272,7 @@ def build_di_dashboard(connection: Connection, *, tenant_id: str, start_day: dat
             "openUrl": _signed(u["page_object_key"]) if include_links else None,
         })
     journeys = {r["journey_id"]: r for r in connection.execute(text("""
-        SELECT j.journey_id::text AS journey_id, j.journey_reference, COALESCE(c.legal_name, c.display_name) AS customer,
+        SELECT j.journey_id::text AS journey_id, j.journey_reference, auditcore.shown_name(c.legal_name, c.display_name) AS customer,
                o.outlet_name
         FROM auditcore.journeys j
         LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id

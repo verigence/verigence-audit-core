@@ -641,7 +641,7 @@ def list_reviewer_journeys(
                    (j.created_at_utc AT TIME ZONE :timezone)::date AS upload_date,
                    count(*) OVER () AS total_matching,
                    j.dealer_id, j.outlet_id, d.dealer_name, o.outlet_name, o.outlet_code,
-                   COALESCE(c.legal_name, c.display_name) AS customer_name,
+                   auditcore.shown_name(c.legal_name, c.display_name) AS customer_name,
                    j.created_by_display_name AS pc_name,
                    cl.claimed_by_actor_id, cl.claimed_at_utc,
                    bk.reviewed_at_utc AS booking_reviewed_at_utc,

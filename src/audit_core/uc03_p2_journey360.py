@@ -673,7 +673,7 @@ def summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
         text(
             """
             SELECT j.journey_id, j.journey_reference, j.created_at_utc,
-                   c.display_name AS customer_name, c.legal_name, c.customer_type_code, c.mobile_last4,
+                   auditcore.shown_name(NULL, c.display_name) AS customer_name, c.legal_name, c.customer_type_code, c.mobile_last4,
                    d.dealer_name, o.outlet_name, o.city,
                    jp.model_name_snapshot AS model, jp.variant_name_snapshot AS variant,
                    jp.colour_name_snapshot AS colour, jp.selection_status, jp.vehicle_category,
@@ -4489,7 +4489,7 @@ def duplicates(connection: Connection, *, tenant_id: str, journey_id: UUID) -> d
             text(
                 """
                 SELECT j.journey_id, j.journey_reference, j.created_at_utc,
-                       COALESCE(c.legal_name, c.display_name) AS customer_name, o.outlet_name,
+                       auditcore.shown_name(c.legal_name, c.display_name) AS customer_name, o.outlet_name,
                        NULLIF(concat_ws(' · ', jp.model_name_snapshot, jp.variant_name_snapshot), '') AS vehicle
                 FROM auditcore.journeys j
                 JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id

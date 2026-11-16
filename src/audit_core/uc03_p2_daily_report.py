@@ -371,7 +371,7 @@ def build_daily_processing_report(
         for row in connection.execute(
             text(
                 """
-                SELECT j.journey_id, COALESCE(c.legal_name, c.display_name) AS customer_name,
+                SELECT j.journey_id, auditcore.shown_name(c.legal_name, c.display_name) AS customer_name,
                        j.created_by_actor_id, j.created_by_display_name,
                        o.outlet_name, o.outlet_code, d.dealer_name
                 FROM auditcore.journeys j
@@ -693,7 +693,7 @@ def _uploaded_files(
             SELECT b.batch_id, b.journey_id, j.journey_reference, b.original_filename, b.page_count,
                    b.batch_status, b.failure_reason, b.sha256, b.original_object_key, b.created_at_utc,
                    COALESCE(b.uploaded_by_actor_id, j.created_by_actor_id) AS pc_actor_id,
-                   COALESCE(c.legal_name, c.display_name) AS customer_name,
+                   auditcore.shown_name(c.legal_name, c.display_name) AS customer_name,
                    d.dealer_name, o.outlet_name, o.outlet_code,
                    tk.task_status AS review_status,
                    (SELECT te.comment FROM auditcore.p2_task_events te
@@ -854,7 +854,7 @@ def _team_work(
             SELECT te.actor_id, upper(COALESCE(te.actor_role_code, '')) AS role, te.event_type, te.task_id,
                    te.journey_id, te.created_at_utc, te.comment,
                    tk.task_type, tk.title, tk.task_status, tk.verified_at_utc,
-                   j.journey_reference, COALESCE(c.legal_name, c.display_name) AS customer_name
+                   j.journey_reference, auditcore.shown_name(c.legal_name, c.display_name) AS customer_name
             FROM auditcore.p2_task_events te
             JOIN auditcore.p2_tasks tk ON tk.tenant_id=te.tenant_id AND tk.task_id=te.task_id
             JOIN auditcore.journeys j ON j.tenant_id=tk.tenant_id AND j.journey_id=tk.journey_id
@@ -971,7 +971,7 @@ def delivery_files_closed(
               GROUP BY tk.journey_id
             )
             SELECT j.journey_id, j.journey_reference, j.created_by_actor_id AS pc_actor_id,
-                   COALESCE(c.legal_name, c.display_name) AS customer_name,
+                   auditcore.shown_name(c.legal_name, c.display_name) AS customer_name,
                    d.dealer_name, j.outlet_id, o.outlet_name, o.outlet_code,
                    GREATEST(dv.last_upload, dt.last_closed) AS closed_at
             FROM delivery dv
@@ -1122,7 +1122,7 @@ def build_failed_pages_report(
             f"""
             SELECT * FROM (
               SELECT q.queue_id, q.journey_id, j.journey_reference,
-                     COALESCE(c.legal_name, c.display_name) AS customer_name,
+                     auditcore.shown_name(c.legal_name, c.display_name) AS customer_name,
                      d.dealer_name, o.outlet_name, o.outlet_code,
                      b.batch_id, b.original_filename, b.uploaded_by_actor_id,
                      b.created_at_utc AS uploaded_at,
@@ -1158,7 +1158,7 @@ def build_failed_pages_report(
         text(
             f"""
             SELECT b.batch_id, b.journey_id, j.journey_reference,
-                   COALESCE(c.legal_name, c.display_name) AS customer_name,
+                   auditcore.shown_name(c.legal_name, c.display_name) AS customer_name,
                    d.dealer_name, o.outlet_name, o.outlet_code,
                    b.original_filename, b.uploaded_by_actor_id, b.created_at_utc AS uploaded_at,
                    b.updated_at_utc AS failed_at, b.failure_reason, b.original_object_key

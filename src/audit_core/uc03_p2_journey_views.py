@@ -252,7 +252,7 @@ SCOPED_SQL = f"""
     scoped AS (
         SELECT j.tenant_id, j.journey_id, j.journey_reference, j.customer_id, j.dealer_id,
                j.outlet_id, j.created_at_utc, j.updated_at_utc, j.created_by_actor_id,
-               COALESCE(c.legal_name, c.display_name) AS customer_name, c.mobile_last4,
+               auditcore.shown_name(c.legal_name, c.display_name) AS customer_name, c.mobile_last4,
                d.dealer_name, o.outlet_name, o.outlet_code,
                {_VEHICLE_SQL} AS vehicle,
                j.created_by_display_name AS pc_name,
@@ -502,7 +502,7 @@ SUGGEST_SQL = f"""
     WITH {_PHONE_HITS_CTE},
     hits AS (
         SELECT j.journey_id, j.journey_reference, j.updated_at_utc,
-               COALESCE(c.legal_name, c.display_name) AS customer_name,
+               auditcore.shown_name(c.legal_name, c.display_name) AS customer_name,
                c.mobile_number, c.mobile_last4,
                d.dealer_name, o.outlet_name, o.outlet_code,
                j.created_by_display_name AS pc_name,

@@ -758,7 +758,7 @@ def statement_detail(connection: Connection, tenant_id: str, statement: dict[str
     txns = connection.execute(
         text("""
             SELECT x.*, j.journey_reference AS matched_reference, nj.journey_reference AS named_reference,
-                   COALESCE(NULLIF(nc.legal_name, ''), nc.display_name) AS named_customer
+                   auditcore.shown_name(nc.legal_name, nc.display_name) AS named_customer
             FROM auditcore.p2_bank_statement_txns x
             LEFT JOIN auditcore.journeys j ON j.tenant_id = x.tenant_id AND j.journey_id = x.journey_id
             LEFT JOIN auditcore.journeys nj ON nj.tenant_id = x.tenant_id AND nj.journey_id = x.named_journey_id

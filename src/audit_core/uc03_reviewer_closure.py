@@ -820,7 +820,7 @@ def list_closures(
     rows = connection.execute(
         text(
             f"""
-            SELECT {cols}, j.journey_reference, COALESCE(cu.legal_name, cu.display_name) AS customer_name,
+            SELECT {cols}, j.journey_reference, auditcore.shown_name(cu.legal_name, cu.display_name) AS customer_name,
                    o.outlet_name, d.dealer_name
             FROM auditcore.p2_journey_closures c
             JOIN auditcore.journeys j ON j.tenant_id=c.tenant_id AND j.journey_id=c.journey_id

@@ -84,7 +84,8 @@ def test_new_booking_needs_no_customer_name_the_documents_name_the_customer(uc03
     journey_id, customer_id = response.json()["journeyId"], response.json()["customerId"]
     assert _customer(setup, customer_id)["display_name"] == journey_id  # the placeholder the database knows
     listed = client.get(url, params={"state": "open"}).json()["items"]
-    assert next(i for i in listed if i["journey_id"] == journey_id)["customer_name"] == journey_id
+    # ...but never shown as the customer's name (closing list item 5, 2026-11-16).
+    assert next(i for i in listed if i["journey_id"] == journey_id)["customer_name"] == "Name not read"
     # Blank counts as no name too, and the same key replays the same Journey.
     again = client.post(url, headers={"Idempotency-Key": "p2-new-journey-002"},
                         json={"outletId": str(setup["outlet_id"]), "customerName": "   "})
