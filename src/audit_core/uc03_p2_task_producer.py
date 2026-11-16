@@ -736,8 +736,9 @@ def sync_field_review_tasks(
         gst = [f for f in fields if "GST_SLAB_RETIRED" in f.get("reasons", ())]
         unbalanced = [f for f in fields if "STATEMENT_DOES_NOT_BALANCE" in f.get("reasons", ())]
         unread = [f for f in fields if NOT_READ in f.get("reasons", ())]
-        dated = [f for f in fields
-                 if f["severity"] == "HIGH" and f not in gst and f not in unbalanced and f not in unread]
+        vins = [f for f in fields if "VIN_MISREAD" in f.get("reasons", ())]
+        dated = [f for f in fields if f["severity"] == "HIGH" and f not in gst and f not in unbalanced
+                 and f not in unread and f not in vins]
         uncertain = [f for f in fields if f["severity"] != "HIGH"]
         sentences = []
         unread_amount = any(f["fieldKey"] == RECEIPT_AMOUNT_FIELD for f in unread)
@@ -768,6 +769,13 @@ def sync_field_review_tasks(
                 "each as CGST and SGST -- with no cess), so the reading is almost certainly not what the page "
                 "prints. Correct each tax rate and amount to the page."
             )
+        if vins:
+            sentences.append(
+                f"The VIN on the {name} was read as "
+                + ", ".join(format_value(f["fieldKey"], f.get("value")) for f in vins)
+                + ", a few characters off this vehicle's VIN: almost certainly a misread. It is not used until "
+                "it is checked. Correct it to the page."
+            )
         if dated:
             sentences.append(
                 f"These dates on the {name} cannot be right as read: "
@@ -779,12 +787,13 @@ def sync_field_review_tasks(
             more = f" and {len(uncertain) - 6} more" if len(uncertain) > 6 else ""
             sentences.append(f"These values on the {name} were read with low confidence: {listed}{more}.")
         sentences.append("Open the document, compare each value with the page and confirm or correct it.")
-        severity = "HIGH" if dated or gst or unbalanced or unread else "MEDIUM"
+        severity = "HIGH" if dated or gst or unbalanced or unread or vins else "MEDIUM"
         count = len(fields)
         title = (
             f"Enter the amount on {name}: it was not read" if unread_amount and len(fields) == 1
             else f"Enter the name on {name}: it was not read" if unread and len(fields) == 1
             else f"Check the lines on {name}: they do not add up" if unbalanced
+            else f"Check the VIN on {name}: it looks misread" if vins and len(fields) == len(vins)
             else f"Check the GST on {name}" if gst and not dated and not uncertain
             else f"Check {count} date{'s' if count != 1 else ''} on {name}" if dated and not uncertain and not gst
             else f"Verify {count} field{'s' if count != 1 else ''} on {name}"

@@ -70,6 +70,7 @@ from audit_core.uc03_p2_dates import parse_extracted_date
 from audit_core.uc03_p2_names import same_person
 from audit_core.uc03_p2_runtime import enqueue_work
 from audit_core.uc03_p2_task_producer import format_value
+from audit_core.uc03_read_plausibility import usable_date, usable_name
 from audit_core.uc03_rule_execution_log import record_execution
 
 logger = structlog.get_logger(__name__)
@@ -195,7 +196,8 @@ class _Facts:
                 "documentId": str(r["source_di_document_id"]) if r["source_di_document_id"] else None,
                 "amount": Decimal(r["amount"]),
                 "receiptNumber": r["receipt_number"],
-                "date": _day(r["receipt_date"]),
+                # A receipt date that cannot be right is not read (read plausibility, 2026-11-16).
+                "date": usable_date(r["receipt_date"], "receipt_date"),
                 "mode": str(r["mode"] or "").upper(),
                 "payer": " ".join(str(r["receipt_customer_name"] or "").split()) or None,
                 "counterparty": " ".join(str(r["counterparty"] or "").split()) or None,
@@ -225,7 +227,7 @@ class _Facts:
 
         paid = dict(self.sheet["summary"]["paid"])
         dated = _paid(self.connection, tenant_id=self.tenant_id, journey_id=self.journey_id)["customerReceipts"]
-        return {**paid, "dated": [{**r, "date": _day(r["date"])} for r in dated]}
+        return {**paid, "dated": [{**r, "date": usable_date(r["date"], "receipt_date")} for r in dated]}
 
     @cached_property
     def loan_received(self) -> Decimal:
@@ -238,7 +240,7 @@ class _Facts:
         from audit_core.uc03_p2_journey360 import gate_pass_date
 
         printed = gate_pass_date(self.connection, tenant_id=self.tenant_id, journey_id=self.journey_id)
-        if printed:
+        if printed and usable_date(printed[:10], "delivery_date"):
             return date.fromisoformat(printed[:10])
         row = self.connection.execute(
             text(
@@ -252,7 +254,7 @@ class _Facts:
             ),
             self._params,
         ).scalar_one_or_none()
-        return _day(row)
+        return usable_date(_day(row), "delivery_date")
 
     @cached_property
     def finance(self) -> dict[str, Any] | None:
@@ -328,15 +330,12 @@ class _Facts:
         the gate pass: {"date", "document"}; None until one is read. A date
         before the programme's floor is a misreading the PC has been asked
         to fix (task #19, 2026-09-30): it never starts the clock."""
-        from audit_core.uc03_p2_registry import get_registry
-
-        floor = get_registry().extraction_rules.date_floor
         found: list[tuple[date, str]] = []
         for doc in self.documents("customer_invoice_dms", "tax_invoice_tally", "insurance_cover", "gate_pass"):
             fields = doc["fields"]
             for key in ("invoice_date", "issue_date", "policy_start_date", "delivery_date"):
-                printed = _day(fields.get(key))
-                if printed and not (floor and printed < floor):
+                printed = usable_date(fields.get(key), "issue_date" if key == "policy_start_date" else key)
+                if printed:
                     found.append((printed, doc["documentType"]))
         if not found:
             return None
@@ -396,14 +395,15 @@ class _Facts:
 
     @cached_property
     def booking_date(self) -> date | None:
+        # A booking date that cannot be right is not read (read plausibility, 2026-11-16).
         booking = self.documents("booking_form", "booking_docket")
-        printed = _day((booking[0]["fields"] if booking else {}).get("booking_date"))
+        printed = usable_date((booking[0]["fields"] if booking else {}).get("booking_date"), "booking_date")
         if printed:
             return printed
-        return _day(self.connection.execute(
+        return usable_date(_day(self.connection.execute(
             text("SELECT booking_confirmation_date FROM auditcore.bookings WHERE tenant_id=:t AND journey_id=:j"),
             self._params,
-        ).scalar_one_or_none())
+        ).scalar_one_or_none()), "booking_date")
 
     @cached_property
     def customer_name(self) -> str | None:
@@ -417,7 +417,7 @@ class _Facts:
             ),
             self._params,
         ).scalar_one_or_none()
-        return " ".join(str(row).split()) if row else None
+        return usable_name(row)
 
     @cached_property
     def customer_pans(self) -> set[str]:
