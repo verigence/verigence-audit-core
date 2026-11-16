@@ -23,6 +23,7 @@ All public API errors use these stable codes. Internal DI/Security/database/prov
 | VAC-NF-005 | 404 | Journey not found | Journey not found in tenant. |
 | VAC-NF-006 | 404 | Evidence not found | Audit Core evidence association not found. |
 | VAC-NF-007 | 404 | Task not found | Audit workflow task not found. |
+| VAC-NF-034 | 404 | Document replaced | A link to a copy of a document that was replaced on its Journey; the problem carries `currentDocumentId`, the copy in use. |
 | VAC-CONFLICT-001 | 409 | Version conflict | Optimistic concurrency/version check failed. |
 | VAC-CONFLICT-002 | 409 | Invalid audit state | Requested audit action is not valid from current audit state. |
 | VAC-CONFLICT-003 | 409 | Idempotency conflict | Same Idempotency-Key reused with different semantic payload. |

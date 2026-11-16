@@ -5332,6 +5332,8 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # The booking form raises no tasks (product owner, 2026-11-15).
         "BOOKING_FORM_TASK_CLEANUP": ("audit_core.uc03_booking_form_task_cleanup",
                                       "run_booking_form_task_cleanup"),
+        # Open tasks linking to a replaced copy of a document, refreshed onto the copy in use (2026-11-16).
+        "TASK_DOCUMENT_REPOINT": ("audit_core.uc03_task_document_repoint", "run_task_document_repoint"),
         # Audit tasks that named no document, and documents the old name check
         # held out of their bookings (2026-11-01): see uc03_audit_task_cleanup.
         "AUDIT_TASK_CLEANUP": ("audit_core.uc03_audit_task_cleanup", "run_audit_task_cleanup"),
