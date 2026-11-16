@@ -113,6 +113,56 @@ def dealer_codes(connection: Connection, *, tenant_id: str, dealer_id: Any) -> s
     ).scalars().all())
 
 
+def other_dealer_codes(connection: Connection, *, tenant_id: str, dealer_id: Any) -> set[str]:
+    """Every other dealership's own Agent / MISP codes in the Project."""
+    return set(connection.execute(
+        text("SELECT normalized_code FROM auditcore.dealer_insurance_codes WHERE tenant_id = :t "
+             "AND dealer_id IS DISTINCT FROM :d"),
+        {"t": tenant_id, "d": dealer_id},
+    ).scalars().all())
+
+
+# A long code read with a character or two wrong is still the dealer's own
+# (2026-11-16: Utkal's MISP code MIBL/M&M/AAACU2665C/000 is read as
+# AAECU2665C, AAECA2665C, AAACU2656C or AAUC2665C on 40 policies, which then
+# showed the insurance as unconfirmed, or Self where the docket said so).
+MAX_CODE_MISREAD = 2
+_MIN_FUZZY_CODE = 12
+
+
+def _edits(a: str, b: str) -> int:
+    """Characters to change, add or drop to turn one code into the other."""
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        current = [i]
+        for j, cb in enumerate(b, start=1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (ca != cb)))
+        previous = current
+    return previous[-1]
+
+
+def dealer_code_match(value: Any, own: set[str], others: set[str] = frozenset()) -> tuple[str, int] | None:
+    """The dealer's own code this policy code is, and how many characters it
+    was misread by (0 when exact): within MAX_CODE_MISREAD of one of the
+    dealer's codes of 12 or more characters, and nearer to it than to any
+    other dealership's. None otherwise. Deterministic: never a guess between
+    two dealers."""
+    code = normalize_code(value)
+    if not code:
+        return None
+    if code in own:
+        return code, 0
+    if len(code) < _MIN_FUZZY_CODE:
+        return None
+    near = sorted((_edits(code, o), o) for o in own if len(o) >= _MIN_FUZZY_CODE)
+    if not near or near[0][0] > MAX_CODE_MISREAD:
+        return None
+    distance, match = near[0]
+    if any(_edits(code, o) <= distance for o in others):
+        return None
+    return match, distance
+
+
 # Every reading a dealer invoice gives of an insurance premium, for one Journey
 # (``:j``) or, with ``journeys`` set, for a list of them in one statement (the
 # insights reports ask for many Journeys at once, 2026-11-10).
@@ -231,9 +281,19 @@ def document_decision(connection: Connection, *, tenant_id: str, journey_id: UUI
         return {"source": INHOUSE, "basis": f"The dealer's statement charges the insurance premium (Rs {charged:,.0f})."}
     if policy is not None:
         known = dealer_codes(connection, tenant_id=tenant_id, dealer_id=policy["dealer_id"])
+        others: set[str] | None = None
         for label, key in (("MISP code", "misp_code"), ("Agent code", "agent_intermediary_code")):
-            if policy.get(key) and normalize_code(policy[key]) in known:
+            if not policy.get(key):
+                continue
+            if normalize_code(policy[key]) in known:
                 return {"source": INHOUSE, "basis": f"The policy carries the dealer's {label} {policy[key]}."}
+            if others is None:
+                others = other_dealer_codes(connection, tenant_id=tenant_id, dealer_id=policy["dealer_id"])
+            near = dealer_code_match(policy[key], known, others)
+            if near is not None:
+                return {"source": INHOUSE,
+                        "basis": f"The policy carries the dealer's {label} (read as {policy[key]}, "
+                                 f"{near[1]} character{'s' if near[1] > 1 else ''} from the dealer's code)."}
     premium = premium_on_dealer_invoice(connection, tenant_id=tenant_id, journey_id=journey_id)
     if premium is not None:
         return {"source": INHOUSE, "basis": f"The dealer invoice bills the insurance premium (Rs {premium:,.0f})."}
