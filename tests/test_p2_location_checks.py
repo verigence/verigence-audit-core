@@ -231,8 +231,14 @@ def test_executive_reads_the_days_log(setup):
     assert [i["status"] for i in away_only["people"][0]["items"]] == ["AWAY", "AWAY"]
     assert away_only["people"][0]["checks"] == 3
 
+    # A day with no checks still lists every PC of the Project, with the reason
+    # (product owner 2026-11-16: "why i didnt see the location check for all the PC").
     other_day = s.client.get(s.base, params={"day": "2026-01-01"}).json()
-    assert other_day["people"] == [] and other_day["day"] == "2026-01-01"
+    assert other_day["day"] == "2026-01-01"
+    [idle] = other_day["people"]
+    assert idle["actorId"] == s.journey.actor_id and idle["checks"] == 0
+    assert idle["issue"] == "NOT_ON_DEALGUARD" and idle["isPc"] is True
+    assert other_day["totals"]["pcsInProject"] == 1 and other_day["totals"]["notChecked"] == 1
 
 
 def test_dealer_scoped_executive_sees_only_their_pcs(setup):
