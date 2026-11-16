@@ -1136,3 +1136,71 @@ def test_nobody_to_compare_with_is_still_reported_as_such(two_journeys) -> None:
 
     result = dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=c.journey_a, correlation_id="")
     assert result == {"raised": 0, "resolved": 0, "examined": 0}
+
+
+# ── the booking's own numbers (closing list item 6, 2026-11-16) ─────────────
+
+
+def _document(c, *, journey_id, document_type_key, field_key, value) -> None:
+    """A field on an ACTIVE document of the journey (the numbers are read off
+    the journey's own documents only)."""
+    doc = uuid4()
+    customer_id = c.execute(text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+                            {"t": c.tenant_id, "j": journey_id}).scalar_one()
+    evidence_id = c.execute(
+        text("INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id, di_document_id, "
+             "document_type_key, evidence_purpose, process_area, association_status) "
+             "VALUES (:t, :j, :c, :s, :d, :k, 'JOURNEY_DOCUMENT', 'BOOKING', 'ACTIVE') RETURNING evidence_id"),
+        {"t": c.tenant_id, "j": journey_id, "c": customer_id, "s": uuid4(), "d": doc, "k": document_type_key},
+    ).scalar_one()
+    c.execute(
+        text("""INSERT INTO auditcore.journey_document_extracted_fields (
+                tenant_id, journey_id, evidence_id, di_document_id, source_fact_ref, source_fact_version, stage_code,
+                source_document_type_key, source_canonical_field_id, field_key, extracted_value, effective_value,
+                confidence_score, is_modified)
+                VALUES (:t, :j, :e, :doc, NULL, 1, 'BOOKING', :dtk, NULL, :fk, CAST(:v AS jsonb), CAST(:v AS jsonb),
+                        0.95, false)"""),
+        {"t": c.tenant_id, "j": journey_id, "e": evidence_id, "doc": doc, "dtk": document_type_key,
+         "fk": field_key, "v": json.dumps(value)},
+    )
+
+
+@pytest.mark.parametrize(("document_type_key", "field_key", "a", "b", "basis"), [
+    ("customer_invoice_dms", "chassis_number", "MA1RE2TTKT5J31078", "T5J31078", "VIN"),
+    ("dealer_receipt", "receipt_number", "MR-14352", "MR 14352", "RECEIPT"),
+    ("booking_docket", "booking_reference_number", "1015544", "1015544", "OTF"),
+])
+def test_the_same_vehicle_receipt_or_booking_number_pairs_two_bookings(
+        two_journeys, document_type_key, field_key, a, b, basis) -> None:
+    """Different customers, nothing else in common: one booking number is
+    still one booking."""
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="pan_card", field_key="pan_number", value="ABCDE1234F")
+    _set_field(c, journey_id=c.journey_b, document_type_key="pan_card", field_key="pan_number", value="ZZZZZ9999Z")
+    _document(c, journey_id=c.journey_a, document_type_key=document_type_key, field_key=field_key, value=a)
+    _document(c, journey_id=c.journey_b, document_type_key=document_type_key, field_key=field_key, value=b)
+    _assert_exactly_one_flagged_as_duplicate_of_the_other(c)
+    payloads = [p for j in (c.journey_a, c.journey_b) for p in [_basis_payload(c, j)] if p]
+    assert payloads[0]["matchBasis"] == basis and payloads[0]["sameCustomer"] is False
+    findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
+    assert "The customers differ" in findings[0]["description"]
+
+
+def _basis_payload(c, journey_id) -> dict | None:
+    row = c.execute(
+        text("SELECT e.safe_payload FROM auditcore.audit_finding_events e JOIN auditcore.audit_findings f "
+             "ON f.tenant_id=e.tenant_id AND f.audit_finding_id=e.audit_finding_id "
+             "WHERE f.tenant_id=:t AND f.journey_id=:j AND f.finding_type_code='DUPLICATE_BOOKING' "
+             "AND e.event_type='RAISED' ORDER BY f.created_at_utc DESC LIMIT 1"),
+        {"t": c.tenant_id, "j": journey_id},
+    ).scalar_one_or_none()
+    return dict(row) if row else None
+
+
+def test_a_short_receipt_number_does_not_pair(two_journeys) -> None:
+    c = two_journeys
+    _document(c, journey_id=c.journey_a, document_type_key="dealer_receipt", field_key="receipt_number", value="12")
+    _document(c, journey_id=c.journey_b, document_type_key="dealer_receipt", field_key="receipt_number", value="12")
+    for j in (c.journey_a, c.journey_b):
+        dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=j, correlation_id="")
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
