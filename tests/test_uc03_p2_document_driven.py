@@ -365,15 +365,15 @@ def test_receipts_after_the_minimum_booking_amount_are_delivery_receipts(journey
     assert "payment_receipt" in missing
     add_receipt_payment(journey, amount="10000", receipt_number="R2", receipt_date="2026-09-03")
     add_receipt_payment(journey, amount="300000", receipt_number="R3", receipt_date="2026-09-25")
-    # same number and amount on another date is a different receipt; it counts
+    # The same number and amount with a date read a day apart is the same receipt: counted once
+    # (product owner 2026-11-16, SHI-SS-261028-001).
     add_receipt_payment(journey, amount="300000", receipt_number="R3", receipt_date="2026-09-26")
     result = _settle(journey)
     gate = result["gates"]["MINIMUM_BOOKING_PAYMENT"]
-    assert gate["passed"] is True and gate["duplicateReceiptsExcluded"] == 1
+    assert gate["passed"] is True and gate["duplicateReceiptsExcluded"] == 2
     assert [r["receiptNumber"] for r in gate["bookingReceipts"]] == ["R1", "R2"]
     assert gate["bookingReceiptTotal"] == "21000.00"
-    assert [(r["receiptNumber"], r["receiptDate"]) for r in gate["deliveryReceipts"]] == [
-        ("R3", "2026-09-25"), ("R3", "2026-09-26")]
+    assert [(r["receiptNumber"], r["receiptDate"]) for r in gate["deliveryReceipts"]] == [("R3", "2026-09-25")]
     missing = {i["key"] for i in result["delivery"]["gates"]["REQUIRED_DOCUMENTS"]["missing"]}
     assert "payment_receipt" not in missing and "dealer_receipt" not in missing
 

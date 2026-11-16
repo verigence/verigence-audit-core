@@ -278,6 +278,22 @@ def compute_duplicate_groups(documents: list[ReceiptRecord]) -> list[DuplicateGr
 
 
 
+def repeated_receipts(documents: list[ReceiptRecord]) -> dict[Any, Any]:
+    """document_id -> the earlier document it repeats: every member of a
+    duplicate group after the first, whatever the dates read on them. The one
+    rule every money total uses (2026-11-16): the same receipt number and
+    amount is the same receipt, counted once -- a second scan with its date
+    read a day apart is still that receipt (live, SHI-SS-261028-001: receipt
+    PB/26-27/0824 for Rs 45,837 read as 22 Oct and as 23 Oct, counted twice on
+    the payments tab while its duplicate task said only one was counted).
+    ``documents`` in the order the earliest should win."""
+    out: dict[Any, Any] = {}
+    for group in compute_duplicate_groups(documents):
+        for later in group.documents[1:]:
+            out[later.document_id] = group.documents[0].document_id
+    return out
+
+
 def describe_group(group: DuplicateGroup) -> dict[str, Any]:
     """One group as plain facts: the receipt number (or none), the amount,
     the dates read, whether they agree, and the documents."""

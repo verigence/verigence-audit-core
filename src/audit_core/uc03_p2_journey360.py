@@ -35,9 +35,9 @@ from audit_core.uc03_deal_source_policy import (
 from audit_core.uc03_duplicate_booking_detection import _BASIS_LABEL
 from audit_core.uc03_duplicate_receipt_detection import (
     ReceiptRecord,
-    compute_duplicate_groups,
     normalize_receipt_date,
     normalize_receipt_number,
+    repeated_receipts,
 )
 from audit_core.uc03_invoice_materialization import (
     CUSTOMER_FAMILIES,
@@ -401,9 +401,9 @@ def _payment_reference(row: Any) -> str | None:
 
 
 def _duplicate_receipts(rows: list[Any]) -> dict[Any, Any]:
-    """payment_id -> the earlier payment it repeats (same receipt number,
-    amount and date, by the stage engine's own rule; or the same bank
-    reference, amount and date)."""
+    """payment_id -> the earlier payment it repeats: the same receipt number
+    and amount whatever the dates read (repeated_receipts, the rule every
+    money total uses), or the same bank reference, amount and date."""
     records = [
         ReceiptRecord(
             document_id=r["payment_id"], stage_code="BOOKING", document_type_key="receipt",
@@ -412,11 +412,7 @@ def _duplicate_receipts(rows: list[Any]) -> dict[Any, Any]:
         )
         for r in rows
     ]
-    out: dict[Any, Any] = {}
-    for group in compute_duplicate_groups(records):
-        if group.dates_match:
-            for later in group.documents[1:]:
-                out[later.document_id] = group.documents[0].document_id
+    out: dict[Any, Any] = repeated_receipts(records)
     first: dict[tuple[str, Decimal, Any], Any] = {}
     for r in rows:
         reference = _payment_reference(r)
@@ -3521,11 +3517,12 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         ).mappings().all()
     }
 
-    # The same receipt again: same number, amount and date as an earlier one
-    # (same amount and date when neither prints a number).
+    # The same receipt again: same number and amount as an earlier one, whatever the dates
+    # read (2026-11-16); same amount and date when neither prints a number.
     eligible = [r for r in rows if r["status_source"] == "EVIDENCE" and r["association_status"] == "ACTIVE"]
     duplicate_of = _duplicate_receipts(eligible)
     number_of = {r["payment_id"]: r["receipt_number"] for r in rows}
+    date_of = {r["payment_id"]: r["receipt_date"] for r in rows}
 
     lines = _bank_lines(connection, tenant_id=tenant_id, journey_id=journey_id)
     by_document = {line["documentId"]: line for line in lines}
@@ -3555,7 +3552,9 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
             reason = "Duplicate: the same bank reference, amount and date as " + (
                 f"receipt {number_of.get(original)}" if number_of.get(original) else "an earlier receipt")
         elif original is not None:
-            reason = "Duplicate: the same receipt number, amount and date as " + (
+            same_date = date_of.get(original) == r["receipt_date"]
+            reason = ("Duplicate: the same receipt number, amount and date as " if same_date
+                      else "Duplicate: the same receipt number and amount (a date read differently) as ") + (
                 f"receipt {number_of.get(original)}" if number_of.get(original) else "an earlier receipt")
         elif not evidenced and r["association_status"] == "FOREIGN":
             reason = "In another customer's file, taken out of this booking"
