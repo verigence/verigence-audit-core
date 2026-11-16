@@ -414,7 +414,9 @@ def loan_received(
        linked as the loan yet (the PC is asked when the rules cannot tell
        which), so that receipt stays a customer receipt on Payments and
        here, and the loan is not counted a second time.
-    3. Else the Bank Approval Letter's sanctioned amount, when no dealership
+    3. Else the lender's paper -- the Delivery Order's loan amount (its
+       disbursement advice or email included), else the Bank Approval
+       Letter's sanctioned amount (2026-11-16) -- when no dealership
        receipt stands for the loan (2026-10-31; ``letter``, from
        uc03_p2_journey360.loan_without_receipt): counted, and marked
        ``withoutReceipt`` so the screen shows it with an asterisk. A customer
@@ -445,6 +447,9 @@ def loan_received(
             out.update(amount=loan, source=stated["source"])
         return out
     letter_amount = dec((letter or {}).get("amount"))
+    # The lender's paper: the Delivery Order (its advice or email) before the
+    # Bank Approval Letter (uc03_p2_journey360.lender_loan, 2026-11-16).
+    letter_source = (letter or {}).get("source") or "Bank Approval Letter (sanctioned amount)"
     if letter_amount is not None:
         # The letter is the lender's approval, not money received. When the
         # money on file already pays all but less than half of it, the loan
@@ -454,16 +459,16 @@ def loan_received(
         # Kotak credit against Rs 7,00,000 -- counted twice, read as excesses.
         if payable is not None and paid_without_loan is not None \
                 and payable - paid_without_loan < letter_amount / 2:
-            out.update(amount=Decimal(0), source="Bank Approval Letter (sanctioned amount)", inReceipts=True,
+            out.update(amount=Decimal(0), source=letter_source, inReceipts=True,
                        note=f"The money on file already pays the net payable but Rs {max(payable - paid_without_loan, Decimal(0)):,.2f}: "
-                            f"the Bank Approval Letter's loan of Rs {letter_amount:,.2f} is taken to be among the receipts, "
+                            f"the loan of Rs {letter_amount:,.2f} on the {letter_source} is taken to be among the receipts, "
                             "not counted again.")
             return out
-        out.update(amount=letter_amount, source="Bank Approval Letter (sanctioned amount)", withoutReceipt=True,
-                   note="No dealership receipt for the loan amount; taken from the Bank Approval Letter.")
+        out.update(amount=letter_amount, source=letter_source, withoutReceipt=True,
+                   note=f"No dealership receipt for the loan amount; taken from the {letter_source}.")
         return out
     if loan_among_receipts is not None:
-        out.update(amount=Decimal(0), source="Bank Approval Letter (sanctioned amount)", inReceipts=True,
+        out.update(amount=Decimal(0), source=letter_source, inReceipts=True,
                    note=f"The loan's receipt (Rs {loan_among_receipts:,.2f}, the sanction less the lender's charges) "
                         "is among the receipts, not yet linked as the loan receipt; not counted twice.")
         return out
@@ -471,6 +476,54 @@ def loan_received(
         out.update(unknown=True, note="Financed deal: the loan amount is not on file (no disbursement on the "
                                       "finance record, no financer line on the NDC or settlement).")
     return out
+
+
+def loan_figures(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, received: Decimal | None, disbursement_known: bool,
+    stated: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Every loan figure on file, in the fixed order the loan is taken
+    (product owner 2026-11-16): the loan's receipt or the disbursement on the
+    finance record, the dealer's statement (NDC / settlement / ledger), the
+    Delivery Order (its disbursement advice or email included), the Bank
+    Approval Letter's sanction. The first is the one counted (loan_received);
+    the others are its cross-checks."""
+    from audit_core.uc03_p2_journey360 import (
+        bank_approval_sanction,
+        delivery_order_loan,
+    )
+
+    out: list[dict[str, Any]] = []
+    if disbursement_known and received:
+        out.append({"source": "Loan receipt / disbursement on the finance record", "amount": received})
+    if stated is not None and dec(stated.get("loan")):
+        out.append({"source": stated["source"], "amount": dec(stated["loan"])})
+    do = delivery_order_loan(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if do is not None:
+        out.append({"source": "Delivery Order (Financier)", "amount": do["amount"]})
+    letter = bank_approval_sanction(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if letter is not None:
+        out.append({"source": "Bank Approval Letter (sanctioned amount)", "amount": letter["amount"]})
+    return out
+
+
+def loan_figures_check(figures: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Whether the loan figures on file agree: each pair the same, or one the
+    other less the lender's charges (within 2%). None with fewer than two."""
+    from audit_core.uc03_ledger_receipts import is_loan_net_of_charges
+
+    if len(figures) < 2:
+        return None
+    amounts = [Decimal(f["amount"]) for f in figures]
+    agree = all(is_loan_net_of_charges(min(a, b), max(a, b)) for i, a in enumerate(amounts) for b in amounts[i + 1:])
+    listed = "; ".join(f"{f['source']} Rs {Decimal(f['amount']):,.2f}" for f in figures)
+    return {
+        "rule": "AS-12", "label": "Loan figures across documents",
+        "conclusion": OK if agree else EXCEPTION,
+        "reason": None if agree else f"The loan figures disagree ({listed}); the first is counted.",
+        "figures": [{"source": f["source"], "amount": money(Decimal(f["amount"]))} for f in figures],
+        "difference": None, "impact": None,
+    }
 
 
 def settlement(
@@ -715,6 +768,11 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     )
     loan = loan_on_file["amount"] or Decimal(0)
     refunds = loan_on_file["refunds"]
+    figures = loan_figures(connection, tenant_id=tenant_id, journey_id=journey_id,
+                           received=dec(pays.get("loanDisbursed")),
+                           disbursement_known=any(dec(r.get("loan_disbursement_amount")) is not None for r in records),
+                           stated=statement_loan(connection, tenant_id=tenant_id, journey_id=journey_id))
+    figures_check = loan_figures_check(figures)
     # The old vehicle the NDC takes against the price: paid in kind, as the
     # Deal counts it (2026-11-02, Deal defect 4).
     old_vehicle = dec((summary.get("paid") or {}).get("oldVehicle")) or Decimal(0)
@@ -758,6 +816,7 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         "oldVehicle": money(old_vehicle) if old_vehicle else None,
         "received": money(receipts + loan + old_vehicle - refunds),
         "bankCheck": bank_check, "loans": loans,
+        "loanFigures": [{"source": f["source"], "amount": money(Decimal(f["amount"]))} for f in figures],
         "bankApprovalOnFile": "bank_approval_letter" in on_file, "deliveryOrderOnFile": "delivery_order_cover" in on_file,
         "exchange": {"applicable": (trade.get("exchange") or {}).get("applicable"),
                      "bookedValue": (trade.get("exchange") or {}).get("value"),
@@ -788,6 +847,7 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                                                   difference=None, impact=None),
                                             *[dict(entry, label=f"Loan ({entry['lender'] or 'lender not named'})",
                                                    impact=None) for entry in loans],
+                                            *([figures_check] if figures_check else []),
                                             dict(settle, label="Money received against net payable",
                                                  difference=settle.get("balance")),
                                             *([ledger] if ledger else [])]

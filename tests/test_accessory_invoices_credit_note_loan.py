@@ -221,6 +221,49 @@ def test_a_receipt_naming_the_financier_is_the_loan_even_unlinked(journey) -> No
     assert _loan(journey) is None
 
 
+# ── the loan from the Delivery Order, in a fixed order (2026-11-16) ──────────
+def _do(journey, amount: str = "640000") -> None:
+    add_ready_document(journey, "delivery_order_cover", process_area="DELIVERY", customer_name="P2 Customer",
+                       financier_name="HDFC BANK LTD", loan_amount=amount, disbursement_date="2026-10-14",
+                       disbursement_reference="UTR123")
+
+
+def test_the_delivery_orders_loan_stands_in_for_a_missing_loan_receipt(journey) -> None:
+    add_receipt_payment(journey, amount="50000", receipt_number="R-1", receipt_date="2026-10-01")
+    _do(journey)
+    loan = _loan(journey)
+    assert loan is not None and D(loan["amount"]) == D(640000) and loan["source"] == "Delivery Order (Financier)"
+    out = summary.loan_received(matched=None, disbursement_known=False, financed=True, stated=None,
+                                receipt_amounts=[D(50000)], letter=loan)
+    assert out["amount"] == D(640000) and out["withoutReceipt"] is True
+    assert out["source"] == "Delivery Order (Financier)" and "Delivery Order (Financier)" in out["note"]
+
+
+def test_the_delivery_order_comes_before_the_bank_letter(journey) -> None:
+    add_receipt_payment(journey, amount="50000", receipt_number="R-1", receipt_date="2026-10-01")
+    _letter(journey, "650000")
+    _do(journey, "640000")
+    assert D(_loan(journey)["amount"]) == D(640000)
+
+
+def test_a_delivery_order_without_a_loan_amount_leaves_the_letter(journey) -> None:
+    add_receipt_payment(journey, amount="50000", receipt_number="R-1", receipt_date="2026-10-01")
+    add_ready_document(journey, "delivery_order_cover", process_area="DELIVERY", customer_name="P2 Customer")
+    _letter(journey, "650000")
+    loan = _loan(journey)
+    assert D(loan["amount"]) == D(650000) and loan["source"] == "Bank Approval Letter (sanctioned amount)"
+
+
+def test_loan_figures_agree_within_the_lenders_charges_and_flag_otherwise() -> None:
+    same = summary.loan_figures_check([{"source": "NDC (account statement)", "amount": D(1880226)},
+                                       {"source": "Delivery Order (Financier)", "amount": D(1850000)}])
+    assert same["conclusion"] == summary.OK and same["rule"] == "AS-12"
+    apart = summary.loan_figures_check([{"source": "NDC (account statement)", "amount": D(1880226)},
+                                        {"source": "Delivery Order (Financier)", "amount": D(1150000)}])
+    assert apart["conclusion"] == summary.EXCEPTION and "the first is counted" in apart["reason"]
+    assert summary.loan_figures_check([{"source": "NDC (account statement)", "amount": D(1)}]) is None
+
+
 def test_the_open_dms_task_becomes_the_one_accessory_task_and_the_tally_one_is_merged(journey) -> None:
     from audit_core.uc03_p2_task_producer import _adopt_member_tasks, raise_or_refresh
 
