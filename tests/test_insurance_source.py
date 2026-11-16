@@ -231,3 +231,55 @@ def test_a_docket_saying_by_the_customer_shows_self_meanwhile_and_still_asks(eng
     # The PC's answer still decides.
     _answer(journey, task["task_id"], "INHOUSE", "Agent code 20000042")
     assert (_sync(journey)["source"], _sync(journey)["decidedBy"]) == ("INHOUSE", "PC")
+
+
+# ── product owner 2026-11-16: MISP code first; if not, the NDC's insurance amount; else Self ──
+UTKAL_MISP = "MIBL/M&M/AAACU2665C/000"
+
+
+def _dealer_code(journey, code=UTKAL_MISP):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        dealer_id = connection.execute(text("SELECT dealer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+                                       {"t": journey.tenant_id, "j": journey.journey_id}).scalar_one()
+        connection.execute(text("INSERT INTO auditcore.dealer_insurance_codes (tenant_id, dealer_id, normalized_code, "
+                                "code_as_entered, confirmed_by_actor_id) VALUES (:t, :d, :n, :c, 'test')"),
+                           {"t": journey.tenant_id, "d": dealer_id, "n": rule.normalize_code(code), "c": code})
+
+
+def test_the_dealers_misp_code_decides_first_even_misread(engine, monkeypatch) -> None:
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _dealer_code(journey)
+    _policy(journey, misp_code="MIBL/M&M/AAECU2665C/000", agent="MIBL")
+    monkeypatch.setattr(rule, "premium_on_dealer_statement", lambda *a, **k: 52305.0)
+    decision = _sync(journey)
+    assert (decision["source"], decision["decidedBy"]) == ("INHOUSE", "DOCUMENT")
+    assert "MISP code" in decision["basis"] and "1 character" in decision["basis"]
+
+
+def test_without_the_misp_code_the_ndc_insurance_amount_makes_it_dealership(engine, monkeypatch) -> None:
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _policy(journey, misp_code="MIBL/M&M/AAXYZ9999C/000")
+    monkeypatch.setattr(rule, "premium_on_dealer_statement", lambda *a, **k: 52305.0)
+    decision = _sync(journey)
+    assert (decision["source"], decision["decidedBy"]) == ("INHOUSE", "DOCUMENT")
+    assert decision["basis"] == "The NDC charges the insurance premium (Rs 52,305)."
+
+
+def test_neither_with_the_ndc_read_is_the_customers_own(engine, monkeypatch) -> None:
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _policy(journey, misp_code="MIBL/M&M/AAXYZ9999C/000")
+    monkeypatch.setattr(rule, "premium_on_dealer_statement", lambda *a, **k: None)
+    monkeypatch.setattr(rule, "ndc_without_premium", lambda *a, **k: True)
+    decision = _sync(journey)
+    assert (decision["source"], decision["decidedBy"]) == ("SELF", "DOCUMENT")
+    assert "NDC charges no insurance premium" in decision["basis"]
+    assert _task(journey) is None  # decided by the documents: nothing to ask
+
+
+def test_neither_before_the_ndc_is_read_still_asks_the_pc(engine, monkeypatch) -> None:
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _policy(journey, misp_code="MIBL/M&M/AAXYZ9999C/000")
+    monkeypatch.setattr(rule, "premium_on_dealer_statement", lambda *a, **k: None)
+    monkeypatch.setattr(rule, "ndc_without_premium", lambda *a, **k: False)
+    assert _sync(journey)["decidedBy"] == "UNCONFIRMED" and _task(journey) is not None
