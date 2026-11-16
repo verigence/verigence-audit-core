@@ -309,11 +309,14 @@ REVIEW_REASON_LABELS = {
     "DATE_IN_FUTURE": "a date after today",
     "GST_SLAB_RETIRED": "a GST split that no longer exists (28% and the cess ended on 22 Sep 2025)",
     "STATEMENT_DOES_NOT_BALANCE": "an account statement whose debits, credits and balance do not add up",
+    "VIN_MISREAD": "a VIN a few characters off the vehicle's VIN (a misread)",
 }
 # Reasons that make the verification High severity: the value is wrong as
 # read, not merely uncertain.
 HIGH_SEVERITY_REASONS = frozenset({"DATE_BEFORE_FLOOR", "DATE_UNREADABLE", "DATE_IN_FUTURE", "GST_SLAB_RETIRED",
-                                   "STATEMENT_DOES_NOT_BALANCE"})
+                                   "STATEMENT_DOES_NOT_BALANCE", "VIN_MISREAD"})
+# The fields that print the vehicle's VIN / chassis number.
+VIN_FIELDS = frozenset({"vin_number", "chassis_number"})
 
 # GST as read must be a rate that exists (2026-10-28). An Aditya Motors invoice
 # printed CGST 20% / SGST 20% (Rs 2,41,414.34 each, 40% in all, no cess); the
@@ -418,6 +421,7 @@ def _is_payment_ledger(line_items: Any) -> bool:
 def field_review_reasons(
     registry: Registry, template: DocumentTemplate, *, di_type: str | None, field_key: str,
     value: Any, confidence: float | None, document_values: dict[str, Any] | None = None,
+    agreed_vin: str | None = None,
 ) -> list[str]:
     """Why a PC has to look at this value: low confidence, a date before the
     programme's floor, a date the extractor could not read, or a GST split
@@ -439,6 +443,13 @@ def field_review_reasons(
     future = future_date_verdict(field_key, value)
     if future:
         reasons.append(future)
+    if field_key in VIN_FIELDS and agreed_vin:
+        # A VIN one to three characters off the Journey's agreed VIN is a misread
+        # of it, not another vehicle (read plausibility, 2026-11-16).
+        from audit_core.uc03_read_plausibility import VIN_MISREAD, vin_relation
+
+        if vin_relation(value if not isinstance(value, str) else value.strip('"'), agreed_vin) == "MISREAD":
+            reasons.append(VIN_MISREAD)
     return reasons
 
 
@@ -486,6 +497,11 @@ def unreviewed_fields(
     by_document: dict[str, dict[str, Any]] = {}
     for row in rows:
         by_document.setdefault(str(row["di_document_id"]), {})[str(row["field_key"])] = row["effective_value"]
+    agreed_vin = None
+    if any(str(r["field_key"]) in VIN_FIELDS for r in rows):
+        from audit_core.uc03_p2_journey_classification import journey_vin
+
+        agreed_vin = journey_vin(connection, tenant_id=tenant_id, journey_id=journey_id)
     pending: list[dict[str, Any]] = []
     for row in rows:
         area = str(row["process_area"] or "").upper() or None
@@ -500,7 +516,7 @@ def unreviewed_fields(
         reasons = field_review_reasons(
             registry, template, di_type=di_type, field_key=field_key,
             value=row["effective_value"], confidence=confidence,
-            document_values=by_document.get(str(row["di_document_id"])),
+            document_values=by_document.get(str(row["di_document_id"])), agreed_vin=agreed_vin,
         )
         if not reasons:
             continue

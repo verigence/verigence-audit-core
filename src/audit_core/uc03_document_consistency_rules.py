@@ -21,8 +21,9 @@ Never ran, now run:
   "legal_name"); EXCHANGE_VALUE_VS_INVOICE_CREDIT, optional: only when a valuation
   report is on file (field valuation_final_offer_value).
 
-A date that cannot be right (before the programme's floor or in the future) is
-not a fact: the check waits instead of failing on it.
+A date that cannot be right (before the programme's floor or in the future),
+or a chassis number one to three characters off the Journey's VIN, is not a
+fact: the check waits instead of failing on it (uc03_read_plausibility).
 """
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ from datetime import date
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from audit_core.uc03_p2_dates import before_floor
+from audit_core.uc03_read_plausibility import clean_chassis, date_problem, vin_relation
 
 if TYPE_CHECKING:
     from audit_core.uc03_p2_audit_rules import RuleOutcome, _Facts
@@ -66,40 +67,32 @@ def _first(facts: _Facts, types: tuple[str, ...], field: str) -> tuple[Any, dict
 def _date(facts: _Facts, types: tuple[str, ...], field: str) -> tuple[date | None, str | None]:
     """(the date, why it is not used); a date that cannot be right is not used."""
     value, _ = _first(facts, types, field)
+    problem = date_problem(value, field, today=facts.today)
     day = _rule()._day(value)
-    if value is not None and day is None:
+    if problem == "DATE_UNREADABLE" or (value is not None and day is None):
         return None, f"read as \"{value}\", which is not a date"
-    if day is not None and (before_floor(day) or day > facts.today):
+    if problem:
         return None, f"read as {_rule()._when(day)}, which cannot be right (correct the reading)"
     return day, None
 
 
 def _norm_vin(value: Any) -> str:
-    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+    return clean_chassis(value)
 
 
 def _vehicle_vin(facts: _Facts) -> str | None:
+    """The Journey's agreed VIN (the one a person entered, else the one most of
+    the sale's documents agree on), else the vehicle invoice's chassis number."""
+    from audit_core.uc03_p2_journey_classification import journey_vin
+
+    agreed = journey_vin(facts.connection, tenant_id=facts.tenant_id, journey_id=facts.journey_id)
+    if agreed:
+        return agreed
     value, _ = _first(facts, _VEHICLE_INVOICES, "chassis_number")
     if not value:
         value, _ = _first(facts, _VEHICLE_INVOICES, "vin_number")
     vin = _norm_vin(value)
     return vin or None
-
-
-def _chassis_agree(short: str, full: str) -> bool:
-    """One chassis number is the other, or its last characters (the accessory
-    invoice and the DO often print only the last 8)."""
-    if not short or not full:
-        return False
-    a, b = sorted((short, full), key=len)
-    return b.endswith(a)
-
-
-def _one_off(short: str, full: str) -> bool:
-    """The printed last characters differ from the VIN's by one character: a misread."""
-    a, b = sorted((short, full), key=len)
-    tail = b[-len(a):]
-    return len(a) >= _MIN_SUFFIX and sum(x != y for x, y in zip(a, tail, strict=True)) == 1
 
 
 # ── dates ─────────────────────────────────────────────────────────────────────
@@ -186,8 +179,9 @@ def accessory_date_vs_delivery(facts: _Facts) -> RuleOutcome:
         return _outcome(code, "SKIPPED", "Checked once the gate pass date is read.")
     rules, late = _rule(), []
     for doc in invoices:
-        day = rules._day(doc["fields"].get("invoice_date"))
-        if day is not None and not before_floor(day) and day <= facts.today and day > gate:
+        value = doc["fields"].get("invoice_date")
+        day = None if date_problem(value, "invoice_date", today=facts.today) else rules._day(value)
+        if day is not None and day > gate:
             late.append(f"{doc['fields'].get('invoice_number') or 'accessory invoice'} dated {rules._when(day)}")
     if late:
         return _outcome(code, "FAIL", f"Accessory invoice after the delivery on {rules._when(gate)}: "
@@ -209,15 +203,16 @@ def _chassis_check(code: str, facts: _Facts, *, types: tuple[str, ...], name: st
     wrong, misread = [], []
     for doc in docs:
         printed = _norm_vin(doc["fields"].get("chassis_number") or doc["fields"].get("vin_number"))
-        if len(printed) < _MIN_SUFFIX or _chassis_agree(printed, vin):
+        relation = vin_relation(printed, vin)
+        if relation in ("SAME", "UNKNOWN"):
             continue
-        (misread if _one_off(printed, vin) else wrong).append(printed)
+        (misread if relation == "MISREAD" else wrong).append(printed)
     if wrong:
         return _outcome(code, "FAIL", f"The {name} names chassis {', '.join(wrong)}, not this vehicle ({vin}).",
                         {"findingTitle": title})
     if misread:
-        return _outcome(code, "SKIPPED", f"The {name} chassis {', '.join(misread)} differs from {vin} by one "
-                                         "character: a misread, correct the reading.")
+        return _outcome(code, "SKIPPED", f"The {name} chassis {', '.join(misread)} differs from {vin} by a few "
+                                         "characters: a misread, correct the reading.")
     return _outcome(code, "PASS", f"The {name} names this vehicle ({vin}).")
 
 
