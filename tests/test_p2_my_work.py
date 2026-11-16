@@ -17,7 +17,11 @@ from audit_core.task_closure_roles import (
     has_team_lead_authority,
     roles_closable_by,
 )
-from audit_core.task_manager import gate_pass_day_label, previous_gate_pass_day
+from audit_core.task_manager import (
+    gate_pass_day_label,
+    previous_gate_pass_day,
+    sunday_is_off,
+)
 from audit_core.uc03_p2_object_keys import ist_day
 from audit_core.uc03_p2_tasks import QUALITY_TASK, TaskPermissionError, submit_action
 
@@ -124,7 +128,7 @@ def test_pc_home_counts_uploads_gate_register_and_tasks(setup):
     assert line["deliveriesUpdated"] + line["bookingsUploaded"] == line["journeysUploaded"] >= 1
     assert line["journeysTotal"] >= 1
     assert line["tasksPending"] == 1
-    if today.isoweekday() != 7:
+    if not sunday_is_off(today):
         [day] = line["gateRegister"]
         assert (day["status"], day["total"], day["intimated"], day["uploadedInTool"], day["pendingWithPc"],
                 day["notIntimated"]) == ("DONE", 5, 3, 2, 1, 2)
@@ -138,7 +142,7 @@ def test_a_range_of_up_to_92_days_is_allowed(setup):
     today = ist_day().date()
     week = _work(s, **{"from": (today - timedelta(days=6)).isoformat(), "to": today.isoformat()}).json()
     assert len(week["outlets"][0]["gateRegister"]) == sum(
-        1 for i in range(7) if (today - timedelta(days=i)).isoweekday() != 7)
+        1 for i in range(7) if not sunday_is_off(today - timedelta(days=i)))
     assert _work(s, **{"from": (today - timedelta(days=40)).isoformat(), "to": today.isoformat()}).status_code == 200
     assert _work(s, **{"from": (today - timedelta(days=100)).isoformat(), "to": today.isoformat()}).status_code == 422
 
@@ -250,7 +254,7 @@ def test_the_tracker_is_day_by_day_and_counts_journeys_completed(setup):
     # A Sunday has no gate register day; any other day carries the outlet's entry.
     for d in data["periods"]:
         entry = d["outlets"][0]["gateRegister"]
-        assert (entry is None) == (datetime.fromisoformat(d["date"]).isoweekday() == 7)
+        assert (entry is None) == sunday_is_off(datetime.fromisoformat(d["date"]).date())
 
 
 def test_a_journey_with_a_document_task_open_is_not_completed(setup):

@@ -26,8 +26,9 @@ The date of a register (product owner 2026-11-07): the PC chooses it, there is
 no default. A new register can be uploaded for any day from today back to 7
 days ago (N to N-7, India time); a register already on file can be edited --
 photos added, replaced or removed -- while its date is within N to N-3, and is
-locked after that. Sunday is the off day and goes with Monday, so Sunday itself
-is never chosen. A register finished after its day's Daily Gate Pass task was
+locked after that. Every day has its own register, Sunday included (product
+owner 2026-11-16, task_manager.SUNDAY_GATE_REGISTER_FROM); before 15 Nov 2026
+Sunday was the off day and went with Monday. A register finished after its day's Daily Gate Pass task was
 marked incomplete closes that task as done late.
 
 The Team Lead's "Delivery not notified to the PC" task is suspended for the time
@@ -76,6 +77,7 @@ from audit_core.task_manager import (
     gate_pass_due,
     gate_pass_tl_tasks_enabled,
     previous_gate_pass_day,
+    sunday_is_off,
     suspend_gate_pass_tl_tasks,
 )
 from audit_core.uc03_p2_access import authorize_p2
@@ -151,13 +153,13 @@ EDIT_BACK_DAYS = 3
 
 def gate_pass_window(now: datetime | None = None) -> dict[str, Any]:
     """The dates a PC can choose for a gate register now: today back to 7 days ago,
-    India time, newest first, Sunday left out (Sunday goes with Monday: Monday's
-    register covers both). ``editFrom``: the oldest date whose register can still
+    India time, newest first. Sunday is a day like the others from 15 Nov 2026; an
+    earlier Sunday is left out (it went with Monday, whose register covered both). ``editFrom``: the oldest date whose register can still
     be edited (N-3); older registers are locked."""
     today = ist_day(now).date()
     back = [today - timedelta(days=i) for i in range(UPLOAD_BACK_DAYS + 1)]
     return {"today": today, "uploadFrom": back[-1], "editFrom": today - timedelta(days=EDIT_BACK_DAYS),
-            "days": [d for d in back if d.isoweekday() != 7]}
+            "days": [d for d in back if not sunday_is_off(d)]}
 
 
 def _range_words(window: dict[str, Any]) -> str:
@@ -171,7 +173,7 @@ def check_register_date(day: date | None, window: dict[str, Any]) -> date:
         raise HTTPException(status_code=422, detail="Choose the date this gate register is for.")
     if day in window["days"]:
         return day
-    if day.isoweekday() == 7 and window["uploadFrom"] <= day <= window["today"] + timedelta(days=1):
+    if sunday_is_off(day) and window["uploadFrom"] <= day <= window["today"] + timedelta(days=1):
         raise HTTPException(status_code=422, detail="Sunday is the off day: upload Sunday's gate pass with "
                                                     "Monday's, one register for both days.")
     if day > window["today"]:
@@ -194,13 +196,13 @@ def check_register_editable(day: date, window: dict[str, Any]) -> None:
 
 
 def gate_pass_days(now: datetime | None = None) -> dict[str, Any]:
-    """Today's gate pass day (none on a Sunday, the off day: Sunday goes with
-    Monday) and the previous gate pass day's while its task is open (until 23:59
+    """Today's gate pass day (none on a Sunday that was off, before 15 Nov 2026:
+    it went with Monday) and the previous gate pass day's while its task is open (until 23:59
     of the next gate pass day). Kept for the ``today`` / ``previous`` fields of
     GET /gate-passes/outlets that older clients read; which dates can be chosen
     is gate_pass_window (2026-11-07)."""
     today = ist_day(now).date()
-    current = None if today.isoweekday() == 7 else today
+    current = None if sunday_is_off(today) else today
     previous = previous_gate_pass_day(today) if current else today - timedelta(days=1)
     if (now or datetime.now(UTC)) > gate_pass_due(previous):
         previous = None
@@ -222,7 +224,7 @@ def vehicle_gate_pass_deliveries(connection: Connection, tenant_id: str, outlet_
 
     A Journey counts only when a vehicle gate pass document is on file (live) and the
     delivery date on its newest reading (a reviewer's correction wins) is the day, year
-    included; Monday's Daily Gate Pass covers Sunday too. Uploading other delivery
+    included; Monday's covered Sunday too while Sunday was off (before 15 Nov 2026). Uploading other delivery
     documents does not count a Journey, and a gate pass whose date was misread (often
     the year, on a handwritten gate pass) counts once the date is corrected."""
     if not outlet_ids:
@@ -255,8 +257,8 @@ def vehicle_gate_pass_deliveries(connection: Connection, tenant_id: str, outlet_
         {"t": tenant_id, "ids": [str(i) for i in outlet_ids], "a": gate_pass_covers(first)[0], "b": last,
          "today": ist_day().date()},
     ).mappings().all():
-        # Sunday's deliveries belong to Monday's Daily Gate Pass, which covers both days.
-        day = r["day"] + timedelta(days=1) if r["day"].isoweekday() == 7 else r["day"]
+        # Deliveries of a Sunday that was off (before 15 Nov 2026) belong to Monday's register.
+        day = r["day"] + timedelta(days=1) if sunday_is_off(r["day"]) else r["day"]
         if first <= day <= last:
             key = (day, str(r["outlet_id"]))
             out[key] = out.get(key, 0) + int(r["n"])
@@ -1254,7 +1256,7 @@ def gate_pass_summary(
         "notes": [
             "Every outlet, satellite outlets included (from 2 Nov 2026).",
             ("As per gate-out register: new deliveries on the gate pass. Updated in tool: deliveries whose vehicle "
-             "gate pass, dated that day, is uploaded to the Journey (Monday's covers Sunday); a gate pass uploaded "
+             "gate pass, dated that day, is uploaded to the Journey (until 15 Nov 2026 Monday's covered Sunday); a gate pass uploaded "
              "later still counts on the day it is dated."),
             ("Not notified to PC: deliveries the PC said the dealership did not notify to them. Pending due to PC: "
              "as per register - (updated in tool + not notified to PC): deliveries the PC has not uploaded, "
