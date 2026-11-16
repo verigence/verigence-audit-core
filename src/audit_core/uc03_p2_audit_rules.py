@@ -1645,6 +1645,13 @@ def _sync_finding(connection: Connection, *, tenant_id: str, journey_id: UUID, s
             # A Team Lead already gave the verdict on this check for this
             # Journey; it is not raised again (Findings can reopen it).
             return None
+        from audit_core.uc03_finding_invariants import finding_may_open
+
+        if not finding_may_open(connection, tenant_id=tenant_id, journey_id=journey_id, code=result.code):
+            # No task will come for it (a check that raises no task, its task
+            # cancelled or decided by a person): no finding either (2026-11-16,
+            # findings and tasks invariants).
+            return None
     if existing is not None:
         connection.execute(
             text("UPDATE auditcore.audit_findings SET title=:title, description=:description, severity=:severity "
