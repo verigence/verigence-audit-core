@@ -480,6 +480,20 @@ def test_insurance_taken_reads_the_cover_note_not_the_bookings_zero(journey):
     assert Decimal(row["booking"]) == 0 and row["billed"] == "62029" and Decimal(row["variance"]) == -9780
 
 
+def test_the_same_receipt_read_with_another_date_counts_once(journey):
+    """SHI-SS-261028-001 (2026-11-16): receipt PB/26-27/0824 for Rs 45,837 read as 22 Oct
+    and, from a second scan, as 23 Oct was counted twice on the payments tab while its
+    duplicate task said only one was counted."""
+    add_receipt_payment(journey, amount="45837", receipt_number="PB/26-27/0824", receipt_date="2026-10-22")
+    add_receipt_payment(journey, amount="45837", receipt_number="PB/26-27/0824", receipt_date="2026-10-23")
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/360"
+    items = [i for i in client.get(f"{base}/payments").json()["items"] if i["receiptNumber"] == "PB/26-27/0824"]
+    assert sorted(i["counted"] for i in items) == [False, True]
+    [later] = [i for i in items if not i["counted"]]
+    assert "a date read differently" in later["notCountedReason"]
+
+
 def test_duplicate_receipts_count_once_and_receipts_meet_the_bank_statement(journey):
     add_receipt_payment(journey, amount="84308", receipt_number="AMP-B/04824/26-27", receipt_date="2026-09-11")
     add_receipt_payment(journey, amount="84308", receipt_number="AMP-B/04824/26-27", receipt_date="2026-09-11")

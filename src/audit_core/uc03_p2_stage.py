@@ -38,9 +38,9 @@ from audit_core.uc03_deal_source_policy import (
 from audit_core.uc03_delivery_start import delivery_has_started
 from audit_core.uc03_duplicate_receipt_detection import (
     ReceiptRecord,
-    compute_duplicate_groups,
     normalize_receipt_date,
     normalize_receipt_number,
+    repeated_receipts,
 )
 from audit_core.uc03_p2_dates import date_floor_verdict, future_date_verdict
 from audit_core.uc03_p2_registry import (
@@ -237,10 +237,8 @@ def receipt_split(connection: Connection, *, tenant_id: str, journey_id: UUID,
         )
         for payment in payments
     ]
-    duplicates: set[Any] = set()
-    for group in compute_duplicate_groups(records):
-        if group.dates_match:  # same amount, number and date: the same receipt again
-            duplicates.update(d.document_id for d in group.documents[1:])
+    # The same receipt number and amount is the same receipt, whatever the dates read (2026-11-16).
+    duplicates: set[Any] = set(repeated_receipts(records))
     booking: list[dict[str, Any]] = []
     delivery: list[dict[str, Any]] = []
     running = Decimal(0)
