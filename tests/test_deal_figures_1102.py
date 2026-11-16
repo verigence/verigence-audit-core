@@ -267,7 +267,7 @@ def test_an_insurance_premium_on_the_statement_makes_the_insurance_in_house(jour
         set_tenant_context(c, journey.tenant_id)
         decided = resolve(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     assert decided["source"] == "INHOUSE" and decided["decidedBy"] == "DOCUMENT"
-    assert "statement charges the insurance premium" in decided["basis"]
+    assert "NDC charges the insurance premium" in decided["basis"]
 
 
 # ── 7. FASTag and 3. a benefit the NDC does not list ─────────────────────────
