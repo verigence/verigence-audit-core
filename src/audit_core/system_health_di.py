@@ -28,7 +28,9 @@ class DiHealthUnavailable(RuntimeError):
     """DI's health could not be read; the message is safe to show a SuperAdmin."""
 
 
-def fetch_di_health(hours: int) -> dict[str, Any]:
+def _di_get(path: str, params: dict[str, Any], *, marker: str) -> dict[str, Any]:
+    """GET a platform route of DI with a ServiceIntegration token. ``marker`` is a
+    key the answer must carry (DI wraps some answers in ``data``)."""
     di_url = os.environ.get("DI_BASE_URL", "").strip().rstrip("/")
     security_url = os.environ.get("SECURITY_BASE_URL", "").strip()
     client_id = os.environ.get("SECURITY_CLIENT_ID", "").strip()
@@ -38,21 +40,35 @@ def fetch_di_health(hours: int) -> dict[str, Any]:
     try:
         with SecurityOAuthClient(base_url=security_url, client_id=client_id, client_secret=client_secret) as oauth:
             token = oauth.get_service_token(audience=_DI_AUDIENCE)
-        response = httpx.get(f"{di_url}/v1/platform/health", params={"hours": hours},
+        response = httpx.get(f"{di_url}{path}", params=params,
                              headers={"Authorization": f"Bearer {token}"}, timeout=_TIMEOUT_SECONDS)
     except httpx.HTTPError as exc:
-        logger.warning("di_platform_health_failed", error_type=type(exc).__name__)
+        logger.warning("di_platform_health_failed", path=path, error_type=type(exc).__name__)
         raise DiHealthUnavailable(f"Document Intelligence did not answer ({type(exc).__name__}).") from exc
     except Exception as exc:
-        logger.warning("di_platform_health_failed", error_type=type(exc).__name__)
+        logger.warning("di_platform_health_failed", path=path, error_type=type(exc).__name__)
         raise DiHealthUnavailable(f"No service token for Document Intelligence ({type(exc).__name__}).") from exc
     if response.status_code != 200:
-        logger.warning("di_platform_health_failed", status_code=response.status_code)
+        logger.warning("di_platform_health_failed", path=path, status_code=response.status_code)
         raise DiHealthUnavailable(f"Document Intelligence answered HTTP {response.status_code}.")
     payload = response.json()
-    if isinstance(payload, dict) and "boots" not in payload and isinstance(payload.get("data"), dict):
+    if isinstance(payload, dict) and marker not in payload and isinstance(payload.get("data"), dict):
         payload = payload["data"]
     if not isinstance(payload, dict):
+        raise DiHealthUnavailable("Document Intelligence answered in an unexpected shape.")
+    return payload
+
+
+def fetch_di_health(hours: int) -> dict[str, Any]:
+    return _di_get("/v1/platform/health", {"hours": hours}, marker="boots")
+
+
+def fetch_di_ai_usage(days: int, tz: str) -> dict[str, Any]:
+    """What DI's AI provider calls cost, per day, Project, kind of call and document
+    type (2026-11-16). A DI that does not have the route yet answers 404: shown as
+    unavailable, like any other failure."""
+    payload = _di_get("/v1/platform/ai-usage", {"days": days, "tz": tz}, marker="rows")
+    if not isinstance(payload.get("rows"), list):
         raise DiHealthUnavailable("Document Intelligence answered in an unexpected shape.")
     return payload
 
