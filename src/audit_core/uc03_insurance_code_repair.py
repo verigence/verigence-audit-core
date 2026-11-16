@@ -77,8 +77,10 @@ def affected_journeys(connection: Connection, tenant_id: str) -> list[dict[str, 
             if looks_like_phone_number(r["agent_intermediary_code"]) or looks_like_phone_number(r["misp_code"])]
 
 
-def insurance_pages(connection: Connection, tenant_id: str, journey: dict[str, Any]) -> list[dict[str, Any]]:
-    """The Journey's live insurance pages, with whether each may be read again."""
+def insurance_pages(connection: Connection, tenant_id: str, journey: dict[str, Any],
+                    types: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+    """The Journey's live insurance pages (or pages of ``types``), with whether
+    each may be read again."""
     from audit_core.uc03_p2_reviewer import page_stage_code, stage_is_reviewed
 
     journey_id = UUID(str(journey["journey_id"]))
@@ -93,7 +95,7 @@ def insurance_pages(connection: Connection, tenant_id: str, journey: dict[str, A
             ORDER BY q.di_document_id, q.created_at_utc DESC
             """
         ),
-        {"t": tenant_id, "j": journey_id, "types": list(_INSURANCE_TYPES)},
+        {"t": tenant_id, "j": journey_id, "types": list(types or _INSURANCE_TYPES)},
     ).mappings().all()
     items: list[dict[str, Any]] = []
     for page in pages:
