@@ -155,6 +155,31 @@ def test_a_submitted_task_waits_while_the_upload_is_still_being_read(journey):
     assert _task(journey, "control:PRICE_INVOICE_VS_LEDGER")["task_status"] == "RETURNED"
 
 
+def test_a_task_is_not_raised_while_the_pages_are_being_read(journey):
+    """Closing list item 8 (2026-11-16): raised on the first pages of an
+    upload and withdrawn minutes later when the rest were read. While pages
+    are being read the task waits, with a follow-up queued; then it is raised."""
+    from p2_support import add_batch_pages
+
+    add_batch_pages(journey, [(None, "EXTRACTING")])
+    assert _fail(journey, "PRICE_INVOICE_VS_LEDGER") == {"DEFERRED": 1}
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert connection.execute(text("SELECT count(*) FROM auditcore.p2_tasks WHERE tenant_id=:t"),
+                                  {"t": journey.tenant_id}).scalar_one() == 0
+        follow_up = connection.execute(text(
+            "SELECT count(*) FROM auditcore.p2_work_queue WHERE tenant_id=:t AND work_status='PENDING' "
+            "AND next_attempt_at_utc > now() + interval '5 minutes'"), {"t": journey.tenant_id}).scalar_one()
+        assert follow_up >= 2
+        connection.execute(text("UPDATE auditcore.p2_document_queue SET queue_status='READY' WHERE tenant_id=:t"),
+                           {"t": journey.tenant_id})
+    assert _fail(journey, "PRICE_INVOICE_VS_LEDGER") == {"RAISED": 1}
+
+
+def test_an_observation_raises_no_task(journey):
+    assert _fail(journey, "SELF_INSURANCE_DECLARED") == {"SUPPRESSED": 1}
+
+
 def test_tl_can_accept_an_exception_for_the_same_values_only(journey):
     _fail(journey, "PRICE_INVOICE_VS_LEDGER")
     task_id = _task(journey, "control:PRICE_INVOICE_VS_LEDGER")["task_id"]
