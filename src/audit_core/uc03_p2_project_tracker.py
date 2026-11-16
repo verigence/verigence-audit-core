@@ -18,7 +18,8 @@ to a PC" row, so the rows add up to the outlet):
 Gate pass (the gate register, uc03_p2_gate_pass; the same rules as My Tracker and the
 consolidated view)
     due             gate register days of the period up to today x outlets with a PC
-                    mapped (Sunday is off, Monday's covers it; satellites from 3 Nov 2026;
+                    mapped (every day, Sunday included from 15 Nov 2026; an earlier Sunday
+                    went with Monday; satellites from 3 Nov 2026;
                     never before the Project's Daily Gate Pass schedule started)
     onTime / late   registers on file, uploaded by / after their Daily Gate Pass task's due
                     time (23:59 IST of the next gate pass day); under the PC who uploaded
@@ -857,8 +858,8 @@ def build_project_tracker(
         "dealers": dealers,
         "satelliteRegistersFrom": SATELLITE_REGISTER_FROM.isoformat(),
         "notes": [
-            ("Gate pass: registers due are the gate register days of the period up to today (Sunday is off; "
-             "Monday's covers it) for every outlet with a PC mapped, from the day the Daily Gate Pass started "
+            ("Gate pass: registers due are the gate register days of the period up to today (every day, "
+             "Sunday included from 15 Nov 2026) for every outlet with a PC mapped, from the day the Daily Gate Pass started "
              "(satellite outlets from 3 Nov 2026). On time / late: uploaded by / after 23:59 of the next gate "
              "pass day, under the PC who uploaded it. Missing: none on file and that time has passed."),
             ("Gate pass counts are what the PCs entered; 'not notified' are deliveries the PC said were not "

@@ -61,6 +61,7 @@ from audit_core.task_manager import (
     gate_pass_day_label,
     gate_pass_due,
     previous_gate_pass_day,
+    sunday_is_off,
 )
 from audit_core.uc03_p2_access import authorize_p2
 from audit_core.uc03_p2_gate_pass import scope_outlets, vehicle_gate_pass_deliveries
@@ -117,9 +118,10 @@ SATELLITE_REGISTER_FROM = date(2026, 11, 3)
 
 
 def gate_register_days(start: date, end: date) -> list[date]:
-    """The gate register days in the period: every day but Sunday (Monday's covers it)."""
+    """The gate register days in the period: every day, Sunday included from 15 Nov 2026
+    (an earlier Sunday was off: Monday's covered it)."""
     return [start + timedelta(days=i) for i in range((end - start).days + 1)
-            if (start + timedelta(days=i)).isoweekday() != 7]
+            if not sunday_is_off(start + timedelta(days=i))]
 
 
 def gate_register(connection: Connection, tenant_id: str, outlets: list[dict[str, Any]], start: date, end: date,

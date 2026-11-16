@@ -447,6 +447,23 @@ def test_gate_pass_days_sunday_is_off():
     assert tm.gate_pass_due(saturday) == _at(monday, 23, 59) + timedelta(seconds=59)
 
 
+def test_every_day_has_its_own_gate_register_from_15_november():
+    """Product owner 2026-11-16: one register per day, Sunday included; the weeks
+    before keep Sunday with Monday."""
+    saturday, sunday, monday = date(2026, 11, 14), date(2026, 11, 15), date(2026, 11, 16)
+    assert not tm.sunday_is_off(sunday) and tm.sunday_is_off(date(2026, 11, 8))
+    assert tm.next_gate_pass_day(saturday) == sunday and tm.previous_gate_pass_day(monday) == sunday
+    assert tm.gate_pass_covers(sunday) == [sunday] and tm.gate_pass_covers(monday) == [monday]
+    assert tm.gate_pass_day_label(sunday) == "Sun 15 Nov" and tm.gate_pass_day_label(monday) == "Mon 16 Nov"
+    assert tm.gate_pass_due(saturday) == _at(sunday, 23, 59) + timedelta(seconds=59)
+    assert tm.gate_pass_due(sunday) == _at(monday, 23, 59) + timedelta(seconds=59)
+    # The Daily Gate Pass task is raised on Sundays from then; other daily tasks still never are.
+    gate = _schedule(system_kind=tm.GATE_PASS_SYSTEM_KIND)
+    assert tm.occurs_on(gate, date(2026, 11, 22)) and not tm.occurs_on(gate, date(2026, 11, 8))
+    assert tm.occurs_on(gate, monday)
+    assert not tm.occurs_on(_schedule(weekdays=[1, 2, 3, 4, 5, 6, 7]), date(2026, 11, 22))
+
+
 def test_monday_gate_pass_task_names_both_days(project):
     p = project
     with _db(p) as c:

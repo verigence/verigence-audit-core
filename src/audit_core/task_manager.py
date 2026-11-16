@@ -13,7 +13,8 @@ apart from the Journey task lifecycle (uc03_p2_tasks), which is untouched:
   the Executive when the Project has no PM). No daily occurrence on a Sunday;
   a weekly or monthly one that falls on a Sunday moves to the Monday. An
   occurrence still open when the next is generated is marked Missed.
-- the Daily Gate Pass task: one per outlet with an active PC and working day,
+- the Daily Gate Pass task: one per outlet with an active PC and day (Sunday
+  too, from SUNDAY_GATE_REGISTER_FROM),
   closed by the system when that outlet's gate pass of the day is finished,
   incomplete when it is not finished by 23:59 IST the next day.
 
@@ -1065,6 +1066,9 @@ def occurs_on(schedule: dict[str, Any], day: date) -> bool:
     weekday = day.isoweekday()
     days = {int(d) for d in schedule["weekdays"] or []}
     frequency = schedule["frequency"]
+    if schedule.get("system_kind") == GATE_PASS_SYSTEM_KIND:
+        # Every day has its own gate register, Sunday included, from SUNDAY_GATE_REGISTER_FROM.
+        return weekday != 7 or not sunday_is_off(day)
     if frequency == "DAILY":
         return weekday != 7 and weekday in days
     if frequency == "WEEKLY":
@@ -1078,29 +1082,39 @@ def occurs_on(schedule: dict[str, Any], day: date) -> bool:
 
 
 # --------------------------------------------------------------------------- gate pass days
-# Sunday is the off day (product owner 2026-10-27): there is no gate pass of
-# Sunday; Monday's gate pass covers Sunday and Monday, one photo for both, and
-# the day after a Saturday is Monday.
+# One gate register per day, Sunday included (product owner 2026-11-16): the
+# Monday register is often ready only on Monday evening or Tuesday morning, and
+# Sunday's could not be uploaded on its own. Until then Sunday was the off day
+# (2026-10-27): no gate pass of Sunday, Monday's covered Sunday and Monday, and
+# the day after a Saturday was Monday. The registers of those weeks keep it.
+SUNDAY_GATE_REGISTER_FROM = date(2026, 11, 15)
+
+
+def sunday_is_off(day: date) -> bool:
+    """A Sunday before SUNDAY_GATE_REGISTER_FROM: no register of its own, Monday's covers it."""
+    return day.isoweekday() == 7 and day < SUNDAY_GATE_REGISTER_FROM
 
 
 def previous_gate_pass_day(day: date) -> date:
     before = day - timedelta(days=1)
-    return before - timedelta(days=1) if before.isoweekday() == 7 else before
+    return before - timedelta(days=1) if sunday_is_off(before) else before
 
 
 def next_gate_pass_day(day: date) -> date:
     after = day + timedelta(days=1)
-    return after + timedelta(days=1) if after.isoweekday() == 7 else after
+    return after + timedelta(days=1) if sunday_is_off(after) else after
 
 
 def gate_pass_covers(day: date) -> list[date]:
-    """The days a gate pass of ``day`` covers: Monday's covers Sunday too."""
-    return [day - timedelta(days=1), day] if day.isoweekday() == 1 else [day]
+    """The days a gate pass of ``day`` covers: the day itself; a Monday's covered
+    the Sunday before too while Sunday was off."""
+    before = day - timedelta(days=1)
+    return [before, day] if day.isoweekday() == 1 and sunday_is_off(before) else [day]
 
 
 def gate_pass_day_label(day: date) -> str:
-    """'Tue 27 Oct', or 'Sun 1 + Mon 2 Nov' for a Monday."""
-    if day.isoweekday() == 1:
+    """'Tue 27 Oct', or 'Sun 1 + Mon 2 Nov' for a Monday that covered Sunday."""
+    if len(gate_pass_covers(day)) > 1:
         sunday = day - timedelta(days=1)
         first = f"Sun {sunday.day}" + ("" if sunday.month == day.month else f" {sunday:%b}")
         return f"{first} + Mon {day.day} {day:%b}"
@@ -1185,7 +1199,7 @@ def generate_occurrence(connection: Connection, *, tenant_id: str, schedule: dic
             outlet_name = who['outlet']['outlet_name']
             title = f"Gate pass for {label}: {outlet_name}"
             covers = (f"{label} (Sunday is off, so one photo of the gate pass for both days, with the counts of "
-                      "both days together)" if day.isoweekday() == 1 else label)
+                      "both days together)" if len(gate_pass_covers(day)) > 1 else label)
             deadline = gate_pass_day_label(next_gate_pass_day(day)).split(" + ")[-1]
             description = (
                 f"Photograph the gate pass of {outlet_name} for {covers} and enter its counts on the Daily Gate "
@@ -1238,7 +1252,7 @@ def ensure_system_schedules(connection: Connection, *, tenant_id: str, now: date
               created_by_actor_id, created_by_role_code, created_by_display_name
             ) VALUES (
               :t, :kind, 'Daily gate pass', 'Photograph the outlet''s gate pass of the day and enter its counts.',
-              'DAILY_GATE_PASS', 'HIGH', 'DAILY', ARRAY[1,2,3,4,5,6]::smallint[], '07:00', 2340,
+              'DAILY_GATE_PASS', 'HIGH', 'DAILY', ARRAY[1,2,3,4,5,6,7]::smallint[], '07:00', 2340,
               'OUTLET_PCS', 'PC', :starts, 'SYSTEM', 'SYSTEM', 'System'
             )
             ON CONFLICT (tenant_id, system_kind) WHERE system_kind IS NOT NULL DO NOTHING

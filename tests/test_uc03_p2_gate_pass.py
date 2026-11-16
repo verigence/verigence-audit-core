@@ -71,7 +71,7 @@ def _window_on(monkeypatch, day: date) -> None:
 # summary, calendar and consolidated views leave it out, so tests that file a register for "today"
 # cannot run on a Sunday (CI on Sunday 8 Nov 2026: 18 failures). They run on every other day.
 not_on_sunday = pytest.mark.skipif(
-    gate_pass.ist_day().isoweekday() == 7,
+    gate_pass.sunday_is_off(gate_pass.ist_day().date()),
     reason="gate pass same-day test does not run on a Sunday (IST): Sunday has no register of its own",
 )
 
@@ -412,6 +412,28 @@ def test_sunday_goes_with_monday(setup, monkeypatch):
     _window_on(monkeypatch, date(2026, 11, 2))
     monday = _upload(s, day="2026-11-02").json()
     assert monday["coversDates"] == ["2026-11-01", "2026-11-02"]
+
+
+def test_sunday_has_its_own_register_from_15_november(setup, monkeypatch):
+    """Product owner 2026-11-16: one register per day, Sunday included. Monday's
+    register is often ready only on Monday evening or Tuesday morning, and Sunday's
+    could not be uploaded on its own."""
+    s = setup
+    _window_on(monkeypatch, date(2026, 11, 16))  # Monday morning
+    days = s.client.get(f"{s.base}/days", params={"outletId": str(s.journey.outlet_id)}).json()
+    dates = [d["date"] for d in days["days"]]
+    assert "2026-11-15" in dates and "2026-11-08" not in dates  # an earlier Sunday stays with its Monday
+    sunday = _upload(s, day="2026-11-15")
+    assert sunday.status_code == 201
+    assert sunday.json()["coversDates"] == ["2026-11-15"]
+    monday = _upload(s, day="2026-11-16").json()
+    assert monday["coversDates"] == ["2026-11-16"]
+    by_date = {d["date"]: d for d in s.client.get(
+        f"{s.base}/days", params={"outletId": str(s.journey.outlet_id)}).json()["days"]}
+    assert by_date["2026-11-15"]["label"] == "Sun 15 Nov" and by_date["2026-11-16"]["label"] == "Mon 16 Nov"
+    # On a Sunday, Sunday is today's gate pass day.
+    _window_on(monkeypatch, date(2026, 11, 22))
+    assert _upload(s, day="2026-11-22").status_code == 201
 
 
 def test_the_days_say_new_editable_or_locked(setup, monkeypatch):

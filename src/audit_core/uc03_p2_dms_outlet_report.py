@@ -37,7 +37,7 @@ Verigence      per outlet, from the 1st up to the last day the dealership's dump
                               register's "uploaded in tool"), and of those the Deal Type:
                               Inscope / Outscope / MR, Lease, Bulk / not yet typed
 Gate register  per outlet with a PC mapped, the gate register days of the delivery
-               period (Sunday's on Monday's):
+               period (a Sunday before 15 Nov 2026 on Monday's):
                on register (the gate out register's deliveries), not intimated (the
                dealership has not handed the file: pending with the client), pending with
                the PC (intimated, not in the tool), registers missed / counts pending.
@@ -250,7 +250,7 @@ def verigence_figures(connection: Connection, tenant_id: str, outlets: list[dict
                       booking_to: date, delivery_to: date, today: date) -> dict[str, dict[str, int]]:
     """Per Verigence outlet: bookings from the 1st to ``booking_to``; deliveries in the tool
     (with Deal Type) and the gate register from the 1st to ``delivery_to``."""
-    from audit_core.task_manager import gate_pass_covers
+    from audit_core.task_manager import gate_pass_covers, sunday_is_off
     from audit_core.uc03_p2_my_work import gate_register
 
     ids = [str(o["outlet_id"]) for o in outlets]
@@ -262,14 +262,14 @@ def verigence_figures(connection: Connection, tenant_id: str, outlets: list[dict
         out[str(r["outlet_id"])]["bookingInVerigence"] = int(r["n"])
         # no booking form date read: dated by the day the booking documents were uploaded
         out[str(r["outlet_id"])]["bookingDatedByUpload"] = int(r["by_upload"])
-    # A delivery on Sunday is Monday's gate register's; one after today has not happened
+    # A delivery on a Sunday that was off (before 15 Nov 2026) is Monday's register's; one after today has not happened
     # (a misread gate pass date), as vehicle_gate_pass_deliveries counts them.
     seen: set[str] = set()
     for r in connection.execute(
         text(_DELIVERIES_SQL),
         {"t": tenant_id, "ids": ids, "a": gate_pass_covers(first)[0], "dd": min(delivery_to, today)},
     ).mappings():
-        shifted = r["day"] + timedelta(days=1) if r["day"].isoweekday() == 7 else r["day"]
+        shifted = r["day"] + timedelta(days=1) if sunday_is_off(r["day"]) else r["day"]
         jid = str(r["journey_id"])
         if not first <= shifted <= delivery_to or jid in seen:
             continue
