@@ -74,8 +74,41 @@ def _misread_once(left: list[str], right: list[str]) -> bool:
             and _one_letter_apart(*different[0]))
 
 
+# Short forms Odisha documents print for the same word (2026-11-16, 199 open
+# "customer name differs" tasks: "Sanjip ku sahoo" / SANJIB KUMAR SAHOO,
+# "Girish ch. Biswal" / GIRISH CHANDRA BISWAL, "MD MUMTAZ" / MOHAMMAD MUMTAZ).
+# KU first is the honorific Kumari ("Ku. Priya"); anywhere else it is Kumar.
+_SHORT_FORMS = {
+    "KU": "KUMAR", "KR": "KUMAR", "KL": "KUMAR", "KMR": "KUMAR", "KUM": "KUMAR",
+    "CH": "CHANDRA", "CHD": "CHANDRA", "CHANDR": "CHANDRA", "CHNDRA": "CHANDRA",
+    "MD": "MOHAMMAD", "MOHD": "MOHAMMAD", "MOHAMMED": "MOHAMMAD", "MOHAMED": "MOHAMMAD",
+    "MAHAMMED": "MOHAMMAD", "MUHAMMAD": "MOHAMMAD", "MAHAMMAD": "MOHAMMAD", "MOHAMAD": "MOHAMMAD",
+    "PD": "PRASAD", "PRASD": "PRASAD",
+}
+
+
 def person_tokens(value: Any) -> list[str]:
-    return _tokens(value, drop=_HONORIFICS)
+    raw = _tokens(value, drop=_HONORIFICS - {"KU"})
+    if raw and raw[0] == "KU":
+        raw = raw[1:]
+    return [_SHORT_FORMS.get(t, t) for t in raw]
+
+
+_DIGRAPHS = (("BH", "B"), ("PH", "F"), ("SH", "S"), ("TH", "T"), ("DH", "D"), ("KH", "K"), ("GH", "G"),
+             ("JH", "J"), ("CHH", "C"), ("CH", "C"), ("OO", "U"), ("EE", "I"), ("AA", "A"), ("RU", "RI"))
+
+
+def sound_key(word: str) -> str:
+    """How a name word sounds, as Odia names are spelt in English: Sahu and
+    Sahoo, Dilip and Dillip, Choudhury and Chhoudhury, Prabhat and Pravat,
+    Behera and Bihera are one word (2026-11-16). Aspirates and doubled letters
+    go, V and W are B, Y is I, a word's closing A goes."""
+    key = re.sub(r"[^A-Z]", "", str(word).upper())
+    for pair, single in _DIGRAPHS:
+        key = key.replace(pair, single)
+    key = key.replace("V", "B").replace("W", "B").replace("Y", "I").replace("Z", "J")
+    key = re.sub(r"(.)\1+", r"\1", key)
+    return key[:-1] if len(key) > 3 and key.endswith("A") else key
 
 
 def org_tokens(value: Any) -> list[str]:
@@ -99,6 +132,9 @@ def _tokens_match(left: list[str], right: list[str]) -> bool:
     whole = 0
     for token in shorter:
         hit = next((t for t in unused if t == token), None)
+        if hit is None and len(token) > 2:
+            # The same word spelt as it sounds (Sahu / Sahoo), 2026-11-16.
+            hit = next((t for t in unused if len(t) > 2 and sound_key(t) == sound_key(token)), None)
         if hit is None:
             hit = next((t for t in unused if _initial_matches(token, t) or _initial_matches(t, token)), None)
         else:
@@ -114,6 +150,20 @@ def _close_enough(left: list[str], right: list[str]) -> bool:
     return bool(a and b) and SequenceMatcher(None, a, b).ratio() >= _SAME_RATIO
 
 
+_SOUND_RATIO = 0.92
+_SOUND_MIN = 10
+
+
+def _sounds_alike(left: list[str], right: list[str]) -> bool:
+    """The whole names, written together and spelt as they sound, the same or
+    one letter apart on a long name (Tusharkant Mohanty / Tusar Kanta Mohanty)."""
+    for x, y in ((left, right), (sorted(left), sorted(right))):
+        a, b = sound_key("".join(x)), sound_key("".join(y))
+        if a == b or (min(len(a), len(b)) >= _SOUND_MIN and SequenceMatcher(None, a, b).ratio() >= _SOUND_RATIO):
+            return True
+    return False
+
+
 def same_person(left: Any, right: Any) -> bool:
     """Whether two printed names are the same customer.
 
@@ -125,6 +175,8 @@ def same_person(left: Any, right: Any) -> bool:
         return True
     if a and b and "".join(a) == "".join(b):
         return True
+    if a and b and _sounds_alike(a, b):
+        return True  # one word written as two, spelt as it sounds (Soumyaranjan / Saumya Ranjan)
     if _is_company(left) or _is_company(right):
         return same_organisation(left, right)
     return False
