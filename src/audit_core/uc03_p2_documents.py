@@ -19,7 +19,7 @@ from sqlalchemy import Connection, Engine, text
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import get_connection, get_engine, get_human_principal
 from audit_core.di_client import DiClient, DiClientError
-from audit_core.errors import DependencyUnavailableError
+from audit_core.errors import DependencyUnavailableError, DocumentReplacedError
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
     SecurityAuthorizationClient,
@@ -67,6 +67,65 @@ _UPDATE_PERMISSION = "audit.journey.update"
 # A Team Lead's bundle carries audit.work.update, not audit.journey.update: a
 # field confirmation or correction by a TL was refused VAC-AUTH-002 (2026-10-30).
 _FIELD_UPDATE_PERMISSIONS = (_UPDATE_PERMISSION, "audit.work.update")
+
+
+def current_copy_of(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, document_id: UUID,
+) -> str | None:
+    """The copy in use of a document that was replaced on this Journey, or
+    None. A page read on its own and then read again with the pages around it
+    is merged into the grouped copy (p2_document_queue.merged_into_queue_id),
+    and its own copy is superseded and removed from Document Intelligence: a
+    link to it (a task, a bookmark) must land on the grouped copy, not on
+    "Document was not found" (UTK-SA-261103-044, 2026-11-16). Failing a merge,
+    a replaced single copy leads to the one copy of its type still in use;
+    when several are in use (receipts, Aadhaar sides) nothing is guessed."""
+    row = connection.execute(
+        text(
+            """
+            WITH RECURSIVE chain AS (
+                SELECT q.queue_id, q.merged_into_queue_id, q.di_document_id, q.queue_status, 0 AS depth
+                FROM auditcore.p2_document_queue q
+                WHERE q.tenant_id=:t AND q.journey_id=:j AND q.di_document_id=:d
+                UNION ALL
+                SELECT n.queue_id, n.merged_into_queue_id, n.di_document_id, n.queue_status, c.depth + 1
+                FROM chain c
+                JOIN auditcore.p2_document_queue n
+                  ON n.tenant_id=:t AND n.journey_id=:j AND n.queue_id=c.merged_into_queue_id
+                WHERE c.depth < 10
+            )
+            SELECT c.di_document_id
+            FROM chain c
+            JOIN auditcore.document_capture_v2_documents d
+              ON d.tenant_id=:t AND d.journey_id=:j AND d.di_document_id=c.di_document_id
+             AND d.capture_status <> 'SUPERSEDED'
+            WHERE c.depth > 0 AND c.queue_status <> 'MERGED'
+            ORDER BY c.depth DESC
+            LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "d": document_id},
+    ).scalar_one_or_none()
+    if row is not None:
+        return str(row)
+    active = connection.execute(
+        text(
+            """
+            SELECT a.di_document_id
+            FROM auditcore.evidence old
+            JOIN auditcore.evidence a
+              ON a.tenant_id=old.tenant_id AND a.journey_id=old.journey_id
+             AND a.document_type_key=old.document_type_key
+             AND a.process_area IS NOT DISTINCT FROM old.process_area
+             AND a.association_status='ACTIVE'
+            WHERE old.tenant_id=:t AND old.journey_id=:j AND old.di_document_id=:d
+              AND old.association_status='SUPERSEDED'
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "d": document_id},
+    ).scalars().all()
+    distinct = {str(value) for value in active if value is not None}
+    return distinct.pop() if len(distinct) == 1 else None
 
 
 def _document_context(
@@ -137,6 +196,10 @@ def _document_context(
             },
         ).mappings().one_or_none()
         if legacy is None:
+            current = current_copy_of(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                      document_id=document_id)
+            if current is not None:
+                raise DocumentReplacedError(current_document_id=current)
             raise HTTPException(status_code=404, detail="Document was not found.")
         return {
             "di_document_id": legacy["di_document_id"],

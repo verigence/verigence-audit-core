@@ -224,6 +224,23 @@ def describe_failure(
     return title, description, reference
 
 
+_DOCUMENT_POINTER_KEYS = ("documentId", "documentIds", "referenceDocumentId")
+
+
+def document_pointers(reference: dict[str, Any] | None) -> dict[str, Any]:
+    """The documents a task's reference opens -- what the task links to, as
+    opposed to the issue it is about (``_issue_hash``)."""
+    reference = reference or {}
+    pointers: dict[str, Any] = {}
+    for key in _DOCUMENT_POINTER_KEYS:
+        value = reference.get(key)
+        if isinstance(value, list):
+            pointers[key] = sorted(str(item) for item in value)
+        elif value is not None:
+            pointers[key] = str(value)
+    return pointers
+
+
 def _issue_hash(reference: dict[str, Any]) -> str:
     material = {k: reference.get(k) for k in ("sourceCode", "leftValue", "rightValue", "fields", "findingTitle")}
     return hashlib.sha256(_json(material).encode()).hexdigest()[:24]
@@ -504,6 +521,13 @@ def raise_or_refresh(
         or existing["title"] != title[:300]
         or existing["description"] != description
         or (existing["reference"] or {}).get("issueHash") != reference["issueHash"]
+        # The document a task opens is not part of the issue (it stays the
+        # same issue, so an accepted exception still holds), but the task must
+        # follow it: pages read one by one and then read again as one document
+        # are replaced by the grouped copy, and a task left on the page copy
+        # opened "Document was not found" (UTK-SA-261103-044, 2026-11-16: 50
+        # open tasks on Mahindra Orissa pointed at replaced copies).
+        or document_pointers(existing["reference"]) != document_pointers(reference)
     )
     if outcome == "UNCHANGED" and not content_changed:
         return task_id, "UNCHANGED"

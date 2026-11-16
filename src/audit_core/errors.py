@@ -105,6 +105,20 @@ class NotFoundError(AuditCoreError):
         super().__init__(error_code, 404, title, detail)
 
 
+class DocumentReplacedError(NotFoundError):
+    """A link to a copy of a document that was replaced on its Journey. The
+    problem carries ``currentDocumentId`` so the client opens the copy in use
+    instead of stopping at "not found" (2026-11-16)."""
+
+    def __init__(self, *, current_document_id: str) -> None:
+        super().__init__(
+            error_code="VAC-NF-034",
+            title="Document replaced",
+            detail="This copy was replaced by a newer reading of the same document. Open the current copy.",
+        )
+        self.extensions = {"currentDocumentId": current_document_id}
+
+
 class ConflictError(AuditCoreError):
     def __init__(self, *, error_code: str, title: str, detail: str) -> None:
         super().__init__(error_code, 409, title, detail)
@@ -399,6 +413,7 @@ def install_error_handlers(app: FastAPI) -> None:
             title=exc.title,
             detail=exc.detail,
             exc=exc,
+            extensions=getattr(exc, "extensions", None),
         )
 
     @app.exception_handler(DiClientError)
