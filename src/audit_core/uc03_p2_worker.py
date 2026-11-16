@@ -5319,6 +5319,8 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         "JOURNEY_CLASSIFICATION": ("audit_core.uc03_p2_journey_classification", "run_journey_classification"),
         "INSURANCE_HYPOTHECATION_REREAD": ("audit_core.uc03_insurance_hypothecation_reread",
                                            "run_insurance_hypothecation_reread"),
+        # Gate passes read again for the chassis number (gate_pass 1.1, 2026-11-16).
+        "GATE_PASS_CHASSIS_REREAD": ("audit_core.uc03_gate_pass_chassis_reread", "run_gate_pass_chassis_reread"),
         "WAITING_CORRECTIONS": ("audit_core.uc03_waiting_corrections", "run_waiting_corrections"),
         # The TL's information task for Reviewer corrections made before it existed (2026-11-04).
         "REVIEWER_CORRECTIONS_BACKFILL": ("audit_core.uc03_reviewer_corrections_task",
