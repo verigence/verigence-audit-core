@@ -303,6 +303,18 @@ BOOKING_FORM_TASK_RESULT = {
 }
 
 
+# Observations raise no task (closing list item 8, 2026-11-16; check catalogue
+# of 15 Nov): the check still runs and its result stays on the ledger and the
+# journey, but nobody is asked to act. A customer insuring the vehicle himself
+# is his choice (9 of 10 decided tasks were false positives); a payment inside
+# the grace period is within the rule.
+INFORMATIONAL_TASK_CODES = frozenset({"SELF_INSURANCE_DECLARED", "PAYMENT_AFTER_DELIVERY_WITHIN_GRACE"})
+INFORMATIONAL_TASK_RESULT = {
+    "outcome": "INFORMATIONAL",
+    "reason": "An observation: recorded on the journey, raises no task (closing list item 8, 2026-11-16)",
+}
+
+
 def about_the_booking_form(source_code: str | None, reference: dict[str, Any] | None) -> bool:
     """Whether a task is one of the booking form's retired tasks: a check of
     the booking form against another document, or a wrong customer / dealer
@@ -345,6 +357,48 @@ def cancel_suppressed_task(connection: Connection, *, tenant_id: str, journey_id
     return task_id
 
 
+# Raise only once the reading settles (closing list item 8, 2026-11-16). Live
+# 7-15 Nov: 48% of the field-review tasks, a third of the booking date and SKU
+# price tasks and 42% of the deal type questions were withdrawn by the system,
+# a median 0-3 minutes after they were raised -- raised on the first pages of
+# an upload, withdrawn when the next ones were read. While the Journey's pages
+# are still being read, a check's task is not raised or reopened: the
+# evaluation after the reading raises it (a follow-up is queued in case
+# nothing else asks for one). A page left "being read" for hours does not
+# hold the Journey's tasks back.
+SETTLE_SOURCE_TYPES = frozenset({"RULE", "DOCUMENT_FIELD", "RESOLVER", "EVIDENCE"})
+# Tasks a person's action raises (a Reviewer's corrections, their re-check) are
+# raised at once, reading or not.
+SETTLE_EXEMPT_CODES = frozenset({"REVIEWER_CORRECTIONS_INFO", "CORRECTIONS_RECHECK"})
+_SETTLE_FOLLOW_UP_SECONDS = 600
+_SETTLE_STALE_HOURS = 2
+
+
+def reading_in_progress(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """Pages of the Journey being read now (not a page stuck for hours)."""
+    from audit_core.uc03_p2_journey_views import _IN_FLIGHT
+
+    return bool(connection.execute(
+        text("SELECT EXISTS (SELECT 1 FROM auditcore.p2_document_queue WHERE tenant_id=:t AND journey_id=:j "
+             "AND queue_status = ANY(:statuses) AND retired_at_utc IS NULL "
+             "AND updated_at_utc > now() - make_interval(hours => :stale))"),
+        {"t": tenant_id, "j": journey_id, "statuses": list(_IN_FLIGHT), "stale": _SETTLE_STALE_HOURS},
+    ).scalar_one())
+
+
+def _follow_up_when_settled(connection: Connection, *, tenant_id: str, journey_id: UUID) -> None:
+    """A recompute and a forced run of the checks after the reading, so a task
+    held back is raised even if no later change asks for it."""
+    from audit_core.uc03_p2_controls import request_control_evaluation
+    from audit_core.uc03_p2_runtime import enqueue_work
+
+    enqueue_work(connection, tenant_id=tenant_id, journey_id=journey_id, work_type="STAGE_RECOMPUTE",
+                 work_key=f"booking:{journey_id}", payload={}, correlation_id=None,
+                 delay_seconds=_SETTLE_FOLLOW_UP_SECONDS)
+    request_control_evaluation(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               delay_seconds=_SETTLE_FOLLOW_UP_SECONDS, force=True)
+
+
 def raise_or_refresh(
     connection: Connection,
     *,
@@ -370,11 +424,22 @@ def raise_or_refresh(
     if about_the_booking_form(source_code, reference):
         return cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
                                       dedupe_key=dedupe_key, result=BOOKING_FORM_TASK_RESULT), "SUPPRESSED"
+    if source_code in INFORMATIONAL_TASK_CODES:
+        return cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                      dedupe_key=dedupe_key, result=INFORMATIONAL_TASK_RESULT), "SUPPRESSED"
     template = registry.tasks[task_type]
     priority = _PRIORITY_BY_SEVERITY.get(severity, "NORMAL")
     reference = {**reference, "issueHash": _issue_hash(reference)}
     existing = _existing(connection, tenant_id=tenant_id, dedupe_key=dedupe_key)
     now = datetime.now(UTC)
+    would_raise = existing is None or (
+        str(existing["task_status"]) == "VERIFIED_COMPLETE"
+        and not (existing["completion_result"] or {}).get("verdict")
+        and (existing["completion_result"] or {}).get("acceptedIssueHash") != reference["issueHash"])
+    if (would_raise and source_type in SETTLE_SOURCE_TYPES and source_code not in SETTLE_EXEMPT_CODES
+            and reading_in_progress(connection, tenant_id=tenant_id, journey_id=journey_id)):
+        _follow_up_when_settled(connection, tenant_id=tenant_id, journey_id=journey_id)
+        return (UUID(str(existing["task_id"])) if existing else None), "DEFERRED"
 
     if existing is None:
         task_id = connection.execute(
@@ -615,6 +680,12 @@ def apply_control_transitions(
             # The booking form raises no tasks (product owner, 2026-11-15).
             cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
                                    result=BOOKING_FORM_TASK_RESULT)
+            counts["SUPPRESSED"] = counts.get("SUPPRESSED", 0) + 1
+            continue
+        if control.code in INFORMATIONAL_TASK_CODES:
+            # An observation raises no task (closing list item 8, 2026-11-16).
+            cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                                   result=INFORMATIONAL_TASK_RESULT)
             counts["SUPPRESSED"] = counts.get("SUPPRESSED", 0) + 1
             continue
         if control.code in OWN_TASK_CODES:
