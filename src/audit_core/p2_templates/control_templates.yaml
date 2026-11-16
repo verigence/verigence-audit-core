@@ -1429,6 +1429,26 @@ controls:
     task:
       type: PC_CONFIRMATION
       owner: PC
+  # Product owner 2026-11-16: money the NDC shows received with no payment
+  # receipt on file raises a PC task; the loan line raises none (a system
+  # remark instead) (uc03_p2_audit_rules.payment_receipt_missing).
+  PAYMENT_RECEIPT_MISSING:
+    executor: NATIVE
+    mode: RERUN
+    phases:
+    - BOOKING
+    - DELIVERY
+    category: Payments & Reconciliation
+    triggers:
+    - DOCUMENT_SYNCED
+    rerun: RERUNNABLE
+    finding_class: DATA_GAP
+    severity: MEDIUM
+    owner: PC
+    resolution: SELF_SERVICE
+    task:
+      type: PC_CONFIRMATION
+      owner: PC
   SELF_INSURANCE_DECLARED:
     executor: NATIVE
     mode: RERUN

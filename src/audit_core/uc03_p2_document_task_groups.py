@@ -100,6 +100,8 @@ DOCUMENT_CATEGORY_BY_RULE: dict[str, str] = {
     # The vehicle is invoiced and no insurance cover note is on file: upload
     # it (or answer that the customer arranged their own insurance).
     "INSURANCE_INVOICE_MISSING": "MISSING_DOCUMENT",
+    # Money the NDC shows received with no payment receipt on file.
+    "PAYMENT_RECEIPT_MISSING": "MISSING_DOCUMENT",
     # External rule engine checks for a document not on file (raised as
     # RULE_DISCREPANCY_REVIEW).
     "INVOICE_MISSING": "MISSING_DOCUMENT",

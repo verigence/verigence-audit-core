@@ -1555,6 +1555,40 @@ def self_insurance_declared(facts: _Facts) -> RuleOutcome:
     return RuleOutcome(code, "PASS", "Insurance is through the dealership.")
 
 
+def _posting_line(posting: dict[str, Any]) -> str:
+    number = f"{posting['number']} " if posting.get("number") else ""
+    return f"{number}{_rupees(posting['amount'])} on {_when(posting.get('date'))}"
+
+
+def payment_receipt_missing(facts: _Facts) -> RuleOutcome:
+    """Money the NDC (or the customer ledger) shows received with no payment
+    receipt on file (product owner 2026-11-16): the PC uploads the receipt.
+
+    The loan is not asked for: a line equal to the loan figure known for the
+    booking (finance record, NDC financier row, delivery order or bank letter)
+    or the financier's journal credit raises no task -- the system remark says
+    the loan was received as per the NDC with no payment receipt on file."""
+    from audit_core.uc03_ledger_receipts import ledger_receipts
+
+    code = "PAYMENT_RECEIPT_MISSING"
+    postings = ledger_receipts(facts.connection, tenant_id=facts.tenant_id, journey_id=facts.journey_id)
+    if not postings:
+        return RuleOutcome(code, "PASS", "Every payment the NDC shows received has its receipt on file "
+                                         "(the loan apart).")
+    total = sum((Decimal(p["amount"]) for p in postings), Decimal(0))
+    where = "NDC" if all(str(p.get("documentLabel") or "").startswith("NDC") for p in postings) else \
+        "NDC / customer ledger"
+    return RuleOutcome(code, "FAIL", (
+        f"The {where} shows {len(postings)} payment(s) received with no payment receipt on file "
+        f"({_rupees(total)}): " + "; ".join(_posting_line(p) for p in postings)
+        + ". Upload the payment receipt(s)."
+    ), {"findingTitle": "Payment receipt missing",
+        "postings": [{"number": p.get("number"), "amount": str(p["amount"]),
+                      "date": p["date"].isoformat() if hasattr(p.get("date"), "isoformat") else p.get("date"),
+                      "documentId": p.get("documentId"), "document": p.get("documentLabel")}
+                     for p in postings]})
+
+
 # Journey-wide checks run with the Booking unit (always evaluated); checks
 # that need a delivery run with the Delivery unit.
 from audit_core import (
@@ -1569,6 +1603,7 @@ _BOOKING_RULES = (
     # intimation question, so neither it nor its finding runs.
     cash_above_limit, payment_before_booking,
     insurance_invoice_missing, self_insurance_declared,
+    payment_receipt_missing,
 )
 _DELIVERY_RULES = (
     delivered_on_short_payment, receipts_equal_invoices, payment_after_delivery_within_grace, payment_after_delivery_beyond_grace,

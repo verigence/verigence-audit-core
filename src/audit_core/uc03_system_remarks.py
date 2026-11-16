@@ -118,10 +118,29 @@ def _closure_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID
     return remarks
 
 
+def _loan_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """The loan the NDC shows received with no payment receipt on file: no
+    task asks for its receipt, the remark says so (product owner 2026-11-16)."""
+    from audit_core.uc03_ledger_receipts import loan_without_receipt
+    from audit_core.uc03_p2_audit_rules import _rupees, _when
+
+    remarks: list[dict[str, Any]] = []
+    for posting in loan_without_receipt(connection, tenant_id=tenant_id, journey_id=journey_id):
+        where = "the NDC" if posting.get("documentLabel") == "NDC" else "the customer ledger"
+        number = f" ({posting['number']})" if posting.get("number") else ""
+        remarks.append(_remark(
+            "LOAN_WITHOUT_RECEIPT", "Loan received, no payment receipt",
+            f"Loan amount of {_rupees(posting['amount'])} received as per {where}{number} on "
+            f"{_when(posting.get('date'))}; no payment receipt available. No task is raised for it.",
+            "NDC" if where == "the NDC" else "Customer ledger"))
+    return remarks
+
+
 def system_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     remarks = [
         *_deal_remarks(connection, tenant_id=tenant_id, journey_id=journey_id),
         *_bh_remark(connection, tenant_id=tenant_id, journey_id=journey_id),
         *_closure_remarks(connection, tenant_id=tenant_id, journey_id=journey_id),
+        *_loan_remarks(connection, tenant_id=tenant_id, journey_id=journey_id),
     ]
     return {"remarks": remarks, "count": len(remarks)}
