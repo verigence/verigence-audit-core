@@ -3752,6 +3752,10 @@ def _control_evaluate(engine: Engine, work: WorkItem) -> None:
         )
         if transitions:
             on_control_transitions(engine, work=work, transitions=transitions, started_at=started_at)
+        # Findings and tasks agree with the checks' results (2026-11-16).
+        from audit_core.uc03_finding_invariants import enforce_after_evaluation
+
+        enforce_after_evaluation(engine, tenant_id=work.tenant_id, journey_id=work.journey_id)
         return
     # Items that name a single control -- queued before the ledger existed, and
     # by auditcore.p2_requeue_verifying_controls on every fact change for each
@@ -5321,6 +5325,8 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
                                           "run_reviewer_corrections_backfill"),
         # Cash transactions raise no tasks (product owner, 2026-10-31).
         "CASH_TASK_CLEANUP": ("audit_core.uc03_cash_task_cleanup", "run_cash_task_cleanup"),
+        # Findings follow their checks; every open finding has one task (2026-11-16).
+        "FINDING_INVARIANTS": ("audit_core.uc03_finding_invariants", "run_finding_invariants"),
         # The booking form raises no tasks (product owner, 2026-11-15).
         "BOOKING_FORM_TASK_CLEANUP": ("audit_core.uc03_booking_form_task_cleanup",
                                       "run_booking_form_task_cleanup"),
