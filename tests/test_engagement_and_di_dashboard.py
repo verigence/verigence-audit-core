@@ -214,7 +214,7 @@ def test_the_day_in_blocks_and_the_longest_stretch_with_no_output():
     assert a["longestNoOutput"]["minutes"] == 60 and a["longestNoOutput"]["from"] == "10:00"
     assert a["longestNoOutput"]["to"] == "11:00" and a["longestNoOutput"]["endsWithOutput"] is True
     assert [b["state"] for b in a["blocks"]] == ["WORKING", "ACTIVE_NO_OUTPUT", "ACTIVE_NO_OUTPUT", "WORKING"]
-    assert a["blockCounts"] == {"WORKING": 2, "ACTIVE_NO_OUTPUT": 2, "IDLE": 0, "AWAY": 0}
+    assert a["blockCounts"] == {"WORKING": 2, "CLICKING_AROUND": 0, "ACTIVE_NO_OUTPUT": 2, "IDLE": 0, "AWAY": 0}
     assert a["scrollOnly"] == [{"from": "10:20", "to": "11:00", "minutes": 40}]
     assert day_analysis(None, []) is None
 
