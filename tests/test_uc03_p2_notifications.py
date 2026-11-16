@@ -9,7 +9,7 @@ from p2_support import add_batch_pages, create_p2_journey, database_engine
 from sqlalchemy import text
 
 from audit_core.db import set_tenant_context
-from audit_core.uc03_p2_notifications import document_status, messages_for, seen_at
+from audit_core.uc03_p2_notifications import messages_for, seen_at, upload_status
 
 
 @pytest.fixture
@@ -32,7 +32,7 @@ def _sql(journey, sql: str, **params):
 def _status(journey, actor=None):
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
-        return document_status(connection, tenant_id=journey.tenant_id, actor_id=actor or str(journey.actor_id))
+        return upload_status(connection, tenant_id=journey.tenant_id, actor_id=actor or str(journey.actor_id))
 
 
 def _messages(journey, actor=None):
@@ -59,19 +59,29 @@ def _not_split(journey, name="scan.pdf"):
          n=name, a=str(journey.actor_id))
 
 
-def test_a_file_never_split_and_failed_pages_are_in_the_status_with_no_time_window(journey):
-    """16 Nov: DOC-20261112-WA0021.pdf was never split into pages, so the PC was never alerted;
-    a failed page also dropped out of the alert after 24 hours."""
+def _bulk(journey, *, source="WEB", status="DONE", files=(("a.pdf", "AWAITING_UPLOAD", "FAILED"),), hours_ago=0):
+    bulk = _sql(journey, "INSERT INTO auditcore.p2_bulk_uploads (tenant_id, dealer_id, outlet_id, uploaded_by_actor_id, status, source, "
+                         "folder, updated_at_utc) SELECT j.tenant_id, j.dealer_id, j.outlet_id, :a, :s, :src, 'Folder 1', "
+                         "now() - make_interval(hours => :h) FROM auditcore.journeys j WHERE j.tenant_id=:t AND "
+                         "j.journey_id=:j RETURNING bulk_id", a=str(journey.actor_id), s=status, src=source, h=hours_ago).scalar_one()
+    for name, upload_status_, outcome in files:
+        _sql(journey, "INSERT INTO auditcore.p2_bulk_files (tenant_id, bulk_id, original_filename, content_type, object_key, upload_status, "
+                      "outcome, detail) VALUES (:t, :b, :n, 'application/pdf', :k, :u, :o, :d)",
+             b=bulk, n=name, k=f"k-{name}", u=upload_status_, o=outcome,
+             d="Not uploaded before submit" if outcome == "FAILED" else None)
+    return bulk
+
+
+def test_only_what_left_no_record_is_listed_not_pages_with_tasks(journey):
+    """Product owner 16 Nov: notify only files or journeys that did not get uploaded -- no record
+    created; failed pages and the rest already raise tasks."""
     add_batch_pages(journey, [("booking_form", "READY"), (None, "FAILED"), (None, "EXTRACTING")])
-    _sql(journey, "UPDATE auditcore.p2_document_queue SET updated_at_utc = now() - interval '3 days' "
-                  "WHERE tenant_id=:t AND journey_id=:j")
     _not_split(journey, "DOC-20261112-WA0021.pdf")
     status = _status(journey)
-    assert (status.beingRead, status.stuck, status.failedPages, status.filesNotRead) == (1, 1, 1, 1)
-    assert status.needsAction == 2
-    [line] = status.journeys
-    assert line.files == ["DOC-20261112-WA0021.pdf"]
-    assert _status(journey, actor="someone-else").journeys == []  # only what the person uploaded
+    assert (status.upload, status.bulk, status.drive, status.total) == (1, 0, 0, 1)
+    [item] = status.items
+    assert (item.source, item.name, item.reference is not None) == ("UPLOAD", "DOC-20261112-WA0021.pdf", True)
+    assert _status(journey, actor="someone-else").total == 0  # only what the person uploaded
 
 
 def test_a_file_uploaded_again_is_no_longer_waiting(journey):
@@ -80,20 +90,28 @@ def test_a_file_uploaded_again_is_no_longer_waiting(journey):
                   "content_type, size_bytes, page_count, original_object_key, batch_status, uploaded_by_actor_id, "
                   "created_at_utc) VALUES (:t, gen_random_uuid(), :j, 'scan.pdf', 'application/pdf', 100, 1, 'k2', "
                   "'COMPLETED', :a, now() + interval '1 minute')", a=str(journey.actor_id))
-    assert _status(journey).filesNotRead == 0
+    assert _status(journey).total == 0
 
 
-def test_an_open_upload_again_task_counts_until_it_is_closed(journey):
-    add_batch_pages(journey, [("booking_form", "READY")])
-    _sql(journey, "INSERT INTO auditcore.p2_tasks (tenant_id, journey_id, task_type, category, origin_kind, "
-                  "source_type, source_code, dedupe_key, title, description, reference, severity, priority, "
-                  "assigned_role_code, allowed_actions, completion_protocol, task_status) VALUES (:t, :j, "
-                  "'PC_PAGE_QUALITY_REJECTED', 'DOCUMENT_REUPLOAD', 'SYSTEM', 'DOCUMENT', 'DOCUMENT_QUALITY_REJECTED', "
-                  "'k1', 'Upload again', 'd', '{}'::jsonb, 'HIGH', 'HIGH', 'PC', '[]'::jsonb, 'MACHINE_VERIFIED', "
-                  "'READY')")
-    assert _status(journey).uploadTasks == 1
-    _sql(journey, "UPDATE auditcore.p2_tasks SET task_status='VERIFIED_COMPLETE' WHERE tenant_id=:t")
-    assert _status(journey).uploadTasks == 0
+def test_bulk_files_not_uploaded_and_a_bulk_never_submitted_are_listed(journey):
+    _bulk(journey, files=(("x.pdf", "AWAITING_UPLOAD", "FAILED"), ("y.pdf", "UPLOADED", "NEW_BOOKING")))
+    _bulk(journey, status="OPEN", hours_ago=5, files=(("p.pdf", "UPLOADED", "PENDING"), ("q.pdf", "AWAITING_UPLOAD", "PENDING")))
+    _bulk(journey, status="OPEN", hours_ago=0, files=(("r.pdf", "UPLOADED", "PENDING"),))  # still being worked on
+    _bulk(journey, source="DRIVE", files=(("drive.pdf", "AWAITING_UPLOAD", "FAILED"),))
+    status = _status(journey)
+    assert (status.bulk, status.drive) == (2, 1)
+    by_name = {i.name: i for i in status.items}
+    assert by_name["x.pdf"].reason == "Not uploaded before submit"
+    assert by_name["Folder 1"].reason.startswith("2 file(s) waiting")
+    assert by_name["drive.pdf"].source == "DRIVE"
+
+
+def test_a_drive_file_set_aside_is_listed_with_its_reason(journey):
+    _sql(journey, "INSERT INTO auditcore.p2_drive_files (tenant_id, drive_file_id, file_name, mime_type, pc_actor_id, "
+                  "file_status, detail) VALUES (:t, 'd1', 'photo.heic', 'image/heic', :a, 'SET_ASIDE', "
+                  "'Not a PDF or image')", a=str(journey.actor_id))
+    [item] = _status(journey).items
+    assert (item.source, item.name, item.reason) == ("DRIVE", "photo.heic", "Not a PDF or image")
 
 
 def test_messages_stay_after_they_expire_and_are_unread_until_the_bell_is_opened(journey):
