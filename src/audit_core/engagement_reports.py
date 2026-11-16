@@ -7,9 +7,17 @@ time on Verigence and sessions from the browser's own tally
 (``p2_user_activity_daily``), output from uploads and journeys, work from task
 events. Nothing here is a judgement; the efficacy figures are plain ratios so
 people can be compared on the same footing.
+
+Product owner, 16 Nov 2026: clicking tabs all day counts as active, so active time is
+split into productive minutes (output follows within the output window, 20 minutes by
+default) and active with no output; a 20-minute block with no output and more than N
+screen changes (10 by default) is "clicking around". Both numbers are SuperAdmin settings
+(activity_settings.engagement_settings) and these figures exist for days with minute
+detail only (from 28 Oct 2026).
 """
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import defaultdict
 from datetime import UTC, date, datetime, time, timedelta
 from itertools import pairwise
@@ -18,7 +26,12 @@ from typing import Any
 
 from sqlalchemy import Connection, text
 
-from audit_core.activity_settings import activity_rule_note, reading_window_minutes
+from audit_core.activity_settings import (
+    activity_rule_note,
+    engagement_rule_note,
+    engagement_settings,
+    reading_window_minutes,
+)
 from audit_core.people_employment import exit_dates, gone_on
 from audit_core.task_manager import (
     EXECUTIVE,
@@ -86,6 +99,10 @@ def _empty() -> dict[str, Any]:
         "journeyTasksWorked": 0, "taskActions": 0,
         "tasksAssigned": 0, "tasksCompleted": 0, "tasksCompletedOnTime": 0, "sendBacksReceived": 0,
         "reviewsDone": 0,
+        # Days with minute detail only (2026-11-16): active minutes there, how many were followed by
+        # output within the output window, and the blocks of clicking around.
+        "detailActiveMinutes": 0, "productiveMinutes": 0, "activeNoOutputMinutes": 0,
+        "clickingAroundBlocks": 0,
     }
 
 
@@ -146,6 +163,9 @@ def _finish(cell: dict[str, Any], *, work_days: int) -> dict[str, Any]:
         "onTimePct": (round(100 * cell["tasksCompletedOnTime"] / cell["tasksCompleted"])
                       if cell["tasksCompleted"] else None),
         "badScanPct": round(100 * cell["badScans"] / cell["pagesUploaded"], 1) if cell["pagesUploaded"] else None,
+        # Share of active time followed by output (days with minute detail).
+        "productivePct": (round(100 * cell["productiveMinutes"] / cell["detailActiveMinutes"])
+                          if cell["detailActiveMinutes"] else None),
     }
     return out
 
@@ -286,7 +306,20 @@ def build_engagement(connection: Connection, *, tenant_id: str, start_day: date,
             if counts_as_output(o["kind"], role):
                 d = o["at"].astimezone(IST).date()
                 by_day[(o["actor"], d)].append(_minute_of(o["at"], d))
-    day_detail = {key: day_analysis(merged_minutes(rows), by_day.get(key, [])) for key, rows in minute_rows.items()}
+    settings = engagement_settings(connection, tenant_id)
+    visits = _visit_minutes(connection, tenant_id=tenant_id, start_day=start_day, end_day=end_day) if minute_rows else {}
+    day_detail = {key: day_analysis(merged_minutes(rows), by_day.get(key, []), visits.get(key, []),
+                                    output_window=settings["outputWindowMinutes"],
+                                    hop_changes=settings["hopScreenChanges"])
+                  for key, rows in minute_rows.items()}
+    for (actor_key, d), analysis in day_detail.items():
+        if not analysis:
+            continue
+        c = cell(actor_key, d)
+        c["detailActiveMinutes"] += analysis["activeMinutes"]
+        c["productiveMinutes"] += analysis["productiveMinutes"]
+        c["activeNoOutputMinutes"] += analysis["activeNoOutputMinutes"]
+        c["clickingAroundBlocks"] += analysis["blockCounts"]["CLICKING_AROUND"]
     out_people = []
     exits = exit_dates(connection)
     for actor in sorted(set(people) | set(cells)):
@@ -328,9 +361,11 @@ def build_engagement(connection: Connection, *, tenant_id: str, start_day: date,
         "periods": [{"periodStart": p.isoformat(), "label": period_label(p, period)} for p in period_starts],
         "workingDays": working_days(start_day, end_day),
         "idleThresholdMinutes": window, "readingWindowMinutes": window, "sessionGapMinutes": SESSION_GAP_MINUTES,
+        "outputWindowMinutes": settings["outputWindowMinutes"], "hopScreenChanges": settings["hopScreenChanges"],
         "people": out_people,
         "notes": [
             activity_rule_note(window),
+            engagement_rule_note(settings),
             (f"A session is a stretch of use with no break of {SESSION_GAP_MINUTES} minutes or more. Sessions are "
              "counted from 27 Oct 2026; days before show time but no sessions."),
             ("Efficacy figures are plain ratios: files and tasks per active hour, tasks closed on time, the share "
@@ -346,7 +381,29 @@ def _day_summary(analysis: dict[str, Any] | None) -> dict[str, Any]:
         return {}
     longest = analysis.get("longestNoOutput") or {}
     return {"longestNoOutputMinutes": longest.get("minutes"), "longestNoOutputFrom": longest.get("from"),
-            "longestNoOutputTo": longest.get("to"), "blockCounts": analysis.get("blockCounts")}
+            "longestNoOutputTo": longest.get("to"), "blockCounts": analysis.get("blockCounts"),
+            "productiveMinutes": analysis.get("productiveMinutes"),
+            "activeNoOutputMinutes": analysis.get("activeNoOutputMinutes")}
+
+
+def _visit_minutes(connection: Connection, *, tenant_id: str, start_day: date,
+                   end_day: date) -> dict[tuple[str, date], list[int]]:
+    """(actor, day) -> the minute of the day (IST) of each screen change, read in the database
+    so the screen lists themselves never leave it."""
+    rows = connection.execute(text(r"""
+        SELECT a.actor_id, a.activity_date,
+               array_agg((extract(hour FROM (v.at AT TIME ZONE 'Asia/Kolkata')) * 60
+                          + extract(minute FROM (v.at AT TIME ZONE 'Asia/Kolkata')))::int) AS minutes
+        FROM auditcore.p2_user_activity_daily a
+        CROSS JOIN LATERAL (
+            SELECT (e ->> 'at')::timestamptz AS at FROM jsonb_array_elements(a.screen_visits) e
+            WHERE jsonb_typeof(a.screen_visits) = 'array' AND (e ->> 'at') ~ '^\d{4}-\d{2}-\d{2}T'
+        ) v
+        WHERE a.tenant_id = :t AND a.activity_date BETWEEN :sd AND :ed AND a.screen_visits IS NOT NULL
+          AND (v.at AT TIME ZONE 'Asia/Kolkata')::date = a.activity_date
+        GROUP BY 1, 2
+    """), {"t": tenant_id, "sd": start_day, "ed": end_day}).all()
+    return {(str(r[0]), r[1]): list(r[2] or []) for r in rows}
 
 
 # --------------------------------------------------------------------------- a person's day, minute by minute
@@ -457,10 +514,26 @@ def _hhmm(minute: int) -> str:
     return f"{minute // 60:02d}:{minute % 60:02d}"
 
 
-def day_analysis(minute_states: str | None, output_minutes: list[int]) -> dict[str, Any] | None:
+def productive_minutes(active: list[int], output_minutes: list[int], window: int) -> int:
+    """Active minutes followed by output within ``window`` minutes (the same minute included)."""
+    marks = sorted(m for m in output_minutes if m >= 0)
+    count = 0
+    for m in active:
+        i = bisect_left(marks, m)
+        if i < len(marks) and marks[i] <= m + window:
+            count += 1
+    return count
+
+
+def day_analysis(minute_states: str | None, output_minutes: list[int], visit_minutes: list[int] | None = None,
+                 *, output_window: int = 20, hop_changes: int = 10) -> dict[str, Any] | None:
     """The day minute by minute: the longest stretch without output, the
     20-minute blocks, and stretches of scrolling with no click. None when the
     browser sent no minutes for the day.
+    Product owner 2026-11-16: active minutes followed by output within
+    ``output_window`` minutes are productive, the rest active with no output; a
+    block with no output, some activity and more than ``hop_changes`` screen
+    changes is CLICKING_AROUND.
 
     From 9 Nov 2026 the app marks a scrolled minute with no click, tap or key in
     the reading window S (idle, kept apart); before, a scroll made the minute A
@@ -473,8 +546,9 @@ def day_analysis(minute_states: str | None, output_minutes: list[int]) -> dict[s
     scroll_marks = "S" if "S" in minute_states else "A"
     if not active:
         return {"firstActive": None, "lastActive": None, "longestNoOutput": None, "blocks": [],
-                "blockCounts": {"WORKING": 0, "ACTIVE_NO_OUTPUT": 0, "IDLE": 0, "AWAY": 0},
-                "scrollOnly": [], "activeMinutes": 0, "scrollOnlyMinutes": minute_states.count("S")}
+                "blockCounts": {"WORKING": 0, "CLICKING_AROUND": 0, "ACTIVE_NO_OUTPUT": 0, "IDLE": 0, "AWAY": 0},
+                "scrollOnly": [], "activeMinutes": 0, "productiveMinutes": 0, "activeNoOutputMinutes": 0,
+                "scrollOnlyMinutes": minute_states.count("S")}
     first, last = active[0], active[-1]
     marks = sorted({m for m in output_minutes if first <= m <= last})
     edges = [first, *marks, last + 1]
@@ -489,18 +563,23 @@ def day_analysis(minute_states: str | None, output_minutes: list[int]) -> dict[s
     start_block = (min(used[0], first) // BLOCK_MINUTES) * BLOCK_MINUTES
     end_block = (max(used[-1], last) // BLOCK_MINUTES) * BLOCK_MINUTES
     blocks = []
-    counts = {"WORKING": 0, "ACTIVE_NO_OUTPUT": 0, "IDLE": 0, "AWAY": 0}
+    counts = {"WORKING": 0, "CLICKING_AROUND": 0, "ACTIVE_NO_OUTPUT": 0, "IDLE": 0, "AWAY": 0}
+    visits = [m for m in (visit_minutes or []) if m >= 0]
     for b in range(start_block, end_block + BLOCK_MINUTES, BLOCK_MINUTES):
         window = minute_states[b:b + BLOCK_MINUTES]
         n_out = sum(1 for m in out_set if b <= m < b + BLOCK_MINUTES)
         n_active = sum(1 for c in window if c in "AK")
         n_scroll = window.count("S")
         n_idle = window.count("I") + n_scroll  # scrolling with no click is idle (2026-11-09)
-        state = ("WORKING" if n_out else "ACTIVE_NO_OUTPUT" if n_active else "IDLE" if n_idle else "AWAY")
+        n_visits = sum(1 for m in visits if b <= m < b + BLOCK_MINUTES)
+        state = ("WORKING" if n_out else
+                 "CLICKING_AROUND" if n_active and n_visits > hop_changes else
+                 "ACTIVE_NO_OUTPUT" if n_active else "IDLE" if n_idle else "AWAY")
         counts[state] += 1
         blocks.append({"from": _hhmm(b), "to": _hhmm(b + BLOCK_MINUTES) if b + BLOCK_MINUTES < 1440 else "24:00",
                        "state": state, "outputs": n_out, "activeMinutes": n_active,
-                       "idleMinutes": n_idle, "scrollOnlyMinutes": n_scroll, "hiddenMinutes": window.count("B")})
+                       "idleMinutes": n_idle, "scrollOnlyMinutes": n_scroll, "hiddenMinutes": window.count("B"),
+                       "screenChanges": n_visits})
     scroll_only = []
     run_start = None
     scan_from = min(i for i, c in enumerate(minute_states) if c in "AKS")
@@ -513,8 +592,10 @@ def day_analysis(minute_states: str | None, output_minutes: list[int]) -> dict[s
         if run_start is not None and i - run_start >= SCROLL_ONLY_MINUTES:
             scroll_only.append({"from": _hhmm(run_start), "to": _hhmm(min(i, 1439)), "minutes": i - run_start})
         run_start = None
+    productive = productive_minutes(active, output_minutes, output_window)
     return {"firstActive": _hhmm(first), "lastActive": _hhmm(last), "longestNoOutput": longest,
             "blocks": blocks, "blockCounts": counts, "scrollOnly": scroll_only, "activeMinutes": len(active),
+            "productiveMinutes": productive, "activeNoOutputMinutes": len(active) - productive,
             "scrollOnlyMinutes": minute_states.count("S")}
 
 
@@ -544,7 +625,6 @@ def person_day(connection: Connection, *, tenant_id: str, actor_id: str, day: da
                   key=lambda o: o["at"])
     counted = [o for o in work if counts_as_output(o["kind"], role)]
     minutes = merged_minutes(rows)
-    analysis = day_analysis(minutes, [_minute_of(o["at"], day) for o in counted])
 
     visits = sorted((v for r in rows for v in (r.get("screen_visits") or []) if isinstance(v, dict)),
                     key=lambda v: str(v.get("at")))
@@ -565,6 +645,9 @@ def person_day(connection: Connection, *, tenant_id: str, actor_id: str, day: da
             current = next((visits[j]["screen"] for j in range(len(visits) - 1, -1, -1)
                             if 0 <= visit_minutes[j] <= m), None)
             per_screen[current or "Before the first screen recorded"] += 1
+    settings = engagement_settings(connection, tenant_id)
+    analysis = day_analysis(minutes, [_minute_of(o["at"], day) for o in counted], visit_minutes,
+                            output_window=settings["outputWindowMinutes"], hop_changes=settings["hopScreenChanges"])
 
     journey_ids = sorted({j for j in [*(o["journeyId"] for o in work), *(v.get("journeyId") for v in visits)] if j})
     refs = {str(r[0]): r[1] for r in connection.execute(
@@ -577,6 +660,7 @@ def person_day(connection: Connection, *, tenant_id: str, actor_id: str, day: da
     return {
         "actorId": actor_id, "name": (person or {}).get("displayName") or names.get(actor_id), "role": role,
         "readingWindowMinutes": window,
+        "outputWindowMinutes": settings["outputWindowMinutes"], "hopScreenChanges": settings["hopScreenChanges"],
         "scrollOnlyMinutes": minutes.count("S") if minutes else 0,
         "day": day.isoformat(),
         "activeMinutes": round(sum(int(r["active_seconds"]) for r in rows) / 60),
@@ -599,9 +683,11 @@ def person_day(connection: Connection, *, tenant_id: str, actor_id: str, day: da
             ("Output for a PC: files uploaded, journeys started, task actions, values corrected or confirmed, pages "
              "removed, retried or retyped. For a Reviewer (and supervisors) opening a document also counts."),
             activity_rule_note(window),
-            (f"The day is cut into {BLOCK_MINUTES}-minute blocks: Working (at least one output), Active with no "
-             "output (clicks, taps or keys, nothing saved), Idle (open with no click, tap or key; scrolling "
-             "included), Away (hidden or closed)."),
+            (f"The day is cut into {BLOCK_MINUTES}-minute blocks: Working (at least one output), Clicking around "
+             f"(no output, more than {settings['hopScreenChanges']} screen changes), Active with no output (clicks, "
+             "taps or keys, nothing saved), Idle (open with no click, tap or key; scrolling included), Away (hidden "
+             "or closed)."),
+            engagement_rule_note(settings),
             (f"Scrolling only: {SCROLL_ONLY_MINUTES} minutes or more of scrolling with no click, tap or key "
              f"within {window} minutes (before November 2026: active minutes with no click)."),
             "Minute-by-minute detail and screens are recorded from 28 Oct 2026; earlier days show totals only.",

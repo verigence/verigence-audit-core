@@ -160,6 +160,19 @@ Project, for one day or a week (with per-day breakdown):
 
 Computed on read from indexed range queries; no batch job.
 
+**Productive time and clicking around (product owner, 16 Nov 2026).** Clicking tabs
+all day counts as active, so for days with minute detail the report splits active
+time: an active minute followed by output (a file, a journey, a saved or confirmed
+value, a task action, a review, a page action; a Reviewer's or supervisor's document
+opened) within the **output window** is *productive*, the rest is *active with no
+output*; `productivePct` = productive ÷ active. A 20-minute block with no output,
+some activity and more than **N screen changes** is *Clicking around* in the
+person's day. The output window (20 minutes by default, 5–60) and N (10 by default,
+3–50) are SuperAdmin settings, for every Project or one Project, in the same rows
+and change log as the reading window (migration 0234); reports read them on every
+request. Screen changes are counted in the database from the screens the app
+records; the screen lists are not sent to the report.
+
 ## 9. Time on Verigence (client-side)
 
 - The browser counts the day in 1-minute buckets: **active** = a click, tap,
