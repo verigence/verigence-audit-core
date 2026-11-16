@@ -34,6 +34,10 @@ def test_the_same_person(left, right):
     ("Sandipta Kumar Das", "SANDIPTA KUMAR BAL"),
     ("MANOJ NAYAK", "Pankaj Kumar Nayak"),
     ("Bhabani Sankar Sasmal", "BANITA SASMAL"),
+    # Live 2026-11-16: one letter apart on a long name, but the first letter of a word.
+    ("BHARAT KUMAR SUBUDHI", "SARAT KUMAR SUBUDHI"),
+    ("BHARAT KUMAR SUBUDHI", "Mr.Sarat Ku Subudhi"),
+    ("Md Golam Ahamad Reza", "MD GOLAM SAMAD REZA"),
 ])
 def test_different_people(left, right):
     assert not same_person(left, right)
