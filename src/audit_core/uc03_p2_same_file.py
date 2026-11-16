@@ -261,11 +261,14 @@ _CLOSED_SQL = """
 """
 
 # A value counts only while its document is on file (review of #594): a PAN
-# or mobile read from a page since removed or replaced pairs nothing.
+# or mobile read from a page since removed or replaced pairs nothing; nor does
+# one from a document the identity check holds as another person's (the
+# financier's PAN in the loan papers, 2026-11-16).
 _ON_ACTIVE_DOCUMENT = """
     EXISTS (SELECT 1 FROM auditcore.evidence e
             WHERE e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
-              AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE')
+              AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
+              AND COALESCE(e.identity_check_status, 'PASSED') NOT IN ('HELD', 'REJECTED'))
 """
 
 _IDENTITY_SQL = f"""
