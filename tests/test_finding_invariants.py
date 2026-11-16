@@ -7,7 +7,12 @@ from p2_support import create_p2_journey, database_engine
 from sqlalchemy import text
 
 from audit_core.db import set_tenant_context
-from audit_core.uc03_finding_invariants import base_code, decide, enforce_journey, finding_may_open
+from audit_core.uc03_finding_invariants import (
+    base_code,
+    decide,
+    enforce_journey,
+    finding_may_open,
+)
 from audit_core.uc03_p2_registry import get_registry
 from audit_core.uc03_p2_task_producer import _json
 

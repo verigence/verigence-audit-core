@@ -77,7 +77,10 @@ def taskless_codes() -> frozenset[str]:
     """Checks that raise no task by a product owner decision: their findings
     are informational. CASH_ABOVE_LIMIT keeps its finding (the legal limit,
     shown on the Audit Summary, 2026-10-31)."""
-    from audit_core.uc03_p2_task_producer import BOOKING_FORM_TASK_CODES, SUPPRESSED_TASK_CODES
+    from audit_core.uc03_p2_task_producer import (
+        BOOKING_FORM_TASK_CODES,
+        SUPPRESSED_TASK_CODES,
+    )
 
     return frozenset((SUPPRESSED_TASK_CODES - {"CASH_ABOVE_LIMIT"}) | BOOKING_FORM_TASK_CODES)
 
@@ -417,5 +420,12 @@ def run_finding_invariants(engine: Engine, tag: str, tenant_ids: list[str]) -> d
     return report
 
 
-__all__ = ["base_code", "decide", "finding_may_open", "enforce_after_evaluation", "enforce_journey", "run_finding_invariants",
-           "taskless_codes"]
+__all__ = [
+    "base_code",
+    "decide",
+    "enforce_after_evaluation",
+    "enforce_journey",
+    "finding_may_open",
+    "run_finding_invariants",
+    "taskless_codes",
+]
