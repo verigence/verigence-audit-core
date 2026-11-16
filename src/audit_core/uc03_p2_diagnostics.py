@@ -996,7 +996,7 @@ REPORTS: dict[str, str] = {
     """,
     # The booking and delivery dates each Journey shows now, and where from.
     "booking_state": """
-        SELECT j.journey_id, j.journey_reference, COALESCE(c.legal_name, c.display_name) AS customer,
+        SELECT j.journey_id, j.journey_reference, auditcore.shown_name(c.legal_name, c.display_name) AS customer,
                ss.business_status, ss.booking_confirm_date::text AS booking_confirm_date,
                ss.booking_confirmed_at_utc::text AS booking_confirmed_at_utc,
                b.booking_date::text AS booking_form_date,

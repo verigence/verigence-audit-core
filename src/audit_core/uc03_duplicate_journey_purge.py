@@ -50,7 +50,7 @@ logger = structlog.get_logger(__name__)
 REASON = "Duplicate journey removed on the product owner's instruction (same PAN, customer name, model, dealership)"
 
 _LOOKUP_SQL = """
-    SELECT j.journey_id, j.journey_reference, COALESCE(c.legal_name, c.display_name) AS customer_name,
+    SELECT j.journey_id, j.journey_reference, auditcore.shown_name(c.legal_name, c.display_name) AS customer_name,
            j.created_by_display_name AS pc_name, d.dealer_name, o.outlet_name,
            NULLIF(concat_ws(' · ', NULLIF(jp.model_name_snapshot, ''), NULLIF(jp.variant_name_snapshot, '')), '')
              AS vehicle,

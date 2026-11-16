@@ -53,7 +53,7 @@ def _active_doc_fields(document_type: str, pattern: str | None = None, *, width:
 REVIEW_SQL: dict[str, str] = {
     "journey": """
         SELECT j.journey_id::text AS journey_id, j.journey_reference AS ref,
-               COALESCE(NULLIF(c.display_name, ''), j.journey_reference) AS customer,
+               auditcore.shown_name(c.legal_name, c.display_name) AS customer,
                j.created_by_display_name AS pc, o.outlet_name AS outlet, r.current_stage AS stage,
                to_char(j.created_at_utc, 'YYYY-MM-DD') AS created,
                jp.model_name_snapshot AS booked_model, jp.variant_name_snapshot AS booked_variant,

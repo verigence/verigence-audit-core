@@ -3508,7 +3508,7 @@ _P2_TASK_LIST_SQL = f"""
                    t.completion_protocol, t.task_status, t.due_at_utc,
                    t.created_at_utc, t.updated_at_utc, t.verified_at_utc,
                    t.completion_result,
-                   COALESCE(c.legal_name, c.display_name) AS customer_name,
+                   auditcore.shown_name(c.legal_name, c.display_name) AS customer_name,
                    o.outlet_name, jr.journey_reference,
                    {closure_columns_sql("jr")},
                    NULLIF(concat_ws(' · ', NULLIF(jp.model_name_snapshot,''),
@@ -3599,7 +3599,7 @@ def list_tasks(
         text(
             """
             SELECT
-              COALESCE(c.legal_name, c.display_name) AS customer_name,
+              auditcore.shown_name(c.legal_name, c.display_name) AS customer_name,
               o.outlet_name, j.journey_reference,
               NULLIF(concat_ws(' · ', NULLIF(jp.model_name_snapshot,''),
                                       NULLIF(jp.variant_name_snapshot,'')), '') AS vehicle,

@@ -357,7 +357,7 @@ def list_tl_supervisory_cases(
                 j.journey_id,
                 b.booking_reference,
                 -- The KYC name once the customer is named (as Booking & Delivery shows it).
-                COALESCE(c.legal_name, c.display_name) AS customer_display_name,
+                auditcore.shown_name(c.legal_name, c.display_name) AS customer_display_name,
                 c.mobile_last4 AS customer_mobile_last4,
                 NULLIF(
                     concat_ws(

@@ -62,7 +62,7 @@ _STATUS_SQL = """
              COALESCE(t.action_completed_at_utc,
                       CASE WHEN t.task_status = 'VERIFIED_COMPLETE' THEN t.verified_at_utc END) AS done_at,
              t.verified_at_utc, t.outlet_id, o.outlet_name,
-             j.journey_reference, COALESCE(c.legal_name, c.display_name) AS customer_name
+             j.journey_reference, auditcore.shown_name(c.legal_name, c.display_name) AS customer_name
       FROM auditcore.p2_tasks t
       LEFT JOIN auditcore.journeys j ON j.tenant_id = t.tenant_id AND j.journey_id = t.journey_id
       LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
