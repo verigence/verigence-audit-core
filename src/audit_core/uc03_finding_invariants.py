@@ -79,10 +79,12 @@ def taskless_codes() -> frozenset[str]:
     shown on the Audit Summary, 2026-10-31)."""
     from audit_core.uc03_p2_task_producer import (
         BOOKING_FORM_TASK_CODES,
+        INFORMATIONAL_TASK_CODES,
         SUPPRESSED_TASK_CODES,
     )
 
-    return frozenset((SUPPRESSED_TASK_CODES - {"CASH_ABOVE_LIMIT"}) | BOOKING_FORM_TASK_CODES)
+    return frozenset((SUPPRESSED_TASK_CODES - {"CASH_ABOVE_LIMIT"}) | BOOKING_FORM_TASK_CODES
+                     | INFORMATIONAL_TASK_CODES)
 
 
 def decide(
