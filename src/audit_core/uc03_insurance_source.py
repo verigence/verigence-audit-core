@@ -6,12 +6,15 @@ task for the PC to confirm whether it is an in-house or external insurance.
 There should be a comment with the Agent Code / MISP Code, filled manually, and
 then the task is closed."
 
-So, in order:
+So, in order (product owner 2026-11-16: "check MISP code, if there good, if
+not anyhow check NDC for insurance; if insurance amount there then it's
+dealership"):
 
 1. The PC's confirmation decides (Deal tab or this task).
-2. In-house when the policy carries one of the dealer's own Agent / MISP codes,
-   or a dealer invoice bills the insurance premium (an INSURANCE line with an
-   amount, or a debit note's insurance amount).
+2. In-house when the policy carries one of the dealer's own Agent / MISP codes
+   (a character or two misread allowed, dealer_code_match); else when the NDC
+   charges the insurance premium, or a dealer invoice bills it.
+2a. Self when neither: the NDC is on file and read, with no insurance amount.
 3. Otherwise, once a policy has been read, a PC task INSURANCE_SOURCE_CONFIRM
    asks: in-house or external, with the Agent / MISP code in the comment. An
    in-house answer records the code as the dealer's, so later policies with
@@ -274,11 +277,11 @@ def premium_on_dealer_statement(connection: Connection, *, tenant_id: str, journ
 
 def document_decision(connection: Connection, *, tenant_id: str, journey_id: UUID,
                       policy: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    """In-house from the documents, with the reason, or None when they do not show it."""
+    """In-house from the documents, with the reason, or None when they do not
+    show it. Product owner 2026-11-16, "simple": the dealer's MISP / Agent code
+    on the policy first; if not, the NDC's insurance amount (or a dealer
+    invoice billing the premium)."""
     policy = policy if policy is not None else _policy(connection, tenant_id=tenant_id, journey_id=journey_id)
-    charged = premium_on_dealer_statement(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if charged is not None:
-        return {"source": INHOUSE, "basis": f"The dealer's statement charges the insurance premium (Rs {charged:,.0f})."}
     if policy is not None:
         known = dealer_codes(connection, tenant_id=tenant_id, dealer_id=policy["dealer_id"])
         others: set[str] | None = None
@@ -294,10 +297,21 @@ def document_decision(connection: Connection, *, tenant_id: str, journey_id: UUI
                 return {"source": INHOUSE,
                         "basis": f"The policy carries the dealer's {label} (read as {policy[key]}, "
                                  f"{near[1]} character{'s' if near[1] > 1 else ''} from the dealer's code)."}
+    charged = premium_on_dealer_statement(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if charged is not None:
+        return {"source": INHOUSE, "basis": f"The NDC charges the insurance premium (Rs {charged:,.0f})."}
     premium = premium_on_dealer_invoice(connection, tenant_id=tenant_id, journey_id=journey_id)
     if premium is not None:
         return {"source": INHOUSE, "basis": f"The dealer invoice bills the insurance premium (Rs {premium:,.0f})."}
     return None
+
+
+def ndc_without_premium(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
+    """The NDC is on file and read, and charges no insurance premium."""
+    from audit_core.uc03_account_statement import statement_reading
+
+    return bool(statement_reading(connection, tenant_id=tenant_id, journey_id=journey_id)["read"]) \
+        and premium_on_dealer_statement(connection, tenant_id=tenant_id, journey_id=journey_id) is None
 
 
 def resolve(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
@@ -313,6 +327,14 @@ def resolve(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
     if decided is not None:
         return {"source": INHOUSE, "decidedBy": "DOCUMENT", "decidedAt": None, "actorId": None,
                 "basis": decided["basis"]}
+    # Neither the dealer's code on the policy nor an insurance amount on the NDC
+    # on file: the customer's own insurance (product owner 2026-11-16). Until
+    # the NDC is read, the PC is asked as before.
+    if policy and (policy["insurer_name"] or policy["policy_reference"]) \
+            and ndc_without_premium(connection, tenant_id=tenant_id, journey_id=journey_id):
+        return {"source": "SELF", "decidedBy": "DOCUMENT", "decidedAt": None, "actorId": None,
+                "basis": "The policy does not carry the dealer's MISP / Agent code and the NDC charges no "
+                         "insurance premium: the customer's own insurance."}
     # Meanwhile the booking docket's own word stands, when it plainly says the
     # customer arranged it (2026-10-28).
     said_self = bool(policy) and booking_says_self(policy.get("insurance_by"))
