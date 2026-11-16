@@ -1557,7 +1557,8 @@ def self_insurance_declared(facts: _Facts) -> RuleOutcome:
 
 def _posting_line(posting: dict[str, Any]) -> str:
     number = f"{posting['number']} " if posting.get("number") else ""
-    return f"{number}{_rupees(posting['amount'])} on {_when(posting.get('date'))}"
+    day = f" on {_when(posting['date'])}" if posting.get("date") else ""
+    return f"{number}{_rupees(posting['amount'])}{day}"
 
 
 def payment_receipt_missing(facts: _Facts) -> RuleOutcome:

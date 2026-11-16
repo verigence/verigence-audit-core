@@ -128,10 +128,11 @@ def _loan_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     for posting in loan_without_receipt(connection, tenant_id=tenant_id, journey_id=journey_id):
         where = "the NDC" if posting.get("documentLabel") == "NDC" else "the customer ledger"
         number = f" ({posting['number']})" if posting.get("number") else ""
+        day = f" on {_when(posting['date'])}" if posting.get("date") else ""
         remarks.append(_remark(
             "LOAN_WITHOUT_RECEIPT", "Loan received, no payment receipt",
-            f"Loan amount of {_rupees(posting['amount'])} received as per {where}{number} on "
-            f"{_when(posting.get('date'))}; no payment receipt available. No task is raised for it.",
+            f"Loan amount of {_rupees(posting['amount'])} received as per {where}{number}{day}; "
+            "no payment receipt available. No task is raised for it.",
             "NDC" if where == "the NDC" else "Customer ledger"))
     return remarks
 

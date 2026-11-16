@@ -88,6 +88,9 @@ def test_the_rule_fails_listing_each_line_and_passes_once_settled(ndc):
     assert outcome.details["findingTitle"] == "Payment receipt missing"
     assert [p["number"] for p in outcome.details["postings"]] == ["PB/26-27/0575"]
 
+    ndc["lines"][0]["date"] = None  # the NDC prints no date: none is made up
+    assert "unknown date" not in rules.payment_receipt_missing(_Facts()).reason
+
     ndc["lines"] = [dict(LOAN_LINE)]
     assert rules.payment_receipt_missing(_Facts()).outcome == "PASS"
 
