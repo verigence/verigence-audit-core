@@ -496,6 +496,38 @@ def bank_approval_sanction(connection: Connection, *, tenant_id: str, journey_id
     return None
 
 
+def delivery_order_loan(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    """The loan the financier's Delivery Order prints -- or its disbursement
+    advice or email, which Document Intelligence files as the DO (DI 0069,
+    product owner 2026-11-16) -- from the newest DO that prints one; None when
+    no DO on file prints a loan amount."""
+    for doc in _document_facts(connection, tenant_id=tenant_id, journey_id=journey_id,
+                               di_types=("delivery_order_cover",)):
+        amount = _dec(doc["fields"].get("loan_amount"))
+        if amount is None or amount <= 0:
+            continue
+        return {
+            "amount": amount, "documentId": doc["documentId"], "document": _document_label("delivery_order_cover"),
+            "financier": doc["fields"].get("financier_name"),
+            "date": doc["fields"].get("disbursement_date") or doc["fields"].get("delivery_date"),
+            "reference": doc["fields"].get("disbursement_reference"),
+            "source": "Delivery Order (Financier)",
+        }
+    return None
+
+
+def lender_loan(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    """The loan as the lender's own paper states it, by a fixed order
+    (product owner 2026-11-16, deterministic, never chosen by the reader):
+    the Delivery Order (its disbursement advice or email included), else the
+    Bank Approval Letter's sanctioned amount."""
+    do = delivery_order_loan(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if do is not None:
+        return do
+    letter = bank_approval_sanction(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return {**letter, "source": "Bank Approval Letter (sanctioned amount)"} if letter is not None else None
+
+
 def letter_loan_among_receipts(
     connection: Connection, *, tenant_id: str, journey_id: UUID, receipt_amounts: list[Decimal | None],
 ) -> Decimal | None:
@@ -506,7 +538,7 @@ def letter_loan_among_receipts(
     sanction of Rs 7,10,000)."""
     from audit_core.uc03_ledger_receipts import is_loan_net_of_charges
 
-    letter = bank_approval_sanction(connection, tenant_id=tenant_id, journey_id=journey_id)
+    letter = lender_loan(connection, tenant_id=tenant_id, journey_id=journey_id)
     if letter is None:
         return None
     return next((Decimal(r) for r in receipt_amounts
@@ -521,8 +553,8 @@ def loan_without_receipt(
     give no receipt for the loan amount). Shown with an asterisk; gone the
     moment a receipt is linked as the loan disbursement.
 
-    Only the Bank Approval Letter prints an amount (its sanctioned amount);
-    the Delivery Order carries none. None when a finance record already has
+    The Delivery Order's loan amount (its disbursement advice or email
+    included), else the Bank Approval Letter's sanction (lender_loan). None when a finance record already has
     a disbursement (linked to a receipt or entered), a counted receipt is the
     same amount to the rupee, or a receipt names the financier (that receipt
     is the loan)."""
@@ -539,7 +571,8 @@ def loan_without_receipt(
     ).scalar_one()
     if known:
         return None
-    letter = bank_approval_sanction(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # The DO (its advice or email) before the letter: a fixed order (2026-11-16).
+    letter = lender_loan(connection, tenant_id=tenant_id, journey_id=journey_id)
     if letter is None:
         return None
     # A counted receipt of the loan amount, or of the disbursement net of the
@@ -578,10 +611,9 @@ def loan_without_receipt(
     if credited is not None:
         return {**letter, "amount": _money(credited),
                 "note": "No dealership receipt for the loan amount; the loan credit the customer ledger records "
-                        f"against the Bank Approval Letter's sanction of Rs {letter['amount']:,.0f}."}
+                        f"against the loan of Rs {letter['amount']:,.0f} on the {letter['source']}."}
     return {**letter, "amount": _money(letter["amount"]),
-            "note": "No dealership receipt for the loan amount; taken from the Bank Approval Letter "
-                    "(sanctioned amount)."}
+            "note": f"No dealership receipt for the loan amount; taken from the {letter['source']}."}
 
 
 def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Decimal]:

@@ -313,10 +313,14 @@ def journey_customer_names(connection: Connection, *, tenant_id: str, journey_id
 
 def stated_loan_amounts(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
     """The loan amount as the paper states it (product owner, 2026-11-02): the
-    dealer statement's financier row and the newest Bank Approval Letter's
-    sanctioned amount, each with the document it comes from."""
+    dealer statement's financier row, the Delivery Order's loan amount
+    (2026-11-16) and the newest Bank Approval Letter's sanctioned amount, in
+    that order, each with the document it comes from."""
     from audit_core.uc03_account_statement import statement_loan
-    from audit_core.uc03_p2_journey360 import bank_approval_sanction
+    from audit_core.uc03_p2_journey360 import (
+        bank_approval_sanction,
+        delivery_order_loan,
+    )
 
     out: list[dict[str, Any]] = []
     stated = statement_loan(connection, tenant_id=tenant_id, journey_id=journey_id)
@@ -324,6 +328,12 @@ def stated_loan_amounts(connection: Connection, *, tenant_id: str, journey_id: U
     if stated is not None and loan is not None and loan > 0:
         out.append({"amount": loan, "source": f"{stated['source']} financier row",
                     "documentId": str(stated.get("documentId") or "") or None})
+    # The lender's paper in a fixed order (2026-11-16): the Delivery Order (its
+    # disbursement advice or email included), then the Bank Approval Letter.
+    do = delivery_order_loan(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if do is not None:
+        out.append({"amount": do["amount"], "source": "Delivery Order (Financier) loan amount",
+                    "documentId": do["documentId"]})
     letter = bank_approval_sanction(connection, tenant_id=tenant_id, journey_id=journey_id)
     if letter is not None:
         out.append({"amount": letter["amount"], "source": "Bank Approval Letter (sanctioned amount)",

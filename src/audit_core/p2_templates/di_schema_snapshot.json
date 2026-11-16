@@ -2414,6 +2414,30 @@
      "key": "embedded_document_types",
      "required": false,
      "type": "array"
+    },
+    {
+     "description": "Financier / bank / NBFC named as funding the vehicle, exactly as printed",
+     "key": "financier_name",
+     "required": false,
+     "type": "string"
+    },
+    {
+     "description": "Loan, finance or DO amount the financier pays for this vehicle, exactly as printed; never the vehicle price, down payment or margin money",
+     "key": "loan_amount",
+     "required": false,
+     "type": "number"
+    },
+    {
+     "description": "Date the loan was disbursed / paid to the dealer, only when printed",
+     "key": "disbursement_date",
+     "required": false,
+     "type": "date"
+    },
+    {
+     "description": "UTR / transaction / cheque reference of the disbursement, only when printed",
+     "key": "disbursement_reference",
+     "required": false,
+     "type": "string"
     }
    ],
    "schema_version": "1.1"
