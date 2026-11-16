@@ -778,3 +778,27 @@ def test_the_daily_run_takes_only_the_outlets_that_use_drive_but_a_run_asked_for
     # Chosen again (null: every outlet): the daily run is for it once more.
     _as(s, "admin", "TENANT_ADMIN")
     assert s.client.put(f"{s.base}/integrations/google-drive/settings", json={"outletIds": None}).json()["outletIds"] is None
+
+
+def test_a_customer_is_found_by_name_or_otf_over_every_day(s):
+    """Product owner 2026-11-16: search the Drive uploads by customer or OTF number."""
+    outlet = _tree(s)
+    s.fake.put("docket.pdf", s.fake.folder("Prabodh Kumar Dash-456909", outlet), b"%PDF docket")
+    s.fake.put("kyc.pdf", s.fake.folder("Akansh-777001", outlet), b"%PDF kyc")
+    _sync(s)
+    _exec(s, "UPDATE auditcore.p2_drive_files SET upload_date = upload_date - 9 WHERE tenant_id=:t "
+             "AND file_name='docket.pdf'")  # put in Drive on another day
+
+    def found(q: str) -> list[str]:
+        response = s.client.get(f"{s.base}/drive/search", params={"q": q})
+        assert response.status_code == 200, response.text
+        return [c["customerFolder"] for c in response.json()["customers"]]
+
+    assert found("456909") == ["Prabodh Kumar Dash-456909"]
+    assert found("prabodh dash") == ["Prabodh Kumar Dash-456909"]
+    assert found("akansh") == ["Akansh-777001"]
+    assert found("nobody") == []
+    [customer] = s.client.get(f"{s.base}/drive/search", params={"q": "456909"}).json()["customers"]
+    assert customer["bookingNumber"] == "456909" and [f["filename"] for f in customer["files"]] == ["docket.pdf"]
+    _as(s, str(uuid4()))  # a PC of no outlet sees nothing
+    assert found("456909") == []
