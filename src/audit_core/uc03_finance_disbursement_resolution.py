@@ -48,7 +48,12 @@ NAYAK ( HP TO UNION BANK OF INDIA )") is the customer's name.
 Resolution order:
 
   1. No financer named on the finance record -- nothing to resolve, skip.
-  2. Already PC_CONFIRMED -- sticky forever; never overwritten here.
+  2. Already PC_CONFIRMED -- sticky; never overwritten here, unless the paper
+     states the loan at another amount (the NDC / settlement financier row
+     or the Bank Approval Letter, beyond the lender's charges): then it is
+     not the loan, and the receipt is the customer's again (2026-11-16,
+     SHI-SS-261027-006: Prabodh Kumar Dash's Rs 11,50,000 down payment was
+     confirmed as HDFC's loan of Rs 18,80,226 on the NDC).
   3. Exactly one candidate in the financier's name -- HIGH. Several -- no
      link, PC task.
   4. Else exactly one candidate equal (Rs 1) to a stated loan amount --
@@ -338,6 +343,21 @@ def _stated_matched(candidate: dict[str, Any], stated: list[dict[str, Any]]) -> 
     return next((s for s in stated if abs(amount - s["amount"]) <= AMOUNT_TOLERANCE), None)
 
 
+def contradicted_by_paper(amount: Any, stated: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The stated loan that a receipt of this amount cannot be: the paper
+    states a loan and the amount is neither it (Rs 1) nor its disbursement
+    net of the lender's charges. None when nothing is stated or one fits."""
+    from audit_core.uc03_ledger_receipts import is_loan_net_of_charges
+
+    value = _to_decimal(amount)
+    if value is None or not stated:
+        return None
+    if any(abs(value - s["amount"]) <= AMOUNT_TOLERANCE or is_loan_net_of_charges(value, s["amount"])
+           for s in stated):
+        return None
+    return stated[0]
+
+
 def _stated_cross_check(stated: list[dict[str, Any]]) -> str:
     """The statement and the letter checked against each other."""
     if len(stated) < 2:
@@ -444,22 +464,29 @@ def plan_finance_disbursement(
         "amount": finance_record["loan_disbursement_amount"],
         "basis": finance_record["loan_disbursement_match_basis"],
     }
+    revoked: str | None = None
     if finance_record["loan_disbursement_confidence"] == "PC_CONFIRMED":
-        return {"skipped": True, "reason": "pc_confirmed", "before": before}
+        contradiction = contradicted_by_paper(
+            finance_record["loan_disbursement_amount"],
+            stated_loan_amounts(connection, tenant_id=tenant_id, journey_id=journey_id))
+        if contradiction is None:
+            return {"skipped": True, "reason": "pc_confirmed", "before": before}
+        revoked = (f"The receipt confirmed as the loan ({_rupees(finance_record['loan_disbursement_amount'])}) is "
+                   f"not the loan the {contradiction['source']} states ({_rupees(contradiction['amount'])}). ")
 
     provider = finance_record["provider_name"]
     plan: dict[str, Any] = {"skipped": False, "before": before, "financeRecordId": finance_record["finance_record_id"],
-                            "providerName": provider, "stated": []}
+                            "providerName": provider, "stated": [], "revoked": revoked is not None}
     candidates = eligible_loan_disbursement_candidates(connection, tenant_id=tenant_id, journey_id=journey_id)
     plan["candidates"] = len(candidates)
 
     def link(payment: dict[str, Any], basis: str) -> dict[str, Any]:
         return {**plan, "resolved": True, "reason": None, "confidence": "HIGH", "payment": payment,
-                "basis": basis}
+                "basis": (revoked or "") + basis}
 
     def ask(reason: str, basis: str) -> dict[str, Any]:
         return {**plan, "resolved": False, "reason": reason, "confidence": "UNVERIFIED",
-                "payment": {"amount": None, "payment_id": None}, "basis": basis}
+                "payment": {"amount": None, "payment_id": None}, "basis": (revoked or "") + basis}
 
     if not candidates:
         return ask("no_eligible_payment", "No eligible (non-Cash/UPI/Card/QR) payment on the booking.")
@@ -492,7 +519,12 @@ def plan_finance_disbursement(
                    f"{' / '.join(dict.fromkeys(s['source'] for _c, s in equal))}: the PC is asked which one is the "
                    f"loan.{cross_check}")
 
-    # 3. No guessing: the PC is asked.
+    # 3. No guessing: the PC is asked -- unless no receipt on file can be the
+    # loan the paper states (none is it, nor it net of the lender's charges):
+    # the loan came without a receipt (a journal, a direct credit), and the
+    # paper's figure is counted (2026-11-16).
+    plan["noReceiptIsTheLoan"] = bool(stated) and all(
+        contradicted_by_paper(c.get("amount"), stated) is not None for c in candidates)
     if stated:
         amounts = "; ".join(f"{s['source']} {_rupees(s['amount'])}" for s in stated)
         basis = f"No receipt is in the financier's name or equals the loan amount ({amounts}): the PC is asked."
@@ -532,6 +564,14 @@ def resolve_finance_disbursement(
             )
         return {"resolved": True, "confidence": plan["confidence"]}
 
+    if plan.get("noReceiptIsTheLoan"):
+        # The paper states the loan and it is counted from there
+        # (uc03_p2_audit_summary.loan_received): nothing for the PC to pick.
+        open_task_id = _open_task_id(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if open_task_id is not None:
+            cancel_workflow_task(connection, tenant_id=tenant_id, workflow_task_id=open_task_id,
+                                 actor_id="SYSTEM", reason="No receipt on file is the loan the paper states.")
+        return {"resolved": False, "reason": "no_receipt_is_the_loan"}
     effect_key = _effect_key(tenant_id, journey_id)
     # One task per financed spell: a task cancelled because the deal stopped
     # being financed (uc03_finance_rule) is raised again, under a fresh key,
@@ -598,6 +638,18 @@ def confirm_loan_disbursement(
             detail=(
                 "The selected payment is not (or is no longer) an eligible "
                 "non-Cash/UPI/Card/QR payment on this Journey."
+            ),
+        )
+    contradiction = contradicted_by_paper(
+        payment["amount"], stated_loan_amounts(connection, tenant_id=tenant_id, journey_id=journey_id))
+    if contradiction is not None:
+        raise ConflictError(
+            error_code="VAC-CONFLICT-021",
+            title="This receipt is not the loan",
+            detail=(
+                f"The {contradiction['source']} states the loan as {_rupees(contradiction['amount'])}; "
+                f"this receipt is {_rupees(payment['amount'])}. A receipt of another amount is the customer's "
+                "own payment, not the loan."
             ),
         )
     _write_disbursement(

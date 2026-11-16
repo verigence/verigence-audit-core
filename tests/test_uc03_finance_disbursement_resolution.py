@@ -669,3 +669,43 @@ def test_the_job_kind_is_registered_with_its_references() -> None:
     finally:
         engine.dispose()
     assert target is run_loan_receipt_resolve and args[-1] == ["REF-1"]
+
+
+def test_a_confirmed_receipt_the_ndc_contradicts_is_not_the_loan_and_asks_nothing(p2) -> None:
+    # SHI-SS-261027-006 (2026-11-16): the customer's own Rs 11,50,000 confirmed as HDFC's loan,
+    # which the NDC records as Rs 18,80,226 credited by journal -- no receipt is the loan.
+    down = _receipt(p2, amount="1150000", number="PB-0765", day="2026-10-16", mode="RTGS", payer="PRABODH KUMAR DASH")
+    record = _financed(p2, provider="HDFC BANK LTD")
+    _ndc(p2, 1880226)
+    with p2.engine.begin() as c:
+        set_tenant_context(c, p2.tenant_id)
+        c.execute(text("UPDATE auditcore.finance_records SET loan_disbursement_payment_id=:p, "
+                       "loan_disbursement_amount=1150000, loan_disbursement_confidence='PC_CONFIRMED', "
+                       "loan_disbursement_match_basis='Confirmed by a person from the eligible payment list.' "
+                       "WHERE tenant_id=:t AND finance_record_id=:f"),
+                  {"p": down, "t": p2.tenant_id, "f": record})
+    result, row = _resolve(p2)
+    assert result == {"resolved": False, "reason": "no_receipt_is_the_loan"}
+    assert row["loan_disbursement_payment_id"] is None and row["loan_disbursement_amount"] is None
+    assert "not the loan" in row["loan_disbursement_match_basis"]
+    with p2.engine.begin() as c:
+        set_tenant_context(c, p2.tenant_id)
+        open_tasks = c.execute(text("SELECT count(*) FROM auditcore.workflow_tasks WHERE tenant_id=:t AND journey_id=:j "
+                                    "AND task_status NOT IN ('CANCELLED','COMPLETED')"),
+                               {"t": p2.tenant_id, "j": p2.journey_id}).scalar_one()
+    assert open_tasks == 0
+    assert _resolve(p2)[0] == {"resolved": False, "reason": "no_receipt_is_the_loan"}  # and stays so
+
+
+def test_a_confirmed_receipt_equal_to_the_ndc_loan_stands(p2) -> None:
+    loan = _receipt(p2, amount="2492449", number="PB-0544", day="2026-10-16", mode="RTGS", payer="BSS TAX")
+    record = _financed(p2, provider="ICICI BANK LTD")
+    _ndc(p2, 2492449)
+    with p2.engine.begin() as c:
+        set_tenant_context(c, p2.tenant_id)
+        c.execute(text("UPDATE auditcore.finance_records SET loan_disbursement_payment_id=:p, "
+                       "loan_disbursement_amount=2492449, loan_disbursement_confidence='PC_CONFIRMED' "
+                       "WHERE tenant_id=:t AND finance_record_id=:f"), {"p": loan, "t": p2.tenant_id, "f": record})
+    result, row = _resolve(p2)
+    assert result == {"skipped": True, "reason": "pc_confirmed"}
+    assert row["loan_disbursement_payment_id"] == loan
