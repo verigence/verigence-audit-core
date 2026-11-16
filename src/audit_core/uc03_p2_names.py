@@ -159,7 +159,36 @@ def _sounds_alike(left: list[str], right: list[str]) -> bool:
     one letter apart on a long name (Tusharkant Mohanty / Tusar Kanta Mohanty)."""
     for x, y in ((left, right), (sorted(left), sorted(right))):
         a, b = sound_key("".join(x)), sound_key("".join(y))
-        if a == b or (min(len(a), len(b)) >= _SOUND_MIN and SequenceMatcher(None, a, b).ratio() >= _SOUND_RATIO):
+        if a == b:
+            return True
+        if min(len(a), len(b)) >= _SOUND_MIN and SequenceMatcher(None, a, b).ratio() >= _SOUND_RATIO \
+                and not _differs_at_a_word_start(x, y):
+            return True
+    return False
+
+
+def _keyed(words: list[str]) -> tuple[str, set[int]]:
+    """The words spelt as they sound, written together, and where each begins."""
+    out, starts = "", set()
+    for word in words:
+        key = sound_key(word)
+        if key:
+            starts.add(len(out))
+            out += key
+    return out, starts
+
+
+def _differs_at_a_word_start(left: list[str], right: list[str]) -> bool:
+    """Whether the one letter the two names differ by begins a word: Bharat and
+    Sarat Kumar Subudhi, Ahamad and Samad Reza are other people, however long
+    the rest of the name (live 2026-11-16: both closed as spellings). A letter
+    inside a word, or a word split differently, is still a spelling."""
+    a, a_starts = _keyed(left)
+    b, b_starts = _keyed(right)
+    for tag, i1, i2, j1, j2 in SequenceMatcher(None, a, b).get_opcodes():
+        if tag == "equal":
+            continue
+        if (i1 in a_starts and i2 > i1) or (j1 in b_starts and j2 > j1):
             return True
     return False
 
