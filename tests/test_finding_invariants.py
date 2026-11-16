@@ -33,6 +33,7 @@ def test_decisions():
     assert _decide("DEAL_TOTAL_VARIANCE_NEGATIVE").reason == "CHECK_RETIRED"
     assert _decide("RE_KYC_NAME_VS_BOOKING", re_on=False).reason == "RULE_ENGINE_OFF"
     assert _decide("INVOICE_DATE_BEFORE_BOOKING", "FAIL").reason == "INFORMATIONAL"
+    assert _decide("SELF_INSURANCE_DECLARED", "FAIL").reason == "INFORMATIONAL"  # an observation (item 8)
     assert _decide("TCS_SHORT", "PASS").reason == "CHECK_PASSES"
     assert _decide("TCS_SHORT", "NOT_APPLICABLE").disposition == "FIXED"
     assert _decide("WF_BOOKING_INCOMPLETE_AT_DELIVERY_START", "WAITING_FOR_FACTS").reason == "CHECK_CANNOT_DECIDE"
