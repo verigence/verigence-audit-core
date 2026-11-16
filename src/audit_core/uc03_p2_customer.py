@@ -57,6 +57,8 @@ _GSTIN = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
 _NAMING_DOCUMENTS = ("booking_docket", "booking_form", "customer_invoice_dms", "tax_invoice_tally",
                      "dealer_receipt", "payment_receipt", "insurance_cover", "cost_sheet")
 _NAMING_FIELDS = ("customer_name", "buyer_name", "insured_name")
+# Why a copy was set aside for a newer upload (uc03_p2_earlier_copy._REPLACED).
+_REPLACED = ("REPLACED_BY_NEWER_UPLOAD", "REPLACED_BY_P2_REUPLOAD", "EARLIER_COPY_RESTORED")
 # Lets follow_entered_name change an entered name (migration 0185).
 _ENTERED_NAME_SETTING = "auditcore.entered_name_follows_customer"
 
@@ -77,6 +79,12 @@ def sync_customer_name(connection: Connection, *, tenant_id: str, journey_id: UU
     "Brajesh Chandra Bhoi" from a superseded Aadhaar while its PAN and
     Aadhaar on file are Sarbeswar Pradhan's) is replaced. A verified name
     that is the same person as the KYC (a corrected spelling) stands.
+
+    A KYC the identity check holds as another person's (HELD, or REJECTED by
+    the PC) never names the customer, and the customer's own KYC it pushed
+    aside as the newer upload still does (2026-11-16, ADI-RD-261111-013: the
+    financier's PAN, "BAJAJ FINANCE LIMITED", in the loan papers replaced
+    Prasanna Kumar Das's PAN and became the customer's name).
 
     Returns VERIFIED when the name was set, UNCHANGED when it already
     stood, NO_NAME when no KYC on file names the customer."""
@@ -106,12 +114,21 @@ def sync_customer_name(connection: Connection, *, tenant_id: str, journey_id: UU
             FROM auditcore.evidence e
             JOIN auditcore.journey_document_extracted_fields f
               ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
-            WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='ACTIVE'
-              AND e.document_type_key = ANY(:types)
-            ORDER BY e.linked_at_utc DESC, f.source_fact_version DESC NULLS LAST, f.updated_at_utc DESC
+            WHERE e.tenant_id=:t AND e.journey_id=:j AND e.document_type_key = ANY(:types)
+              AND COALESCE(e.identity_check_status, 'PASSED') NOT IN ('HELD', 'REJECTED')
+              AND (e.association_status='ACTIVE'
+                   -- the customer's own KYC pushed aside by another person's (2026-11-16)
+                   OR (e.association_status='SUPERSEDED' AND e.void_reason = ANY(:replaced)
+                       AND EXISTS (SELECT 1 FROM auditcore.evidence n
+                                   WHERE n.tenant_id=e.tenant_id AND n.journey_id=e.journey_id
+                                     AND n.supersedes_evidence_id=e.evidence_id
+                                     AND n.association_status='ACTIVE'
+                                     AND n.identity_check_status IN ('HELD', 'REJECTED'))))
+            ORDER BY (e.association_status='ACTIVE') DESC, e.linked_at_utc DESC,
+                     f.source_fact_version DESC NULLS LAST, f.updated_at_utc DESC
             """
         ),
-        {"t": tenant_id, "j": journey_id, "types": sorted(_KYC_NAME_FIELDS)},
+        {"t": tenant_id, "j": journey_id, "types": sorted(_KYC_NAME_FIELDS), "replaced": list(_REPLACED)},
     ).mappings().all()
     # A GST certificate names the customer only when it carries a GSTIN.
     with_gstin = {r["evidence_id"] for r in rows if r["field_key"] == "gstin" and is_gstin(r["effective_value"])}

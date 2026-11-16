@@ -55,7 +55,9 @@ _CANDIDATES_SQL = """
                OR (f.field_key = 'receipt_number' AND f.source_document_type_key = 'dealer_receipt'))
           AND EXISTS (SELECT 1 FROM auditcore.evidence e
                       WHERE e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
-                        AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE')
+                        AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
+                        -- not a document held as another person's (2026-11-16)
+                        AND COALESCE(e.identity_check_status, 'PASSED') NOT IN ('HELD', 'REJECTED'))
     )
     SELECT DISTINCT j.journey_id, j.journey_reference, j.created_at_utc
     FROM k a
