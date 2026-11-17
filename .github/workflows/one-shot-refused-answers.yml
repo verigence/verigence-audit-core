@@ -1,0 +1,85 @@
+name: One-shot refused answers (DEV, read-only)
+
+# Why Document Intelligence refuses some answers as "unusable"
+# (DOCUMENT_AI_RESPONSE_INVALID). Every document standing FAILED with that code
+# is read once more with production's own request, and the answer is described
+# without any of its text (tools/statement_reread_experiment/di_refused.py):
+# JSON or not, how many objects, where on the page each was read from, and per
+# requested field whether the objects agree.
+# Writes to no database and no storage. The log carries counts, document ids,
+# the schema's own field names and the words same / differ -- never a value.
+# Run again by changing RUN below.
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-refused-answers.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-refused-answers
+  cancel-in-progress: false
+
+jobs:
+  describe:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUN: '1'
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      DI_SERVICE: di-worker
+      # Mahindra Orissa, the live Project.
+      EXPERIMENT_TENANT_ID: afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out Document Intelligence (dev)
+        uses: actions/checkout@v4
+        with:
+          repository: verigence/verigence-di
+          ref: dev
+          path: di-src
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Document Intelligence
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "DI_COMMIT=$(git -C di-src rev-parse --short HEAD)"
+          python -m venv "$RUNNER_TEMP/di"
+          "$RUNNER_TEMP/di/bin/pip" install --quiet --upgrade pip
+          "$RUNNER_TEMP/di/bin/pip" install --quiet -e di-src/backend
+          npm install --global @railway/cli
+
+      - name: Resolve the DEV worker's variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$DI_SERVICE" --json >/dev/null
+          railway variable list --service "$DI_SERVICE" --json >"$RUNNER_TEMP/di-vars.json"
+          # Nothing below prints a variable; the masks are a second guard.
+          python - "$RUNNER_TEMP/di-vars.json" <<'PY'
+          import json, re, sys
+          from pathlib import Path
+          for key, value in json.loads(Path(sys.argv[1]).read_text()).items():
+              value = str(value or "")
+              if re.search(r"KEY|SECRET|TOKEN|PASSWORD|URL|DSN", key) and len(value) >= 8 and "\n" not in value:
+                  print(f"::add-mask::{value}")
+          PY
+
+      - name: Read each refused document once more and describe the answer (nothing stored)
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/di/bin/python" tools/statement_reread_experiment/di_refused.py \
+            "$RUNNER_TEMP/di-vars.json" "$EXPERIMENT_TENANT_ID"
+
+      - name: Remove the variables from the runner
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/di-vars.json"
