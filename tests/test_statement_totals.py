@@ -64,6 +64,56 @@ def test_a_row_misread_or_read_twice_is_found_against_each_total():
     assert [(d["total"], d["rows"]) for d in found] == [("Total Receipts", D(952090))]
 
 
+def test_a_row_the_reader_takes_into_no_line_is_tried_in_and_out_of_the_total():
+    """2026-11-17: the check asks whether the page was read right, not whether
+    every label is known. Aditya's "IF ANY OTHERS" row with a word the mapping
+    does not know is a charge the dealer's Net Value may count."""
+    aditya = [
+        {"particulars_raw": "EX-SHOW ROOM PRICE OF VEHICLE", "debit_amount": "1399000"},
+        {"particulars_raw": "TCS ON INVOICE", "debit_amount": "13990"},
+        {"particulars_raw": "REGISTRATION COST", "debit_amount": "142140"},
+        {"particulars_raw": "IF ANY OTHERS UNDER BODY PROTECTION CHOICE", "debit_amount": "10000"},
+        {"particulars_raw": "BOOKING AMOUNT", "credit_amount": "21000"},
+        {"particulars_raw": "FINANCER AMOUNT", "credit_amount": "1544130"},
+    ]
+    read = read_statement(aditya)
+    assert [u["label"] for u in read.unmapped] == ["IF ANY OTHERS UNDER BODY PROTECTION CHOICE"]
+    assert read.left_out == [("DR", D(10000))]
+    # the dealer counted it ...
+    assert statement_differences(_fields(aditya, net_value="1565130", total_receipts="1565130")) == []
+    # ... or did not: both are the rows read giving the printed total
+    assert statement_differences(_fields(aditya, net_value="1555130", total_receipts="1565130")) == []
+    # a total neither way gives is still found
+    [net] = statement_differences(_fields(aditya, net_value="1560130", total_receipts="1565130"))
+    assert (net["total"], net["printed"]) == ("Net Value", D(1560130))
+
+
+def test_an_unnamed_credit_is_tried_as_a_deduction_and_as_money_received():
+    rows = [
+        {"particulars_raw": "EX-SHOW ROOM PRICE OF VEHICLE", "debit_amount": "849001"},
+        {"particulars_raw": "CONSUMER OFFER (IF APPLICABLE)", "credit_amount": "45000"},
+        {"particulars_raw": "EXCHANGED VEHICLE (Welcome Bonus)", "credit_amount": "15000"},
+        {"particulars_raw": "REGISTRATION COST", "debit_amount": "11373"},
+        {"particulars_raw": "BOOKING AMOUNT", "credit_amount": "21000"},
+        {"particulars_raw": "FINANCER AMOUNT", "credit_amount": "779374"},
+    ]
+    assert read_statement(rows).left_out == [("CR", D(15000))]
+    # off the net value, as the dealer wrote it (849001 - 45000 - 15000 + 11373)
+    assert statement_differences(_fields(rows, net_value="800374", total_receipts="800374")) == []
+    # or counted with the receipts, as a form's right-hand column does
+    assert statement_differences(_fields(rows, net_value="800374", total_receipts="815374")) == []
+
+
+def test_many_unnamed_rows_are_not_tried():
+    rows = [dict(r) for r in UTKAL] + [
+        {"particulars_raw": f"Word {n} nobody knows", "debit_amount": str(1000 * n)} for n in range(1, 5)]
+    printed = {"total_cost": str(868265 + 1000 + 2000), "total_receipts": "872090"}
+    [cost] = statement_differences(_fields(rows, **printed))
+    assert cost["total"] == "Total Cost"
+    # three of them are tried
+    assert statement_differences(_fields(rows[:-1], **printed)) == []
+
+
 def test_a_form_may_print_its_discounts_on_either_side():
     """Aditya's Net Receivable is the charges less the offers printed among them;
     its cash discount stands with the receipts (ADI-RD-261101-027)."""

@@ -1,0 +1,95 @@
+name: One-shot statement recount (DEV, read-only)
+
+# What a change to the statement add-up check or to the comma-misread repair
+# does to every account statement on file. Each statement's machine reading is
+# judged twice, by Audit Core as it was before this push and as it is after
+# (tools/statement_reread_experiment/ac_side.py count / compare), and the
+# verdicts are compared statement by statement.
+# Reads only: one read-only query, nothing written. The log carries counts by
+# dealer only -- never an amount or a name.
+# Run again by changing RUN below.
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-statement-recount.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-statement-recount
+  cancel-in-progress: false
+
+jobs:
+  recount:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      RUN: '1'
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      # Mahindra Orissa, the live Project.
+      EXPERIMENT_TENANT_ID: afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Audit Core as it was before this push and as it is now
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "AFTER=$(git rev-parse --short HEAD) BEFORE=$(git rev-parse --short HEAD~1)"
+          git worktree add --detach "$RUNNER_TEMP/before-src" HEAD~1
+          python -m venv "$RUNNER_TEMP/before"
+          "$RUNNER_TEMP/before/bin/pip" install --quiet --upgrade pip
+          "$RUNNER_TEMP/before/bin/pip" install --quiet -e "$RUNNER_TEMP/before-src"
+          python -m venv "$RUNNER_TEMP/after"
+          "$RUNNER_TEMP/after/bin/pip" install --quiet --upgrade pip
+          "$RUNNER_TEMP/after/bin/pip" install --quiet -e .
+          npm install --global @railway/cli
+
+      - name: Resolve the DEV database connection
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json >"$RUNNER_TEMP/audit-vars.json"
+          raw="$(python - "$RUNNER_TEMP/audit-vars.json" <<'PY'
+          import json, sys
+          from pathlib import Path
+          variables = json.loads(Path(sys.argv[1]).read_text())
+          print(variables.get('DATABASE_PUBLIC_URL') or variables.get('DATABASE_URL') or '')
+          PY
+          )"
+          rm -f "$RUNNER_TEMP/audit-vars.json"
+          [[ -n "$raw" ]] || { echo '::error::no DATABASE_URL on the Audit Core service.'; exit 1; }
+          case "$raw" in
+            postgresql+psycopg://*) url="$raw" ;;
+            postgresql+asyncpg://*) url="postgresql+psycopg://${raw#postgresql+asyncpg://}" ;;
+            postgresql://*) url="postgresql+psycopg://${raw#postgresql://}" ;;
+            postgres://*) url="postgresql+psycopg://${raw#postgres://}" ;;
+            *) echo '::error::DATABASE_URL is not a PostgreSQL URL.'; exit 1 ;;
+          esac
+          echo "::add-mask::$url"
+          echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
+
+      - name: Judge every statement with each version and compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool=tools/statement_reread_experiment/ac_side.py
+          "$RUNNER_TEMP/before/bin/python" "$tool" count "$RUNNER_TEMP/before.json"
+          "$RUNNER_TEMP/after/bin/python" "$tool" count "$RUNNER_TEMP/after.json"
+          "$RUNNER_TEMP/after/bin/python" "$tool" compare "$RUNNER_TEMP/before.json" "$RUNNER_TEMP/after.json"
+
+      - name: Remove the verdicts from the runner
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/audit-vars.json" "$RUNNER_TEMP/before.json" "$RUNNER_TEMP/after.json"

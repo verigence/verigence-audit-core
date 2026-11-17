@@ -119,3 +119,27 @@ def test_a_failure_is_reported_by_kind_and_place_only(tmp_path, capsys):
     assert ac_side.main(["ac_side.py", "score", str(secret), str(tmp_path / "missing.jsonl")]) == 1
     out = capsys.readouterr().out
     assert out.startswith("::error::FileNotFoundError at ") and "852000" not in out and str(tmp_path) not in out
+
+
+def test_what_a_gap_looks_like():
+    amounts = [ac_side.Decimal(852000), ac_side.Decimal(24143)]
+    assert ac_side.gaps([], amounts) is None
+    assert ac_side.gaps([ac_side.Decimal(-20)], amounts) == "SMALL"
+    assert ac_side.gaps([ac_side.Decimal(24143)], amounts) == "ROW"
+    assert ac_side.gaps([ac_side.Decimal(-3000)], amounts) == "DIGIT"
+    assert ac_side.gaps([ac_side.Decimal(92265), ac_side.Decimal(500)], amounts) == "DIGIT+OTHER"
+    assert ac_side.judge(_misread())["gaps"] == "OTHER"  # 852000 read 825000: two digits moved
+
+
+def test_a_change_is_measured_statement_by_statement():
+    bad, good = ac_side.judge(_misread()), ac_side.judge(_fields(UTKAL, **PRINTED))
+    before = {"d1": {"dealer": "aaa", **bad}, "d2": {"dealer": "aaa", **bad}, "d3": {"dealer": "bbb", **good},
+              "gone": {"dealer": "aaa", **good}}
+    after = {"d1": {"dealer": "aaa", **good}, "d2": {"dealer": "aaa", **bad},
+             "d3": {"dealer": "bbb", **good, "commaRepairs": 1, "repairedTotals": 1}, "new": {"dealer": "aaa", **good}}
+    result = ac_side.changes(before, after)
+    assert (result["statements"], result["onlyBefore"], result["onlyAfter"]) == (3, 1, 1)
+    assert result["moves"] == [{"dealer": "aaa", "from": ac_side.FAIL, "to": ac_side.PASS,
+                                "how": "ROW_NOT_NEEDED_BY_NAME", "statements": 1}]
+    assert {"when": "after", "dealer": "aaa", "verdict": ac_side.FAIL, "statements": 1} in result["verdicts"]
+    assert result["stillNotAddingUp"] == [{"dealer": "aaa", "gaps": "OTHER", "statements": 1}]
