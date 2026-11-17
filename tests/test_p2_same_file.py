@@ -1167,7 +1167,9 @@ def test_cross_outlet_rule_without_a_database():
     assert cross_outlet_fields(_identity(outlet_id=b, booking_refs=frozenset({"BK-99"}), name=None), base)
     assert cross_outlet_fields(_identity(outlet_id=b, pan=None, aadhaar="234567891234"), _identity(
         outlet_id=a, pan=None, aadhaar="234567891234"))
-    assert cross_outlet_fields(_identity(outlet_id=b, mobile="9876500000"), base) is None
+    # 2026-11-17: the mobile may differ; the name may not.
+    assert cross_outlet_fields(_identity(outlet_id=b, mobile="9876500000"), base)
+    assert cross_outlet_fields(_identity(outlet_id=b, name="Pankaj Nayak"), base) is None
     assert cross_outlet_fields(_identity(outlet_id=b, model_name="SCORPIO N"), base) is None
     assert cross_outlet_fields(_identity(outlet_id=b, pan="ABCPE9999F"), base) is None
     # The same outlet is never "across outlets"; and another outlet is never "the same file".
@@ -1563,6 +1565,12 @@ def test_one_receipt_or_one_vin_is_one_booking_whatever_the_otf_was_read_as():
     other = _identity(booking_refs=frozenset({"3714"}), receipt_numbers=frozenset({"AMCB999"}),
                       outlet_id=outlet, dealer_id=dealer)
     assert not booking_identified(other, old)
+    # The same receipt at another outlet of the dealership is the same booking too.
+    elsewhere = _identity(booking_refs=frozenset({"B-13509319"}), receipt_numbers=frozenset({"AMCB336272627"}),
+                          outlet_id=uuid4(), dealer_id=dealer)
+    assert booking_identified(elsewhere, old)
+    assert not booking_identified(_identity(booking_refs=frozenset({"9"}), receipt_numbers=frozenset({"AMCB336272627"}),
+                                            outlet_id=uuid4(), dealer_id=uuid4()), old)  # another dealership
     # The same chassis is the same sale.
     assert booking_identified(_identity(booking_refs=frozenset({"1"}), vin="MA1RA2TTKT6J34768"),
                               _identity(booking_refs=frozenset({"2"}), vin="MA1RA2TTKT6J34768"))

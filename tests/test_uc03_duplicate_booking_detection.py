@@ -368,16 +368,49 @@ def test_the_same_mobile_at_another_dealership_is_a_less_probable_duplicate(two_
     assert finding["raised"]["matchConfidencePercent"] == 40
 
 
+def _model_on(c, journey_id, model: str = "XUV700") -> None:
+    c.execute(
+        text("INSERT INTO auditcore.journey_products (tenant_id, journey_id, product_sku_id, model_name_snapshot, "
+             "variant_name_snapshot, selection_status, selection_method, selection_source) "
+             "VALUES (:t, :j, NULL, :m, NULL, NULL, 'TEST', 'EVIDENCE')"),
+        {"t": c.tenant_id, "j": journey_id, "m": model},
+    )
+
+
 def test_customer_matches_relative_on_other_booking_flags_as_probable(two_journeys) -> None:
     """Product owner 2026-10-28: a probable case, not a high-probability one."""
     c = two_journeys
     _set_field(c, journey_id=c.journey_a, document_type_key="aadhaar", field_key="aadhaar_name", value="Ramesh Gupta")
     _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_relationship_name", value="Ramesh Gupta")
     _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_name", value="Sunita Gupta")
+    # 2026-11-17: only for one model, and only against a booking not yet at delivery.
+    _model_on(c, c.journey_a)
+    _model_on(c, c.journey_b)
 
     _assert_exactly_one_flagged_as_duplicate_of_the_other(c)
     findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
     assert findings[0]["severity"] == "MEDIUM"
+
+
+def test_a_relative_booking_another_model_is_not_flagged(two_journeys) -> None:
+    """Product owner 2026-11-17: a relative's name and the same model."""
+    c = two_journeys
+    _set_field(c, journey_id=c.journey_a, document_type_key="aadhaar", field_key="aadhaar_name", value="Ramesh Gupta")
+    _set_field(c, journey_id=c.journey_b, document_type_key="pan_card", field_key="pan_father_name", value="Ramesh Gupta")
+    _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_name", value="Sunita Gupta")
+    _model_on(c, c.journey_a, "XUV700")
+    _model_on(c, c.journey_b, "THAR")
+    _sync_both(c)
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+
+
+def test_relative_booking_needs_one_model_and_no_vehicle_on_the_other() -> None:
+    empty = {"B": set(), "R": set(), "C": set(), "M": set()}
+    assert dbd.relative_booking({**empty, "M": {"XUV700"}}, {**empty, "M": {"XUV700"}})
+    assert not dbd.relative_booking({**empty, "M": {"XUV700"}}, {**empty, "M": {"THAR"}})
+    assert not dbd.relative_booking({**empty, "M": {"XUV700"}}, empty)  # no model known
+    # the other already has its vehicle: delivery documents, not a booking
+    assert not dbd.relative_booking({**empty, "M": {"XUV700"}}, {**empty, "M": {"XUV700"}, "C": {"KT1H73515"}})
 
 
 def test_surname_and_pincode_without_full_name_match_flags_as_probable(two_journeys) -> None:
@@ -410,6 +443,8 @@ def test_a_finding_raised_at_the_old_level_is_raised_again_at_the_new_one(two_jo
     _set_field(c, journey_id=c.journey_a, document_type_key="aadhaar", field_key="aadhaar_name", value="Ramesh Gupta")
     _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_relationship_name", value="Ramesh Gupta")
     _set_field(c, journey_id=c.journey_b, document_type_key="aadhaar", field_key="aadhaar_name", value="Sunita Gupta")
+    _model_on(c, c.journey_a)
+    _model_on(c, c.journey_b)
     _assert_exactly_one_flagged_as_duplicate_of_the_other(c)
     # As raised before 2026-10-28.
     c.execute(text("UPDATE auditcore.audit_findings SET severity = 'CRITICAL' WHERE tenant_id = :t "

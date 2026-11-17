@@ -639,16 +639,22 @@ def same_customer(new: FileIdentity, existing: FileIdentity) -> tuple[bool, bool
 
 def cross_outlet_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
     """The fields when the two journeys are one customer's booking of one model at two
-    different outlets (product owner 2026-11-03): the same PAN and/or Aadhaar, the same
-    mobile and the same model -- no booking reference number (each dealership numbers its
-    own) and no name (the PAN or Aadhaar is the person). None otherwise."""
+    different outlets: the same PAN and/or Aadhaar, the same model, and the same customer
+    name -- no booking reference number (each dealership numbers its own).
+
+    Product owner 2026-11-17: "mobile number can or cant be same.. same PAN or same aadhar,
+    same product type, then ... customer name and mobile number.. mobile number may not be
+    same". The mobile is shown, no longer required (until then, 2026-11-03, it was); the
+    name is required when both names are known (one not yet read: the PAN or Aadhaar is the
+    person). None otherwise."""
     if same_outlet(new, existing):
         return None
     customer = same_customer(new, existing)
     if customer is None:
         return None
-    if not (new.mobile and new.mobile == existing.mobile and (new.model_id or new.model_key)
-            and same_model(new, existing)):
+    if not ((new.model_id or new.model_key) and same_model(new, existing)):
+        return None
+    if new.name and existing.name and not same_name(new.name, existing.name):
         return None
     same_pan, same_aadhaar = customer
     fields: list[dict[str, Any]] = []
@@ -658,9 +664,12 @@ def cross_outlet_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[
     if same_aadhaar:
         fields.append({"field": "aadhaar", "label": "Aadhaar", "newValue": mask_aadhaar(new.aadhaar),
                        "existingValue": mask_aadhaar(existing.aadhaar), "exact": True})
+    if new.name and existing.name:
+        fields.append({"field": "name", "label": "Customer name", "newValue": new.name,
+                       "existingValue": existing.name, "exact": True})
     fields += [
         {"field": "mobile", "label": "Mobile", "newValue": _masked(new.mobile),
-         "existingValue": _masked(existing.mobile), "exact": True},
+         "existingValue": _masked(existing.mobile), "exact": bool(new.mobile and new.mobile == existing.mobile)},
         {"field": "model", "label": "Model", "newValue": new.model_name, "existingValue": existing.model_name,
          "exact": bool(new.model_id and new.model_id == existing.model_id) or new.model_name == existing.model_name},
         {"field": "outlet", "label": "Outlet", "newValue": _place(new.dealer_name, new.outlet_name),
@@ -879,6 +888,13 @@ def booking_identified(new: FileIdentity, existing: FileIdentity) -> bool:
     second booking has its own receipt and its own vehicle: one receipt number, or one VIN,
     is one booking, so a misread OTF no longer keeps the copy."""
     if booking_reference_shared(new, existing) or same_sale_fields(new, existing) is not None:
+        return True
+    # A dealer receipt number is the dealership's own series, not an outlet's: the same receipt
+    # and the same customer at two outlets of one dealership is one booking too (2026-11-17:
+    # ADI-RD-261027-013 / ADI-BM-261114-014, receipt AMCB301852627, held for the Team Lead).
+    same_dealer = bool(new.dealer_id and new.dealer_id == existing.dealer_id)
+    if (same_dealer and new.receipt_numbers & existing.receipt_numbers
+            and same_customer(new, existing) is not None and not two_vehicles(new, existing)):
         return True
     return bool(new.vin and new.vin == existing.vin and not two_people(new, existing))
 
