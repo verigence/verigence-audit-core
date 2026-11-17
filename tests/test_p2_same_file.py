@@ -1353,12 +1353,13 @@ def test_a_booking_file_then_its_delivery_file_become_one_journey(tenant):
     [alert] = _alerts(delivery)
     # The delivery file holds more documents: it is kept, the booking file is the copy.
     assert alert["subject_journey_id"] == booking.journey_id and alert["related_journey_id"] == delivery.journey_id
-    # 2026-11-14: one model family ("Maxx HD" and "BOL MAXX PUP HD") and the same PAN find it, but
-    # the OTF read differs by a digit: flagged for the Team Lead, never deleted ("delete should
-    # happen only for journey which has same OTF").
+    # 2026-11-17: the OTF read differs by a digit, but both carry dealer receipt BRMM/2627/04861:
+    # one payment is one booking, a misread OTF no longer holds it ("its reading problem of
+    # system", "system has to improve"): the booking file's pages go to the delivery file's
+    # journey and the copy is deleted -- not reported.
     assert {f["field"] for f in alert["payload"]["matchedFields"]} >= {"pan", "model"}
-    assert alert["outcome"] == KEPT_NO_BOOKING_REFERENCE and "the OTF differs" in alert["body"]
-    assert _queued(booking) == [] and _exists(booking) and _exists(delivery)
+    assert alert["outcome"] == "PENDING_DELETE"
+    assert len(_queued(booking)) == 1 and _exists(delivery)
 
 
 def test_the_settle_job_finds_old_pairs_and_its_dry_run_changes_nothing(tenant):
@@ -1374,13 +1375,12 @@ def test_the_settle_job_finds_old_pairs_and_its_dry_run_changes_nothing(tenant):
     _invoice(delivery, "INV27P000427")
 
     dry = run_same_sale_settle(tenant.engine, f"{tenant.tenant_id}:settle", [])
-    # Another OTF on each (2026-11-14): found and flagged, never deleted.
-    assert dry["commit"] is False and dry["toDelete"] == 0 and dry["kept"] == 1
-    assert dry["pairs"][0]["outcome"] == KEPT_NO_BOOKING_REFERENCE
+    # Another OTF read on each, one dealer receipt (2026-11-17): one booking -- to be deleted.
+    assert dry["commit"] is False and dry["toDelete"] == 1 and dry["kept"] == 0
     assert _alerts(delivery) == [] and _alerts(booking) == []
 
     done = run_same_sale_settle(tenant.engine, f"{tenant.tenant_id}:settle-commit", [])
-    assert done["toDelete"] == 0 and _queued(booking) == [] and len(_alerts(booking)) == 1
+    assert done["toDelete"] == 1 and len(_queued(booking)) == 1
 
 
 def test_the_settle_job_deletes_a_pair_with_the_same_otf(tenant):
