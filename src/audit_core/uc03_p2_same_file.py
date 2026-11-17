@@ -868,9 +868,19 @@ def pages_in_flight(connection: Connection, *, tenant_id: str, journey_id: UUID)
 
 
 def booking_identified(new: FileIdentity, existing: FileIdentity) -> bool:
-    """The copy is known to be the same booking: a booking number in common, or the same
-    sale by its receipt -- otherwise it is kept and alerted (KEPT_NO_BOOKING_REFERENCE)."""
-    return booking_reference_shared(new, existing) or same_sale_fields(new, existing) is not None
+    """The copy is known to be the same booking: the OTF in common, or -- whatever the OTF was
+    read as -- the same dealer receipt number with the same customer, or the same VIN.
+    Otherwise it is kept and alerted (KEPT_NO_BOOKING_REFERENCE).
+
+    Product owner 2026-11-17 ("its reading problem of system", "i cant tell PC to improve,
+    system has to improve"): ASHOK BEHERA, ADI-BO-261115-003 / ADI-BM-261116-031 -- the same
+    booking form, scanned twice, read INV-3693 on one copy and 3714 on the other, so the copy
+    was kept for the Team Lead although both carry dealer receipt AMCB336272627. A customer's
+    second booking has its own receipt and its own vehicle: one receipt number, or one VIN,
+    is one booking, so a misread OTF no longer keeps the copy."""
+    if booking_reference_shared(new, existing) or same_sale_fields(new, existing) is not None:
+        return True
+    return bool(new.vin and new.vin == existing.vin and not two_people(new, existing))
 
 
 def document_counts(connection: Connection, *, tenant_id: str, journey_ids: Iterable[UUID]) -> dict[UUID, int]:
@@ -969,11 +979,13 @@ def _place(dealer: str | None, outlet: str | None) -> str:
 
 
 def alert_body(payload: dict[str, Any], outcome: str) -> str:
+    # "The copy" is the journey deleted or held (fewer pages), whichever was opened first
+    # (2026-11-17: an older file was called "the new file").
     new = payload.get("newJourney") or {}
     existing = payload.get("existingJourney") or {}
     who = (f"{payload.get('customerName') or 'Unknown customer'}, {payload.get('model') or 'unknown model'}, "
            f"PC {new.get('pcName') or 'unknown'}, {_place(new.get('dealerName'), new.get('outletName'))}")
-    ref = new.get("reference") or "the new journey"
+    ref = new.get("reference") or "the copy"
     kept = payload.get("keptReason") or "the PAN is not an individual's"
     labels = [str(f.get("label") or "").replace("Customer name", "customer name").replace("Receipt number",
               "receipt number").replace("Booking reference number", "booking reference number")
@@ -981,30 +993,30 @@ def alert_body(payload: dict[str, Any], outcome: str) -> str:
               for f in payload.get("matchedFields") or []
               if f.get("field") != "bookingReference" or f.get("exact")] or ["PAN", "mobile", "customer name", "model"]
     on = labels[0] if len(labels) == 1 else f"{', '.join(labels[:-1])} and {labels[-1]}"
-    matches = (f"It matches {existing.get('reference') or 'an earlier journey'} "
+    matches = (f"It matches {existing.get('reference') or 'the journey kept'} "
                f"(PC {existing.get('pcName') or 'unknown'}, "
                f"{_place(existing.get('dealerName'), existing.get('outletName'))}) "
                f"on {on}.")
     what = {
-        DELETED: (f"The new file {ref} was deleted"
+        DELETED: (f"The copy {ref} was deleted"
                   + (f" after its {', '.join(payload['carriedDocuments']).replace('_', ' ')} "
                      f"{'was' if len(payload['carriedDocuments']) == 1 else 'were'} added to "
-                     f"{existing.get('reference') or 'the earlier journey'}."
+                     f"{existing.get('reference') or 'the journey kept'}."
                      if payload.get("carriedDocuments") else ".")),
-        PENDING_DELETE: f"The new file {ref} is being deleted.",
-        KEPT_NOT_INDIVIDUAL: (f"The new file {ref} was kept for review: {kept} "
+        PENDING_DELETE: f"The copy {ref} is being deleted.",
+        KEPT_NOT_INDIVIDUAL: (f"The copy {ref} was kept for review: {kept} "
                               "(a company or firm may book two identical vehicles)."),
-        KEPT_CHANGED: (f"The new file {ref} was kept for review: "
+        KEPT_CHANGED: (f"The copy {ref} was kept for review: "
                        f"{payload.get('keptReason') or 'it no longer matches'}."),
-        REMOVED: f"The new file {ref} has been removed.",
-        KEPT_REVIEWED: f"The new file {ref} was kept for review: its documents are already marked reviewed.",
-        KEPT_OWN_DOCUMENTS: (f"The new file {ref} was kept for review: it holds "
-                             f"{payload.get('keptReason') or 'documents the earlier journey does not'}."),
-        KEPT_CLOSED: f"The new file {ref} was kept for review: it is already closed.",
-        KEPT_NO_BOOKING_REFERENCE: (f"The new file {ref} was kept for review: "
+        REMOVED: f"The copy {ref} has been removed.",
+        KEPT_REVIEWED: f"The copy {ref} was kept for review: its documents are already marked reviewed.",
+        KEPT_OWN_DOCUMENTS: (f"The copy {ref} was kept for review: it holds "
+                             f"{payload.get('keptReason') or 'documents the journey kept does not'}."),
+        KEPT_CLOSED: f"The copy {ref} was kept for review: it is already closed.",
+        KEPT_NO_BOOKING_REFERENCE: (f"The copy {ref} was kept for review: "
                                     f"{payload.get('keptReason') or 'the booking reference number was not read'}."),
-        DELETE_FAILED: f"The new file {ref} could not be deleted; the Team Lead has been told.",
-    }.get(outcome, f"The new file is {ref}.")
+        DELETE_FAILED: f"The copy {ref} could not be deleted; the Team Lead has been told.",
+    }.get(outcome, f"The copy is {ref}.")
     return f"{ALERT_TITLE} — {who}. {what} {matches}"
 
 
@@ -1290,7 +1302,7 @@ def _raise(
     kept_reason: str | None = None
     plan = carry_plan(connection, tenant_id=tenant_id, new=new, existing=existing)
     outcome = PENDING_DELETE
-    if not booking_reference_shared(new, existing):
+    if not booking_identified(new, existing):
         outcome = KEPT_NO_BOOKING_REFERENCE
         kept_reason = _otf_reason(new, existing)
     payload = {
@@ -1567,7 +1579,7 @@ def recheck_before_delete(
         raise SameFileNoLongerHolds("it is already closed")
     if same_file_fields(new, existing) is None:
         raise SameFileNoLongerHolds(f"its model, or its PAN / Aadhaar / mobile / GSTIN, no longer match {ref}")
-    if not booking_reference_shared(new, existing):
+    if not booking_identified(new, existing):
         raise SameFileNoLongerHolds(_otf_reason(new, existing))
     pages = page_counts(connection, tenant_id=tenant_id, journey_ids=[new_journey_id, existing_journey_id])
     if kept_of([new, existing], pages) is new:

@@ -304,7 +304,7 @@ def test_alert_text_names_customer_model_pc_and_dealership():
                "existingJourney": {"reference": "ADI-RD-0", "pcName": "Mona", "dealerName": "Adishakti", "outletName": "Patia"}}
     body = alert_body(payload, "DELETED")
     assert body.startswith("Same file being uploaded — Amit Kumar Sahoo, THAR, PC Rakesh, Adishakti/Rasulgarh.")
-    assert "The new file ADI-RD-1 was deleted." in body
+    assert "The copy ADI-RD-1 was deleted." in body
     assert "ADI-RD-0 (PC Mona, Adishakti/Patia)" in body
     assert "kept for review" in alert_body(payload, "KEPT_NOT_INDIVIDUAL")
 
@@ -1546,3 +1546,33 @@ def test_the_same_chassis_is_one_vehicle_whatever_the_model_text(tenant):
                                {"t": journey.tenant_id, "j": journey.journey_id})
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
     assert "vin" in {f["field"] for f in _alerts(new)[0]["payload"]["matchedFields"]}
+
+
+def test_one_receipt_or_one_vin_is_one_booking_whatever_the_otf_was_read_as():
+    """Product owner 2026-11-17 (ASHOK BEHERA): the same booking form read INV-3693 on one
+    copy and 3714 on the other, both with dealer receipt AMCB336272627 -- one booking."""
+    from audit_core.uc03_p2_same_file import booking_identified
+
+    outlet, dealer = uuid4(), uuid4()
+    old = _identity(booking_refs=frozenset({"INV3693"}), receipt_numbers=frozenset({"AMCB336272627"}),
+                    outlet_id=outlet, dealer_id=dealer)
+    new = _identity(booking_refs=frozenset({"3714"}), receipt_numbers=frozenset({"AMCB336272627"}),
+                    outlet_id=outlet, dealer_id=dealer)
+    assert booking_identified(new, old)
+    # Another receipt and no VIN in common: the customer may have two bookings -- the Team Lead.
+    other = _identity(booking_refs=frozenset({"3714"}), receipt_numbers=frozenset({"AMCB999"}),
+                      outlet_id=outlet, dealer_id=dealer)
+    assert not booking_identified(other, old)
+    # The same chassis is the same sale.
+    assert booking_identified(_identity(booking_refs=frozenset({"1"}), vin="MA1RA2TTKT6J34768"),
+                              _identity(booking_refs=frozenset({"2"}), vin="MA1RA2TTKT6J34768"))
+
+
+def test_the_same_booking_merged_is_not_told():
+    """Product owner 2026-11-17: the same booking's new pages are added, not reported."""
+    from audit_core.uc03_p2_tenant_alerts import is_silent_merge
+
+    assert is_silent_merge("SAME_FILE_UPLOADED", {"outcome": "DELETED"})
+    assert is_silent_merge("SAME_FILE_UPLOADED", {"outcome": "PENDING_DELETE"})
+    assert not is_silent_merge("SAME_FILE_UPLOADED", {"outcome": "KEPT_NO_BOOKING_REFERENCE"})
+    assert not is_silent_merge("DUPLICATE_ACROSS_OUTLETS", {"outcome": "DELETED"})

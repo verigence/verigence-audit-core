@@ -43,7 +43,11 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_p2_access import check_p2_permission
-from audit_core.uc03_p2_tenant_alerts import _for_audience, roles_by_outlet
+from audit_core.uc03_p2_tenant_alerts import (
+    _for_audience,
+    is_silent_merge,
+    roles_by_outlet,
+)
 
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2"])
 
@@ -182,7 +186,7 @@ def messages_for(connection: Connection, *, tenant_id: str, actor_id: str,
     out: list[NotificationMessage] = []
     for row in rows:
         payload = dict(row["payload"] or {})
-        if not _for_audience(payload, held, actor_id):
+        if not _for_audience(payload, held, actor_id) or is_silent_merge(row["alert_kind"], payload):
             continue
         out.append(NotificationMessage(
             alertId=str(row["alert_id"]), kind=row["alert_kind"], title=row["title"], body=row["body"],
