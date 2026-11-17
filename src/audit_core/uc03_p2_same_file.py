@@ -639,16 +639,22 @@ def same_customer(new: FileIdentity, existing: FileIdentity) -> tuple[bool, bool
 
 def cross_outlet_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
     """The fields when the two journeys are one customer's booking of one model at two
-    different outlets (product owner 2026-11-03): the same PAN and/or Aadhaar, the same
-    mobile and the same model -- no booking reference number (each dealership numbers its
-    own) and no name (the PAN or Aadhaar is the person). None otherwise."""
+    different outlets: the same PAN and/or Aadhaar, the same model, and the same customer
+    name -- no booking reference number (each dealership numbers its own).
+
+    Product owner 2026-11-17: "mobile number can or cant be same.. same PAN or same aadhar,
+    same product type, then ... customer name and mobile number.. mobile number may not be
+    same". The mobile is shown, no longer required (until then, 2026-11-03, it was); the
+    name is required when both names are known (one not yet read: the PAN or Aadhaar is the
+    person). None otherwise."""
     if same_outlet(new, existing):
         return None
     customer = same_customer(new, existing)
     if customer is None:
         return None
-    if not (new.mobile and new.mobile == existing.mobile and (new.model_id or new.model_key)
-            and same_model(new, existing)):
+    if not ((new.model_id or new.model_key) and same_model(new, existing)):
+        return None
+    if new.name and existing.name and not same_name(new.name, existing.name):
         return None
     same_pan, same_aadhaar = customer
     fields: list[dict[str, Any]] = []
@@ -658,9 +664,12 @@ def cross_outlet_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[
     if same_aadhaar:
         fields.append({"field": "aadhaar", "label": "Aadhaar", "newValue": mask_aadhaar(new.aadhaar),
                        "existingValue": mask_aadhaar(existing.aadhaar), "exact": True})
+    if new.name and existing.name:
+        fields.append({"field": "name", "label": "Customer name", "newValue": new.name,
+                       "existingValue": existing.name, "exact": True})
     fields += [
         {"field": "mobile", "label": "Mobile", "newValue": _masked(new.mobile),
-         "existingValue": _masked(existing.mobile), "exact": True},
+         "existingValue": _masked(existing.mobile), "exact": bool(new.mobile and new.mobile == existing.mobile)},
         {"field": "model", "label": "Model", "newValue": new.model_name, "existingValue": existing.model_name,
          "exact": bool(new.model_id and new.model_id == existing.model_id) or new.model_name == existing.model_name},
         {"field": "outlet", "label": "Outlet", "newValue": _place(new.dealer_name, new.outlet_name),

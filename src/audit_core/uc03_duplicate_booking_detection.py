@@ -82,7 +82,10 @@ _NAME_FIELDS: dict[str, str] = {
     "customer_kyc": "customer_name",
 }
 # Preferred to weaker, matching the KYC precedence _NAME_FIELDS already uses.
-_RELATIONSHIP_NAME_FIELDS: tuple[str, ...] = ("aadhaar_relationship_name", "pan_relationship_name")
+# 2026-11-17: the PAN's father's name too -- read on 87% of PANs, where pan_relationship_name
+# is almost never filled.
+_RELATIONSHIP_NAME_FIELDS: tuple[str, ...] = ("aadhaar_relationship_name", "pan_relationship_name",
+                                              "pan_father_name")
 _ADDRESS_FIELDS: tuple[str, ...] = ("aadhaar_address", "customer_address")
 
 # Deciding "is this the same specific person" (surname already matched) is
@@ -911,6 +914,15 @@ def different_bookings(left: dict[str, set[str]], right: dict[str, set[str]], *,
     return by_model and bool(left.get("M") and right.get("M") and not left["M"] & right["M"])
 
 
+def relative_booking(own: dict[str, set[str]], theirs: dict[str, set[str]]) -> bool:
+    """A booking made in a relative's name (product owner 2026-11-17: "compares new booking
+    file relationship name with any existing name in the bookings (not where we get delivery
+    documents) and they have same model"): the customer's name is the other booking's
+    father's / spouse's name on its KYC, or the other way round (_match_basis), and both are
+    for one model, and the other is still a booking -- no vehicle (VIN) on it yet."""
+    return bool(own.get("M") and theirs.get("M") and own["M"] & theirs["M"]) and not theirs.get("C")
+
+
 # The booking's own numbers on another live booking (closing list item 6,
 # product owner 2026-11-16, check catalogue C1/C2): the same vehicle (its VIN,
 # or the chassis ending a document prints), the same booking number (OTF) or
@@ -1278,10 +1290,11 @@ def sync_duplicate_booking_detection(
                 continue
             if _withdrawn(connection, tenant_id=tenant_id, journey_id=candidate["journey_id"]):
                 continue  # cancelled or closed as a duplicate: never paired
-            if number is None and different_bookings(own_numbers, _booking_numbers(
-                    connection, tenant_id=tenant_id, journey_id=candidate["journey_id"]),
-                    by_model=basis in _SAME_CUSTOMER_BASES):
+            theirs = _booking_numbers(connection, tenant_id=tenant_id, journey_id=candidate["journey_id"])
+            if number is None and different_bookings(own_numbers, theirs, by_model=basis in _SAME_CUSTOMER_BASES):
                 continue  # the same customer's other booking; any open finding resolves below
+            if number is None and basis == "CUSTOMER_MATCHES_RELATIVE" and not relative_booking(own_numbers, theirs):
+                continue  # a relative's booking of another model, or one already at delivery
 
             this_confirm_date = _booking_confirm_date(
                 connection, tenant_id=tenant_id, journey_id=journey_id
