@@ -237,3 +237,28 @@ def test_the_account_register_keeps_each_transaction_once_across_uploads(dealer)
     # the reconciliation's verdict is on the row however many uploads printed it
     asha = next(r for r in account["rows"] if "ASHA" in r["narration"])
     assert asha["result"] == "Tied to receipt" and asha["journeyId"] == dealer.journeys["ASHA KUMARI RATH"]
+
+
+def test_bank_rematch_job_dry_run_changes_nothing_and_commit_reconciles(dealer):
+    """BANK_REMATCH: statements uploaded before a rule change reconciled again; the dry run
+    reports the result inside a transaction that is rolled back."""
+    from audit_core.uc03_bank_rematch import run_bank_rematch
+
+    statement = _upload(dealer)
+    with dealer.engine.begin() as c:  # as if reconciled under the old rule: the loan not tied
+        c.execute(text("UPDATE auditcore.p2_bank_statement_txns SET outcome = 'UNIDENTIFIED', journey_id = NULL, "
+                       "match_basis = NULL WHERE tenant_id = :t AND amount = 1026639"), {"t": dealer.tenant_id})
+
+    def loan_outcome():
+        with dealer.engine.begin() as c:
+            return c.execute(text("SELECT outcome FROM auditcore.p2_bank_statement_txns "
+                                  "WHERE tenant_id = :t AND amount = 1026639"), {"t": dealer.tenant_id}).scalar_one()
+
+    dry = run_bank_rematch(dealer.engine, f"{dealer.tenant_id}:bank-rematch-test", [])
+    assert (dry["commit"], dry["dealers"], dry["failed"]) == (False, 1, 0)
+    assert dry["items"][0]["loans"][0]["basis"] == "LOAN_REFERENCE"
+    assert loan_outcome() == "UNIDENTIFIED"  # rolled back
+    done = run_bank_rematch(dealer.engine, f"{dealer.tenant_id}:bank-rematch-test-commit", [])
+    assert done["commit"] is True and done["items"][0]["statements"][0]["after"]["creditsLoan"] == 1
+    assert loan_outcome() == "LOAN"
+    assert statement["statementId"]
