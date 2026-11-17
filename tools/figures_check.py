@@ -31,6 +31,9 @@ from typing import Any
 from uuid import UUID
 
 SECTIONS = ("deal", "payments", "audit-summary")
+# Bookings built at once: each section makes many round trips to the database,
+# so from a GitHub runner one booking takes half a minute on its own.
+_WORKERS = int(os.environ.get("FIGURES_WORKERS", "8"))
 
 
 def _load(path: str) -> Any:
@@ -45,7 +48,7 @@ def _engine():
     url = os.environ["FIGURES_DATABASE_URL"]
     url = url.replace("postgresql://", "postgresql+psycopg://", 1) if url.startswith("postgresql://") else url
     url = url.replace("postgres://", "postgresql+psycopg://", 1) if url.startswith("postgres://") else url
-    return create_engine(url, pool_pre_ping=True)
+    return create_engine(url, pool_pre_ping=True, pool_size=_WORKERS, max_overflow=2)
 
 
 def _read_only(engine, tenant_id: str):
@@ -147,8 +150,8 @@ def capture(args) -> None:
                               "WHERE tenant_id=:t AND journey_reference = ANY(:r)"),
                          {"t": args.tenant, "r": wanted}).mappings().all()
     started = time.monotonic()
-    out: dict[str, Any] = {}
-    for row in sorted(rows, key=lambda r: r["journey_reference"]):
+
+    def one(row) -> tuple[str, dict[str, Any]]:
         journey_id = UUID(str(row["journey_id"]))
         item: dict[str, Any] = {}
         with _read_only(engine, args.tenant) as c:
@@ -164,7 +167,12 @@ def capture(args) -> None:
                 item["checks"] = _checks(c, args.tenant, journey_id)
         except Exception as exc:  # noqa: BLE001
             item["checks"] = {"error": f"{type(exc).__name__}: {exc}"[:300]}
-        out[str(row["journey_reference"])] = item
+        return str(row["journey_reference"]), item
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=_WORKERS) as pool:
+        out = dict(pool.map(one, sorted(rows, key=lambda r: r["journey_reference"])))
     with open(args.out, "w") as handle:
         json.dump(out, handle)
     import audit_core
