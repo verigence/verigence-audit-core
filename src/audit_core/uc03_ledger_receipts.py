@@ -1,24 +1,30 @@
-"""Money the customer ledger records as received, as payments (2026-11-02).
+"""Money the customer ledger and the NDC record as received with no payment
+receipt on file: the receipts that are missing, never payments.
 
-Product owner rule (2 Nov 2026): any line item read on a billing document
-counts, the customer ledger is one, and the customer ledger is used for the
-payment verification. A receipt the dealer posted in the Tally customer ledger
-whose own receipt is not in the file (live: Bhikari Singh's Rs 11,000 booking
-amount of 23-09; Chinmay Kumar Gajendra's Rs 5,82,229 and Rs 12,50,000 of
-23-09) is money received all the same.
+Product owner 2026-11-17: "payment receipts should contain only the payment
+receipts.. it shouldn't have any data coming from NDC". A payment is a payment
+receipt on file, and nothing else: not a line of the NDC, not a posting of the
+customer ledger. From 2 to 16 Nov 2026 such a line or posting with no receipt
+on file was itself counted as a payment and listed among the payment receipts
+("NDC (no receipt on file)"), on 216 bookings by 17 Nov. That put the NDC's
+own reading among the receipts (live, UTK-SA-261103-012: receipts 2045 of
+Rs 11,000 and 2047 of Rs 5,00,000 are on file; the NDC's lines were read as
+"CHAN-2045 Rs 1,100" and "CHAN-2047 Rs 4,50,000" and stood as Rs 4,51,100 of
+further money received) and made the owner's own check -- the payment receipts
+equal the NDC's net value -- compare the NDC with itself.
 
-Each credit posting of the ledger that is money in -- a Receipt voucher, or a
-journal transfer from another ledger (a relative's account) -- is a payment of
-the booking, the ledger its document, unless a receipt on file already stands
-for it: the same receipt number, else the same amount (each receipt standing
-for one posting, the nearest date first). It is
-read from the ledger each time (payments are one row per document, and the
-ledger is one document with many postings), never stored. Credit notes
+What the NDC and the ledger are used for (product owner 2026-11-02, 11-15,
+11-16): verification. Each credit posting of the ledger that is money in -- a
+Receipt voucher, or a journal transfer from another ledger (a relative's
+account) -- and each received line of the NDC, that no receipt on file stands
+for (the same receipt number, else the same amount, each receipt standing for
+one posting, the nearest date first), is a receipt the PC is asked to upload
+(PAYMENT_RECEIPT_MISSING). It is read each time, never stored. Credit notes
 (benefits), the vehicle sale and round-off are not money received. A posting
 equal to a loan amount already known (the finance record's disbursement, the
 statement's financier row, the bank letter's sanction), or a journal from the
-financier, is the loan, which the loan rule counts: never a second payment
-beside it.
+financier, is the loan, which the loan rule counts and a system remark
+states: no receipt is asked for it.
 """
 from __future__ import annotations
 
@@ -146,7 +152,28 @@ def _match(postings: list[dict[str, Any]], receipts: list[dict[str, Any]]) -> li
             return abs((day - posting["date"]).days) if day and posting["date"] else 0
 
         free.remove(min(same, key=gap))
-    return _combined(left, [receipts[i] for i in free])
+    # (against every receipt on file: one another line took by its amount is on file all the same)
+    return _combined(_same_serial(left, receipts), [receipts[i] for i in free])
+
+
+def _serial(value: Any) -> str | None:
+    """The running number a receipt number ends in, when it has four digits or
+    more, without its leading zeros ("CDAM/2627/02045" and "CHAN-2045" both
+    end in 2045; "AMC-B/26509/26-27" ends in its year, not a serial)."""
+    digits = re.search(r"(\d+)\D*$", str(value or ""))
+    return digits.group(1).lstrip("0") or "0" if digits and len(digits.group(1)) >= 4 else None
+
+
+def _same_serial(postings: list[dict[str, Any]], receipts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Of the postings left, those whose receipt is not on file under the same
+    running number either. The NDC is handwritten: its receipt number's letters
+    and its amount are misread ("CHAN-2045 Rs 1,100" for CDAM/2627/02045 of
+    Rs 11,000, live 2026-11-17), so the number and the amount both failed to
+    find the receipt that is on file. A receipt on file ending in the same
+    running number of four digits or more is that receipt: it is not missing,
+    whatever amount the line was read as."""
+    serials = {_serial(r["receipt_number"]) for r in receipts} - {None}
+    return [p for p in postings if _serial(p["number"]) not in serials]
 
 
 # The rupees an NDC's received lines may run over its total (rounding).
@@ -269,10 +296,12 @@ def unreceipted_postings(connection: Connection, *, tenant_id: str, journey_id: 
     return {"customer": out, "loan": loan_out}
 
 
-def ledger_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
-    """The customer ledger's money-in postings, and the NDC's received lines,
-    that no receipt on file stands for and that are not the loan, each with
-    its page as its document."""
+def missing_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """The receipts the NDC and the customer ledger show and the file does not
+    have: their money-in lines no receipt on file stands for and that are not
+    the loan, each with its page as its document. Never payments: nothing here
+    is counted as money received or listed among the payment receipts (product
+    owner 2026-11-17)."""
     return unreceipted_postings(connection, tenant_id=tenant_id, journey_id=journey_id)["customer"]
 
 
@@ -365,8 +394,8 @@ __all__ = [
     "ledger_balance",
     "ledger_financier_credit",
     "ledger_loan_credit",
-    "ledger_receipts",
     "loan_without_receipt",
+    "missing_receipts",
     "money_in",
     "unreceipted_postings",
 ]

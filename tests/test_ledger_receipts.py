@@ -73,7 +73,23 @@ def _payments(journey) -> dict:
         return payments(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
 
 
-def test_a_ledger_receipt_not_in_the_file_is_counted_once_and_the_loan_never_twice(journey) -> None:
+def _missing(journey) -> list[dict]:
+    """The receipts the ledger / NDC shows and the file does not have."""
+    from audit_core.uc03_ledger_receipts import missing_receipts
+
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        return missing_receipts(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+
+def _only_receipts(view: dict) -> None:
+    """Product owner 2026-11-17: the payment receipts are the receipts on file; nothing of
+    the NDC or the customer ledger is listed among them or counted."""
+    assert not [i for i in view["items"] if i.get("fromLedger") or str(i["paymentId"]).startswith("ledger:")]
+    assert not [i for i in view["items"] if "no receipt on file" in str(i.get("document") or "")]
+
+
+def test_a_ledger_receipt_not_in_the_file_is_asked_for_and_never_a_payment(journey) -> None:
     _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
     add_receipt_payment(journey, amount="200000", receipt_number="PB/26-27/0658", receipt_date="2026-10-13")
     add_receipt_payment(journey, amount="50000", receipt_number="B/26-27/0672", receipt_date="2026-10-14")
@@ -83,17 +99,19 @@ def test_a_ledger_receipt_not_in_the_file_is_counted_once_and_the_loan_never_twi
     _ledger(journey, BHIKARI)
     _sync(journey)
     view = _payments(journey)
-    ledger = [i for i in view["items"] if i.get("fromLedger")]
-    # The booking amount and the relative's transfer, from the ledger; the cash
-    # and the 50,000 stand on their own receipts; the loan is not a payment.
-    assert sorted((i["receiptNumber"], D(i["amount"])) for i in ledger) == [
+    # The booking amount and the relative's transfer are on the ledger with no receipt on
+    # file: receipts to ask for. The cash and the 50,000 stand on their own receipts; the
+    # loan is not asked for.
+    assert sorted((p["number"], D(p["amount"])) for p in _missing(journey)) == [
         ("PB/26-27/0436", D(11000)), ("TRANS/OCT/1", D(30000))]
-    assert all(i["counted"] for i in ledger)
-    assert D(view["receiptsTotal"]) == D(291000)
+    # ... and they are not payments: the two receipts on file are the payment receipts.
+    _only_receipts(view)
+    assert sorted(D(i["amount"]) for i in view["items"]) == [D(50000), D(200000)]
+    assert D(view["receiptsTotal"]) == D(250000)
 
-    # Synced again: nothing added twice.
+    # Synced again: nothing changes.
     _sync(journey)
-    assert D(_payments(journey)["receiptsTotal"]) == D(291000)
+    assert D(_payments(journey)["receiptsTotal"]) == D(250000)
 
 
 def test_each_receipt_stands_for_one_posting_whatever_the_date_gap(journey) -> None:
@@ -114,9 +132,9 @@ def test_each_receipt_stands_for_one_posting_whatever_the_date_gap(journey) -> N
     ])
     _sync(journey)
     view = _payments(journey)
-    assert [(i["receiptNumber"], D(i["amount"])) for i in view["items"] if i.get("fromLedger")] == [
-        ("PB/26-27/0502", D(100000))]
-    assert D(view["receiptsTotal"]) == D(270000)
+    assert [(p["number"], D(p["amount"])) for p in _missing(journey)] == [("PB/26-27/0502", D(100000))]
+    _only_receipts(view)
+    assert D(view["receiptsTotal"]) == D(170000)
 
 
 def test_a_disbursement_net_of_the_lenders_charges_is_the_loan(journey) -> None:
@@ -136,8 +154,9 @@ def test_a_disbursement_net_of_the_lenders_charges_is_the_loan(journey) -> None:
     ])
     _sync(journey)
     view = _payments(journey)
-    assert [(i["receiptNumber"], D(i["amount"])) for i in view["items"] if i.get("fromLedger")] == [
-        ("PB/26-27/0401", D(582229))]
+    assert [(p["number"], D(p["amount"])) for p in _missing(journey)] == [("PB/26-27/0401", D(582229))]
+    _only_receipts(view)
+    assert D(view["receiptsTotal"]) == D(0)
     # The loan received is the ledger's credit, not the sanction.
     assert D(view["loanWithoutReceipt"]["amount"]) == D(1250000)
 
@@ -167,16 +186,17 @@ def test_the_financiers_posting_on_the_ledger_is_the_loan_when_no_statement_give
     assert (D(stated["loan"]), stated["source"]) == (D(1486991), "Customer ledger (financier's posting)")
     assert D(loan["amount"]) == D(1486991)
     view = _payments(journey)
-    assert [(i["receiptNumber"], D(i["amount"])) for i in view["items"] if i.get("fromLedger")] == [
-        ("PB/26-27/0300", D(21000))]
+    assert [(p["number"], D(p["amount"])) for p in _missing(journey)] == [("PB/26-27/0300", D(21000))]
+    _only_receipts(view)
 
 
-def test_an_ndc_receipt_line_with_no_receipt_on_file_counts_as_paid_once(journey) -> None:
-    """Product owner 2026-11-04 (Utkal NDCs: "MR NO. CR-150349" Rs 84,000 with
-    no receipt in the file): an NDC's received line counts as paid like the
-    ledger's. The line a receipt on file stands for, the finance D/O (the
-    loan) and a refund are not added; nor is a line the Tally ledger already
-    counted."""
+def test_an_ndc_receipt_line_with_no_receipt_on_file_is_asked_for_and_never_a_payment(journey) -> None:
+    """Utkal NDCs: "MR NO. CR-150349" Rs 84,000 with no receipt in the file.
+    From 2026-11-04 the line counted as paid; product owner 2026-11-17: the
+    payment receipts contain only the payment receipts, nothing from the NDC.
+    The line is a receipt to ask for. The line a receipt on file stands for,
+    the finance D/O (the loan) and a refund are not asked for; nor is a line
+    the Tally ledger already showed."""
     _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
     add_receipt_payment(journey, amount="11000", receipt_number="BRMM/2627/00416", receipt_date="2026-10-01")
     _ledger(journey, [
@@ -188,12 +208,18 @@ def test_an_ndc_receipt_line_with_no_receipt_on_file_counts_as_paid_once(journey
     ])
     _sync(journey)
     view = _payments(journey)
-    ndc = [i for i in view["items"] if i.get("fromLedger")]
-    assert [(i["receiptNumber"], D(i["amount"]), i["document"]) for i in ndc] == [
+    assert [(p["number"], D(p["amount"]), p["documentLabel"]) for p in _missing(journey)] == [
         ("CR-150349", D(84000), "NDC (no receipt on file)")]
-    assert D(view["receiptsTotal"]) == D(95000)
-    _sync(journey)
-    assert D(_payments(journey)["receiptsTotal"]) == D(95000)
+    _only_receipts(view)
+    assert [(i["receiptNumber"], D(i["amount"])) for i in view["items"]] == [("BRMM/2627/00416", D(11000))]
+    assert D(view["receiptsTotal"]) == D(11000)
+    # the Deal counts the same: the receipt on file, not the NDC's line
+    from audit_core.uc03_p2_journey360 import _paid
+
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        paid = _paid(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert paid["receipts"] == D(11000) and [r["amount"] for r in paid["customerReceipts"]] == [D(11000)]
 
 
 def test_the_offer_letters_booking_amount_is_its_plan_and_its_receipt_serials_are_the_receipts(journey) -> None:
@@ -219,5 +245,44 @@ def test_the_offer_letters_booking_amount_is_its_plan_and_its_receipt_serials_ar
     _sync(journey)
     view = _payments(journey)
     # 0608 and 0695 (a digit misread, within 1%) are the receipts on file; 0847 is not on file
-    assert [(i["receiptNumber"], D(i["amount"])) for i in view["items"] if i.get("fromLedger")] == [
-        ("0847", D(10814))]
+    assert [(p["number"], D(p["amount"])) for p in _missing(journey)] == [("0847", D(10814))]
+    _only_receipts(view)
+    assert D(view["receiptsTotal"]) == D(271335)
+
+
+def test_the_job_finds_the_booking_that_carried_ndc_money_and_runs_its_checks_again(journey) -> None:
+    """Product owner 2026-11-17: the rule having been built otherwise before, "create a job
+    which does this check, updates journey and tasks accordingly" (PAYMENT_RECEIPTS_ONLY)."""
+    from sqlalchemy import text
+
+    from audit_core.uc03_payment_receipts_only import run_payment_receipts_only
+
+    _set_policy(journey, POLICY_ACCOUNT_STATEMENT)
+    add_receipt_payment(journey, amount="11000", receipt_number="BRMM/2627/00416", receipt_date="2026-10-01")
+    _ledger(journey, [
+        {"particulars_raw": "VEHICLE COST", "debit_amount": 986500},
+        {"particulars_raw": "MR NO. BR-00416", "credit_amount": 11000},
+        {"particulars_raw": "MR NO. CR-150349", "credit_amount": 84000},
+    ])
+    _sync(journey)
+
+    def queued() -> list[str]:
+        with journey.engine.begin() as c:
+            set_tenant_context(c, journey.tenant_id)
+            return [r[0] for r in c.execute(
+                text("SELECT work_key FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
+                     "AND work_type='CONTROL_EVALUATE' AND correlation_id LIKE '%receipts-only%' ORDER BY work_key"),
+                {"t": journey.tenant_id, "j": journey.journey_id}).all()]
+
+    dry = run_payment_receipts_only(journey.engine, f"{journey.tenant_id}:receipts-only", [])
+    assert dry["commit"] is False and dry["queued"] == 0 and queued() == []
+    # the NDC's Rs 84,000 with no receipt on file: the money that was counted and is not now
+    assert (dry["bookings"], dry["withLines"], dry["lines"], D(dry["amount"])) == (1, 1, 1, D(84000))
+    assert dry["items"][0]["journeyId"] == str(journey.journey_id) and dry["items"][0]["taskSettles"] is False
+
+    done = run_payment_receipts_only(journey.engine, f"{journey.tenant_id}:receipts-only-commit", [])
+    assert done["commit"] is True and done["queued"] == 1 and done["failed"] == 0
+    assert f"unit:{journey.journey_id}:NATIVE:BOOKING" in queued()
+    # a booking named that is not on file is said so; one with nothing of the NDC among its money is left alone
+    other = run_payment_receipts_only(journey.engine, f"{journey.tenant_id}:receipts-only", ["NOPE-1"])
+    assert other["notFound"] == ["NOPE-1"] and other["bookings"] == 0

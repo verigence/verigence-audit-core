@@ -528,12 +528,16 @@ def loan_figures_check(figures: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 def settlement(
     payable: Decimal | None, received: Decimal, *, loan_unknown: bool = False, awaiting: list[str] | None = None,
+    receipts_missing: Decimal | None = None,
 ) -> dict[str, Any]:
     """Money received against the net payable. ``awaiting``: the lines still
     awaiting their billing document (product owner 2026-11-02: only billing
     documents count), so the payable is what is billed so far: a shortfall
     stands (the awaited bills can only add to it); an excess is not judged,
-    as it may be paying for them."""
+    as it may be paying for them. ``receipts_missing``: what the NDC / customer
+    ledger shows received with no payment receipt on file -- not counted as
+    received (product owner 2026-11-17: only payment receipts are payments),
+    and said beside a shortfall so the reader sees what it is waiting for."""
     if payable is None:
         return {"payable": None, "received": money(received), "balance": None, "status": None,
                 "conclusion": CANNOT, "rule": "AS-09",
@@ -557,8 +561,12 @@ def settlement(
             # A balance is money still to come in (or to refund), not a price
             # or benefit given wrongly: it is not added to the amount at risk.
             "impact": None,
+            "receiptsMissing": money(receipts_missing) if receipts_missing else None,
             "reason": None if status == "SETTLED" else (
-                "Received less than the net payable." if status == "SHORT" else "Received more than the net payable.")}
+                "Received more than the net payable." if status == "EXCESS" else
+                "Received less than the net payable." + (
+                    f" The NDC / customer ledger shows Rs {receipts_missing:,.0f} received with no payment "
+                    "receipt on file; it is not counted until the receipt is uploaded." if receipts_missing else ""))}
 
 
 # The ledger posts round-off and paise the deal does not carry: the product
@@ -833,8 +841,14 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                       "decidedBy": (deal.get("insurance") or {}).get("decidedBy"),
                       "basis": (deal.get("insurance") or {}).get("basis")},
     }
+    from audit_core.uc03_ledger_receipts import missing_receipts
+
+    # What the NDC / customer ledger shows received with no payment receipt on file: not
+    # money received (product owner 2026-11-17), said beside a shortfall.
+    not_on_file = sum((Decimal(p["amount"]) for p in missing_receipts(connection, tenant_id=tenant_id,
+                                                                      journey_id=journey_id)), Decimal(0))
     settle = settlement(dec(summary.get("payable")), receipts + loan + old_vehicle - refunds,
-                        loan_unknown=loan_on_file["unknown"],
+                        loan_unknown=loan_on_file["unknown"], receipts_missing=not_on_file or None,
                         # Each awaited bill named once (two warranty lines are one warranty bill).
                         awaiting=list(dict.fromkeys(a.get("label") or a.get("key")
                                                     for a in summary.get("awaiting") or [])))

@@ -216,10 +216,11 @@ class _Facts:
     @cached_property
     def money(self) -> dict[str, Any]:
         """Money received exactly as the Deal counts it (2026-11-03): the
-        Deal's own paid block -- the customer's receipts (the ledger's
-        receipts with no receipt on file among them), the loan by the one loan
-        rule, the old vehicle taken in kind, refunds, the total -- and the
-        customer's receipts dated, the same receipts (uc03_p2_journey360._paid).
+        Deal's own paid block -- the customer's payment receipts on file (never
+        a line of the NDC or the customer ledger: product owner 2026-11-17),
+        the loan by the one loan rule, the old vehicle taken in kind, refunds,
+        the total -- and the customer's receipts dated, the same receipts
+        (uc03_p2_journey360._paid).
         Live 2026-11-03: the payment rules counted only the receipts on file
         and a person-entered sanction, so a loan the NDC, the ERP settlement or
         the ledger gives and the exchanged vehicle read as money short."""
@@ -228,6 +229,19 @@ class _Facts:
         paid = dict(self.sheet["summary"]["paid"])
         dated = _paid(self.connection, tenant_id=self.tenant_id, journey_id=self.journey_id)["customerReceipts"]
         return {**paid, "dated": [{**r, "date": usable_date(r["date"], "receipt_date")} for r in dated]}
+
+    @cached_property
+    def missing_receipts(self) -> list[dict[str, Any]]:
+        """The receipts the NDC or the customer ledger shows and the file does
+        not have (uc03_ledger_receipts.missing_receipts): asked for from the
+        PC, never counted as money received (product owner 2026-11-17)."""
+        from audit_core.uc03_ledger_receipts import missing_receipts
+
+        return missing_receipts(self.connection, tenant_id=self.tenant_id, journey_id=self.journey_id)
+
+    @cached_property
+    def missing_receipts_total(self) -> Decimal:
+        return sum((Decimal(p["amount"]) for p in self.missing_receipts), Decimal(0))
 
     @cached_property
     def loan_received(self) -> Decimal:
@@ -911,11 +925,28 @@ def _received_in_all(facts: _Facts) -> Decimal:
     return _dec(facts.money.get("total")) or Decimal(0)
 
 
+def _awaiting_receipts(facts: _Facts, short: Decimal, tolerance: Decimal) -> str | None:
+    """Why a shortfall is not judged yet: the receipts on file fall short by no
+    more than the NDC / customer ledger shows received with no payment receipt
+    on file. Those receipts are asked for from the PC (PAYMENT_RECEIPT_MISSING)
+    -- one task for one cause, not a second finding beside it; the money is
+    judged once they are on file. None when the shortfall is larger than that,
+    or nothing is missing."""
+    missing = facts.missing_receipts_total
+    if missing <= 0 or short <= tolerance or short > missing + tolerance:
+        return None
+    return (f"The payment receipts on file are {_rupees(short)} short, and the NDC / customer ledger shows "
+            f"{_rupees(missing)} received with no payment receipt on file. Judged once those receipts are "
+            f"uploaded (see Payment receipt missing).")
+
+
 def delivered_on_short_payment(facts: _Facts) -> RuleOutcome:
     code = "DELIVERED_ON_SHORT_PAYMENT"
     state = _at_delivery(facts)
     if isinstance(state, RuleOutcome):
         return RuleOutcome(code, state.outcome, state.reason)
+    if (awaiting := _awaiting_receipts(facts, state["short"], _TOLERANCE)) is not None:
+        return RuleOutcome(code, "SKIPPED", awaiting)
     if state["short"] > _TOLERANCE:
         committed = (f" plus the loan of {_rupees(state['committed'])}"
                      + (f" ({state['loanSource']})" if state["loanSource"] else "")) if state["committed"] else ""
@@ -1070,7 +1101,7 @@ def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
             f"{_when(settles)} ({_SETTLEMENT_DAYS} days after delivery on {_when(delivered)})."
         ))
     # The money received as the Deal counts it (2026-11-03): the customer's
-    # receipts (the ledger's among them), the loan by the one loan rule and
+    # payment receipts on file, the loan by the one loan rule and
     # the old vehicle taken in kind, less refunds. Live: the receipts alone
     # were compared, so every loan the financier paid with no dealer receipt
     # read as the customer's shortfall.
@@ -1093,6 +1124,8 @@ def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
         return RuleOutcome(code, "PASS", (
             f"Money received {_rupees(received)}{refund_text} matches {how}, {_rupees(billed)}."
         ), details)
+    if (awaiting := _awaiting_receipts(facts, -gap, _INVOICE_TOLERANCE)) is not None:
+        return RuleOutcome(code, "SKIPPED", awaiting, details)
     direction = "short of" if gap < 0 else "more than"
     return RuleOutcome(code, "FAIL", (
         f"Money received {_rupees(received)}{refund_text} (receipts, loan and old vehicle as the Deal counts them) "
@@ -1569,10 +1602,8 @@ def payment_receipt_missing(facts: _Facts) -> RuleOutcome:
     booking (finance record, NDC financier row, delivery order or bank letter)
     or the financier's journal credit raises no task -- the system remark says
     the loan was received as per the NDC with no payment receipt on file."""
-    from audit_core.uc03_ledger_receipts import ledger_receipts
-
     code = "PAYMENT_RECEIPT_MISSING"
-    postings = ledger_receipts(facts.connection, tenant_id=facts.tenant_id, journey_id=facts.journey_id)
+    postings = facts.missing_receipts
     if not postings:
         return RuleOutcome(code, "PASS", "Every payment the NDC shows received has its receipt on file "
                                          "(the loan apart).")
