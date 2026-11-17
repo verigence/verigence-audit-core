@@ -152,6 +152,15 @@ _CONFIDENCE_PERCENT_BY_BASIS: dict[str, int] = {
     "SURNAME_AND_PINCODE": 50,
     "SIMILAR_ADDRESS": 35,
 }
+def confidence_percent(basis: str, signals: dict[str, Any] | None, candidate: dict[str, Any]) -> int:
+    """The match's probability. The same PAN or Aadhaar (product owner 2026-11-17): "if mobile
+    matches its 100% duplicate, if mobile doesnt match other things matches 90% probability"."""
+    if basis in ("PAN", "AADHAAR"):
+        mobile = (signals or {}).get("mobile")
+        return 100 if mobile and mobile == candidate.get("mobile") else 90
+    return _CONFIDENCE_PERCENT_BY_BASIS[basis]
+
+
 # One-to-one with _SEVERITY_BY_BASIS's own tiers -- kept as an explicit,
 # separate mapping (not derived inline) so a reviewer-facing label never
 # silently drifts if the internal severity tiers used for SLA routing
@@ -1377,7 +1386,7 @@ def sync_duplicate_booking_detection(
                     "originalityBasis": originality_basis,
                     "thisBookingConfirmDate": this_confirm_date,
                     "holderBookingConfirmDate": other_confirm_date,
-                    "matchConfidencePercent": _CONFIDENCE_PERCENT_BY_BASIS[basis],
+                    "matchConfidencePercent": confidence_percent(basis, signals, candidate),
                     "matchConfidenceLabel": _CONFIDENCE_LABEL_BY_SEVERITY[_SEVERITY_BY_BASIS[basis]],
                     # The evidence, so the pair can be judged without opening
                     # both journeys (2026-10-23).

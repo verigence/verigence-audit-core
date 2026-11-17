@@ -548,7 +548,7 @@ def test_an_open_finding_raised_on_a_weaker_basis_is_raised_again_on_the_stronge
     old, new = _findings_with_basis(c)
     assert old["audit_finding_id"] == first["audit_finding_id"] and old["finding_status"] == "VOIDED"
     assert new["finding_status"] == "OPEN" and new["severity"] == "CRITICAL"
-    assert new["raised"]["matchBasis"] == "PAN" and new["raised"]["matchConfidencePercent"] == 99
+    assert new["raised"]["matchBasis"] == "PAN" and new["raised"]["matchConfidencePercent"] == 100  # the mobile too (2026-11-17)
     assert new["journey_id"] == first["journey_id"]  # still the same journey flagged as the duplicate
     event = c.execute(
         text("SELECT safe_payload FROM auditcore.audit_finding_events WHERE tenant_id=:t "
@@ -1239,3 +1239,11 @@ def test_a_short_receipt_number_does_not_pair(two_journeys) -> None:
     for j in (c.journey_a, c.journey_b):
         dbd.sync_duplicate_booking_detection(c, tenant_id=c.tenant_id, journey_id=j, correlation_id="")
     assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+
+
+def test_a_pan_or_aadhaar_match_is_100_with_the_mobile_90_without() -> None:
+    """Product owner 2026-11-17."""
+    assert dbd.confidence_percent("PAN", {"mobile": "9876543210"}, {"mobile": "9876543210"}) == 100
+    assert dbd.confidence_percent("AADHAAR", {"mobile": "9876543210"}, {"mobile": "7654321098"}) == 90
+    assert dbd.confidence_percent("PAN", {"mobile": None}, {"mobile": None}) == 90
+    assert dbd.confidence_percent("MOBILE", {}, {}) == 95
