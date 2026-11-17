@@ -469,8 +469,9 @@ def test_the_rule_does_not_pass_a_discount_it_could_not_judge():
                      sources=[ndc])], invoice=False, price=None, policy="ACCOUNT_STATEMENT")
 
     class _Facts:
-        sheet = view
-        ndc_in_doubt = {"doc-1": "NDC (page 2): Net Value printed Rs 10,00,000, its rows add up to Rs 9,45,000"}
+        def __init__(self) -> None:
+            self.sheet = view
+            self.ndc_in_doubt = {"doc-1": "NDC (page 2): Net Value printed Rs 10,00,000, its rows add up to Rs 9,45,000"}
 
     outcome = excess_discount(_Facts())
     assert outcome.outcome == "SKIPPED" and "Not judged yet" in outcome.reason and "page 2" in outcome.reason
