@@ -178,3 +178,12 @@ def test_a_commit_job_runs_only_after_its_dry_run() -> None:
             c.execute(text("DELETE FROM auditcore.p2_worker_jobs WHERE tag LIKE :t"), {"t": f"{tenant}:%"})
     finally:
         engine.dispose()
+
+
+def test_the_code_version_is_the_deployed_commit(monkeypatch) -> None:
+    """The deploy workflow uploads the code with a BUILD_SHA file and no git metadata: the
+    after-deploy comparison found no version and never ran (live 17 Nov)."""
+    from audit_core import uc03_verified_bookings as module
+
+    monkeypatch.setenv("VERIGENCE_GIT_SHA", "4c2da234d09064be")
+    assert module.code_version() == "4c2da234d090"

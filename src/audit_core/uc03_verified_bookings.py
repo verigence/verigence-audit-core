@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated, Any
@@ -62,7 +61,12 @@ _MAX_CHANGES = 40
 
 
 def code_version() -> str | None:
-    return (os.environ.get("VERIGENCE_GIT_SHA") or os.environ.get("RAILWAY_GIT_COMMIT_SHA") or "")[:12] or None
+    """The deployed commit (the BUILD_SHA file the deploy workflow writes, the services are
+    uploaded without git): the after-deploy comparison runs once per version."""
+    from audit_core.logging_config import release_version
+
+    version = release_version()
+    return None if version == "unknown" else version
 
 
 # ── the figures ───────────────────────────────────────────────────────────────
