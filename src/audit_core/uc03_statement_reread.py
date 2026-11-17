@@ -40,6 +40,12 @@ A tag containing "-costsheet-" picks, instead, the cost sheets read before
 cost_sheet schema 1.1, which reads every priced row and the printed title
 (2026-11-05): no rows and no title yet. The same safeguards hold.
 
+A tag containing "-slashdash-" picks, instead, the statements with an amount of Rs 1,000
+or more ending in 001 -- the '/-' written after a round amount read as a 1 (2026-11-17:
+UTK-SB-261030-009's Scheme Discount 30,001, Exchange Loyalty 20,001, Other Discount 70,001
+against the cost sheet's 30,000; read before customer_ledger was told, 2026-11-06, to
+ignore a trailing '/-'). The same safeguards hold.
+
 A tag containing "-copy-" does not ask DI again: it only copies the pages DI
 has already read (after a worker restart cut a run short).
 
@@ -138,9 +144,32 @@ def _corrected_fields(connection: Connection, tenant_id: str, journey_id: UUID, 
     ).scalar() or 0)
 
 
+def slash_dash_amounts(fields: dict[str, Any]) -> list[Decimal]:
+    """The statement's amounts of Rs 1,000 or more that end in 001 (a written '/-' read as 1)."""
+    found: list[Decimal] = []
+    for key in ("discount_details", "line_items"):
+        value = fields.get(key)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                continue
+        for row in value if isinstance(value, list) else []:
+            if not isinstance(row, dict):
+                continue
+            for name in ("amount", "debit_amount", "credit_amount"):
+                try:
+                    amount = Decimal(str(row.get(name)))
+                except (ArithmeticError, ValueError):
+                    continue
+                if amount >= 1000 and amount % 1000 == 1:
+                    found.append(amount)
+    return found
+
+
 def statement_items(connection: Connection, tenant_id: str, *, misread: bool = False,
                     no_rows: bool = False, adds_up: bool = False, cost_sheets: bool = False,
-                    cost_adds_up: bool = False) -> list[dict[str, Any]]:
+                    cost_adds_up: bool = False, slash_dash: bool = False) -> list[dict[str, Any]]:
     """Every customer_ledger statement of the tenant, with whether it needs
     reading again and why not when it is left alone. ``misread`` picks the
     statements whose ex-showroom is implausible against the price book instead
@@ -184,8 +213,10 @@ def statement_items(connection: Connection, tenant_id: str, *, misread: bool = F
                            else statement_differences(document["fields"]) if adds_up else None)
             if cost_adds_up:
                 adds_up = True
-            if cost_sheets or no_rows or adds_up:
-                if cost_sheets and not cost_adds_up and (rows or document["fields"].get("document_title")):
+            if cost_sheets or no_rows or adds_up or slash_dash:
+                if slash_dash and not slash_dash_amounts(document["fields"]):
+                    decision = "SKIP_NO_SLASH_DASH_AMOUNT"
+                elif cost_sheets and not cost_adds_up and (rows or document["fields"].get("document_title")):
                     decision = "SKIP_READ_SINCE_1_1"
                 elif no_rows and rows:
                     decision = "SKIP_HAS_ROWS"
@@ -431,6 +462,7 @@ def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> dic
     adds_up = "-addsup-" in tag
     cost_adds_up = "-csaddsup-" in tag
     cost_sheets = "-costsheet-" in tag
+    slash_dash = "-slashdash-" in tag
     summary: dict[str, Any] = {}
     for tenant_id in tenant_ids:
         try:
@@ -439,7 +471,7 @@ def run_statement_reread(engine: Engine, tag: str, tenant_ids: list[str]) -> dic
                 if not account_statement_is_source_of_truth(connection, tenant_id=tenant_id):
                     continue
                 items = statement_items(connection, tenant_id, misread=misread, no_rows=no_rows, adds_up=adds_up,
-                                        cost_sheets=cost_sheets, cost_adds_up=cost_adds_up)
+                                        cost_sheets=cost_sheets, cost_adds_up=cost_adds_up, slash_dash=slash_dash)
         except Exception:
             logger.warning("statement_reread_failed", tag=tag, tenant_id=tenant_id, exc_info=True)
             continue
