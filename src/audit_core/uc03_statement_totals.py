@@ -19,6 +19,16 @@ Within ADDS_UP_TOLERANCE. A copy that is not a statement form, or whose rows
 the reader mostly cannot name (an ERP settlement filed as the NDC), is not
 judged here: the rows would not mean what a form's rows mean.
 
+A row the reader takes into no line is still a row on the page (2026-11-17).
+The check asks whether the page was read right, not whether every label is
+known: a row left out for its label ("IF ANY OTHERS" with a word the mapping
+does not know, "EXCHANGED VEHICLE (Welcome Bonus)", "SCHEME OF MONTH TCS @ 1%")
+is tried both in and out of the dealer's total, a debit as a charge, a credit
+as a deduction or money received. Live, of 15 copies that added up under no
+reading: 4 failed for such a row, 2 of them for it alone. The row itself stays
+reported as not taken into the Deal (the unmapped finding), which is a
+different question. More than _MAX_UNNAMED such rows on a side are not tried.
+
 A cost sheet is judged once its rows are read (cost_sheet schema 1.1,
 ``line_items``): the on-road total is its charges less some of its
 deductions. A cost sheet read before that has four figures only, and its
@@ -59,6 +69,9 @@ TASK_TYPE = "STATEMENT_ROWS_DO_NOT_ADD_UP"
 ADDS_UP_TOLERANCE = Decimal(10)
 # More discount rows than this and the ways they may be split are not tried.
 _MAX_SPLIT = 8
+# More rows the reader took into no line than this, on one side, and they are
+# not tried in the totals: the ways to add up would grow until one fitted.
+_MAX_UNNAMED = 3
 _CHARGES_TOTALS = {"total_cost": "Total Cost", "gross_value": "Gross Value"}
 _NET_TOTALS = {"net_value": "Net Value"}
 _RECEIPT_TOTALS = {"total_receipts": "Total Receipts"}
@@ -155,6 +168,13 @@ def _difference(label: str, printed: Decimal, ways: list[Decimal]) -> dict[str, 
     return {"total": label, "printed": printed, "rows": nearest, "difference": printed - nearest}
 
 
+def _unnamed(read: StatementRead, side: str) -> list[Decimal]:
+    """The amounts of the rows of one side the reader took into no line; none
+    when there are too many to try."""
+    amounts = [amount for row_side, amount in read.left_out if row_side == side]
+    return amounts if len(amounts) <= _MAX_UNNAMED else []
+
+
 def understood(read: StatementRead) -> bool:
     """A statement form whose rows the reader names (at most half the charges'
     worth left unnamed)."""
@@ -176,8 +196,12 @@ def statement_differences(fields: dict[str, Any]) -> list[dict[str, Any]] | None
         return None
     charges = sum(read.components.values(), Decimal(0))
     old = read.old_vehicle_value or Decimal(0)
+    unnamed_charges, unnamed_credits = _unnamed(read, "DR"), _unnamed(read, "CR")
     shares = _splits(list(read.discounts.values()))
-    less = [charges - share - o for share in shares for o in {Decimal(0), old}]
+    if unnamed_credits:
+        shares = {share + credit for share in shares for credit in _splits(unnamed_credits)}
+    less = [charges + more - share - o
+            for more in _splits(unnamed_charges) for share in shares for o in {Decimal(0), old}]
     received = [read.receipts + share + o for share in shares for o in {Decimal(0), old, -old}]
     ex_showroom = read.components.get("ex_showroom_price")
     printed: list[tuple[str, Decimal, list[Decimal]]] = []

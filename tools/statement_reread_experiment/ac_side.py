@@ -10,6 +10,12 @@ the same pages under other provider settings.
     python ac_side.py select <sample.json>
     python ac_side.py score  <sample.json> <readings.jsonl>
 
+and, to measure a change to the check or to the misread repair on every
+statement on file (2026-11-17), with each version of Audit Core installed:
+
+    python ac_side.py count   <verdicts.json>
+    python ac_side.py compare <before.json> <after.json>
+
 The repository is public and so is this job's log: only counts, document ids
 and verdicts are printed. No amount, name or field value ever is.
 """
@@ -62,8 +68,33 @@ def judge(fields: dict[str, Any]) -> dict[str, Any]:
     else:
         error = sum((abs(Decimal(str(d["difference"]))) for d in differences), Decimal(0))
         verdict = FAIL if differences else PASS
+    amounts = [amount for row in line_rows(fields.get("line_items")) for key in ("debit_amount", "credit_amount")
+               if (amount := _amount(row.get(key))) not in (None, Decimal(0))]
     return {"verdict": verdict, "error": None if error is None else str(error), "rows": rows_read,
-            "totals": totals, "commaRepairs": len(repairs)}
+            "totals": totals, "commaRepairs": len(repairs),
+            "repairedTotals": sum(1 for r in repairs if r.get("side") == "printed_total"),
+            "gaps": gaps([Decimal(str(d["difference"])) for d in differences or []], amounts)}
+
+
+def gaps(differences: list[Decimal], amounts: list[Decimal]) -> str | None:
+    """What the gaps of a copy that does not add up look like, as an indication
+    of the cause (never proof): SMALL within Rs 100 (the dealer's rounding, or a
+    last digit), ROW the amount of one of its rows (a row read twice, not read
+    as the dealer counted it, or left out of the dealer's sum), DIGIT one digit
+    of one place (3,000, 500: one digit misread somewhere), OTHER anything else."""
+    kinds = set()
+    for difference in differences:
+        gap = abs(difference)
+        digits = str(int(gap)) if gap == gap.to_integral_value() else ""
+        if gap <= 100:
+            kinds.add("SMALL")
+        elif any(abs(gap - abs(amount)) <= 10 for amount in amounts):
+            kinds.add("ROW")
+        elif digits and digits.strip("0") and len(digits.strip("0")) == 1:
+            kinds.add("DIGIT")
+        else:
+            kinds.add("OTHER")
+    return "+".join(sorted(kinds)) or None
 
 
 def stratum(judged: dict[str, Any]) -> str | None:
@@ -250,6 +281,51 @@ def select(sample_path: Path) -> None:
     print(f"SAMPLE statements={len(sample)}")
 
 
+def count(out_path: Path) -> None:
+    """Every statement on file judged by the Audit Core installed here."""
+    population = _population(os.environ["EXPERIMENT_TENANT_ID"])
+    out_path.write_text(json.dumps({item["documentId"]: {"dealer": item["dealer"], **item["stored"]}
+                                    for item in population}))
+    verdicts = Counter(item["stored"]["verdict"] for item in population)
+    print(f"COUNT statements={len(population)} " + " ".join(f"{k}={v}" for k, v in sorted(verdicts.items())))
+
+
+def changes(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """What a change to the check or the repair did to each statement both
+    versions judged: verdicts before and after, each move with what made it
+    (a figure put back, a printed total put back, or a row no longer needed
+    by name), and what the gaps of those still not adding up look like."""
+    both = sorted(set(before) & set(after))
+    moves: Counter[tuple[str, str, str, str]] = Counter()
+    verdicts: Counter[tuple[str, str, str]] = Counter()
+    left: Counter[tuple[str, str]] = Counter()
+    for document in both:
+        was, now = before[document], after[document]
+        dealer = str(now["dealer"])
+        verdicts[("before", dealer, was["verdict"])] += 1
+        verdicts[("after", dealer, now["verdict"])] += 1
+        if was["verdict"] != now["verdict"]:
+            how = ("PRINTED_TOTAL_PUT_BACK" if now.get("repairedTotals") else
+                   "FIGURE_PUT_BACK" if int(now.get("commaRepairs") or 0) > int(was.get("commaRepairs") or 0) else
+                   "ROW_NOT_NEEDED_BY_NAME")
+            moves[(dealer, was["verdict"], now["verdict"], how)] += 1
+        if now["verdict"] == FAIL:
+            left[(dealer, str(now.get("gaps")))] += 1
+    return {"statements": len(both), "onlyBefore": len(set(before) - set(after)),
+            "onlyAfter": len(set(after) - set(before)),
+            "verdicts": [{"when": w, "dealer": d, "verdict": v, "statements": n} for (w, d, v), n in sorted(verdicts.items())],
+            "moves": [{"dealer": d, "from": a, "to": b, "how": h, "statements": n} for (d, a, b, h), n in sorted(moves.items())],
+            "stillNotAddingUp": [{"dealer": d, "gaps": g, "statements": n} for (d, g), n in sorted(left.items())]}
+
+
+def compare(before_path: Path, after_path: Path) -> None:
+    result = changes(json.loads(before_path.read_text()), json.loads(after_path.read_text()))
+    print(f"COMPARED statements={result['statements']} only_before={result['onlyBefore']} only_after={result['onlyAfter']}")
+    for key, name in (("verdicts", "VERDICT"), ("moves", "MOVE"), ("stillNotAddingUp", "STILL")):
+        for row in result[key]:
+            print(f"{name} " + json.dumps(row, sort_keys=True))
+
+
 def report(sample_path: Path, readings_path: Path) -> None:
     sample = json.loads(sample_path.read_text())["documents"]
     readings = [json.loads(line) for line in readings_path.read_text().splitlines() if line.strip()]
@@ -273,8 +349,13 @@ def main(argv: list[str]) -> int:
             select(Path(argv[2]))
         elif len(argv) == 4 and argv[1] == "score":
             report(Path(argv[2]), Path(argv[3]))
+        elif len(argv) == 3 and argv[1] == "count":
+            count(Path(argv[2]))
+        elif len(argv) == 4 and argv[1] == "compare":
+            compare(Path(argv[2]), Path(argv[3]))
         else:
-            print("usage: ac_side.py select <sample.json> | score <sample.json> <readings.jsonl>")
+            print("usage: ac_side.py select <sample.json> | score <sample.json> <readings.jsonl> | "
+                  "count <verdicts.json> | compare <before.json> <after.json>")
             return 2
     except Exception as exc:  # noqa: BLE001 - a public log: the kind of failure and where, never its text
         import traceback

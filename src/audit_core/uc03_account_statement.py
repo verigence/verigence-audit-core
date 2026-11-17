@@ -431,6 +431,10 @@ class StatementRead:
     refunds: Decimal = Decimal(0)
     # lines left blank on purpose, with why
     unmapped: list[dict[str, Any]] = field(default_factory=list)
+    # the same lines as figures: (side "DR" / "CR", amount) of each row the
+    # reader took into no line. The row is still on the page, and the dealer's
+    # printed totals may count it (uc03_statement_totals).
+    left_out: list[tuple[str, Decimal]] = field(default_factory=list)
     # the customer's money received, line by line (not the finance D/O nor
     # the old vehicle taken in kind): (row, amount)
     received: list[tuple[dict[str, Any], Decimal]] = field(default_factory=list)
@@ -460,6 +464,10 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
 
     def give(kind: str, key: str, amount: Decimal, row: str = "") -> None:
         found.setdefault((kind, key, row), []).append(amount)
+
+    def leave(label: str, side: tuple[str, Decimal], why: str) -> None:
+        out.unmapped.append({"label": label, "amount": side[1], "why": why})
+        out.left_out.append(side)
 
     # The Offer Letter / Payment Details form plans the payment ("BOOKING
     # AMOUNT", "FINANCE AMOUNT", "DOWNPAYMENT") and then lists the money
@@ -493,8 +501,7 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             continue
         if _SCRAPPAGE.fullmatch(label):
             if not _SCRAPPAGE_BONUS.fullmatch(label):
-                out.unmapped.append({"label": label, "amount": amount, "why": (
-                    "names the scrappage but no bonus: it may be the certificate of deposit bought for it")})
+                leave(label, side, "names the scrappage but no bonus: it may be the certificate of deposit bought for it")
                 continue
             give("DISCOUNT", SCRAPPAGE_COD_KEY if _COD.fullmatch(label) else SCRAPPAGE_DEALER_KEY, amount)
             continue
@@ -520,8 +527,7 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             # "CASH DISCOUNT (11.2kw Charger Stock In)" Rs 71,429 (ADI-BM-261114-008,
             # recheck 2026-11-14): the charger's value settled with the customer,
             # not a discount the dealer gave.
-            out.unmapped.append({"label": label, "amount": amount,
-                                 "why": "charger settlement written on a discount row, not a discount"})
+            leave(label, side, "charger settlement written on a discount row, not a discount")
             continue
         if discount is not None:
             give("DISCOUNT", discount, amount)
@@ -564,8 +570,7 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
         if working is not None and item is not None:
             read = read_working(working["working"], amount)
             if read is None or (read[1] and item != "accessories_cost"):
-                out.unmapped.append({"label": label, "amount": amount,
-                                     "why": "the working written beside it does not agree with the amount"})
+                leave(label, side, "the working written beside it does not agree with the amount")
                 continue
             value, free = read
             give("COMMERCIAL", item, value, "VLTD" if item == "other_charges" else "")
@@ -577,7 +582,7 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             charge, named = noted
             give("COMMERCIAL", charge, amount, _other_charge_row(named) if charge == "other_charges" else "")
             continue
-        out.unmapped.append({"label": label, "amount": amount, "why": "label not in the mapping"})
+        leave(label, side, "label not in the mapping")
     totals: dict[tuple[str, str], Decimal] = {}
     in_conflict: set[tuple[str, str]] = set()
     for (kind, key, _), amounts in sorted(found.items()):
