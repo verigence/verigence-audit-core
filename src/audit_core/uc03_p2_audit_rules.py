@@ -932,8 +932,17 @@ def _awaiting_receipts(facts: _Facts, short: Decimal, tolerance: Decimal) -> str
     -- one task for one cause, not a second finding beside it; the money is
     judged once they are on file. None when the shortfall is larger than that,
     or nothing is missing."""
+    if short <= tolerance:
+        return None
+    # The NDC's payment lines do not add up to the total it prints: what it shows received
+    # is not known, so neither is a shortfall the receipts would explain (one cause, one
+    # task: the NDC reading, product owner 2026-11-17).
+    check = getattr(facts, "receipts_check", None) or {}
+    if check.get("status") == "HELD":
+        return (f"The payment receipts on file are {_rupees(short)} short, and the NDC's payments cannot be "
+                f"read with certainty: {check.get('held')} The payments are judged once it is.")
     missing = facts.missing_receipts_total
-    if missing <= 0 or short <= tolerance or short > missing + tolerance:
+    if missing <= 0 or short > missing + tolerance:
         return None
     return (f"The payment receipts on file are {_rupees(short)} short, and the NDC shows "
             f"{_rupees(missing)} received with no payment receipt on file. Judged once those receipts are "

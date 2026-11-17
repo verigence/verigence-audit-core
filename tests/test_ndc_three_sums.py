@@ -252,3 +252,19 @@ def test_a_payments_column_a_few_rupees_off_is_still_checked(journey) -> None:
     add_receipt_payment(journey, amount="11000", receipt_number="KRM/2627/3592", receipt_date="2026-10-01")
     check = _check(journey)
     assert (check["status"], check["short"]) == ("SHORT", D(100000))
+
+
+def test_the_short_payment_checks_wait_while_the_ndcs_payments_are_held(journey) -> None:
+    """Figures check on #855: ADI-RD-261114-027's NDC payments do not add up (Total Receipts
+    read Rs 1,13,179 for Rs 11,25,179); with the receipt task held, delivered-on-short-payment
+    fired on the same shortfall instead. While the NDC is held, the money waits for its reading."""
+    from audit_core.uc03_p2_audit_rules import _awaiting_receipts, _Facts
+
+    misread = [dict(r) for r in UTKAL]
+    misread[7]["credit_amount"] = "150000"
+    _ndc(journey, misread, **PRINTED)
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        facts = _Facts(c, journey.tenant_id, journey.journey_id)
+        waiting = _awaiting_receipts(facts, D(204598), D(1000))
+    assert waiting is not None and "cannot be read with certainty" in waiting
