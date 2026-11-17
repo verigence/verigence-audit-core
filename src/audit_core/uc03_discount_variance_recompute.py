@@ -75,7 +75,10 @@ def recompute_journey(engine: Engine, *, tenant_id: str, journey_id: UUID, commi
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
         if not commit:
-            return discount_variance_rows(deal(connection, tenant_id=tenant_id, journey_id=journey_id))
+            from audit_core.uc03_statement_totals import charges_in_doubt
+
+            return discount_variance_rows(deal(connection, tenant_id=tenant_id, journey_id=journey_id),
+                                          charges_in_doubt(connection, tenant_id=tenant_id, journey_id=journey_id))
         if refresh_price_variance(connection, tenant_id=tenant_id, journey_id=journey_id) is None:
             raise RuntimeError("the Deal could not be built")
         stored = connection.execute(

@@ -301,6 +301,22 @@ def copies_not_adding_up(connection: Connection, *, tenant_id: str, journey_id: 
     return judged, sorted(out, key=lambda d: (d["pageNumber"] is None, d["pageNumber"] or 0, d["documentId"]))
 
 
+def charges_in_doubt(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, str]:
+    """The NDC / cost-sheet copies whose charges and discounts do not give their own
+    printed totals (Net Value, Total Cost, ...; the payments column apart), by document
+    id, with why. A discount read from such a copy is not judged as excess until the
+    reading is corrected: the product owner's first sum, "all these values should add
+    up as one sum" (2026-11-17). A PC's closure of the reading task does not change it:
+    a closure is not a reading."""
+    _, copies = copies_not_adding_up(connection, tenant_id=tenant_id, journey_id=journey_id)
+    out: dict[str, str] = {}
+    for copy in copies:
+        charges = [d for d in copy["differences"] if d["total"] != "Total Receipts"]
+        if charges:
+            out[copy["documentId"]] = describe([{**copy, "differences": charges}])
+    return out
+
+
 def _rupees(value: Decimal) -> str:
     whole = int(abs(value).quantize(Decimal(1)))
     digits = str(whole)

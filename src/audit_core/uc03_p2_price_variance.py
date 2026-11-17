@@ -45,7 +45,10 @@ def refresh_price_variance(connection: Connection, *, tenant_id: str, journey_id
             view = deal(connection, tenant_id=tenant_id, journey_id=journey_id)
             raw = view["summary"]["variance"]["currentVsStandard"]
             value = Decimal(raw) if raw is not None else Decimal(0)
-            discounts = json.dumps(discount_variance_rows(view))
+            from audit_core.uc03_statement_totals import charges_in_doubt
+
+            discounts = json.dumps(discount_variance_rows(
+                view, charges_in_doubt(connection, tenant_id=tenant_id, journey_id=journey_id)))
             # The version is stamped even when the figure itself has not moved:
             # that is what marks the cache current for the facts as they stand.
             connection.execute(
