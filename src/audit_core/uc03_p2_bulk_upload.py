@@ -758,7 +758,7 @@ def run_bulk_settle(engine: Engine, tag: str, tenant_ids: list[str] | None = Non
     from audit_core.uc03_p2_journey_delete import system_delete_journey
     from audit_core.uc03_p2_same_file import (
         _identities,
-        booking_reference_shared,
+        booking_identified,
         carry_documents,
         carry_plan,
     )
@@ -790,7 +790,7 @@ def run_bulk_settle(engine: Engine, tag: str, tenant_ids: list[str] | None = Non
             # "delete should happen only for journey which has same OTF"); otherwise it stays a
             # booking of its own, which the duplicate-booking check flags for the Team Lead.
             if target is not None and me is not None and not unsure and not (
-                    booking_reference_shared(me, target)
+                    booking_identified(me, target)
                     or _folder_numbers(connection, tenant_id, journey_id) & target.booking_refs):
                 unsure = "no booking reference number (OTF) in common"
         files_sql = ("UPDATE auditcore.p2_bulk_files SET outcome=:o, placed_journey_id=:p, placed_reference=:r, "

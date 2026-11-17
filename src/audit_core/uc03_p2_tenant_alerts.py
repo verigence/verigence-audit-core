@@ -84,6 +84,19 @@ def roles_by_outlet(connection: Connection, *, tenant_id: str, actor_id: str) ->
             for o in scope_outlets(connection, tenant_id, actor_id)}
 
 
+# Product owner 2026-11-17: "if the booking otf is same and there are additional pages, then it
+# shouldnt be reported as duplicate booking and we should simply add new pages". A copy found to be
+# the same booking (the OTF, the dealer receipt or the VIN in common: uc03_p2_same_file
+# .booking_identified) has its new pages added and is removed without a word: no banner, no
+# message. Only a copy held for the Team Lead (a KEPT_* outcome) is told.
+_MERGED_OUTCOMES = frozenset({"DELETED", "PENDING_DELETE"})
+
+
+def is_silent_merge(kind: str | None, payload: dict[str, Any] | None) -> bool:
+    """A same-file alert that only records the same booking's pages being added (not told)."""
+    return kind == "SAME_FILE_UPLOADED" and (payload or {}).get("outcome") in _MERGED_OUTCOMES
+
+
 def active_alerts(connection: Connection, *, tenant_id: str, since: datetime | None = None,
                   held: dict[str, set[str]] | None = None, actor_id: str | None = None) -> list[TenantAlert]:
     from audit_core.uc03_p2_same_file import _CLOSED_SQL
@@ -125,6 +138,7 @@ def active_alerts(connection: Connection, *, tenant_id: str, since: datetime | N
         )
         for row in rows
         if _for_audience(dict(row["payload"] or {}), held, actor_id)
+        and not is_silent_merge(row["alert_kind"], dict(row["payload"] or {}))
     ]
 
 
