@@ -4397,6 +4397,61 @@ def run_data_archive(engine: Engine, tenant_id: str, now: datetime | None = None
         return None
 
 
+# The verified bookings compared again (product owner 17 Nov 2026, uc03_verified_bookings):
+# each night at the Jobs page time (9:40 pm IST), and once per Project after each deploy.
+_VERIFIED_CHECK_UTC = job_schedule.time_utc("VERIFIED_CHECK")
+_last_verified_check: dict[str, str] = {}
+_verified_after_deploy: set[str] = set()
+
+
+def _verified_check_due(tenant_id: str, now: datetime | None = None) -> str | None:
+    """The UTC date whose verified-bookings check this worker still owes, once its time has passed."""
+    if _VERIFIED_CHECK_UTC.strip().lower() in {"", "off", "none"}:
+        return None
+    now = now or datetime.now(UTC)
+    hour, _, minute = _VERIFIED_CHECK_UTC.partition(":")
+    due_at = now.replace(hour=int(hour), minute=int(minute or 0), second=0, microsecond=0)
+    if now < due_at:
+        return None
+    today = now.date().isoformat()
+    return None if _last_verified_check.get(tenant_id) == today else today
+
+
+def run_verified_checks(engine: Engine, tenant_id: str, now: datetime | None = None) -> dict | None:
+    """The night's comparison, and the one after a deploy: each claimed durably once
+    (p2_scheduled_runs), so two workers or a restart never run it twice."""
+    from audit_core.uc03_verified_bookings import (
+        DAILY_RUN,
+        DEPLOY_RUN,
+        check_verified,
+        code_version,
+    )
+
+    runs = []
+    version = code_version()
+    if version and tenant_id not in _verified_after_deploy:
+        runs.append((DEPLOY_RUN, version, "DEPLOY"))
+    due = _verified_check_due(tenant_id, now)
+    if due is not None:
+        runs.append((DAILY_RUN, due, "DAILY"))
+    result = None
+    for run_name, run_key, trigger in runs:
+        try:
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                claimed = claim_scheduled_run(connection, tenant_id=tenant_id, run_name=run_name,
+                                              run_key=run_key, claimed_by=_WORKER_ID)
+            if trigger == "DEPLOY":
+                _verified_after_deploy.add(tenant_id)
+            else:
+                _last_verified_check[tenant_id] = run_key
+            if claimed:
+                result = check_verified(engine, tenant_id, trigger)
+        except Exception:
+            logger.warning("p2_verified_check_failed", tenant_id=tenant_id, trigger=trigger, exc_info=True)
+    return result
+
+
 def run_task_manager(engine: Engine, tenant_id: str, now: datetime | None = None) -> dict[str, int] | None:
     """The Task Manager's pass for one Project (docs/TASK_MANAGER_DESIGN_v1.0.md):
     raise today's recurring occurrences (each claimed once in
@@ -4487,6 +4542,7 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
             logger.warning("p2_document_alerts_failed", tenant_id=tenant_id, exc_info=True)
     run_dayend_sweep(engine, tenant_id)
     run_data_archive(engine, tenant_id)
+    run_verified_checks(engine, tenant_id)
     if now - _last_task_manager_at.get(tenant_id, 0.0) >= _TASK_MANAGER_SECONDS:
         _last_task_manager_at[tenant_id] = now
         run_task_manager(engine, tenant_id)
@@ -4722,6 +4778,7 @@ def _scheduled_run_due() -> bool:
     clock and what this process already ran, never the database."""
     return any(
         _nightly_review_due(tenant_id) or _dayend_sweep_due(tenant_id) or _data_archive_due(tenant_id)
+        or _verified_check_due(tenant_id)
         for tenant_id in _known_tenants
     )
 
@@ -5200,6 +5257,10 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
     if kind == "DIAG_REPORTS":
         from audit_core.uc03_p2_diagnostics import run_diagnostics
         return run_diagnostics, (engine, reports)
+    if kind == "VERIFIED_BOOKINGS_CHECK":
+        # Verified bookings compared now (the Verified bookings page's "Check now").
+        from audit_core.uc03_verified_bookings import run_verified_check
+        return run_verified_check, (engine, tag, reports)
     if kind == "MASTER_RELOAD":
         from audit_core.oem_master_reload import run_master_reload
         return run_master_reload, (engine, tag)
@@ -5457,12 +5518,48 @@ def reclaim_stalled_jobs(engine: Engine) -> dict[str, int]:
     return {"resumed": resumed, "closed": closed}
 
 
+# A job that changes live bookings runs only after its dry run (product owner 17 Nov 2026,
+# the introspection: "dry-run on live data and check a sample before applying"). A tag whose
+# label ends with "-commit" is refused unless a dry run of the same kind for the same Project
+# finished in the last _DRY_RUN_HOURS hours; the refusal is the job's detail.
+_DRY_RUN_HOURS = 24
+
+
+def dry_run_missing(connection: Connection, job: dict[str, Any]) -> str | None:
+    """Why this commit job may not run (no recent dry run of it), or None."""
+    tenant_id, sep, label = str(job.get("tag") or "").partition(":")
+    if not sep or not label.strip().lower().endswith("-commit"):
+        return None
+    found = connection.execute(
+        text(
+            """
+            SELECT 1 FROM auditcore.p2_worker_jobs
+            WHERE job_kind = :kind AND status = 'DONE' AND tag LIKE :prefix
+              AND lower(tag) NOT LIKE '%-commit'
+              AND finished_at_utc >= now() - make_interval(hours => :hours)
+            LIMIT 1
+            """
+        ),
+        {"kind": job["job_kind"], "prefix": f"{tenant_id.strip()}:%", "hours": _DRY_RUN_HOURS},
+    ).first()
+    if found is not None:
+        return None
+    return (f"Refused: no dry run of {job['job_kind']} for this Project finished in the last {_DRY_RUN_HOURS} "
+            "hours. Run it first with a label that does not end with '-commit', check its result and a "
+            "sample of the bookings it names against their papers, then run the '-commit' job.")
+
+
 def _run_job(engine: Engine, job: dict[str, Any]) -> None:
     job_id = str(job["job_id"])
     status, detail = "DONE", None
     done = threading.Event()
     threading.Thread(target=_beat, args=(engine, job_id, done), name="job-heartbeat", daemon=True).start()
     try:
+        with engine.begin() as connection:
+            set_platform_super_admin_context(connection)
+            refused = dry_run_missing(connection, job)
+        if refused:
+            raise PermissionError(refused)
         target, args = _one_shot_target(job["job_kind"], engine, job["tag"], list(job["reports"] or []))
         logger.info("p2_worker_job_started", job_id=job_id, kind=job["job_kind"], tag=job["tag"])
         result = target(*args)

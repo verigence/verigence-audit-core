@@ -23,9 +23,17 @@ deployed. What stays behind from before, and this job puts right, per booking:
   so they leave it and each Journey's bank status is worked out on its
   receipts.
 
-Which bookings: every one with an NDC / customer ledger on file whose NDC or
-ledger shows money with no receipt on file (the money that was counted), and
-every one with a "Payment receipt missing" task still open. ``reports`` may
+Product owner, later the same day: the NDC's payments are checked as sums, never
+line by line (uc03_ledger_receipts.receipts_against_ndc) -- the receipts on file
+added up against the money the NDC shows received; short by about the loan only,
+a system remark. Run again after that change, the job decides every booking's
+"Payment receipt missing" afresh: tasks asking for an NDC line a receipt on file
+already covers (a misread line) close, and an NDC whose payment lines do not add
+up to its printed Total Receipts asks for nothing until its reading is corrected.
+
+Which bookings: every one with an NDC / customer ledger on file whose receipts
+on file are short of the NDC's money, and every one with a "Payment receipt
+missing" task still open. ``reports`` may
 list journey references to limit the run.
 
 Worker job ``PAYMENT_RECEIPTS_ONLY``: tag ``<tenant_id>:<label>``. A DRY RUN
@@ -95,16 +103,18 @@ def look(connection: Connection, tenant_id: str, journey: dict[str, Any]) -> dic
     """What one booking carried: the NDC / ledger lines with no receipt on file
     (the money that was counted as paid and is not now) and whether its
     missing-receipt task is open. None when it carried neither."""
-    from audit_core.uc03_ledger_receipts import missing_receipts
+    from audit_core.uc03_ledger_receipts import receipts_against_ndc
 
-    lines = missing_receipts(connection, tenant_id=tenant_id, journey_id=UUID(str(journey["journey_id"])))
-    if not lines and not journey["open_task"]:
+    check = receipts_against_ndc(connection, tenant_id=tenant_id, journey_id=UUID(str(journey["journey_id"])))
+    short = Decimal(check["short"])
+    if not short and not journey["open_task"]:
         return None
     return {"reference": journey["journey_reference"], "journeyId": str(journey["journey_id"]),
-            "lines": len(lines), "amount": sum((Decimal(p["amount"]) for p in lines), Decimal(0)),
+            "status": check["status"], "lines": 1 if short else 0, "amount": short,
             "openTask": bool(journey["open_task"]),
-            # its task asks for receipts that are all on file: it closes when the checks run
-            "taskSettles": bool(journey["open_task"]) and not lines}
+            # its task is no longer asked (covered, held for the NDC's reading, no NDC): it
+            # closes when the checks run
+            "taskSettles": bool(journey["open_task"]) and not short}
 
 
 def _bank_dealers(connection: Connection, tenant_id: str) -> list[str]:
@@ -172,6 +182,7 @@ def run_payment_receipts_only(engine: Engine, tag: str, reports: list[str]) -> d
         "withLines": sum(1 for f in found if f["lines"]), "lines": sum(f["lines"] for f in found),
         "amount": str(sum((f["amount"] for f in found), Decimal(0))),
         "openTasks": sum(1 for f in found if f["openTask"]),
+        "byStatus": {k: sum(1 for f in found if f.get("status") == k) for k in ("SHORT", "COVERED", "HELD", "NO_NDC")},
         "tasksSettling": sum(1 for f in found if f["taskSettles"]),
         "queued": queued, "units": units,
         "bankLines": bank_lines, "bankDealers": len(dealers), "bankReconciled": reconciled, "failed": failed,

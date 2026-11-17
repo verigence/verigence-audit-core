@@ -33,7 +33,6 @@ from test_uc03_account_statement import UTKAL, _ledger, _set_policy, _sync
 
 from audit_core.db import set_tenant_context
 from audit_core.uc03_deal_source_policy import POLICY_ACCOUNT_STATEMENT
-from audit_core.uc03_ledger_receipts import _match
 from audit_core.uc03_p2_audit_summary import settlement
 
 
@@ -103,21 +102,6 @@ def test_a_figure_an_earlier_reading_recorded_leaves_the_deal(journey) -> None:
 
 
 # ── money counted once ───────────────────────────────────────────────────────
-def test_one_ledger_transfer_for_several_receipts_on_file_is_those_receipts() -> None:
-    """Live 2026-11-03: receipts of Rs 5,000, 11,000 and 70,000 posted as one
-    Rs 86,000 journal transfer."""
-    from datetime import date
-
-    posting = {"amount": D(86000), "date": date(2026, 9, 30), "number": "25287",
-               "particulars": "TRANSFER FROM ANOTHER LEDGER", "voucherType": "JOURNAL_NONGST", "mode": "OTHERS"}
-    receipts = [{"receipt_number": n, "receipt_date": d, "amount": a} for n, d, a in (
-        ("AMC-B/26509/26-27", date(2026, 9, 21), D(5000)), ("AMC-B/27112/26-27", date(2026, 9, 25), D(11000)),
-        ("AMC-B/27110/26-27", date(2026, 9, 26), D(70000)))]
-    assert _match([posting], receipts) == []
-    other = {**posting, "amount": D(30000), "number": "25288"}
-    assert _match([posting, other], receipts) == [other]
-
-
 def test_the_loans_own_receipt_net_of_charges_is_not_counted_again_from_the_letter(journey) -> None:
     """Live 2026-11-03: a Rs 7,01,366 "DISB:" receipt against a sanction of
     Rs 7,10,000; the letter's amount was added on top of it."""

@@ -1,0 +1,55 @@
+name: Rule note
+
+# A change to a module that decides a business rule names the rule and the bookings
+# checked against their papers, and updates docs/rules/RULES.md (product owner
+# 2026-11-17, introspection: a rule was added on top of the old one three times
+# because nothing asked for the rule to be written down and the old one replaced).
+
+on:
+  pull_request:
+    branches: [dev]
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  rule-note:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check the pull request names the rule
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          files="$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')"
+          rule_modules='^src/audit_core/(uc03_p2_audit_rules|uc03_ledger_receipts|uc03_p2_audit_summary|uc03_p2_journey360|uc03_account_statement|uc03_statement_totals|uc03_p2_stage|uc03_p2_task_producer)\.py$'
+          touched="$(printf '%s\n' "$files" | grep -E "$rule_modules" || true)"
+          if [ -z "$touched" ]; then
+            echo "No rule module changed."
+            exit 0
+          fi
+          echo "Rule modules changed:"; printf '  %s\n' $touched
+          rule="$(printf '%s\n' "$BODY" | grep -iE '^\s*Rule:\s*\S' || true)"
+          papers="$(printf '%s\n' "$BODY" | grep -iE '^\s*Checked against papers:\s*\S' || true)"
+          problems=0
+          if [ -z "$rule" ]; then
+            echo "::error::Name the rule in the pull request: a line 'Rule: <the rule in one line>' (or 'Rule: none' when no business rule changes)."
+            problems=1
+          fi
+          if ! printf '%s\n' "$rule" | grep -qiE 'Rule:\s*none'; then
+            if ! printf '%s\n' "$files" | grep -qx 'docs/rules/RULES.md'; then
+              echo "::error::A rule changes: update docs/rules/RULES.md in the same pull request (the rule, what it replaces, what reads it)."
+              problems=1
+            fi
+            if [ -z "$papers" ]; then
+              echo "::error::Say which bookings were checked against their papers: a line 'Checked against papers: <booking references>'."
+              problems=1
+            fi
+          fi
+          exit $problems

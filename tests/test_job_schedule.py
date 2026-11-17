@@ -148,7 +148,9 @@ def test_the_page_lists_every_job_and_a_super_admin_changes_a_time(client, monke
         assert page["sleepWindow"] == {"enabled": True, "startIst": "00:30", "endIst": "08:00"}
         daily = {j["key"]: j for j in page["daily"]}
         assert {k: j["timeIst"] for k, j in daily.items()} == {
-            "DAYEND_CLEANUP": "21:30", "NIGHTLY_REVIEW": "21:30", "DATA_ARCHIVE": "21:50"}
+            "DAYEND_CLEANUP": "21:30", "NIGHTLY_REVIEW": "21:30", "DATA_ARCHIVE": "21:50",
+            # the verified bookings compared each night (2026-11-17)
+            "VERIFIED_CHECK": "21:40"}
         assert all(j["editable"] and j["enabled"] and not j["insideSleepWindow"] for j in daily.values())
         assert daily["NIGHTLY_REVIEW"]["lastRunAtUtc"] and daily["NIGHTLY_REVIEW"]["projectsRunLast"] >= 1
         assert daily["DATA_ARCHIVE"]["changedBy"] is None
