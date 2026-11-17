@@ -12,7 +12,8 @@ dealership"):
 
 1. The PC's confirmation decides (Deal tab or this task).
 2. In-house when the policy carries one of the dealer's own Agent / MISP codes
-   (a character or two misread allowed, dealer_code_match); else when the NDC
+   (a character or two misread allowed, dealer_code_match), or the dealer's own
+   insurance dump lists the Journey's policy (2026-11-17); else when the NDC
    charges the insurance premium, or a dealer invoice bills it.
    Self when the NDC's insurance row says the customer arranged it ("Insurance
    amount OWN", "Insurance SELF", "Done by Customer"), whatever amount is
@@ -321,6 +322,24 @@ def ndc_says_own(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
     return own[0] if own else None
 
 
+def dealer_dump_policy(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    """The Journey's policy in an ACTIVE insurance dump of its own dealer, if any."""
+    row = connection.execute(
+        text(
+            """
+            SELECT d.policy_number, d.insurer, d.misp_code
+            FROM auditcore.p2_insurance_dump_rows d
+            JOIN auditcore.p2_insurance_dumps u ON u.tenant_id = d.tenant_id AND u.dump_id = d.dump_id
+            JOIN auditcore.journeys j ON j.tenant_id = d.tenant_id AND j.journey_id = d.journey_id
+            WHERE d.tenant_id = :t AND d.journey_id = :j AND u.status = 'ACTIVE' AND d.dealer_id = j.dealer_id
+            ORDER BY d.policy_date DESC NULLS LAST, d.row_no LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().first()
+    return dict(row) if row is not None else None
+
+
 def document_decision(connection: Connection, *, tenant_id: str, journey_id: UUID,
                       policy: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """In-house from the documents, with the reason, or None when they do not
@@ -343,6 +362,16 @@ def document_decision(connection: Connection, *, tenant_id: str, journey_id: UUI
                 return {"source": INHOUSE,
                         "basis": f"The policy carries the dealer's {label} (read as {policy[key]}, "
                                  f"{near[1]} character{'s' if near[1] > 1 else ''} from the dealer's code)."}
+    # The policy with the dealer's code, as the dealer's own insurance dump
+    # lists it (the MISP portal export, matched to the Journey by VIN): the
+    # policy is the dealer's even when its page was never uploaded (2026-11-17:
+    # 12 of the 56 invoiced bookings with no policy on file are in the dump).
+    dumped = dealer_dump_policy(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if dumped is not None:
+        code = f" under MISP code {dumped['misp_code']}" if dumped.get("misp_code") else ""
+        return {"source": INHOUSE,
+                "basis": f"The dealer's insurance dump lists policy {dumped['policy_number']} "
+                         f"({dumped['insurer'] or 'insurer not given'}){code}."}
     # The NDC saying the customer arranged it outweighs an amount written on
     # that row, a cost sheet's premium and a dealer invoice (2026-11-17).
     if ndc_says_own(connection, tenant_id=tenant_id, journey_id=journey_id) is not None:

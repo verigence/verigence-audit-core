@@ -374,3 +374,29 @@ def test_review_reports_pc_answers_the_documents_contradict(engine, monkeypatch)
     report = run_insurance_source_review(engine, "t-dry", [journey.tenant_id])
     listed = report["tenants"][journey.tenant_id]["pcAgainstDocuments"]
     assert [(x["pc"], x["documents"]) for x in listed] == [("INHOUSE", "SELF")]
+
+
+def test_the_dealers_insurance_dump_listing_the_policy_is_inhouse(engine, monkeypatch) -> None:
+    # the policy page never uploaded, but the dealer's MISP export lists it (2026-11-17)
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _ndc(journey, '[{"particulars_raw": "Insurance amount", "debit_amount": null}]')
+    with engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        dealer_id = connection.execute(text("SELECT dealer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+                                       {"t": journey.tenant_id, "j": journey.journey_id}).scalar_one()
+        dump_id = uuid4()
+        connection.execute(text("INSERT INTO auditcore.p2_insurance_dumps (tenant_id, dump_id, dealer_id, period_month, "
+                                "file_name, uploaded_by) VALUES (:t, :id, :d, '2026-10-01', 'oct.xlsx', 'test')"),
+                           {"t": journey.tenant_id, "id": dump_id, "d": dealer_id})
+        connection.execute(text("INSERT INTO auditcore.p2_insurance_dump_rows (tenant_id, dump_id, row_no, dealer_id, "
+                                "policy_number, insurer, misp_code, journey_id, raw) VALUES (:t, :id, 1, :d, 'MIB/1703800', "
+                                "'SBI General Insurance Co. Ltd.', :m, :j, '{}'::jsonb)"),
+                           {"t": journey.tenant_id, "id": dump_id, "d": dealer_id, "m": UTKAL_MISP, "j": journey.journey_id})
+    decision = _sync(journey)
+    assert (decision["source"], decision["decidedBy"]) == ("INHOUSE", "DOCUMENT")
+    assert "insurance dump lists policy MIB/1703800" in decision["basis"]
+    with engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_insurance_dumps SET status='SUPERSEDED' WHERE tenant_id=:t AND dump_id=:id"),
+                           {"t": journey.tenant_id, "id": dump_id})
+    assert "insurance dump" not in (_sync(journey)["basis"] or "")  # a superseded dump no longer counts
