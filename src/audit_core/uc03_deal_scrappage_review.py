@@ -41,7 +41,7 @@ logger = structlog.get_logger(__name__)
 
 _FASTAG = re.compile(r"\bFAST[ -]?T?T?AGE?\b|\bFT/", re.IGNORECASE)
 _RSA = re.compile(r"\bRSA\b|ROAD ?SIDE", re.IGNORECASE)
-_ITEMS_CAP = 1500
+_ITEMS_CAP = 1200
 
 
 def _dec(value: Any) -> Decimal | None:
@@ -116,8 +116,25 @@ def review_journey(connection: Any, *, tenant_id: str, journey_id: UUID) -> dict
             # posted on the customer ledger / Tally, not charged on the NDC
             "ledgerOnly": name in ledger and (on_ndc is None or on_ndc <= 0) and bool(statement),
         }
+    # The lines the variance is made of (more than Rs 1,000 off their standard), so a
+    # high variance can be traced to its line.
+    lines = []
+    for group in view.get("categories") or []:
+        for row in group.get("components") or []:
+            if row.get("partOf") or row.get("excluded") or row.get("notTaken"):
+                continue
+            std, cur = _dec(row.get("standard")), _dec(row.get("current"))
+            if cur is not None and std is not None and abs(cur - std) > 1000:
+                lines.append([row.get("key"), str(std), str(cur)])
+            elif cur is not None and std is None and cur > 0:
+                lines.append([row.get("key"), None, str(cur)])
+    for row in view.get("discounts") or []:
+        ent, cur = _dec(row.get("entitled")), _dec(row.get("current"))
+        if row.get("inStandard") and cur is not None and ent is not None and abs(cur - ent) > 1000:
+            lines.append([row.get("key"), str(ent), str(cur)])
     return {
         "variance": (summary.get("variance") or {}).get("currentVsStandard"),
+        "lines": lines,
         "deliveryStarted": bool(summary.get("deliveryStarted")),
         "ndcRead": bool(statement),
         "rto": {"masterStandard": (rto or {}).get("standardMaster") or (rto or {}).get("standard"),
@@ -174,7 +191,8 @@ def run_deal_scrappage_review(engine: Engine, tag: str, reports: list[str]) -> d
             totals[f"{name}LedgerOnly"] += item[name]["ledgerOnly"]
         variance = _dec(item["variance"])
         totals["varianceOver10000"] += variance is not None and abs(variance) > 10000
-        worth = bool(s) or any(item[n]["missingOnDeal"] or item[n]["ledgerOnly"] for n in ("fastag", "rsa"))
+        worth = (bool(s) or any(item[n]["missingOnDeal"] or item[n]["ledgerOnly"] for n in ("fastag", "rsa"))
+                 or (variance is not None and abs(variance) > 10000))
         if worth and len(items) < _ITEMS_CAP:
             items.append({"ref": journey["journey_reference"], **item})
     result = {"tag": tag, "totals": totals, "items": items}
