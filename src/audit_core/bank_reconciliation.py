@@ -1,11 +1,11 @@
 """bank_reconciliation.py -- tie the dealership's payment receipts to the credits on its
 own bank statements (product owner 2026-11-14). Pure: no database, no clock.
 
-Scope (product owner: "it should be from +- 5 days for which the account statement is..
-and only those bookings and journey need to be verified"): a receipt is checked only when
-its date falls within an uploaded statement's period +/- 5 days (and the statement is the
-dealership's, or that receipt's outlet's); a receipt is tied only to a credit dated within
-5 days of it. Every other receipt is left alone -- never "not found".
+Scope (product owner 2026-11-17, replacing the +/- 5 days of 2026-11-14: "lets change
+the time to statement transaction dates"): a receipt is checked only when its date falls
+within the dates of an uploaded statement's own transactions, first to last (and the
+statement is the dealership's, or that receipt's outlet's); a receipt is tied only to a
+credit dated within 5 days of it. Every other receipt is left alone -- never "not found".
 
 What the receipts on file carry (live, Mahindra Orissa, 14 Nov 2026): the amount and date
 always; the payer's UTR / RRN / cheque number on about half; the mode often only "OTHERS";
@@ -26,8 +26,9 @@ order of strength:
                statement's bank
 A tie is made only when it is unambiguous at its strength -- one candidate each way, or
 (above AMOUNT_DATE) the one clearly nearest in date each way; a receipt with several
-equally good credits is AMBIGUOUS, not guessed. A receipt not tied is NOT_FOUND when it is
-dated within a statement's own dates, OUTSIDE_DATES when only within the 5-day margin. Then, by name or reference only: one receipt paid
+equally good credits is AMBIGUOUS, not guessed. A receipt not tied is NOT_FOUND. (Until
+17 Nov 2026 a receipt dated only in a 5-day margin around the statement was OUTSIDE_DATES;
+kept for the rows of that time.) Then, by name or reference only: one receipt paid
 as two or three credits (two IMPS of Rs 1,00,000 for a Rs 2,00,000 receipt), and one credit
 receipted as two to four receipts of the same Journey.
 
@@ -35,6 +36,25 @@ Cash receipts are tied only to a cash deposit of the exact amount made the same 
 two days after, uniquely; the rest are CASH
 -- deposited in batches, not traceable one by one (product owner: cash raises no tasks).
 Card receipts the same way against card settlements (CARD).
+
+Loans (product owner 2026-11-17, match_loans): a financier's disbursement often has no
+receipt on file. A credit no receipt took -- a financier's, or a customer's that names one
+of our customers -- is tied to the Journey whose loan it is, from the loan papers on file
+(the D.O. cover, the bank approval letter, the finance record), in order of strength:
+  LOAN_REFERENCE  the D.O.'s disbursement UTR, the D.O. number, the loan application or
+                  sanction letter number is in the narration
+  LOAN_NAME       the narration names the customer and the amount is the loan's
+                  (disbursed, payout to the dealer, sanctioned or D.O. amount)
+  LOAN_FINANCIER  a credit of the loan's amount naming its financier (or its initials:
+                  PNB, IOB), the
+                  loan dated near the credit (_loan_dated: disbursed within 15 days of
+                  it, or sanctioned up to 60 days before it)
+  LOAN_AMOUNT     a financier's credit of a distinctive amount (not a round Rs 10,000)
+                  that exactly one loan of the dealership carries, that loan so dated
+Each only when one loan and one credit meet it. A financier's pooled payment (one credit
+for many loans: Cholamandalam, Softcell pool accounts) meets none and stays not identified.
+The Journey's loan receipt of that amount, if one is on file and was not found, is then
+found on that credit.
 """
 from __future__ import annotations
 
@@ -54,6 +74,8 @@ MATCHED, AMBIGUOUS, NOT_FOUND, CASH, CARD = "MATCHED", "AMBIGUOUS", "NOT_FOUND",
 # margin only): the money may have come in on a day the statements do not show.
 OUTSIDE_DATES = "OUTSIDE_DATES"
 REFERENCE, NAME, NAME_PREFIX, AMOUNT_DATE = "REFERENCE", "NAME", "NAME_PREFIX", "AMOUNT_DATE"
+LOAN_REFERENCE, LOAN_NAME, LOAN_FINANCIER, LOAN_AMOUNT = "LOAN_REFERENCE", "LOAN_NAME", "LOAN_FINANCIER", "LOAN_AMOUNT"
+LOAN_TIERS = (LOAN_REFERENCE, LOAN_NAME, LOAN_FINANCIER, LOAN_AMOUNT)
 CASH_DEPOSIT, NAME_SPLIT, COMBINED = "CASH_DEPOSIT", "SPLIT_CREDITS", "COMBINED_RECEIPTS"
 
 # What a credit is.
@@ -102,11 +124,13 @@ class Window:
         return day is not None and self.period_from <= day <= self.period_to
 
     def covers(self, day: date | None, outlet_id: str | None) -> bool:
+        """The receipt is checked on this statement: dated within its transactions' dates
+        (period_from..period_to are those, first to last), the outlet's own when it is one."""
         if day is None:
             return False
         if self.outlet_id is not None and self.outlet_id != outlet_id:
             return False
-        return (self.period_from - _days(WINDOW_DAYS)) <= day <= (self.period_to + _days(WINDOW_DAYS))
+        return self.period_from <= day <= self.period_to
 
 
 @dataclass
@@ -126,12 +150,8 @@ class CreditResult:
     basis: str | None = None
     journey_id: str | None = None
     named_journey_id: str | None = None
+    loan: bool = False  # tied to the Journey's loan (match_loans), not to a receipt
 
-
-def _days(n: int) -> Any:
-    from datetime import timedelta
-
-    return timedelta(days=n)
 
 
 # --------------------------------------------------------------------------- classifying
@@ -483,8 +503,7 @@ def reconcile(receipts: list[Receipt], credits: list[Credit], windows: list[Wind
             result.note = "Card: settled by the card company in daily batches, net of charges."
         elif not any(w.within_period(result.receipt.receipt_date) for w in in_scope(result.receipt, windows)):
             result.outcome = OUTSIDE_DATES
-            result.note = ("Dated outside the statement's own dates (within the 5-day margin): upload the "
-                           "statement for the adjoining days to confirm.")
+            result.note = "Dated outside the statement's transaction dates."
         else:
             same = [c for c in credits if c.key in free_credits and _within(result.receipt, c)
                     and _same_amount(c.amount, result.receipt.amount)]
@@ -532,21 +551,159 @@ def name_journeys(credit: Credit, people: dict[str, list[str]]) -> list[str]:
     return [jid for jid, names in people.items() if name_hit(names, credit.narration) == NAME]
 
 
+# --------------------------------------------------------------------------- loans
+
+@dataclass
+class Loan:
+    """One Journey's loan as its papers give it."""
+    journey_id: str
+    outlet_id: str | None
+    amounts: set[Decimal] = field(default_factory=set)
+    financiers: list[str] = field(default_factory=list)
+    references: list[str] = field(default_factory=list)
+    disbursed: list[date] = field(default_factory=list)
+    sanctioned: list[date] = field(default_factory=list)
+    customer_names: list[str] = field(default_factory=list)
+
+
+_FINANCIER_STOP = {"BANK", "LIMITED", "LTD", "FINANCE", "FINANCIAL", "FINANCIERS", "SERVICES", "SERVICE", "INDIA",
+                   "OF", "THE", "AND", "PRIVATE", "PVT", "COMPANY", "CORPORATION", "CO", "BRANCH", "MAIN", "NBFC",
+                   "CREDIT", "FINCORP", "FIN", "LOANS", "LOAN"}
+
+
+def financier_words(name: Any) -> list[str]:
+    """The distinctive words of a financier's name (ICICI, KOTAK, CENTRAL, CHOLAMANDALAM)."""
+    return [w for w in re.findall(r"[A-Z]{3,}", str(name or "").upper()) if w not in _FINANCIER_STOP]
+
+
+def _financier_hit(loan: Loan, narration: str) -> bool:
+    """The narration names the loan's financier: its first distinctive word (ICICI, KOTAK,
+    CENTRAL), or its initials as a word of their own (PNB, IOB, SBI)."""
+    letters = _letters(narration)
+    tokens = set(re.findall(r"[A-Z]+", str(narration or "").upper()))
+    for name in loan.financiers:
+        words = financier_words(name)
+        if words and words[0] in letters:
+            return True
+        initials = "".join(w[0] for w in re.findall(r"[A-Z]+", str(name or "").upper())
+                           if w not in {"OF", "THE", "AND", "LTD", "LIMITED", "PVT", "PRIVATE", "CO"})
+        if len(initials) >= 3 and initials in tokens:
+            return True
+    return False
+
+
+def _loan_reference_hit(loan: Loan, narration: str) -> bool:
+    """A loan paper's number in the narration: as a whole token, or (10+ characters, a UTR)
+    anywhere in it."""
+    text_ = str(narration or "").upper()
+    tokens = set(re.findall(r"[A-Z0-9]+", text_))
+    flat = _alnum(text_)
+    for ref in loan.references:
+        key = _alnum(ref)
+        if len(key) < 6 or not re.search(r"\d", key):
+            continue
+        if key in tokens or (len(key) >= 10 and key in flat):
+            return True
+    return False
+
+
+def _loan_dated(loan: Loan, day: date | None) -> bool:
+    """The loan was disbursed within 15 days of the credit, or sanctioned up to 60 days before it."""
+    if day is None:
+        return False
+    return (any(abs((day - d).days) <= 15 for d in loan.disbursed)
+            or any(0 <= (day - d).days <= 60 for d in loan.sanctioned))
+
+
+def _loan_amount(loan: Loan, amount: Decimal) -> bool:
+    return any(_same_amount(a, amount) for a in loan.amounts)
+
+
+def match_loans(loans: list[Loan], receipts: list[ReceiptResult], credits: list[CreditResult],
+                windows: list[Window]) -> None:
+    """Tie the credits no receipt took to the Journey whose loan they are (see the module
+    docstring); a tied Journey's loan receipt of that amount, not found so far, is found on
+    it. Changes ``receipts`` and ``credits`` in place."""
+    statements_of = {w.statement_id: w for w in windows}
+    taken = {cr.journey_id for cr in credits if cr.loan}
+    free = [cr for cr in credits if not cr.receipt_keys and not cr.loan
+            and cr.credit.kind in (K_LOAN, K_CUSTOMER) and cr.credit.amount >= DISTINCTIVE_AMOUNT]
+
+    def in_reach(loan: Loan, credit: Credit) -> bool:
+        window = statements_of.get(credit.statement_id)
+        return window is not None and (window.outlet_id is None or window.outlet_id == loan.outlet_id)
+
+    def tier_of(loan: Loan, credit: Credit) -> str | None:
+        if _loan_reference_hit(loan, credit.narration):
+            return LOAN_REFERENCE
+        if not _loan_amount(loan, credit.amount):
+            return None
+        if name_hit(loan.customer_names, credit.narration) == NAME:
+            return LOAN_NAME
+        if not _loan_dated(loan, credit.txn_date):
+            return None
+        if _financier_hit(loan, credit.narration):
+            return LOAN_FINANCIER
+        # the amount alone: a financier's credit only, of an amount no round figure
+        return LOAN_AMOUNT if credit.kind == K_LOAN and credit.amount % 10000 != 0 else None
+
+    options: dict[str, dict[str, str]] = {}
+    for cr in free:
+        options[cr.credit.key] = {}
+        for loan in loans:
+            if loan.journey_id not in taken and in_reach(loan, cr.credit):
+                tier = tier_of(loan, cr.credit)
+                if tier is not None:
+                    options[cr.credit.key][loan.journey_id] = tier
+    by_key = {cr.credit.key: cr for cr in free}
+    with_amount = {k: [ln.journey_id for ln in loans if _loan_amount(ln, by_key[k].credit.amount)] for k in by_key}
+    for tier in LOAN_TIERS:
+        open_credits = [k for k in by_key if not by_key[k].loan]
+        for key in open_credits:
+            mine = [j for j, t in options[key].items() if t == tier and j not in taken]
+            if len(mine) != 1:
+                continue
+            journey = mine[0]
+            rivals = [k for k in open_credits if k != key and options[k].get(journey) == tier]
+            if rivals:
+                continue
+            if tier == LOAN_AMOUNT and len(with_amount[key]) != 1:
+                continue  # another loan of the dealership, dated or not, carries the amount
+            cr = by_key[key]
+            cr.loan, cr.basis, cr.journey_id = True, tier, journey
+            taken.add(journey)
+            for result in receipts:
+                if (result.receipt.journey_id == journey and result.outcome in (NOT_FOUND, AMBIGUOUS)
+                        and _same_amount(result.receipt.amount, cr.credit.amount)):
+                    result.outcome, result.basis, result.credit_keys = MATCHED, tier, [key]
+                    result.candidates, result.note = [], None
+                    cr.receipt_keys.append(result.receipt.key)
+                    break
+
+
 __all__ = [
     "AMBIGUOUS",
     "CARD",
     "CASH",
+    "LOAN_AMOUNT",
+    "LOAN_FINANCIER",
+    "LOAN_NAME",
+    "LOAN_REFERENCE",
+    "LOAN_TIERS",
     "MATCHED",
     "NOT_FOUND",
     "OUTSIDE_DATES",
     "WINDOW_DAYS",
     "Credit",
     "CreditResult",
+    "Loan",
     "Receipt",
     "ReceiptResult",
     "Window",
     "classify_credit",
+    "financier_words",
     "in_scope",
+    "match_loans",
     "mode_class",
     "name_hit",
     "name_journeys",

@@ -8,6 +8,7 @@ reached SQL, so this runs the endpoint function end to end as the runtime role.
 from __future__ import annotations
 
 import io
+import json
 import os
 from datetime import date
 from types import SimpleNamespace
@@ -28,6 +29,7 @@ Txn Date,Value Date,Description,Ref No,Debit,Credit,Balance
 03/11/2026,03/11/2026,MMT/IMPS/630700000001/IMPS/BIKASHMOHA/Test Bank,,,"5,00,000.00","11,74,000.00"
 03/11/2026,03/11/2026,BY CASH - TEST BRANCH,,,"2,00,000.00","13,74,000.00"
 04/11/2026,04/11/2026,CHQ PAID OFFICE RENT,,"50,000.00",,"13,24,000.00"
+04/11/2026,04/11/2026,NEFT/KKBK263087488998/KOTAK MAHINDRA BANK/Pyt Loan A c LCV 4137380 dt 0,,,"10,26,639.00","23,50,639.00"
 """
 
 
@@ -83,6 +85,28 @@ def dealer():
                                             "n": f"R-{name[:4]}", "rd": date(2026, 11, 3), "ref": reference,
                                             "m": mode}).scalar_one())
             journeys[name] = str(journey)
+        # A financed Journey with no receipt for its loan: the D.O. cover gives the loan.
+        customer = c.execute(text("""INSERT INTO auditcore.customers (tenant_id, dealer_id, outlet_id,
+                customer_type_code, display_name, legal_name) VALUES (:t, :d, :o, 'INDIVIDUAL', 'LOAN BUYER',
+                'LOAN BUYER') RETURNING customer_id"""), {"t": tenant_id, "d": dealer_id, "o": outlet_id}).scalar_one()
+        journey = c.execute(text("""INSERT INTO auditcore.journeys (tenant_id, dealer_id, outlet_id, customer_id,
+                journey_reference) VALUES (:t, :d, :o, :c, :r) RETURNING journey_id"""),
+                            {"t": tenant_id, "d": dealer_id, "o": outlet_id, "c": customer,
+                             "r": f"BS-J-{suffix}-LOAN"}).scalar_one()
+        journeys["LOAN BUYER"] = str(journey)
+        document = uuid4()
+        c.execute(text("""INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id,
+                di_document_id, document_type_key, evidence_purpose, process_area, association_status)
+                VALUES (:t, :j, :c, :s, :d, 'delivery_order_cover', 'JOURNEY_DOCUMENT', 'DELIVERY', 'ACTIVE')"""),
+                  {"t": tenant_id, "j": journey, "c": customer, "s": uuid4(), "d": document})
+        for key, value in (("loan_amount", "1026639"), ("delivery_order_number", "4137380"),
+                           ("disbursement_date", "2026-11-03"), ("financier_name", "Kotak Mahindra Bank")):
+            c.execute(text("""INSERT INTO auditcore.journey_document_extracted_fields (tenant_id, journey_id,
+                    di_document_id, source_fact_version, field_key, stage_code, source_document_type_key,
+                    extracted_value, effective_value)
+                    VALUES (:t, :j, :d, 1, :f, 'DELIVERY', 'delivery_order_cover', CAST(:v AS jsonb),
+                            CAST(:v AS jsonb))"""),
+                      {"t": tenant_id, "j": journey, "d": document, "f": key, "v": json.dumps(value)})
     try:
         yield SimpleNamespace(engine=engine, tenant_id=tenant_id, dealer_id=dealer_id, payments=payments,
                               journeys=journeys)
@@ -96,14 +120,14 @@ def _as_runtime(c, tenant_id):
     c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
 
 
-def _upload(d):
+def _upload(d, data: bytes = STATEMENT, name: str = "statement.csv"):
     with d.engine.begin() as c, \
             mock.patch.object(bs, "_access", return_value={"ADMIN"}), \
             mock.patch.object(bs, "_dealers", return_value=[{"dealerId": str(d.dealer_id)}]), \
             mock.patch.object(bs, "_name_of", return_value="Tester"):
         _as_runtime(c, d.tenant_id)
         return bs.upload_bank_statement(d.tenant_id, SimpleNamespace(subject="user-1"), None, c,
-                                        UploadFile(io.BytesIO(STATEMENT), filename="statement.csv"), d.dealer_id, None)
+                                        UploadFile(io.BytesIO(data), filename=name), d.dealer_id, None)
 
 
 def test_upload_reconciles_and_updates_statuses(dealer):
@@ -159,3 +183,57 @@ def test_second_upload_rematches_detail_and_report(dealer):
         summary = bs.journey_bank_summary(c, tenant_id=dealer.tenant_id,
                                           journey_id=dealer.journeys["ASHA KUMARI RATH"])
         assert summary is not None
+
+
+def test_a_loan_with_no_receipt_is_tied_to_its_journey(dealer):
+    statement = _upload(dealer)
+    assert statement["counts"]["creditsLoan"] == 1
+    assert statement["counts"]["creditsLoanAmount"] == "1026639.00"
+    # the window is the statement's own transaction dates
+    assert (statement["checkFrom"], statement["checkTo"]) == ("2026-11-03", "2026-11-04")
+    with dealer.engine.begin() as c:
+        _as_runtime(c, dealer.tenant_id)
+        row = c.execute(text("SELECT outcome, match_basis, CAST(journey_id AS text) FROM auditcore.p2_bank_statement_txns "
+                             "WHERE tenant_id = :t AND amount = 1026639"), {"t": dealer.tenant_id}).one()
+        assert tuple(row) == ("LOAN", "LOAN_REFERENCE", dealer.journeys["LOAN BUYER"])
+        report = bs.build_report(c, tenant_id=dealer.tenant_id, statements=[statement])
+        # Audit Summary AS-13: the loan amount confirmed received in the bank
+        from decimal import Decimal
+
+        from audit_core.uc03_p2_audit_summary import loan_in_bank
+
+        line = loan_in_bank(c, tenant_id=dealer.tenant_id, journey_id=dealer.journeys["LOAN BUYER"],
+                            loan=Decimal(1026639))
+        assert (line["conclusion"], line["received"], line["rule"]) == ("OK", "1026639.00", "AS-13")
+        assert loan_in_bank(c, tenant_id=dealer.tenant_id, journey_id=dealer.journeys["NOT IN BANK"],
+                            loan=None) is None
+    from openpyxl import load_workbook
+
+    sheet = load_workbook(io.BytesIO(report))["Loans found in bank"]
+    assert sheet.max_row == 2 and sheet.cell(2, 5).value == 1026639
+
+
+def test_the_account_register_keeps_each_transaction_once_across_uploads(dealer):
+    """Statements loaded daily or twice a week overlap: the account's register carries each
+    transaction once, loaded by the first upload that had it, and the days covered."""
+    from datetime import date
+
+    from audit_core.uc03_p2_bank_register import registers
+
+    _upload(dealer, STATEMENT, "first.csv")  # 3-4 Nov
+    later = STATEMENT + b'05/11/2026,05/11/2026,NEFT/SBIN526300000009/NEW PAYER/SBI,,,"25,000.00","23,75,639.00"\n'
+    _upload(dealer, later, "second.csv")  # 3-5 Nov: the same rows again and the 5th
+    with dealer.engine.begin() as c:
+        _as_runtime(c, dealer.tenant_id)
+        found = registers(c, tenant_id=dealer.tenant_id, dealer_ids=[str(dealer.dealer_id)],
+                          first=date(2026, 11, 1), today=date(2026, 11, 8), with_rows=True)
+    assert len(found) == 1
+    account = found[0]
+    assert (account["uploads"], account["transactions"], account["credits"], account["debits"]) == (2, 6, 5, 1)
+    assert account["coverage"]["from"] == "2026-11-03" and account["coverage"]["to"] == "2026-11-05"
+    assert account["coverage"]["notYetLoaded"] == {"from": "2026-11-06", "to": "2026-11-07"}
+    loaded = {r["narration"][:12]: r["loadedFrom"] for r in account["rows"]}
+    assert loaded["NEFT/SBIN526"] == "second.csv" and loaded["BY CASH - TE"] == "first.csv"
+    # the reconciliation's verdict is on the row however many uploads printed it
+    asha = next(r for r in account["rows"] if "ASHA" in r["narration"])
+    assert asha["result"] == "Tied to receipt" and asha["journeyId"] == dealer.journeys["ASHA KUMARI RATH"]

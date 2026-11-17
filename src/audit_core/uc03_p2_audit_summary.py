@@ -48,6 +48,30 @@ INFO = "INFO"                  # a fact, nothing to conclude (not taken, eligibl
 CUSTOMER = "CUSTOMER"          # the customer paid more than they should have
 COMPANY = "COMPANY"            # the dealership gave more than it should have
 
+def loan_in_bank(connection: Any, *, tenant_id: str, journey_id: Any, loan: Decimal | None
+                 ) -> dict[str, Any] | None:
+    """AS-13 (product owner 2026-11-17: "if it gets verified with bank then a line can be added
+    to confirm loan amount received"): the financier's credits tied to this Journey's loan on
+    the dealership's bank statements, against the loan counted as received. None when no
+    statement carries one."""
+    from audit_core.uc03_p2_bank_statements import _journey_loans
+
+    credits = _journey_loans(connection, tenant_id, journey_id)
+    if not credits:
+        return None
+    received = sum((Decimal(c["amount"]) for c in credits), Decimal(0))
+    row: dict[str, Any] = {"rule": "AS-13", "received": money(received), "credits": credits}
+    if loan is None or loan <= 0:
+        row.update(conclusion=INFO, reason="Received in the bank; no loan amount on file to compare.")
+    elif _same(received, loan):
+        row.update(conclusion=OK, reason=None)
+    else:
+        # a financier often pays the dealer net of its own charges: shown, not concluded
+        row.update(conclusion=INFO, difference=money(loan - received),
+                   reason="The bank credit differs from the loan counted as received.")
+    return row
+
+
 RULES = {
     "AS-01": "Charged against the standard figure (price master, or the statutory rate for TCS)",
     "AS-02": "Charged against its own proof document (RTO challan, insurance policy)",
@@ -60,6 +84,7 @@ RULES = {
     "AS-09": "Money received against the net payable",
     "AS-10": "The deal's balance against the customer ledger's balance",
     "AS-11": "The NDC's and the cost sheet's rows add up to the totals they print",
+    "AS-13": "Loan amount received in the dealership's bank (bank statement)",
 }
 
 # The document that proves a charge, by Deal line (third party: issued by the
@@ -845,6 +870,8 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
             entry.update(conclusion=EXCEPTION, difference=money(sanctioned - disbursed),
                          reason="Disbursed differs from sanctioned.")
         loans.append(entry)
+    loan_bank = loan_in_bank(connection, tenant_id=tenant_id, journey_id=journey_id,
+                             loan=loan_on_file["amount"])
     # Every credit note on file (2026-10-31: the statement-policy Deal reads no
     # invoices, so its invoice list never held one): shown, not settled against.
     credit_notes = deal.get("creditNotes") or []
@@ -856,7 +883,7 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         "refunds": money(refunds) if refunds else None, "refundsSource": loan_on_file["refundsSource"],
         "oldVehicle": money(old_vehicle) if old_vehicle else None,
         "received": money(receipts + loan + old_vehicle - refunds),
-        "bankCheck": bank_check, "loans": loans,
+        "bankCheck": bank_check, "loans": loans, "loanBank": loan_bank,
         "loanFigures": [{"source": f["source"], "amount": money(Decimal(f["amount"]))} for f in figures],
         "bankApprovalOnFile": "bank_approval_letter" in on_file, "deliveryOrderOnFile": "delivery_order_cover" in on_file,
         "exchange": {"applicable": (trade.get("exchange") or {}).get("applicable"),

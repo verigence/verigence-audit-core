@@ -85,6 +85,8 @@ BASIS_LABELS = {
     br.REFERENCE: "UTR / reference", br.NAME: "Customer name", br.NAME_PREFIX: "Customer name (shortened)",
     br.AMOUNT_DATE: "Amount and date only", br.CASH_DEPOSIT: "Cash deposit of the same amount",
     br.NAME_SPLIT: "Paid in parts (name / reference)", br.COMBINED: "One credit for several receipts",
+    br.LOAN_REFERENCE: "Loan: D.O. / loan reference", br.LOAN_NAME: "Loan: customer name and loan amount",
+    br.LOAN_FINANCIER: "Loan: financier and loan amount", br.LOAN_AMOUNT: "Loan: loan amount and date only",
 }
 KIND_LABELS = {
     br.K_CUSTOMER: "Customer / third party", br.K_CASH: "Cash deposit", br.K_CARD: "Card / UPI settlement",
@@ -114,12 +116,26 @@ def _money(value: Any) -> str:
 
 # --------------------------------------------------------------------------- loading
 
+# A statement's transactions' first and last dates: the receipts it checks are dated within
+# them (product owner 2026-11-17: "lets change the time to statement transaction dates").
+_TXN_DATES = """
+    LEFT JOIN LATERAL (SELECT min(x.txn_date) AS txn_from, max(x.txn_date) AS txn_to
+                       FROM auditcore.p2_bank_statement_txns x
+                       WHERE x.tenant_id = s.tenant_id AND x.statement_id = s.statement_id) tx ON true
+"""
+
+
+def _check_dates(r: Any) -> tuple[date, date]:
+    return r["txn_from"] or r["period_from"], r["txn_to"] or r["period_to"]
+
+
 def _active_statements(connection: Connection, tenant_id: str, dealer_id: str) -> list[dict[str, Any]]:
     return [dict(r) for r in connection.execute(
         text("""
-            SELECT * FROM auditcore.p2_bank_statements
-            WHERE tenant_id = :t AND dealer_id = :d AND status = 'ACTIVE'
-            ORDER BY period_from, uploaded_at_utc
+            SELECT s.*, tx.txn_from, tx.txn_to FROM auditcore.p2_bank_statements s
+        """ + _TXN_DATES + """
+            WHERE s.tenant_id = :t AND s.dealer_id = :d AND s.status = 'ACTIVE'
+            ORDER BY s.period_from, s.uploaded_at_utc
         """),
         {"t": tenant_id, "d": dealer_id},
     ).mappings()]
@@ -237,6 +253,90 @@ def _people(connection: Connection, tenant_id: str, dealer_id: str) -> tuple[dic
     return people, meta
 
 
+# The loan papers of a Journey: (document type, field) -> what it gives the Loan.
+_LOAN_FIELDS = {
+    ("delivery_order_cover", "loan_amount"): "amount",
+    ("delivery_order_cover", "disbursement_reference"): "reference",
+    ("delivery_order_cover", "delivery_order_number"): "reference",
+    ("delivery_order_cover", "disbursement_date"): "disbursed",
+    ("delivery_order_cover", "financier_name"): "financier",
+    ("bank_approval_letter", "finance_dealer_payout_amount"): "amount",
+    ("bank_approval_letter", "finance_sanctioned_amount"): "amount",
+    ("bank_approval_letter", "finance_application_number"): "reference",
+    ("bank_approval_letter", "finance_sanction_letter_number"): "reference",
+    ("bank_approval_letter", "finance_disbursement_date"): "disbursed",
+    ("bank_approval_letter", "finance_sanction_date"): "sanctioned",
+    ("bank_approval_letter", "financier_name"): "financier",
+}
+_LOANS_SQL = """
+    SELECT f.journey_id, COALESCE(e.document_type_key, f.source_document_type_key) AS doc, f.field_key,
+           f.effective_value #>> '{}' AS value
+    FROM auditcore.journey_document_extracted_fields f
+    JOIN auditcore.journeys j ON j.tenant_id = f.tenant_id AND j.journey_id = f.journey_id
+    JOIN auditcore.evidence e
+      ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id AND e.di_document_id = f.di_document_id
+     AND e.association_status = 'ACTIVE'
+    WHERE f.tenant_id = :t AND j.dealer_id = :d
+      AND COALESCE(e.document_type_key, f.source_document_type_key) IN ('delivery_order_cover', 'bank_approval_letter')
+      AND f.field_key = ANY(:keys) AND jsonb_typeof(f.effective_value) IN ('string', 'number')
+    UNION ALL
+    SELECT r.journey_id, 'finance_record', k.key, k.value
+    FROM auditcore.finance_records r
+    JOIN auditcore.journeys j ON j.tenant_id = r.tenant_id AND j.journey_id = r.journey_id
+    CROSS JOIN LATERAL (VALUES ('amount', CAST(r.financed_amount AS text)),
+                               ('amount', CAST(r.loan_disbursement_amount AS text)),
+                               ('financier', r.provider_name), ('reference', r.do_reference)) AS k(key, value)
+    WHERE r.tenant_id = :t AND j.dealer_id = :d AND k.value IS NOT NULL
+"""
+
+
+def _loans(connection: Connection, tenant_id: str, dealer_id: str, people: dict[str, list[str]],
+           meta: dict[str, Any]) -> list[br.Loan]:
+    """Every loan of the dealership's Journeys, from its D.O. cover, bank approval letter and
+    finance record."""
+    loans: dict[str, br.Loan] = {}
+    for r in connection.execute(text(_LOANS_SQL), {"t": tenant_id, "d": dealer_id,
+                                                   "keys": sorted({k for _, k in _LOAN_FIELDS})}).mappings():
+        jid = str(r["journey_id"])
+        what = "amount" if r["doc"] == "finance_record" and r["field_key"] == "amount" else (
+            r["field_key"] if r["doc"] == "finance_record" else _LOAN_FIELDS.get((r["doc"], r["field_key"])))
+        value = str(r["value"] or "").strip()
+        if not what or not value:
+            continue
+        loan = loans.get(jid)
+        if loan is None:
+            loan = loans[jid] = br.Loan(journey_id=jid, outlet_id=(meta.get(jid) or {}).get("outletId"),
+                                        customer_names=people.get(jid, []))
+        if what == "amount":
+            amount = _loan_money(value)
+            if amount is not None and amount > 0:
+                loan.amounts.add(amount)
+        elif what == "reference":
+            loan.references.append(value)
+        elif what == "financier":
+            loan.financiers.append(value)
+        else:
+            day = _loan_day(value)
+            if day is not None:
+                (loan.disbursed if what == "disbursed" else loan.sanctioned).append(day)
+    return [loan for loan in loans.values() if loan.amounts or loan.references]
+
+
+def _loan_money(value: str) -> Decimal | None:
+    digits = re.sub(r"[^0-9.]", "", value)
+    try:
+        return Decimal(digits).quantize(Decimal("0.01")) if digits and digits.count(".") <= 1 else None
+    except ArithmeticError:
+        return None
+
+
+def _loan_day(value: str) -> date | None:
+    try:
+        return date.fromisoformat(value[:10])
+    except ValueError:
+        return None
+
+
 # --------------------------------------------------------------------------- the run
 
 def reconcile_dealer(connection: Connection, *, tenant_id: str, dealer_id: str) -> dict[str, Any]:
@@ -251,19 +351,21 @@ def reconcile_dealer(connection: Connection, *, tenant_id: str, dealer_id: str) 
         return {"statements": 0}
     windows = [br.Window(statement_id=str(s["statement_id"]),
                          outlet_id=str(s["outlet_id"]) if s["outlet_id"] else None,
-                         period_from=s["period_from"], period_to=s["period_to"]) for s in statements]
-    first = min(w.period_from for w in windows) - timedelta(days=br.WINDOW_DAYS)
-    last = max(w.period_to for w in windows) + timedelta(days=br.WINDOW_DAYS)
+                         period_from=_check_dates(s)[0], period_to=_check_dates(s)[1]) for s in statements]
+    first = min(w.period_from for w in windows)
+    last = max(w.period_to for w in windows)
     credits, duplicates = _credits(connection, tenant_id, statements)
     receipts = _receipts(connection, tenant_id, dealer_id, first, last)
-    people, _ = _people(connection, tenant_id, dealer_id)
+    people, journey_meta = _people(connection, tenant_id, dealer_id)
     named = {c.key: br.name_journeys(c, people) for c in credits}
     # The payment receipts on file and nothing else (product owner 2026-11-17): a line of the
     # NDC or a posting of the customer ledger with no receipt on file is not a receipt to verify.
 
     results, credit_results = br.reconcile(receipts, credits, windows)
+    # A financier's disbursement with no receipt on file: tied to the Journey whose loan it is.
+    br.match_loans(_loans(connection, tenant_id, dealer_id, people, journey_meta), results, credit_results, windows)
     for cr in credit_results:
-        if not cr.receipt_keys:
+        if not cr.receipt_keys and not cr.loan:
             candidates = named.get(cr.credit.key) or []
             cr.named_journey_id = candidates[0] if len(candidates) == 1 else None
 
@@ -294,8 +396,8 @@ def reconcile_dealer(connection: Connection, *, tenant_id: str, dealer_id: str) 
     for cr in credit_results:
         sid, row_no = cr.credit.key.split(":")
         updates.append({"t": tenant_id, "s": sid, "n": int(row_no), "k": cr.credit.kind,
-                        "o": "MATCHED" if cr.receipt_keys else ("OWN_TRANSFER" if cr.credit.kind == br.K_INTERNAL
-                                                                else "UNIDENTIFIED"),
+                        "o": "MATCHED" if cr.receipt_keys else "LOAN" if cr.loan else (
+                            "OWN_TRANSFER" if cr.credit.kind == br.K_INTERNAL else "UNIDENTIFIED"),
                         "b": cr.basis, "rk": json.dumps(cr.receipt_keys), "j": cr.journey_id,
                         "nj": cr.named_journey_id, "dup": None})
     for key, original in duplicates.items():
@@ -492,7 +594,8 @@ def _statement_counts(results: list[br.ReceiptResult], credit_results: list[br.C
     mine = [r for r in results if window.covers(r.receipt.receipt_date, r.receipt.outlet_id)]
     journeys = journey_rollup(mine)
     credits = [c for c in credit_results if c.credit.statement_id == window.statement_id]
-    unidentified = [c for c in credits if not c.receipt_keys and c.credit.kind != br.K_INTERNAL]
+    unidentified = [c for c in credits if not c.receipt_keys and not c.loan and c.credit.kind != br.K_INTERNAL]
+    loans = [c for c in credits if c.loan]
 
     def total(items: list[br.ReceiptResult]) -> str:
         return _money(sum((r.receipt.amount for r in items), Decimal(0)))
@@ -514,6 +617,7 @@ def _statement_counts(results: list[br.ReceiptResult], credit_results: list[br.C
         "verifiedAmount": _money(sum((j["verified"] for j in journeys.values()), Decimal(0))),
         "leftAmount": _money(sum((j["left"] for j in journeys.values()), Decimal(0))),
         "credits": len(credits), "creditsMatched": sum(1 for c in credits if c.receipt_keys),
+        "creditsLoan": len(loans), "creditsLoanAmount": _money(sum((c.credit.amount for c in loans), Decimal(0))),
         "creditsUnidentified": len(unidentified),
         "creditsUnidentifiedAmount": _money(sum((c.credit.amount for c in unidentified), Decimal(0))),
         "creditsNamingCustomer": sum(1 for c in unidentified if c.named_journey_id),
@@ -559,8 +663,7 @@ def _statement_json(r: Any) -> dict[str, Any]:
         "outletId": str(r["outlet_id"]) if r["outlet_id"] else None, "outletName": r.get("outlet_name"),
         "bankName": r["bank_name"], "accountNumber": r["account_number"], "accountHolder": r["account_holder"],
         "ifsc": r["ifsc"], "periodFrom": r["period_from"].isoformat(), "periodTo": r["period_to"].isoformat(),
-        "checkFrom": (r["period_from"] - timedelta(days=br.WINDOW_DAYS)).isoformat(),
-        "checkTo": (r["period_to"] + timedelta(days=br.WINDOW_DAYS)).isoformat(),
+        "checkFrom": _check_dates(r)[0].isoformat(), "checkTo": _check_dates(r)[1].isoformat(),
         "openingBalance": _money(r["opening_balance"]) if r["opening_balance"] is not None else None,
         "closingBalance": _money(r["closing_balance"]) if r["closing_balance"] is not None else None,
         "creditCount": r["credit_count"], "creditTotal": _money(r["credit_total"]),
@@ -575,9 +678,10 @@ def _statement_json(r: Any) -> dict[str, Any]:
 
 
 _STATEMENT_SQL = """
-    SELECT s.*, d.dealer_name, o.outlet_name FROM auditcore.p2_bank_statements s
+    SELECT s.*, d.dealer_name, o.outlet_name, tx.txn_from, tx.txn_to FROM auditcore.p2_bank_statements s
     JOIN auditcore.dealers d ON d.tenant_id = s.tenant_id AND d.dealer_id = s.dealer_id
     LEFT JOIN auditcore.dealer_outlets o ON o.tenant_id = s.tenant_id AND o.outlet_id = s.outlet_id
+""" + _TXN_DATES + """
     WHERE s.tenant_id = :t
 """
 
@@ -719,7 +823,7 @@ _MATCH_SQL = """
 
 
 def statement_detail(connection: Connection, tenant_id: str, statement: dict[str, Any]) -> dict[str, Any]:
-    """The statement's receipts (in its period +/- 5 days), Journeys and credits."""
+    """The statement's receipts (dated within its transactions' dates), Journeys and credits."""
     check_from, check_to, outlet_id = _window_of(statement)
     matches = connection.execute(
         text(_MATCH_SQL), {"t": tenant_id, "d": statement["dealerId"], "f": check_from, "l": check_to, "o": outlet_id},
@@ -727,6 +831,8 @@ def statement_detail(connection: Connection, tenant_id: str, statement: dict[str
     txns = connection.execute(
         text("""
             SELECT x.*, j.journey_reference AS matched_reference, nj.journey_reference AS named_reference,
+                   (SELECT auditcore.shown_name(mc.legal_name, mc.display_name) FROM auditcore.customers mc
+                    WHERE mc.tenant_id = j.tenant_id AND mc.customer_id = j.customer_id) AS matched_customer,
                    auditcore.shown_name(nc.legal_name, nc.display_name) AS named_customer
             FROM auditcore.p2_bank_statement_txns x
             LEFT JOIN auditcore.journeys j ON j.tenant_id = x.tenant_id AND j.journey_id = x.journey_id
@@ -790,6 +896,7 @@ def statement_detail(connection: Connection, tenant_id: str, statement: dict[str
         "kind": t["credit_kind"], "kindLabel": KIND_LABELS.get(t["credit_kind"] or "", None),
         "outcome": t["outcome"], "basis": t["match_basis"], "basisLabel": BASIS_LABELS.get(t["match_basis"] or "", None),
         "journeyId": str(t["journey_id"]) if t["journey_id"] else None, "journeyReference": t["matched_reference"],
+        "matchedCustomer": t["matched_customer"],
         "namedJourneyId": str(t["named_journey_id"]) if t["named_journey_id"] else None,
         "namedJourneyReference": t["named_reference"], "namedCustomer": t["named_customer"],
         "receipts": len(t["receipt_keys"] or []),
@@ -946,7 +1053,10 @@ def rematch_bank_statement(
 
 # --------------------------------------------------------------------------- Excel
 
-def build_report(connection: Connection, *, tenant_id: str, statements: list[dict[str, Any]]) -> bytes:
+def build_report(connection: Connection, *, tenant_id: str, statements: list[dict[str, Any]],
+                 accounts: list[dict[str, Any]] | None = None) -> bytes:
+    """The reconciliation workbook; with ``accounts`` (uc03_p2_bank_register, the month's
+    export) also each account's register of transactions and its coverage."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill
 
@@ -996,6 +1106,9 @@ def build_report(connection: Connection, *, tenant_id: str, statements: list[dic
     credits_sheet = sheet_with("Bank credits", ["Statement", "Date", "Narration", "Reference", "Amount", "Kind",
                                                 "Result", "Matched on", "Journey", "Names customer (no receipt)",
                                                 "Customer"])
+    loans_sheet = sheet_with("Loans found in bank", ["Statement", "Journey", "Customer", "Bank credit date",
+                                                     "Amount", "Bank credit narration", "Matched on",
+                                                     "Loan receipt on file"])
     unidentified_sheet = sheet_with("Credits not identified", ["Statement", "Date", "Narration", "Reference",
                                                                "Amount", "Kind", "Names Journey", "Customer"])
     for statement in statements:
@@ -1034,14 +1147,43 @@ def build_report(connection: Connection, *, tenant_id: str, statements: list[dic
         for t in detail["transactions"]:
             if t["direction"] != "CR":
                 continue
-            result = {"MATCHED": "Tied to receipt", "UNIDENTIFIED": "No receipt", "OWN_TRANSFER": "Own transfer",
+            result = {"MATCHED": "Tied to receipt", "LOAN": "Loan of the Journey (no receipt)",
+                      "UNIDENTIFIED": "No receipt", "OWN_TRANSFER": "Own transfer",
                       "DUPLICATE": "Printed on another upload"}.get(t["outcome"] or "", t["outcome"])
             credits_sheet.append([label, t["date"], t["narration"], t["reference"], num(t["amount"]), t["kindLabel"],
                                   result, t["basisLabel"], t["journeyReference"], t["namedJourneyReference"],
                                   t["namedCustomer"]])
+            if t["outcome"] == "LOAN" or (t["outcome"] == "MATCHED" and str(t["basis"] or "").startswith("LOAN")):
+                loans_sheet.append([label, t["journeyReference"], t["matchedCustomer"], t["date"], num(t["amount"]),
+                                    t["narration"], t["basisLabel"],
+                                    "Yes" if t["outcome"] == "MATCHED" else "No receipt on file"])
             if t["outcome"] == "UNIDENTIFIED":
                 unidentified_sheet.append([label, t["date"], t["narration"], t["reference"], num(t["amount"]),
                                            t["kindLabel"], t["namedJourneyReference"], t["namedCustomer"]])
+    if accounts is not None:
+        coverage_sheet = sheet_with("Account coverage", [
+            "Dealership", "Outlet", "Bank", "Account", "Uploads", "Days covered", "From", "To", "Missing days",
+            "Not yet loaded", "Balance breaks", "Opening balance", "Closing balance", "Credits", "Credit total",
+            "Debits", "Debit total", "Credits with no receipt"])
+        register_sheet = sheet_with("Account register", [
+            "Dealership", "Bank", "Account", "Date", "Value date", "Narration", "Reference", "Debit", "Credit",
+            "Balance", "Result", "Matched on", "Journey", "Loaded from", "Loaded at (UTC)"])
+        for a in accounts:
+            cov = a["coverage"]
+            pending = cov.get("notYetLoaded")
+            coverage_sheet.append([
+                a["dealerName"], a["outletName"] or "All outlets", a["bankName"], a["accountNumber"], a["uploads"],
+                cov["coveredDays"], cov["from"], cov["to"], ", ".join(cov["missing"]) or None,
+                f"{pending['from']} to {pending['to']}" if pending else None,
+                "; ".join(f"after {b['after']}: closing {b['closing']}, next opening {b['nextOpening']}"
+                          for b in a["balanceBreaks"]) or None,
+                num(a["openingBalance"]), num(a["closingBalance"]), a["credits"], num(a["creditTotal"]),
+                a["debits"], num(a["debitTotal"]), a["creditsNoReceipt"]])
+            for r in a.get("rows") or []:
+                register_sheet.append([
+                    a["dealerName"], a["bankName"], a["accountNumber"], r["date"], r["valueDate"], r["narration"],
+                    r["reference"], num(r["debit"]), num(r["credit"]), num(r["balance"]), r["result"],
+                    r["basisLabel"], r["journeyReference"], r["loadedFrom"], r["loadedAtUtc"]])
     for sheet in workbook.worksheets:
         for column in sheet.columns:
             width = max((len(str(c.value)) for c in column if c.value is not None), default=8)
@@ -1077,7 +1219,13 @@ def export_bank_statement_report(
         statements = [_statement_json(r) for r in rows]
         name = f"Bank-Reconciliation_{first:%Y-%m}.xlsx"
     statements = [s for s in statements if s["dealerId"] in dealer_ids]
-    data = build_report(connection, tenant_id=tenant_id, statements=statements)
+    accounts = None
+    if statement_id is None:
+        from audit_core.uc03_p2_bank_register import registers
+
+        accounts = registers(connection, tenant_id=tenant_id, dealer_ids=sorted(dealer_ids), first=first,
+                             today=_today(connection, tenant_id), with_rows=True)
+    data = build_report(connection, tenant_id=tenant_id, statements=statements, accounts=accounts)
     return StreamingResponse(io.BytesIO(data), media_type=(
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         headers={"Content-Disposition": f'attachment; filename="{name}"'})
@@ -1121,12 +1269,38 @@ def journey_bank_summary(connection: Connection, *, tenant_id: str, journey_id: 
             ).mappings().one_or_none()
     except Exception:  # noqa: BLE001 -- the table may not exist yet on an old database
         return None
+    loans = _journey_loans(connection, tenant_id, journey_id)
     if row is None:
-        return None
-    return {"status": row["status"], "bankVerified": row["status"] == "BANK_VERIFIED",
+        # no bank receipt to verify, a loan credit of its own on a statement all the same
+        return ({"status": None, "bankVerified": False, "bankReceipts": "0.00", "verified": "0.00", "left": "0.00",
+                 "cash": "0.00", "bankVerifiedAtUtc": None, "loans": loans} if loans else None)
+    return {"status": row["status"], "bankVerified": row["status"] == "BANK_VERIFIED", "loans": loans,
             "bankReceipts": _money(row["bank_receipts"]), "verified": _money(row["verified"]),
             "left": _money(row["left_to_verify"]), "cash": _money(row["cash"]),
             "bankVerifiedAtUtc": row["bank_verified_at"].isoformat() if row["bank_verified_at"] else None}
+
+
+def _journey_loans(connection: Connection, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """The financier's credits tied to this Journey's loan on the current statements."""
+    try:
+        with connection.begin_nested():
+            rows = connection.execute(
+                text("""
+                    SELECT x.txn_date, x.amount, x.narration, x.match_basis, x.outcome, s.bank_name, s.account_number
+                    FROM auditcore.p2_bank_statement_txns x
+                    JOIN auditcore.p2_bank_statements s
+                      ON s.tenant_id = x.tenant_id AND s.statement_id = x.statement_id AND s.status = 'ACTIVE'
+                    WHERE x.tenant_id = :t AND x.journey_id = :j AND x.match_basis LIKE 'LOAN%'
+                    ORDER BY x.txn_date
+                """),
+                {"t": tenant_id, "j": str(journey_id)},
+            ).mappings().all()
+    except Exception:  # noqa: BLE001 -- the table may not exist yet on an old database
+        return []
+    return [{"date": r["txn_date"].isoformat() if r["txn_date"] else None, "amount": _money(r["amount"]),
+             "narration": r["narration"], "basis": r["match_basis"],
+             "basisLabel": BASIS_LABELS.get(r["match_basis"] or "", None), "bankName": r["bank_name"],
+             "accountNumber": r["account_number"], "receiptOnFile": r["outcome"] == "MATCHED"} for r in rows]
 
 
 __all__ = ["build_report", "journey_bank_matches", "journey_bank_status", "journey_bank_summary", "journey_rollup", "reconcile_dealer", "router",
