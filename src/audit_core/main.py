@@ -199,6 +199,7 @@ from audit_core.uc03_tl_supervisory import router as uc03_tl_supervisory_router
 from audit_core.uc03_unified_document_capture import (
     router as uc03_unified_document_capture_router,
 )
+from audit_core.uc03_verified_bookings import router as uc03_verified_bookings_router
 from audit_core.uc03_work_item_enrichment import (
     router as uc03_work_item_enrichment_router,
 )
@@ -384,6 +385,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_dms_dumps_router)
     application.include_router(uc03_p2_insurance_dumps_router)
     application.include_router(uc03_p2_scheme_dumps_router)
+    application.include_router(uc03_verified_bookings_router)
     application.include_router(uc03_p2_bank_statements_router)
     application.include_router(uc03_p2_performance_router)
     application.include_router(performance_settings_router)

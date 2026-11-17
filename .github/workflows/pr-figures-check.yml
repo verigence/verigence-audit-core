@@ -1,0 +1,102 @@
+name: Figures check (live bookings, read only)
+
+# What a change moves on real bookings before it is merged (product owner
+# 2026-11-17): the base branch's code and this pull request's code each build the
+# Deal, Payments and Audit Summary and run every audit check, read only, on the
+# verified bookings and a fixed sample of delivered bookings of the live Project.
+# The difference is posted on the pull request. It reports; it does not block
+# (product owner: "go live and report").
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - 'src/**'
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Code to compare against
+        default: dev
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: figures-check-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  figures:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      # The live Project (Mahindra Orissa).
+      FIGURES_TENANT: afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
+      APP_ENV: ci
+    steps:
+      - name: Check out this change
+        uses: actions/checkout@v4
+        with:
+          path: head
+      - name: Check out the base
+        uses: actions/checkout@v4
+        with:
+          path: base
+          ref: ${{ github.event.pull_request.base.sha || inputs.base_ref || 'dev' }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install ./head 'psycopg[binary]>=3.2,<4'
+          npm install --global @railway/cli@5.70.0
+      - name: Reach the live database (read only from here on)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${RAILWAY_API_TOKEN:-}"
+          cd head
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/vars.json
+          url="$(python - <<'PY'
+          import json
+          from urllib.parse import urlparse
+          v = json.load(open('/tmp/vars.json'))
+          for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
+              value = (v.get(key) or '').replace('postgresql+psycopg://', 'postgresql://', 1)
+              host = (urlparse(value).hostname or '').lower()
+              if value and host and not host.endswith('.railway.internal'):
+                  print(value)
+                  break
+          PY
+          )"
+          test -n "$url"
+          echo "::add-mask::$url"
+          echo "FIGURES_DATABASE_URL=$url" >> "$GITHUB_ENV"
+      - name: Pick the bookings
+        run: python head/tools/figures_check.py pick --tenant "$FIGURES_TENANT" --out /tmp/bookings.json --sample 40
+      - name: Base code
+        env:
+          PYTHONPATH: ${{ github.workspace }}/base/src
+        run: python head/tools/figures_check.py capture --tenant "$FIGURES_TENANT" --bookings /tmp/bookings.json --out /tmp/before.json
+      - name: This change
+        env:
+          PYTHONPATH: ${{ github.workspace }}/head/src
+        run: python head/tools/figures_check.py capture --tenant "$FIGURES_TENANT" --bookings /tmp/bookings.json --out /tmp/after.json
+      - name: Compare
+        env:
+          PYTHONPATH: ${{ github.workspace }}/head/src
+        run: |
+          python head/tools/figures_check.py diff /tmp/before.json /tmp/after.json --bookings /tmp/bookings.json --out /tmp/report.md
+          cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Post on the pull request
+        if: ${{ github.event_name == 'pull_request' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --body-file /tmp/report.md

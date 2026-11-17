@@ -636,8 +636,8 @@ def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[s
     counted = [r for r in rows if r["payment_id"] not in duplicates]
     # Payment receipts on file and nothing else (product owner 2026-11-17): a
     # line of the NDC or a posting of the customer ledger with no receipt on
-    # file is a receipt to ask for (uc03_ledger_receipts.missing_receipts),
-    # never money counted here.
+    # file is never money counted here; the receipts the NDC shows and the
+    # file lacks are asked for (uc03_ledger_receipts.receipts_against_ndc).
     receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids), Decimal(0))
     loan_receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] in loan_ids), Decimal(0))
     loan = loan_receipts + _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)

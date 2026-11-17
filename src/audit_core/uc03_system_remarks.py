@@ -126,7 +126,7 @@ def _loan_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -
 
     remarks: list[dict[str, Any]] = []
     for posting in loan_without_receipt(connection, tenant_id=tenant_id, journey_id=journey_id):
-        where = "the NDC" if posting.get("documentLabel") == "NDC" else "the customer ledger"
+        where = "the NDC"
         number = f" ({posting['number']})" if posting.get("number") else ""
         day = f" on {_when(posting['date'])}" if posting.get("date") else ""
         remarks.append(_remark(

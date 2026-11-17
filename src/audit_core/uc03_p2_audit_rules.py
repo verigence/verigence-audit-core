@@ -231,17 +231,18 @@ class _Facts:
         return {**paid, "dated": [{**r, "date": usable_date(r["date"], "receipt_date")} for r in dated]}
 
     @cached_property
-    def missing_receipts(self) -> list[dict[str, Any]]:
-        """The receipts the NDC or the customer ledger shows and the file does
-        not have (uc03_ledger_receipts.missing_receipts): asked for from the
-        PC, never counted as money received (product owner 2026-11-17)."""
-        from audit_core.uc03_ledger_receipts import missing_receipts
+    def receipts_check(self) -> dict[str, Any]:
+        """The payment receipts on file against the money the NDC shows
+        received (uc03_ledger_receipts.receipts_against_ndc, product owner
+        2026-11-17): the receipts not on file are asked for from the PC, never
+        counted as money received."""
+        from audit_core.uc03_ledger_receipts import receipts_against_ndc
 
-        return missing_receipts(self.connection, tenant_id=self.tenant_id, journey_id=self.journey_id)
+        return receipts_against_ndc(self.connection, tenant_id=self.tenant_id, journey_id=self.journey_id)
 
     @cached_property
     def missing_receipts_total(self) -> Decimal:
-        return sum((Decimal(p["amount"]) for p in self.missing_receipts), Decimal(0))
+        return Decimal(self.receipts_check["short"])
 
     @cached_property
     def loan_received(self) -> Decimal:
@@ -927,15 +928,14 @@ def _received_in_all(facts: _Facts) -> Decimal:
 
 def _awaiting_receipts(facts: _Facts, short: Decimal, tolerance: Decimal) -> str | None:
     """Why a shortfall is not judged yet: the receipts on file fall short by no
-    more than the NDC / customer ledger shows received with no payment receipt
-    on file. Those receipts are asked for from the PC (PAYMENT_RECEIPT_MISSING)
+    more than the NDC shows received with no payment receipt on file. Those receipts are asked for from the PC (PAYMENT_RECEIPT_MISSING)
     -- one task for one cause, not a second finding beside it; the money is
     judged once they are on file. None when the shortfall is larger than that,
     or nothing is missing."""
     missing = facts.missing_receipts_total
     if missing <= 0 or short <= tolerance or short > missing + tolerance:
         return None
-    return (f"The payment receipts on file are {_rupees(short)} short, and the NDC / customer ledger shows "
+    return (f"The payment receipts on file are {_rupees(short)} short, and the NDC shows "
             f"{_rupees(missing)} received with no payment receipt on file. Judged once those receipts are "
             f"uploaded (see Payment receipt missing).")
 
@@ -1588,37 +1588,37 @@ def self_insurance_declared(facts: _Facts) -> RuleOutcome:
     return RuleOutcome(code, "PASS", "Insurance is through the dealership.")
 
 
-def _posting_line(posting: dict[str, Any]) -> str:
-    number = f"{posting['number']} " if posting.get("number") else ""
-    day = f" on {_when(posting['date'])}" if posting.get("date") else ""
-    return f"{number}{_rupees(posting['amount'])}{day}"
-
-
 def payment_receipt_missing(facts: _Facts) -> RuleOutcome:
-    """Money the NDC (or the customer ledger) shows received with no payment
-    receipt on file (product owner 2026-11-16): the PC uploads the receipt.
-
-    The loan is not asked for: a line equal to the loan figure known for the
-    booking (finance record, NDC financier row, delivery order or bank letter)
-    or the financier's journal credit raises no task -- the system remark says
-    the loan was received as per the NDC with no payment receipt on file."""
+    """The payment receipts on file, added up, against the money the NDC shows
+    received (product owner 2026-11-17, uc03_ledger_receipts.receipts_against_ndc):
+    short, one PC task for the receipts not on file. Short by about the loan
+    only: no task, the system remark says the loan was received as per the NDC
+    with no payment receipt on file (2026-11-16). The NDC's lines are never set
+    against the receipts one by one; while its payment lines do not add up to
+    the Total Receipts it prints, nothing is asked (the NDC's reading is the
+    task)."""
     code = "PAYMENT_RECEIPT_MISSING"
-    postings = facts.missing_receipts
-    if not postings:
-        return RuleOutcome(code, "PASS", "Every payment the NDC shows received has its receipt on file "
-                                         "(the loan apart).")
-    total = sum((Decimal(p["amount"]) for p in postings), Decimal(0))
-    where = "NDC" if all(str(p.get("documentLabel") or "").startswith("NDC") for p in postings) else \
-        "NDC / customer ledger"
+    check = facts.receipts_check
+    status = check["status"]
+    if status == "NO_NDC":
+        return RuleOutcome(code, "SKIPPED", "No NDC on file: the payment receipts are compared with it once it is.")
+    if status == "HELD":
+        return RuleOutcome(code, "SKIPPED", check["held"])
+    money, on_file = Decimal(check["money"]), Decimal(check["onFile"])
+    shown = (f"The NDC shows {_rupees(money)} received ({_rupees(check['customer'])} from the customer"
+             + (f", {_rupees(check['loan'])} the loan" if check["loan"] else "") + ")")
+    receipts = f"the payment receipts on file add up to {_rupees(on_file)} ({check['receiptsOnFile']} receipt(s))"
+    loan = (f" The loan of {_rupees(check['loanWithoutReceipt'])} is received as per the NDC with no payment receipt "
+            "on file: no receipt is asked for it (system remark)." if check["loanWithoutReceipt"] else "")
+    details = {"ndcReceived": str(money), "ndcCustomer": str(check["customer"]), "ndcLoan": str(check["loan"]),
+               "receiptsOnFile": str(on_file), "loanWithoutReceipt": str(check["loanWithoutReceipt"]),
+               "documentId": check.get("documentId")}
+    if status == "COVERED":
+        return RuleOutcome(code, "PASS", f"{shown}; {receipts}." + loan, details)
     return RuleOutcome(code, "FAIL", (
-        f"The {where} shows {len(postings)} payment(s) received with no payment receipt on file "
-        f"({_rupees(total)}): " + "; ".join(_posting_line(p) for p in postings)
-        + ". Upload the payment receipt(s)."
-    ), {"findingTitle": "Payment receipt missing",
-        "postings": [{"number": p.get("number"), "amount": str(p["amount"]),
-                      "date": p["date"].isoformat() if hasattr(p.get("date"), "isoformat") else p.get("date"),
-                      "documentId": p.get("documentId"), "document": p.get("documentLabel")}
-                     for p in postings]})
+        f"{shown}; {receipts}. Payment receipts of {_rupees(check['short'])} are not on file: upload them."
+        + loan
+    ), {**details, "findingTitle": "Payment receipt missing", "short": str(check["short"])})
 
 
 # Journey-wide checks run with the Booking unit (always evaluated); checks

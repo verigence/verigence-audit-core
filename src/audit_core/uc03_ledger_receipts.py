@@ -1,30 +1,18 @@
-"""Money the customer ledger and the NDC record as received with no payment
-receipt on file: the receipts that are missing, never payments.
+"""The payment receipts on file set against the money the NDC shows received;
+the customer ledger's postings and balance, for verification.
 
 Product owner 2026-11-17: "payment receipts should contain only the payment
 receipts.. it shouldn't have any data coming from NDC". A payment is a payment
 receipt on file, and nothing else: not a line of the NDC, not a posting of the
-customer ledger. From 2 to 16 Nov 2026 such a line or posting with no receipt
-on file was itself counted as a payment and listed among the payment receipts
-("NDC (no receipt on file)"), on 216 bookings by 17 Nov. That put the NDC's
-own reading among the receipts (live, UTK-SA-261103-012: receipts 2045 of
-Rs 11,000 and 2047 of Rs 5,00,000 are on file; the NDC's lines were read as
-"CHAN-2045 Rs 1,100" and "CHAN-2047 Rs 4,50,000" and stood as Rs 4,51,100 of
-further money received) and made the owner's own check -- the payment receipts
-equal the NDC's net value -- compare the NDC with itself.
+customer ledger. And the NDC's payments are checked as sums, never line by
+line (receipts_against_ndc, below): the receipts on file are added up and set
+against the money the NDC shows received; short of it, one task asks the PC
+for the receipts; short by about the loan only, a system remark says the loan
+was received as per the NDC with no receipt on file.
 
-What the NDC and the ledger are used for (product owner 2026-11-02, 11-15,
-11-16): verification. Each credit posting of the ledger that is money in -- a
-Receipt voucher, or a journal transfer from another ledger (a relative's
-account) -- and each received line of the NDC, that no receipt on file stands
-for (the same receipt number, else the same amount, each receipt standing for
-one posting, the nearest date first), is a receipt the PC is asked to upload
-(PAYMENT_RECEIPT_MISSING). It is read each time, never stored. Credit notes
-(benefits), the vehicle sale and round-off are not money received. A posting
-equal to a loan amount already known (the finance record's disbursement, the
-statement's financier row, the bank letter's sanction), or a journal from the
-financier, is the loan, which the loan rule counts and a system remark
-states: no receipt is asked for it.
+The customer ledger (Tally) verifies (product owner 2026-11-15): its balance
+against the Deal's (customer_ledger_balance), its financier's credit as the
+loan where nothing else gives one (ledger_financier_credit, ledger_loan_credit).
 """
 from __future__ import annotations
 
@@ -34,7 +22,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection
 
 # A disbursement is the sanction less the lender's charges: within 2%.
 _LOAN_NET_SHARE = Decimal("0.98")
@@ -94,222 +82,176 @@ def money_in(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def _on_file(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
-    return [dict(r) for r in connection.execute(
-        text(
-            """
-            SELECT p.receipt_number, p.receipt_date, p.amount
-            FROM auditcore.payments p
-            JOIN auditcore.evidence e
-              ON e.tenant_id = p.tenant_id AND e.journey_id = p.journey_id
-             AND e.di_document_id = p.source_di_document_id AND e.association_status = 'ACTIVE'
-            WHERE p.tenant_id = :t AND p.journey_id = :j AND p.amount > 0 AND p.status_source = 'EVIDENCE'
-            """
-        ),
-        {"t": tenant_id, "j": journey_id},
-    ).mappings().all()]
+# ── the payment receipts set against the NDC (product owner 2026-11-17) ───────
+#
+# "NDC has to be there to read all the line items ... all these values should
+# add up as one sum; now if NDC has payment receipt info, add up all those
+# numbers and verify if two sums are same; additionally check the payment
+# receipts and add up those, if payment receipts are less then just raise that
+# task. Here it may be that customer has taken up loan. If payment receipt is
+# equal to the loan amount ... don't raise task for this and just add system
+# remark."
+#
+# Three sums, never a line of the NDC set against a receipt one by one:
+# 1. the NDC's charges less its discounts give its net value
+#    (uc03_statement_totals, the "NDC rows do not add up" task);
+# 2. the NDC's payments give its printed Total Receipts -- read as one sum,
+#    which is how a handwritten line is caught (live UTK-SA-261103-012, Avijit
+#    Biswal: "CHAN-2045 Rs 1,100" and "CHAN-2047 Rs 4,50,000" read for receipts
+#    of Rs 11,000 and Rs 4,00,000; the lines add up to Rs 40,100 over the printed
+#    total). While they do not, the NDC's money is not known, and no receipt is
+#    asked for: the reading is the one task (one cause, one task);
+# 3. the payment receipts on file are added up and set against the money the
+#    NDC shows received: its customer payments and the loan. What the dealer
+#    writes in the payments column that is not money -- an offer (Aditya prints
+#    a Rs 4,000 corporate offer among the receipts), the old vehicle taken in
+#    kind -- is not money a receipt can show and is not asked for.
+# The loan with no receipt on file standing for it (none linked to it, none of
+# its amount): the loan received as per the NDC, a system remark, no task. The
+# receipts short of the rest: one task for what is short.
+#
+# From 2 to 17 Nov 2026 each NDC line was matched to a receipt by its number,
+# then its amount; a misread line was then a receipt "missing" (the
+# Rs 4,50,000 above). The customer ledger (Tally) is not used for this: it is
+# read to verify the NDC (product owner 2026-11-15), and the NDC is the source.
+RECEIPTS_TOLERANCE = Decimal(100)
 
 
-def _number(value: Any) -> str:
-    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+def _section_copy(forms: list[tuple[dict[str, Any], list[dict[str, Any]]]]) -> dict[str, Any] | None:
+    """The NDC copy whose payments are read: the standing copy (the one the
+    Deal reads), else the newest other one in use that shows money. Never
+    added across copies."""
+    from audit_core.uc03_account_statement import combine_statements, read_statement
+
+    _, copies = combine_statements(forms)
+    if copies.primary is None:
+        return None
+    rows_of = {id(d): rows for d, rows in forms}
+    order = [copies.primary, *[d for d in copies.used if d is not copies.primary]]
+    for document in order:
+        read = read_statement(rows_of[id(document)])
+        if read.received or read.financer:
+            return {"document": document, "read": read}
+    return {"document": copies.primary, "read": read_statement(rows_of[id(copies.primary)])}
 
 
-def _match(postings: list[dict[str, Any]], receipts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The postings no receipt on file stands for. Each receipt stands for one
-    posting at most: first by its number (the receipt's own reading may drop
-    a leading letter, "B/26-27/0672" for "PB/26-27/0672"), then by its amount,
-    the nearest date first -- whatever the gap: the dealer posts a transfer
-    from another ledger days or weeks after the receipt (live 2026-11-02: a
-    Rs 70,000 cash booking amount of 03-10 posted as "SABITA RANI DASH" on
-    24-10; a Rs 21,000 receipt posted as "BARADA PRASAN NAYAK")."""
-    free = list(range(len(receipts)))
-    left: list[dict[str, Any]] = []
-    unmatched: list[dict[str, Any]] = []
-    for posting in postings:
-        number = _number(posting["number"])
-        hit = next((i for i in free if number and len(_number(receipts[i]["receipt_number"])) >= 4 and (
-            number == _number(receipts[i]["receipt_number"])
-            or (number.endswith(_number(receipts[i]["receipt_number"]))
-                and abs(Decimal(receipts[i]["amount"]) - posting["amount"]) <= 1)
-            # the NDC writes only the receipt's serial ("RECEIPT 0608" for
-            # PB/26-27/0608; independent check 2026-11-04): the same receipt
-            # when the amounts agree within 1% (a digit misread)
-            or (len(number) >= 3 and _number(receipts[i]["receipt_number"]).endswith(number)
-                and abs(Decimal(receipts[i]["amount"]) - posting["amount"])
-                <= max(Decimal(1), Decimal(receipts[i]["amount"]) / 100)))), None)
-        if hit is not None:
-            free.remove(hit)
-        else:
-            unmatched.append(posting)
-    for posting in unmatched:
-        same = [i for i in free if abs(Decimal(receipts[i]["amount"]) - posting["amount"]) <= 1]
-        if not same:
-            left.append(posting)
-            continue
-
-        def gap(i: int, posting: dict[str, Any] = posting) -> int:
-            day = _day(receipts[i]["receipt_date"])
-            return abs((day - posting["date"]).days) if day and posting["date"] else 0
-
-        free.remove(min(same, key=gap))
-    # (against every receipt on file: one another line took by its amount is on file all the same)
-    return _combined(_same_serial(left, receipts), [receipts[i] for i in free])
-
-
-def _serial(value: Any) -> str | None:
-    """The running number a receipt number ends in, when it has four digits or
-    more, without its leading zeros ("CDAM/2627/02045" and "CHAN-2045" both
-    end in 2045; "AMC-B/26509/26-27" ends in its year, not a serial)."""
-    digits = re.search(r"(\d+)\D*$", str(value or ""))
-    return digits.group(1).lstrip("0") or "0" if digits and len(digits.group(1)) >= 4 else None
-
-
-def _same_serial(postings: list[dict[str, Any]], receipts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Of the postings left, those whose receipt is not on file under the same
-    running number either. The NDC is handwritten: its receipt number's letters
-    and its amount are misread ("CHAN-2045 Rs 1,100" for CDAM/2627/02045 of
-    Rs 11,000, live 2026-11-17), so the number and the amount both failed to
-    find the receipt that is on file. A receipt on file ending in the same
-    running number of four digits or more is that receipt: it is not missing,
-    whatever amount the line was read as."""
-    serials = {_serial(r["receipt_number"]) for r in receipts} - {None}
-    return [p for p in postings if _serial(p["number"]) not in serials]
-
-
-# The rupees an NDC's received lines may run over its total (rounding).
-_NDC_TOLERANCE = Decimal(10)
-
-# The most receipts one posting is matched against.
-_MAX_COMBINED = 4
-
-
-def _combined(postings: list[dict[str, Any]], receipts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Of the postings left, those no set of the receipts left adds up to:
-    the dealer may post several receipts as one transfer (live 2026-11-03:
-    three receipts of Rs 5,000, 11,000 and 70,000 posted as one Rs 86,000
-    journal from the customer's ledger). Each receipt stands once."""
-    receipts = list(receipts)
-    left = list(postings)
-    for posting in sorted(postings, key=lambda p: -p["amount"]):
-        hit = _subset(posting["amount"], [Decimal(r["amount"]) for r in receipts])
-        if hit is not None:
-            receipts = [r for i, r in enumerate(receipts) if i not in hit]
-            left = [p for p in left if p is not posting]
-    return left
-
-
-def _subset(total: Decimal, amounts: list[Decimal]) -> set[int] | None:
-    """The indexes of the fewest amounts (two to _MAX_COMBINED) that add up to
-    ``total`` within a rupee; None when none do."""
-    from itertools import combinations
-
-    for size in range(2, min(_MAX_COMBINED, len(amounts)) + 1):
-        for picked in combinations(range(len(amounts)), size):
-            if abs(sum((amounts[i] for i in picked), Decimal(0)) - total) <= 1:
-                return set(picked)
-    return None
-
-
-def _loan_amounts(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[Decimal]:
-    """The loan amounts known for the booking: disbursed on the finance
-    record, the statement's financier row, the bank letter's sanction."""
-    from audit_core.uc03_finance_disbursement_resolution import stated_loan_amounts
-
-    amounts = [Decimal(r[0]) for r in connection.execute(
-        text("SELECT loan_disbursement_amount FROM auditcore.finance_records "
-             "WHERE tenant_id=:t AND journey_id=:j AND loan_disbursement_amount IS NOT NULL"),
-        {"t": tenant_id, "j": journey_id},
-    ).all()]
-    amounts += [Decimal(str(s["amount"])) for s in stated_loan_amounts(connection, tenant_id=tenant_id,
-                                                                       journey_id=journey_id)
-                if s.get("amount") is not None]
-    return amounts
-
-
-def unreceipted_postings(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, list[dict[str, Any]]]:
-    """The customer ledger's money-in postings, and the NDC's received lines,
-    that no receipt on file stands for, each with its page as its document:
-    ``customer`` -- not the loan (``ledger_receipts``); ``loan`` -- the loan
-    (an amount equal to a loan figure known for the booking, or the
-    financier's journal credit), received with no receipt on file (product
-    owner 2026-11-16: no task for it, a system remark)."""
+def ndc_money(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    """What the NDC shows: its net value, its printed Total Receipts, and the
+    money received (customer payments and the loan) -- with ``held`` saying why
+    the money cannot be taken from it yet. None when no NDC form is on file."""
     from audit_core.uc03_account_statement import (
-        KIND_TALLY,
-        combined_tally_rows,
-        journey_statement_received_lines,
+        KIND_FORM,
         line_rows,
         load_ledger_documents,
         statement_kind,
+        statement_total,
     )
+    from audit_core.uc03_statement_totals import _rupees, statement_differences
 
-    documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
-    tallies = [(d, rows) for d in documents for rows in [line_rows(d["fields"].get("line_items"))]
-               if statement_kind(rows) == KIND_TALLY]
-    ndc_lines, ndc_total, ndc_document = journey_statement_received_lines(
-        connection, tenant_id=tenant_id, journey_id=journey_id)
-    if not tallies and not ndc_lines:
-        return {"customer": [], "loan": []}
-    receipts = _on_file(connection, tenant_id=tenant_id, journey_id=journey_id)
-    loans: list[Decimal] | None = None
-    out: list[dict[str, Any]] = []
-    loan_out: list[dict[str, Any]] = []
-
-    def not_the_loan(posting: dict[str, Any]) -> bool:
-        nonlocal loans
-        loans = loans if loans is not None else _loan_amounts(connection, tenant_id=tenant_id, journey_id=journey_id)
-        # The loan: the amount known, or the disbursement net of the lender's
-        # charges, a little under it (live: Rs 12,50,000 credited against a
-        # sanction of Rs 12,57,000).
-        return not any(is_loan_net_of_charges(posting["amount"], loan) for loan in loans)
-
-    if tallies:
-        origin = max((d for d, _ in tallies), key=lambda d: (
-            d.get("linkedAtUtc").timestamp() if hasattr(d.get("linkedAtUtc"), "timestamp") else 0.0))
-        for posting in _match(money_in(combined_tally_rows(tallies)), receipts):
-            located = {**posting, "documentId": str(origin["documentId"])}
-            if (_JOURNAL_VOUCHER.fullmatch(posting["voucherType"])
-                    and _FINANCIER.fullmatch(_label(posting["particulars"]))) or not not_the_loan(posting):
-                loan_out.append({**located, "documentLabel": "Customer ledger"})
-            else:
-                out.append({**located, "documentLabel": "Customer ledger (no receipt on file)"})
-    if ndc_lines:
-        # The NDC's received lines no receipt on file and no ledger posting
-        # already counted stands for (product owner 2026-11-04): each money
-        # received once, whichever document shows it. Never more than the
-        # NDC's own received total leaves unexplained by the receipts on file
-        # and the ledger: when its lines and the receipts are split
-        # differently, the lines left are not more money.
-        taken = receipts + [{"receipt_number": p["number"], "receipt_date": p["date"], "amount": p["amount"]}
-                            for p in out]
-        left = [p for p in _match(ndc_lines, taken) if not_the_loan(p)]
-        on_file = sum((Decimal(r["amount"]) for r in receipts if not_the_loan({"amount": Decimal(r["amount"])})),
-                      Decimal(0)) + sum((p["amount"] for p in out), Decimal(0))
-        # (a receipt matched within 1% of its NDC line leaves that 1% of slack)
-        if sum((p["amount"] for p in left), Decimal(0)) <= ndc_total - on_file + max(_NDC_TOLERANCE, on_file / 100):
-            out.extend({**p, "documentId": ndc_document, "documentLabel": "NDC (no receipt on file)"} for p in left)
-        # The loan on the NDC with no receipt on file, unless the ledger
-        # already showed the same credit.
-        shown = taken + [{"receipt_number": p["number"], "receipt_date": p["date"], "amount": p["amount"]}
-                         for p in loan_out]
-        loan_out.extend({**p, "documentId": ndc_document, "documentLabel": "NDC"}
-                        for p in _match(ndc_lines, shown) if not not_the_loan(p))
-    return {"customer": out, "loan": loan_out}
+    forms = [(d, rows) for d in load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+             for rows in [line_rows(d["fields"].get("line_items"))] if statement_kind(rows) == KIND_FORM]
+    if not forms:
+        return None
+    picked = _section_copy(forms)
+    if picked is None:
+        return None
+    document, read = picked["document"], picked["read"]
+    fields = document["fields"]
+    received = sum((amount for _, amount in read.received), Decimal(0))
+    loan = read.financer or Decimal(0)
+    # The financier's payment listed among the received lines too (Shivnath's
+    # offer letter plans the finance and lists its receipt): one payment,
+    # counted once -- and still the loan.
+    listed = bool(loan) and any(abs(amount - loan) <= 1 for _, amount in read.received)
+    customer = received - loan if listed else received
+    printed = _amount(fields.get("total_receipts"))
+    printed = abs(printed) if printed else None
+    net = statement_total(fields, read)
+    differences = statement_differences(fields)
+    # A payments column more than the receipts tolerance away from its printed total: a line is
+    # misread, and the NDC's money is not known (a smaller gap cannot raise a task on its own).
+    payments_off = next((d for d in differences or []
+                         if d["total"] == "Total Receipts" and abs(d["difference"]) > RECEIPTS_TOLERANCE), None)
+    held = None
+    if differences is None:
+        held = "The NDC's rows are not read well enough to tell its payments."
+    elif printed is None:
+        held = "The NDC prints no Total Receipts, so its payment lines cannot be checked as one sum."
+    elif payments_off is not None:
+        held = (f"The NDC's payment lines add up to {_rupees(payments_off['rows'])} as read; it prints Total "
+                f"Receipts of {_rupees(payments_off['printed'])}. The payment receipts are compared once the NDC's "
+                f"reading is corrected (task: NDC rows do not add up).")
+    return {"documentId": str(document["documentId"]), "net": net, "printedReceipts": printed,
+            "customer": customer, "loan": loan, "money": customer + loan, "held": held,
+            # the NDC's own showing of a balance: net value against its payments column
+            "ndcBalance": (net - printed) if net is not None and printed is not None else None}
 
 
-def missing_receipts(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
-    """The receipts the NDC and the customer ledger show and the file does not
-    have: their money-in lines no receipt on file stands for and that are not
-    the loan, each with its page as its document. Never payments: nothing here
-    is counted as money received or listed among the payment receipts (product
-    owner 2026-11-17)."""
-    return unreceipted_postings(connection, tenant_id=tenant_id, journey_id=journey_id)["customer"]
+def _receipts_on_file(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """The payment receipts on file, each counted once (the Deal's own rule:
+    uc03_p2_journey360._paid): every amount, and the total of those linked to
+    the loan."""
+    from audit_core.uc03_p2_journey360 import _paid
+
+    paid = _paid(connection, tenant_id=tenant_id, journey_id=journey_id)
+    counted = [Decimal(a) for a in paid["countedAmounts"]]
+    customer = [Decimal(a) for a in paid["customerAmounts"]]
+    return {"amounts": counted, "total": sum(counted, Decimal(0)),
+            "loanLinked": sum(counted, Decimal(0)) - sum(customer, Decimal(0))}
+
+
+def _loan_receipt(loan: Decimal, on_file: dict[str, Any]) -> Decimal | None:
+    """The receipt on file that stands for the loan: those linked to it on the
+    finance record, else the one of the loan's amount or the loan less the
+    lender's charges (2%) -- its amount; None when no receipt stands for it."""
+    if on_file["loanLinked"] >= loan * _LOAN_NET_SHARE - RECEIPTS_TOLERANCE:
+        return on_file["loanLinked"]
+    found = [amount for amount in on_file["amounts"] if is_loan_net_of_charges(amount, loan)]
+    return max(found) if found else None
+
+
+def receipts_against_ndc(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """The payment receipts on file against the money the NDC shows received.
+
+    ``status``: NO_NDC (no NDC form on file), HELD (the NDC's payments do not
+    add up to the total it prints: not judged), COVERED, or SHORT -- ``short``
+    the receipts not on file, the loan apart. ``loanWithoutReceipt`` the loan
+    the NDC shows received that no receipt on file stands for (a system remark,
+    no task: product owner 2026-11-16 and 2026-11-17)."""
+    ndc = ndc_money(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if ndc is None:
+        return {"status": "NO_NDC", "short": Decimal(0), "loanWithoutReceipt": Decimal(0)}
+    on_file = _receipts_on_file(connection, tenant_id=tenant_id, journey_id=journey_id)
+    out = {**ndc, "onFile": on_file["total"], "receiptsOnFile": len(on_file["amounts"]), "short": Decimal(0),
+           "loanWithoutReceipt": Decimal(0)}
+    if ndc["held"]:
+        return {**out, "status": "HELD"}
+    loan = ndc["loan"]
+    receipt = _loan_receipt(loan, on_file) if loan else None
+    loan_without = loan if loan and receipt is None else Decimal(0)
+    # The loan's receipt a little under the NDC's figure: the lender's charges, not a receipt missing.
+    charges = max(loan - receipt, Decimal(0)) if receipt is not None else Decimal(0)
+    short = ndc["money"] - loan_without - charges - on_file["total"]
+    return {**out, "loanWithoutReceipt": loan_without, "lenderCharges": charges,
+            "short": short if short > RECEIPTS_TOLERANCE else Decimal(0),
+            "status": "SHORT" if short > RECEIPTS_TOLERANCE else "COVERED"}
+
+
+def missing_receipts_total(connection: Connection, *, tenant_id: str, journey_id: UUID) -> Decimal:
+    """The payment receipts not on file, the loan apart (0 unless SHORT). Never
+    money received: nothing here is counted as paid or listed among the
+    payment receipts (product owner 2026-11-17)."""
+    return receipts_against_ndc(connection, tenant_id=tenant_id, journey_id=journey_id)["short"]
 
 
 def loan_without_receipt(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
-    """The loan the NDC or the customer ledger shows received, with no
-    payment receipt on file for it."""
-    return unreceipted_postings(connection, tenant_id=tenant_id, journey_id=journey_id)["loan"]
-
+    """The loan the NDC shows received with no payment receipt on file for it
+    (product owner 2026-11-16: no task, a system remark)."""
+    check = receipts_against_ndc(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if not check["loanWithoutReceipt"]:
+        return []
+    return [{"amount": check["loanWithoutReceipt"], "documentId": check.get("documentId"),
+             "documentLabel": "NDC", "number": None, "date": None}]
 
 # Rows of a ledger printout that repeat the postings above them.
 _CARRIED = re.compile(r"(CLOSING BALANCE|TOTAL|GRAND TOTAL|CARRIED OVER|BROUGHT FORWARD|C/F|B/F|C/O|B/O)\b.*")
@@ -389,13 +331,15 @@ def ledger_loan_credit(connection: Connection, *, tenant_id: str, journey_id: UU
 
 
 __all__ = [
+    "RECEIPTS_TOLERANCE",
     "customer_ledger_balance",
     "is_loan_net_of_charges",
     "ledger_balance",
     "ledger_financier_credit",
     "ledger_loan_credit",
     "loan_without_receipt",
-    "missing_receipts",
+    "missing_receipts_total",
     "money_in",
-    "unreceipted_postings",
+    "ndc_money",
+    "receipts_against_ndc",
 ]

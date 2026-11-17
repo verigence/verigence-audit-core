@@ -72,6 +72,17 @@ DAILY_JOBS: dict[str, DailyJob] = {
             env_utc="P2_NIGHTLY_REVIEW_UTC",
         ),
         DailyJob(
+            key="VERIFIED_CHECK",
+            name="Verified bookings check",
+            what=("Works out again the figures of every booking a Team Lead or Reviewer verified against "
+                  "its papers and says, per booking, Matches or Changed (and whether its papers changed). "
+                  "It also runs once after each deploy."),
+            default_ist="21:40",
+            run_name="P2_VERIFIED_CHECK",
+            env_utc="P2_VERIFIED_CHECK_UTC",
+            can_be_off=True,
+        ),
+        DailyJob(
             key="DATA_ARCHIVE",
             name="Data archive",
             what=("Moves old records (rule runs and the like) to the archive bucket, checks each batch "
@@ -164,6 +175,7 @@ def apply(times_ist: dict[str, str]) -> None:
     if worker is not None:
         worker._NIGHTLY_REVIEW_UTC = time_utc("NIGHTLY_REVIEW")
         worker._DATA_ARCHIVE_UTC = time_utc("DATA_ARCHIVE")
+        worker._VERIFIED_CHECK_UTC = time_utc("VERIFIED_CHECK")
 
 
 def stored_times(connection: Connection) -> dict[str, dict[str, Any]]:

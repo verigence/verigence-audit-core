@@ -598,6 +598,39 @@ def ledger_check(ledger: dict[str, Any] | None, settle: dict[str, Any]) -> dict[
                       f"({'due' if deal_balance > 0 else 'paid over'}): they differ by Rs {abs(difference):,.2f}."}
 
 
+def ndc_payments_view(check: dict[str, Any]) -> dict[str, Any] | None:
+    """The three sums of the NDC and the payment receipts (product owner 2026-11-17), as
+    the Audit Summary shows them: the NDC's net value and its printed Total Receipts
+    (do they agree), the money it shows received, the payment receipts on file and what
+    they are short of it."""
+    from audit_core.uc03_statement_totals import _rupees
+
+    if check.get("status") in (None, "NO_NDC"):
+        return None
+    balance = dec(check.get("ndcBalance"))
+    status = check["status"]
+    if status == "HELD":
+        reason = check["held"]
+    elif status == "SHORT":
+        reason = (f"Payment receipts of {_rupees(Decimal(check['short']))} that the NDC shows received are not on "
+                  "file (task: Payment receipt missing).")
+    else:
+        reason = "The payment receipts on file cover the money the NDC shows received."
+    if check.get("loanWithoutReceipt"):
+        reason += (f" The loan of {_rupees(Decimal(check['loanWithoutReceipt']))} is received as per the NDC with "
+                   "no payment receipt on file (system remark).")
+    if balance is not None and abs(balance) > 10:
+        reason += (f" The NDC's own payments column is {_rupees(abs(balance))} "
+                   + ("short of" if balance > 0 else "over") + " its net value.")
+    return {"status": status, "documentId": check.get("documentId"), "netValue": money(dec(check.get("net"))),
+            "ndcTotalReceipts": money(dec(check.get("printedReceipts"))),
+            "ndcBalance": money(balance) if balance is not None else None,
+            "ndcReceived": money(dec(check.get("money"))), "ndcCustomer": money(dec(check.get("customer"))),
+            "ndcLoan": money(dec(check.get("loan"))), "receiptsOnFile": money(dec(check.get("onFile"))),
+            "receiptsShort": money(dec(check.get("short"))),
+            "loanWithoutReceipt": money(dec(check.get("loanWithoutReceipt"))), "reason": reason}
+
+
 # The totals whose excess the customer pays (a charges or net total printed above
 # its rows); a receipts total is the dealer's record of money in, no impact.
 _CHARGED_TOTALS = frozenset({"Total Cost", "Gross Value", "Net Value", "On-road total"})
@@ -841,12 +874,13 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                       "decidedBy": (deal.get("insurance") or {}).get("decidedBy"),
                       "basis": (deal.get("insurance") or {}).get("basis")},
     }
-    from audit_core.uc03_ledger_receipts import missing_receipts
+    from audit_core.uc03_ledger_receipts import receipts_against_ndc
 
-    # What the NDC / customer ledger shows received with no payment receipt on file: not
-    # money received (product owner 2026-11-17), said beside a shortfall.
-    not_on_file = sum((Decimal(p["amount"]) for p in missing_receipts(connection, tenant_id=tenant_id,
-                                                                      journey_id=journey_id)), Decimal(0))
+    # The payment receipts on file against the money the NDC shows received (product owner
+    # 2026-11-17): what is not on file is not money received, said beside a shortfall.
+    ndc_check = receipts_against_ndc(connection, tenant_id=tenant_id, journey_id=journey_id)
+    not_on_file = Decimal(ndc_check["short"])
+    funding["ndcPayments"] = ndc_payments_view(ndc_check)
     settle = settlement(dec(summary.get("payable")), receipts + loan + old_vehicle - refunds,
                         loan_unknown=loan_on_file["unknown"], receipts_missing=not_on_file or None,
                         # Each awaited bill named once (two warranty lines are one warranty bill).
