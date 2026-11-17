@@ -184,7 +184,7 @@ def test_pc_sees_a_pairing_touching_their_own_journey_even_across_dealers(two_jo
     pair = body["pairs"][0]
     assert pair["matchBasis"] == "PAN"
     assert pair["matchBasisLabel"] == "PAN"
-    assert pair["matchConfidencePercent"] == 99
+    assert pair["matchConfidencePercent"] == 90  # the PAN alone, no mobile (2026-11-17)
     assert pair["matchConfidenceLabel"] == "HIGH"
 
     sides = {pair["duplicate"]["dealerName"], pair["holder"]["dealerName"]}

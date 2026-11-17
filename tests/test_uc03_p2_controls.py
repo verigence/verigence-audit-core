@@ -428,7 +428,7 @@ def test_a_stronger_duplicate_match_replaces_the_finding_the_control_and_task_fo
             {"t": second.tenant_id, "j": second.journey_id},
         ).scalars().all()
     state = _states(second)["DUPLICATE_BOOKING"]
-    assert state["details"]["matchBasis"] == "PAN" and state["details"]["matchConfidencePercent"] == 99
+    assert state["details"]["matchBasis"] == "PAN" and state["details"]["matchConfidencePercent"] == 100
     assert status == "OPEN"  # the control follows the finding on the current basis, not the voided one
     assert tasks == [str(linked)]  # one open Team Lead task, pointing at it
 

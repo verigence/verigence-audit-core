@@ -43,6 +43,7 @@ from audit_core.uc03_p2_same_file import (
     FileIdentity,
     alert_body,
     cross_outlet_fields,
+    cross_outlet_probability,
     is_individual_pan,
     matched_fields,
     run_same_file_delete,
@@ -1167,8 +1168,10 @@ def test_cross_outlet_rule_without_a_database():
     assert cross_outlet_fields(_identity(outlet_id=b, booking_refs=frozenset({"BK-99"}), name=None), base)
     assert cross_outlet_fields(_identity(outlet_id=b, pan=None, aadhaar="234567891234"), _identity(
         outlet_id=a, pan=None, aadhaar="234567891234"))
-    # 2026-11-17: the mobile may differ; the name may not.
+    # 2026-11-17: the mobile may differ (90%), the name may not; the mobile too is 100%.
     assert cross_outlet_fields(_identity(outlet_id=b, mobile="9876500000"), base)
+    assert cross_outlet_probability(_identity(outlet_id=b, mobile="9876500000"), base) == 90
+    assert cross_outlet_probability(_identity(outlet_id=b), base) == 100
     assert cross_outlet_fields(_identity(outlet_id=b, name="Pankaj Nayak"), base) is None
     assert cross_outlet_fields(_identity(outlet_id=b, model_name="SCORPIO N"), base) is None
     assert cross_outlet_fields(_identity(outlet_id=b, pan="ABCPE9999F"), base) is None

@@ -678,6 +678,13 @@ def cross_outlet_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[
     return fields
 
 
+def cross_outlet_probability(new: FileIdentity, existing: FileIdentity) -> int:
+    """How sure the duplicate booking across dealerships is (product owner 2026-11-17: "if
+    mobile matches its 100% duplicate, if mobile doesnt match other things matches 90%
+    probability"): the PAN or Aadhaar, the model and the name agree in both cases."""
+    return 100 if new.mobile and new.mobile == existing.mobile else 90
+
+
 def matched_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
     """The fields, as a reviewer should see them, when the two journeys are one
     booking entered twice at one outlet; None otherwise.
@@ -1406,7 +1413,14 @@ def cross_outlet_body(payload: dict[str, Any], *, title: str | None = None) -> s
             f"(PC {new.get('pcName') or 'unknown'}, {_place(new.get('dealerName'), new.get('outletName'))}) "
             f"and {existing.get('reference') or 'an earlier journey'} "
             f"(PC {existing.get('pcName') or 'unknown'}, {_place(existing.get('dealerName'), existing.get('outletName'))}) "
-            f"are the same customer on {on}. Nothing was deleted.{blocked}")
+            f"are the same customer on {on}{_probability(payload)}. Nothing was deleted.{blocked}")
+
+
+def _probability(payload: dict[str, Any]) -> str:
+    percent = payload.get("probabilityPercent")
+    if percent is None:
+        return ""
+    return " (100% duplicate)" if percent >= 100 else f" ({percent}% probability: the mobile differs)"
 
 
 def _raise_cross_outlet(connection: Connection, *, tenant_id: str, new: FileIdentity, existing: FileIdentity,
@@ -1430,6 +1444,7 @@ def _raise_cross_outlet(connection: Connection, *, tenant_id: str, new: FileIden
                             "outletId": str(existing.outlet_id) if existing.outlet_id else None},
         "matchedFields": fields,
         "severity": "CRITICAL",
+        "probabilityPercent": cross_outlet_probability(new, existing),
         **({"audienceOutletIds": sorted({str(o) for o in (new.outlet_id, existing.outlet_id) if o}),
             "audienceRoles": ["PC", "REVIEWER", "TL"], "uploadsBlocked": True} if same_dealership else {}),
     }
