@@ -343,3 +343,34 @@ def test_an_ndc_copy_naming_the_dealer_does_not_count_as_own(engine, monkeypatch
     _ndc(journey, '[{"particulars_raw": "INSURANCE IN HOUSE", "debit_amount": 41000}]')
     monkeypatch.setattr(rule, "premium_on_dealer_statement", lambda *a, **k: 41000.0)
     assert _sync(journey)["source"] == "INHOUSE"
+
+
+def test_with_an_ndc_read_a_dealer_invoice_premium_does_not_decide(engine, monkeypatch) -> None:
+    # product owner 2026-11-17: the dealer's code on the policy or the NDC's amount; nothing else
+    journey = create_p2_journey(engine, prefix="inssrc")
+    invoice = uuid4()
+    add_evidence(journey, di_document_id=invoice, document_type_key="customer_invoice_dms", process_area="DELIVERY")
+    add_extracted_field(journey, di_document_id=invoice, field_key="line_items", document_type="customer_invoice_dms",
+                        value='[{"description_raw": "Insurance", "net_amount": 37476.0, "line_category": "INSURANCE"}]')
+    import audit_core.uc03_account_statement as statement
+
+    monkeypatch.setattr(statement, "statement_reading", lambda *a, **k: {"read": True, "unread": []})
+    monkeypatch.setattr(rule, "premium_on_dealer_statement", lambda *a, **k: None)
+    decision = _sync(journey)  # no policy on file: the NDC alone decides
+    assert (decision["source"], decision["decidedBy"]) == ("SELF", "DOCUMENT")
+    assert "no policy with the dealer's code" in decision["basis"]
+
+
+def test_review_reports_pc_answers_the_documents_contradict(engine, monkeypatch) -> None:
+    from audit_core.uc03_insurance_source_review import run_insurance_source_review
+
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _policy(journey, agent_code="91063100000001")
+    with engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.insurance_records SET insurance_source='INHOUSE' "
+                                "WHERE tenant_id=:t AND journey_id=:j"), {"t": journey.tenant_id, "j": journey.journey_id})
+    _ndc(journey, '[{"particulars_raw": "Insurance amount OWN", "debit_amount": null}]')
+    report = run_insurance_source_review(engine, "t-dry", [journey.tenant_id])
+    listed = report["tenants"][journey.tenant_id]["pcAgainstDocuments"]
+    assert [(x["pc"], x["documents"]) for x in listed] == [("INHOUSE", "SELF")]
