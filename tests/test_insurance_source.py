@@ -400,3 +400,13 @@ def test_the_dealers_insurance_dump_listing_the_policy_is_inhouse(engine, monkey
         connection.execute(text("UPDATE auditcore.p2_insurance_dumps SET status='SUPERSEDED' WHERE tenant_id=:t AND dump_id=:id"),
                            {"t": journey.tenant_id, "id": dump_id})
     assert "insurance dump" not in (_sync(journey)["basis"] or "")  # a superseded dump no longer counts
+
+
+def test_own_written_where_the_amount_goes_is_self(engine, monkeypatch) -> None:
+    # 2026-11-18: "Insurance amount" with "OWN" in the amount column, a cost sheet premium beside it
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _ndc(journey, '[{"particulars_raw": "Insurance amount", "debit_amount": "OWN"}]')
+    monkeypatch.setattr(rule, "premium_on_dealer_statement", lambda *a, **k: 96351.0)
+    decision = _sync(journey)
+    assert (decision["source"], decision["decidedBy"]) == ("SELF", "DOCUMENT")
+    assert '"Insurance amount: OWN"' in decision["basis"]

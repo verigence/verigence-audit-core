@@ -317,8 +317,14 @@ def ndc_says_own(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
                     continue
                 if _DEALER_WORDS.search(label.upper()) or _IN_HOUSE.search(label.upper()):
                     return None
+                # "own" may be written where the amount goes ("Insurance amount":
+                # "OWN", 2026-11-18: UTK-JP-261101-009, SHI-SW-261112-014)
+                written = next((str(row[k]) for k in ("debit_amount", "credit_amount", "amount")
+                                if isinstance(row.get(k), str) and booking_says_self(row[k])), None)
                 if own_insurance_row(label):
                     own.append(label)
+                elif written is not None and not _NOT_AN_OWN_ROW.search(label.upper()):
+                    own.append(f"{label}: {written}")
     return own[0] if own else None
 
 

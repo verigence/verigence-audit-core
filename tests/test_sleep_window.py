@@ -244,7 +244,17 @@ def _enqueue(journey, *, retry_in_seconds: int | None = None) -> str:
     return key
 
 
+def _no_one_off_jobs(engine):
+    from audit_core.db import set_platform_super_admin_context
+
+    with engine.begin() as connection:
+        set_platform_super_admin_context(connection)
+        connection.execute(text("UPDATE auditcore.p2_worker_jobs SET status='DONE' "
+                                "WHERE status IN ('PENDING', 'RUNNING')"))
+
+
 def test_the_look_says_when_there_is_next_something_to_do(journey):
+    _no_one_off_jobs(journey.engine)
     assert worker._night_work_due_in(journey.engine) is None
     assert worker._known_tenants == [journey.tenant_id]
     _enqueue(journey, retry_in_seconds=600)
@@ -285,3 +295,18 @@ def test_work_on_the_way_as_the_window_opens_is_finished_before_the_worker_sleep
     assert done == [key]
     assert sleep_window.asleep()
     assert time.monotonic() - started < 10
+
+
+def test_a_one_off_job_asked_for_at_night_wakes_the_worker(journey):
+    # 2026-11-18: a job queued after the window opened waited for the hourly look
+    from audit_core.db import set_platform_super_admin_context
+
+    _no_one_off_jobs(journey.engine)
+    assert worker._night_work_due_in(journey.engine) is None
+    with journey.engine.begin() as connection:
+        set_platform_super_admin_context(connection)
+        connection.execute(text("INSERT INTO auditcore.p2_worker_jobs (job_kind, tag, reports, requested_by) "
+                                "VALUES ('INSURANCE_SOURCE_REVIEW', :tag, '{}', 'test')"),
+                           {"tag": f"{journey.tenant_id}:night-dry"})
+    assert worker._night_work_due_in(journey.engine) == 0
+    _no_one_off_jobs(journey.engine)
