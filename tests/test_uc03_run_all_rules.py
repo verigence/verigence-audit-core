@@ -99,8 +99,8 @@ def test_run_all_rules_for_a_fresh_booking_journey_returns_all_expected_rule_cod
     assert by_code["AUTOMATED_SYNC_FAILURE"] == "PASS"
     passes = {"AUTOMATED_SYNC_FAILURE", "THIRD_PARTY_PAYMENT_UNCONFIRMED", "THIRD_PARTY_PAYMENT_UNDECLARED",
               "EXCESS_DISCOUNT", "KIT_GIVEN_AS_CASH", "CASH_ABOVE_LIMIT",
-              "PAYMENT_BEFORE_BOOKING", "INSURANCE_INVOICE_MISSING", "SELF_INSURANCE_DECLARED",
-              "PAYMENT_RECEIPT_MISSING"}  # nothing paid, given or invoiced yet
+              "PAYMENT_BEFORE_BOOKING", "INSURANCE_INVOICE_MISSING", "SELF_INSURANCE_DECLARED"}
+    # nothing paid, given or invoiced yet; PAYMENT_RECEIPT_MISSING waits for the NDC (2026-11-17)
     assert all(outcome == ("PASS" if code in passes else "SKIPPED") for code, outcome in by_code.items())
     assert all(r.stage == "BOOKING" for r in results)
 
