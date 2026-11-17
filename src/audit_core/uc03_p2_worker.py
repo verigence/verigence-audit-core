@@ -4788,6 +4788,14 @@ def _night_work_due_in(engine: Engine) -> float | None:
     running or a page is still being read, the wait for the earliest retry
     otherwise, None when there is nothing at all."""
     soonest: float | None = None
+    # A one-off job asked for (or still running) is work too: it is never left
+    # waiting for the next hourly look (2026-11-18: a recompute queued at
+    # 00:35 would otherwise wait until about 01:30).
+    with engine.begin() as connection:
+        set_platform_super_admin_context(connection)
+        if connection.execute(text("SELECT EXISTS (SELECT 1 FROM auditcore.p2_worker_jobs "
+                                   "WHERE status IN ('PENDING', 'RUNNING'))")).scalar_one():
+            return 0.0
     tenants = _active_tenants(engine)
     _known_tenants[:] = tenants
     for tenant_id in tenants:
