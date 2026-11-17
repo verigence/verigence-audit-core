@@ -73,8 +73,6 @@ logger = structlog.get_logger(__name__)
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-bank-statements"])
 
 MAX_BYTES = 20 * 1024 * 1024
-# Journeys whose customer ledger / NDC postings are read in one run (each is a few reads).
-MAX_LEDGER_JOURNEYS = 400
 
 JOURNEY_VERIFIED, JOURNEY_PARTIAL, JOURNEY_NOT_VERIFIED, JOURNEY_CASH_ONLY = (
     "VERIFIED", "PARTIAL", "NOT_VERIFIED", "CASH_ONLY")
@@ -239,35 +237,6 @@ def _people(connection: Connection, tenant_id: str, dealer_id: str) -> tuple[dic
     return people, meta
 
 
-def _ledger_receipts(connection: Connection, tenant_id: str, journey_ids: list[str], people: dict[str, list[str]],
-                     meta: dict[str, Any], first: date, last: date) -> list[br.Receipt]:
-    """Money the customer ledger / NDC records with no receipt on file (counted as paid,
-    product owner 2026-11-04), dated in the range. Keyed as the Journey 360 keys them."""
-    from audit_core.uc03_ledger_receipts import ledger_receipts
-    from audit_core.uc03_p2_dates import parse_extracted_date
-
-    out = []
-    for jid in journey_ids[:MAX_LEDGER_JOURNEYS]:
-        try:
-            with connection.begin_nested():
-                postings = ledger_receipts(connection, tenant_id=tenant_id, journey_id=UUID(jid))
-        except Exception:
-            logger.warning("bank_reconciliation_ledger_skipped", journey_id=jid, exc_info=True)
-            continue
-        for posting in postings:
-            day = posting.get("date")
-            day = day if isinstance(day, date) else parse_extracted_date(day)
-            if day is None or not (first <= day <= last):
-                continue
-            out.append(br.Receipt(
-                key=f"ledger:{posting['number'] or posting['date']}:{posting['amount']}", journey_id=jid,
-                outlet_id=meta.get(jid, {}).get("outletId"), amount=_dec(posting["amount"]), receipt_date=day,
-                mode=posting.get("mode"), reference=posting.get("particulars"), bank=None,
-                customer_names=people.get(jid, []), source="LEDGER", number=posting.get("number"),
-            ))
-    return out
-
-
 # --------------------------------------------------------------------------- the run
 
 def reconcile_dealer(connection: Connection, *, tenant_id: str, dealer_id: str) -> dict[str, Any]:
@@ -287,10 +256,10 @@ def reconcile_dealer(connection: Connection, *, tenant_id: str, dealer_id: str) 
     last = max(w.period_to for w in windows) + timedelta(days=br.WINDOW_DAYS)
     credits, duplicates = _credits(connection, tenant_id, statements)
     receipts = _receipts(connection, tenant_id, dealer_id, first, last)
-    people, meta = _people(connection, tenant_id, dealer_id)
+    people, _ = _people(connection, tenant_id, dealer_id)
     named = {c.key: br.name_journeys(c, people) for c in credits}
-    ledger_journeys = sorted({r.journey_id for r in receipts} | {j for js in named.values() for j in js})
-    receipts += _ledger_receipts(connection, tenant_id, ledger_journeys, people, meta, first, last)
+    # The payment receipts on file and nothing else (product owner 2026-11-17): a line of the
+    # NDC or a posting of the customer ledger with no receipt on file is not a receipt to verify.
 
     results, credit_results = br.reconcile(receipts, credits, windows)
     for cr in credit_results:

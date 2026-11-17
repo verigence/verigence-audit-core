@@ -5314,6 +5314,12 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # see uc03_rules_rerun. A dry run unless the label ends with "-commit".
         from audit_core.uc03_rules_rerun import run_rules_rerun
         return run_rules_rerun, (engine, tag, reports)
+    if kind == "PAYMENT_RECEIPTS_ONLY":
+        # The bookings on file put right after the payment receipts became the payment
+        # receipts only, nothing of the NDC among them (product owner 2026-11-17): see
+        # uc03_payment_receipts_only. A dry run unless the label ends with "-commit".
+        from audit_core.uc03_payment_receipts_only import run_payment_receipts_only
+        return run_payment_receipts_only, (engine, tag, reports)
     if kind == "LOAN_RECEIPT_RESOLVE":
         # The loan receipt of every financed booking re-resolved by the
         # no-guessing rules (2026-11-02), or only the references in

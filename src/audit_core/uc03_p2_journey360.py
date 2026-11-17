@@ -634,25 +634,21 @@ def _paid(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[s
     duplicates = _duplicate_receipts(rows)
     loan_ids = _loan_receipt_ids(connection, tenant_id=tenant_id, journey_id=journey_id, duplicate_of=duplicates)
     counted = [r for r in rows if r["payment_id"] not in duplicates]
-    # Money the customer ledger records with no receipt on file (2026-11-02).
-    from audit_core.uc03_ledger_receipts import ledger_receipts
-
-    postings = ledger_receipts(connection, tenant_id=tenant_id, journey_id=journey_id)
-    from_ledger = [p["amount"] for p in postings]
+    # Payment receipts on file and nothing else (product owner 2026-11-17): a
+    # line of the NDC or a posting of the customer ledger with no receipt on
+    # file is a receipt to ask for (uc03_ledger_receipts.missing_receipts),
+    # never money counted here.
     receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids), Decimal(0))
-    receipts += sum(from_ledger, Decimal(0))
     loan_receipts = sum((Decimal(r["amount"]) for r in counted if r["payment_id"] in loan_ids), Decimal(0))
     loan = loan_receipts + _loan_received(connection, tenant_id=tenant_id, journey_id=journey_id)
-    customer = [Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids] + from_ledger
+    customer = [Decimal(r["amount"]) for r in counted if r["payment_id"] not in loan_ids]
     # The same customer money, dated as printed, for the rules that ask what
     # was paid by a day (delivery): the receipts that make up ``receipts``.
     dated = [{"paymentId": str(r["payment_id"]), "amount": Decimal(r["amount"]), "date": r["receipt_date"],
               "receiptNumber": r["receipt_number"]} for r in counted if r["payment_id"] not in loan_ids]
-    dated += [{"paymentId": None, "amount": Decimal(p["amount"]), "date": p["date"],
-               "receiptNumber": p["number"]} for p in postings]
     return {"receipts": receipts, "loan": loan, "total": receipts + loan,
             "customerAmounts": customer, "customerReceipts": dated,
-            "countedAmounts": [Decimal(r["amount"]) for r in counted] + from_ledger}
+            "countedAmounts": [Decimal(r["amount"]) for r in counted]}
 
 
 def _loan_counted(connection: Connection, *, tenant_id: str, journey_id: UUID, paid: dict[str, Any],
@@ -3649,24 +3645,11 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         item["bankMatch"] = status
     for item in items:
         item.pop("bank_", None)
-    # Money the customer ledger records with no receipt on file: counted, its
-    # document the ledger page (product owner 2026-11-02: the customer ledger
-    # is used for the payment verification).
-    from audit_core.uc03_ledger_receipts import ledger_receipts
-
-    for posting in ledger_receipts(connection, tenant_id=tenant_id, journey_id=journey_id):
-        items.append({
-            "paymentId": f"ledger:{posting['number'] or posting['date']}:{posting['amount']}",
-            "amount": _money(posting["amount"]), "receiptNumber": posting["number"],
-            "receiptDate": posting["date"], "mode": posting["mode"], "stage": None, "bank": None,
-            "reference": posting["particulars"], "documentId": posting["documentId"],
-            "document": posting["documentLabel"], "counted": True, "isLoanReceipt": False,
-            "notCountedReason": None, "duplicateOf": None, "bankMatch": None, "bankStatement": None,
-            "fromLedger": True,
-        })
-        verdict = dealer_verdict(items[-1]["paymentId"])
-        if verdict is not None:
-            items[-1]["bankStatement"], items[-1]["bankMatch"] = verdict, verdict["status"]
+    # Only the payment receipts on file are listed and counted (product owner
+    # 2026-11-17: "payment receipts should contain only the payment receipts..
+    # it shouldn't have any data coming from NDC"). What the NDC or the
+    # customer ledger shows received with no receipt on file is asked for from
+    # the PC (PAYMENT_RECEIPT_MISSING), never a row or money here.
 
     # One split of the money received (2026-11-02): the customer's receipts,
     # and the loan -- its linked receipt plus a disbursement on the finance
