@@ -104,7 +104,11 @@ def run_field_reread(engine: Engine, tag: str, tenant_ids: list[str], *, types: 
 
 # An amount of Rs 1,000 or more ending in 001, as a value or inside a list of rows.
 _SLASH_DASH_SCALAR = r"^[1-9][0-9]*001(\.0+)?$"
-_SLASH_DASH_IN_ROWS = r'"(amount|debit_amount|credit_amount)": ?"?[1-9][0-9]*001(\.0+)?"?[,}]'
+# Only the amounts written round by hand -- discounts, bonuses, payments received. Mahindra's
+# own prices do end in 001 (the price book: 9,99,001, 10,29,901), so a vehicle price, a charge
+# or a total ending in 001 is no sign of a misread (2026-11-17: 199 booking-form ex-showroom
+# prices ended in 001, the price book's own).
+_SLASH_DASH_IN_ROWS = r'"(amount|credit_amount)": ?"?[1-9][0-9]*001(\.0+)?"?[,}]'
 
 
 def slash_dash_documents(connection: Any, tenant_id: str) -> dict[str, set[str]]:
@@ -120,11 +124,11 @@ def slash_dash_documents(connection: Any, tenant_id: str) -> dict[str, set[str]]
               ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id AND e.di_document_id = f.di_document_id
              AND e.association_status = 'ACTIVE'
             WHERE f.tenant_id = :t AND NOT f.is_modified AND f.modified_value IS NULL
-              AND ((f.effective_value #>> '{}') ~ :scalar
-                   AND (f.field_key ILIKE ANY (ARRAY['%amount%', '%price%', '%discount%', '%cost%',
-                                                     '%value%', '%total%', '%charges%', '%premium%'])))
-               OR (f.tenant_id = :t AND NOT f.is_modified AND f.modified_value IS NULL
-                   AND (f.effective_value #>> '{}') ~ :rows)
+              AND (((f.effective_value #>> '{}') ~ :scalar
+                    AND f.field_key ILIKE ANY (ARRAY['%discount%', '%amount_paid%', '%booking_amount%',
+                                                     '%bonus%', '%loyalty%', '%exchange%']))
+                   OR (f.field_key IN ('discount_details', 'line_items')
+                       AND (f.effective_value #>> '{}') ~ :rows))
             """
         ),
         {"t": tenant_id, "scalar": _SLASH_DASH_SCALAR, "rows": _SLASH_DASH_IN_ROWS},

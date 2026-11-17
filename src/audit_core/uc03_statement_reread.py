@@ -157,7 +157,7 @@ def slash_dash_amounts(fields: dict[str, Any]) -> list[Decimal]:
         for row in value if isinstance(value, list) else []:
             if not isinstance(row, dict):
                 continue
-            for name in ("amount", "debit_amount", "credit_amount"):
+            for name in ("amount", "credit_amount"):  # not charges: the price book ends in 001 too
                 try:
                     amount = Decimal(str(row.get(name)))
                 except (ArithmeticError, ValueError):
