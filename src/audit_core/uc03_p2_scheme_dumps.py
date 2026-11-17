@@ -26,8 +26,12 @@ to a Journey of the same dealership on, in this order:
   CUSTOMER_ID    the DMS customer id the dealer's invoice prints (R270905009), when one
                  Journey has it
   REGISTRATION   the vehicle's registration number, when one Journey has it
-  MOBILE / NAME_MODEL  only when a dump does carry the customer's mobile or name
-                 (uc03_p2_dms_dumps.match_row)
+  MOBILE / NAME_MODEL  the customer's mobile, else name and model (uc03_p2_dms_dumps
+                 .match_row) -- from the dump when it carries them, else from the
+                 dealership's other current dumps that name the customer beside the same
+                 chassis: the insurance dump and the DMS delivery dump. So a vehicle whose
+                 Journey has no chassis read yet (a booking with no delivery papers) is
+                 still found through its customer
 
 Half of a dump is not a new-vehicle sale at all: schemes the workshop sells on older
 vehicles (Sold By SERV, or a Service Manager's entry). Those are kept and counted, and
@@ -106,6 +110,7 @@ from audit_core.uc03_p2_dms_dumps import (
     registration_key,
 )
 from audit_core.uc03_p2_dms_outlet_report import label_key, outlet_map, resolve_outlet
+from audit_core.uc03_p2_insurance_dumps import _bare_name
 
 logger = structlog.get_logger(__name__)
 
@@ -126,6 +131,8 @@ IN_SYNC, NOT_BOUGHT, NOT_IN_DUMP, NOT_IN_VERIGENCE, SERVICE_ONLY, CANCELLED = (
     "IN_SYNC", "NOT_BOUGHT", "NOT_IN_DUMP", "NOT_IN_VERIGENCE", "SERVICE_ONLY", "CANCELLED")
 BASIS_LABELS = {"CHASSIS": "Chassis", "CUSTOMER_ID": "DMS customer id", "REGISTRATION": "Registration number",
                 "MOBILE": "Mobile", "NAME_MODEL": "Name and model"}
+# match_note: the chassis is on several Journeys; the customer came from another dump.
+SEVERAL_JOURNEYS, VIA_OTHER_DUMP = "SEVERAL_JOURNEYS", "VIA_OTHER_DUMP"
 # The condition of the one "sold" rule each type stands for (uc03_p2_stage.CHARGED_ONLY_CONDITIONS).
 CONDITIONS = {EW: "ewSold", RSA: "rsaSold"}
 # How far back the nightly check looks: the dumps of this month and the two before it.
@@ -429,9 +436,46 @@ def period_of(rows: list[dict[str, Any]]) -> date | None:
 
 # --------------------------------------------------------------------------- matching
 
-def match_scheme_row(index: JourneyIndex, row: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
+def vehicle_contacts(connection: Connection, *, tenant_id: str, dealer_id: Any) -> dict[str, dict[str, Any]]:
+    """Chassis (last 8) -> the customer the dealership's other current dumps name beside
+    it: the insurance dump (insured name, phone) and the DMS delivery dump. The scheme
+    registers print neither, so this is where a registration's customer is known from."""
+    rows = connection.execute(
+        text("""
+            SELECT r.vin AS chassis, r.mobile, r.insured_name AS customer_name, r.model, 1 AS source
+            FROM auditcore.p2_insurance_dump_rows r
+            JOIN auditcore.p2_insurance_dumps u
+              ON u.tenant_id = r.tenant_id AND u.dump_id = r.dump_id AND u.status = 'ACTIVE'
+            WHERE r.tenant_id = :t AND r.dealer_id = CAST(:d AS uuid) AND r.vin IS NOT NULL
+            UNION ALL
+            SELECT r.chassis, r.mobile, r.customer_name, r.model, 2
+            FROM auditcore.p2_dms_dump_rows r
+            JOIN auditcore.p2_dms_dumps u
+              ON u.tenant_id = r.tenant_id AND u.dump_id = r.dump_id AND u.status = 'ACTIVE'
+            WHERE r.tenant_id = :t AND r.dealer_id = CAST(:d AS uuid) AND r.dump_kind = 'DELIVERY'
+              AND r.chassis IS NOT NULL
+            ORDER BY source
+        """),
+        {"t": tenant_id, "d": str(dealer_id)},
+    ).mappings().all()
+    contacts: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        key = chassis_key(r["chassis"])
+        if key is None or not (r["mobile"] or r["customer_name"]):
+            continue
+        known = contacts.setdefault(key, {"mobile": None, "customer_name": None, "model": None})
+        known["mobile"] = known["mobile"] or mobile_key(r["mobile"])
+        known["customer_name"] = known["customer_name"] or _bare_name(r["customer_name"])
+        known["model"] = known["model"] or r["model"]
+    return contacts
+
+
+def match_scheme_row(index: JourneyIndex, row: dict[str, Any], contacts: dict[str, dict[str, Any]] | None = None
+                     ) -> tuple[str | None, str | None, str | None]:
     """(journey id, basis, note). A chassis two Journeys carry goes to the one with a
-    delivery file; where that does not settle it, to neither (note SEVERAL_JOURNEYS)."""
+    delivery file; where that does not settle it, to neither (note SEVERAL_JOURNEYS). A
+    row found through the customer another dump names for its chassis is noted
+    VIA_OTHER_DUMP."""
     note = None
     if (key := chassis_key(row.get("chassis"))) is not None and (found := index.by_chassis.get(key)):
         if len(found) == 1:
@@ -439,21 +483,29 @@ def match_scheme_row(index: JourneyIndex, row: dict[str, Any]) -> tuple[str | No
         delivered = {j for j in found if index.journeys[j]["hasDelivery"]}
         if len(delivered) == 1:
             return next(iter(delivered)), "CHASSIS", None
-        note = "SEVERAL_JOURNEYS"
+        note = SEVERAL_JOURNEYS
     if (key := row.get("customer_code")) and len(found := index.by_customer_code.get(key, set())) == 1:
         return next(iter(found)), "CUSTOMER_ID", None
     if (key := row.get("registration_number")) and len(found := index.by_registration.get(key, set())) == 1:
         return next(iter(found)), "REGISTRATION", None
-    if row.get("mobile") or row.get("customer_name"):
-        jid, basis = match_row(index, DELIVERY, {"mobile": row.get("mobile"), "customer_name": row.get("customer_name"),
-                                                 "model": row.get("model")})
+    known = (contacts or {}).get(chassis_key(row.get("chassis")) or "") or {}
+    mobile = row.get("mobile") or known.get("mobile")
+    name = row.get("customer_name") or known.get("customer_name")
+    if mobile or name:
+        jid, basis = match_row(index, DELIVERY, {"mobile": mobile, "customer_name": name,
+                                                 "model": row.get("model") or known.get("model")})
+        if jid is None and known.get("model") and row.get("model"):
+            # the two dumps word the model differently (XUV3XO AX5 PM MT / XUV 3XO): the other dump's wording
+            jid, basis = match_row(index, DELIVERY, {"mobile": mobile, "customer_name": name, "model": known["model"]})
         if jid is not None:
-            return jid, basis, None
+            borrowed = not (row.get("mobile") or row.get("customer_name"))
+            return jid, basis, VIA_OTHER_DUMP if borrowed else None
     return None, None, note
 
 
 def match_scheme_dump(connection: Connection, *, tenant_id: str, dump_id: UUID | str,
-                      index: JourneyIndex | None = None) -> int:
+                      index: JourneyIndex | None = None,
+                      contacts: dict[str, dict[str, Any]] | None = None) -> int:
     """Match (again) every row of one dump to a Journey of its dealership."""
     dealer_id = connection.execute(
         text("SELECT dealer_id FROM auditcore.p2_scheme_dumps WHERE tenant_id = :t AND dump_id = :id"),
@@ -461,6 +513,8 @@ def match_scheme_dump(connection: Connection, *, tenant_id: str, dump_id: UUID |
     ).scalar_one()
     if index is None:
         index = build_index(connection, tenant_id=tenant_id, dealer_id=dealer_id)
+    if contacts is None:
+        contacts = vehicle_contacts(connection, tenant_id=tenant_id, dealer_id=dealer_id)
     rows = connection.execute(
         text("""
             SELECT row_no, chassis, customer_code, registration_number, mobile, customer_name, model
@@ -470,7 +524,7 @@ def match_scheme_dump(connection: Connection, *, tenant_id: str, dump_id: UUID |
     ).mappings().all()
     updates, matched = [], 0
     for r in rows:
-        jid, basis, note = match_scheme_row(index, dict(r))
+        jid, basis, note = match_scheme_row(index, dict(r), contacts)
         matched += jid is not None
         updates.append({"t": tenant_id, "id": str(dump_id), "n": r["row_no"], "j": jid, "b": basis, "note": note})
     if updates:
@@ -608,8 +662,9 @@ def recheck_dealer(connection: Connection, *, tenant_id: str, dealer_id: str, fi
     if not dumps:
         return {"dumps": 0, "journeys": 0}
     index = build_index(connection, tenant_id=tenant_id, dealer_id=UUID(str(dealer_id)))
+    contacts = vehicle_contacts(connection, tenant_id=tenant_id, dealer_id=dealer_id)
     for dump_id in dumps:
-        match_scheme_dump(connection, tenant_id=tenant_id, dump_id=dump_id, index=index)
+        match_scheme_dump(connection, tenant_id=tenant_id, dump_id=dump_id, index=index, contacts=contacts)
     return {"dumps": len(dumps),
             "journeys": refresh_checks(connection, tenant_id=tenant_id, dealer_id=str(dealer_id))}
 
@@ -767,8 +822,10 @@ def _row_json(r: dict[str, Any], kind: str) -> dict[str, Any]:
         "schemeAmount": _f(r["scheme_amount"]), "taxAmount": _f(r["tax_amount"]), "location": r["location"],
         "journeyId": str(r["journey_id"]) if r["journey_id"] else None, "journeyReference": r["journey_reference"],
         "journeyCustomer": r["journey_customer"], "outletName": r["outlet_name"],
-        "matchBasis": r["match_basis"], "matchBasisLabel": BASIS_LABELS.get(r["match_basis"] or "", r["match_basis"]),
-        "severalJourneys": r["match_note"] == "SEVERAL_JOURNEYS",
+        "matchBasis": r["match_basis"],
+        "matchBasisLabel": (BASIS_LABELS.get(r["match_basis"] or "", r["match_basis"]) or "") + (
+            " (customer from the insurance / delivery dump)" if r["match_note"] == VIA_OTHER_DUMP else "") or None,
+        "severalJourneys": r["match_note"] == SEVERAL_JOURNEYS, "viaOtherDump": r["match_note"] == VIA_OTHER_DUMP,
         "verigenceSold": bool(r[f"{low}_sold"]), "verigenceReason": r[f"{low}_reason"],
         "papersOnFile": bool(r["papers_on_file"]),
         # A free scheme (FOC) the customer's papers nevertheless charge for.
@@ -1190,4 +1247,4 @@ def scheme_report_file(
 
 __all__ = ["build_scheme_excel", "build_scheme_report", "channel_of", "classify", "covered_outlets", "detect_kind",
            "match_scheme_dump", "match_scheme_row", "parse_scheme_file", "period_of", "recheck_dealer",
-           "refresh_checks", "refresh_recent", "router"]
+           "refresh_checks", "refresh_recent", "router", "vehicle_contacts"]

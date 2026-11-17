@@ -177,9 +177,27 @@ def test_a_row_is_matched_on_chassis_then_customer_id_then_registration() -> Non
 
 
 def test_a_chassis_on_two_delivered_journeys_is_not_guessed() -> None:
-    assert m.match_scheme_row(_index(), {"chassis": "T5J25790"}) == (None, None, "SEVERAL_JOURNEYS")
+    assert m.match_scheme_row(_index(), {"chassis": "T5J25790"}) == (None, None, m.SEVERAL_JOURNEYS)
     # ... unless the customer id settles it
     assert m.match_scheme_row(_index(), {"chassis": "T5J25790", "customer_code": "R270600851"}) == ("j3", "CUSTOMER_ID", None)
+
+
+def test_a_vehicle_with_no_chassis_on_its_journey_is_found_through_the_customer_another_dump_names() -> None:
+    index = _index()
+    index.journeys["j5"] = {"journeyId": "j5", "reference": "j5", "outletId": None, "customer": "ASHA RATH",
+                            "names": {"ASHA RATH"}, "model": "XUV 3XO", "hasDelivery": False}
+    index.by_mobile["9876543210"].add("j5")
+    # the insurance dump names the customer of chassis T7A11111; the scheme register does not
+    contacts = {"T7A11111": {"mobile": "9876543210", "customer_name": "ASHA RATH", "model": "XUV 3XO"}}
+    row = {"chassis": "T7A11111", "model": "XUV3XO AX5 PM MT RP"}
+    assert m.match_scheme_row(index, row) == (None, None, None)
+    assert m.match_scheme_row(index, row, contacts) == ("j5", "MOBILE", m.VIA_OTHER_DUMP)
+    # by name and the other dump's wording of the model, when the mobile is not on the Journey
+    by_name = {"T7A11111": {"mobile": None, "customer_name": "Asha Rath", "model": "XUV 3XO"}}
+    assert m.match_scheme_row(index, row, by_name) == ("j5", "NAME_MODEL", m.VIA_OTHER_DUMP)
+    # the chassis itself still comes first, and a dump's own mobile is not "from another dump"
+    assert m.match_scheme_row(index, {"chassis": "T6H49888"}, contacts) == ("j1", "CHASSIS", None)
+    assert m.match_scheme_row(index, {"chassis": "T0X00000", "mobile": "9876543210"}, contacts) == ("j5", "MOBILE", None)
 
 
 def _outlets() -> list[dict]:
