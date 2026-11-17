@@ -219,6 +219,13 @@ IF_NOT_INHOUSE = "OVER_UNLESS_INHOUSE"
 # documents, not an excess -- listed apart with both figures (product owner
 # 2026-11-14, "pls recheck all excess discount journeys").
 FIGURES_DISAGREE = "FIGURES_DISAGREE"
+# The figure was read from an NDC / cost sheet whose charges and discounts do not
+# give its own printed total (product owner 2026-11-17: "all these values should add
+# up as one sum"): the reading is in doubt, so the line is listed apart with the
+# reason and never counted as excess (live: UTK-SA-261027-004 "Other Discount"
+# read Rs 71,000 against a grid of 0-5,000; ADI-RD-261116-040 "Consumer offer"
+# Rs 82,000 against the invoice's Rs 27,000).
+READING_IN_DOUBT = "READING_IN_DOUBT"
 _TALLY_NORM = _norm_type("customer_ledger_tally")
 _TIER_ORDER = ("BASE", "WITH_INSURANCE", "WITH_EW_INSURANCE")
 _TIER_WORDS = {"WITH_INSURANCE": "the insurance was in-house",
@@ -253,6 +260,20 @@ def disagreeing_figures(row: dict[str, Any], amount: Decimal) -> Decimal | None:
     return ledger[0]
 
 
+def doubtful_reading(row: dict[str, Any], amount: Decimal, in_doubt: dict[str, str] | None) -> str | None:
+    """Why the given ``amount`` cannot be trusted yet: every NDC / cost-sheet copy that
+    gives it does not add up (``in_doubt``: document id -> why). None when one copy
+    giving it adds up, or none is in doubt."""
+    if not in_doubt:
+        return None
+    giving = [s for s in row.get("sources") or []
+              if _norm_type(s.get("documentType")) in _STATEMENT_NORM
+              and _dec(s.get("amount")) is not None and abs(_dec(s.get("amount")) - amount) <= 1]
+    if not giving or any(str(s.get("documentId")) not in in_doubt for s in giving):
+        return None
+    return in_doubt[str(giving[0].get("documentId"))]
+
+
 def kit_available(discounts: list[dict[str, Any]]) -> Decimal:
     """The accessories kit the deal is entitled to and no accessories invoice
     used: the consumer scheme gives it in kind (Scorpio Classic, Thar Roxx),
@@ -267,11 +288,14 @@ def kit_available(discounts: list[dict[str, Any]]) -> Decimal:
     return amount if amount and amount > 0 else Decimal(0)
 
 
-def assess(discounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def assess(discounts: list[dict[str, Any]], in_doubt: dict[str, str] | None = None) -> list[dict[str, Any]]:
     """Every discount line the Deal counts, judged per line (product owner
     2026-11-06: the basis stays per line), in the Deal's order:
 
     * ENTITLEMENT_UNKNOWN: no master to compare with (``unknown_reason``);
+    * READING_IN_DOUBT: above the entitlement, but read from an NDC / cost sheet
+      that does not add up (``in_doubt``, uc03_statement_totals.charges_in_doubt):
+      listed apart with why, never counted as excess (2026-11-17);
     * KIT_AS_CASH: the part of the consumer offer the unused accessories kit
       covers -- reported with the kit amount, never as excess;
     * OVER_UNLESS_INHOUSE: a dealer discount above the grid tier it was
@@ -303,6 +327,11 @@ def assess(discounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         entitled_amount = entitled(row)
         extra = amount - entitled_amount
+        doubt = doubtful_reading(row, amount, in_doubt) if extra > LINE_TOLERANCE else None
+        if doubt is not None:
+            out.append({**base, "status": READING_IN_DOUBT, "entitled": entitled_amount, "variance": extra,
+                        "reason": f"the NDC does not add up: {doubt}"})
+            continue
         # The NDC decides (product owner 2026-11-15: "NDC should be the source
         # for all comparisons"): a Tally ledger giving another amount is shown
         # beside the row, never a status of its own.
@@ -342,10 +371,12 @@ __all__ = [
     "KIT_AS_CASH",
     "LINE_TOLERANCE",
     "OVER",
+    "READING_IN_DOUBT",
     "UNDER",
     "UNKNOWN",
     "assess",
     "disagreeing_figures",
+    "doubtful_reading",
     "entitled",
     "entitlement_unknown",
     "given",

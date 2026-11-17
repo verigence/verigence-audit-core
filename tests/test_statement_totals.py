@@ -346,3 +346,20 @@ def test_rows_the_reader_left_unnamed_on_live_forms():
     ])
     assert read.unmapped == []
     assert read.discounts == {"EXCHANGE_BONUS": D(20000), "ADDITIONAL_DISCOUNT": D(12000)}
+
+
+def test_the_copies_whose_charges_do_not_add_up_are_in_doubt(monkeypatch):
+    """2026-11-17: the payments column apart, a copy whose charges and discounts do not
+    give its printed totals puts the discounts read from it in doubt."""
+    from audit_core import uc03_statement_totals as st
+
+    copies = [
+        {"documentId": "a", "document": "NDC", "pageNumber": 3, "differences": [
+            {"total": "Net Value", "printed": D(1210000), "rows": D(1146000), "difference": D(64000)}]},
+        {"documentId": "b", "document": "NDC", "pageNumber": 5, "differences": [
+            {"total": "Total Receipts", "printed": D(872090), "rows": D(922090),
+             "difference": D(-50000)}]},
+    ]
+    monkeypatch.setattr(st, "copies_not_adding_up", lambda *a, **k: (2, copies))
+    doubt = st.charges_in_doubt(None, tenant_id="t", journey_id=None)
+    assert list(doubt) == ["a"] and "Net Value printed Rs 12,10,000" in doubt["a"]

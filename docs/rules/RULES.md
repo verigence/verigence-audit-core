@@ -42,6 +42,15 @@ rule once, with what it replaced and where it is read, is what stops that.
 | A receipt issued by an insurer (self insurance) is not a payment receipt. | 11 Nov 2026 | — | receipt issuer check | — |
 | A payment up to one day before the booking docket date is an observation, not a finding. | 14 Nov 2026 | — | PAYMENT_BEFORE_BOOKING | — |
 
+## Discounts (Excess discount)
+
+| Rule | Since | Replaces | Read by | Job for bookings before |
+|---|---|---|---|---|
+| A discount read from an NDC / cost sheet whose charges and discounts do not give its own printed totals is not judged as excess: listed apart ("NDC reading in doubt") with why, until the reading is corrected. A PC's closure of the reading task does not change it. | 17 Nov 2026 | — (such figures were judged as read: UTK-SA-261027-004 ₹71,000 vs grid 0–5,000) | `uc03_discount_given.assess` (`in_doubt`), EXCESS_DISCOUNT, KIT_GIVEN_AS_CASH, Excess discount screen, Insights discount report | `DISCOUNT_VARIANCE_RECOMPUTE` |
+| The NDC decides the amount given; a Tally ledger or DMS invoice giving another amount is shown beside the row, not a status. | 15 Nov 2026 | 14 Nov: Tally disagreement listed apart | `assess`, readings on each row | — |
+| A dealer-grid amount of 0 means no dealer discount is allowed: anything given is excess. | 17 Nov 2026 (confirmed) | — | grid entitlement | — |
+| Consumer-scheme cash amounts like 7,001 / 80,001 are the bulletin's own: cash is the total offer less the EW price (7,001 + 17,999 + kit 50,000 = 75,000). Not a misread; never "corrected". | 17 Nov 2026 (checked) | 15 Nov recheck wrongly called them master errors | scheme master import (cash + other = total check) | — |
+
 ## Bank statement reconciliation (Data uploads)
 
 | Rule | Since | Replaces | Read by | Job for bookings before |
