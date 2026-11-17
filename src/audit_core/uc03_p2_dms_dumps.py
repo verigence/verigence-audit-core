@@ -35,7 +35,8 @@ A dump row is matched to a Journey of the same dealership, in this order:
                   (whole, without "OTF", or its numeric tail: Utkal's forms carry
                   "OTF NO-22672" for OTF27C022672)
   CHASSIS         (delivery) the last 8 characters of the chassis / VIN read from the
-                  Journey's invoice, NDC, Form 21 or RC
+                  Journey's invoice, NDC, Form 21, RC, gate pass, accessory or tax
+                  invoice, insurance cover or RTO challan (CHASSIS_DOCUMENT_TYPES)
   MOBILE          the customer's mobile (last 10 digits) on the booking form, a receipt
                   or the KYC
   NAME_MODEL      the same customer name and model, only when one Journey has it
@@ -375,7 +376,43 @@ class JourneyIndex:
     by_ref: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     by_chassis: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     by_mobile: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
+    # The DMS customer id the dealer's invoices print (R270905009) and the vehicle's
+    # registration number: what the OEM's scheme dumps (extended warranty, RSA) carry
+    # beside the chassis -- they print no customer name or mobile (2026-11-17).
+    by_customer_code: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
+    by_registration: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     journeys: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+# The papers of the vehicle being sold that print its chassis / VIN. Until 2026-11-17 only
+# the first six were read: of 59 vehicles of 2026 in Utkal's October extended warranty dump,
+# 9 were on a Journey only through its accessory invoice, tax invoice, insurance cover or
+# RTO challan and so were "not in Verigence". Never the exchange vehicle's papers.
+CHASSIS_DOCUMENT_TYPES = (
+    "customer_invoice_dms", "customer_invoice_tally", "customer_ledger", "form_21", "vehicle_rc", "gate_pass",
+    "tax_invoice_tally", "accessory_invoice_dms", "accessory_invoice_tally", "insurance_cover", "rto_challan",
+    "ew_invoice", "rsa_invoice", "delivery_order_cover",
+)
+# The same vehicle's papers that print its registration number (not the RC, valuation,
+# transfer or no-dues papers: those are the exchange vehicle's).
+REGISTRATION_DOCUMENT_TYPES = (
+    "rto_challan", "gate_pass", "customer_invoice_dms", "tax_invoice_tally", "insurance_cover", "form_21",
+    "accessory_invoice_dms", "accessory_invoice_tally", "ew_invoice", "rsa_invoice", "delivery_order_cover",
+)
+_REGISTRATION = re.compile(r"^(?:[A-Z]{2}\d{1,2}[A-Z]{0,3}\d{4}|\d{2}BH\d{4}[A-Z]{1,2})$")
+
+
+def registration_key(value: Any) -> str | None:
+    """A registration number as compared (OD02DV8990, 23BH5495F); None for 'New',
+    'OD02 BHUBANESWAR' (the RTO, not a number) or a chassis printed in its place."""
+    key = _alnum(value)
+    return key if _REGISTRATION.fullmatch(key) else None
+
+
+def customer_code_key(value: Any) -> str | None:
+    """The DMS customer id (R270905009, C240333566): a letter and at least six digits."""
+    key = _alnum(value)
+    return key if re.fullmatch(r"[A-Z]{1,3}\d{6,}", key) else None
 
 
 _INDEX_SQL = """
@@ -406,17 +443,20 @@ _INDEX_SQL = """
           (f.field_key = 'booking_reference_number' AND f.source_document_type_key = 'booking_form')
        OR (f.field_key IN ('customer_phone', 'phone_number')
            AND f.source_document_type_key IN ('booking_form', 'dealer_receipt', 'customer_kyc'))
-       OR (f.field_key IN ('vin_number', 'chassis_number')
-           AND f.source_document_type_key IN ('customer_invoice_dms', 'customer_invoice_tally', 'customer_ledger',
-                                              'form_21', 'vehicle_rc', 'gate_pass'))
+       OR (f.field_key IN ('vin_number', 'chassis_number') AND f.source_document_type_key = ANY(:chassis_types))
        OR (f.field_key = 'customer_name' AND f.source_document_type_key IN ('customer_kyc', 'booking_form'))
+       OR f.field_key = 'buyer_customer_id'
+       OR (f.field_key IN ('registration_number', 'vehicle_registration_number')
+           AND f.source_document_type_key = ANY(:registration_types))
      )
 """
 
 
 def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> JourneyIndex:
     index = JourneyIndex()
-    for r in connection.execute(text(_INDEX_SQL), {"t": tenant_id, "d": str(dealer_id)}).mappings():
+    for r in connection.execute(text(_INDEX_SQL), {
+            "t": tenant_id, "d": str(dealer_id), "chassis_types": list(CHASSIS_DOCUMENT_TYPES),
+            "registration_types": list(REGISTRATION_DOCUMENT_TYPES)}).mappings():
         jid = str(r["journey_id"])
         journey = index.journeys.get(jid)
         if journey is None:
@@ -448,6 +488,12 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
                 index.by_chassis[key].add(jid)
         elif field_key == "customer_name":
             journey["names"].add(value)
+        elif field_key == "buyer_customer_id":
+            if (key := customer_code_key(value)) is not None:
+                index.by_customer_code[key].add(jid)
+        elif (field_key in ("registration_number", "vehicle_registration_number")
+              and (key := registration_key(value)) is not None):
+            index.by_registration[key].add(jid)
     return index
 
 

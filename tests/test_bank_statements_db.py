@@ -143,6 +143,19 @@ def test_second_upload_rematches_detail_and_report(dealer):
         assert len(detail["receipts"]) == 4
         report = bs.build_report(c, tenant_id=dealer.tenant_id, statements=[second])
         assert report[:2] == b"PK"
+        # the matched transactions across statements, each with its Journey and bank credit (2026-11-17)
+        matched = bs.matched_transactions(c, dealer.tenant_id, [second])
+        assert {m["journeyId"] for m in matched} == {dealer.journeys[n] for n in
+                                                     ("ASHA KUMARI RATH", "BIKASH MOHANTY", "CASH BUYER")}
+        asha = next(m for m in matched if m["journeyId"] == dealer.journeys["ASHA KUMARI RATH"])
+        assert asha["amount"] == "674000.00" and asha["basis"] == "REFERENCE"
+        assert asha["credits"][0]["statementId"] == second["statementId"]
+        assert "ASHA KUMARI RATH" in asha["credits"][0]["narration"]
+        # a statement that is not in the view gives no rows: the superseded upload's credits are gone
+        assert bs.matched_transactions(c, dealer.tenant_id, [first]) == []
+        from openpyxl import load_workbook
+        found = load_workbook(io.BytesIO(report))["Found in bank"]
+        assert found.max_row == 4 and found["C2"].value is not None
         summary = bs.journey_bank_summary(c, tenant_id=dealer.tenant_id,
                                           journey_id=dealer.journeys["ASHA KUMARI RATH"])
         assert summary is not None

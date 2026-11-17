@@ -846,6 +846,96 @@ def _credit_lookup(connection: Connection, tenant_id: str, matches: list[Any], k
     return {f"{r['statement_id']}:{r['row_no']}": r for r in rows}
 
 
+_MATCHED_SQL = """
+    SELECT m.*, j.journey_reference, o.outlet_name, d.dealer_name,
+           auditcore.shown_name(c.legal_name, c.display_name) AS customer
+    FROM auditcore.p2_bank_receipt_matches m
+    JOIN auditcore.journeys j ON j.tenant_id = m.tenant_id AND j.journey_id = m.journey_id
+    JOIN auditcore.dealers d ON d.tenant_id = m.tenant_id AND d.dealer_id = m.dealer_id
+    LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
+    LEFT JOIN auditcore.dealer_outlets o ON o.tenant_id = m.tenant_id AND o.outlet_id = m.outlet_id
+    WHERE m.tenant_id = :t AND m.is_current AND m.outcome = 'MATCHED' AND CAST(m.dealer_id AS text) = ANY(:ds)
+    ORDER BY lower(d.dealer_name), m.receipt_date, j.journey_reference, m.amount DESC
+"""
+
+
+def matched_transactions(connection: Connection, tenant_id: str, statements: list[dict[str, Any]]
+                         ) -> list[dict[str, Any]]:
+    """Every receipt tied to a bank credit on one of these statements, across them all, each
+    with its Journey and the credit(s) it was tied to (product owner 2026-11-17: "list which
+    transactions got matched and give journey 360 link for those ... add this view")."""
+    by_id = {s["statementId"]: s for s in statements}
+    if not by_id:
+        return []
+    matches = connection.execute(
+        text(_MATCHED_SQL), {"t": tenant_id, "ds": sorted({s["dealerId"] for s in statements})},
+    ).mappings().all()
+    credits = _credit_lookup(connection, tenant_id, matches, set())
+    out = []
+    for m in matches:
+        tied = []
+        for key in m["credits"] or []:
+            t = credits.get(key)
+            statement = by_id.get(str(t["statement_id"])) if t else None
+            if statement is None:
+                continue  # a credit on a statement outside this view (another month, or replaced)
+            tied.append({
+                "statementId": statement["statementId"], "bankName": statement["bankName"],
+                "accountNumber": statement["accountNumber"],
+                "date": t["txn_date"].isoformat() if t["txn_date"] else None, "amount": _money(t["amount"]),
+                "narration": t["narration"], "reference": t["reference"] or t["cheque_number"],
+                "kind": t["credit_kind"], "kindLabel": KIND_LABELS.get(t["credit_kind"] or "", None),
+            })
+        if not tied:
+            continue
+        out.append({
+            "dealerId": str(m["dealer_id"]), "dealerName": m["dealer_name"], "outletName": m["outlet_name"],
+            "journeyId": str(m["journey_id"]), "journeyReference": m["journey_reference"], "customer": m["customer"],
+            "source": m["source"], "receiptKey": m["receipt_key"], "receiptNumber": m["receipt_number"],
+            "receiptDate": m["receipt_date"].isoformat() if m["receipt_date"] else None,
+            "amount": _money(m["amount"]), "mode": m["mode"], "reference": m["reference"],
+            "basis": m["match_basis"], "basisLabel": BASIS_LABELS.get(m["match_basis"] or "", None),
+            "credits": tied,
+        })
+    return out
+
+
+def _month_statements(connection: Connection, tenant_id: str, dealer_ids: list[str], first: date,
+                      dealer_id: UUID | None) -> list[dict[str, Any]]:
+    """The current statements whose period touches the month."""
+    rows = connection.execute(
+        text(_STATEMENT_SQL + """
+            AND s.status = 'ACTIVE' AND s.period_to >= :f AND s.period_from < :l
+            AND CAST(s.dealer_id AS text) = ANY(:ds)
+            AND (CAST(:d AS uuid) IS NULL OR s.dealer_id = CAST(:d AS uuid))
+            ORDER BY lower(d.dealer_name), s.period_from
+        """),
+        {"t": tenant_id, "f": first, "l": _next_month(first), "ds": dealer_ids,
+         "d": str(dealer_id) if dealer_id else None},
+    ).mappings().all()
+    return [_statement_json(r) for r in rows]
+
+
+@router.get("/bank-statements/matched")
+def list_matched_transactions(
+    tenant_id: str,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    month: str | None = None,
+    dealer_id: UUID | None = None,
+) -> dict[str, Any]:
+    """The month's matched transactions in one list: every receipt found in the bank across
+    the month's current statements, with its Journey and the bank credit it was tied to."""
+    held = _access(connection, tenant_id, principal, client)
+    first = _month(month, _today(connection, tenant_id))
+    dealer_ids = [d["dealerId"] for d in _dealers(connection, tenant_id, principal.subject, "ADMIN" in held)]
+    statements = _month_statements(connection, tenant_id, dealer_ids, first, dealer_id)
+    items = matched_transactions(connection, tenant_id, statements)
+    return {"month": first.strftime("%Y-%m"), "statements": len(statements), "count": len(items),
+            "amount": _money(sum((_dec(i["amount"]) for i in items), Decimal(0))), "items": items}
+
+
 @router.get("/bank-statements/{statement_id}")
 def read_bank_statement(
     tenant_id: str,
@@ -922,6 +1012,16 @@ def build_report(connection: Connection, *, tenant_id: str, statements: list[dic
     receipts_sheet = sheet_with("Receipts", ["Statement", "Journey", "Customer", "Outlet", "Receipt date",
                                              "Receipt no.", "Amount", "Mode", "Reference", "Source", "Result",
                                              "Matched on", "Bank credit date", "Bank credit narration", "Note"])
+    matched_sheet = sheet_with("Found in bank", ["Dealership", "Outlet", "Journey", "Customer", "Receipt no.",
+                                                 "Receipt date", "Mode", "Reference", "Amount", "Matched on", "Bank",
+                                                 "Account", "Bank credit date", "Bank credit amount",
+                                                 "Bank credit narration"])
+    for r in matched_transactions(connection, tenant_id, statements):
+        for n, credit in enumerate(r["credits"]):
+            matched_sheet.append([r["dealerName"], r["outletName"], r["journeyReference"], r["customer"],
+                                  r["receiptNumber"], r["receiptDate"], r["mode"], r["reference"],
+                                  num(r["amount"]) if n == 0 else None, r["basisLabel"], credit["bankName"],
+                                  credit["accountNumber"], credit["date"], num(credit["amount"]), credit["narration"]])
     missing_sheet = sheet_with("Not found in bank", ["Statement", "Journey", "Customer", "Outlet", "Receipt date",
                                                      "Receipt no.", "Amount", "Mode", "Reference", "Result", "Note"])
     credits_sheet = sheet_with("Bank credits", ["Statement", "Date", "Narration", "Reference", "Amount", "Kind",

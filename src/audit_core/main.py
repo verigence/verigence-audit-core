@@ -172,6 +172,7 @@ from audit_core.uc03_p2_performance import router as uc03_p2_performance_router
 from audit_core.uc03_p2_project_tracker import router as uc03_p2_project_tracker_router
 from audit_core.uc03_p2_resplit import router as uc03_p2_resplit_router
 from audit_core.uc03_p2_reviewer import router as uc03_p2_reviewer_router
+from audit_core.uc03_p2_scheme_dumps import router as uc03_p2_scheme_dumps_router
 from audit_core.uc03_p2_tenant_alerts import router as uc03_p2_tenant_alerts_router
 from audit_core.uc03_p2_upload_pause import (
     admin_router as uc03_p2_upload_pause_admin_router,
@@ -382,6 +383,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_dms_outlet_report_router)
     application.include_router(uc03_p2_dms_dumps_router)
     application.include_router(uc03_p2_insurance_dumps_router)
+    application.include_router(uc03_p2_scheme_dumps_router)
     application.include_router(uc03_p2_bank_statements_router)
     application.include_router(uc03_p2_performance_router)
     application.include_router(performance_settings_router)
