@@ -197,6 +197,16 @@ def test_a_loan_with_no_receipt_is_tied_to_its_journey(dealer):
                              "WHERE tenant_id = :t AND amount = 1026639"), {"t": dealer.tenant_id}).one()
         assert tuple(row) == ("LOAN", "LOAN_REFERENCE", dealer.journeys["LOAN BUYER"])
         report = bs.build_report(c, tenant_id=dealer.tenant_id, statements=[statement])
+        # Audit Summary AS-13: the loan amount confirmed received in the bank
+        from decimal import Decimal
+
+        from audit_core.uc03_p2_audit_summary import loan_in_bank
+
+        line = loan_in_bank(c, tenant_id=dealer.tenant_id, journey_id=dealer.journeys["LOAN BUYER"],
+                            loan=Decimal(1026639))
+        assert (line["conclusion"], line["received"], line["rule"]) == ("OK", "1026639.00", "AS-13")
+        assert loan_in_bank(c, tenant_id=dealer.tenant_id, journey_id=dealer.journeys["NOT IN BANK"],
+                            loan=None) is None
     from openpyxl import load_workbook
 
     sheet = load_workbook(io.BytesIO(report))["Loans found in bank"]
