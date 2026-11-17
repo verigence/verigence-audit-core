@@ -122,7 +122,8 @@ def test_classify_credit(narration: str, kind: str) -> None:
 
 # --------------------------------------------------------------------------- matching
 
-STATEMENT = br.Window(statement_id="S", outlet_id=None, period_from=date(2026, 11, 4), period_to=date(2026, 11, 4))
+# A statement whose transactions run from 1 to 5 Nov (the receipts it checks are dated within them).
+STATEMENT = br.Window(statement_id="S", outlet_id=None, period_from=date(2026, 11, 1), period_to=date(2026, 11, 5))
 
 
 def _receipt(key: str, amount: str, day: int, *, journey: str = "J1", mode: str = "OTHERS", ref: str | None = None,
@@ -145,13 +146,12 @@ def _run(receipts: list[br.Receipt], credits: list[br.Credit], windows: list[br.
     return {r.receipt.key: r for r in results}
 
 
-def test_only_receipts_within_five_days_of_the_period_are_checked() -> None:
-    results = _run([_receipt("in", "21000", 4), _receipt("margin", "21000", 9),
-                    _receipt("early", "21000", 29, month=10), _receipt("out", "21000", 10)], [])
-    assert set(results) == {"in", "margin"}  # 30 Oct .. 9 Nov for a 4 Nov statement
-    assert results["in"].outcome == br.NOT_FOUND
-    # in the margin only: the money may have come in on a day the statement does not show
-    assert results["margin"].outcome == br.OUTSIDE_DATES
+def test_only_receipts_dated_within_the_statements_transaction_dates_are_checked() -> None:
+    # product owner 2026-11-17: the statement's transaction dates, no 5-day margin
+    results = _run([_receipt("in", "21000", 4), _receipt("first", "21000", 1), _receipt("after", "21000", 6),
+                    _receipt("early", "21000", 31, month=10)], [])
+    assert set(results) == {"in", "first"}
+    assert {r.outcome for r in results.values()} == {br.NOT_FOUND}
 
 
 def test_a_utr_ties_a_receipt_paid_by_a_third_party() -> None:
@@ -214,7 +214,7 @@ def test_amount_alone_is_refused_when_the_receipt_prints_another_reference() -> 
 def test_a_same_day_cash_deposit_beats_an_earlier_cash_receipt_of_the_same_amount() -> None:
     results = _run(
         [_receipt("same_day", "200000", 3, mode="CASH", names=("A B",), journey="J1"),
-         _receipt("earlier", "200000", 30, month=10, mode="CASH", names=("C D",), journey="J2")],
+         _receipt("earlier", "200000", 1, mode="CASH", names=("C D",), journey="J2")],
         [_credit("c1", "200000", "BY CASH - BHUBANESWAR - KESURA", day=3)])
     assert results["same_day"].credit_keys == ["c1"]
     assert results["earlier"].outcome != br.MATCHED
@@ -294,3 +294,82 @@ def test_a_journey_is_bank_verified_when_every_bank_receipt_is_found_and_cash_do
     # a receipt never covered by any statement is not verified either
     assert journey_bank_status(receipts, {"a": "MATCHED"})["status"] == "PARTIAL"
     assert journey_bank_status(receipts[2:], {})["status"] == "CASH_ONLY"
+
+
+# --------------------------------------------------------------------------- loans
+
+def _loan(journey: str, *amounts: str, financier: str = "ICICI Bank Ltd", refs: tuple[str, ...] = (),
+          disbursed: date | None = date(2026, 11, 3), names: tuple[str, ...] = ("RAMA CHANDRA DAS",),
+          outlet: str | None = None) -> br.Loan:
+    return br.Loan(journey_id=journey, outlet_id=outlet, amounts={Decimal(a) for a in amounts},
+                   financiers=[financier], references=list(refs), disbursed=[disbursed] if disbursed else [],
+                   customer_names=list(names))
+
+
+def _loans(loans: list[br.Loan], credits: list[br.Credit], receipts: list[br.Receipt] | None = None
+           ) -> tuple[dict[str, br.CreditResult], dict[str, br.ReceiptResult]]:
+    results, credit_results = br.reconcile(receipts or [], credits, [STATEMENT])
+    br.match_loans(loans, results, credit_results, [STATEMENT])
+    return {c.credit.key: c for c in credit_results}, {r.receipt.key: r for r in results}
+
+
+def test_a_loan_is_tied_on_the_do_reference_in_the_narration() -> None:
+    credits, _ = _loans([_loan("J1", "1050000", refs=("4137380",)), _loan("J2", "1026639")],
+                        [_credit("c1", "1026639", "NEFT/KKBK263087488998/ Kotak Mahindra Bank Ltd/Pyt Loan A c LCV "
+                                                  "4137380 dt 0")])
+    assert (credits["c1"].loan, credits["c1"].journey_id, credits["c1"].basis) == (True, "J1", br.LOAN_REFERENCE)
+
+
+def test_a_financiers_credit_of_the_loan_amount_naming_the_financier() -> None:
+    credits, _ = _loans([_loan("J1", "895000"), _loan("J2", "895000", financier="HDFC Bank")],
+                        [_credit("c1", "895000", "RTGS/ICICR22026110419860108/ICICI BANK LTD RAOG NE/ICICI BANK "
+                                                 "LIMITED//URGENT/LVBBS00053126810")])
+    assert (credits["c1"].journey_id, credits["c1"].basis) == ("J1", br.LOAN_FINANCIER)
+
+
+def test_a_common_loan_amount_alone_ties_nothing() -> None:
+    # Rs 8,00,000 is the loan of 18 Journeys at one dealership: never guessed
+    credits, _ = _loans([_loan("J1", "800000", financier="SBI"), _loan("J2", "800000", financier="SBI")],
+                        [_credit("c1", "800000", "NEFT/SBIN526308695596/SOMEONE/STATE BANK OF INDIA//ATTN/LOAN DISB")])
+    assert credits["c1"].loan is False
+
+
+def test_the_customers_name_and_the_loan_amount_tie_a_loan() -> None:
+    credits, _ = _loans([_loan("J1", "800000", names=("PRAVATI MALLICK",)), _loan("J2", "800000")],
+                        [_credit("c1", "800000", "NEFT/SBIN526308695596/PRAVATI MALLICK/STATE BANK OF INDIA//ATTN/"
+                                                 "LOAN DISB")])
+    assert (credits["c1"].journey_id, credits["c1"].basis) == ("J1", br.LOAN_NAME)
+
+
+def test_the_financiers_initials_name_it() -> None:
+    credits, _ = _loans([_loan("J1", "730000", financier="Punjab National Bank"), _loan("J2", "730000")],
+                        [_credit("c1", "730000", "RTGS/PUNBR52026110414648660/RTG S INTERBANK/PNB")])
+    assert (credits["c1"].journey_id, credits["c1"].basis) == ("J1", br.LOAN_FINANCIER)
+
+
+def test_a_distinctive_amount_one_loan_carries_ties_on_amount_and_date() -> None:
+    narration = "NEFT/CBINH26308757838/TERM LOAN DISBURSAL ACCOUNT/SOME BANK///ATTN/Loan disbursal"
+    credits, _ = _loans([_loan("J1", "730000"), _loan("J2", "1026639", financier="Other Fin")],
+                        [_credit("c1", "1026639", narration)])
+    assert (credits["c1"].journey_id, credits["c1"].basis) == ("J2", br.LOAN_AMOUNT)
+    # the same, the loan disbursed two months earlier: not this credit
+    credits, _ = _loans([_loan("J2", "1026639", financier="Other Fin", disbursed=date(2026, 9, 1))],
+                        [_credit("c1", "1026639", narration)])
+    assert credits["c1"].loan is False
+
+
+def test_a_pooled_financier_payment_stays_not_identified() -> None:
+    credits, _ = _loans([_loan("J1", "800000", financier="Cholamandalam"), _loan("J2", "700000",
+                                                                                    financier="Cholamandalam")],
+                        [_credit("c1", "15000000", "CHOLAMANDALAM -574105")])
+    assert credits["c1"].loan is False
+
+
+def test_the_journeys_loan_receipt_is_found_on_the_loan_credit() -> None:
+    receipt = _receipt("r", "1026639", 4, ref="UTR998877665544", names=("NOBODY ON NARRATION",), journey="J1")
+    credits, results = _loans([_loan("J1", "1026639", refs=("4137380",))],
+                              [_credit("c1", "1026639", "NEFT/KKBK263087488998/Pyt Loan A c LCV 4137380 dt 0")],
+                              [receipt])
+    assert (results["r"].outcome, results["r"].basis, results["r"].credit_keys) == (br.MATCHED, br.LOAN_REFERENCE,
+                                                                                     ["c1"])
+    assert credits["c1"].receipt_keys == ["r"]
