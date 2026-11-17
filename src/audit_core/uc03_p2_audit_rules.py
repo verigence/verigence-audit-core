@@ -654,6 +654,13 @@ def excess_discount(facts: _Facts) -> RuleOutcome:
             over.append({"key": row["key"], "label": row["label"], "entitled": str(entitled),
                          "given": str(given), "extra": str(given - entitled)})
     extra_total = total_given - total_entitled
+    doubt = [i for i in judged if i["status"] == dg.READING_IN_DOUBT]
+    doubt_note = "; ".join(f"{i['row']['label']} {_rupees(i['given'])}" for i in doubt)
+    if not over and extra_total <= _TOLERANCE and doubt:
+        # Product owner 2026-11-17: an NDC that does not add up is not read with certainty;
+        # its discounts are judged once the reading is corrected (task: NDC rows do not add up).
+        return RuleOutcome(code, "SKIPPED", f"Not judged yet: {doubt_note} read from an NDC that does not add up "
+                                            f"({doubt[0]['reason'].removeprefix('the NDC does not add up: ')}).")
     if not over and extra_total <= _TOLERANCE:
         return RuleOutcome(code, "PASS", f"Discounts of {_rupees(total_given)} given within the entitlement "
                                          f"of {_rupees(total_entitled)}.")
@@ -686,7 +693,11 @@ def kit_given_as_cash(facts: _Facts) -> RuleOutcome:
         return RuleOutcome(code, "PASS", "No unused accessories kit on this deal.")
     if not dg.standards_known(facts.sheet):
         return RuleOutcome(code, "SKIPPED", _NO_STANDARD)
-    kits = [i for i in dg.assess(facts.sheet["discounts"], getattr(facts, "ndc_in_doubt", None)) if i["status"] == dg.KIT_AS_CASH]
+    assessed = dg.assess(facts.sheet["discounts"], getattr(facts, "ndc_in_doubt", None))
+    kits = [i for i in assessed if i["status"] == dg.KIT_AS_CASH]
+    if not kits and any(i["status"] == dg.READING_IN_DOUBT and i["row"].get("key") == dg.CASH_KEY for i in assessed):
+        return RuleOutcome(code, "SKIPPED", "Not judged yet: the consumer offer is read from an NDC that does not "
+                                            "add up; judged once its reading is corrected.")
     if not kits:
         return RuleOutcome(code, "PASS", "The accessories kit was not given as cash.")
     lines = [{"key": i["row"]["key"], "label": i["row"]["label"], "given": str(i["given"]),

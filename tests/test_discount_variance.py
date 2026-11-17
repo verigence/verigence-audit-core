@@ -456,3 +456,21 @@ def test_a_kit_given_as_cash_shows_the_kit_offer():
     [item] = discount_variance_rows(_view([cash, kit], policy="ACCOUNT_STATEMENT"))
     assert item["status"] == KIT_AS_CASH
     assert item["offer"]["source"] == "Mahindra Consumer — SCORPIO CLASSIC" and item["offer"]["kit"] == "50000.00"
+
+
+def test_the_rule_does_not_pass_a_discount_it_could_not_judge():
+    """Figures check on #858: with the only discount in doubt the rule said "given within
+    the entitlement of Rs 82,000" -- it was not judged. It says so instead."""
+    from audit_core.uc03_p2_audit_rules import excess_discount
+
+    ndc = {"document": "NDC (Account Statement)", "documentType": "account_statement", "amount": "82000.00",
+           "documentId": "doc-1"}
+    view = _view([_d("CASH_DISCOUNT", "27000", "82000.00", billed_from="statement", eligibility="ELIGIBLE",
+                     sources=[ndc])], invoice=False, price=None, policy="ACCOUNT_STATEMENT")
+
+    class _Facts:
+        sheet = view
+        ndc_in_doubt = {"doc-1": "NDC (page 2): Net Value printed Rs 10,00,000, its rows add up to Rs 9,45,000"}
+
+    outcome = excess_discount(_Facts())
+    assert outcome.outcome == "SKIPPED" and "Not judged yet" in outcome.reason and "page 2" in outcome.reason
