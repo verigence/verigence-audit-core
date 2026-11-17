@@ -51,6 +51,12 @@ rule once, with what it replaced and where it is read, is what stops that.
 | A dealer-grid amount of 0 means no dealer discount is allowed: anything given is excess. | 17 Nov 2026 (confirmed) | — | grid entitlement | — |
 | Consumer-scheme cash amounts like 7,001 / 80,001 are the bulletin's own: cash is the total offer less the EW price (7,001 + 17,999 + kit 50,000 = 75,000). Not a misread; never "corrected". | 17 Nov 2026 (checked) | 15 Nov recheck wrongly called them master errors | scheme master import (cash + other = total check) | — |
 
+## Insurance (in-house or the customer's own)
+
+| Rule | Since | Replaces | Read by | Job for bookings before |
+|---|---|---|---|---|
+| Order: the PC's answer; then the dealer's own MISP / Agent code on the policy → in-house; then an NDC insurance row saying the customer arranged it ("Insurance amount OWN", "Insurance SELF", "Done by Customer", "by party") → Self, whatever amount is written on that row and whatever a cost sheet or dealer invoice shows; then an insurance premium on the NDC or a dealer invoice → in-house; then NDC read with no premium → Self. "Own" means self, never dealership. | 17 Nov 2026 | 16 Nov: any amount on the NDC's insurance row (even "OWN=50000") or a cost sheet's premium made it in-house | `uc03_insurance_source.resolve` / `document_decision`, Journey 360 Deal and Insurance card, stored classification (reports, export), dealer-grid tier (Excess discount), PC insurance task | `INSURANCE_SOURCE_REVIEW`, `JOURNEY_CLASSIFICATION`, `DISCOUNT_VARIANCE_RECOMPUTE` |
+
 ## Verified bookings
 
 | Rule | Since | Read by |

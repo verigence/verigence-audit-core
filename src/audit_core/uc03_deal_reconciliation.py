@@ -1022,10 +1022,11 @@ def _grid_tier(connection: Connection, *, tenant_id: str, journey_id: UUID) -> s
     if not source:
         # Not confirmed by the PC: in-house only when the documents show it
         # (the dealer's Agent / MISP code, or the premium on the dealer invoice).
-        from audit_core.uc03_insurance_source import document_decision
+        from audit_core.uc03_insurance_source import document_decision, ndc_says_own
 
         decided = document_decision(connection, tenant_id=tenant_id, journey_id=journey_id)
-        source = "INHOUSE" if decided is not None else ""
+        source = "INHOUSE" if decided is not None else (
+            "SELF" if ndc_says_own(connection, tenant_id=tenant_id, journey_id=journey_id) is not None else "")
     inhouse = source == "INHOUSE" or (source != "SELF" and (_to_decimal(row["insurance"]) or 0) > 0)
     ew = (_to_decimal(row["ew"]) or 0) > 0
     if inhouse and ew:
