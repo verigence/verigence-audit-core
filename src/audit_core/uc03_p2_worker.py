@@ -4517,6 +4517,21 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
         logger.info("p2_nightly_review_queued", tenant_id=tenant_id, night=due, deliveries_reviewed=queued, **swept)
     except Exception:
         logger.warning("p2_nightly_review_failed", tenant_id=tenant_id, exc_info=True)
+        return
+    # With the night's review, once a night: the extended warranty / RSA dumps of the last
+    # months are matched again and what Verigence shows for their Journeys is decided again
+    # (2026-11-17), so a Journey whose NDC came in after the upload moves on its own. Apart
+    # from the review's own transaction: a failure here never undoes the night's claim.
+    try:
+        from audit_core.uc03_p2_scheme_dumps import refresh_recent
+
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            refreshed = refresh_recent(connection, tenant_id=tenant_id)
+        if refreshed["dumps"]:
+            logger.info("p2_scheme_dumps_rechecked", tenant_id=tenant_id, night=due, **refreshed)
+    except Exception:
+        logger.warning("p2_scheme_dumps_recheck_failed", tenant_id=tenant_id, exc_info=True)
 
 
 def _settle(engine: Engine, work: WorkItem, action, *args) -> None:

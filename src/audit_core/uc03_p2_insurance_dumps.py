@@ -43,6 +43,11 @@ insurance (journey_classifications.insurance_type = SELF) while the dealership's
 dump carries its policy is reported, with what decided Self (the PC, a default, not yet
 confirmed).
 
+New policies only (product owner 2026-11-17: "include insurance type as New only while
+running the query"): the report's Policy Type says New for a new vehicle's first policy.
+A renewal or a rollover is not a new vehicle sale, so both reports and their counts leave
+it out and say how many were left out; a file with no Policy Type column is read whole.
+
 ``GET  /p2/v1/tenants/{t}/insurance-dumps/setup``
 ``POST /p2/v1/tenants/{t}/insurance-dumps``                      (file, dealerId)
 ``GET  /p2/v1/tenants/{t}/insurance-dumps?month=YYYY-MM``
@@ -127,6 +132,7 @@ _COLUMNS: dict[str, tuple[str, ...]] = {
     "segment": ("vehicleclass",),
     "plan_type": ("plantype",),
     "policy_tenure": ("policytenure",),
+    "policy_type": ("policytype", "insurancetype", "businesstype"),
     "od_discount_pct": ("oddiscount%", "oddiscount"),
     "created": ("createddate",),
     "effective": ("policyeffectivedate",),
@@ -216,6 +222,13 @@ def _policy_key(value: Any) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
 
 
+def is_new_policy(policy_type: Any) -> bool:
+    """A new vehicle's first policy: Policy Type 'New' (also 'New Business'). True when the
+    report carries no Policy Type at all -- what cannot be told is not left out."""
+    kind = re.sub(r"[^a-z]", "", str(policy_type or "").lower())
+    return not kind or kind.startswith("new")
+
+
 def _table(headers: list[Any], body: list[tuple[Any, ...]], file_format: str) -> ParsedInsurance:
     normalized = [_norm(h) for h in headers]
     columns: dict[str, int] = {}
@@ -253,6 +266,7 @@ def _table(headers: list[Any], body: list[tuple[Any, ...]], file_format: str) ->
             "variant": _text(cell("variant"), 200),
             "segment": (_text(cell("segment"), 20) or "").upper() or None,
             "plan_type": plan,
+            "policy_type": _text(cell("policy_type"), 40),
             "od_years": years,
             "od_discount_pct": _number(cell("od_discount_pct")),
             "idv": _number(cell("idv")),
@@ -604,12 +618,15 @@ def build_insurance_report(connection: Connection, *, tenant_id: str, dealers: l
     over, no_limit, self_but_dealer = [], [], []
     per_dealer: dict[str, dict[str, Any]] = {
         d["dealerId"]: {"dealerId": d["dealerId"], "dealerName": d["dealerName"], "policies": 0, "over": 0,
-                        "within": 0, "noLimit": 0, "matched": 0, "selfButDealer": 0} for d in dealers}
+                        "within": 0, "noLimit": 0, "matched": 0, "selfButDealer": 0, "notNew": 0} for d in dealers}
     for r in rows:
         did = str(r["dealer_id"])
+        stats = per_dealer[did]
+        if not is_new_policy(r["policy_type"]):
+            stats["notNew"] += 1  # a renewal or rollover: not a new vehicle sale (2026-11-17)
+            continue
         grid = own.get(did) or common
         verdict = evaluate(r, grid)
-        stats = per_dealer[did]
         stats["policies"] += 1
         stats["matched"] += r["journey_id"] is not None
         base = {
@@ -724,10 +741,10 @@ def upload_insurance_dump(
         text("""
             INSERT INTO auditcore.p2_insurance_dump_rows (tenant_id, dump_id, row_no, dealer_id, policy_number,
               policy_date, insurer, insured_name, mobile, vin, engine_number, model, variant, segment, plan_type,
-              od_years, od_discount_pct, idv, net_od_premium, misp_code, location, raw)
+              od_years, od_discount_pct, idv, net_od_premium, misp_code, location, policy_type, raw)
             VALUES (:t, :id, :n, :d, :policy_number, :policy_date, :insurer, :insured_name, :mobile, :vin,
               :engine_number, :model, :variant, :segment, :plan_type, :od_years, :od_discount_pct, :idv,
-              :net_od_premium, :misp_code, :location, CAST(:raw AS jsonb))
+              :net_od_premium, :misp_code, :location, :policy_type, CAST(:raw AS jsonb))
         """),
         [{"t": tenant_id, "id": str(dump_id), "n": n, "d": str(dealerId),
           **{k: v for k, v in row.items() if k != "raw"}, "raw": json.dumps(row["raw"], default=str)}
@@ -958,13 +975,13 @@ def build_insurance_excel(report: dict[str, Any]) -> bytes:
     summary.title = "Summary"
     summary.append([f"Insurance dump report - {report['month']}"])
     summary["A1"].font = Font(bold=True, size=13)
-    summary.append(["Dealership", "Policies", "OD over the limit", "Within the limit", "No limit in grid",
-                    "Matched to a journey", "Self in Verigence, dealer policy"])
+    summary.append(["Dealership", "New policies", "OD over the limit", "Within the limit", "No limit in grid",
+                    "Matched to a journey", "Self in Verigence, dealer policy", "Not New (left out)"])
     for cell in summary[2]:
         cell.font, cell.fill = head_font, head_fill
     for d in report["dealers"]:
         summary.append([d["dealerName"], d["policies"], d["over"], d["within"], d["noLimit"], d["matched"],
-                        d["selfButDealer"]])
+                        d["selfButDealer"], d.get("notNew", 0)])
     summary.column_dimensions["A"].width = 26
     sheet(wb.create_sheet("OD over the limit"), _OVER_COLUMNS, report["odOverLimit"], "None over the limit.")
     sheet(wb.create_sheet("Self vs dealership"), _SELF_COLUMNS, report["selfButDealer"],
@@ -991,5 +1008,6 @@ def insurance_report_file(
 
 
 __all__ = ["Grid", "build_grid_template", "build_insurance_excel", "build_insurance_report", "evaluate",
-           "grid_from_rows", "grid_from_workbook", "od_years", "parse_insurance_file", "plan_type", "router",
+           "grid_from_rows", "grid_from_workbook", "is_new_policy", "od_years", "parse_insurance_file", "plan_type",
+           "router",
            "tenure_of", "validate_grid"]
