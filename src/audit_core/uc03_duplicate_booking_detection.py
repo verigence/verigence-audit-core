@@ -1043,8 +1043,10 @@ def _void_open_finding_with_stale_basis(
     rule_key: str,
     basis: str,
     correlation_id: str,
+    percent: int | None = None,
 ) -> bool:
-    """Replace an OPEN finding that was raised on a different match basis.
+    """Replace an OPEN finding that was raised on a different match basis (or, 2026-11-17, at
+    another probability: a PAN match is 100% with the mobile too, 90% without).
 
     The basis, confidence and severity are fixed when a finding is raised
     (its RAISED event is append-only), and ``_machine_flag`` returns an
@@ -1067,6 +1069,12 @@ def _void_open_finding_with_stale_basis(
                                AND e.audit_finding_id = f.audit_finding_id
                                AND e.event_type = 'RAISED'
                              ORDER BY e.occurred_at_utc LIMIT 1) AS stored_basis,
+                           (SELECT e.safe_payload ->> 'matchConfidencePercent'
+                              FROM auditcore.audit_finding_events e
+                             WHERE e.tenant_id = f.tenant_id
+                               AND e.audit_finding_id = f.audit_finding_id
+                               AND e.event_type = 'RAISED'
+                             ORDER BY e.occurred_at_utc LIMIT 1) AS stored_percent,
                            f.severity AS stored_severity
                     FROM auditcore.audit_findings f
                     WHERE f.tenant_id = :tenant_id AND f.journey_id = :journey_id
@@ -1078,8 +1086,9 @@ def _void_open_finding_with_stale_basis(
                 ),
                 {"tenant_id": tenant_id, "journey_id": journey_id, "stage": _STAGE, "rule_key": rule_key},
             ).mappings().one_or_none()
+            same_percent = percent is None or str(row["stored_percent"] if row else "") == str(percent)
             if row is None or (row["stored_basis"] == basis
-                                and row["stored_severity"] == _SEVERITY_BY_BASIS[basis]):
+                                and row["stored_severity"] == _SEVERITY_BY_BASIS[basis] and same_percent):
                 return False
             note = (f"Match basis changed from {row['stored_basis'] or 'unknown'} to {basis}; "
                     "raised again on the current basis." if row["stored_basis"] != basis else
@@ -1357,6 +1366,7 @@ def sync_duplicate_booking_detection(
             _void_open_finding_with_stale_basis(
                 connection, tenant_id=tenant_id, journey_id=journey_id,
                 rule_key=rule_key, basis=basis, correlation_id=correlation_id,
+                percent=confidence_percent(basis, signals, candidate),
             )
             _void_cleared_finding(
                 connection, tenant_id=tenant_id, journey_id=journey_id,
