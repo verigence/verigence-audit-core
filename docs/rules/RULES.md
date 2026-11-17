@@ -57,6 +57,21 @@ rule once, with what it replaced and where it is read, is what stops that.
 |---|---|---|---|---|
 | Order: the PC's answer; then the dealer's own MISP / Agent code on the policy, or the policy listed in the dealer's own insurance dump (MISP export, matched by VIN) → in-house; then an NDC insurance row saying the customer arranged it ("Insurance amount OWN", "Insurance SELF", "Done by Customer", "by party") → Self, whatever amount is written on that row and whatever a cost sheet or dealer invoice shows; then an insurance amount on the NDC / cost sheet → in-house; then NDC read with no insurance amount → Self, policy on file or not. A dealer invoice's premium counts only while no NDC has been read (17 Nov: "very simple rules: the policy has the dealership code or the NDC mentions an amount for insurance"). "Own" means self, never dealership. | 17 Nov 2026 | 16 Nov: any amount on the NDC's insurance row (even "OWN=50000") or a cost sheet's premium made it in-house | `uc03_insurance_source.resolve` / `document_decision`, Journey 360 Deal and Insurance card, stored classification (reports, export), dealer-grid tier (Excess discount), PC insurance task | `INSURANCE_SOURCE_REVIEW`, `JOURNEY_CLASSIFICATION`, `DISCOUNT_VARIANCE_RECOMPUTE` |
 
+## Bank statement reconciliation (Data uploads)
+
+| Rule | Since | Replaces | Read by | Job for bookings before |
+|---|---|---|---|---|
+| A payment receipt is checked against a dealership bank statement only when it is dated within that statement's own transaction dates (first to last); it is tied to a credit of the same amount dated within 5 days of it. | 17 Nov 2026 | 14–17 Nov: the statement's period ±5 days (a receipt only in the margin was "outside statement dates") | `bank_reconciliation.Window`, `uc03_p2_bank_statements.reconcile_dealer`, statement counts, Excel, Journey 360 bank verification, Audit Summary AS-08 | after deploying, Rematch one current statement of each dealership (re-decides all its statements) |
+| A bank credit no receipt took is tied to the Journey whose loan it is, from the D.O. cover, bank approval letter and finance record: loan reference in the narration; customer name + loan amount; financier (or its initials) + loan amount, the loan disbursed within 15 days or sanctioned within 60 days; a non-round amount only one loan of the dealership carries (financier credits only). Only when one loan and one credit meet it; pooled financier payments stay not identified. | 17 Nov 2026 | — (loan credits were "not identified") | `bank_reconciliation.match_loans`, credit outcome LOAN, "Loans found in bank" (Excel, Data uploads), Journey 360 Payments | same |
+| When the loan is found in the bank, the Audit Summary confirms the loan amount received (AS-13): OK when it equals the loan counted, a difference shown (not concluded: financiers pay net of their charges). | 17 Nov 2026 | — | `uc03_p2_audit_summary.loan_in_bank` (How it was paid) | — (read live) |
+| Card / UPI settlements (PhonePe, Paytm, EDC, POS) are many customers' payments net of charges: never tied to a receipt one by one. | 14 Nov 2026 | — | `bank_reconciliation.classify_credit` (CARD_UPI) | — |
+
+## DMS dumps (Data uploads)
+
+| Rule | Since | Replaces | Read by | Job for bookings before |
+|---|---|---|---|---|
+| A daily DMS delivery dump (month to date) is compared with the Verigence deliveries dated from the 1st of its month to the last day it covers; a Journey's delivery day is its gate pass's date, else the NDC's printed delivery date, else its latest payment receipt — for Journeys with delivery files only. | 17 Nov 2026 | 16–17 Nov: gate pass date only | `uc03_p2_delivery_dates`, DMS outlet report (In Verigence, In Verigence not in dump), dump detail (NOT_IN_DMS), variance Excel | — (read live) |
+
 ## Verified bookings
 
 | Rule | Since | Read by |

@@ -870,11 +870,16 @@ def read_dms_dump(
     principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
     client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
-    outcome: Annotated[str | None, Query(pattern="^(MATCHED|NOT_IN_TOOL|MISSING|CANCELLED)$")] = None,
+    outcome: Annotated[str | None, Query(pattern="^(MATCHED|NOT_IN_TOOL|MISSING|CANCELLED|NOT_IN_DMS)$")] = None,
 ) -> dict[str, Any]:
-    """One upload and its rows (the not found first)."""
+    """One upload and its rows (the not found first); for a delivery dump also the other side,
+    the delivery Journeys dated in the days it covers that it does not carry (NOT_IN_DMS)."""
     _access(connection, tenant_id, principal, client, _READ, READ_ROLES)
     dump = _read_dump(connection, tenant_id, dump_id)
+    extra = (_not_in_dump(connection, tenant_id, [dump_id])
+             if dump["kind"] == DELIVERY and outcome in (None, "NOT_IN_DMS") else [])
+    if outcome == "NOT_IN_DMS":
+        return {**dump, "items": extra}
     rows = connection.execute(
         text(_ROW_SQL + """
             AND r.dump_id = :id AND (CAST(:o AS text) IS NULL OR r.outcome = CAST(:o AS text))
@@ -883,7 +888,31 @@ def read_dms_dump(
         """),
         {"t": tenant_id, "id": str(dump_id), "o": outcome},
     ).mappings().all()
-    return {**dump, "items": [_row_json(r) for r in rows]}
+    return {**dump, "items": [_row_json(r) for r in rows] + extra}
+
+
+def _not_in_dump(connection: Connection, tenant_id: str, dump_ids: list[Any]) -> list[dict[str, Any]]:
+    """The delivery Journeys of the days each delivery dump covers that it does not carry
+    (product owner 2026-11-17: a daily dump is compared with Verigence's deliveries from the
+    1st of its month to its day only)."""
+    from audit_core.uc03_p2_delivery_dates import SOURCE_LABELS, verigence_not_in_dump
+
+    today = _today(connection, tenant_id)
+    out = []
+    for dump in connection.execute(
+        text("""
+            SELECT u.dump_id, u.dealer_id, u.period_month, u.business_date, d.dealer_name
+            FROM auditcore.p2_dms_dumps u
+            JOIN auditcore.dealers d ON d.tenant_id = u.tenant_id AND d.dealer_id = u.dealer_id
+            WHERE u.tenant_id = :t AND u.dump_kind = 'DELIVERY' AND CAST(u.dump_id AS text) = ANY(:ids)
+        """),
+        {"t": tenant_id, "ids": [str(i) for i in dump_ids]},
+    ).mappings():
+        for row in verigence_not_in_dump(connection, tenant_id=tenant_id, dump=dict(dump), today=today):
+            row["dealerName"] = dump["dealer_name"]
+            row["datedBy"] = SOURCE_LABELS.get(row["matchBasis"], row["matchBasis"])
+            out.append(row)
+    return out
 
 
 @router.post("/dms-dumps/{dump_id}/rematch")
@@ -911,9 +940,10 @@ _COLUMNS = (
     ("Model", "model"), ("Variant", "variant"), ("DMS stage", "stage"), ("Consultant", "consultant"),
     ("Journey", "journeyReference"), ("Matched on", "matchBasis"),
 )
+NOT_IN_DMS = "NOT_IN_DMS"
 OUTCOME_LABELS = {
     MISSING: "Not in Verigence", NOT_IN_TOOL: "Booking on file, delivery not uploaded",
-    MATCHED: "Synced", CANCELLED: "Cancelled in DMS",
+    MATCHED: "Synced", CANCELLED: "Cancelled in DMS", NOT_IN_DMS: "In Verigence, not in DMS dump",
 }
 
 
@@ -950,33 +980,44 @@ def build_report(connection: Connection, *, tenant_id: str, dealer_ids: list[str
             cell.font, cell.fill = bold, head
         sheet.freeze_panes = "A2"
 
+    items = [_row_json(r) for r in rows]
+    # The other side of each delivery dump: Verigence's deliveries of the days it covers
+    # that it does not carry (2026-11-17).
+    items += _not_in_dump(connection, tenant_id, [d["dump_id"] for d in dumps if str(d["dump_id"]) in active
+                                                   and d["dump_kind"] == DELIVERY])
+    not_in_dump: dict[tuple[str, str | None], int] = defaultdict(int)
+    for item in items:
+        if item["outcome"] == NOT_IN_DMS:
+            not_in_dump[(item["dumpDate"], item["dealerName"])] += 1
     summary = workbook.active
     summary.title = "Summary"
     header(summary, ["Dump date", "Dealership", "Dump", "File", "Rows", "Synced", "Delivery not uploaded",
-                     "Not in Verigence", "Cancelled in DMS", "Uploaded by", "Uploaded at (UTC)", "Status"])
+                     "Not in Verigence", "Cancelled in DMS", "In Verigence, not in dump", "Uploaded by",
+                     "Uploaded at (UTC)", "Status"])
     for d in dumps:
         summary.append([d["business_date"], d["dealer_name"], d["dump_kind"].title(), d["file_name"], d["row_count"],
                         d["matched_count"], d["not_in_tool_count"], d["missing_count"], d["cancelled_count"],
+                        not_in_dump.get((d["business_date"].isoformat(), d["dealer_name"]), 0)
+                        if d["dump_kind"] == DELIVERY and str(d["dump_id"]) in active else None,
                         d["uploaded_by_name"] or d["uploaded_by"], d["uploaded_at_utc"].replace(tzinfo=None),
                         "Current" if d["status"] == "ACTIVE" else "Replaced"])
+    for item in items:
+        item["outcomeLabel"] = OUTCOME_LABELS[item["outcome"]]
+        if item["outcome"] == NOT_IN_DMS:
+            item["matchBasis"] = f"Dated by {item['datedBy'].lower()}"
     for title, kind in (("Booking dump variance", BOOKING), ("Delivery dump variance", DELIVERY)):
         sheet = workbook.create_sheet(title)
         header(sheet, [c for c, _ in _COLUMNS])
-        for r in rows:
-            if r["dump_kind"] != kind:
-                continue
-            item = _row_json(r)
-            item["outcomeLabel"] = OUTCOME_LABELS[r["outcome"]]
-            sheet.append([item.get(key) for _, key in _COLUMNS])
+        for item in items:
+            if item["kind"] == kind:
+                sheet.append([item.get(key) for _, key in _COLUMNS])
     # One sheet per day a dump was uploaded (product owner: "with each date wise when the
     # dump was uploaded report should be available").
     for day in sorted({d["business_date"] for d in dumps if str(d["dump_id"]) in active}):
         sheet = workbook.create_sheet(f"{day:%d-%b}")
         header(sheet, [c for c, _ in _COLUMNS])
-        for r in rows:
-            if r["business_date"] == day:
-                item = _row_json(r)
-                item["outcomeLabel"] = OUTCOME_LABELS[r["outcome"]]
+        for item in items:
+            if item["dumpDate"] == day.isoformat():
                 sheet.append([item.get(key) for _, key in _COLUMNS])
     for sheet in workbook.worksheets:
         for column in sheet.columns:
