@@ -1,0 +1,128 @@
+name: One-shot statement re-read experiment (DEV, read-only)
+
+# Which provider setting reads the dealers' account statements (NDC) best?
+# The statement prints its own totals, so a reading scores itself: Audit Core's
+# add-up check (uc03_statement_totals) says whether the rows read give the
+# totals read. This job
+#   1. picks a fixed sample of live statements by what that check says of
+#      today's reading (do not add up / add up / only the totals were read),
+#   2. reads each page again under each setting with Document Intelligence's
+#      own prompt and parser (tools/statement_reread_experiment/di_side.py),
+#   3. scores every reading with Audit Core's own check and prints the counts.
+# It writes to no database and no storage: no job, no run, no value, no task.
+# The readings stay on the runner and are deleted at the end. The log carries
+# counts, document ids and verdicts only -- never an amount or a name.
+# Run again by changing RUN below.
+on:
+  push:
+    branches: [dev]
+    paths:
+      - '.github/workflows/one-shot-statement-reread-experiment.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-core-statement-reread-experiment
+  cancel-in-progress: false
+
+jobs:
+  experiment:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      RUN: '1'
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      DI_SERVICE: di-worker
+      # Mahindra Orissa, the live Project.
+      EXPERIMENT_TENANT_ID: afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
+      # Statements per part of the sample; empty for the full sample (100 / 40 / 30).
+      EXPERIMENT_LIMIT: ''
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out Document Intelligence (dev)
+        uses: actions/checkout@v4
+        with:
+          repository: verigence/verigence-di
+          ref: dev
+          path: di-src
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install both services, each in its own environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "DI_COMMIT=$(git -C di-src rev-parse --short HEAD)"
+          python -m venv "$RUNNER_TEMP/ac"
+          "$RUNNER_TEMP/ac/bin/pip" install --quiet --upgrade pip
+          "$RUNNER_TEMP/ac/bin/pip" install --quiet -e .
+          python -m venv "$RUNNER_TEMP/di"
+          "$RUNNER_TEMP/di/bin/pip" install --quiet --upgrade pip
+          "$RUNNER_TEMP/di/bin/pip" install --quiet -e di-src/backend
+          npm install --global @railway/cli
+
+      - name: Resolve the DEV services' variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${RAILWAY_API_TOKEN:-}" ] || { echo '::error::RAILWAY_API_TOKEN is not configured.'; exit 1; }
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json >"$RUNNER_TEMP/audit-vars.json"
+          railway variable list --service "$DI_SERVICE" --json >"$RUNNER_TEMP/di-vars.json"
+          # Nothing below prints a variable; the masks are a second guard.
+          python - "$RUNNER_TEMP/audit-vars.json" "$RUNNER_TEMP/di-vars.json" <<'PY'
+          import json, re, sys
+          from pathlib import Path
+          for path in sys.argv[1:]:
+              for key, value in json.loads(Path(path).read_text()).items():
+                  value = str(value or "")
+                  if re.search(r"KEY|SECRET|TOKEN|PASSWORD|URL|DSN", key) and len(value) >= 8 and "\n" not in value:
+                      print(f"::add-mask::{value}")
+          PY
+          raw="$(python - "$RUNNER_TEMP/audit-vars.json" <<'PY'
+          import json, sys
+          from pathlib import Path
+          variables = json.loads(Path(sys.argv[1]).read_text())
+          print(variables.get('DATABASE_PUBLIC_URL') or variables.get('DATABASE_URL') or '')
+          PY
+          )"
+          [[ -n "$raw" ]] || { echo '::error::no DATABASE_URL on the Audit Core service.'; exit 1; }
+          case "$raw" in
+            postgresql+psycopg://*) url="$raw" ;;
+            postgresql+asyncpg://*) url="postgresql+psycopg://${raw#postgresql+asyncpg://}" ;;
+            postgresql://*) url="postgresql+psycopg://${raw#postgresql://}" ;;
+            postgres://*) url="postgresql+psycopg://${raw#postgres://}" ;;
+            *) echo '::error::DATABASE_URL is not a PostgreSQL URL.'; exit 1 ;;
+          esac
+          echo "::add-mask::$url"
+          echo "DATABASE_URL=$url" >> "$GITHUB_ENV"
+          rm -f "$RUNNER_TEMP/audit-vars.json"
+
+      - name: Pick the sample by today's reading (Audit Core, read only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/ac/bin/python" tools/statement_reread_experiment/ac_side.py select "$RUNNER_TEMP/sample.json"
+
+      - name: Read each statement again under each setting (nothing stored)
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/di/bin/python" tools/statement_reread_experiment/di_side.py \
+            "$RUNNER_TEMP/di-vars.json" "$RUNNER_TEMP/sample.json" "$RUNNER_TEMP/readings.jsonl"
+
+      - name: Score every reading with Audit Core's add-up check
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/ac/bin/python" tools/statement_reread_experiment/ac_side.py score \
+            "$RUNNER_TEMP/sample.json" "$RUNNER_TEMP/readings.jsonl"
+
+      - name: Remove the variables and the readings from the runner
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/audit-vars.json" "$RUNNER_TEMP/di-vars.json" "$RUNNER_TEMP/sample.json" "$RUNNER_TEMP/readings.jsonl"
