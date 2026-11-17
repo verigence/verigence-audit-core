@@ -137,11 +137,45 @@ def _loan_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     return remarks
 
 
+def _loan_amount_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """The Delivery Order and the Bank Approval Letter print different loan amounts (product
+    owner 2026-11-17: "highlight this as system remarks"). The loan counted follows the fixed
+    order (receipt, NDC, DO, sanction letter: uc03_p2_audit_summary.loan_figures); the remark
+    names both figures and the difference."""
+    from audit_core.uc03_ledger_receipts import is_loan_net_of_charges
+    from audit_core.uc03_p2_audit_rules import _rupees
+    from audit_core.uc03_p2_journey360 import (
+        bank_approval_sanction,
+        delivery_order_loan,
+    )
+
+    do = delivery_order_loan(connection, tenant_id=tenant_id, journey_id=journey_id)
+    letter = bank_approval_sanction(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if do is None or letter is None:
+        return []
+    do_amount, sanctioned = Decimal(do["amount"]), Decimal(letter["amount"])
+    difference = abs(do_amount - sanctioned)
+    if difference <= _LOAN_TOLERANCE:
+        return []
+    charges = (" -- within 2%, possibly the lender's charges deducted"
+               if is_loan_net_of_charges(min(do_amount, sanctioned), max(do_amount, sanctioned)) else "")
+    return [_remark(
+        "LOAN_AMOUNT_DIFFERS", "Loan amount differs: DO and sanction letter",
+        f"The Delivery Order shows a loan of {_rupees(do_amount)}; the Bank Approval Letter sanctions "
+        f"{_rupees(sanctioned)} (a difference of {_rupees(difference)}{charges}). "
+        "The Delivery Order's figure is taken ahead of the sanction letter's.",
+        "Delivery Order / Bank Approval Letter")]
+
+
+_LOAN_TOLERANCE = Decimal(1)
+
+
 def system_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     remarks = [
         *_deal_remarks(connection, tenant_id=tenant_id, journey_id=journey_id),
         *_bh_remark(connection, tenant_id=tenant_id, journey_id=journey_id),
         *_closure_remarks(connection, tenant_id=tenant_id, journey_id=journey_id),
         *_loan_remarks(connection, tenant_id=tenant_id, journey_id=journey_id),
+        *_loan_amount_remarks(connection, tenant_id=tenant_id, journey_id=journey_id),
     ]
     return {"remarks": remarks, "count": len(remarks)}
