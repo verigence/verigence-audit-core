@@ -373,3 +373,30 @@ def test_the_journeys_loan_receipt_is_found_on_the_loan_credit() -> None:
     assert (results["r"].outcome, results["r"].basis, results["r"].credit_keys) == (br.MATCHED, br.LOAN_REFERENCE,
                                                                                      ["c1"])
     assert credits["c1"].receipt_keys == ["r"]
+
+
+# --------------------------------------------------------------------------- the account register
+
+def _stmt(start: int, end: int, opening: str | None, closing: str | None, name: str = "f") -> dict:
+    return {"period_from": date(2026, 11, start), "period_to": date(2026, 11, end), "opening_balance": opening,
+            "closing_balance": closing, "file_name": name}
+
+
+def test_coverage_shows_missing_days_and_days_not_yet_loaded() -> None:
+    from audit_core.uc03_p2_bank_register import coverage
+
+    out = coverage([_stmt(1, 3, None, None), _stmt(6, 8, None, None), _stmt(2, 4, None, None)],
+                   date(2026, 11, 1), date(2026, 11, 30), date(2026, 11, 10))
+    assert (out["coveredDays"], out["from"], out["to"]) == (7, "2026-11-01", "2026-11-08")
+    assert out["missing"] == ["2026-11-05"]
+    assert out["notYetLoaded"] == {"from": "2026-11-09", "to": "2026-11-10"}
+
+
+def test_uploads_that_follow_one_another_must_continue_the_balance() -> None:
+    from audit_core.uc03_p2_bank_register import balance_breaks
+
+    assert balance_breaks([_stmt(1, 3, "100", "500"), _stmt(4, 6, "500", "900")]) == []
+    breaks = balance_breaks([_stmt(1, 3, "100", "500", "a"), _stmt(4, 6, "650", "900", "b")])
+    assert [(b["after"], b["difference"]) for b in breaks] == [("2026-11-03", "150.00")]
+    # overlapping uploads (the same days again) are not a break
+    assert balance_breaks([_stmt(1, 4, "100", "500"), _stmt(1, 6, "100", "900")]) == []

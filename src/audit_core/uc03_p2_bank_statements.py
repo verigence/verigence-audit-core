@@ -1053,7 +1053,10 @@ def rematch_bank_statement(
 
 # --------------------------------------------------------------------------- Excel
 
-def build_report(connection: Connection, *, tenant_id: str, statements: list[dict[str, Any]]) -> bytes:
+def build_report(connection: Connection, *, tenant_id: str, statements: list[dict[str, Any]],
+                 accounts: list[dict[str, Any]] | None = None) -> bytes:
+    """The reconciliation workbook; with ``accounts`` (uc03_p2_bank_register, the month's
+    export) also each account's register of transactions and its coverage."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill
 
@@ -1157,6 +1160,30 @@ def build_report(connection: Connection, *, tenant_id: str, statements: list[dic
             if t["outcome"] == "UNIDENTIFIED":
                 unidentified_sheet.append([label, t["date"], t["narration"], t["reference"], num(t["amount"]),
                                            t["kindLabel"], t["namedJourneyReference"], t["namedCustomer"]])
+    if accounts is not None:
+        coverage_sheet = sheet_with("Account coverage", [
+            "Dealership", "Outlet", "Bank", "Account", "Uploads", "Days covered", "From", "To", "Missing days",
+            "Not yet loaded", "Balance breaks", "Opening balance", "Closing balance", "Credits", "Credit total",
+            "Debits", "Debit total", "Credits with no receipt"])
+        register_sheet = sheet_with("Account register", [
+            "Dealership", "Bank", "Account", "Date", "Value date", "Narration", "Reference", "Debit", "Credit",
+            "Balance", "Result", "Matched on", "Journey", "Loaded from", "Loaded at (UTC)"])
+        for a in accounts:
+            cov = a["coverage"]
+            pending = cov.get("notYetLoaded")
+            coverage_sheet.append([
+                a["dealerName"], a["outletName"] or "All outlets", a["bankName"], a["accountNumber"], a["uploads"],
+                cov["coveredDays"], cov["from"], cov["to"], ", ".join(cov["missing"]) or None,
+                f"{pending['from']} to {pending['to']}" if pending else None,
+                "; ".join(f"after {b['after']}: closing {b['closing']}, next opening {b['nextOpening']}"
+                          for b in a["balanceBreaks"]) or None,
+                num(a["openingBalance"]), num(a["closingBalance"]), a["credits"], num(a["creditTotal"]),
+                a["debits"], num(a["debitTotal"]), a["creditsNoReceipt"]])
+            for r in a.get("rows") or []:
+                register_sheet.append([
+                    a["dealerName"], a["bankName"], a["accountNumber"], r["date"], r["valueDate"], r["narration"],
+                    r["reference"], num(r["debit"]), num(r["credit"]), num(r["balance"]), r["result"],
+                    r["basisLabel"], r["journeyReference"], r["loadedFrom"], r["loadedAtUtc"]])
     for sheet in workbook.worksheets:
         for column in sheet.columns:
             width = max((len(str(c.value)) for c in column if c.value is not None), default=8)
@@ -1192,7 +1219,13 @@ def export_bank_statement_report(
         statements = [_statement_json(r) for r in rows]
         name = f"Bank-Reconciliation_{first:%Y-%m}.xlsx"
     statements = [s for s in statements if s["dealerId"] in dealer_ids]
-    data = build_report(connection, tenant_id=tenant_id, statements=statements)
+    accounts = None
+    if statement_id is None:
+        from audit_core.uc03_p2_bank_register import registers
+
+        accounts = registers(connection, tenant_id=tenant_id, dealer_ids=sorted(dealer_ids), first=first,
+                             today=_today(connection, tenant_id), with_rows=True)
+    data = build_report(connection, tenant_id=tenant_id, statements=statements, accounts=accounts)
     return StreamingResponse(io.BytesIO(data), media_type=(
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         headers={"Content-Disposition": f'attachment; filename="{name}"'})

@@ -136,6 +136,7 @@ from audit_core.uc03_p2_access_locations import (
     router as uc03_p2_access_locations_router,
 )
 from audit_core.uc03_p2_api import router as uc03_p2_router
+from audit_core.uc03_p2_bank_register import router as uc03_p2_bank_register_router
 from audit_core.uc03_p2_bank_statements import router as uc03_p2_bank_statements_router
 from audit_core.uc03_p2_bulk_upload import router as uc03_p2_bulk_upload_router
 from audit_core.uc03_p2_daily_report import router as uc03_p2_daily_report_router
@@ -386,6 +387,8 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_insurance_dumps_router)
     application.include_router(uc03_p2_scheme_dumps_router)
     application.include_router(uc03_verified_bookings_router)
+    # before the statements router: /bank-statements/accounts is not a /bank-statements/{statement_id}
+    application.include_router(uc03_p2_bank_register_router)
     application.include_router(uc03_p2_bank_statements_router)
     application.include_router(uc03_p2_performance_router)
     application.include_router(performance_settings_router)

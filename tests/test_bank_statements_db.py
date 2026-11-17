@@ -120,14 +120,14 @@ def _as_runtime(c, tenant_id):
     c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
 
 
-def _upload(d):
+def _upload(d, data: bytes = STATEMENT, name: str = "statement.csv"):
     with d.engine.begin() as c, \
             mock.patch.object(bs, "_access", return_value={"ADMIN"}), \
             mock.patch.object(bs, "_dealers", return_value=[{"dealerId": str(d.dealer_id)}]), \
             mock.patch.object(bs, "_name_of", return_value="Tester"):
         _as_runtime(c, d.tenant_id)
         return bs.upload_bank_statement(d.tenant_id, SimpleNamespace(subject="user-1"), None, c,
-                                        UploadFile(io.BytesIO(STATEMENT), filename="statement.csv"), d.dealer_id, None)
+                                        UploadFile(io.BytesIO(data), filename=name), d.dealer_id, None)
 
 
 def test_upload_reconciles_and_updates_statuses(dealer):
@@ -211,3 +211,29 @@ def test_a_loan_with_no_receipt_is_tied_to_its_journey(dealer):
 
     sheet = load_workbook(io.BytesIO(report))["Loans found in bank"]
     assert sheet.max_row == 2 and sheet.cell(2, 5).value == 1026639
+
+
+def test_the_account_register_keeps_each_transaction_once_across_uploads(dealer):
+    """Statements loaded daily or twice a week overlap: the account's register carries each
+    transaction once, loaded by the first upload that had it, and the days covered."""
+    from datetime import date
+
+    from audit_core.uc03_p2_bank_register import registers
+
+    _upload(dealer, STATEMENT, "first.csv")  # 3-4 Nov
+    later = STATEMENT + b'05/11/2026,05/11/2026,NEFT/SBIN526300000009/NEW PAYER/SBI,,,"25,000.00","23,75,639.00"\n'
+    _upload(dealer, later, "second.csv")  # 3-5 Nov: the same rows again and the 5th
+    with dealer.engine.begin() as c:
+        _as_runtime(c, dealer.tenant_id)
+        found = registers(c, tenant_id=dealer.tenant_id, dealer_ids=[str(dealer.dealer_id)],
+                          first=date(2026, 11, 1), today=date(2026, 11, 8), with_rows=True)
+    assert len(found) == 1
+    account = found[0]
+    assert (account["uploads"], account["transactions"], account["credits"], account["debits"]) == (2, 6, 5, 1)
+    assert account["coverage"]["from"] == "2026-11-03" and account["coverage"]["to"] == "2026-11-05"
+    assert account["coverage"]["notYetLoaded"] == {"from": "2026-11-06", "to": "2026-11-07"}
+    loaded = {r["narration"][:12]: r["loadedFrom"] for r in account["rows"]}
+    assert loaded["NEFT/SBIN526"] == "second.csv" and loaded["BY CASH - TE"] == "first.csv"
+    # the reconciliation's verdict is on the row however many uploads printed it
+    asha = next(r for r in account["rows"] if "ASHA" in r["narration"])
+    assert asha["result"] == "Tied to receipt" and asha["journeyId"] == dealer.journeys["ASHA KUMARI RATH"]
