@@ -889,6 +889,13 @@ def booking_identified(new: FileIdentity, existing: FileIdentity) -> bool:
     is one booking, so a misread OTF no longer keeps the copy."""
     if booking_reference_shared(new, existing) or same_sale_fields(new, existing) is not None:
         return True
+    # A dealer receipt number is the dealership's own series, not an outlet's: the same receipt
+    # and the same customer at two outlets of one dealership is one booking too (2026-11-17:
+    # ADI-RD-261027-013 / ADI-BM-261114-014, receipt AMCB301852627, held for the Team Lead).
+    same_dealer = bool(new.dealer_id and new.dealer_id == existing.dealer_id)
+    if (same_dealer and new.receipt_numbers & existing.receipt_numbers
+            and same_customer(new, existing) is not None and not two_vehicles(new, existing)):
+        return True
     return bool(new.vin and new.vin == existing.vin and not two_people(new, existing))
 
 
