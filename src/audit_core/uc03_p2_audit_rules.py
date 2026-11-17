@@ -527,18 +527,27 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
         return RuleOutcome(code, "SKIPPED", f"Not checked until the booking date is corrected: {rejected}.")
     if not _standards_known(facts):
         return RuleOutcome(code, "SKIPPED", _NO_STANDARD)
-    # Registration on a scrappage deal (2026-11-09, uc03_scrappage_registration):
-    # a shortfall that is exactly the 25% concession is not an undercharge.
+    # Registration on a scrappage deal: the Deal takes the scrappage concession
+    # off the RTO standard itself (2026-11-17, uc03_scrappage_registration.apply_concession),
+    # so the line's standard is already what the customer could be charged and
+    # this check reads the concession from the Deal instead of working it out again.
     from audit_core import uc03_scrappage_registration as scrappage_rule
-    from audit_core.uc03_discount_given import has_figure
 
-    scrappage = scrappage_rule.scrappage_evidence(
-        cod_documents=len(facts.documents(*scrappage_rule.COD_DOCUMENT_TYPES)),
-        scrappage_discounts=[d for d in facts.sheet.get("discounts") or []
-                             if str(d.get("key") or "").startswith("SCRAPPAGE") and has_figure(d)],
-    )
     explained: list[dict[str, Any]] = []
-    concession_total = Decimal(0)
+    for group in facts.sheet["categories"]:
+        for row in group["components"]:
+            applied = row.get("scrappageConcession")
+            if applied:
+                explained.append({"key": row["key"], "label": row["label"],
+                                  "standard": Decimal(str(applied["masterStandard"])),
+                                  "charged": _dec(row.get("current")) if row.get("current") is not None
+                                  else Decimal(str(applied["standard"])),
+                                  "concession": Decimal(str(applied["concession"])),
+                                  "source": applied.get("source"), "scrappage": applied.get("evidence"),
+                                  "codOnFile": applied.get("codOnFile")})
+    block = facts.sheet.get("scrappage") or {}
+    scrappage_on_file = scrappage_rule.scrappage_evidence(
+        cod_documents=len(block.get("certificates") or []), scrappage_discounts=block.get("benefits") or [])
     short: list[dict[str, Any]] = []
     # A registration charged at less than half its standard may be a BH-series
     # registration: the PC is asked (product owner 2026-11-15,
@@ -561,15 +570,10 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
             gap = standard - charged
             note = None
             if gap > _LINE_TOLERANCE and row["key"] in scrappage_rule.REGISTRATION_KEYS:
-                line = scrappage_rule.assess_line(standard=standard, charged=charged, scrappage=scrappage)
-                note = line.get("note")
-                if line["explained"]:
-                    explained.append({"key": row["key"], "label": row["label"], "standard": standard,
-                                      "charged": charged, "short": gap, "concession": line["concession"],
-                                      "scrappage": scrappage})
-                    concession_total += line["concession"]
-                    continue
-                if registration_is_low(standard=standard, charged=charged):
+                # Not taken as the concession by the Deal: say how it stands against one.
+                note = scrappage_rule.assess_line(standard=standard, charged=charged,
+                                                  scrappage=scrappage_on_file).get("note")
+                if registration_is_low(standard=_dec(row.get("standardMaster")) or standard, charged=charged):
                     low_registration.append({"key": row["key"], "label": row["label"], "standard": str(standard),
                                              "charged": str(charged)})
                     asked = "less than half the standard: the PC is asked whether it is a BH registration"
@@ -584,12 +588,10 @@ def deal_undercharged(facts: _Facts) -> RuleOutcome:
     concession_details = {"scrappageConcession": [
         {k: (str(v) if isinstance(v, Decimal) else v) for k, v in e.items()} for e in explained]}
     explained_text = "; ".join(
-        f"{e['label']}: {_rupees(e['charged'])} against the standard {_rupees(e['standard'])} is the 25% scrappage "
-        f"concession ({_rupees(e['concession'])}), not counted as short" for e in explained)
+        f"{e['label']}: the price master's {_rupees(e['standard'])} less the scrappage concession of "
+        f"{_rupees(e['concession'])} ({e.get('source') or 'scrappage'}), not counted as short" for e in explained)
     net = facts.sheet["summary"]["net"]
     net_standard, net_current = _dec(net["standard"]), _dec(net["current"])
-    if net_standard is not None:
-        net_standard -= concession_total
     net_gap = net_standard - net_current if net_standard is not None and net_current is not None else None
     if not short and (net_gap is None or net_gap <= _TOLERANCE):
         reason = "Every price component is charged at or above its standard price"

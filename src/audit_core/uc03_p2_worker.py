@@ -5370,6 +5370,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # uc03_same_sale_settle. A dry run unless the label ends with "-commit".
         from audit_core.uc03_same_sale_settle import run_same_sale_settle
         return run_same_sale_settle, (engine, tag, reports)
+    if kind == "DEAL_SCRAPPAGE_REVIEW":
+        # Every Journey's Deal reviewed for scrappage, RTO, FASTag and RSA
+        # (product owner 2026-11-17): see uc03_deal_scrappage_review. Read-only.
+        from audit_core.uc03_deal_scrappage_review import run_deal_scrappage_review
+        return run_deal_scrappage_review, (engine, tag, reports)
     if kind == "RULES_RERUN":
         # Every booking's checks run again after a rule changes (2026-11-03):
         # see uc03_rules_rerun. A dry run unless the label ends with "-commit".

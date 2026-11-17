@@ -222,7 +222,7 @@ _CHARGES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
           r"ROAD TAX")),
         # The Offer Letter's "Others" row with "FT" / "Fastag" written on it is
         # the FASTag (2026-11-03), so it is matched before the other charges.
-        ("fastag_amount", r"(OTHERS )?(FAST ?T?AGE?( CHARGES)?|FT)"),
+        ("fastag_amount", r"(OTHERS )?(FAST[ -]?T?T?AGE?( CHARGES)?|FT)"),
         ("other_charges", "|".join(f"(?:{p.pattern})" for _, p in _OTHER_CHARGES)),
         ("accessories_cost", r"(PAID )?ACCESSOR(IES|Y)|SALE OF ACCESSORIES"),
         # Not "RSA COD" / "RSA COP": their amounts are the certificate of
@@ -496,11 +496,25 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
         if not label or side is None:
             continue  # a zero or empty line is not a figure
         _, amount = side
+        if (written := _AMOUNT_IN_LABEL.fullmatch(label)) is not None \
+                and Decimal(written["amount"].replace(",", "")) == amount \
+                and any(pattern.fullmatch(written["label"]) for _, pattern in _CHARGES):
+            # The amount written again beside the charge (2026-11-17,
+            # SHI-SS-261031-006: "OTHERS FASTAG 600" of Rs 600 was read as an
+            # other charge, and the FASTag the customer bought was missing
+            # from the Deal): the charge is the label without it.
+            label = written["label"]
         if _OLD_VEHICLE.fullmatch(label):
             give("OLD_VEHICLE", "old_vehicle_value", amount)
             continue
         if _SCRAPPAGE.fullmatch(label):
             if not _SCRAPPAGE_BONUS.fullmatch(label):
+                if side[0] == "DR":
+                    # Charged: the certificate of deposit bought for the scrappage
+                    # ("Scorpige" 29,143, "IF ANY OTHERS SCRAPPAGE"): an other
+                    # charge (product owner 2026-11-04), never dropped (2026-11-17).
+                    give("COMMERCIAL", "other_charges", amount, "SCRAPPAGE_COD")
+                    continue
                 leave(label, side, "names the scrappage but no bonus: it may be the certificate of deposit bought for it")
                 continue
             give("DISCOUNT", SCRAPPAGE_COD_KEY if _COD.fullmatch(label) else SCRAPPAGE_DEALER_KEY, amount)
@@ -581,6 +595,35 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
         if noted is not None:
             charge, named = noted
             give("COMMERCIAL", charge, amount, _other_charge_row(named) if charge == "other_charges" else "")
+            continue
+        posting = _ERP_POSTED_CHARGE.fullmatch(label) if side[0] == "DR" else None
+        if posting is not None:
+            # Aditya's computer statement prints "Road Side Assistance 0" and
+            # posts the RSA and the certificate of deposit as journals below
+            # ("Journal_NonGST, 25764, Mahindra & Mahindra Ltd( RSA) Payable"
+            # 2,021; "... DigiELV PURCHASE & SALE (COD)" 24,143): charged to
+            # the customer on the statement itself, so they are the Deal's RSA
+            # and an other charge (2026-11-17: 17 statements' RSA and 8
+            # certificates were left out of the Deal).
+            if posting["rsa"]:
+                give("COMMERCIAL", "rsa_amount", amount)
+            else:
+                give("COMMERCIAL", "other_charges", amount, "SCRAPPAGE_COD")
+            continue
+        general = _GENERAL_ROW_WITH_NOTE.fullmatch(label) if side[0] == "DR" else None
+        if general is not None and not _COD_WORD.search(label[general.end(1):]):
+            general = None  # a word that names no charge known: left for a person (2026-11-04)
+        if general is not None or (side[0] == "DR" and (_COD_SALE.fullmatch(label) or _COMBINED_CHARGES.fullmatch(label))):
+            # 2026-11-17: the certificate of deposit the dealer wrote on the
+            # "If any others" / "Misc" row however it is read (DigiELV read
+            # "DIGI LV", "DIGIEKV", "ZGIELV", "D141 LV"...), the certificate of deposit sold
+            # ("COD SALE"), and the commercial vehicles' combined row ("Speed
+            # Governer+Fast Tag+Rsa+Accessories+Choice no+VLTD") are other
+            # charges: allowed and summed under the other charges (product
+            # owner 2026-11-15), never left out of the Deal. Live, 37 such rows
+            # were dropped, Rs 24,143 each for the certificates.
+            give("COMMERCIAL", "other_charges", amount,
+                 "COMBINED" if _COMBINED_CHARGES.fullmatch(label) else "SCRAPPAGE_COD")
             continue
         leave(label, side, "label not in the mapping")
     totals: dict[tuple[str, str], Decimal] = {}
@@ -732,6 +775,17 @@ def _price_and_scheme(out: StatementRead, totals: dict[tuple[str, str], Decimal]
 # refund pending"). Debits only.
 _RUN_TOGETHER = re.compile(r"(?<=CHARGES)(?=[A-Z])")
 _GENERAL_ROWS = frozenset({"OTHERS", "IF_ANY_OTHERS", "MISC"})
+# The general rows with the certificate of deposit written on them however the
+# handwriting reads it (2026-11-17; any other word stays unmapped), the certificate of
+# deposit sold, the commercial vehicles' combined row, and the words that name
+# the certificate of deposit however the handwriting is read.
+_GENERAL_ROW_WITH_NOTE = re.compile(r"(IF ANY OTHERS?|MISC( \(IF ANY\))?|OTHERS) .+")
+_ERP_POSTED_CHARGE = re.compile(
+    r"(\d{4}-\d{2}-\d{2}, )?JOURNAL[_ ]NON ?GST, \d+, (?:(?P<rsa>MAHINDRA & MAHINDRA (LTD)? ?-? ?\( ?RSA ?\)( ?PAYABLE)?)"
+    r"|(?P<cod>DIGI\w* PURCHASE & SALE \(COD\)))")
+_COD_SALE = re.compile(r"(SALE OF )?C\.?O\.?D\.?( SALE| PURCHASE)?( .*)?")
+_COMBINED_CHARGES = re.compile(r".*\+.*\b(FAST ?TAG|RSA|VLTD|ACCESSOR\w*|CHOICE NO)\b.*\+.*")
+_COD_WORD = re.compile(r"\bCO[DP]\b|\b[DZA]\w{0,3}[- ]?[EI]?[LK]\w{0,3}\b|DIGI|SCRAP|SCORP|ELV")
 _NOTE_NOT_BILLED = re.compile(r"(.* )?(FREE|REFUND\w*|RETURN\w*|ADJUST\w*|CANCEL\w*|EXCESS|SHORT\w*|DIFF\w*)( .*)?")
 
 

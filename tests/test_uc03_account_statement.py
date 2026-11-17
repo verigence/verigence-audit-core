@@ -1338,3 +1338,21 @@ def test_every_line_the_customer_ledger_posts_is_checked_against_the_ndc() -> No
         ("RTO / registration", D(64000), D(61634)),
         ("discount additional discount", D(7000), D(71000)),
     ]
+
+
+# ── FASTag, RSA and the certificate of deposit on the NDC (2026-11-17) ──────
+@pytest.mark.parametrize(("label", "amount", "key"), [
+    ("OTHERS Fastag 600", 600, "fastag_amount"),            # SHI-SS-261031-006: the amount written again
+    ("FAST-TAG", 600, "fastag_amount"),
+    ("IF ANY OTHERS DIGI LV", 24143, "other_charges"),      # the certificate of deposit, misread
+    ("IF ANY OTHERS ZGIELV", 24143, "other_charges"),
+    ("COD SALE", 24143, "other_charges"),
+    ("SCORPIGE", 29143, "other_charges"),                   # charged: the certificate bought, not a bonus
+    ("Speed Governer+Fast Tag+Rsa+Accessories+Choice no+VLTD", 27000, "other_charges"),
+    ("Journal_NonGST, 25764, Mahindra & Mahindra Ltd( RSA) Payable", 2021, "rsa_amount"),
+    ("Journal_NonGST, 25759, DigiELV PURCHASE & SALE (COD)", 24143, "other_charges"),
+])
+def test_a_charge_the_ndc_bills_reaches_its_deal_line(label: str, amount: int, key: str) -> None:
+    read = read_statement([{"particulars_raw": "Ex Showroom", "debit_amount": 1000000},
+                           {"particulars_raw": label, "debit_amount": amount}])
+    assert read.components == {"ex_showroom_price": D(1000000), key: D(amount)} and read.unmapped == []

@@ -932,6 +932,17 @@ def condition_reasons(connection: Connection, *, tenant_id: str, journey_id: UUI
             found("registrationByDealer", f"The {where(document_type)} shows registration by {_as_text(value)}.")
         if key == "exchange_applicable" and upper in _YES_WORDS:
             found("exchangeBenefit", f"The {where(document_type)} marks exchange as applicable.")
+    # The RTO took the scrappage concession: the challan prints a rebate on the
+    # motor vehicle tax, which the RTO grants only against a Certificate of
+    # Deposit, so the certificate is asked for (product owner 2026-11-17:
+    # "scrappage discount on RTO amount is given but scrappage document is missing").
+    from audit_core.uc03_scrappage_registration import challan_rebate
+
+    rebate = challan_rebate([{"fields": {"line_items": row["value"]}} for row in fields
+                             if row["document_type_key"] == "rto_challan" and str(row["field_key"]) == "line_items"])
+    if rebate:
+        found("scrappageClaimed", f"The RTO challan shows a scrappage rebate of ₹{rebate['rebate']:,.0f} on the "
+                                  "motor vehicle tax.")
     if facts["customer_type"] in ("CORPORATE", "COMPANY", "BUSINESS", "INSTITUTIONAL"):
         found("corporateCustomer", "The customer is a company.")
     if facts["trade_in"]:
