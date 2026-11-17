@@ -143,3 +143,39 @@ def test_a_change_is_measured_statement_by_statement():
                                 "how": "ROW_NOT_NEEDED_BY_NAME", "statements": 1}]
     assert {"when": "after", "dealer": "aaa", "verdict": ac_side.FAIL, "statements": 1} in result["verdicts"]
     assert result["stillNotAddingUp"] == [{"dealer": "aaa", "gaps": "OTHER", "statements": 1}]
+
+
+# Why some answers are refused (2026-11-17): described with none of their text.
+def _entry(value, top=None, page=1):
+    entry = {"value": value, "confidence": "high", "pageNo": page}
+    if top is not None:
+        entry["box_2d"] = [top, 100, top + 40, 600]
+    return entry
+
+
+def test_a_refused_answer_is_described_without_its_text():
+    import di_refused
+
+    wanted = ["receipt_number", "receipt_date", "amount_paid", "customer_name", "bank_name"]
+    one = {"receipt_number": _entry("KRM/2627/3592", 120), "receipt_date": _entry("14/10/2026", 160),
+           "amount_paid": _entry("11000", 300), "customer_name": _entry("A Customer", 200)}
+    copy = {k: _entry(v["value"].upper() + " ", v["box_2d"][0] + 500) for k, v in one.items()}
+    other = {**copy, "receipt_number": _entry("KRM/2627/3677", 620), "amount_paid": _entry("100000", 800)}
+
+    same = di_refused.describe(json.dumps([one, copy]), wanted)
+    assert (same["kind"], same["objects"], same["fieldsGiven"]) == ("LIST", 2, [4, 4])
+    assert set(same["fields"].values()) == {"same"} and "bank_name" not in same["fields"]
+    assert same["places"] == [{"pages": [1], "top": 120, "bottom": 340}, {"pages": [1], "top": 620, "bottom": 840}]
+    assert same["apartOnThePage"] is True
+    assert di_refused.verdict(same) == "LIST_SAME_VALUES"
+
+    two = di_refused.describe("```json\n" + json.dumps([one, other]) + "\n```", wanted)
+    assert two["fields"] == {"receipt_number": "differ", "receipt_date": "same", "amount_paid": "differ",
+                             "customer_name": "same"}
+    assert di_refused.verdict(two) == "LIST_DIFFERENT_DOCUMENTS"
+
+    assert di_refused.verdict(di_refused.describe(json.dumps(one), wanted)) == "ONE_OBJECT"
+    broken = di_refused.describe('{"receipt_number": {"value": "KRM', wanted)
+    assert broken["kind"] == "NOT_JSON" and "KRM" not in json.dumps(broken)
+    for shape in (same, two):
+        assert "KRM" not in json.dumps(shape) and "Customer" not in json.dumps(shape) and "11000" not in json.dumps(shape)
