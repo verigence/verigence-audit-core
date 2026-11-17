@@ -32,10 +32,13 @@ Verigence      per outlet, from the 1st up to the last day the dealership's dump
                               day the PC uploaded the booking documents -- the booking
                               date rule of 2026-11-07) falls in the period; of those,
                               the ones dated by the upload day are shown apart
-               deliveries     delivery Journeys carrying the vehicle's own gate pass dated
-                              in the period (vehicle_gate_pass_deliveries: the gate
-                              register's "uploaded in tool"), and of those the Deal Type:
-                              Inscope / Outscope / MR, Lease, Bulk / not yet typed
+               deliveries     delivery Journeys whose delivery day falls in the period
+                              (uc03_p2_delivery_dates, 2026-11-17): the gate pass's date,
+                              else the NDC's printed delivery date, else the latest payment
+                              receipt -- those dated without a gate pass shown apart; of
+                              those not found by the delivery dump ("in Verigence, not in
+                              dump"), and the Deal Type: Inscope / Outscope / MR, Lease,
+                              Bulk / not yet typed
 Gate register  per outlet with a PC mapped, the gate register days of the delivery
                period (a Sunday before 15 Nov 2026 on Monday's):
                on register (the gate out register's deliveries), not intimated (the
@@ -89,7 +92,8 @@ MAP_ROLES = ("TL",)
 
 DMS_KEYS = ("bookingDms", "bookingSynced", "bookingNotInVerigence", "bookingCancelled",
             "deliveryDump", "deliverySynced", "deliveryNotUploaded", "deliveryNotInVerigence")
-VERIGENCE_KEYS = ("bookingInVerigence", "bookingDatedByUpload", "deliveryInVerigence", "inscope", "outscope", "otherDealType",
+VERIGENCE_KEYS = ("bookingInVerigence", "bookingDatedByUpload", "deliveryInVerigence", "deliveryDatedWithoutGatePass",
+                  "deliveryNotInDms", "inscope", "outscope", "otherDealType",
                   "dealTypePending", "gateRegister", "notIntimated", "pendingWithPc", "registersMissed",
                   "countsPending")
 
@@ -224,33 +228,13 @@ _BOOKINGS_SQL = """
     GROUP BY j.outlet_id
 """
 
-# The delivery Journeys of vehicle_gate_pass_deliveries (the gate register's "uploaded in
-# tool"), with their Deal Type: the vehicle gate pass on file, its newest delivery date.
-_DELIVERIES_SQL = """
-    WITH dated AS (
-        SELECT DISTINCT ON (f.journey_id, f.di_document_id) f.journey_id, f.effective_value #>> '{}' AS v
-        FROM auditcore.journey_document_extracted_fields f
-        JOIN auditcore.evidence e
-          ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
-         AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
-        WHERE f.tenant_id = :t AND f.field_key = 'delivery_date'
-          AND COALESCE(e.document_type_key, f.source_document_type_key) = 'gate_pass'
-        ORDER BY f.journey_id, f.di_document_id, f.source_fact_version DESC NULLS LAST, f.updated_at_utc DESC
-    )
-    SELECT DISTINCT d.journey_id, j.outlet_id, CAST(d.v AS date) AS day, c.deal_type
-    FROM dated d
-    JOIN auditcore.journeys j ON j.tenant_id = :t AND j.journey_id = d.journey_id
-    LEFT JOIN auditcore.journey_classifications c ON c.tenant_id = :t AND c.journey_id = d.journey_id
-    WHERE d.v ~ '^\\d{4}-\\d{2}-\\d{2}$' AND CAST(j.outlet_id AS text) = ANY(:ids)
-      AND CAST(d.v AS date) BETWEEN :a AND :dd
-"""
-
-
 def verigence_figures(connection: Connection, tenant_id: str, outlets: list[dict[str, Any]], first: date,
-                      booking_to: date, delivery_to: date, today: date) -> dict[str, dict[str, int]]:
+                      booking_to: date, delivery_to: date, today: date,
+                      dump_journeys: set[str] | None = None) -> dict[str, dict[str, int]]:
     """Per Verigence outlet: bookings from the 1st to ``booking_to``; deliveries in the tool
-    (with Deal Type) and the gate register from the 1st to ``delivery_to``."""
-    from audit_core.task_manager import gate_pass_covers, sunday_is_off
+    (with Deal Type) and the gate register from the 1st to ``delivery_to``. ``dump_journeys``:
+    the Journeys the dealership's delivery dump found (None: no dump on file)."""
+    from audit_core.uc03_p2_delivery_dates import GATE_PASS, deliveries, in_period
     from audit_core.uc03_p2_my_work import gate_register
 
     ids = [str(o["outlet_id"]) for o in outlets]
@@ -262,21 +246,19 @@ def verigence_figures(connection: Connection, tenant_id: str, outlets: list[dict
         out[str(r["outlet_id"])]["bookingInVerigence"] = int(r["n"])
         # no booking form date read: dated by the day the booking documents were uploaded
         out[str(r["outlet_id"])]["bookingDatedByUpload"] = int(r["by_upload"])
-    # A delivery on a Sunday that was off (before 15 Nov 2026) is Monday's register's; one after today has not happened
-    # (a misread gate pass date), as vehicle_gate_pass_deliveries counts them.
-    seen: set[str] = set()
-    for r in connection.execute(
-        text(_DELIVERIES_SQL),
-        {"t": tenant_id, "ids": ids, "a": gate_pass_covers(first)[0], "dd": min(delivery_to, today)},
-    ).mappings():
-        shifted = r["day"] + timedelta(days=1) if sunday_is_off(r["day"]) else r["day"]
-        jid = str(r["journey_id"])
-        if not first <= shifted <= delivery_to or jid in seen:
+    # The delivery day (product owner 2026-11-17): the gate pass's, else the NDC's printed
+    # delivery date, else the latest payment receipt -- delivery files on file only.
+    counted = in_period(deliveries(connection, tenant_id=tenant_id, today=today, outlet_ids=ids),
+                        first, min(delivery_to, today))
+    for jid, (delivery, _day) in counted.items():
+        figures = out.get(delivery.outlet_id or "")
+        if figures is None:
             continue
-        seen.add(jid)
-        figures = out[str(r["outlet_id"])]
         figures["deliveryInVerigence"] += 1
-        kind = str(r["deal_type"] or "")
+        figures["deliveryDatedWithoutGatePass"] += delivery.source != GATE_PASS
+        if dump_journeys is not None and jid not in dump_journeys:
+            figures["deliveryNotInDms"] += 1
+        kind = str(delivery.deal_type or "")
         key = ("inscope" if kind == "INSCOPE" else "outscope" if kind == "OUTSCOPE"
                else "otherDealType" if kind in ("MR", "LEASE", "BULK") else "dealTypePending")
         figures[key] += 1
@@ -331,7 +313,8 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
     if dump_ids:
         for r in connection.execute(
             text("""
-                SELECT dealer_id, dump_kind, outlet_label, outcome FROM auditcore.p2_dms_dump_rows
+                SELECT dealer_id, dump_kind, outlet_label, outcome, CAST(journey_id AS text) AS journey_id
+                FROM auditcore.p2_dms_dump_rows
                 WHERE tenant_id = :t AND CAST(dump_id AS text) = ANY(:ids)
             """),
             {"t": tenant_id, "ids": dump_ids},
@@ -349,7 +332,10 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
         # (a dump of the 5th carries the 1st to the 4th), else up to the report's day.
         booking_to = max(first, booking["covers_to"]) if booking and booking["covers_to"] else day
         delivery_to = max(first, delivery["covers_to"]) if delivery and delivery["covers_to"] else day
-        verigence = verigence_figures(connection, tenant_id, outlets, first, booking_to, delivery_to, today)
+        dump_journeys = ({r["journey_id"] for r in rows_by_dealer.get(did, [])
+                          if r["dump_kind"] == DELIVERY and r["journey_id"]} if delivery else None)
+        verigence = verigence_figures(connection, tenant_id, outlets, first, booking_to, delivery_to, today,
+                                      dump_journeys)
         members: dict[str, list[str]] = defaultdict(list)
         for o in outlets:
             anchor = str(o["dms_outlet_id"])
@@ -426,11 +412,13 @@ EXCEL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("As per gate out register", "gateRegister", "Total delivery"),
     ("As per delivery dump", "deliveryDump", "Total delivery"),
     ("In Verigence", "deliveryInVerigence", "Total delivery"),
+    ("of which dated without gate pass", "deliveryDatedWithoutGatePass", "Total delivery"),
     ("Synced with dump", "deliverySynced", "Total delivery"),
     ("Pending with PC", "pendingWithPc", "Total delivery"),
     ("Not intimated (client)", "notIntimated", "Total delivery"),
     ("Delivery not uploaded", "deliveryNotUploaded", "Total delivery"),
     ("Not in Verigence", "deliveryNotInVerigence", "Total delivery"),
+    ("In Verigence, not in dump", "deliveryNotInDms", "Total delivery"),
     ("Dump less Verigence", "deliveryGap", "Total delivery"),
     ("Inscope", "inscope", "Delivery bifurcation (Verigence)"),
     ("Outscope", "outscope", "Delivery bifurcation (Verigence)"),
