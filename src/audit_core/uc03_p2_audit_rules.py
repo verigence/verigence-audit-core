@@ -162,6 +162,14 @@ class _Facts:
         return deal(self.connection, tenant_id=self.tenant_id, journey_id=self.journey_id)
 
     @cached_property
+    def ndc_in_doubt(self) -> dict[str, str]:
+        """NDC / cost-sheet copies whose charges do not give their printed totals: a
+        discount read from them is not judged (product owner 2026-11-17)."""
+        from audit_core.uc03_statement_totals import charges_in_doubt
+
+        return charges_in_doubt(self.connection, tenant_id=self.tenant_id, journey_id=self.journey_id)
+
+    @cached_property
     def payments(self) -> list[dict[str, Any]]:
         """Every evidenced payment on an active document, duplicates of the
         same receipt dropped, oldest first."""
@@ -624,7 +632,7 @@ def excess_discount(facts: _Facts) -> RuleOutcome:
     # is always on the sheet, opted out by default) is no discount yet.
     if not any(dg.has_figure(r) for r in facts.sheet["discounts"]):
         return RuleOutcome(code, "PASS", "No discount on this deal.")
-    judged = [i for i in dg.assess(facts.sheet["discounts"]) if i["status"] != dg.UNKNOWN]
+    judged = [i for i in dg.assess(facts.sheet["discounts"], getattr(facts, "ndc_in_doubt", None)) if i["status"] != dg.UNKNOWN]
     if not judged:
         return RuleOutcome(code, "SKIPPED", "The entitlement of the discounts given is not known yet.")
     if not dg.standards_known(facts.sheet):
@@ -635,7 +643,7 @@ def excess_discount(facts: _Facts) -> RuleOutcome:
         if item["status"] == dg.KIT_AS_CASH:
             continue  # the same line's assessment after the kit follows
         row, given, entitled = item["row"], item["given"], item["entitled"]
-        if item["status"] in (dg.IF_NOT_INHOUSE, dg.FIGURES_DISAGREE):
+        if item["status"] in (dg.IF_NOT_INHOUSE, dg.FIGURES_DISAGREE, dg.READING_IN_DOUBT):
             # Within a higher grid tier (in-house insurance / EW), or the
             # statement and the Tally ledger disagree on the figure: not counted
             # as excess (product owner 2026-11-14), nor against the others.
@@ -678,7 +686,7 @@ def kit_given_as_cash(facts: _Facts) -> RuleOutcome:
         return RuleOutcome(code, "PASS", "No unused accessories kit on this deal.")
     if not dg.standards_known(facts.sheet):
         return RuleOutcome(code, "SKIPPED", _NO_STANDARD)
-    kits = [i for i in dg.assess(facts.sheet["discounts"]) if i["status"] == dg.KIT_AS_CASH]
+    kits = [i for i in dg.assess(facts.sheet["discounts"], getattr(facts, "ndc_in_doubt", None)) if i["status"] == dg.KIT_AS_CASH]
     if not kits:
         return RuleOutcome(code, "PASS", "The accessories kit was not given as cash.")
     lines = [{"key": i["row"]["key"], "label": i["row"]["label"], "given": str(i["given"]),

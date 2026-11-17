@@ -420,3 +420,39 @@ def test_the_ndc_decides_and_the_tally_figure_is_shown_beside_it():
     assert row["readings"] == [{"document": "NDC (Account Statement)", "amount": "71000"},
                                {"document": "Customer ledger (Tally)", "amount": "7000"}]
     assert row["offer"]["source"] == "Dealer discount grid" and row["offer"]["tiers"]["WITH_EW_INSURANCE"] == "10000"
+
+
+def test_a_discount_read_from_an_ndc_that_does_not_add_up_is_listed_apart_not_excess():
+    """Product owner 2026-11-17 ("why the excess discount tab is still showing weird
+    numbers"): UTK-SA-261027-004's NDC "Other Discount" read Rs 71,000 against a grid of
+    0-5,000, on an NDC whose rows do not give its printed totals. Until the reading is
+    corrected it is listed apart with why, never as excess."""
+    from audit_core import uc03_discount_given as dg
+
+    ndc = {"document": "NDC (Account Statement)", "documentType": "account_statement", "amount": "71000.00",
+           "documentId": "doc-1"}
+    row = _d("ADDITIONAL_DISCOUNT", "0", "71000.00", billed_from="statement", eligibility="ELIGIBLE", sources=[ndc])
+    doubt = {"doc-1": "NDC (page 3): Net Value printed Rs 12,10,000, its rows add up to Rs 11,46,000"}
+    [item] = discount_variance_rows(_view([row], policy="ACCOUNT_STATEMENT"), doubt)
+    assert item["status"] == dg.READING_IN_DOUBT and item["variance"] == "71000.00"
+    assert item["reason"].startswith("the NDC does not add up: NDC (page 3)")
+    # the same figure on an NDC that adds up is excess, as before
+    [item] = discount_variance_rows(_view([row], policy="ACCOUNT_STATEMENT"), {})
+    assert item["status"] == OVER
+    # a second copy that adds up and gives the same figure: the reading stands
+    other = {**ndc, "documentId": "doc-2"}
+    both = _d("ADDITIONAL_DISCOUNT", "0", "71000.00", billed_from="statement", eligibility="ELIGIBLE",
+              sources=[ndc, other])
+    [item] = discount_variance_rows(_view([both], policy="ACCOUNT_STATEMENT"), doubt)
+    assert item["status"] == OVER
+
+
+def test_a_kit_given_as_cash_shows_the_kit_offer():
+    """2026-11-17: 41 kit-as-cash rows (Scorpio Classic, kit-only offer) showed no offer:
+    the scheme sits on the kit line, not on the cash line."""
+    cash = _d("CASH_DISCOUNT", "0", "50000.00", billed_from="statement", eligibility="ELIGIBLE")
+    kit = {**_d("ACCESSORIES_KIT", "50000", None, billed_from=None, eligibility="ELIGIBLE"),
+           "scheme": {"name": "Mahindra Consumer — SCORPIO CLASSIC", "code": "MAH_CONSUMER_SC"}}
+    [item] = discount_variance_rows(_view([cash, kit], policy="ACCOUNT_STATEMENT"))
+    assert item["status"] == KIT_AS_CASH
+    assert item["offer"]["source"] == "Mahindra Consumer — SCORPIO CLASSIC" and item["offer"]["kit"] == "50000.00"
