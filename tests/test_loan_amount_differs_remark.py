@@ -54,3 +54,19 @@ def test_a_written_slash_dash_read_as_one_is_found() -> None:
                              {"particulars_raw": "Registration", "debit_amount": 61001}]}
     assert slash_dash_amounts(fields) == [Decimal(30001), Decimal(20001), Decimal(61001)]
     assert slash_dash_amounts({"discount_details": [{"amount": 30000}], "line_items": []}) == []
+
+
+def test_the_slash_dash_patterns_pick_001_amounts_only() -> None:
+    import re
+
+    from audit_core.uc03_gate_pass_chassis_reread import (
+        _SLASH_DASH_IN_ROWS,
+        _SLASH_DASH_SCALAR,
+    )
+
+    assert re.search(_SLASH_DASH_SCALAR, "30001") and re.search(_SLASH_DASH_SCALAR, "1250001.00")
+    assert not re.search(_SLASH_DASH_SCALAR, "30000") and not re.search(_SLASH_DASH_SCALAR, "1001x")
+    assert not re.search(_SLASH_DASH_SCALAR, "001")
+    assert re.search(_SLASH_DASH_IN_ROWS, '[{"label": "Scheme", "amount": 30001}]')
+    assert re.search(_SLASH_DASH_IN_ROWS, '[{"debit_amount": 1029901, "x": 1}]') is None
+    assert re.search(_SLASH_DASH_IN_ROWS, '[{"credit_amount": "61001"}]')
