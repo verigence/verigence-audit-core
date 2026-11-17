@@ -938,7 +938,7 @@ def _awaiting_receipts(facts: _Facts, short: Decimal, tolerance: Decimal) -> str
     # is not known, so neither is a shortfall the receipts would explain (one cause, one
     # task: the NDC reading, product owner 2026-11-17).
     check = getattr(facts, "receipts_check", None) or {}
-    if check.get("status") == "HELD":
+    if check.get("status") == "HELD" and check.get("heldFor") == "PAYMENTS_OFF":
         return (f"The payment receipts on file are {_rupees(short)} short, and the NDC's payments cannot be "
                 f"read with certainty: {check.get('held')} The payments are judged once it is.")
     missing = facts.missing_receipts_total

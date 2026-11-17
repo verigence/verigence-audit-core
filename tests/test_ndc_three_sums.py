@@ -171,12 +171,27 @@ def test_payment_lines_that_do_not_give_the_printed_total_ask_for_nothing(journe
     assert _remarks(journey) == []
 
 
-def test_an_ndc_printing_no_total_receipts_asks_for_nothing(journey) -> None:
+def test_an_ndc_printing_no_total_receipts_is_checked_against_its_net_value(journey) -> None:
+    """The other sum (product owner: "verify if two sums are same"): with no Total Receipts
+    printed, the payment lines must give the net value; then the receipts are compared."""
+    _ndc(journey, total_cost="868265", net_value="872090")
+    add_receipt_payment(journey, amount="11000", receipt_number="KRM/2627/3592", receipt_date="2026-10-01")
+    check = _check(journey)
+    assert (check["status"], check["short"]) == ("SHORT", D(100000))
+
+
+def test_an_ndc_printing_neither_total_asks_for_nothing(journey) -> None:
     _ndc(journey, total_cost="868265")
     add_receipt_payment(journey, amount="11000", receipt_number="KRM/2627/3592", receipt_date="2026-10-01")
     check = _check(journey)
-    assert check["status"] == "HELD" and "prints no Total Receipts" in check["held"]
+    assert check["status"] == "HELD" and check["heldFor"] == "NO_TOTAL"
     assert _rule(journey).outcome == "SKIPPED"
+    # the short-payment checks do not wait for this: nothing is known to be misread
+    from audit_core.uc03_p2_audit_rules import _awaiting_receipts, _Facts
+
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        assert _awaiting_receipts(_Facts(c, journey.tenant_id, journey.journey_id), D(50000), D(1000)) is None
 
 
 def test_no_ndc_on_file_is_not_judged(journey) -> None:

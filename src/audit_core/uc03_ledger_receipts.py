@@ -146,7 +146,7 @@ def ndc_money(connection: Connection, *, tenant_id: str, journey_id: UUID) -> di
         statement_kind,
         statement_total,
     )
-    from audit_core.uc03_statement_totals import _rupees, statement_differences
+    from audit_core.uc03_statement_totals import _rupees, _splits, statement_differences
 
     forms = [(d, rows) for d in load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
              for rows in [line_rows(d["fields"].get("line_items"))] if statement_kind(rows) == KIND_FORM]
@@ -172,17 +172,28 @@ def ndc_money(connection: Connection, *, tenant_id: str, journey_id: UUID) -> di
     # misread, and the NDC's money is not known (a smaller gap cannot raise a task on its own).
     payments_off = next((d for d in differences or []
                          if d["total"] == "Total Receipts" and abs(d["difference"]) > RECEIPTS_TOLERANCE), None)
-    held = None
+    held = held_for = None
     if differences is None:
-        held = "The NDC's rows are not read well enough to tell its payments."
-    elif printed is None:
-        held = "The NDC prints no Total Receipts, so its payment lines cannot be checked as one sum."
+        held, held_for = "The NDC's rows are not read well enough to tell its payments.", "NOT_READ"
     elif payments_off is not None:
-        held = (f"The NDC's payment lines add up to {_rupees(payments_off['rows'])} as read; it prints Total "
-                f"Receipts of {_rupees(payments_off['printed'])}. The payment receipts are compared once the NDC's "
-                f"reading is corrected (task: NDC rows do not add up).")
+        held, held_for = (f"The NDC's payment lines add up to {_rupees(payments_off['rows'])} as read; it prints "
+                          f"Total Receipts of {_rupees(payments_off['printed'])}. The payment receipts are compared "
+                          "once the NDC's reading is corrected (task: NDC rows do not add up)."), "PAYMENTS_OFF"
+    elif printed is None and (customer or loan):
+        # No Total Receipts printed: the payments are set against the other sum, the net value
+        # (product owner: "verify if two sums are same"), in any of the ways the form adds them.
+        old = read.old_vehicle_value or Decimal(0)
+        ways = [read.receipts + share + o for share in _splits(list(read.discounts.values()))
+                for o in {Decimal(0), old, -old}]
+        if net is None:
+            held, held_for = ("The NDC prints neither Total Receipts nor a net value, so its payment lines cannot "
+                              "be checked as one sum."), "NO_TOTAL"
+        elif min(abs(net - way) for way in ways) > RECEIPTS_TOLERANCE:
+            held, held_for = ("The NDC prints no Total Receipts, and its payment lines do not give its net value "
+                              f"of {_rupees(net)}: the payment receipts are compared once its reading is "
+                              "checked."), "NO_TOTAL"
     return {"documentId": str(document["documentId"]), "net": net, "printedReceipts": printed,
-            "customer": customer, "loan": loan, "money": customer + loan, "held": held,
+            "customer": customer, "loan": loan, "money": customer + loan, "held": held, "heldFor": held_for,
             # the NDC's own showing of a balance: net value against its payments column
             "ndcBalance": (net - printed) if net is not None and printed is not None else None}
 
