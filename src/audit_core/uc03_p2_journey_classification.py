@@ -710,6 +710,9 @@ def run_journey_classification(engine: Engine, tag: str, tenant_ids: list[str]) 
                     set_tenant_context(connection, tenant_id)
                     corrected = correct_vehicle_record(connection, tenant_id=tenant_id, journey_id=journey_id,
                                                        apply=commit)
+                    before = connection.execute(
+                        text("SELECT insurance_type, insurance_decided_by FROM auditcore.journey_classifications "
+                             "WHERE tenant_id=:t AND journey_id=:j"), {"t": tenant_id, "j": journey_id}).first()
                     facts = (refresh if commit else classify)(connection, tenant_id=tenant_id, journey_id=journey_id)
             except Exception:
                 count("failed")
@@ -721,6 +724,15 @@ def run_journey_classification(engine: Engine, tag: str, tenant_ids: list[str]) 
             count(f"insurance_{str(facts['insurance_type']).lower()}_{str(facts['insurance_decided_by']).lower()}")
             if facts.get("changed"):
                 count("written")
+            # which Journeys' insurance the rules now decide differently, so a
+            # dry run shows them before anything is written (2026-11-17)
+            if before is not None and before[0] != facts["insurance_type"]:
+                count(f"insurance_moved_to_{str(facts['insurance_type']).lower()}")
+                if len(report.setdefault("insuranceChanges", [])) < 500:
+                    report["insuranceChanges"].append({
+                        "journey": journey["journey_reference"], "from": f"{before[0]}/{before[1]}",
+                        "to": f"{facts['insurance_type']}/{facts['insurance_decided_by']}",
+                        "basis": facts.get("insurance_basis")})
             if corrected is not None:
                 count("vehicle_record_corrected")
                 if len(report.setdefault("vehicleRecords", [])) < 300:

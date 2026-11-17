@@ -283,3 +283,120 @@ def test_neither_before_the_ndc_is_read_still_asks_the_pc(engine, monkeypatch) -
     monkeypatch.setattr(rule, "premium_on_dealer_statement", lambda *a, **k: None)
     monkeypatch.setattr(rule, "ndc_without_premium", lambda *a, **k: False)
     assert _sync(journey)["decidedBy"] == "UNCONFIRMED" and _task(journey) is not None
+
+
+# The NDC's insurance row saying the customer arranged it (product owner
+# 2026-11-17: "own means self and not dealership"); labels as read on live NDCs.
+@pytest.mark.parametrize(("label", "own"), [
+    ("Insurance amount OWN", True), ("INSURANCE AMOUNT (OWN)", True), ("Insurance SELF", True),
+    ("INSURANCE COST (NORMAL) Done By Customer", True), ("Insurance amount by party", True),
+    ("Insurance amount Customer", True), ("Insurance amount", False), ("INSURANCE IN HOUSE", False),
+    ("INSURANCE COST (NIL DEP) (3+3) 1st-party", False),
+    ("Insurance Premium Amount Debited to Customer", False),
+    ("Payment Refund to Customer/Other Adjustment", False),
+])
+def test_what_the_ndc_insurance_row_says(label, own) -> None:
+    assert rule.own_insurance_row(label) is own
+
+
+def _ndc(journey, rows):
+    ndc = uuid4()
+    add_evidence(journey, di_document_id=ndc, document_type_key="customer_ledger", process_area="DELIVERY")
+    add_extracted_field(journey, di_document_id=ndc, field_key="line_items", document_type="customer_ledger",
+                        value=rows)
+
+
+def test_an_ndc_saying_own_is_self_whatever_amount_or_cost_sheet(engine, monkeypatch) -> None:
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _policy(journey, misp_code="MIBL/M&M/AAXYZ9999C/000")
+    _ndc(journey, '[{"particulars_raw": "Vehicle cost", "debit_amount": 1058500}, '
+                  '{"particulars_raw": "Insurance amount OWN", "debit_amount": 50000}]')
+    # the amount on that row, or a cost sheet's premium, no longer makes it the dealer's
+    monkeypatch.setattr(rule, "premium_on_dealer_statement", lambda *a, **k: 50000.0)
+    decision = _sync(journey)
+    assert (decision["source"], decision["decidedBy"]) == ("SELF", "DOCUMENT")
+    assert decision["basis"] == 'The NDC\'s insurance row says "Insurance amount OWN": the customer\'s own insurance.'
+    assert _task(journey) is None
+    with engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert rule.document_decision(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id) is None
+
+
+def test_an_ndc_saying_own_decides_even_without_a_policy(engine) -> None:
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _ndc(journey, '[{"particulars_raw": "Insurance amount self", "debit_amount": null}]')
+    decision = _sync(journey)
+    assert (decision["source"], decision["decidedBy"]) == ("SELF", "DOCUMENT")
+
+
+def test_the_dealers_code_on_the_policy_outweighs_an_ndc_saying_own(engine) -> None:
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _dealer_code(journey)
+    _policy(journey, misp_code=UTKAL_MISP, agent="MIBL")
+    _ndc(journey, '[{"particulars_raw": "Insurance amount OWN", "debit_amount": 50000}]')
+    assert (_sync(journey)["source"], _sync(journey)["decidedBy"]) == ("INHOUSE", "DOCUMENT")
+
+
+def test_an_ndc_copy_naming_the_dealer_does_not_count_as_own(engine, monkeypatch) -> None:
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _ndc(journey, '[{"particulars_raw": "Insurance amount OWN", "debit_amount": null}]')
+    _ndc(journey, '[{"particulars_raw": "INSURANCE IN HOUSE", "debit_amount": 41000}]')
+    monkeypatch.setattr(rule, "premium_on_dealer_statement", lambda *a, **k: 41000.0)
+    assert _sync(journey)["source"] == "INHOUSE"
+
+
+def test_with_an_ndc_read_a_dealer_invoice_premium_does_not_decide(engine, monkeypatch) -> None:
+    # product owner 2026-11-17: the dealer's code on the policy or the NDC's amount; nothing else
+    journey = create_p2_journey(engine, prefix="inssrc")
+    invoice = uuid4()
+    add_evidence(journey, di_document_id=invoice, document_type_key="customer_invoice_dms", process_area="DELIVERY")
+    add_extracted_field(journey, di_document_id=invoice, field_key="line_items", document_type="customer_invoice_dms",
+                        value='[{"description_raw": "Insurance", "net_amount": 37476.0, "line_category": "INSURANCE"}]')
+    import audit_core.uc03_account_statement as statement
+
+    monkeypatch.setattr(statement, "statement_reading", lambda *a, **k: {"read": True, "unread": []})
+    monkeypatch.setattr(rule, "premium_on_dealer_statement", lambda *a, **k: None)
+    decision = _sync(journey)  # no policy on file: the NDC alone decides
+    assert (decision["source"], decision["decidedBy"]) == ("SELF", "DOCUMENT")
+    assert "no policy with the dealer's code" in decision["basis"]
+
+
+def test_review_reports_pc_answers_the_documents_contradict(engine, monkeypatch) -> None:
+    from audit_core.uc03_insurance_source_review import run_insurance_source_review
+
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _policy(journey, agent_code="91063100000001")
+    with engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.insurance_records SET insurance_source='INHOUSE' "
+                                "WHERE tenant_id=:t AND journey_id=:j"), {"t": journey.tenant_id, "j": journey.journey_id})
+    _ndc(journey, '[{"particulars_raw": "Insurance amount OWN", "debit_amount": null}]')
+    report = run_insurance_source_review(engine, "t-dry", [journey.tenant_id])
+    listed = report["tenants"][journey.tenant_id]["pcAgainstDocuments"]
+    assert [(x["pc"], x["documents"]) for x in listed] == [("INHOUSE", "SELF")]
+
+
+def test_the_dealers_insurance_dump_listing_the_policy_is_inhouse(engine, monkeypatch) -> None:
+    # the policy page never uploaded, but the dealer's MISP export lists it (2026-11-17)
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _ndc(journey, '[{"particulars_raw": "Insurance amount", "debit_amount": null}]')
+    with engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        dealer_id = connection.execute(text("SELECT dealer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+                                       {"t": journey.tenant_id, "j": journey.journey_id}).scalar_one()
+        dump_id = uuid4()
+        connection.execute(text("INSERT INTO auditcore.p2_insurance_dumps (tenant_id, dump_id, dealer_id, period_month, "
+                                "file_name, uploaded_by) VALUES (:t, :id, :d, '2026-10-01', 'oct.xlsx', 'test')"),
+                           {"t": journey.tenant_id, "id": dump_id, "d": dealer_id})
+        connection.execute(text("INSERT INTO auditcore.p2_insurance_dump_rows (tenant_id, dump_id, row_no, dealer_id, "
+                                "policy_number, insurer, misp_code, journey_id, raw) VALUES (:t, :id, 1, :d, 'MIB/1703800', "
+                                "'SBI General Insurance Co. Ltd.', :m, :j, '{}'::jsonb)"),
+                           {"t": journey.tenant_id, "id": dump_id, "d": dealer_id, "m": UTKAL_MISP, "j": journey.journey_id})
+    decision = _sync(journey)
+    assert (decision["source"], decision["decidedBy"]) == ("INHOUSE", "DOCUMENT")
+    assert "insurance dump lists policy MIB/1703800" in decision["basis"]
+    with engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_insurance_dumps SET status='SUPERSEDED' WHERE tenant_id=:t AND dump_id=:id"),
+                           {"t": journey.tenant_id, "id": dump_id})
+    assert "insurance dump" not in (_sync(journey)["basis"] or "")  # a superseded dump no longer counts

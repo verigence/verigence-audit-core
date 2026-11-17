@@ -12,8 +12,14 @@ dealership"):
 
 1. The PC's confirmation decides (Deal tab or this task).
 2. In-house when the policy carries one of the dealer's own Agent / MISP codes
-   (a character or two misread allowed, dealer_code_match); else when the NDC
+   (a character or two misread allowed, dealer_code_match), or the dealer's own
+   insurance dump lists the Journey's policy (2026-11-17); else when the NDC
    charges the insurance premium, or a dealer invoice bills it.
+   Self when the NDC's insurance row says the customer arranged it ("Insurance
+   amount OWN", "Insurance SELF", "Done by Customer"), whatever amount is
+   written on that row and whatever a cost sheet or dealer invoice shows
+   (product owner 2026-11-17: "own means self and not dealership"). Only the
+   dealer's own code on the policy, or the PC, outweighs it.
 2a. Self when neither: the NDC is on file and read, with no insurance amount.
 3. Otherwise, once a policy has been read, a PC task INSURANCE_SOURCE_CONFIRM
    asks: in-house or external, with the Agent / MISP code in the comment. An
@@ -275,6 +281,65 @@ def premium_on_dealer_statement(connection: Connection, *, tenant_id: str, journ
     return max(positive) if positive else None
 
 
+# The NDC's insurance row naming the customer as the one who arranged it
+# (product owner 2026-11-17: "own means self and not dealership"). Read on the
+# live NDCs: "Insurance amount OWN", "INSURANCE AMOUNT (OWN)", "Insurance SELF",
+# "INSURANCE COST (NORMAL) Done By Customer", "Insurance amount by party". Not a
+# posting that merely mentions the customer ("Insurance Premium Amount Debited
+# to Customer", "Payment Refund to Customer"): those are the dealer's own.
+_INSURANCE_ROW = re.compile(r"^\W*INSURANCE\b")
+# "1st-party" / "3rd party" name the cover, not who arranged it.
+_NOT_AN_OWN_ROW = re.compile(r"DEBIT|REFUND|PREMIUM|\bTO\s+(THE\s+)?CUSTOMER\b|\b(1ST|FIRST|3RD|THIRD)[\s-]*PARTY")
+_MAX_OWN_ROW = 60
+_IN_HOUSE = re.compile(r"\bIN\s+HOUSE\b")
+
+
+def own_insurance_row(particulars: Any) -> bool:
+    """True when an NDC row is the insurance row and says the customer arranged it."""
+    label = " ".join(str(particulars or "").upper().split())
+    return len(label) <= _MAX_OWN_ROW and bool(_INSURANCE_ROW.match(label)) \
+        and not _NOT_AN_OWN_ROW.search(label) and booking_says_self(label)
+
+
+def ndc_says_own(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str | None:
+    """The NDC's insurance row as printed, when a current NDC copy says the
+    customer arranged the insurance ("Insurance amount OWN") and no copy names
+    the dealer on it; else None."""
+    from audit_core.uc03_account_statement import line_rows, load_ledger_documents
+
+    own: list[str] = []
+    for document_type in sorted(_STATEMENT_TYPES):
+        for document in load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                              document_type=document_type):
+            for row in line_rows(document["fields"].get("line_items")):
+                label = " ".join(str(row.get("particulars_raw") or "").split())
+                if not _INSURANCE_ROW.match(label.upper()) or len(label) > _MAX_OWN_ROW:
+                    continue
+                if _DEALER_WORDS.search(label.upper()) or _IN_HOUSE.search(label.upper()):
+                    return None
+                if own_insurance_row(label):
+                    own.append(label)
+    return own[0] if own else None
+
+
+def dealer_dump_policy(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    """The Journey's policy in an ACTIVE insurance dump of its own dealer, if any."""
+    row = connection.execute(
+        text(
+            """
+            SELECT d.policy_number, d.insurer, d.misp_code
+            FROM auditcore.p2_insurance_dump_rows d
+            JOIN auditcore.p2_insurance_dumps u ON u.tenant_id = d.tenant_id AND u.dump_id = d.dump_id
+            JOIN auditcore.journeys j ON j.tenant_id = d.tenant_id AND j.journey_id = d.journey_id
+            WHERE d.tenant_id = :t AND d.journey_id = :j AND u.status = 'ACTIVE' AND d.dealer_id = j.dealer_id
+            ORDER BY d.policy_date DESC NULLS LAST, d.row_no LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().first()
+    return dict(row) if row is not None else None
+
+
 def document_decision(connection: Connection, *, tenant_id: str, journey_id: UUID,
                       policy: dict[str, Any] | None = None) -> dict[str, Any] | None:
     """In-house from the documents, with the reason, or None when they do not
@@ -297,9 +362,30 @@ def document_decision(connection: Connection, *, tenant_id: str, journey_id: UUI
                 return {"source": INHOUSE,
                         "basis": f"The policy carries the dealer's {label} (read as {policy[key]}, "
                                  f"{near[1]} character{'s' if near[1] > 1 else ''} from the dealer's code)."}
+    # The policy with the dealer's code, as the dealer's own insurance dump
+    # lists it (the MISP portal export, matched to the Journey by VIN): the
+    # policy is the dealer's even when its page was never uploaded (2026-11-17:
+    # 12 of the 56 invoiced bookings with no policy on file are in the dump).
+    dumped = dealer_dump_policy(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if dumped is not None:
+        code = f" under MISP code {dumped['misp_code']}" if dumped.get("misp_code") else ""
+        return {"source": INHOUSE,
+                "basis": f"The dealer's insurance dump lists policy {dumped['policy_number']} "
+                         f"({dumped['insurer'] or 'insurer not given'}){code}."}
+    # The NDC saying the customer arranged it outweighs an amount written on
+    # that row, a cost sheet's premium and a dealer invoice (2026-11-17).
+    if ndc_says_own(connection, tenant_id=tenant_id, journey_id=journey_id) is not None:
+        return None
     charged = premium_on_dealer_statement(connection, tenant_id=tenant_id, journey_id=journey_id)
     if charged is not None:
         return {"source": INHOUSE, "basis": f"The NDC charges the insurance premium (Rs {charged:,.0f})."}
+    # The NDC decides (product owner 2026-11-17: "very simple rules: the policy
+    # has the dealership code or the NDC mentions an amount for insurance"): a
+    # dealer invoice's premium counts only while no NDC has been read.
+    from audit_core.uc03_account_statement import statement_reading
+
+    if statement_reading(connection, tenant_id=tenant_id, journey_id=journey_id)["read"]:
+        return None
     premium = premium_on_dealer_invoice(connection, tenant_id=tenant_id, journey_id=journey_id)
     if premium is not None:
         return {"source": INHOUSE, "basis": f"The dealer invoice bills the insurance premium (Rs {premium:,.0f})."}
@@ -327,14 +413,23 @@ def resolve(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
     if decided is not None:
         return {"source": INHOUSE, "decidedBy": "DOCUMENT", "decidedAt": None, "actorId": None,
                 "basis": decided["basis"]}
-    # Neither the dealer's code on the policy nor an insurance amount on the NDC
-    # on file: the customer's own insurance (product owner 2026-11-16). Until
-    # the NDC is read, the PC is asked as before.
-    if policy and (policy["insurer_name"] or policy["policy_reference"]) \
-            and ndc_without_premium(connection, tenant_id=tenant_id, journey_id=journey_id):
+    # The NDC's insurance row says the customer arranged it ("Insurance amount
+    # OWN"): Self, policy on file or not (product owner 2026-11-17: "own means
+    # self and not dealership").
+    own_row = ndc_says_own(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if own_row is not None:
         return {"source": "SELF", "decidedBy": "DOCUMENT", "decidedAt": None, "actorId": None,
-                "basis": "The policy does not carry the dealer's MISP / Agent code and the NDC charges no "
-                         "insurance premium: the customer's own insurance."}
+                "basis": f"The NDC's insurance row says \"{own_row}\": the customer's own insurance."}
+    # Neither the dealer's code on the policy nor an insurance amount on the NDC
+    # on file: the customer's own insurance (product owner 2026-11-16), policy
+    # on file or not (2026-11-17). Until the NDC is read, the PC is asked as before.
+    if ndc_without_premium(connection, tenant_id=tenant_id, journey_id=journey_id):
+        has_policy = bool(policy) and bool(policy["insurer_name"] or policy["policy_reference"])
+        return {"source": "SELF", "decidedBy": "DOCUMENT", "decidedAt": None, "actorId": None,
+                "basis": ("The policy does not carry the dealer's MISP / Agent code and the NDC charges no "
+                          "insurance premium: the customer's own insurance.") if has_policy else
+                         ("The NDC charges no insurance premium and no policy with the dealer's code is on file: "
+                          "the customer's own insurance.")}
     # Meanwhile the booking docket's own word stands, when it plainly says the
     # customer arranged it (2026-10-28).
     said_self = bool(policy) and booking_says_self(policy.get("insurance_by"))

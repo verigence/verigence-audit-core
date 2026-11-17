@@ -19,10 +19,30 @@ from audit_core.db import set_tenant_context
 logger = structlog.get_logger(__name__)
 
 
-def run_insurance_source_review(engine: Engine, tag: str, tenant_ids: list[str]) -> None:
+def _documents_say(connection, *, tenant_id: str, journey_id: UUID) -> str | None:
+    """What the documents alone decide (the PC's answer set aside): INHOUSE,
+    SELF, or None when they do not decide."""
+    from audit_core.uc03_insurance_source import (
+        document_decision,
+        ndc_says_own,
+        ndc_without_premium,
+    )
+
+    if document_decision(connection, tenant_id=tenant_id, journey_id=journey_id) is not None:
+        return "INHOUSE"
+    if ndc_says_own(connection, tenant_id=tenant_id, journey_id=journey_id) is not None \
+            or ndc_without_premium(connection, tenant_id=tenant_id, journey_id=journey_id):
+        return "SELF"
+    return None
+
+
+def run_insurance_source_review(engine: Engine, tag: str, tenant_ids: list[str]) -> dict:
+    """Returns the counts and, per Project, the PC answers the documents now
+    contradict (2026-11-17), kept on the job row."""
     from audit_core.uc03_insurance_source import resolve, sync_insurance_source_task
 
     commit = tag.endswith("-commit")
+    report: dict = {"commit": commit, "tenants": {}}
     for tenant_id in tenant_ids:
         with engine.begin() as connection:
             set_tenant_context(connection, tenant_id)
@@ -39,6 +59,8 @@ def run_insurance_source_review(engine: Engine, tag: str, tenant_ids: list[str])
                 with engine.begin() as connection:
                     set_tenant_context(connection, tenant_id)
                     decision = resolve(connection, tenant_id=tenant_id, journey_id=journey_id)
+                    documents = _documents_say(connection, tenant_id=tenant_id, journey_id=journey_id) \
+                        if decision["decidedBy"] == "PC" else None
                     if commit:
                         sync_insurance_source_task(connection, tenant_id=tenant_id, journey_id=journey_id)
             except Exception:
@@ -48,9 +70,17 @@ def run_insurance_source_review(engine: Engine, tag: str, tenant_ids: list[str])
                 continue
             key = f"{decision['decidedBy']}_{decision['source']}".lower()
             counts[key] = counts.get(key, 0) + 1
+            pc = "INHOUSE" if decision["source"] == "INHOUSE" else "SELF"
+            if documents is not None and documents != pc:
+                counts["pc_against_documents"] = counts.get("pc_against_documents", 0) + 1
+                tenant_report = report["tenants"].setdefault(tenant_id, {})
+                tenant_report.setdefault("pcAgainstDocuments", []).append(
+                    {"journey": journey["journey_reference"], "pc": pc, "documents": documents})
             if decision["decidedBy"] in ("DOCUMENT", "UNCONFIRMED"):
                 logger.info("insurance_source_review_item", tag=tag, tenant_id=tenant_id, commit=commit,
                             journey=journey["journey_reference"], decided_by=decision["decidedBy"],
                             source=decision["source"], basis=decision["basis"])
         logger.info("insurance_source_review_finished", tag=tag, tenant_id=tenant_id, commit=commit,
                     journeys=len(journeys), **dict(sorted(counts.items())))
+        report["tenants"].setdefault(tenant_id, {}).update({"journeys": len(journeys), **dict(sorted(counts.items()))})
+    return report
