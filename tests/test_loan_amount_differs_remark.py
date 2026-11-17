@@ -51,7 +51,8 @@ def test_a_written_slash_dash_read_as_one_is_found() -> None:
 
     fields = {"discount_details": '[{"label": "Scheme Discount", "amount": 30001}, {"label": "Exchange", "amount": 20001}]',
               "line_items": [{"particulars_raw": "Insurance amount", "debit_amount": 34993},
-                             {"particulars_raw": "Registration", "debit_amount": 61001}]}
+                             {"particulars_raw": "MR NO 5", "credit_amount": 61001},
+                             {"particulars_raw": "Vehicle cost", "debit_amount": 999001}]}
     assert slash_dash_amounts(fields) == [Decimal(30001), Decimal(20001), Decimal(61001)]
     assert slash_dash_amounts({"discount_details": [{"amount": 30000}], "line_items": []}) == []
 
@@ -70,3 +71,5 @@ def test_the_slash_dash_patterns_pick_001_amounts_only() -> None:
     assert re.search(_SLASH_DASH_IN_ROWS, '[{"label": "Scheme", "amount": 30001}]')
     assert re.search(_SLASH_DASH_IN_ROWS, '[{"debit_amount": 1029901, "x": 1}]') is None
     assert re.search(_SLASH_DASH_IN_ROWS, '[{"credit_amount": "61001"}]')
+    # a charge (vehicle cost) ending in 001 is the price book's own, not a misread
+    assert re.search(_SLASH_DASH_IN_ROWS, '[{"debit_amount": 999001}]') is None
