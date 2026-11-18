@@ -829,6 +829,14 @@ def upload_dms_dump(
          for n, row in enumerate(parsed.rows, start=1)],
     )
     counts = match_dump(connection, tenant_id=tenant_id, dump_id=dump_id)
+    # The PCs are told at once to mark what was intimated to them; the report is generated
+    # later, from the Reports section (product owner 2026-11-18).
+    from audit_core.uc03_p2_dms_intimations import publish_dump_alert
+
+    dealer_name = next(d["dealerName"] for d in _dealers(connection, tenant_id, principal.subject, admin)
+                       if d["dealerId"] == str(dealerId))
+    publish_dump_alert(connection, tenant_id=tenant_id, dealer_id=str(dealerId), dealer_name=dealer_name,
+                       kind=parsed.kind, business_date=business_date)
     logger.info("dms_dump_uploaded", tenant_id=tenant_id, dump_id=str(dump_id), kind=parsed.kind,
                 rows=len(parsed.rows), **{k.lower(): v for k, v in counts.items()})
     return _read_dump(connection, tenant_id, dump_id)

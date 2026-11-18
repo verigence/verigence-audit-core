@@ -90,12 +90,12 @@ router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-dms-o
 # Who changes the DMS location map: the Team Lead (and an administrator).
 MAP_ROLES = ("TL",)
 
-DMS_KEYS = ("bookingDms", "bookingSynced", "bookingNotInVerigence", "bookingCancelled",
-            "deliveryDump", "deliverySynced", "deliveryNotUploaded", "deliveryNotInVerigence")
+DMS_KEYS = ("bookingDms", "bookingSynced", "bookingNotInVerigence", "bookingCancelled", "bookingIntimated",
+            "bookingNotIntimated", "deliveryDump", "deliverySynced", "deliveryNotUploaded", "deliveryNotInVerigence",
+            "deliveryIntimated", "deliveryNotIntimated")
 VERIGENCE_KEYS = ("bookingInVerigence", "bookingDatedByUpload", "deliveryInVerigence", "deliveryDatedWithoutGatePass",
                   "deliveryNotInDms", "inscope", "outscope", "otherDealType",
-                  "dealTypePending", "gateRegister", "notIntimated", "pendingWithPc", "registersMissed",
-                  "countsPending")
+                  "dealTypePending", "gateRegister", "registersMissed", "countsPending")
 
 
 # --------------------------------------------------------------------------- the map
@@ -180,7 +180,8 @@ def _latest_dumps(connection: Connection, tenant_id: str, dealer_ids: list[str],
 def dms_figures(rows: list[dict[str, Any]], outlets: list[dict[str, Any]]
                 ) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
     """Per DMS location (anchor outlet id) and per unmapped location name: the dump
-    rows' figures. ``rows``: dump_kind, outlet_label, outcome."""
+    rows' figures. ``rows``: dump_kind, outlet_label, outcome, intimated (a PC's mark on a row
+    Verigence does not hold: uc03_p2_dms_intimations, 2026-11-18)."""
     located: dict[str, dict[str, int]] = defaultdict(lambda: _zero(DMS_KEYS))
     unmapped: dict[str, dict[str, int]] = defaultdict(lambda: _zero(DMS_KEYS))
     cache: dict[str, str | None] = {}
@@ -198,11 +199,15 @@ def dms_figures(rows: list[dict[str, Any]], outlets: list[dict[str, Any]]
             figures["bookingDms"] += 1
             figures["bookingSynced"] += outcome == MATCHED
             figures["bookingNotInVerigence"] += outcome == MISSING
+            if outcome != MATCHED:
+                figures["bookingIntimated" if r.get("intimated") else "bookingNotIntimated"] += 1
         else:
             figures["deliveryDump"] += 1
             figures["deliverySynced"] += outcome == MATCHED
             figures["deliveryNotUploaded"] += outcome == NOT_IN_TOOL
             figures["deliveryNotInVerigence"] += outcome == MISSING
+            if outcome != MATCHED:
+                figures["deliveryIntimated" if r.get("intimated") else "deliveryNotIntimated"] += 1
     return dict(located), dict(unmapped)
 
 
@@ -230,10 +235,15 @@ _BOOKINGS_SQL = """
 
 def verigence_figures(connection: Connection, tenant_id: str, outlets: list[dict[str, Any]], first: date,
                       booking_to: date, delivery_to: date, today: date,
-                      dump_journeys: set[str] | None = None) -> dict[str, dict[str, int]]:
+                      dump_journeys: set[str] | None = None,
+                      missed: dict[str, list[date]] | None = None) -> dict[str, dict[str, int]]:
     """Per Verigence outlet: bookings from the 1st to ``booking_to``; deliveries in the tool
     (with Deal Type) and the gate register from the 1st to ``delivery_to``. ``dump_journeys``:
-    the Journeys the dealership's delivery dump found (None: no dump on file)."""
+    the Journeys the dealership's delivery dump found (None: no dump on file). ``missed``, when
+    given, gets each outlet's days with no gate register.
+
+    What was intimated to the PC is no longer asked at the gate register (product owner
+    2026-11-18): it comes from the PCs' marks on the dumps (dms_figures)."""
     from audit_core.uc03_p2_delivery_dates import GATE_PASS, deliveries, in_period
     from audit_core.uc03_p2_my_work import gate_register
 
@@ -278,14 +288,15 @@ def verigence_figures(connection: Connection, tenant_id: str, outlets: list[dict
         figures = out[oid]
         for d in days:
             if d["gatePassId"] is None:
-                figures["registersMissed"] += d["status"] == "MISSED"
+                if d["status"] == "MISSED":
+                    figures["registersMissed"] += 1
+                    if missed is not None:
+                        missed.setdefault(oid, []).append(date.fromisoformat(d["date"]))
                 continue
             if d["status"] == "COUNTS_PENDING":
                 figures["countsPending"] += 1
                 continue
             figures["gateRegister"] += int(d["total"] or 0)
-            figures["notIntimated"] += int(d["notIntimated"] or 0)
-            figures["pendingWithPc"] += int(d["pendingWithPc"] or 0)
     return out
 
 
@@ -303,6 +314,117 @@ def _gaps(figures: dict[str, int]) -> dict[str, int]:
     return out
 
 
+# --------------------------------------------------------------------------- the statement
+
+def _pcs_by_outlet(connection: Connection, tenant_id: str, outlet_ids: list[str]) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = defaultdict(set)
+    for r in connection.execute(
+        text("""
+            SELECT CAST(outlet_id AS text) AS outlet_id, security_actor_id FROM auditcore.business_assignments
+            WHERE tenant_id = :t AND assignment_status = 'ACTIVE' AND CAST(outlet_id AS text) = ANY(:ids)
+              AND upper(business_role_code) = 'PC'
+              AND effective_from <= now() AND (effective_to IS NULL OR effective_to >= now())
+        """),
+        {"t": tenant_id, "ids": outlet_ids},
+    ).mappings():
+        out[r["outlet_id"]].add(str(r["security_actor_id"]))
+    return out
+
+
+def _day_status(connection: Connection, actors: set[str], first: date, last: date) -> dict[tuple[str, date], str]:
+    """(person, day) -> PRESENT / LEAVE, from myHR (auditcore.hr_pc_day_status)."""
+    if not actors or last < first:
+        return {}
+    out: dict[tuple[str, date], str] = {}
+    for r in connection.execute(
+        text("SELECT security_user_id, day, status FROM auditcore.hr_pc_day_status "
+             "WHERE security_user_id = ANY(:a) AND day BETWEEN :f AND :l"),
+        {"a": sorted(actors), "f": first, "l": last},
+    ).mappings():
+        key = (str(r["security_user_id"]), r["day"])
+        if out.get(key) != "PRESENT":  # a check-in outweighs a leave the same day
+            out[key] = r["status"]
+    return out
+
+
+def dealer_statement(connection: Connection, tenant_id: str, outlets: list[dict[str, Any]],
+                     missed: dict[str, list[date]], first: date, to: date, today: date) -> dict[str, Any]:
+    """The dealership's simple statement (product owner 2026-11-18): per outlet, the days
+    its gate register is missing -- onsite and satellite apart -- and the outlets whose PC
+    was not available (no PC mapped; or no PC of the outlet checked in on a register day,
+    from myHR attendance and approved leave; today is not judged)."""
+    from audit_core.uc03_p2_my_work import gate_register_days
+
+    by_id = {str(o["outlet_id"]): o for o in outlets}
+    pcs = _pcs_by_outlet(connection, tenant_id, list(by_id))
+    days = [d for d in gate_register_days(first, to) if d < today]
+    status = _day_status(connection, set().union(*pcs.values()) if pcs else set(),
+                         days[0] if days else first, days[-1] if days else first)
+    absent: dict[str, list[tuple[date, bool]]] = {}
+    for oid, people in pcs.items():
+        for d in days:
+            states = [status.get((p, d)) for p in people]
+            if "PRESENT" not in states:
+                absent.setdefault(oid, []).append((d, "LEAVE" in states))
+    register: dict[str, list[dict[str, Any]]] = {"ONSITE": [], "SATELLITE": []}
+    for oid in sorted(missed, key=lambda i: short_name(by_id[i]["outlet_name"]).lower()):
+        dates = sorted(missed[oid])
+        if not dates:
+            continue
+        away = {d for d, _ in absent.get(oid, [])}
+        cls = "SATELLITE" if by_id[oid].get("outlet_classification") == "SATELLITE" else "ONSITE"
+        register[cls].append({"outletId": oid, "outlet": short_name(by_id[oid]["outlet_name"]), "days": len(dates),
+                              "dates": [d.isoformat() for d in dates],
+                              "pcAbsentDays": sum(d in away for d in dates)})
+    unavailable = []
+    for oid in sorted(by_id, key=lambda i: short_name(by_id[i]["outlet_name"]).lower()):
+        name = short_name(by_id[oid]["outlet_name"])
+        cls = by_id[oid].get("outlet_classification") or "ONSITE"
+        if oid not in pcs:
+            unavailable.append({"outletId": oid, "outlet": name, "classification": cls, "noPcMapped": True,
+                                "days": 0, "dates": [], "leaveDays": 0})
+        elif absent.get(oid):
+            unavailable.append({"outletId": oid, "outlet": name, "classification": cls, "noPcMapped": False,
+                                "days": len(absent[oid]), "dates": [d.isoformat() for d, _ in absent[oid]],
+                                "leaveDays": sum(leave for _, leave in absent[oid])})
+    return {"from": first.isoformat(), "to": to.isoformat(), "registerMissing": register,
+            "pcNotAvailable": unavailable}
+
+
+def _dates_text(dates: list[str]) -> str:
+    """['2026-11-04', '2026-11-09'] -> '4, 9 Nov'."""
+    by_month: dict[str, list[str]] = defaultdict(list)
+    for value in dates:
+        d = date.fromisoformat(value)
+        by_month[f"{d:%b}"].append(str(d.day))
+    return "; ".join(f"{', '.join(days)} {month}" for month, days in by_month.items())
+
+
+def statement_lines(dealers: list[dict[str, Any]]) -> list[str]:
+    """The statement as lines, an asterisk to each."""
+    lines: list[str] = []
+    for dealer in dealers:
+        st = dealer.get("statement")
+        if not st:
+            continue
+        lines.append(dealer["dealerName"])
+        for cls, label in (("ONSITE", "Onsite"), ("SATELLITE", "Satellite")):
+            items = st["registerMissing"][cls]
+            text_ = "; ".join(f"{i['outlet']} {i['days']} day{'s' if i['days'] != 1 else ''} "
+                              f"({_dates_text(i['dates'])})"
+                              + (f", PC absent on {i['pcAbsentDays']}" if i["pcAbsentDays"] else "")
+                              for i in items) or "none"
+            lines.append(f"* {label} - gate register missing: {text_}")
+        items = st["pcNotAvailable"]
+        text_ = "; ".join(
+            f"{i['outlet']} (no PC mapped)" if i["noPcMapped"] else
+            f"{i['outlet']} {i['days']} day{'s' if i['days'] != 1 else ''} ({_dates_text(i['dates'])})"
+            + (f", {i['leaveDays']} on leave" if i["leaveDays"] else "")
+            for i in items) or "none"
+        lines.append(f"* PC not available (outlets impacted): {text_}")
+    return lines
+
+
 def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list[dict[str, Any]], day: date,
                         today: date) -> dict[str, Any]:
     first = day.replace(day=1)
@@ -313,13 +435,20 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
     if dump_ids:
         for r in connection.execute(
             text("""
-                SELECT dealer_id, dump_kind, outlet_label, outcome, CAST(journey_id AS text) AS journey_id
+                SELECT dealer_id, dump_kind, outlet_label, outcome, CAST(journey_id AS text) AS journey_id,
+                       dms_booking_number, booking_number, chassis, invoice_number, customer_name, mobile, event_date
                 FROM auditcore.p2_dms_dump_rows
                 WHERE tenant_id = :t AND CAST(dump_id AS text) = ANY(:ids) AND outcome <> 'OUT_OF_PERIOD'
             """),
             {"t": tenant_id, "ids": dump_ids},
         ).mappings():
             rows_by_dealer[str(r["dealer_id"])].append(dict(r))
+    from audit_core.uc03_p2_dms_intimations import live_marks, row_key
+
+    marks = live_marks(connection, tenant_id, dealer_ids) if dump_ids else {}
+    for did, rows in rows_by_dealer.items():
+        for r in rows:
+            r["intimated"] = (did, r["dump_kind"], row_key(r["dump_kind"], r)) in marks
     project = {**_zero(DMS_KEYS), **_zero(VERIGENCE_KEYS)}
     out_dealers = []
     for dealer in dealers:
@@ -338,8 +467,9 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
                        if delivery else day)
         dump_journeys = ({r["journey_id"] for r in rows_by_dealer.get(did, [])
                           if r["dump_kind"] == DELIVERY and r["journey_id"]} if delivery else None)
+        missed: dict[str, list[date]] = {}
         verigence = verigence_figures(connection, tenant_id, outlets, first, booking_to, delivery_to, today,
-                                      dump_journeys)
+                                      dump_journeys, missed)
         members: dict[str, list[str]] = defaultdict(list)
         for o in outlets:
             anchor = str(o["dms_outlet_id"])
@@ -370,10 +500,12 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
             "deliveryDumpDate": delivery["business_date"].isoformat() if delivery else None,
             "bookingsTo": booking_to.isoformat(), "deliveriesTo": delivery_to.isoformat(),
             "locations": locations, "unmapped": unmapped_rows, "figures": _gaps(total),
+            "statement": dealer_statement(connection, tenant_id, outlets, missed, first, min(delivery_to, today), today),
         })
         _add(project, total)
     return {"date": day.isoformat(), "month": first.strftime("%Y-%m"), "today": today.isoformat(),
-            "dealers": out_dealers, "figures": _gaps(project)}
+            "dealers": out_dealers, "figures": _gaps(project),
+            "statementLines": statement_lines(out_dealers)}
 
 
 # --------------------------------------------------------------------------- endpoints
@@ -412,14 +544,16 @@ EXCEL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("of which no booking form date", "bookingDatedByUpload", "Booking"),
     ("Synced with DMS", "bookingSynced", "Booking"),
     ("Not in Verigence", "bookingNotInVerigence", "Booking"),
+    ("Intimated to PC, not in Verigence", "bookingIntimated", "Booking"),
+    ("Not intimated to PC", "bookingNotIntimated", "Booking"),
     ("DMS less Verigence", "bookingGap", "Booking"),
     ("As per gate out register", "gateRegister", "Total delivery"),
     ("As per delivery dump", "deliveryDump", "Total delivery"),
     ("In Verigence", "deliveryInVerigence", "Total delivery"),
     ("of which dated without gate pass", "deliveryDatedWithoutGatePass", "Total delivery"),
     ("Synced with dump", "deliverySynced", "Total delivery"),
-    ("Pending with PC", "pendingWithPc", "Total delivery"),
-    ("Not intimated (client)", "notIntimated", "Total delivery"),
+    ("Intimated to PC, not uploaded", "deliveryIntimated", "Total delivery"),
+    ("Not intimated to PC", "deliveryNotIntimated", "Total delivery"),
     ("Delivery not uploaded", "deliveryNotUploaded", "Total delivery"),
     ("Not in Verigence", "deliveryNotInVerigence", "Total delivery"),
     ("In Verigence, not in dump", "deliveryNotInDms", "Total delivery"),
@@ -503,6 +637,15 @@ def build_outlet_report_excel(report: dict[str, Any]) -> bytes:
     for col in range(start, start + len(EXCEL_COLUMNS)):
         ws.column_dimensions[get_column_letter(col)].width = 12
     ws.row_dimensions[2].height = 45
+    if report.get("statementLines"):
+        st = wb.create_sheet("Statement")
+        st.append([f"Statement, {day:%d-%b-%y} (month to date)"])
+        st["A1"].font = Font(bold=True)
+        for line in report["statementLines"]:
+            st.append([line])
+            if not line.startswith("*"):
+                st.cell(row=st.max_row, column=1).font = Font(bold=True)
+        st.column_dimensions["A"].width = 160
     notes = wb.create_sheet("How it is counted")
     for line in (
         ("Month to date. DMS figures come from each dealership's latest dump dated in the month up to the report's date; the "
@@ -514,7 +657,10 @@ def build_outlet_report_excel(report: dict[str, Any]) -> bytes:
          "figures and the location's row compares the DMS with their total."),
         "Bookings in Verigence: journeys whose booking date (booking form, else the day the booking documents were uploaded) is in the period.",
         "Deliveries in Verigence: delivery journeys with the vehicle gate pass dated in the period (the gate register's 'in tool').",
-        "Gate register: the PC's daily register. Pending with PC = intimated but not in Verigence; not intimated = file not handed by the dealership.",
+        ("Intimated to PC: a dump row Verigence does not hold that the PC marked as intimated to them (Booking / Delivery "
+         "Intimation tab) -- pending with the PC. Not intimated to PC: no PC marked it -- pending with the dealership. "
+         "A row in Verigence needs no mark. Nothing here is asked at the gate register any more."),
+        "Gate register: the PC's daily register, its count of deliveries; registers missed are listed on the Statement sheet.",
         "Synced = a DMS row found in Verigence. Not in Verigence = no journey at all. Delivery not uploaded = journey found, delivery file not uploaded.",
         "Cancelled bookings in the DMS are left out of 'As per DMS'.",
     ):
@@ -654,5 +800,5 @@ def put_outlet_map(
     return {"outletId": str(outlet_id), "dmsOutletId": under, "labels": labels, "catchAll": catch_all}
 
 
-__all__ = ["build_outlet_report", "build_outlet_report_excel", "dms_figures", "label_key", "resolve_location",
-           "resolve_outlet", "router", "short_name"]
+__all__ = ["build_outlet_report", "build_outlet_report_excel", "dealer_statement", "dms_figures", "label_key",
+           "resolve_location", "resolve_outlet", "router", "short_name", "statement_lines"]
