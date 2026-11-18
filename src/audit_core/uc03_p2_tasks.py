@@ -47,6 +47,10 @@ CLOSE_TASK = "CLOSE_TASK"
 COST_SHEET_DIFFERENCE_TASK = "COST_SHEET_NDC_DIFFERENCE"
 # Copies of the NDC or cost sheet that differ: information too (2026-11-02).
 COPIES_DIFFERENCE_TASK = "NDC_COPIES_DIFFERENCE"
+# A FASTag row on the NDC above Rs 600 (2026-11-18): the PC checks the reading and closes it.
+FASTAG_VERIFY_TASK = "NDC_FASTAG_ROW_VERIFY"
+# A Deal line far from its standard (2026-11-18, uc03_deal_reading_check): checked by hand.
+DEAL_LINE_VERIFY_TASK = "DEAL_LINE_VERIFY"
 # The Team Lead's information task for a Reviewer's corrections (2026-11-04,
 # uc03_reviewer_corrections_task) closes the same way, by the Team Lead.
 REVIEWER_CORRECTIONS_TASK = "REVIEWER_CORRECTIONS_INFO"
@@ -62,6 +66,7 @@ CORRECTIONS_RECHECK_TASK = "CORRECTIONS_RECHECK"
 # The PC's answer to "Is this a BH registration?" (2026-11-15, uc03_registration_closures).
 BH_QUESTION_TASK = "REGISTRATION_BH_CONFIRM"
 CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK, COST_SHEET_DIFFERENCE_TASK, COPIES_DIFFERENCE_TASK,
+                              FASTAG_VERIFY_TASK, DEAL_LINE_VERIFY_TASK,
                               REVIEWER_CORRECTIONS_TASK, KEY_FIGURES_TASK, ADDS_UP_TASK,
                               SCRAPPAGE_REGISTRATION_TASK, CORRECTIONS_RECHECK_TASK, BH_QUESTION_TASK})
 # "Upload the ..." tasks (a conditional document, or the booking docket) close

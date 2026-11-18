@@ -86,3 +86,9 @@ def test_the_same_rupees_read_as_handling_charges_on_the_ndc_are_not_a_second_fa
                tally=_tally_fastag())
     view = _deal(journey)
     assert _row(view, "fastag_amount")["current"] is None and view["fastagNotOnNdc"] is None
+
+
+def test_an_invoiced_fastag_above_600_is_not_taken(journey) -> None:
+    _statement(journey, _without(UTKAL, "Fastag charges"), tally=_tally_fastag(2021))
+    view = _deal(journey)
+    assert view["fastagNotOnNdc"] is None and _row(view, "fastag_amount")["current"] is None

@@ -191,9 +191,10 @@ WRITTEN_ON_ANOTHER_ROW = [
 
 @pytest.mark.parametrize(("label", "key"), WRITTEN_ON_ANOTHER_ROW)
 def test_a_charge_written_on_another_row_is_the_charge_written(label: str, key: str) -> None:
+    amount = 600 if key == "fastag_amount" else 12345  # a FASTag costs at most Rs 600 (2026-11-18)
     read = read_statement([{"particulars_raw": "Ex Showroom", "debit_amount": 1000000},
-                           {"particulars_raw": label, "debit_amount": 12345}])
-    assert read.components == {"ex_showroom_price": D(1000000), key: D(12345)}
+                           {"particulars_raw": label, "debit_amount": amount}])
+    assert read.components == {"ex_showroom_price": D(1000000), key: D(amount)}
     assert read.discounts == {} and read.unmapped == [] and read.conflicts == []
 
 
@@ -1356,3 +1357,22 @@ def test_a_charge_the_ndc_bills_reaches_its_deal_line(label: str, amount: int, k
     read = read_statement([{"particulars_raw": "Ex Showroom", "debit_amount": 1000000},
                            {"particulars_raw": label, "debit_amount": amount}])
     assert read.components == {"ex_showroom_price": D(1000000), key: D(amount)} and read.unmapped == []
+
+
+# ── a FASTag costs at most Rs 600 (product owner 2026-11-18) ────────────────
+@pytest.mark.parametrize(("label", "amount"), [
+    ("FAST TAG", 24143),        # ADI-RD-261102-012: the certificate of deposit on the FASTag row
+    ("FAST TAG", 1001494),      # ADI-RD-261113-046: misread
+    ("FAST-TAG", 63977),        # ADI-RD-261116-005: rows shifted
+])
+def test_a_fastag_above_600_is_an_other_charge_to_be_checked(label: str, amount: int) -> None:
+    read = read_statement([{"particulars_raw": "Ex Showroom", "debit_amount": 1000000},
+                           {"particulars_raw": label, "debit_amount": amount}])
+    assert read.components == {"ex_showroom_price": D(1000000), "other_charges": D(amount)}
+    assert [(v["label"], v["amount"]) for v in read.verify] == [(label.upper(), D(amount))]
+
+
+def test_a_fastag_of_600_or_less_is_the_fastag() -> None:
+    read = read_statement([{"particulars_raw": "Ex Showroom", "debit_amount": 1000000},
+                           {"particulars_raw": "Fastag charges", "debit_amount": 600}])
+    assert read.components["fastag_amount"] == D(600) and read.verify == []
