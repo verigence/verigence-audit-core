@@ -180,8 +180,8 @@ def test_a_dump_is_matched_marked_reported_and_shown_on_the_calendar(journey) ->
         {"booking_number": "B-13455387", "dms_booking_number": "OTF27A090950", "customer_name": "P2 Customer"},
         {"booking_number": "B-99999999", "dms_booking_number": "OTF27A000001", "customer_name": "Someone Else"},
         {"booking_number": "B-88888888", "customer_name": "Gone", "stage": "Cancellation"},
-        # dated on the upload day: outside the days compared, not counted (2026-11-18)
-        {"booking_number": "B-77777777", "customer_name": "Today Only", "days_back": 0},
+        # dated after the upload day: outside the days compared, not counted (2026-11-18)
+        {"booking_number": "B-77777777", "customer_name": "Tomorrow Only", "days_back": -1},
     ])
     delivery = _store(journey, m.DELIVERY, [{"chassis": "T2K61232", "customer_name": "P2 Customer"}])
     with journey.engine.begin() as connection:
@@ -260,10 +260,10 @@ def test_a_booking_row_matches_on_the_name_and_the_booking_date() -> None:
     assert m.match_row(index, m.BOOKING, {**row, "event_date": date(2026, 10, 10)}) == (None, None)
 
 
-def test_a_dump_is_compared_from_the_first_to_the_day_before_its_upload() -> None:
-    """2026-11-18: uploaded on the 18th, compared for the 1st to the 17th."""
+def test_a_dump_is_compared_from_the_first_to_its_upload_day() -> None:
+    """2026-11-18: uploaded on the 18th, compared for the 1st to the 18th."""
     from datetime import date
 
-    assert m.dump_window(date(2026, 11, 1), date(2026, 11, 18)) == (date(2026, 11, 1), date(2026, 11, 17))
+    assert m.dump_window(date(2026, 11, 1), date(2026, 11, 18)) == (date(2026, 11, 1), date(2026, 11, 18))
     # uploaded on 1 Dec with November's rows: the whole of November
     assert m.dump_window(date(2026, 11, 1), date(2026, 12, 1)) == (date(2026, 11, 1), date(2026, 11, 30))

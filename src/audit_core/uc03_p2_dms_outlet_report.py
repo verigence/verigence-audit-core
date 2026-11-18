@@ -330,7 +330,7 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
         booking, delivery = dumps.get((did, BOOKING)), dumps.get((did, DELIVERY))
         # Like with like: Verigence is counted up to the last day the dealership's dump covers
         # (a dump of the 5th carries the 1st to the 4th), else up to the report's day.
-        # The days each dump is compared for: the 1st to the day before its upload (2026-11-18).
+        # The days each dump is compared for: the 1st to its upload day (2026-11-18).
         from audit_core.uc03_p2_dms_dumps import dump_window
 
         booking_to = max(first, dump_window(booking["period_month"], booking["business_date"])[1]) if booking else day

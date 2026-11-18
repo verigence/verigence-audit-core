@@ -1,5 +1,5 @@
 """A DMS dump row dated outside the days its dump is compared for (product owner,
-2026-11-18: a dump uploaded on the 18th is compared for the 1st to the 17th) is kept
+2026-11-18: a dump uploaded on the 18th is compared for the 1st to the 18th) is kept
 as OUT_OF_PERIOD -- in the file, not counted, not reported.
 """
 from __future__ import annotations

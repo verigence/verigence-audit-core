@@ -656,11 +656,10 @@ OUT_OF_PERIOD = "OUT_OF_PERIOD"
 
 
 def dump_window(period_month: date, business_date: date) -> tuple[date, date]:
-    """The days a dump is compared for (product owner 2026-11-18: "if i upload today which 18,
-    then the report shall be from 1-17"): the 1st of its month to the day before its upload
-    (the upload day is not complete in the DMS yet), within the month."""
+    """The days a dump is compared for (product owner 2026-11-18: "till the day of upload from
+    the start of the month"): the 1st of its month to its upload day, within the month."""
     month_end = _next_month(period_month) - timedelta(days=1)
-    return period_month, min(business_date - timedelta(days=1), month_end)
+    return period_month, min(business_date, month_end)
 
 
 def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict[str, int]:
