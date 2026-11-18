@@ -55,14 +55,15 @@ def _deal_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     for line in concession_remarks(list((undercharged.details or {}).get("scrappageConcession") or [])):
         remarks.append(_remark("SCRAPPAGE_CONCESSION", "Scrappage concession on registration", line, "Deal"))
     seen: set[str] = set()
-    # FASTag not on the NDC (product owner 2026-11-18: "for fast tag there is
-    # no tally invoice... if it is not in NDC then put a comment in system
-    # remarks"): with an NDC read, a FASTag it does not charge is said so --
-    # whether or not the price master prices it -- with what the dealer's
-    # ledger posts for it, if anything; never added to the Deal.
+    # FASTag not on the NDC (product owner 2026-11-18: "if it is not in NDC
+    # then put a comment in system remarks"; "if NDC doesnt show fast tag and
+    # invoice has, then add to deal and audit summary and make remarks"): with
+    # an NDC read, a FASTag it does not charge is said so, whether or not the
+    # price master prices it.
     from audit_core.uc03_account_statement import ndc_charges
 
-    fastag = fastag_not_on_ndc(*ndc_charges(connection, tenant_id=tenant_id, journey_id=journey_id))
+    fastag = fastag_not_on_ndc(ndc_charges(connection, tenant_id=tenant_id, journey_id=journey_id)[0],
+                               facts.sheet.get("fastagNotOnNdc"))
     if fastag is not None:
         seen.add("FASTag")
         remarks.append(fastag)
@@ -79,20 +80,24 @@ def _deal_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     return remarks
 
 
-def fastag_not_on_ndc(ndc: dict[str, Decimal] | None, ledger: dict[str, Decimal]) -> dict[str, Any] | None:
-    """The remark for a FASTag the NDC does not charge (2026-11-18), with what
-    the dealer's ledger posts for one; None with no NDC read or a FASTag on it."""
+def fastag_not_on_ndc(ndc: dict[str, Decimal] | None, from_invoice: dict[str, Any] | None) -> dict[str, Any] | None:
+    """The remark for a FASTag the NDC does not charge (product owner 2026-11-18),
+    None with no NDC read or a FASTag on it. ``from_invoice`` is the Deal's
+    ``fastagNotOnNdc``: an invoice charges it, so the Deal took it from there and
+    the journey is a HIGH observation (uc03_observation_severity)."""
     from audit_core.uc03_p2_audit_rules import _rupees
 
+    if from_invoice:
+        return _remark(
+            "FASTAG_NOT_ON_NDC", "FASTag not on the NDC",
+            f"The NDC does not charge a FASTag, but the {from_invoice['source']} charges "
+            f"{_rupees(Decimal(str(from_invoice['amount'])))} for one: it is taken into the Deal and the Audit "
+            "Summary from there, and the journey is marked a HIGH observation.", "NDC")
     if ndc is None or (ndc.get("fastag_amount") or Decimal(0)) > 0:
         return None
-    posted = ledger.get("fastag")
-    return _remark(
-        "FASTAG_NOT_ON_NDC", "FASTag not on the NDC",
-        "The NDC does not charge a FASTag"
-        + (f"; the dealer's ledger posts {_rupees(posted)} for one, not counted on the Deal (the NDC prices the "
-           "deal)." if posted else ": the customer did not take it from the dealership, so it is not counted as "
-           "an undercharge."), "NDC")
+    return _remark("FASTAG_NOT_ON_NDC", "FASTag not on the NDC",
+                   "The NDC does not charge a FASTag and no invoice does: the customer did not take it from the "
+                   "dealership, so it is not counted as an undercharge.", "NDC")
 
 
 def _bh_remark(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
@@ -197,9 +202,26 @@ def _loan_amount_remarks(connection: Connection, *, tenant_id: str, journey_id: 
 _LOAN_TOLERANCE = Decimal(1)
 
 
+def _severity_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """The journey's observation severity when a Reviewer / Team Lead / Project
+    Manager set it over the system's (2026-11-18), with their reason, beside the
+    Reviewer's other remarks."""
+    from audit_core.uc03_observation_severity import journey_severity
+
+    state = journey_severity(connection, tenant_id=tenant_id, journey_id=journey_id)
+    override = state.get("override")
+    if not override:
+        return []
+    system = state.get("system")
+    return [_remark("OBSERVATION_SEVERITY_SET", f"Observation severity set to {override['severity'].title()}",
+                    f"Set over the system's {system.title() if system else 'none'}. Reason: {override['reason']}",
+                    "Observation severity", at=override.get("at"), by=override.get("role"))]
+
+
 def system_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     remarks = [
         *_deal_remarks(connection, tenant_id=tenant_id, journey_id=journey_id),
+        *_severity_remarks(connection, tenant_id=tenant_id, journey_id=journey_id),
         *_bh_remark(connection, tenant_id=tenant_id, journey_id=journey_id),
         *_closure_remarks(connection, tenant_id=tenant_id, journey_id=journey_id),
         *_loan_remarks(connection, tenant_id=tenant_id, journey_id=journey_id),

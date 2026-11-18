@@ -129,6 +129,9 @@ from audit_core.uc03_nightly_reprocessing_reports import (
 from audit_core.uc03_not_mandatory_claims import (
     router as uc03_not_mandatory_claims_router,
 )
+from audit_core.uc03_observation_severity import (
+    router as uc03_observation_severity_router,
+)
 from audit_core.uc03_p2_access_locations import (
     admin_router as uc03_p2_access_locations_admin_router,
 )
@@ -387,6 +390,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_insurance_dumps_router)
     application.include_router(uc03_p2_scheme_dumps_router)
     application.include_router(uc03_verified_bookings_router)
+    application.include_router(uc03_observation_severity_router)
     # before the statements router: /bank-statements/accounts is not a /bank-statements/{statement_id}
     application.include_router(uc03_p2_bank_register_router)
     application.include_router(uc03_p2_bank_statements_router)

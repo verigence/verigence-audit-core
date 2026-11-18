@@ -23,16 +23,17 @@ def test_the_ledgers_fastag_and_rsa_postings_are_read() -> None:
     assert ledger_postings([_TALLY]) == {"fastag": Decimal(600), "rsa": Decimal(2021)}
 
 
-def test_a_fastag_the_ndc_does_not_charge_is_a_remark_naming_the_ledgers_posting() -> None:
-    remark = fastag_not_on_ndc({"ex_showroom_price": Decimal(1399000)}, {"fastag": Decimal(600)})
-    assert remark["code"] == "FASTAG_NOT_ON_NDC" and "₹600" in remark["text"] and "not counted" in remark["text"]
+def test_a_fastag_an_invoice_charges_and_the_ndc_does_not_is_a_remark_that_it_was_taken_from_there() -> None:
+    remark = fastag_not_on_ndc({"ex_showroom_price": Decimal(1399000)},
+                               {"amount": "600", "source": "Tally invoice (customer ledger)"})
+    assert remark["code"] == "FASTAG_NOT_ON_NDC" and "₹600" in remark["text"] and "HIGH" in remark["text"]
 
 
-def test_a_fastag_neither_charged_nor_posted_is_a_remark_that_it_was_not_taken() -> None:
-    remark = fastag_not_on_ndc({"ex_showroom_price": Decimal(1399000)}, {})
+def test_a_fastag_neither_on_the_ndc_nor_invoiced_is_a_remark_that_it_was_not_taken() -> None:
+    remark = fastag_not_on_ndc({"ex_showroom_price": Decimal(1399000)}, None)
     assert "did not take it" in remark["text"]
 
 
 def test_a_fastag_on_the_ndc_or_no_ndc_read_is_no_remark() -> None:
-    assert fastag_not_on_ndc({"fastag_amount": Decimal(600)}, {"fastag": Decimal(600)}) is None
-    assert fastag_not_on_ndc(None, {"fastag": Decimal(600)}) is None
+    assert fastag_not_on_ndc({"fastag_amount": Decimal(600)}, None) is None
+    assert fastag_not_on_ndc(None, None) is None

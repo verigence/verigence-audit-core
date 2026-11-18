@@ -1816,6 +1816,9 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         for r in discount_rows if str(r.get("key") or "").startswith("SCRAPPAGE")
         and any((_dec(r.get(c)) or Decimal(0)) > 0 for c in ("billed", "current"))]
     scrappage_applied = scrappage_rule.apply_concession(all_rows, scrappage_facts, benefits=scrappage_benefits)
+    # FASTag the NDC does not charge but an invoice does (product owner 2026-11-18).
+    fastag_not_on_ndc = (_fastag_from_invoice(all_rows) if statement_policy and any(
+        s["source_document_type"] == _STATEMENT_COLUMN_TYPE for s in sources) else None)
 
     # "Current" is what the deal stands at now: the billed figure; before
     # any invoice, what the booking offered. Once an invoice is on file, a
@@ -1992,6 +1995,9 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         # RTO standard and the scrappage benefits given; None with no scrappage.
         "scrappage": scrappage_rule.deal_block(scrappage_facts, applied=scrappage_applied,
                                                benefits=scrappage_benefits),
+        # FASTag charged by an invoice and not on the NDC (2026-11-18): in the
+        # Deal from the invoice, a system remark and a HIGH observation.
+        "fastagNotOnNdc": fastag_not_on_ndc,
         # The invoices on file, each with what it bills and whether it is
         # the copy counted (retail and tax alike).
         "invoices": _invoice_entries(documents, selection),
@@ -2242,6 +2248,32 @@ def _standing_copies(
                 continue
         kept.append(s)
     return kept
+
+
+def _fastag_from_invoice(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """FASTag the NDC does not charge but an invoice does (product owner
+    2026-11-18: "if fasttag is not in NDC but in Tally Invoice ... those
+    conditional rules are only to be executed when NDC has been uploaded and
+    tally or any other invoice comes in ... add to deal and audit summary and
+    make remarks in system that NDC doesnt has fasttag and mark this as
+    transaction with observation level as high").
+
+    Called only with the NDC read. The FASTag line takes the invoices' figure
+    (a DMS / Tally invoice read for it), else what the Tally customer ledger
+    posts for it ("FAST TAG (SALES)" is the Tally sales invoice), as its charge.
+    The one exception to "the NDC alone prices the deal": no other line is
+    priced from an invoice or the ledger. Returns what it found, else None."""
+    row = next((r for r in rows if r["key"] == "fastag_amount" and not r.get("partOf")), None)
+    if row is None or (_dec(row.get("billed")) or Decimal(0)) > 0:
+        return None
+    for column, source in (("invoiced", "invoice"), ("ledger", "Tally invoice (customer ledger)")):
+        amount = _dec(row.get(column))
+        if amount is not None and amount > 0:
+            row["billed"], row["billedFrom"] = _money(amount), "invoice" if column == "invoiced" else "ledger"
+            row["flags"] = [*row["flags"], "FASTAG_NOT_ON_NDC"]
+            row["fastagNotOnNdc"] = {"amount": str(amount), "source": source}
+            return {"amount": str(amount), "source": source}
+    return None
 
 
 def _statement_policy_sources(
