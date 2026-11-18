@@ -10,6 +10,8 @@ from audit_core import mahindra_masters, role_mappings
 from audit_core.activity_settings import admin_router as activity_settings_admin_router
 from audit_core.config import load_settings
 from audit_core.contract_guards import install_contract_guards
+from audit_core.daily_duties_api import admin_router as daily_duties_admin_router
+from audit_core.daily_duties_api import router as daily_duties_router
 from audit_core.daily_operations_api import router as daily_operations_router
 from audit_core.data_archive_api import router as data_archive_router
 from audit_core.dealers import router as dealer_router
@@ -404,6 +406,8 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_missing_documents_router)
     application.include_router(task_manager_router)
     application.include_router(task_manager_admin_router)
+    application.include_router(daily_duties_router)
+    application.include_router(daily_duties_admin_router)
     application.include_router(uc03_p2_vehicle_photos_router)
     application.include_router(uc03_document_capture_v2_router)
     application.include_router(uc03_unified_document_capture_router)

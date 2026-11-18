@@ -39,6 +39,7 @@ _refuse_non_local_database()
 # of this shape must now call delete_tenant_data(engine, tenant_id) after
 # its own yield.
 _TENANT_DATA_DELETE_ORDER = (
+    "p2_duty_events", "p2_duty_reasons", "p2_duty_day_closes", "p2_duty_items", "p2_duties", "p2_duty_settings",
     "p2_scheme_journey_checks", "p2_scheme_dump_rows", "p2_scheme_dumps",
     "p2_verified_booking_checks", "p2_verified_bookings", "p2_observation_severity",
     "p2_journey_bank_status", "p2_bank_receipt_matches", "p2_bank_statement_txns", "p2_bank_statements",
