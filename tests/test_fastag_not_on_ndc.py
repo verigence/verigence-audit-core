@@ -92,3 +92,19 @@ def test_an_invoiced_fastag_above_600_is_not_taken(journey) -> None:
     _statement(journey, _without(UTKAL, "Fastag charges"), tally=_tally_fastag(2021))
     view = _deal(journey)
     assert view["fastagNotOnNdc"] is None and _row(view, "fastag_amount")["current"] is None
+
+
+def test_a_fastag_row_above_600_on_the_ndc_raises_the_verification_task(journey) -> None:
+    """ADI-RD-261102-012: the certificate of deposit, Rs 24,143, on the FASTag row."""
+    from sqlalchemy import text
+
+    _statement(journey, [*_without(UTKAL, "Fastag charges"), {"particulars_raw": "FAST TAG", "debit_amount": 24143}])
+    with journey.engine.begin() as c:
+        set_tenant_context(c, journey.tenant_id)
+        [task] = c.execute(text("SELECT task_type, severity, description FROM auditcore.p2_tasks "
+                                "WHERE tenant_id=:t AND task_type='NDC_FASTAG_ROW_VERIFY'"),
+                           {"t": journey.tenant_id}).mappings().all()
+    assert task["severity"] == "HIGH" and "Rs 24,143" in task["description"]
+    view = _deal(journey)
+    keys = {r["key"]: r for g in view["categories"] for r in g["components"]}
+    assert "fastag_amount" not in keys and D(keys["other_charges"]["current"]) >= D(24143)

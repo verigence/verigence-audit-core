@@ -1398,6 +1398,9 @@ def combine_statements(
     for read in in_use:
         out.unmapped.extend(read.unmapped)
         out.conflicts.extend(read.conflicts)
+        # Rows to check by hand (a FASTag row above Rs 600), once across copies.
+        out.verify.extend(v for v in read.verify
+                          if (v["label"], v["amount"]) not in {(w["label"], w["amount"]) for w in out.verify})
     old_vehicle = [r.old_vehicle_value for r in reads.values() if r.old_vehicle_value]
     for key in drop_old_vehicle_read_as_discount(out, old_vehicle):
         combined.figures.pop(("DISCOUNT", key), None)
