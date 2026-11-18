@@ -57,3 +57,17 @@ def test_the_alert_goes_once_nothing_is_left(journey):
     _sql(journey, "UPDATE auditcore.p2_document_queue SET retired_at_utc = now() WHERE tenant_id=:t AND journey_id=:j")
     assert _publish(journey)["withdrawn"] == 1
     assert _alerts(journey, str(journey.actor_id)) == []
+
+
+def test_the_alert_names_the_customer_of_each_booking(journey):
+    """Product owner 2026-11-18: the alert did not say which customer it was about."""
+    _sql(journey, "UPDATE auditcore.customers SET legal_name='Sanjay Kumar Sahoo' WHERE tenant_id=:t "
+                  "AND customer_id=(SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j)")
+    add_batch_pages(journey, [(None, "FAILED")])
+    _publish(journey)
+    [alert] = _alerts(journey, str(journey.actor_id))
+    assert alert.body.startswith("On Sanjay Kumar Sahoo (P2-J-")
+    [booking] = alert.payload["journeys"]
+    assert booking["customerName"] == "Sanjay Kumar Sahoo" and booking["journeyId"] == str(journey.journey_id)
+    assert booking["failed"] == 1 and booking["sinceUtc"]
+

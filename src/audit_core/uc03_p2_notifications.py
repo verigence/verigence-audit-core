@@ -25,6 +25,14 @@ that left nothing behind -- no pages, no booking -- and so no task either:
 
 Failed pages, stuck pages and documents to upload again are not here: each raises its task. The
 bell's count is the unread messages plus these.
+
+Product owner 2026-11-18: "notification tab is quite vague... it doesnt tell which customer/journey
+is the reported issue.. can you provide it clickable so that it can directly open up that task or
+journey 360". The message about a person's own stuck or failed pages (MY_DOCUMENTS_ATTENTION, one
+alert per person over all their bookings) is therefore shown as one message per booking, named by
+its customer and carrying the booking, so each opens that booking. And it is listed only while it
+stands: withdrawn (the pages were sent again or removed) it says something no longer true -- on
+18 Nov a PC's bell held three such messages of which two had been settled within a minute.
 """
 from __future__ import annotations
 
@@ -43,6 +51,8 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_p2_access import check_p2_permission
+from audit_core.uc03_p2_document_alerts import ALERT_KIND as DOCUMENTS_KIND
+from audit_core.uc03_p2_document_alerts import booking_messages
 from audit_core.uc03_p2_tenant_alerts import (
     _for_audience,
     is_silent_merge,
@@ -167,6 +177,14 @@ def seen_at(connection: Connection, *, tenant_id: str, actor_id: str) -> datetim
     ).scalar_one_or_none()
 
 
+def _at(value: Any, fallback: datetime) -> datetime:
+    try:
+        at = datetime.fromisoformat(str(value)) if value else fallback
+    except ValueError:
+        return fallback
+    return at if at.tzinfo else fallback
+
+
 def messages_for(connection: Connection, *, tenant_id: str, actor_id: str,
                  held: dict[str, set[str]] | None, seen: datetime | None) -> list[NotificationMessage]:
     rows = connection.execute(
@@ -177,16 +195,32 @@ def messages_for(connection: Connection, *, tenant_id: str, actor_id: str,
             FROM auditcore.p2_tenant_alerts
             WHERE tenant_id=:t AND alert_status='PUBLISHED'
               AND published_at_utc > now() - make_interval(days => :days)
+              -- one's own stuck or failed pages: only while it stands (2026-11-18)
+              AND (alert_kind <> :documents OR expires_at_utc > now())
             ORDER BY published_at_utc DESC, alert_id
             LIMIT :limit
             """
         ),
-        {"t": tenant_id, "days": HISTORY_DAYS, "limit": _MESSAGE_LIMIT * 4},
+        {"t": tenant_id, "days": HISTORY_DAYS, "limit": _MESSAGE_LIMIT * 4, "documents": DOCUMENTS_KIND},
     ).mappings().all()
     out: list[NotificationMessage] = []
     for row in rows:
         payload = dict(row["payload"] or {})
         if not _for_audience(payload, held, actor_id) or is_silent_merge(row["alert_kind"], payload):
+            continue
+        bookings = booking_messages(payload) if row["alert_kind"] == DOCUMENTS_KIND else []
+        for booking in bookings:
+            # One message per booking, named by its customer; new since the booking came up.
+            since = _at(booking["sinceUtc"], row["published_at_utc"])
+            out.append(NotificationMessage(
+                alertId=f"{row['alert_id']}:{booking['journeyId']}", kind=row["alert_kind"],
+                title=booking["title"], body=booking["body"], journeyId=booking["journeyId"],
+                journeyReference=booking["reference"],
+                payload={k: booking[k] for k in ("customerName", "stuck", "failed")},
+                publishedAtUtc=since, expiresAtUtc=row["expires_at_utc"],
+                unread=seen is None or since > seen,
+            ))
+        if bookings:
             continue
         out.append(NotificationMessage(
             alertId=str(row["alert_id"]), kind=row["alert_kind"], title=row["title"], body=row["body"],
@@ -195,9 +229,8 @@ def messages_for(connection: Connection, *, tenant_id: str, actor_id: str,
             publishedAtUtc=row["published_at_utc"], expiresAtUtc=row["expires_at_utc"],
             unread=seen is None or row["published_at_utc"] > seen,
         ))
-        if len(out) >= _MESSAGE_LIMIT:
-            break
-    return out
+    out.sort(key=lambda m: m.publishedAtUtc, reverse=True)
+    return out[:_MESSAGE_LIMIT]
 
 
 def upload_status(connection: Connection, *, tenant_id: str, actor_id: str) -> UploadStatus:
