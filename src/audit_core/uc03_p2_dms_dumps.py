@@ -1075,6 +1075,15 @@ def export_dms_dump_report(
     held = _access(connection, tenant_id, principal, client, _READ, READ_ROLES)
     first = day.replace(day=1) if day else _month(month, _today(connection, tenant_id))
     dealer_ids = [d["dealerId"] for d in _dealers(connection, tenant_id, principal.subject, "ADMIN" in held)]
+    if day is not None:
+        # Matched again first: Journeys uploaded (or read) since the dump came in are found,
+        # so the day's report is as of now, not as of its upload (2026-11-18).
+        for dump in connection.execute(
+            text("SELECT dump_id FROM auditcore.p2_dms_dumps WHERE tenant_id = :t AND status = 'ACTIVE' "
+                 "AND business_date = :d AND CAST(dealer_id AS text) = ANY(:ds)"),
+            {"t": tenant_id, "d": day, "ds": dealer_ids},
+        ).scalars().all():
+            match_dump(connection, tenant_id=tenant_id, dump_id=dump)
     data = build_report(connection, tenant_id=tenant_id, dealer_ids=dealer_ids, first=first, dump_id=dump_id,
                         day=day)
     name = f"DMS-Dump-Variance_{day:%Y-%m-%d}.xlsx" if day else f"DMS-Dump-Variance_{first:%Y-%m}.xlsx"
