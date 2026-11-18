@@ -135,3 +135,45 @@ def test_calendar_month_by_booking_date_and_delivery_date(uc03_create_booking_se
                         params={"from": "2026-08-15", "to": "2026-09-30", "breakdown": "true"}).json()
     assert ranged["counts"]["all"] == 3
     assert (ranged["counts"]["bookings_in_month"], ranged["counts"]["deliveries_in_month"]) == (3, 1)
+
+
+def test_the_list_carries_the_observation_severity_and_filters_by_it(uc03_create_booking_setup):  # noqa: F811
+    """Product owner 2026-11-18: a column observation severity (High / Medium / Low), a filter
+    for it; a Reviewer / TL / PM's setting stands over the system's."""
+    from audit_core.uc03_observation_severity import journey_severity, set_override
+
+    setup = uc03_create_booking_setup
+    client, base, ids = _seed(setup)
+    high, medium = ids[0], ids[1]
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        connection.execute(
+            text("INSERT INTO auditcore.p2_observation_severity (tenant_id, journey_id, system_severity, "
+                 "system_reasons) VALUES (:t, :j, 'HIGH', '[]'), (:t, :m, 'HIGH', '[]')"),
+            {"t": setup["tenant_id"], "j": high, "m": medium},
+        )
+        after = set_override(connection, tenant_id=setup["tenant_id"], journey_id=medium, severity="MEDIUM",
+                             reason="FASTag confirmed with the dealer", actor_id="tl-1", actor_name="TL One",
+                             role="TL")
+        assert (after["severity"], after["system"], after["override"]["by"]) == ("MEDIUM", "HIGH", "TL One")
+        back = set_override(connection, tenant_id=setup["tenant_id"], journey_id=medium, severity=None,
+                            reason="back to the system", actor_id="tl-1", actor_name="TL One", role="TL")
+        assert back["severity"] == "HIGH" and back["override"] is None
+        set_override(connection, tenant_id=setup["tenant_id"], journey_id=medium, severity="MEDIUM",
+                     reason="FASTag confirmed with the dealer", actor_id="tl-1", actor_name="TL One", role="TL")
+        assert journey_severity(connection, tenant_id=setup["tenant_id"], journey_id=ids[2])["severity"] is None
+
+    def listed(**params):
+        response = client.get(f"{base}/journeys", params={"view": "all", **params})
+        assert response.status_code == 200, response.text
+        return {item["journey_id"]: item for item in response.json()["items"]}
+
+    every = listed()
+    assert every[high]["observation_severity"] == "HIGH" and not every[high]["observation_severity_set_by_person"]
+    assert every[medium]["observation_severity"] == "MEDIUM" and every[medium]["observation_severity_set_by_person"]
+    assert every[ids[2]]["observation_severity"] is None
+    assert set(listed(severity="high")) == {high}
+    assert set(listed(severity="MEDIUM")) == {medium}
+    assert set(listed(severity="NONE")) == set(ids) - {high, medium}
+    counts = client.get(f"{base}/journeys:counts", params={"severity": "HIGH"})
+    assert counts.status_code == 200, counts.text

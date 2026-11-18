@@ -185,6 +185,12 @@ _SCOPE_WHERE_SQL = f"""j.tenant_id = :tenant_id
                    AND (NOT ({_BUSINESS_MONTH} OR {_RANGE}) OR {_in_period("bm.booking_date")}))
                OR (CAST(:kind AS varchar) = 'delivery' AND bm.delivery_date IS NOT NULL
                    AND (NOT ({_BUSINESS_MONTH} OR {_RANGE}) OR {_in_period("bm.delivery_date")})))
+          -- Observation severity (2026-11-18, uc03_observation_severity): the person's over the system's.
+          AND (CAST(:severity AS varchar) IS NULL
+               OR COALESCE((SELECT COALESCE(os.override_severity, os.system_severity)
+                            FROM auditcore.p2_observation_severity os
+                            WHERE os.tenant_id = j.tenant_id AND os.journey_id = j.journey_id), 'NONE')
+                  = CAST(:severity AS varchar))
           AND (
             :search = ''
             OR c.display_name ILIKE '%' || :search || '%'
@@ -465,6 +471,9 @@ def mobile_search_pattern(search: str | None) -> str | None:
     return f"%{digits}" if len(digits) == 4 else f"%{digits}%"
 
 
+from audit_core.uc03_observation_severity import severity_filter
+
+
 def scope_params(
     *,
     search: str | None,
@@ -474,6 +483,7 @@ def scope_params(
     kind: str | None = None,
     date_from: date | None = None,
     date_to: date | None = None,
+    severity: str | None = None,
 ) -> dict[str, Any]:
     """The search and filter parameters SCOPED_SQL / SUGGEST_SQL read, from the request's own.
     ``date_from`` / ``date_to`` (both, from not after to): the business-date range, in place of
@@ -489,6 +499,7 @@ def scope_params(
         "outlet_id": str(outlet_id) if outlet_id else None,
         "pc_actor_id": (pc_actor_id or "").strip() or None,
         "kind": journey_kind(kind),
+        "severity": severity_filter(severity),
     }
 
 

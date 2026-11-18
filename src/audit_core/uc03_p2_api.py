@@ -576,6 +576,7 @@ def list_p2_journeys(
     month_basis: str | None = None,
     dealer_id: UUID | None = None,
     kind: str | None = None,
+    severity: str | None = None,
     date_from: Annotated[date | None, Query(alias="from")] = None,
     date_to: Annotated[date | None, Query(alias="to")] = None,
 ) -> dict[str, Any]:
@@ -675,8 +676,13 @@ def list_p2_journeys(
                    -- Deal Type, Customer Type and the insurance decision: the stored
                    -- copy (uc03_journey_classification, 2026-11-11).
                    jc.deal_type, jc.vin_pending AS deal_type_vin_pending, jc.customer_type,
-                   jc.insurance_type, jc.insurance_decided_by
+                   jc.insurance_type, jc.insurance_decided_by,
+                   -- Observation severity (2026-11-18): the person's over the system's.
+                   COALESCE(os.override_severity, os.system_severity) AS observation_severity,
+                   (os.override_severity IS NOT NULL) AS observation_severity_set_by_person
             FROM page p
+            LEFT JOIN auditcore.p2_observation_severity os
+              ON os.tenant_id=p.tenant_id AND os.journey_id=p.journey_id
             LEFT JOIN auditcore.p2_journey_runtime pr
               ON pr.tenant_id=p.tenant_id AND pr.journey_id=p.journey_id
             LEFT JOIN auditcore.journey_classifications jc
@@ -832,6 +838,7 @@ def list_p2_journeys(
             "tenant_id": tenant_id,
             "actor_id": human_principal.subject,
             **scope_params(search=q, dealer_id=dealer_id, outlet_id=outlet_id, pc_actor_id=pc_actor_id, kind=kind,
+                         severity=severity,
                          date_from=date_from, date_to=date_to),
             "date_floor": programme_date_floor() or date(1900, 1, 1),
             "limit": page_size + 1,
@@ -903,6 +910,7 @@ def journey_view_counts(
     month_basis: str | None = None,
     dealer_id: UUID | None = None,
     kind: str | None = None,
+    severity: str | None = None,
     date_from: Annotated[date | None, Query(alias="from")] = None,
     date_to: Annotated[date | None, Query(alias="to")] = None,
 ) -> dict[str, Any]:
@@ -919,6 +927,7 @@ def journey_view_counts(
         "tenant_id": tenant_id,
         "actor_id": human_principal.subject,
         **scope_params(search=q, dealer_id=dealer_id, outlet_id=outlet_id, pc_actor_id=pc_actor_id, kind=kind,
+                         severity=severity,
                          date_from=date_from, date_to=date_to),
         "month": month if month and re.fullmatch(r"\d{4}-\d{2}", month) else None,
         "month_basis": _month_basis(month_basis),
@@ -949,6 +958,7 @@ def journey_suggestions(
     outlet_id: UUID | None = None,
     pc_actor_id: str | None = None,
     kind: str | None = None,
+    severity: str | None = None,
     date_from: Annotated[date | None, Query(alias="from")] = None,
     date_to: Annotated[date | None, Query(alias="to")] = None,
     limit: int = SUGGEST_LIMIT,
@@ -970,6 +980,7 @@ def journey_suggestions(
             "tenant_id": tenant_id,
             "actor_id": human_principal.subject,
             **scope_params(search=q, dealer_id=dealer_id, outlet_id=outlet_id, pc_actor_id=pc_actor_id, kind=kind,
+                         severity=severity,
                          date_from=date_from, date_to=date_to),
             "month": month if month and re.fullmatch(r"\d{4}-\d{2}", month) else None,
             "month_basis": _month_basis(month_basis),

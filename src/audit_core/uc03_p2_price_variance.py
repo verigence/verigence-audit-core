@@ -49,6 +49,11 @@ def refresh_price_variance(connection: Connection, *, tenant_id: str, journey_id
 
             discounts = json.dumps(discount_variance_rows(
                 view, charges_in_doubt(connection, tenant_id=tenant_id, journey_id=journey_id)))
+            # The journey's observation severity the system sets from this Deal
+            # (2026-11-18, uc03_observation_severity).
+            from audit_core.uc03_observation_severity import record_system
+
+            record_system(connection, tenant_id=tenant_id, journey_id=journey_id, view=view)
             # The version is stamped even when the figure itself has not moved:
             # that is what marks the cache current for the facts as they stand.
             connection.execute(
