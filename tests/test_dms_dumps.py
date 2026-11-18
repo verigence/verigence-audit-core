@@ -202,6 +202,14 @@ def test_a_dump_is_matched_marked_reported_and_shown_on_the_calendar(journey) ->
         assert [r[8] for r in missing] == ["Someone Else"]  # the cancelled booking is not missing
         assert [r[4] for r in book["Delivery dump variance"].iter_rows(values_only=True)][1:] == [
             "Booking on file, delivery not uploaded"]
+        # One day's uploads only (2026-11-18): a day with no upload gives an empty report.
+        today_dumps = m.build_report(connection, tenant_id=journey.tenant_id, dealer_ids=[str(journey.dealer_id)],
+                                     first=today_db.replace(day=1), day=today_db)
+        assert load_workbook(io.BytesIO(today_dumps))["Summary"].max_row > 1
+        other_day = today_db.replace(day=1) if today_db.day != 1 else today_db.replace(day=2)
+        none = m.build_report(connection, tenant_id=journey.tenant_id, dealer_ids=[str(journey.dealer_id)],
+                              first=today_db.replace(day=1), day=other_day)
+        assert load_workbook(io.BytesIO(none))["Summary"].max_row == 1
         calendar = m.dump_calendar(connection, tenant_id=journey.tenant_id, dealer_ids=[str(journey.dealer_id)],
                                    first=today_db.replace(day=1), today=today_db)
         today = next(d for d in calendar["dealers"][0]["days"] if d["date"] == today_db.isoformat())
