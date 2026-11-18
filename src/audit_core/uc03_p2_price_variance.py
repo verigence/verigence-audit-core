@@ -54,6 +54,10 @@ def refresh_price_variance(connection: Connection, *, tenant_id: str, journey_id
             from audit_core.uc03_observation_severity import record_system
 
             record_system(connection, tenant_id=tenant_id, journey_id=journey_id, view=view)
+            # A Deal line far from its standard is checked by hand (2026-11-18).
+            from audit_core.uc03_deal_reading_check import refresh_task
+
+            refresh_task(connection, tenant_id=tenant_id, journey_id=journey_id, view=view)
             # The version is stamped even when the figure itself has not moved:
             # that is what marks the cache current for the facts as they stand.
             connection.execute(

@@ -2274,7 +2274,10 @@ def _fastag_from_invoice(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
                          if r is not row and not r.get("partOf") and _dec(r.get("billed"))}
     for column, source in (("invoiced", "invoice"), ("ledger", "Tally invoice (customer ledger)")):
         amount = _dec(row.get(column))
-        if amount is not None and amount > 0 and amount not in charged_elsewhere:
+        # A FASTag costs at most Rs 600 (2026-11-18): more is not a FASTag.
+        from audit_core.uc03_account_statement import FASTAG_MAX
+
+        if amount is not None and 0 < amount <= FASTAG_MAX and amount not in charged_elsewhere:
             row["billed"], row["billedFrom"] = _money(amount), "invoice" if column == "invoiced" else "ledger"
             row["flags"] = [*row["flags"], "FASTAG_NOT_ON_NDC"]
             row["fastagNotOnNdc"] = {"amount": str(amount), "source": source}

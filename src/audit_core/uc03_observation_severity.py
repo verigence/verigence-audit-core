@@ -10,7 +10,8 @@ Reviewer, TL, PM".
 A journey's severity is HIGH, MEDIUM, LOW or none. The system sets it from
 the Deal each time the Deal is worked out for the list (refresh_price_variance,
 so every journey whose facts move, and DISCOUNT_VARIANCE_RECOMPUTE for all):
-today one reason, a FASTag an invoice charges that the NDC does not (HIGH).
+a FASTag an invoice charges that the NDC does not (HIGH); a Deal line far from
+its standard, to be checked by hand (MEDIUM, uc03_deal_reading_check).
 A Reviewer, Team Lead or Project Manager may set it over the system's, with a
 reason; their setting stands until one of them changes or clears it, and the
 system's own keeps being worked out beside it. Stored in
@@ -46,6 +47,12 @@ router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-obser
 def system_findings(view: dict[str, Any]) -> list[dict[str, Any]]:
     """The reasons the Deal gives for a severity, each {code, severity, text}."""
     found: list[dict[str, Any]] = []
+    from audit_core.uc03_deal_reading_check import lines_to_verify
+
+    for line in lines_to_verify(view):
+        found.append({"code": "DEAL_LINE_VERIFY", "severity": "MEDIUM",
+                      "text": f"{line['label']} Rs {line['current']} against the standard Rs {line['standard']} "
+                              f"({line['why']}): to be checked"})
     fastag = view.get("fastagNotOnNdc")
     if fastag:
         found.append({"code": "FASTAG_NOT_ON_NDC", "severity": "HIGH",

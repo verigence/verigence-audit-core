@@ -439,6 +439,28 @@ class StatementRead:
     # the old vehicle taken in kind): (row, amount)
     received: list[tuple[dict[str, Any], Decimal]] = field(default_factory=list)
     conflicts: list[dict[str, Any]] = field(default_factory=list)
+    # rows to be checked by hand (FASTAG_VERIFY_TASK): {"label", "amount", "why"}
+    verify: list[dict[str, Any]] = field(default_factory=list)
+
+
+# A FASTag costs at most Rs 600 (product owner 2026-11-18: "Fasttag cost wont be
+# more than Rs 600 ... if some other line item is coming up or being written
+# wrong, lets raise manual verification task"). A FASTag row of more carries
+# another charge written on it (the certificate of deposit Rs 24,143, a choice
+# number, VLTD) or is misread (Rs 10,01,494): it counts as an other charge, so
+# the deal's total stays whole, and a person checks the reading. Live
+# 2026-11-18: 21 journeys, Rs 13.9 lakh read as FASTag.
+FASTAG_MAX = Decimal(600)
+FASTAG_VERIFY_TASK = "NDC_FASTAG_ROW_VERIFY"
+
+
+def _fastag_over_limit(out: StatementRead, label: str, amount: Decimal) -> bool:
+    """A FASTag figure above FASTAG_MAX: noted for checking; True when it is."""
+    if amount <= FASTAG_MAX:
+        return False
+    out.verify.append({"label": label, "amount": amount,
+                       "why": f"a FASTag costs at most Rs {FASTAG_MAX}: another charge on the FASTag row, or misread"})
+    return True
 
 
 # A label ending in a whole number of three digits or more, on a row whose
@@ -463,6 +485,8 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
     found: dict[tuple[str, str, str], list[Decimal]] = {}
 
     def give(kind: str, key: str, amount: Decimal, row: str = "") -> None:
+        if key == "fastag_amount" and _fastag_over_limit(out, label, amount):
+            key, row = "other_charges", "FASTAG_ROW_OVER_LIMIT"
         found.setdefault((kind, key, row), []).append(amount)
 
     def leave(label: str, side: tuple[str, Decimal], why: str) -> None:
@@ -870,6 +894,8 @@ def read_erp_settlement(lines: list[dict[str, Any]]) -> StatementRead:
             continue
         key = next((k for k, pattern in _CHARGES if pattern.fullmatch(label)), None)
         if key is not None and key != "ex_showroom_price":
+            if key == "fastag_amount" and _fastag_over_limit(out, label, amount):
+                key = "other_charges"
             found.setdefault(key, []).append(amount)
             continue
         if _ERP_SUMMARY.fullmatch(label):
@@ -2063,9 +2089,11 @@ def sync_account_statement(
     # the discounts). Nothing canonical is set from it.
     settlements = [(d, rows) for d, rows, kind in parsed if kind == KIND_ERP]
     settlement_lines = 0
+    settlement_read: StatementRead | None = None
     if statement is None and settlements:
         erp_document, erp_rows = settlements[0]
-        for key, amount in sorted(read_erp_settlement(erp_rows).components.items()):
+        settlement_read = read_erp_settlement(erp_rows)
+        for key, amount in sorted(settlement_read.components.items()):
             record_source_value(
                 connection, tenant_id=tenant_id, journey_id=journey_id, line_kind="COMMERCIAL", component_key=key,
                 source_document_type=SETTLEMENT_SOURCE_TYPE, amount=amount, evidence_id=erp_document["evidenceId"],
@@ -2193,6 +2221,27 @@ def sync_account_statement(
         _resolve_task(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=NO_EX_SHOWROOM_TASK,
                       evidence={"statementRead": statement is not None})
 
+    # A FASTag row of more than Rs 600 (2026-11-18): a person checks the reading.
+    to_verify = [*(statement.verify if statement is not None else []),
+                 *(settlement_read.verify if settlement_read is not None else [])]
+    if to_verify:
+        _raise_task(
+            connection, tenant_id=tenant_id, journey_id=journey_id, task_type=FASTAG_VERIFY_TASK,
+            title="Check the FASTag line on the NDC",
+            description=(
+                "A FASTag costs at most Rs 600, but the NDC's FASTag row reads "
+                + "; ".join(f"Rs {v['amount']:,.0f} (\"{v['label']}\")" for v in to_verify)
+                + ". Another charge may be written on the FASTag row (certificate of deposit, choice number, VLTD) "
+                "or the figure is misread. Until checked it counts as an other charge, not as FASTag. Correct the "
+                "reading, or close this task with what the charge is."
+            ),
+            reference=_json_amounts({"rows": to_verify}),
+            severity="HIGH",
+        )
+    else:
+        _resolve_task(connection, tenant_id=tenant_id, journey_id=journey_id, task_type=FASTAG_VERIFY_TASK,
+                      evidence={"statementRead": statement is not None})
+
     # The Tally ledger validates the statement.
     deviations: list[dict[str, Any]] = []
     if statement is not None and tallies:
@@ -2310,6 +2359,8 @@ __all__ = [
     "DECLARED_NET",
     "DECLARED_OLD_VEHICLE",
     "DECLARED_RECEIVED",
+    "FASTAG_MAX",
+    "FASTAG_VERIFY_TASK",
     "FREE_ACCESSORIES_KEY",
     "KIND_ERP",
     "KIND_FORM",

@@ -21,7 +21,8 @@ actions:
 - CONFIRM_BREACH
 - MARK_FALSE_POSITIVE
 # The PC closes a task by hand, with a comment (PC_PAGE_QUALITY_REJECTED,
-# PC_LARGE_UPLOAD_REVIEW, COST_SHEET_NDC_DIFFERENCE, NDC_COPIES_DIFFERENCE, SCRAPPAGE_REGISTRATION_CONCESSION,
+# PC_LARGE_UPLOAD_REVIEW, COST_SHEET_NDC_DIFFERENCE, NDC_COPIES_DIFFERENCE, NDC_FASTAG_ROW_VERIFY, DEAL_LINE_VERIFY,
+# SCRAPPAGE_REGISTRATION_CONCESSION,
 # CORRECTIONS_RECHECK,
 # and DOCUMENT_MISSING raised as DOCUMENT_MISSING / BOOKING_FORM_MISSING only).
 - CLOSE_TASK
@@ -567,6 +568,28 @@ task_types:
     - CLOSE_TASK
     - ADD_COMMENT
   NDC_COPIES_DIFFERENCE:
+    category: CROSS_DOCUMENT_REVIEW
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - CLOSE_TASK
+    - ADD_COMMENT
+  # A Deal line far from its standard (product owner 2026-11-18): manual verification.
+  DEAL_LINE_VERIFY:
+    category: CROSS_DOCUMENT_REVIEW
+    owner: PC
+    origin: SYSTEM
+    source: RESOLVER
+    completion: MACHINE_VERIFIED
+    actions:
+    - REVIEW_DOCUMENT
+    - CLOSE_TASK
+    - ADD_COMMENT
+  # A FASTag row on the NDC above Rs 600 (product owner 2026-11-18): manual verification.
+  NDC_FASTAG_ROW_VERIFY:
     category: CROSS_DOCUMENT_REVIEW
     owner: PC
     origin: SYSTEM
