@@ -14,7 +14,12 @@ from sqlalchemy import text
 
 from audit_core.db import set_tenant_context
 from audit_core.uc03_p2_audit_rules import run_p2_audit_rules
-from audit_core.uc03_scrappage_registration import assess_line
+from audit_core.uc03_scrappage_registration import (
+    apply_concession,
+    assess_line,
+    challan_rebate,
+    deal_block,
+)
 from audit_core.uc03_system_remarks import system_remarks
 
 # ── the line on its own ──────────────────────────────────────────────────────
@@ -89,7 +94,7 @@ def test_on_a_scrappage_deal_the_concession_is_not_an_undercharge_and_is_a_syste
 
     under = _run(journey)["DEAL_UNDERCHARGED"]
     assert under.outcome == "PASS", under.reason
-    assert "25% scrappage concession" in under.reason
+    assert "scrappage concession of ₹20,000 (25% of the RTO standard)" in under.reason
     [explained] = under.details["scrappageConcession"]
     assert explained["concession"] == "20000.00"
     # Product owner 2026-11-15: a remark on the journey, not a PC task.
@@ -98,7 +103,7 @@ def test_on_a_scrappage_deal_the_concession_is_not_an_undercharge_and_is_a_syste
         set_tenant_context(connection, journey.tenant_id)
         remarks = system_remarks(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
     [remark] = [r for r in remarks["remarks"] if r["code"] == "SCRAPPAGE_CONCESSION"]
-    assert "25% scrappage concession" in remark["text"] and "not counted as an undercharge" in remark["text"]
+    assert "scrappage concession of ₹20,000" in remark["text"] and "not counted as an undercharge" in remark["text"]
 
 
 def test_an_information_task_raised_before_is_closed_saying_where_the_note_went(journey):
@@ -129,3 +134,57 @@ def test_on_a_scrappage_deal_a_different_shortfall_stays_with_the_expected_conce
     assert under.outcome == "FAIL"
     assert "the 25% concession would be ₹20,000" in under.reason
     assert _pc_task(journey) is None
+
+
+# ── the Deal owns the concession (product owner 2026-11-17) ──────────────────
+
+_CHALLAN = {"documentId": "c1", "fields": {"line_items": (
+    '[{"description_raw": "Hypothecation Addition", "amount": 1500, "rebate_waiver_amount": null, "total": 1500}, '
+    '{"description_raw": "MV Tax(13-Oct-2026 to One Time)", "amount": 235899, "rebate_waiver_amount": 58975, '
+    '"total": 176924}, {"description_raw": "Automation and Technology Fee", "amount": 140, "total": 140}]')}}
+
+
+def test_the_challan_prints_the_rebate_the_rto_granted():
+    # ADI-RD-261102-003 (PRUTHIRAJ MUDULI), live 2026-11-17
+    assert challan_rebate([_CHALLAN]) == {"rebate": Decimal(58975), "tax": Decimal(235899), "documentId": "c1"}
+    assert challan_rebate([{"fields": {"line_items": '[{"description_raw": "MV Tax", "amount": 100}]'}}]) is None
+
+
+def _rto(standard: str, billed: str) -> list[dict]:
+    return [{"key": "registration_charges", "label": "Registration", "standard": standard, "billed": billed,
+             "flags": []}]
+
+
+def test_the_deal_takes_the_challans_rebate_off_the_rto_standard():
+    # Live: standard 2,36,639.97 + 1,500 hypothecation; the NDC charges 1,78,564.
+    rows = _rto("238139.97", "178564")
+    facts = {"certificates": [{"certificateNumber": "COD2026100HR20AK5127"}], "challan": challan_rebate([_CHALLAN])}
+    applied = apply_concession(rows, facts, benefits=[])
+    assert applied["concession"] == "58975" and applied["source"].startswith("the scrappage rebate")
+    assert rows[0]["standard"] == "179164.97" and rows[0]["standardMaster"] == "238139.97"
+    assert "SCRAPPAGE_CONCESSION" in rows[0]["flags"] and "SCRAPPAGE_COD_MISSING" not in rows[0]["flags"]
+    block = deal_block(facts, applied=applied, benefits=[])
+    assert block["challanRebate"] == "58975" and not block["codMissing"]
+
+
+def test_a_rebate_with_no_certificate_on_file_is_taken_and_the_certificate_is_missing():
+    rows = _rto("238139.97", "178564")
+    facts = {"certificates": [], "challan": challan_rebate([_CHALLAN])}
+    applied = apply_concession(rows, facts, benefits=[])
+    assert applied and "SCRAPPAGE_COD_MISSING" in rows[0]["flags"]
+    assert deal_block(facts, applied=applied, benefits=[])["codMissing"]
+
+
+def test_no_rebate_and_no_scrappage_leaves_the_standard_alone():
+    rows = _rto("80000", "60000")
+    assert apply_concession(rows, {"certificates": [], "challan": None}, benefits=[]) is None
+    assert rows[0]["standard"] == "80000"
+    assert deal_block({"certificates": [], "challan": None}, applied=None, benefits=[]) is None
+
+
+def test_a_scrappage_benefit_given_lets_the_25_percent_shortfall_be_the_concession():
+    rows = _rto("80000", "60000")
+    applied = apply_concession(rows, {"certificates": [], "challan": None},
+                               benefits=[{"key": "SCRAPPAGE_BONUS_DEALER", "label": "Scrappage bonus (dealer)",
+                                          "current": "20000"}])
+    assert applied["concession"] == "20000.00" and rows[0]["standard"] == "60000.00"

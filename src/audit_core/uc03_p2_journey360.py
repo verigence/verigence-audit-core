@@ -1804,6 +1804,18 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     _tcs_at_one_percent(all_rows)
     if _financed(connection, tenant_id=tenant_id, journey_id=journey_id):
         _hypothecation_on_rto(all_rows)
+    # Scrappage (product owner 2026-11-17): the RTO's scrappage concession
+    # comes off the RTO standard here, once, before any variance is measured,
+    # and the Deal shows the certificates and the rebate (uc03_scrappage_registration).
+    from audit_core import uc03_scrappage_registration as scrappage_rule
+
+    scrappage_facts = scrappage_rule.journey_scrappage(connection, tenant_id=tenant_id, journey_id=journey_id)
+    scrappage_benefits = [
+        {"key": r["key"], "label": r.get("label"),
+         "current": next((r[c] for c in ("billed", "current") if r.get(c) not in (None, "")), None)}
+        for r in discount_rows if str(r.get("key") or "").startswith("SCRAPPAGE")
+        and any((_dec(r.get(c)) or Decimal(0)) > 0 for c in ("billed", "current"))]
+    scrappage_applied = scrappage_rule.apply_concession(all_rows, scrappage_facts, benefits=scrappage_benefits)
 
     # "Current" is what the deal stands at now: the billed figure; before
     # any invoice, what the booking offered. Once an invoice is on file, a
@@ -1975,6 +1987,11 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         "categories": groups,
         "discounts": discount_rows,
         "insurance": insurance,
+        # Scrappage on the deal (2026-11-17): the Certificates of Deposit on
+        # file, the rebate the RTO challan prints, the concession taken off the
+        # RTO standard and the scrappage benefits given; None with no scrappage.
+        "scrappage": scrappage_rule.deal_block(scrappage_facts, applied=scrappage_applied,
+                                               benefits=scrappage_benefits),
         # The invoices on file, each with what it bills and whether it is
         # the copy counted (retail and tax alike).
         "invoices": _invoice_entries(documents, selection),

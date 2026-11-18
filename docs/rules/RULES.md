@@ -42,6 +42,14 @@ rule once, with what it replaced and where it is read, is what stops that.
 | A receipt issued by an insurer (self insurance) is not a payment receipt. | 11 Nov 2026 | — | receipt issuer check | — |
 | A payment up to one day before the booking docket date is an observation, not a finding. | 14 Nov 2026 | — | PAYMENT_BEFORE_BOOKING | — |
 
+## Deal: RTO, scrappage, FASTag and RSA
+
+| Rule | Since | Replaces | Read by | Job for bookings before |
+|---|---|---|---|---|
+| On a scrappage deal the RTO standard is the price master's RTO (plus the hypothecation fee when financed) less the scrappage concession; the concession is the rebate the RTO challan prints on the motor vehicle tax, else 25% of the standard (within ₹100) when a Certificate of Deposit or a scrappage benefit is on record. The Deal applies it once; nothing else works it out. | 17 Nov 2026 | 9–17 Nov: the concession only inside DEAL_UNDERCHARGED (25% within ₹100 of a standard carrying the HP fee); the Deal and its variance kept the full RTO | `uc03_scrappage_registration.apply_concession` → Deal (RTO line, variance, list price variance), DEAL_UNDERCHARGED, System remarks (SCRAPPAGE_CONCESSION), `DEAL_SCRAPPAGE_REVIEW` | `RULES_RERUN` + `ACCOUNT_STATEMENT` (17 Nov) |
+| The Deal shows scrappage: the Certificates of Deposit on file, the challan's rebate, the concession and the scrappage benefits; the RTO took the concession or a benefit was given with no certificate on file → the certificate is asked for in the one missing-documents task. | 17 Nov 2026 | — (certificates shown nowhere on the Deal; certificate asked only when a scrappage bonus was given) | Deal `scrappage` block (Deal tab Scrappage card), `condition_reasons` (`scrappageClaimed`) → DOCUMENT_MISSING | same |
+| A charge the NDC prints reaches its Deal line: FASTag written "OTHERS FASTAG 600" / "FAST-TAG"; RSA and the certificate of deposit posted as journals on Aditya's computer statement; the certificate of deposit however misread on the "If any others" / "Misc" row, "COD SALE", a scrappage row charged with no bonus, the CV combined row → other charges. A word on a general row naming no known charge stays unmapped. | 17 Nov 2026 | such rows were dropped or read as other charges | `uc03_account_statement.read_statement` → Deal, statement totals | `ACCOUNT_STATEMENT` |
+
 ## Discounts (Excess discount)
 
 | Rule | Since | Replaces | Read by | Job for bookings before |
