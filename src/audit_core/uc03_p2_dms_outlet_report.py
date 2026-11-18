@@ -160,15 +160,15 @@ def _zero(keys: tuple[str, ...]) -> dict[str, int]:
 
 def _latest_dumps(connection: Connection, tenant_id: str, dealer_ids: list[str], first: date, day: date
                   ) -> dict[tuple[str, str], dict[str, Any]]:
-    """(dealer, kind) -> the latest current dump dated in the month up to the day."""
+    """(dealer, kind) -> the current dump uploaded on the day. An earlier upload is not taken
+    in its place (product owner 2026-11-18: "it shouldnt take into consideration the previous
+    DMS upload like of 5th Nov"); a dealership with none that day has no DMS figures."""
     rows = connection.execute(
         text("""
             SELECT DISTINCT ON (u.dealer_id, u.dump_kind) u.dealer_id, u.dump_kind, u.dump_id, u.business_date,
-                   (SELECT max(r.event_date) FROM auditcore.p2_dms_dump_rows r
-                    WHERE r.tenant_id = u.tenant_id AND r.dump_id = u.dump_id AND r.event_date <= u.business_date
-                   ) AS covers_to
+                   u.period_month
             FROM auditcore.p2_dms_dumps u
-            WHERE u.tenant_id = :t AND u.status = 'ACTIVE' AND u.business_date BETWEEN :f AND :d
+            WHERE u.tenant_id = :t AND u.status = 'ACTIVE' AND u.business_date = :d
               AND CAST(u.dealer_id AS text) = ANY(:ds)
             ORDER BY u.dealer_id, u.dump_kind, u.business_date DESC, u.uploaded_at_utc DESC
         """),
@@ -315,7 +315,7 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
             text("""
                 SELECT dealer_id, dump_kind, outlet_label, outcome, CAST(journey_id AS text) AS journey_id
                 FROM auditcore.p2_dms_dump_rows
-                WHERE tenant_id = :t AND CAST(dump_id AS text) = ANY(:ids)
+                WHERE tenant_id = :t AND CAST(dump_id AS text) = ANY(:ids) AND outcome <> 'OUT_OF_PERIOD'
             """),
             {"t": tenant_id, "ids": dump_ids},
         ).mappings():
@@ -330,8 +330,12 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
         booking, delivery = dumps.get((did, BOOKING)), dumps.get((did, DELIVERY))
         # Like with like: Verigence is counted up to the last day the dealership's dump covers
         # (a dump of the 5th carries the 1st to the 4th), else up to the report's day.
-        booking_to = max(first, booking["covers_to"]) if booking and booking["covers_to"] else day
-        delivery_to = max(first, delivery["covers_to"]) if delivery and delivery["covers_to"] else day
+        # The days each dump is compared for: the 1st to the day before its upload (2026-11-18).
+        from audit_core.uc03_p2_dms_dumps import dump_window
+
+        booking_to = max(first, dump_window(booking["period_month"], booking["business_date"])[1]) if booking else day
+        delivery_to = (max(first, dump_window(delivery["period_month"], delivery["business_date"])[1])
+                       if delivery else day)
         dump_journeys = ({r["journey_id"] for r in rows_by_dealer.get(did, [])
                           if r["dump_kind"] == DELIVERY and r["journey_id"]} if delivery else None)
         verigence = verigence_figures(connection, tenant_id, outlets, first, booking_to, delivery_to, today,

@@ -82,6 +82,7 @@ rule once, with what it replaced and where it is read, is what stops that.
 
 | Rule | Since | Replaces | Read by | Job for bookings before |
 |---|---|---|---|---|
+| A DMS dump uploaded on a day is compared for the 1st of its month to the day before the upload (uploaded on the 18th: the 1st to the 17th); its rows dated otherwise are OUT_OF_PERIOD (kept, not counted, not reported). A report or outlet report as at a day uses that day's uploads only, never an earlier upload in their place. | 18 Nov 2026 | every row of the dump; the outlet report fell back to the latest earlier upload | `uc03_p2_dms_dumps.dump_window` / `match_dump`, report by day, dump detail, DMS outlet report, `uc03_p2_delivery_dates.verigence_not_in_dump` | DMS_REMATCH (worker job) |
 | A daily DMS delivery dump (month to date) is compared with the Verigence deliveries dated from the 1st of its month to the last day it covers; a Journey's delivery day is its gate pass's date, else the NDC's printed delivery date, else its latest payment receipt — for Journeys with delivery files only. | 17 Nov 2026 | 16–17 Nov: gate pass date only | `uc03_p2_delivery_dates`, DMS outlet report (In Verigence, In Verigence not in dump), dump detail (NOT_IN_DMS), variance Excel | — (read live) |
 
 ## Verified bookings
