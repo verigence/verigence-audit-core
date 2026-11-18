@@ -243,47 +243,29 @@ def test_equal_counts_finish_the_task_and_bookings_are_not_counted(setup):
     assert _counts(s, gp, 2).status_code == 200
 
 
+# The PC is no longer asked what was intimated to them, nor to explain a difference (product
+# owner 2026-11-18): the counts settle the day; intimation comes from the DMS dump marks.
 @not_on_sunday
-def test_more_files_than_declared_asks_which_belong_to_other_days(setup):
+def test_more_files_than_declared_settles_the_day_without_a_question(setup):
     s = setup
     _delivery_file(s, journeys=3)
     gp = _upload(s).json()["gatePassId"]
     result = _counts(s, gp, 1).json()
     assert result["divergence"] == "EXTRA_FILES" and result["difference"] == 2
-    assert result["nextStep"] == "EXPLAIN_EXTRA_FILES" and result["gatePass"]["completed"] is False
-    assert s.client.post(f"{s.base}/{gp}/answer", json={}).status_code == 422
-    done = s.client.post(f"{s.base}/{gp}/answer", json={"pastDeliveries": "Ramesh Das, J-1042"}).json()
-    assert done["gatePass"]["completed"] is True and done["taskRaised"] is False
+    assert result["nextStep"] == "DONE" and result["gatePass"]["completed"] is True
+    assert s.client.post(f"{s.base}/{gp}/answer", json={"pastDeliveries": "x"}).status_code == 409
 
 
 @not_on_sunday
-def test_fewer_files_than_declared_raises_a_high_priority_daily_task_only_on_no(setup):
+def test_fewer_files_than_declared_settles_the_day_and_raises_no_task(setup):
     s = setup
     _delivery_file(s, journeys=1)
     gp = _upload(s).json()["gatePassId"]
     result = _counts(s, gp, 3).json()
     assert result["divergence"] == "MISSING_FILES" and result["difference"] == 2
-    assert result["nextStep"] == "CONFIRM_FILES_HELD"
-    assert s.client.post(f"{s.base}/{gp}/answer", json={}).status_code == 422
-
-    yes = s.client.post(f"{s.base}/{gp}/answer", json={"filesHeld": True}).json()
-    assert yes["taskRaised"] is False
-
-    # a second day's gate pass (a new photo replaces today's) answered NO
-    gp2 = _upload(s).json()["gatePassId"]
-    _counts(s, gp2, 3)
-    no = s.client.post(f"{s.base}/{gp2}/answer", json={"filesHeld": False}).json()
-    assert no["taskRaised"] is True
-    with s.journey.engine.begin() as connection:
-        set_tenant_context(connection, s.journey.tenant_id)
-        [task] = connection.execute(
-            text("SELECT category, task_type, priority, assigned_role_code, task_status, scope_kind, "
-                 "completion_protocol FROM auditcore.p2_tasks WHERE tenant_id=:t AND category='DAILY_TASK'"),
-            {"t": s.journey.tenant_id}).all()
-    # Daily tasks live in the Task Manager (2026-10-26): an outlet task for the
-    # Team Lead, closed by the TL with a note, no reviewer.
-    assert tuple(task) == ("DAILY_TASK", "GATE_PASS_DELIVERY_NOT_NOTIFIED", "HIGH", "TL", "READY", "OUTLET",
-                           "SELF_CLOSING")
+    assert result["nextStep"] == "DONE" and result["taskRaised"] is False
+    assert s.client.post(f"{s.base}/{gp}/answer", json={"filesHeld": False}).status_code == 409
+    assert _tasks(s, "GATE_PASS_DELIVERY_NOT_NOTIFIED") == []
 
 
 def test_other_entries_need_a_description(setup):
@@ -294,12 +276,11 @@ def test_other_entries_need_a_description(setup):
 
 
 @not_on_sunday
-def test_calendar_shows_outlet_photo_but_no_photo_for_a_dealership_view_and_tl_resolves(setup):
+def test_calendar_shows_outlet_photo_but_no_photo_for_a_dealership_view(setup):
     s = setup
     _delivery_file(s, journeys=1)
     gp = _upload(s).json()["gatePassId"]
     _counts(s, gp, 3)
-    s.client.post(f"{s.base}/{gp}/answer", json={"filesHeld": False})
     from audit_core.uc03_p2_object_keys import ist_day
     month = f"{ist_day():%Y-%m}"
     today = f"{ist_day():%Y-%m-%d}"
@@ -308,9 +289,9 @@ def test_calendar_shows_outlet_photo_but_no_photo_for_a_dealership_view_and_tl_r
     [day] = outlet_view["days"]
     assert (day["date"], day["declared"], day["uploaded"], day["missing"]) == (today, 3, 1, 2)
     assert day["gatePassId"] == gp and outlet_view["scope"] == "OUTLET"
-    # the older "files not held" answer: the whole gap was not intimated to the PC
-    assert (day["notNotified"], day["toUpload"]) == (2, 0)
-    assert outlet_view["totals"] == {"declared": 3, "uploaded": 1, "missing": 2, "notNotified": 2, "toUpload": 0}
+    # no intimation asked (2026-11-18): the register's gap is left to upload
+    assert (day["notNotified"], day["toUpload"]) == (0, 2)
+    assert outlet_view["totals"] == {"declared": 3, "uploaded": 1, "missing": 2, "notNotified": 0, "toUpload": 2}
 
     dealer_view = s.client.get(f"{s.base}/calendar", params={"month": month, "dealerId": str(s.journey.dealer_id)}).json()
     assert dealer_view["scope"] == "DEALER" and "gatePassId" not in dealer_view["days"][0]
@@ -319,23 +300,8 @@ def test_calendar_shows_outlet_photo_but_no_photo_for_a_dealership_view_and_tl_r
     url = s.client.get(f"{s.base}/{gp}/image-url").json()
     assert url["url"].startswith("https://storage.test/get/daily-gate-passes/")
 
-    # the PC supervises nothing: no Daily Tasks; a TL of the outlet sees and resolves it
+    # no question, no Team Lead task (2026-11-18)
     assert s.client.get(f"{s.base.replace('gate-passes', 'daily-tasks')}").json()["items"] == []
-    tl = f"gatepass-tl-{uuid4().hex[:8]}"
-    with s.journey.engine.begin() as connection:
-        set_tenant_context(connection, s.journey.tenant_id)
-        connection.execute(
-            text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, "
-                 "dealer_id) VALUES (:t, :a, 'TL', :d)"),
-            {"t": s.journey.tenant_id, "a": tl, "d": s.journey.dealer_id})
-    s.acting["subject"] = tl
-    tasks_url = s.base.replace("gate-passes", "daily-tasks")
-    [task] = s.client.get(tasks_url).json()["items"]
-    assert task["priority"] == "HIGH" and task["category"] == "DAILY_TASK" and task["status"] == "OPEN"
-    assert s.client.post(f"{tasks_url}/{task['dailyTaskId']}/resolve", json={"note": ""}).status_code == 400
-    done = s.client.post(f"{tasks_url}/{task['dailyTaskId']}/resolve", json={"note": "Called the dealer"}).json()
-    assert done["status"] == "DONE"
-    assert s.client.get(tasks_url).json()["items"] == []
 
 
 def test_older_clients_still_get_today_and_the_previous_day(setup, monkeypatch):
@@ -607,13 +573,10 @@ def test_consolidated_view_register_tool_and_pending(setup):
     view = s.client.get(f"{s.base}/summary").json()
     [row] = view["outlets"]
     assert (row["asPerRegister"], row["updatedInTool"], row["pendingDueToPc"], row["pendingDueToClient"]) == (5, 2, 3, 0)
-    assert row["days"][-1]["status"] == "ANSWER_PENDING" and row["days"][-1]["photoQuality"] == "GOOD"
-    assert s.client.post(f"{s.base}/{gp}/answer", json={"filesHeld": False}).status_code == 200
-    after = s.client.get(f"{s.base}/summary").json()
-    assert (after["totals"]["pendingDueToClient"], after["totals"]["pendingDueToPc"]) == (3, 0)
-    assert after["totals"]["gatePassesFinished"] == 1
+    assert row["days"][-1]["status"] == "DONE" and row["days"][-1]["photoQuality"] == "GOOD"
+    assert view["totals"]["gatePassesFinished"] == 1
     _delivery_file(s, journeys=1, fresh=True)  # one of them uploaded later the same day
-    assert s.client.get(f"{s.base}/summary").json()["totals"]["pendingDueToClient"] == 2
+    assert s.client.get(f"{s.base}/summary").json()["totals"]["pendingDueToPc"] == 2
 
 
 @not_on_sunday
@@ -673,12 +636,12 @@ def test_all_intimated_and_uploaded_raises_no_task(setup):
 
 
 @not_on_sunday
-def test_more_uploaded_than_the_register_still_asks_which_belong_to_other_days(setup):
+def test_more_uploaded_than_the_register_settles_without_a_question(setup):
     s = setup
     _delivery_file(s, journeys=3)
     gp = _upload(s).json()["gatePassId"]
     result = _register(s, gp, 1, 1).json()
-    assert result["nextStep"] == "EXPLAIN_EXTRA_FILES" and result["gatePass"]["completed"] is False
+    assert result["nextStep"] == "DONE" and result["gatePass"]["completed"] is True
 
 
 @not_on_sunday
@@ -780,62 +743,6 @@ def test_monday_counts_vehicle_gate_passes_of_sunday_too(setup):
         assert gate_pass.delivery_file_count(connection, s.journey.tenant_id, s.journey.outlet_id, monday) == 2
 
 
-@not_on_sunday
-def test_consolidated_view_names_the_column_not_notified_to_pc(setup):
-    s = setup
-    _delivery_file(s, journeys=1)
-    gp = _upload(s).json()["gatePassId"]
-    _counts(s, gp, 3)
-    s.client.post(f"{s.base}/{gp}/answer", json={"filesHeld": False})
-    view = s.client.get(f"{s.base}/summary").json()
-    assert view["totals"]["notNotifiedToPc"] == 2 == view["totals"]["pendingDueToClient"]
-    assert view["outlets"][0]["days"][-1]["notNotifiedToPc"] == 2
-    assert any(n.startswith("Not notified to PC") for n in view["notes"])
-
-
-
-@not_on_sunday
-def test_the_pc_says_how_many_were_not_notified_and_the_rest_is_not_uploaded_by_the_pc(setup):
-    """Product owner 2026-10-27: not uploaded by PC = deliveries on the gate pass
-    - (found in the tool + not notified to the PC by the dealership)."""
-    s = setup
-    _delivery_file(s, journeys=1)
-    gp = _upload(s).json()["gatePassId"]
-    assert _counts(s, gp, 5).json()["difference"] == 4
-    assert s.client.post(f"{s.base}/{gp}/answer", json={"notNotified": 5}).status_code == 422  # more than the gap
-    answer = s.client.post(f"{s.base}/{gp}/answer", json={"notNotified": 3}).json()
-    assert (answer["notNotified"], answer["notUploadedByPc"], answer["taskRaised"]) == (3, 1, True)
-    assert (answer["gatePass"]["notNotifiedToPc"], answer["gatePass"]["notUploadedByPc"]) == (3, 1)
-    totals = s.client.get(f"{s.base}/summary").json()["totals"]
-    assert (totals["asPerRegister"], totals["updatedInTool"], totals["notNotifiedToPc"], totals["pendingDueToPc"]) == \
-        (5, 1, 3, 1)
-    # The calendar splits the gap the same way (product owner 2026-10-29): uploaded
-    # with the day's gate pass, not intimated to the PC, and left for the PC to upload.
-    from audit_core.uc03_p2_object_keys import ist_day
-    calendar = s.client.get(f"{s.base}/calendar", params={"month": f"{ist_day():%Y-%m}"}).json()
-    assert {k: calendar["totals"][k] for k in ("declared", "uploaded", "notNotified", "toUpload")} == \
-        {"declared": 5, "uploaded": 1, "notNotified": 3, "toUpload": 1}
-    with s.journey.engine.begin() as connection:
-        set_tenant_context(connection, s.journey.tenant_id)
-        reference = connection.execute(
-            text("SELECT reference FROM auditcore.p2_tasks WHERE tenant_id=:t AND category='DAILY_TASK'"),
-            {"t": s.journey.tenant_id}).scalar_one()
-    assert (reference["missing"], reference["notUploadedByPc"]) == (3, 1)
-
-
-@not_on_sunday
-def test_all_notified_means_the_whole_gap_is_the_pcs_and_no_tl_task(setup):
-    s = setup
-    gp = _upload(s).json()["gatePassId"]
-    _counts(s, gp, 2)
-    answer = s.client.post(f"{s.base}/{gp}/answer", json={"notNotified": 0}).json()
-    assert (answer["notUploadedByPc"], answer["taskRaised"]) == (2, False)
-    assert s.client.get(f"{s.base}/summary").json()["totals"]["pendingDueToPc"] == 2
-    from audit_core.uc03_p2_object_keys import ist_day
-    [day] = s.client.get(f"{s.base}/calendar", params={"month": f"{ist_day():%Y-%m}"}).json()["days"]
-    assert (day["notNotified"], day["toUpload"]) == (0, 2)
-
-
 # ── the PC corrects the counts on the day of the upload (product owner 2026-11-03) ──
 def _not_notified_task(s, gp):
     with s.journey.engine.begin() as connection:
@@ -928,8 +835,7 @@ def test_suspended_no_team_lead_task_is_raised_but_the_comparison_is_kept(setup,
     # A correction does not raise it either; nor does the older clients' answer.
     assert _register(s, gp, 5, 2).json()["taskRaised"] is False
     gp2 = _upload(s).json()["gatePassId"]
-    _counts(s, gp2, 3)
-    assert s.client.post(f"{s.base}/{gp2}/answer", json={"notNotified": 2}).json()["taskRaised"] is False
+    assert _counts(s, gp2, 3).json()["taskRaised"] is False
     assert _tasks(s, "GATE_PASS_DELIVERY_NOT_NOTIFIED") == []
     monkeypatch.setenv("AUDIT_CORE_GATE_PASS_TL_TASKS", "off")
     assert _register(s, gp2, 6, 2).json()["taskRaised"] is False

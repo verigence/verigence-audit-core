@@ -42,7 +42,7 @@ _TENANT_DATA_DELETE_ORDER = (
     "p2_scheme_journey_checks", "p2_scheme_dump_rows", "p2_scheme_dumps",
     "p2_verified_booking_checks", "p2_verified_bookings", "p2_observation_severity",
     "p2_journey_bank_status", "p2_bank_receipt_matches", "p2_bank_statement_txns", "p2_bank_statements",
-    "archive_runs", "p2_journey_dms_sync", "p2_dms_dump_rows", "p2_dms_dumps", "journey_classifications", "p2_reread_corrections", "sevasutra_instances", "p2_drive_shares", "p2_drive_people", "p2_drive_files", "p2_drive_runs", "p2_drive_folders", "p2_drive_connections", "p2_bulk_files", "p2_bulk_uploads", "p2_journey_exports",
+    "archive_runs", "p2_dms_reports", "p2_dms_intimations", "p2_journey_dms_sync", "p2_dms_dump_rows", "p2_dms_dumps", "journey_classifications", "p2_reread_corrections", "sevasutra_instances", "p2_drive_shares", "p2_drive_people", "p2_drive_files", "p2_drive_runs", "p2_drive_folders", "p2_drive_connections", "p2_bulk_files", "p2_bulk_uploads", "p2_journey_exports",
     "p2_task_events", "p2_tasks", "p2_task_schedules", "p2_user_activity_daily", "p2_daily_tasks",
     "p2_gate_pass_pages", "p2_gate_passes", "p2_location_tracking_keys", "p2_location_checks", "p2_access_locations", "p2_place_addresses",
     "sku_resolution_run_items", "sku_resolution_runs", "delivery_vehicle_photos", "activity_records", "administrative_operations", "audit_chain_heads", "audit_events",

@@ -803,7 +803,12 @@ def submit_counts(
     # still asks the PC which belong to other days. An older client (no intimated count) answers the
     # difference in the next step, as before.
     not_notified = declared - intimated if intimated is not None else None
-    settled = divergence == "NONE" or (intimated is not None and divergence == "MISSING_FILES")
+    # The PC is no longer asked what was intimated to them, nor to explain a difference (product
+    # owner 2026-11-18: "discontinue asking those queries, and build the entire process full
+    # deterministic"): the counts settle the day. What was intimated comes from the PCs' marks on
+    # the DMS dumps (uc03_p2_dms_intimations); a delivery's day from its documents
+    # (uc03_p2_delivery_dates).
+    settled = True
     pending = max(intimated - files, 0) if intimated is not None else None
     if editing:
         before = {"newDeliveries": row["new_deliveries"], "notNotifiedToPc": row.get("not_notified_count"),
