@@ -213,3 +213,17 @@ def test_a_team_lead_s_bundle_is_enough_to_upload() -> None:
     journey.update alone refused every TL upload (2026-11-14, VAC-AUTH-002)."""
     assert "audit.work.update" in m._UPDATE and "audit.journey.update" in m._UPDATE
     assert set(m.UPLOAD_ROLES) == {"TL", "REVIEWER"}
+
+
+def test_a_model_spaced_or_extended_differently_is_the_same_car() -> None:
+    # 2026-11-18: Shivnath's bookings on file were reported "not in Verigence" because the
+    # model names were spaced differently in the DMS and on the papers.
+    assert m.same_model("XEV9S", "XEV 9S")
+    assert m.same_model("BE6 sportber threet 79 NCH", "BE 6")
+    assert m.same_model("3XO", "XUV3XO EV")
+    assert not m.same_model("THAR ROXX", "XUV 3XO")
+    assert not m.same_model("BE", "BE 6")  # too short to stand for a model
+    index = m.JourneyIndex()
+    index.journeys = {"j1": {"journeyId": "j1", "model": "XEV9S", "names": {"RENUBALA ROUT"}, "hasDelivery": False,
+                             "outletId": None}}
+    assert m.match_row(index, m.BOOKING, {"customer_name": "RENUBALA ROUT", "model": "XEV 9S"}) == ("j1", "NAME_MODEL")

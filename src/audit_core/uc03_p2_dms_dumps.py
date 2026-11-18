@@ -39,7 +39,8 @@ A dump row is matched to a Journey of the same dealership, in this order:
                   invoice, insurance cover or RTO challan (CHASSIS_DOCUMENT_TYPES)
   MOBILE          the customer's mobile (last 10 digits) on the booking form, a receipt
                   or the KYC
-  NAME_MODEL      the same customer name and model, only when one Journey has it
+  NAME_MODEL      the same customer name and model (same_model: spacing aside, one name
+                  within the other), only when one Journey has it
 Outcome per row: MATCHED; for a delivery row, NOT_IN_TOOL when its Journey is found but
 no delivery file is on it yet; MISSING when no Journey has it; CANCELLED for a booking
 the DMS shows cancelled (not counted as missing).
@@ -371,6 +372,19 @@ def _model_tokens(value: Any) -> set[str]:
     return {t for t in re.findall(r"[A-Z0-9]+", str(value or "").upper().replace("-", "")) if len(t) >= 3}
 
 
+def same_model(a: Any, b: Any) -> bool:
+    """The same car, however the DMS and the papers space or extend its name (2026-11-18:
+    "XEV9S" / "XEV 9S", "BE 6" / "BE6 Pack Three 79", "3XO" / "XUV3XO EV" were taken for
+    different models and the bookings reported "not in Verigence"): the names compared with
+    spaces and punctuation taken out, one within the other (3 characters at least), or a
+    word in common."""
+    if _model_tokens(a) & _model_tokens(b):
+        return True
+    x, y = re.sub(r"[^A-Z0-9]", "", str(a or "").upper()), re.sub(r"[^A-Z0-9]", "", str(b or "").upper())
+    shorter, longer = sorted((x, y), key=len)
+    return len(shorter) >= 3 and shorter in longer
+
+
 @dataclass
 class JourneyIndex:
     by_ref: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
@@ -513,14 +527,14 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any]) -> tuple[str 
         if (jid := _one(found)) is not None:
             return jid, "MOBILE"
         # one customer, two bookings: the one of the same model
-        same_model = {j for j in found if _model_tokens(index.journeys[j]["model"]) & _model_tokens(row.get("model"))}
-        if (jid := _one(same_model)) is not None:
+        same_model_ = {j for j in found if same_model(index.journeys[j]["model"], row.get("model"))}
+        if (jid := _one(same_model_)) is not None:
             return jid, "MOBILE"
     name = row.get("customer_name")
     if name:
         candidates = {jid for jid, j in index.journeys.items()
                       if any(same_person(name, n) for n in j["names"])
-                      and _model_tokens(j["model"]) & _model_tokens(row.get("model"))}
+                      and same_model(j["model"], row.get("model"))}
         if (jid := _one(candidates)) is not None:
             return jid, "NAME_MODEL"
     return None, None

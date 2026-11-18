@@ -5388,6 +5388,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # see uc03_rules_rerun. A dry run unless the label ends with "-commit".
         from audit_core.uc03_rules_rerun import run_rules_rerun
         return run_rules_rerun, (engine, tag, reports)
+    if kind == "DMS_REMATCH":
+        # The current DMS dumps matched again after the matching changed (2026-11-18): see
+        # uc03_dms_rematch. A dry run (rolled back) unless the label ends with "-commit".
+        from audit_core.uc03_dms_rematch import run_dms_rematch
+        return run_dms_rematch, (engine, tag, reports)
     if kind == "BANK_REMATCH":
         # The dealerships' current bank statements reconciled again after a reconciliation
         # rule changed (2026-11-17): see uc03_bank_rematch. A dry run (rolled back) unless the
