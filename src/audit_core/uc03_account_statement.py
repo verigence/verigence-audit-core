@@ -2245,6 +2245,62 @@ def sync_if_source_of_truth(
                                   stage_code=stage_code, correlation_id=correlation_id)
 
 
+# ── what the NDC charges, and what the ledgers post (2026-11-17/18) ─────────
+# One reading for the Deal review job and the System remarks: the NDC's charges
+# as read now, and what the Tally / DMS customer ledgers debit the customer for
+# FASTag and RSA (shown for a person, never added: the NDC alone prices the deal,
+# product owner 2026-11-15).
+_LEDGER_FASTAG = re.compile(r"\bFAST[ -]?T?T?AGE?\b|\bFT/", re.IGNORECASE)
+_LEDGER_RSA = re.compile(r"\bRSA\b|ROAD ?SIDE", re.IGNORECASE)
+
+
+def ledger_postings(documents: list[dict[str, Any]]) -> dict[str, Decimal]:
+    """What the Tally rows on file debit the customer for FASTag (``fastag``)
+    and RSA (``rsa``): the largest copy's, copies not added up."""
+    out: dict[str, Decimal] = {}
+    for document in documents:
+        rows = line_rows((document.get("fields") or {}).get("line_items"))
+        if statement_kind(rows) != KIND_TALLY:
+            continue
+        found: dict[str, Decimal] = {}
+        for row in rows:
+            label = str(row.get("particulars_raw") or "")
+            try:
+                debit = Decimal(str(row.get("debit_amount"))) if row.get("debit_amount") not in (None, "") else None
+            except (ArithmeticError, ValueError):
+                debit = None
+            if not debit or debit <= 0:
+                continue
+            if _LEDGER_FASTAG.search(label):
+                found["fastag"] = found.get("fastag", Decimal(0)) + debit
+            elif _LEDGER_RSA.search(label):
+                found["rsa"] = found.get("rsa", Decimal(0)) + debit
+        for key, amount in found.items():
+            out[key] = max(out.get(key, Decimal(0)), amount)
+    return out
+
+
+def ndc_charges(connection: Connection, *, tenant_id: str, journey_id: UUID
+                ) -> tuple[dict[str, Decimal] | None, dict[str, Decimal]]:
+    """The NDC's charges as read now (None with no NDC / cost sheet read) and
+    the ledgers' FASTag / RSA postings."""
+    documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+    parsed = [(d, rows, statement_kind(rows)) for d in documents
+              if (rows := line_rows((d.get("fields") or {}).get("line_items")))]
+    forms = [(d, rows) for d, rows, kind in parsed if kind == KIND_FORM]
+    postings = ledger_postings(documents)
+    # Read as the Deal reads them (sync_account_statement): the statement forms,
+    # else the ERP settlement printout, else the cost sheet.
+    statement = combine_statements(forms)[0] if forms else None
+    if statement is not None:
+        return dict(statement.components), postings
+    settlements = [rows for _d, rows, kind in parsed if kind == KIND_ERP]
+    if settlements:
+        return dict(read_erp_settlement(settlements[0]).components), postings
+    sheet, _copies = journey_cost_sheet(connection, tenant_id=tenant_id, journey_id=journey_id)
+    return (dict(sheet.components) if sheet is not None else None), postings
+
+
 __all__ = [
     "COPIES_DIFFERENCE_TASK",
     "COST_SHEET_DIFFERENCE_TASK",
@@ -2275,8 +2331,10 @@ __all__ = [
     "combined_tally_rows",
     "cost_sheet_differences",
     "cost_sheet_discount",
+    "ledger_postings",
     "line_rows",
     "load_ledger_documents",
+    "ndc_charges",
     "read_cost_sheet",
     "read_erp_settlement",
     "read_statement",

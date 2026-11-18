@@ -27,7 +27,6 @@ the job's detail.
 """
 from __future__ import annotations
 
-import re
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID
@@ -39,8 +38,6 @@ from audit_core.db import set_tenant_context
 
 logger = structlog.get_logger(__name__)
 
-_FASTAG = re.compile(r"\bFAST[ -]?T?T?AGE?\b|\bFT/", re.IGNORECASE)
-_RSA = re.compile(r"\bRSA\b|ROAD ?SIDE", re.IGNORECASE)
 _ITEMS_CAP = 1200
 
 
@@ -51,53 +48,20 @@ def _dec(value: Any) -> Decimal | None:
         return None
 
 
-def _ledger_postings(documents: list[dict[str, Any]]) -> dict[str, Decimal]:
-    """What the Tally / DMS customer ledgers (and the Tally rows of the NDC
-    slot) debit the customer for FASTag and RSA, the largest copy's."""
-    from audit_core.uc03_account_statement import KIND_TALLY, line_rows, statement_kind
-
-    out: dict[str, Decimal] = {}
-    for document in documents:
-        rows = line_rows((document.get("fields") or {}).get("line_items"))
-        if statement_kind(rows) != KIND_TALLY:
-            continue
-        found: dict[str, Decimal] = {}
-        for row in rows:
-            label = str(row.get("particulars_raw") or "")
-            debit = _dec(row.get("debit_amount"))
-            if not debit or debit <= 0:
-                continue
-            if _FASTAG.search(label):
-                found["fastag"] = found.get("fastag", Decimal(0)) + debit
-            elif _RSA.search(label):
-                found["rsa"] = found.get("rsa", Decimal(0)) + debit
-        for key, amount in found.items():
-            out[key] = max(out.get(key, Decimal(0)), amount)
-    return out
-
-
 def _row(view: dict[str, Any], key: str) -> dict[str, Any] | None:
     return next((r for g in view.get("categories") or [] for r in g.get("components") or [] if r.get("key") == key),
                 None)
 
 
 def review_journey(connection: Any, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
-    from audit_core.uc03_account_statement import (
-        KIND_FORM,
-        combine_statements,
-        line_rows,
-        load_ledger_documents,
-        statement_kind,
-    )
+    from audit_core.uc03_account_statement import ndc_charges
     from audit_core.uc03_p2_journey360 import deal
 
     view = deal(connection, tenant_id=tenant_id, journey_id=journey_id)
     summary = view.get("summary") or {}
-    documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
-    forms = [(d, rows) for d in documents if statement_kind(rows := line_rows(d["fields"].get("line_items"))) == KIND_FORM]
-    statement, _copies = combine_statements(forms) if forms else (None, None)
-    ndc = statement.components if statement else {}
-    ledger = _ledger_postings(documents)
+    components, ledger = ndc_charges(connection, tenant_id=tenant_id, journey_id=journey_id)
+    statement = components is not None
+    ndc = components or {}
     rto = next((r for k in ("road_tax_registration", "road_tax_amount", "registration_charges")
                 if (r := _row(view, k)) is not None and r.get("standard") is not None and not r.get("partOf")), None)
     scrappage = view.get("scrappage") or {}
@@ -136,7 +100,7 @@ def review_journey(connection: Any, *, tenant_id: str, journey_id: UUID) -> dict
         "variance": (summary.get("variance") or {}).get("currentVsStandard"),
         "lines": lines,
         "deliveryStarted": bool(summary.get("deliveryStarted")),
-        "ndcRead": bool(statement),
+        "ndcRead": statement,
         "rto": {"masterStandard": (rto or {}).get("standardMaster") or (rto or {}).get("standard"),
                 "standard": (rto or {}).get("standard"), "charged": (rto or {}).get("current"),
                 "variance": (rto or {}).get("variance")} if rto else None,
