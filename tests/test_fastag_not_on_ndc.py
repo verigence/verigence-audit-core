@@ -70,3 +70,11 @@ def test_the_journey_is_a_high_observation_and_a_remark_says_why(journey) -> Non
     assert [r["code"] for r in severity["reasons"]] == ["FASTAG_NOT_ON_NDC"]
     [remark] = [r for r in remarks["remarks"] if r["code"] == "FASTAG_NOT_ON_NDC"]
     assert "NDC does not charge" in remark["text"] and "₹600" in remark["text"]
+
+
+def test_the_ndcs_own_charge_of_the_same_amount_under_another_name_is_not_a_second_fastag(journey) -> None:
+    """SHI-SS-261027-010: the NDC's RSA row of Rs 600 is the FASTag the ledger posts."""
+    _statement(journey, [*_without(UTKAL, "Fastag charges", "RSA"), {"particulars_raw": "RSA", "debit_amount": 600}],
+               tally=_tally_fastag())
+    view = _deal(journey)
+    assert _row(view, "fastag_amount")["current"] is None and view["fastagNotOnNdc"] is None

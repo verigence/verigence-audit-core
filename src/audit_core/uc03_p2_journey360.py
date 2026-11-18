@@ -2266,9 +2266,14 @@ def _fastag_from_invoice(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     row = next((r for r in rows if r["key"] == "fastag_amount" and not r.get("partOf")), None)
     if row is None or (_dec(row.get("billed")) or Decimal(0)) > 0:
         return None
+    # The same rupees the NDC charges under another name (SHI-SS-261027-010:
+    # the NDC's "RSA" row struck out with "Fastag 600" over it, beside the
+    # ledger's FASTag 600) are not a second charge.
+    charged_elsewhere = {_dec(r.get("billed")) for r in rows
+                         if r["key"] in ("rsa_amount", "other_charges") and _dec(r.get("billed"))}
     for column, source in (("invoiced", "invoice"), ("ledger", "Tally invoice (customer ledger)")):
         amount = _dec(row.get(column))
-        if amount is not None and amount > 0:
+        if amount is not None and amount > 0 and amount not in charged_elsewhere:
             row["billed"], row["billedFrom"] = _money(amount), "invoice" if column == "invoiced" else "ledger"
             row["flags"] = [*row["flags"], "FASTAG_NOT_ON_NDC"]
             row["fastagNotOnNdc"] = {"amount": str(amount), "source": source}
