@@ -652,12 +652,25 @@ def _name_of(connection: Connection, actor_id: str) -> str | None:
 
 # --------------------------------------------------------------------------- matching a stored dump
 
+OUT_OF_PERIOD = "OUT_OF_PERIOD"
+
+
+def dump_window(period_month: date, business_date: date) -> tuple[date, date]:
+    """The days a dump is compared for (product owner 2026-11-18: "till the day of upload from
+    the start of the month"): the 1st of its month to its upload day, within the month."""
+    month_end = _next_month(period_month) - timedelta(days=1)
+    return period_month, min(business_date, month_end)
+
+
 def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict[str, int]:
-    """Match (again) every row of one dump, store the outcome and mark the Journeys found."""
+    """Match (again) every row of one dump, store the outcome and mark the Journeys found.
+    A row dated outside dump_window is OUT_OF_PERIOD: kept, not compared, not counted."""
     dump = connection.execute(
-        text("SELECT dump_kind, dealer_id FROM auditcore.p2_dms_dumps WHERE tenant_id = :t AND dump_id = :id"),
+        text("SELECT dump_kind, dealer_id, period_month, business_date FROM auditcore.p2_dms_dumps "
+             "WHERE tenant_id = :t AND dump_id = :id"),
         {"t": tenant_id, "id": str(dump_id)},
     ).mappings().one()
+    first, last = dump_window(dump["period_month"], dump["business_date"])
     kind, dealer_id = dump["dump_kind"], dump["dealer_id"]
     index = build_index(connection, tenant_id=tenant_id, dealer_id=dealer_id)
     # The dealership's DMS location names (p2_dms_outlet_map, 2026-11-16), else the outlet names.
@@ -671,6 +684,10 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
     counts = {MATCHED: 0, NOT_IN_TOOL: 0, MISSING: 0, CANCELLED: 0}
     updates, synced = [], []
     for row in rows:
+        if row["event_date"] is not None and not first <= row["event_date"] <= last:
+            updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": None, "b": None,
+                            "o": OUT_OF_PERIOD, "ol": resolve_outlet(row["outlet_label"], outlets)})
+            continue
         jid, basis = match_row(index, kind, dict(row))
         journey = index.journeys.get(jid) if jid else None
         outcome = outcome_of(kind, dict(row), journey)
@@ -910,6 +927,7 @@ def read_dms_dump(
     rows = connection.execute(
         text(_ROW_SQL + """
             AND r.dump_id = :id AND (CAST(:o AS text) IS NULL OR r.outcome = CAST(:o AS text))
+            AND r.outcome <> 'OUT_OF_PERIOD'
             ORDER BY CASE r.outcome WHEN 'MISSING' THEN 0 WHEN 'NOT_IN_TOOL' THEN 1 WHEN 'CANCELLED' THEN 2 ELSE 3 END,
                      r.event_date DESC NULLS LAST, r.row_no
         """),

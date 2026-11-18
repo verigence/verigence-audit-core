@@ -161,15 +161,14 @@ def in_period(found: dict[str, Delivery], first: date, last: date) -> dict[str, 
 def verigence_not_in_dump(connection: Connection, *, tenant_id: str, dump: dict[str, Any], today: date
                           ) -> list[dict[str, Any]]:
     """A delivery dump's other side: the dealership's delivery Journeys dated from the 1st of
-    the dump's month to the last day the dump covers that no row of the dump found. ``dump``:
+    the dump's month to its upload day (dump_window) that no row of the dump found. ``dump``:
     dump_id, dealer_id, period_month, business_date."""
     first = dump["period_month"]
-    covers_to = connection.execute(
-        text("SELECT max(event_date) FROM auditcore.p2_dms_dump_rows WHERE tenant_id = :t AND dump_id = :id "
-             "AND event_date <= :b"),
-        {"t": tenant_id, "id": str(dump["dump_id"]), "b": dump["business_date"]},
-    ).scalar()
-    last = max(first, covers_to) if covers_to else min(dump["business_date"], today)
+    from audit_core.uc03_p2_dms_dumps import dump_window
+
+    # The days the dump is compared for: the 1st to its upload day (2026-11-18).
+    first, last = dump_window(first, dump["business_date"])
+    last = min(last, today)
     found = set(connection.execute(
         text("SELECT DISTINCT CAST(journey_id AS text) FROM auditcore.p2_dms_dump_rows "
              "WHERE tenant_id = :t AND dump_id = :id AND journey_id IS NOT NULL"),

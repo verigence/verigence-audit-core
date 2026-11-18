@@ -155,16 +155,19 @@ def _store(journey, kind: str, rows: list[dict]) -> str:
         connection.execute(text("""
             INSERT INTO auditcore.p2_dms_dumps (tenant_id, dump_id, dump_kind, dealer_id, business_date, period_month,
               file_name, file_format, row_count, uploaded_by)
-            VALUES (:t, :id, :k, :d, CURRENT_DATE, date_trunc('month', CURRENT_DATE)::date, 'f.xlsx', 'X', :n, 'tl')
+            VALUES (:t, :id, :k, :d, CURRENT_DATE, date_trunc('month', CURRENT_DATE - 1)::date, 'f.xlsx', 'X', :n, 'tl')
         """), {"t": journey.tenant_id, "id": dump_id, "k": kind, "d": str(journey.dealer_id), "n": len(rows)})
         for n, row in enumerate(rows, start=1):
             connection.execute(text("""
                 INSERT INTO auditcore.p2_dms_dump_rows (tenant_id, dump_id, row_no, dump_kind, dealer_id, booking_number,
                   dms_booking_number, customer_name, mobile, chassis, model, stage, event_date, raw)
-                VALUES (:t, :id, :n, :k, :d, :b, :o, :c, :m, :ch, :model, :stage, CURRENT_DATE, CAST(:raw AS jsonb))
+                VALUES (:t, :id, :n, :k, :d, :b, :o, :c, :m, :ch, :model, :stage,
+                        CURRENT_DATE - CAST(:back AS integer), CAST(:raw AS jsonb))
             """), {"t": journey.tenant_id, "id": dump_id, "n": n, "k": kind, "d": str(journey.dealer_id),
                    "b": row.get("booking_number"), "o": row.get("dms_booking_number"), "c": row.get("customer_name"),
                    "m": row.get("mobile"), "ch": row.get("chassis"), "model": row.get("model"), "stage": row.get("stage"),
+                   # the day before the upload (compared), unless the row says otherwise
+                   "back": row.get("days_back", 1),
                    "raw": json.dumps({})})
     return dump_id
 
@@ -177,6 +180,8 @@ def test_a_dump_is_matched_marked_reported_and_shown_on_the_calendar(journey) ->
         {"booking_number": "B-13455387", "dms_booking_number": "OTF27A090950", "customer_name": "P2 Customer"},
         {"booking_number": "B-99999999", "dms_booking_number": "OTF27A000001", "customer_name": "Someone Else"},
         {"booking_number": "B-88888888", "customer_name": "Gone", "stage": "Cancellation"},
+        # dated after the upload day: outside the days compared, not counted (2026-11-18)
+        {"booking_number": "B-77777777", "customer_name": "Tomorrow Only", "days_back": -1},
     ])
     delivery = _store(journey, m.DELIVERY, [{"chassis": "T2K61232", "customer_name": "P2 Customer"}])
     with journey.engine.begin() as connection:
@@ -253,3 +258,12 @@ def test_a_booking_row_matches_on_the_name_and_the_booking_date() -> None:
     assert m.match_row(index, m.BOOKING, row) == ("j1", "NAME_DATE")
     # a month away from both, a different model: no Journey is taken on the name alone
     assert m.match_row(index, m.BOOKING, {**row, "event_date": date(2026, 10, 10)}) == (None, None)
+
+
+def test_a_dump_is_compared_from_the_first_to_its_upload_day() -> None:
+    """2026-11-18: uploaded on the 18th, compared for the 1st to the 18th."""
+    from datetime import date
+
+    assert m.dump_window(date(2026, 11, 1), date(2026, 11, 18)) == (date(2026, 11, 1), date(2026, 11, 18))
+    # uploaded on 1 Dec with November's rows: the whole of November
+    assert m.dump_window(date(2026, 11, 1), date(2026, 12, 1)) == (date(2026, 11, 1), date(2026, 11, 30))
