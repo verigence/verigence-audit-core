@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import io
 import json
-from datetime import date
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from conftest import delete_tenant_data
@@ -80,31 +81,40 @@ def setup():
         delete_tenant_data(engine, journey.tenant_id)
 
 
+def _today() -> date:
+    """Today as the Project counts it (its time zone, Asia/Kolkata here), the day the DMS code
+    works by (uc03_p2_dms_dumps._today). Not the database's CURRENT_DATE: that is the UTC day,
+    one day behind from 00:00 to 05:30 IST, when a report "for today" then found no dump."""
+    return datetime.now(UTC).astimezone(ZoneInfo("Asia/Kolkata")).date()
+
+
 def _dump(s, kind: str, rows: list[dict], back: int = 0) -> str:
     """A dump uploaded ``back`` days ago, its rows dated the day before."""
     dump_id = str(uuid4())
+    today = _today()
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
         connection.execute(text("""
             INSERT INTO auditcore.p2_dms_dumps (tenant_id, dump_id, dump_kind, dealer_id, business_date, period_month,
               file_name, file_format, row_count, uploaded_by)
-            VALUES (:t, :id, :k, :d, CURRENT_DATE - CAST(:b AS integer),
-                    date_trunc('month', CURRENT_DATE - 2)::date, 'f.xlsx', 'X', :n, 'rv')
+            VALUES (:t, :id, :k, :d, CAST(:today AS date) - CAST(:b AS integer),
+                    date_trunc('month', CAST(:today AS date) - 2)::date, 'f.xlsx', 'X', :n, 'rv')
         """), {"t": s.journey.tenant_id, "id": dump_id, "k": kind, "d": str(s.journey.dealer_id), "n": len(rows),
-               "b": back})
+               "b": back, "today": today})
         for n, row in enumerate(rows, start=1):
             connection.execute(text("""
                 INSERT INTO auditcore.p2_dms_dump_rows (tenant_id, dump_id, row_no, dump_kind, dealer_id, booking_number,
                   dms_booking_number, customer_name, mobile, chassis, event_date, raw)
-                VALUES (:t, :id, :n, :k, :d, :b, :o, :c, :m, :ch, CURRENT_DATE - CAST(:back AS integer), '{}')
+                VALUES (:t, :id, :n, :k, :d, :b, :o, :c, :m, :ch, CAST(:today AS date) - CAST(:back AS integer),
+                        '{}')
             """), {"t": s.journey.tenant_id, "id": dump_id, "n": n, "k": kind, "d": str(s.journey.dealer_id),
                    "b": row.get("booking_number"), "o": row.get("otf"), "c": row.get("name"), "m": row.get("mobile"),
-                   "ch": row.get("chassis"), "back": row.get("back", back)})
+                   "ch": row.get("chassis"), "back": row.get("back", back), "today": today})
         dumps.match_dump(connection, tenant_id=s.journey.tenant_id, dump_id=dump_id)
     return dump_id
 
 
-@pytest.mark.skipif(date.today().day < 3, reason="needs two dump days in the month")  # noqa: DTZ011
+@pytest.mark.skipif(_today().day < 3, reason="needs two dump days in the month")
 def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(setup) -> None:
     s = setup
     add_extracted_field(s.journey, di_document_id=uuid4(), field_key="booking_reference_number", value="B-13455387")
@@ -171,7 +181,7 @@ def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(set
     assert "Bookings not in Verigence" in book.sheetnames and "PC intimations" in book.sheetnames
     # A day with no dump: nothing to generate.
     assert s.client.post(f"{s.base}/dms-reports",
-                         json={"date": date.today().replace(day=1).isoformat()}).status_code == 409  # noqa: DTZ011
+                         json={"date": _today().replace(day=1).isoformat()}).status_code == 409
 
 
 def test_an_upload_alerts_the_dealership_s_pcs(setup) -> None:
