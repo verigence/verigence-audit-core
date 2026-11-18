@@ -975,7 +975,10 @@ OUTCOME_LABELS = {
 
 
 def build_report(connection: Connection, *, tenant_id: str, dealer_ids: list[str], first: date,
-                 dump_id: UUID | None = None) -> bytes:
+                 dump_id: UUID | None = None, day: date | None = None) -> bytes:
+    """The variance workbook of the month, one upload, or (``day``) the uploads of one day only
+    (product owner 2026-11-18: the download reported every earlier run of the month; each
+    daily dump is month to date, so one day's report is the whole picture as of that day)."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill
 
@@ -985,10 +988,11 @@ def build_report(connection: Connection, *, tenant_id: str, dealer_ids: list[str
             JOIN auditcore.dealers d ON d.tenant_id = u.tenant_id AND d.dealer_id = u.dealer_id
             WHERE u.tenant_id = :t AND u.business_date >= :f AND u.business_date < :l
               AND CAST(u.dealer_id AS text) = ANY(:ds) AND (CAST(:id AS uuid) IS NULL OR u.dump_id = CAST(:id AS uuid))
+              AND (CAST(:day AS date) IS NULL OR u.business_date = CAST(:day AS date))
             ORDER BY u.business_date, lower(d.dealer_name), u.dump_kind
         """),
         {"t": tenant_id, "f": first, "l": _next_month(first), "ds": dealer_ids,
-         "id": str(dump_id) if dump_id else None},
+         "id": str(dump_id) if dump_id else None, "day": day},
     ).mappings().all()
     active = [str(d["dump_id"]) for d in dumps if d["status"] == "ACTIVE" or dump_id is not None]
     rows = connection.execute(
@@ -1040,11 +1044,11 @@ def build_report(connection: Connection, *, tenant_id: str, dealer_ids: list[str
                 sheet.append([item.get(key) for _, key in _COLUMNS])
     # One sheet per day a dump was uploaded (product owner: "with each date wise when the
     # dump was uploaded report should be available").
-    for day in sorted({d["business_date"] for d in dumps if str(d["dump_id"]) in active}):
-        sheet = workbook.create_sheet(f"{day:%d-%b}")
+    for sheet_day in sorted({d["business_date"] for d in dumps if str(d["dump_id"]) in active}):
+        sheet = workbook.create_sheet(f"{sheet_day:%d-%b}")
         header(sheet, [c for c, _ in _COLUMNS])
         for item in items:
-            if item["dumpDate"] == day.isoformat():
+            if item["dumpDate"] == sheet_day.isoformat():
                 sheet.append([item.get(key) for _, key in _COLUMNS])
     for sheet in workbook.worksheets:
         for column in sheet.columns:
@@ -1063,14 +1067,17 @@ def export_dms_dump_report(
     connection: Annotated[Connection, Depends(get_connection)],
     month: str | None = None,
     dump_id: UUID | None = None,
+    day: date | None = None,
 ) -> StreamingResponse:
-    """Export to Excel: the month's (or one upload's) missing bookings and deliveries --
-    Summary, Booking dump variance, Delivery dump variance, and a sheet per dump day."""
+    """Export to Excel: the missing bookings and deliveries of one day's uploads (``day``), one
+    upload, or the month -- Summary, Booking dump variance, Delivery dump variance, and a
+    sheet per dump day."""
     held = _access(connection, tenant_id, principal, client, _READ, READ_ROLES)
-    first = _month(month, _today(connection, tenant_id))
+    first = day.replace(day=1) if day else _month(month, _today(connection, tenant_id))
     dealer_ids = [d["dealerId"] for d in _dealers(connection, tenant_id, principal.subject, "ADMIN" in held)]
-    data = build_report(connection, tenant_id=tenant_id, dealer_ids=dealer_ids, first=first, dump_id=dump_id)
-    name = f"DMS-Dump-Variance_{first:%Y-%m}.xlsx"
+    data = build_report(connection, tenant_id=tenant_id, dealer_ids=dealer_ids, first=first, dump_id=dump_id,
+                        day=day)
+    name = f"DMS-Dump-Variance_{day:%Y-%m-%d}.xlsx" if day else f"DMS-Dump-Variance_{first:%Y-%m}.xlsx"
     return StreamingResponse(io.BytesIO(data), media_type=(
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         headers={"Content-Disposition": f'attachment; filename="{name}"'})
