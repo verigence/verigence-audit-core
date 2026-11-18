@@ -141,3 +141,19 @@ def test_a_daily_dump_is_compared_with_the_days_it_covers_only(dealer):
     assert figures["deliveryInVerigence"] == 4
     assert figures["deliveryDatedWithoutGatePass"] == 3
     assert figures["deliveryNotInDms"] == 3
+
+
+def test_dms_rematch_job_dry_run_then_commit(dealer):
+    """DMS_REMATCH: the current dumps matched again; a dry run writes nothing."""
+    from audit_core.uc03_dms_rematch import run_dms_rematch
+
+    with dealer.engine.begin() as c:  # the dump's synced row as if never matched
+        c.execute(text("UPDATE auditcore.p2_dms_dump_rows SET outcome = 'MISSING', journey_id = NULL "
+                       "WHERE tenant_id = :t"), {"t": dealer.tenant_id})
+    dry = run_dms_rematch(dealer.engine, f"{dealer.tenant_id}:dms-rematch-test", [])
+    assert (dry["commit"], dry["dumps"], dry["failed"]) == (False, 1, 0)
+    with dealer.engine.begin() as c:
+        assert c.execute(text("SELECT count(*) FROM auditcore.p2_dms_dump_rows WHERE tenant_id = :t "
+                              "AND outcome <> 'MISSING'"), {"t": dealer.tenant_id}).scalar_one() == 0
+    done = run_dms_rematch(dealer.engine, f"{dealer.tenant_id}:dms-rematch-test-commit", [])
+    assert done["commit"] is True and done["failed"] == 0

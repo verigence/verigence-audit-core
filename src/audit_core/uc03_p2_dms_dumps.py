@@ -39,7 +39,10 @@ A dump row is matched to a Journey of the same dealership, in this order:
                   invoice, insurance cover or RTO challan (CHASSIS_DOCUMENT_TYPES)
   MOBILE          the customer's mobile (last 10 digits) on the booking form, a receipt
                   or the KYC
-  NAME_MODEL      the same customer name and model, only when one Journey has it
+  NAME_DATE       (booking) the same customer name, the Journey booked within 3 days of the
+                  DMS booking date, only when one Journey has it (2026-11-18)
+  NAME_MODEL      the same customer name and model (same_model: spacing aside, one name
+                  within the other), only when one Journey has it
 Outcome per row: MATCHED; for a delivery row, NOT_IN_TOOL when its Journey is found but
 no delivery file is on it yet; MISSING when no Journey has it; CANCELLED for a booking
 the DMS shows cancelled (not counted as missing).
@@ -371,6 +374,19 @@ def _model_tokens(value: Any) -> set[str]:
     return {t for t in re.findall(r"[A-Z0-9]+", str(value or "").upper().replace("-", "")) if len(t) >= 3}
 
 
+def same_model(a: Any, b: Any) -> bool:
+    """The same car, however the DMS and the papers space or extend its name (2026-11-18:
+    "XEV9S" / "XEV 9S", "BE 6" / "BE6 Pack Three 79", "3XO" / "XUV3XO EV" were taken for
+    different models and the bookings reported "not in Verigence"): the names compared with
+    spaces and punctuation taken out, one within the other (3 characters at least), or a
+    word in common."""
+    if _model_tokens(a) & _model_tokens(b):
+        return True
+    x, y = re.sub(r"[^A-Z0-9]", "", str(a or "").upper()), re.sub(r"[^A-Z0-9]", "", str(b or "").upper())
+    shorter, longer = sorted((x, y), key=len)
+    return len(shorter) >= 3 and shorter in longer
+
+
 @dataclass
 class JourneyIndex:
     by_ref: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
@@ -421,7 +437,7 @@ _INDEX_SQL = """
                COALESCE(NULLIF(c.legal_name, ''),
                         CASE WHEN c.display_name ~* '^[0-9a-f]{8}-[0-9a-f]{4}-' THEN NULL ELSE c.display_name END)
                  AS customer_name,
-               c.mobile_number, b.booking_reference, jp.model_name_snapshot AS model,
+               c.mobile_number, b.booking_reference, b.booking_date, jp.model_name_snapshot AS model,
                (dl.actual_delivered_at IS NOT NULL OR ds.first_started_at_utc IS NOT NULL) AS has_delivery,
                vr.vin, vr.chassis_number
         FROM auditcore.journeys j
@@ -463,6 +479,7 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
             journey = index.journeys[jid] = {
                 "journeyId": jid, "reference": r["journey_reference"], "outletId": r["outlet_id"],
                 "customer": r["customer_name"], "names": set(), "model": r["model"],
+                "bookingDate": r["booking_date"],
                 "hasDelivery": bool(r["has_delivery"]),
             }
             for key in journey_ref_keys(r["booking_reference"]):
@@ -497,6 +514,9 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
     return index
 
 
+NAME_DATE_DAYS = 3
+
+
 def _one(found: set[str]) -> str | None:
     return next(iter(found)) if len(found) == 1 else None
 
@@ -513,15 +533,22 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any]) -> tuple[str 
         if (jid := _one(found)) is not None:
             return jid, "MOBILE"
         # one customer, two bookings: the one of the same model
-        same_model = {j for j in found if _model_tokens(index.journeys[j]["model"]) & _model_tokens(row.get("model"))}
-        if (jid := _one(same_model)) is not None:
+        same_model_ = {j for j in found if same_model(index.journeys[j]["model"], row.get("model"))}
+        if (jid := _one(same_model_)) is not None:
             return jid, "MOBILE"
     name = row.get("customer_name")
     if name:
-        candidates = {jid for jid, j in index.journeys.items()
-                      if any(same_person(name, n) for n in j["names"])
-                      and _model_tokens(j["model"]) & _model_tokens(row.get("model"))}
-        if (jid := _one(candidates)) is not None:
+        named = {jid for jid, j in index.journeys.items() if any(same_person(name, n) for n in j["names"])}
+        # A booking row: the customer's name and the booking date the DMS prints, within
+        # NAME_DATE_DAYS of the Journey's (2026-11-18: papers often carry no OTF or a misread
+        # mobile; the date, not the model, tells two customers of one name apart).
+        day = row.get("event_date")
+        if kind == BOOKING and isinstance(day, date):
+            dated = {j for j in named if index.journeys[j].get("bookingDate") is not None
+                     and abs((index.journeys[j]["bookingDate"] - day).days) <= NAME_DATE_DAYS}
+            if (jid := _one(dated)) is not None:
+                return jid, "NAME_DATE"
+        if (jid := _one({j for j in named if same_model(index.journeys[j]["model"], row.get("model"))})) is not None:
             return jid, "NAME_MODEL"
     return None, None
 
