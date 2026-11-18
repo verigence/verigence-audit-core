@@ -55,6 +55,17 @@ def _deal_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -
     for line in concession_remarks(list((undercharged.details or {}).get("scrappageConcession") or [])):
         remarks.append(_remark("SCRAPPAGE_CONCESSION", "Scrappage concession on registration", line, "Deal"))
     seen: set[str] = set()
+    # FASTag not on the NDC (product owner 2026-11-18: "for fast tag there is
+    # no tally invoice... if it is not in NDC then put a comment in system
+    # remarks"): with an NDC read, a FASTag it does not charge is said so --
+    # whether or not the price master prices it -- with what the dealer's
+    # ledger posts for it, if anything; never added to the Deal.
+    from audit_core.uc03_account_statement import ndc_charges
+
+    fastag = fastag_not_on_ndc(*ndc_charges(connection, tenant_id=tenant_id, journey_id=journey_id))
+    if fastag is not None:
+        seen.add("FASTag")
+        remarks.append(fastag)
     for row in (facts.sheet.get("summary") or {}).get("notTaken") or []:
         product = _NOT_TAKEN_PRODUCTS.get(str(row.get("key") or ""))
         if not product or product in seen:
@@ -66,6 +77,22 @@ def _deal_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                                f"No bill on file charges the {product}{priced}: the customer did not take it, "
                                "so it is not counted as an undercharge.", "Deal"))
     return remarks
+
+
+def fastag_not_on_ndc(ndc: dict[str, Decimal] | None, ledger: dict[str, Decimal]) -> dict[str, Any] | None:
+    """The remark for a FASTag the NDC does not charge (2026-11-18), with what
+    the dealer's ledger posts for one; None with no NDC read or a FASTag on it."""
+    from audit_core.uc03_p2_audit_rules import _rupees
+
+    if ndc is None or (ndc.get("fastag_amount") or Decimal(0)) > 0:
+        return None
+    posted = ledger.get("fastag")
+    return _remark(
+        "FASTAG_NOT_ON_NDC", "FASTag not on the NDC",
+        "The NDC does not charge a FASTag"
+        + (f"; the dealer's ledger posts {_rupees(posted)} for one, not counted on the Deal (the NDC prices the "
+           "deal)." if posted else ": the customer did not take it from the dealership, so it is not counted as "
+           "an undercharge."), "NDC")
 
 
 def _bh_remark(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
