@@ -149,14 +149,17 @@ def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(set
 
     # Only the Reviewer and above see the counter and generate the report.
     assert s.client.get(f"{s.base}/dms-intimations/counter", params={"kind": "BOOKING"}).status_code == 403
-    assert s.client.post(f"{s.base}/dms-reports", json={}).status_code == 403
+    assert s.client.post(f"{s.base}/dms-reports", json={}).status_code == 403  # a PC may not
     s.acting["subject"] = s.reviewer
     [dealer] = s.client.get(f"{s.base}/dms-intimations/counter", params={"kind": "BOOKING"}).json()["dealers"]
     assert dealer["totals"] == {"rows": 3, "inVerigence": 1, "intimated": 1, "open": 1, "newRows": 1, "newOpen": 1}
     [pc] = dealer["pcs"]
     assert pc["actorId"] == s.journey.actor_id and pc["marked"] == 1 and pc["markedNew"] == 0
 
-    made = s.client.post(f"{s.base}/dms-reports", json={})
+    # The dumps are dated by the database's day; the Project's day (IST) can be a day ahead.
+    with s.journey.engine.begin() as connection:
+        db_day = connection.execute(text("SELECT CURRENT_DATE")).scalar_one()
+    made = s.client.post(f"{s.base}/dms-reports", json={"date": db_day.isoformat()})
     assert made.status_code == 201, made.text
     figures = made.json()["figures"]
     assert (figures["bookingDms"], figures["bookingSynced"], figures["bookingIntimated"],
@@ -171,7 +174,7 @@ def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(set
     assert "Bookings not in Verigence" in book.sheetnames and "PC intimations" in book.sheetnames
     # A day with no dump: nothing to generate.
     assert s.client.post(f"{s.base}/dms-reports",
-                         json={"date": date.today().replace(day=1).isoformat()}).status_code == 409  # noqa: DTZ011
+                         json={"date": db_day.replace(day=1).isoformat()}).status_code == 409
 
 
 def test_an_upload_alerts_the_dealership_s_pcs(setup) -> None:
