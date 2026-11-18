@@ -518,3 +518,59 @@ def test_the_backfill_raises_the_tl_task_for_corrections_made_before_it(journey)
     assert task["reference"]["correctionCount"] == 1
     run_reviewer_corrections_backfill(journey.engine, "rcb2-commit", [journey.tenant_id])
     assert len(_corrections_task(journey)) == 1          # idempotent
+
+
+# --- a correction lands on the stored value, whatever stage it was stored under ----------------
+# Product owner 2026-11-18: "PC closed manual verification but it is not closed.. it is still
+# open, why so". UTK-JI-261019-002: the receipt dates were stored under DELIVERY, the screen had
+# the page under BOOKING, so each correction became a second row and the value as read stayed
+# "not reviewed" -- the task waiting on it could never close.
+
+def _field_rows(journey, document_id):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return connection.execute(
+            text("SELECT stage_code, effective_value, extracted_value, is_modified, reviewed_at_utc IS NOT NULL AS reviewed "
+                 "FROM auditcore.journey_document_extracted_fields WHERE tenant_id=:t AND journey_id=:j "
+                 "AND di_document_id=:d AND field_key='amount' ORDER BY stage_code"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "d": document_id},
+        ).mappings().all()
+
+
+def _store_under(journey, document_id, stage):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.journey_document_extracted_fields SET stage_code=:s WHERE tenant_id=:t "
+                 "AND journey_id=:j AND di_document_id=:d AND field_key='amount'"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "d": document_id, "s": stage},
+        )
+
+
+def test_a_correction_goes_onto_the_stored_row_not_a_second_one(journey):
+    pc = _actor(journey, "PC")
+    _, _, document = add_page(journey, page_number=1, status="READY")
+    _confident_field(journey, document)
+    _store_under(journey, document, "DELIVERY")
+
+    _correct(journey, document, pc, "PC", value="125000")
+
+    [row] = _field_rows(journey, document)
+    assert row["stage_code"] == "DELIVERY" and row["effective_value"] == "125000"
+    assert row["extracted_value"] == "100000" and row["is_modified"] and row["reviewed"]
+
+
+def test_a_value_stored_under_both_stages_is_corrected_under_both(journey):
+    pc = _actor(journey, "PC")
+    _, _, document = add_page(journey, page_number=1, status="READY")
+    _confident_field(journey, document)
+    _store_under(journey, document, "DELIVERY")
+    _confident_field(journey, document)  # the same value again, under BOOKING
+
+    _correct(journey, document, pc, "PC", value="125000")
+
+    rows = _field_rows(journey, document)
+    assert [r["stage_code"] for r in rows] == ["BOOKING", "DELIVERY"]
+    assert all(r["effective_value"] == "125000" and r["reviewed"] and r["is_modified"] for r in rows)
+    assert all(r["extracted_value"] == "100000" for r in rows)
+

@@ -26,6 +26,10 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.security_integration import SecurityOAuthClient
+from audit_core.uc03_di_core_persistence import (
+    ReviewedDiField,
+    persist_reviewed_di_fields,
+)
 from audit_core.uc03_document_capture_v2 import (
     _DI_AUDIENCE,
     _ensure_di_context,
@@ -1006,13 +1010,16 @@ def correct_p2_document_field(
         journey_id=journey_id,
         document_id=document_id,
     )
-    field = connection.execute(
+    # Every stored copy of the value, the one last touched first. The table keeps a value per
+    # stage, and a page whose stage changed after it was read has its value under the old stage
+    # (and, read again, under both).
+    copies = connection.execute(
         text(
             """
             SELECT evidence_id, source_document_type_key, field_key,
                    source_canonical_field_id, source_fact_version,
                    confidence_score, extracted_value, effective_value,
-                   is_modified
+                   is_modified, stage_code
             FROM auditcore.journey_document_extracted_fields
             WHERE tenant_id=:tenant_id
               AND journey_id=:journey_id
@@ -1021,7 +1028,6 @@ def correct_p2_document_field(
               AND source_fact_version=:source_fact_version
               AND field_key=:field_key
             ORDER BY updated_at_utc DESC
-            LIMIT 1
             """
         ),
         {
@@ -1032,7 +1038,8 @@ def correct_p2_document_field(
             "source_fact_version": command.sourceFactVersion,
             "field_key": command.fieldKey,
         },
-    ).mappings().one_or_none()
+    ).mappings().all()
+    field = copies[0] if copies else None
     if field is None:
         raise HTTPException(status_code=409, detail=_field_missing_detail(
             connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id))
@@ -1077,11 +1084,16 @@ def correct_p2_document_field(
     # The Team Lead and the Reviewer are informed instead: the journey's
     # activity records who changed what, from which value, at what confidence.
     reviewer = (access.operating_role or "").upper() == "REVIEWER"
+    # The correction goes onto the row the value was read from, under that row's own stage --
+    # not the page's stage as the document screen has it. Where the two differed, the
+    # correction was stored as a second row and the value as read stayed "not reviewed", so
+    # the PC's manual verification task could never close (UTK-JI-261019-002, Suresh Kumar
+    # Barik: two receipt dates corrected on 12 and 17 Nov, both tasks still open on 18 Nov).
     _apply_field_value(
         connection,
         tenant_id=tenant_id,
         journey_id=journey_id,
-        stage_code=str(context["stage_code"]),
+        stage_code=str(field["stage_code"] or context["stage_code"]),
         document_id=document_id,
         evidence_id=field["evidence_id"],
         document_type_key=(
@@ -1096,6 +1108,33 @@ def correct_p2_document_field(
         new_value=command.newValue,
         actor_id=human_principal.subject,
     )
+    # A value already stored under two stages is corrected under both: one value on the page,
+    # one answer, whichever copy a reader takes.
+    for copy in copies[1:]:
+        if copy["stage_code"] == field["stage_code"]:
+            continue
+        copy_confidence = float(copy["confidence_score"]) if copy["confidence_score"] is not None else None
+        persist_reviewed_di_fields(
+            connection,
+            tenant_id=tenant_id,
+            journey_id=journey_id,
+            stage_code=str(copy["stage_code"]),
+            actor_id=human_principal.subject,
+            fields=[ReviewedDiField(
+                document_id=document_id,
+                evidence_id=copy["evidence_id"],
+                source_canonical_field_id=command.canonicalFieldId,
+                source_document_type_key=copy["source_document_type_key"] or context["document_type_key"],
+                field_key=command.fieldKey,
+                source_fact_version=command.sourceFactVersion,
+                extracted_value=copy["extracted_value"],
+                modified_value=command.newValue,
+                effective_value=command.newValue,
+                is_modified=True,
+                confidence_score=copy_confidence,
+                confidence_scale="PERCENT" if copy_confidence is not None else None,
+            )],
+        )
     log_field_change(
         connection,
         tenant_id=tenant_id,
