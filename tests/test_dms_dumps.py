@@ -227,3 +227,21 @@ def test_a_model_spaced_or_extended_differently_is_the_same_car() -> None:
     index.journeys = {"j1": {"journeyId": "j1", "model": "XEV9S", "names": {"RENUBALA ROUT"}, "hasDelivery": False,
                              "outletId": None}}
     assert m.match_row(index, m.BOOKING, {"customer_name": "RENUBALA ROUT", "model": "XEV 9S"}) == ("j1", "NAME_MODEL")
+
+
+def test_a_booking_row_matches_on_the_name_and_the_booking_date() -> None:
+    # 2026-11-18: no OTF and no mobile on the papers; the DMS booking date tells two
+    # customers of one name apart, whatever the model is called.
+    from datetime import date
+
+    index = m.JourneyIndex()
+    index.journeys = {
+        "j1": {"journeyId": "j1", "model": "XEV9S", "names": {"RENUBALA ROUT"}, "hasDelivery": False,
+               "outletId": None, "bookingDate": date(2026, 11, 7)},
+        "j2": {"journeyId": "j2", "model": "THAR", "names": {"Renubala Rout"}, "hasDelivery": False,
+               "outletId": None, "bookingDate": date(2026, 9, 1)},
+    }
+    row = {"customer_name": "RENUBALA ROUT", "model": "Something else", "event_date": date(2026, 11, 8)}
+    assert m.match_row(index, m.BOOKING, row) == ("j1", "NAME_DATE")
+    # a month away from both, a different model: no Journey is taken on the name alone
+    assert m.match_row(index, m.BOOKING, {**row, "event_date": date(2026, 10, 10)}) == (None, None)

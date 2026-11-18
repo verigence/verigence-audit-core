@@ -39,6 +39,8 @@ A dump row is matched to a Journey of the same dealership, in this order:
                   invoice, insurance cover or RTO challan (CHASSIS_DOCUMENT_TYPES)
   MOBILE          the customer's mobile (last 10 digits) on the booking form, a receipt
                   or the KYC
+  NAME_DATE       (booking) the same customer name, the Journey booked within 3 days of the
+                  DMS booking date, only when one Journey has it (2026-11-18)
   NAME_MODEL      the same customer name and model (same_model: spacing aside, one name
                   within the other), only when one Journey has it
 Outcome per row: MATCHED; for a delivery row, NOT_IN_TOOL when its Journey is found but
@@ -435,7 +437,7 @@ _INDEX_SQL = """
                COALESCE(NULLIF(c.legal_name, ''),
                         CASE WHEN c.display_name ~* '^[0-9a-f]{8}-[0-9a-f]{4}-' THEN NULL ELSE c.display_name END)
                  AS customer_name,
-               c.mobile_number, b.booking_reference, jp.model_name_snapshot AS model,
+               c.mobile_number, b.booking_reference, b.booking_date, jp.model_name_snapshot AS model,
                (dl.actual_delivered_at IS NOT NULL OR ds.first_started_at_utc IS NOT NULL) AS has_delivery,
                vr.vin, vr.chassis_number
         FROM auditcore.journeys j
@@ -477,6 +479,7 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
             journey = index.journeys[jid] = {
                 "journeyId": jid, "reference": r["journey_reference"], "outletId": r["outlet_id"],
                 "customer": r["customer_name"], "names": set(), "model": r["model"],
+                "bookingDate": r["booking_date"],
                 "hasDelivery": bool(r["has_delivery"]),
             }
             for key in journey_ref_keys(r["booking_reference"]):
@@ -511,6 +514,9 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
     return index
 
 
+NAME_DATE_DAYS = 3
+
+
 def _one(found: set[str]) -> str | None:
     return next(iter(found)) if len(found) == 1 else None
 
@@ -532,10 +538,17 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any]) -> tuple[str 
             return jid, "MOBILE"
     name = row.get("customer_name")
     if name:
-        candidates = {jid for jid, j in index.journeys.items()
-                      if any(same_person(name, n) for n in j["names"])
-                      and same_model(j["model"], row.get("model"))}
-        if (jid := _one(candidates)) is not None:
+        named = {jid for jid, j in index.journeys.items() if any(same_person(name, n) for n in j["names"])}
+        # A booking row: the customer's name and the booking date the DMS prints, within
+        # NAME_DATE_DAYS of the Journey's (2026-11-18: papers often carry no OTF or a misread
+        # mobile; the date, not the model, tells two customers of one name apart).
+        day = row.get("event_date")
+        if kind == BOOKING and isinstance(day, date):
+            dated = {j for j in named if index.journeys[j].get("bookingDate") is not None
+                     and abs((index.journeys[j]["bookingDate"] - day).days) <= NAME_DATE_DAYS}
+            if (jid := _one(dated)) is not None:
+                return jid, "NAME_DATE"
+        if (jid := _one({j for j in named if same_model(index.journeys[j]["model"], row.get("model"))})) is not None:
             return jid, "NAME_MODEL"
     return None, None
 
