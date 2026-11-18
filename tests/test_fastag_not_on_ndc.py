@@ -78,3 +78,11 @@ def test_the_ndcs_own_charge_of_the_same_amount_under_another_name_is_not_a_seco
                tally=_tally_fastag())
     view = _deal(journey)
     assert _row(view, "fastag_amount")["current"] is None and view["fastagNotOnNdc"] is None
+
+
+def test_the_same_rupees_read_as_handling_charges_on_the_ndc_are_not_a_second_fastag(journey) -> None:
+    """UTK-SW-261110-004: one NDC copy reads the FASTag 600 as "Handling charges"."""
+    _statement(journey, [*_without(UTKAL, "Fastag charges"), {"particulars_raw": "Handling charges", "debit_amount": 600}],
+               tally=_tally_fastag())
+    view = _deal(journey)
+    assert _row(view, "fastag_amount")["current"] is None and view["fastagNotOnNdc"] is None
