@@ -746,6 +746,30 @@ def dump_window(period_month: date, business_date: date) -> tuple[date, date]:
     return period_month, min(business_date, month_end)
 
 
+def dms_dates(connection: Connection, tenant_id: str, dealer_id: str, upto: date) -> dict[str, dict[str, date]]:
+    """kind -> Journey -> the date the DMS gives it. The DMS is the source of truth for the date
+    of a booking or a delivery (product owner 2026-11-19: "you have to stick to the DMS date ...
+    DMS will always be source of truth.. no matter"): a Journey any of the dealership's dumps
+    found is dated by that dump's row, whatever date Verigence reads from the papers. From the
+    dealership's active dumps uploaded up to ``upto``; the latest dump's row decides."""
+    out: dict[str, dict[str, date]] = {BOOKING: {}, DELIVERY: {}}
+    for r in connection.execute(
+        text("""
+            SELECT r.dump_kind, CAST(r.journey_id AS text) AS journey_id, r.event_date
+            FROM auditcore.p2_dms_dump_rows r
+            JOIN auditcore.p2_dms_dumps u ON u.tenant_id = r.tenant_id AND u.dump_id = r.dump_id
+            WHERE r.tenant_id = :t AND CAST(u.dealer_id AS text) = :d AND u.status = 'ACTIVE'
+              AND u.business_date <= :upto AND r.journey_id IS NOT NULL AND r.event_date IS NOT NULL
+              AND r.outcome NOT IN ('OUT_OF_PERIOD', 'EXCLUDED', 'DUPLICATE')
+            ORDER BY u.business_date, u.uploaded_at_utc, r.row_no
+        """),
+        {"t": tenant_id, "d": str(dealer_id), "upto": upto},
+    ).mappings():
+        if r["dump_kind"] in out:
+            out[r["dump_kind"]][r["journey_id"]] = r["event_date"]
+    return out
+
+
 def chassis_manufacture_month(value: Any, *, today: date | None = None) -> date | None:
     """The 1st of the month a Mahindra vehicle was made in, from a full VIN or from the last
     eight characters a delivery report prints (T2H76332: year T = 2026, plant 2, month H =
@@ -1409,6 +1433,19 @@ def get_dms_dump_calendar(
 
 
 __all__ = [
-    "booking_keys", "build_index", "chassis_key", "detect_kind", "dump_calendar", "journey_ref_keys",
-    "match_dump", "match_row", "mobile_key", "outcome_of", "outlet_for", "parse_date", "parse_workbook", "router",
+    "booking_keys",
+    "build_index",
+    "chassis_key",
+    "detect_kind",
+    "dms_dates",
+    "dump_calendar",
+    "journey_ref_keys",
+    "match_dump",
+    "match_row",
+    "mobile_key",
+    "outcome_of",
+    "outlet_for",
+    "parse_date",
+    "parse_workbook",
+    "router",
 ]

@@ -143,6 +143,76 @@ def test_a_daily_dump_is_compared_with_the_days_it_covers_only(dealer):
     assert figures["deliveryNotInDms"] == 3
 
 
+def test_the_dms_date_decides_whatever_verigence_reads(dealer):
+    """Product owner, 19 Nov 2026: "you have to stick to the DMS date.. check DMS Dump date and
+    compare the data accordingly.. DMS will always be source of truth.. no matter"."""
+    from audit_core.uc03_p2_dms_dumps import dms_dates
+    from audit_core.uc03_p2_dms_outlet_report import build_outlet_report
+
+    j = dealer.journeys
+    with dealer.engine.begin() as c:
+        def dump(kind: str, business_date: date, period: date, rows: list[tuple[date, str | None, str]]) -> None:
+            dump_id = uuid4()
+            c.execute(text("""INSERT INTO auditcore.p2_dms_dumps (tenant_id, dump_id, dump_kind, dealer_id,
+                    business_date, period_month, file_name, file_format, row_count, uploaded_by)
+                    VALUES (:t, :id, :k, :d, :b, :p, 'x.xlsx', 'DMS', :n, 'u')"""),
+                      {"t": dealer.tenant_id, "id": dump_id, "k": kind, "d": dealer.dealer_id, "b": business_date,
+                       "p": period, "n": len(rows)})
+            for n, (day, jid, outcome) in enumerate(rows, start=1):
+                c.execute(text("""INSERT INTO auditcore.p2_dms_dump_rows (tenant_id, dump_id, row_no, dump_kind,
+                        dealer_id, event_date, journey_id, outcome, outlet_label)
+                        VALUES (:t, :id, :n, :k, :d, :e, CAST(:j AS uuid), :o, 'Main')"""),
+                          {"t": dealer.tenant_id, "id": dump_id, "n": n, "k": kind, "d": dealer.dealer_id, "e": day,
+                           "j": jid, "o": outcome})
+
+        # October's dump dates NDCONLY's delivery on 31 Oct; Verigence reads 4 Nov from its NDC.
+        dump("DELIVERY", date(2026, 10, 31), date(2026, 10, 1), [(date(2026, 10, 31), j["NDCONLY"], "MATCHED")])
+        # The fixture's dump of 6 Nov (GATEPASS on the 3rd, one row not in Verigence) gets two more rows:
+        # LATERGP on the 4th (Verigence reads the 8th from its gate pass) and NODATE on the 5th (a
+        # delivery file with no delivery date read at all).
+        c.execute(text("""INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code,
+                business_status, first_started_at_utc) VALUES (:t, :j, 'DELIVERY', 'IN_PROGRESS', now())"""),
+                  {"t": dealer.tenant_id, "j": j["BOOKINGONLY"]})
+        for n, (day, name) in enumerate(((date(2026, 11, 4), "LATERGP"), (date(2026, 11, 5), "BOOKINGONLY")), start=3):
+            c.execute(text("""INSERT INTO auditcore.p2_dms_dump_rows (tenant_id, dump_id, row_no, dump_kind, dealer_id,
+                    event_date, journey_id, outcome, outlet_label)
+                    VALUES (:t, :id, :n, 'DELIVERY', :d, :e, CAST(:j AS uuid), 'MATCHED', 'Main')"""),
+                      {"t": dealer.tenant_id, "id": dealer.dump_id, "n": n, "d": dealer.dealer_id, "e": day,
+                       "j": j[name]})
+        c.execute(text("UPDATE auditcore.p2_dms_dump_rows SET outlet_label = 'Main' WHERE tenant_id = :t"),
+                  {"t": dealer.tenant_id})
+        # The booking dump of 6 Nov: GATEPASS booked on 3 Nov per the DMS; Verigence reads 20 Oct
+        # from its receipt's booking. One more row is not in Verigence.
+        dump("BOOKING", date(2026, 11, 6), date(2026, 11, 1),
+             [(date(2026, 11, 3), j["GATEPASS"], "MATCHED"), (date(2026, 11, 2), None, "MISSING")])
+
+        dated = dms_dates(c, dealer.tenant_id, dealer.dealer_id, date(2026, 11, 6))
+        assert dated["DELIVERY"][j["NDCONLY"]] == date(2026, 10, 31)
+        assert dated["DELIVERY"][j["LATERGP"]] == date(2026, 11, 4)
+        assert dated["BOOKING"][j["GATEPASS"]] == date(2026, 11, 3)
+        # A dump uploaded after the report's day is not read.
+        assert dms_dates(c, dealer.tenant_id, dealer.dealer_id, date(2026, 11, 5))["BOOKING"] == {}
+
+        report = build_outlet_report(c, tenant_id=dealer.tenant_id,
+                                     dealers=[{"dealerId": dealer.dealer_id, "dealerName": "D"}],
+                                     day=date(2026, 11, 6), today=TODAY)
+        dump_row = dict(c.execute(text("SELECT dump_id, dealer_id, period_month, business_date FROM auditcore.p2_dms_dumps "
+                                       "WHERE tenant_id = :t AND dump_id = :id"),
+                                  {"t": dealer.tenant_id, "id": dealer.dump_id}).mappings().one())
+        not_in_dump = dd.verigence_not_in_dump(c, tenant_id=dealer.tenant_id, dump=dump_row, today=TODAY)
+    f = report["dealers"][0]["figures"]
+    # Bookings: the DMS's 3 Nov, not Verigence's 20 Oct -- synced and in Verigence.
+    assert (f["bookingDms"], f["bookingSynced"], f["bookingNotInVerigence"]) == (2, 1, 1)
+    assert f["bookingInVerigence"] == f["bookingSynced"] + f["bookingNotInDms"]
+    # Deliveries: GATEPASS, LATERGP (DMS 4 Nov, Verigence 8 Nov) and BOOKINGONLY (no date read) synced;
+    # NDCONLY is October's per the DMS, so not counted in November though Verigence reads 4 Nov.
+    assert (f["deliveryDump"], f["deliverySynced"], f["deliveryNotInVerigence"]) == (4, 3, 1)
+    assert f["deliveryInVerigence"] == f["deliverySynced"] + f["deliveryNotInDms"]
+    assert "deliveryDatedElsewhere" not in f and "datedElsewhere" not in report
+    names = {v: k for k, v in j.items()}
+    assert sorted(names[r["journeyId"]] for r in not_in_dump) == ["MISREAD", "RECEIPTONLY"]
+
+
 def test_dms_rematch_job_dry_run_then_commit(dealer):
     """DMS_REMATCH: the current dumps matched again; a dry run writes nothing."""
     from audit_core.uc03_dms_rematch import run_dms_rematch

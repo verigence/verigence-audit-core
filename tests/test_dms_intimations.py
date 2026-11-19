@@ -175,12 +175,11 @@ def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(set
     made = s.client.post(f"{s.base}/dms-reports", json={})
     assert made.status_code == 201, made.text
     figures = made.json()["figures"]
-    # The Journey is in Verigence; whether Verigence dates its booking in the same days decides
-    # synced or "dated outside the period" (2026-11-19). The figures add up either way.
-    assert (figures["bookingDms"], figures["bookingSynced"] + figures["bookingDatedElsewhere"],
-            figures["bookingIntimated"], figures["bookingNotIntimated"]) == (3, 1, 1, 1)
-    assert figures["bookingDms"] == (figures["bookingSynced"] + figures["bookingDatedElsewhere"]
-                                     + figures["bookingNotInVerigence"])
+    # The Journey is in Verigence: synced, on the DMS's date whatever Verigence reads (2026-11-19).
+    assert (figures["bookingDms"], figures["bookingSynced"], figures["bookingIntimated"],
+            figures["bookingNotIntimated"]) == (3, 1, 1, 1)
+    assert "bookingDatedElsewhere" not in figures
+    assert figures["bookingDms"] == figures["bookingSynced"] + figures["bookingNotInVerigence"]
     assert figures["bookingInVerigence"] == figures["bookingSynced"] + figures["bookingNotInDms"]
     listed_reports = s.client.get(f"{s.base}/dms-reports").json()["items"]
     assert [r["reportId"] for r in listed_reports] == [made.json()["reportId"]]
