@@ -690,12 +690,17 @@ def chassis_manufacture_month(value: Any, *, today: date | None = None) -> date 
 
 
 class DeliveryScope:
-    """The Deal Type rule (uc03_p2_journey_classification) for a delivery dump row
-    (product owner 2026-11-19). A row whose Journey is in Verigence takes the Journey's own
-    Deal Type -- the Team Lead's call included. Any other row: the rule on the row itself --
-    its chassis gives the month of manufacture, its delivery date the age, and the booking
-    date is the one the report prints, else the Journey's, else the dealership's booking dump
-    row with the same booking number / OTF. A booking date after the delivery is not one."""
+    """The Deal Type rule (uc03_p2_journey_classification) for a delivery dump row.
+
+    Product owner 2026-11-19: "for a delivery dump, we can find a corresponding existing
+    details if it exist in the verigence and if not then VIN".
+    * The row's Journey is in Verigence: the Journey's own Deal Type (the Team Lead's call
+      included); a Journey whose Deal Type is not settled yet (no VIN on file) gets the rule
+      with its booking date and the dump's chassis.
+    * Not in Verigence: the VIN alone -- the month of manufacture read from the chassis, the
+      age at the delivery date (90 days or more = Outscope). A booking date the dealership's
+      sheet prints, or a booking dump, is not used.
+    * No readable chassis: pending."""
 
     def __init__(self, connection: Connection, tenant_id: str, dealer_id: Any) -> None:
         self.today = _today(connection, tenant_id)
@@ -708,18 +713,6 @@ class DeliveryScope:
                 """),
                 {"t": tenant_id, "d": str(dealer_id)},
             ).mappings()}
-        self.booked: dict[str, date] = {}
-        for r in connection.execute(
-            text("""
-                SELECT r.booking_number, r.dms_booking_number, r.event_date FROM auditcore.p2_dms_dump_rows r
-                JOIN auditcore.p2_dms_dumps u ON u.tenant_id = r.tenant_id AND u.dump_id = r.dump_id
-                WHERE r.tenant_id = :t AND r.dealer_id = CAST(:d AS uuid) AND r.dump_kind = 'BOOKING'
-                  AND u.status = 'ACTIVE' AND r.event_date IS NOT NULL
-            """),
-            {"t": tenant_id, "d": str(dealer_id)},
-        ).mappings():
-            for key in booking_keys(r["booking_number"], r["dms_booking_number"]):
-                self.booked.setdefault(key, r["event_date"])
 
     def decide(self, row: dict[str, Any], journey_id: str | None, journey: dict[str, Any] | None
                ) -> tuple[str | None, str | None]:
@@ -729,20 +722,17 @@ class DeliveryScope:
             deal_type, basis = self.journey_types[journey_id]
             return deal_type, f"As in Verigence ({LABELS.get(deal_type, deal_type)}): {basis or ''}".strip()
         delivered = row.get("event_date")
-        booked = row.get("booking_date")
-        if booked is not None and delivered is not None and booked > delivered:
-            booked = None
-        if booked is None and journey is not None:
-            booked = journey.get("bookingDate")
-        if booked is None:
-            booked = next((self.booked[k] for k in booking_keys(row.get("booking_number"), row.get("dms_booking_number"))
-                           if k in self.booked), None)
+        booked = journey.get("bookingDate") if journey is not None else None
         vin = re.sub(r"[^A-Z0-9]", "", str(row.get("chassis") or "").upper()) or None
         made = chassis_manufacture_month(vin, today=self.today)
         decided = decide_deal_type(booking_date=booked, vin=vin, manufacture_month=made,
                                    reference_date=delivered if made is not None else None,
                                    reference_kind="delivery")
-        return decided["deal_type"], decided["deal_type_basis"]
+        basis = decided["deal_type_basis"]
+        if journey is None and basis:
+            basis = "Not in Verigence: on the VIN alone. " + basis.replace("No booking date yet. ", "").replace(
+                "No booking date yet; ", "")
+        return decided["deal_type"], basis
 
 
 def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict[str, int]:
