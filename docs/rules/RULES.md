@@ -40,7 +40,8 @@ rule once, with what it replaced and where it is read, is what stops that.
 | Booking is confirmed once the money received reaches the Minimum Booking Amount; receipts carry no Booking/Delivery stage. | 19 Oct 2026 | stage-tagged receipts | stage engine, Deal | — |
 | Cash transactions raise no tasks. | 31 Oct 2026 | cash intimation checks | `_BOOKING_RULES` (cash checks off) | cash task clean-up job |
 | A receipt issued by an insurer (self insurance) is not a payment receipt. | 11 Nov 2026 | — | receipt issuer check | — |
-| A payment up to one day before the booking docket date is an observation, not a finding. | 14 Nov 2026 | — | PAYMENT_BEFORE_BOOKING | — |
+| A payment less than 3 days before the booking docket date (1 or 2 days) is an observation (informational, no task); 3 days or more stays a finding with its Team Lead task. | 19 Nov 2026 | 14–18 Nov: up to one day | PAYMENT_BEFORE_BOOKING (`_PAYMENT_BEFORE_BOOKING_GRACE_DAYS`) | RULES_RERUN (closes the open tasks now inside the window) |
+| "Delivery not completed in time" is switched off per Project by default (`tenant_rule_config.delivery_in_time_check_enabled`); while off the check passes, its Team Lead tasks close and the seventh-day event is not queued. | 19 Nov 2026 | 7 days from the earliest printed invoice / cover note / gate pass date | DELIVERY_NOT_COMPLETED_IN_TIME, `schedule_delivery_completion_check` | RULES_RERUN |
 
 ## Deal: RTO, scrappage, FASTag and RSA
 

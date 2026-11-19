@@ -20,6 +20,7 @@ and answer the questions a manual deal audit asks:
                            THIRD_PARTY_PAYMENT_UNDECLARED (TL violation)
   Accessories fitted       ACCESSORIES_FITTED_UNCONFIRMED (PC question), ACCESSORY_FITTED_UNBILLED
   Delivery in time         DELIVERY_NOT_COMPLETED_IN_TIME  complete within N days of the printed date
+                           (switched off per Project by default, 2026-11-19)
 
 Cash transactions raise no tasks (product owner, 2026-10-31): the cash
 intimation question (CASH_INTIMATION_UNCONFIRMED) and its finding
@@ -153,6 +154,14 @@ class _Facts:
         (tenant_rule_config, migration 0213): off unless the Project has it on."""
         return bool(self.connection.execute(
             text("SELECT accessories_fitted_check_enabled FROM auditcore.tenant_rule_config WHERE tenant_id=:t"),
+            {"t": self.tenant_id}).scalar_one_or_none())
+
+    @cached_property
+    def delivery_in_time_check_enabled(self) -> bool:
+        """The Project's switch for "Delivery not completed in time" (tenant_rule_config,
+        migration 0244): off unless the Project has it on."""
+        return bool(self.connection.execute(
+            text("SELECT delivery_in_time_check_enabled FROM auditcore.tenant_rule_config WHERE tenant_id=:t"),
             {"t": self.tenant_id}).scalar_one_or_none())
 
     @cached_property
@@ -723,11 +732,13 @@ def cash_above_limit(facts: _Facts) -> RuleOutcome:
     ), {"findingTitle": "Cash receipt above the statutory limit", "paymentIds": [r["paymentId"] for r in over]})
 
 
-# A receipt up to one day before the booking docket is an observation, not a
-# finding (product owner 2026-11-14): the token is taken on the day and the
-# docket entered in the DMS the day after. 327 open findings on 14 Nov were
-# mostly that one day.
-_PAYMENT_BEFORE_BOOKING_GRACE_DAYS = 1
+# A receipt shortly before the booking docket is an observation, not a finding:
+# the token is taken on the day and the docket entered in the DMS later. One
+# day allowed from 2026-11-14 (327 open findings were mostly that one day);
+# widened 2026-11-19 -- product owner: "payment dated before booking tasks can
+# be move to informational if it is for less than 3 days gap". So a gap of 1 or
+# 2 days is an observation; 3 days or more stays a finding with its TL task.
+_PAYMENT_BEFORE_BOOKING_GRACE_DAYS = 2
 
 
 def payment_before_booking(facts: _Facts) -> RuleOutcome:
@@ -745,15 +756,17 @@ def payment_before_booking(facts: _Facts) -> RuleOutcome:
         return "; ".join(f"{_rupees(r['amount'])} on {_when(r['date'])}"
                          + (f" (receipt {r['receiptNumber']})" if r["receiptNumber"] else "") for r in rows)
 
-    note = (f" Observation: {_lines(observed)} received the day before the booking docket, within the one day "
-            "allowed.") if observed else ""
+    note = (f" Observation: {_lines(observed)} received before the booking docket, within the "
+            f"{_PAYMENT_BEFORE_BOOKING_GRACE_DAYS} days allowed (informational, no task).") if observed else ""
     observation = {"observations": [r["paymentId"] for r in observed]} if observed else {}
     if not early:
         if observed:
-            return RuleOutcome(code, "PASS", f"No payment more than a day before the booking on {_when(booked)}."
+            return RuleOutcome(code, "PASS", f"No payment {_PAYMENT_BEFORE_BOOKING_GRACE_DAYS + 1} or more days "
+                               f"before the booking on {_when(booked)}."
                                + note, observation)
         return RuleOutcome(code, "PASS", f"Every payment is dated on or after the booking on {_when(booked)}.")
-    return RuleOutcome(code, "FAIL", f"{_lines(early)}: dated more than a day before the booking on "
+    return RuleOutcome(code, "FAIL", f"{_lines(early)}: dated {_PAYMENT_BEFORE_BOOKING_GRACE_DAYS + 1} or more days "
+                       "before the booking on "
                        f"{_when(booked)}." + note,
                        {"findingTitle": "Payment dated before the booking",
                         "paymentIds": [r["paymentId"] for r in early], **observation})
@@ -1508,6 +1521,11 @@ def _cash_lines(rows: list[dict[str, Any]]) -> str:
 
 def delivery_not_completed_in_time(facts: _Facts) -> RuleOutcome:
     code = "DELIVERY_NOT_COMPLETED_IN_TIME"
+    # Product owner 2026-11-19: "for the time being supress the tasks for delay in delivery --
+    # delivery not completed in time.. its not relevant as of now, may we introduce it later".
+    # Off by default per Project; passing closes the Team Lead tasks already raised.
+    if not facts.delivery_in_time_check_enabled:
+        return RuleOutcome(code, "PASS", "The delivery-in-time check is switched off for this Project.")
     clock = facts.delivery_clock
     if clock is None:
         return RuleOutcome(code, "PASS", "No invoice, insurance cover note or gate pass read yet.")
@@ -1843,6 +1861,8 @@ def schedule_delivery_completion_check(
     with everything still pending. Moves earlier if an earlier-dated
     document arrives; never re-fires once spent."""
     facts = _Facts(connection, tenant_id, journey_id)
+    if not facts.delivery_in_time_check_enabled:
+        return None  # switched off for the Project (2026-11-19)
     clock = facts.delivery_clock
     if clock is None or facts.delivery_complete:
         return None
