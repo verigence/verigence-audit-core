@@ -141,7 +141,7 @@ _ROWS_SQL = """
     FROM auditcore.p2_dms_dump_rows r
     LEFT JOIN auditcore.journeys j ON j.tenant_id = r.tenant_id AND j.journey_id = r.journey_id
     LEFT JOIN auditcore.dealer_outlets jo ON jo.tenant_id = j.tenant_id AND jo.outlet_id = j.outlet_id
-    WHERE r.tenant_id = :t AND r.dump_id = CAST(:id AS uuid) AND r.outcome NOT IN (:oop, :cancelled, 'EXCLUDED')
+    WHERE r.tenant_id = :t AND r.dump_id = CAST(:id AS uuid) AND r.outcome NOT IN (:oop, :cancelled, 'EXCLUDED', 'DUPLICATE')
     ORDER BY r.event_date DESC NULLS LAST, r.row_no
 """
 
@@ -414,7 +414,7 @@ def claim_intimation(
     """The PC marks a row as intimated to them."""
     _access(connection, tenant_id, principal, client, _READ, PC_ROLES)
     row = _row_for_mark(connection, tenant_id, principal, command)
-    if row["outcome"] in (OUT_OF_PERIOD, CANCELLED, "EXCLUDED"):
+    if row["outcome"] in (OUT_OF_PERIOD, CANCELLED, "EXCLUDED", "DUPLICATE"):
         raise HTTPException(status_code=409, detail="This row is not compared in the dump.")
     if not needs_mark(row):
         raise HTTPException(status_code=409, detail="This one is already in Verigence; it needs no mark.")

@@ -322,6 +322,11 @@ _NAME_DIFFERS_COLUMNS = (("Dealer", "dealerName"), ("Dump", "kind"), ("DMS locat
                          ("Journey", "journeyReference"), ("Journey outlet", "journeyOutlet"),
                          ("Matched on", "matchedOn"), ("Chassis", "chassis"), ("Mobile", "mobile"),
                          ("OTF / booking no.", "otf"))
+_DATED_ELSEWHERE_COLUMNS = (("Dealer", "dealerName"), ("Dump", "kind"), ("DMS location", "location"),
+                            ("DMS date", "dmsDate"), ("Customer", "customerName"), ("OTF / booking no.", "otf"),
+                            ("Chassis", "chassis"), ("Journey", "journeyReference"),
+                            ("Verigence date", "verigenceDate"), ("Verigence dated by", "datedBy"),
+                            ("Days compared", "period"))
 _NOT_IN_DUMP_COLUMNS = (("Dealer", "dealerName"), ("Outlet", "outletName"), ("Delivery date", "eventDate"),
                         ("Dated by", "datedBy"), ("Customer", "customerName"), ("Mobile", "mobile"),
                         ("Chassis", "chassis"), ("Model", "model"), ("Journey", "journeyReference"))
@@ -349,6 +354,7 @@ def build_report_excel(report: dict[str, Any]) -> bytes:
     sheet("Bookings not in Verigence", _ROW_COLUMNS, [r for r in rows if r["kind"] == BOOKING])
     sheet("Deliveries not in Verigence", _ROW_COLUMNS, [r for r in rows if r["kind"] == DELIVERY])
     sheet("Matched, name differs", _NAME_DIFFERS_COLUMNS, report.get("nameDiffers") or [])
+    sheet("Dated outside the period", _DATED_ELSEWHERE_COLUMNS, report.get("datedElsewhere") or [])
     sheet("Delivery dump scope", _SCOPE_COLUMNS, report.get("deliveryScope") or [])
     sheet("In Verigence, not in dump", _NOT_IN_DUMP_COLUMNS, report.get("notInDump") or [])
     pcs = wb.create_sheet("PC intimations")

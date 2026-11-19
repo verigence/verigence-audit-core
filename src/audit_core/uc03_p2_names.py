@@ -128,6 +128,10 @@ def _tokens_match(left: list[str], right: list[str]) -> bool:
     if sorted(left) == sorted(right):
         return True
     shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    # One word is a surname, not a customer: "PRADHAN" (or "Pradhan Enterprises" once the
+    # company words go) is not every Pradhan (2026-11-19: one Journey took five Pradhans).
+    if len(shorter) == 1 and len(longer) > 1:
+        return False
     unused = list(longer)
     whole = 0
     for token in shorter:
@@ -315,7 +319,7 @@ def same_organisation(left: Any, right: Any) -> bool:
     a, b = org_tokens(left), org_tokens(right)
     if not a or not b:
         return False
-    if a == b or a[: len(b)] == b or b[: len(a)] == a:
+    if a == b or (min(len(a), len(b)) >= 2 and (a[: len(b)] == b or b[: len(a)] == a)):
         return True
     # Initials written apart or together, and a word singular or plural, are the same company
     # (2026-11-19: "Gk and son automobile pvt ltd" is "G K & SONS AUTOMOBILES PRIVATE LIMITED").

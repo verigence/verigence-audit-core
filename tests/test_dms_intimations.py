@@ -175,8 +175,13 @@ def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(set
     made = s.client.post(f"{s.base}/dms-reports", json={})
     assert made.status_code == 201, made.text
     figures = made.json()["figures"]
-    assert (figures["bookingDms"], figures["bookingSynced"], figures["bookingIntimated"],
-            figures["bookingNotIntimated"]) == (3, 1, 1, 1)
+    # The Journey is in Verigence; whether Verigence dates its booking in the same days decides
+    # synced or "dated outside the period" (2026-11-19). The figures add up either way.
+    assert (figures["bookingDms"], figures["bookingSynced"] + figures["bookingDatedElsewhere"],
+            figures["bookingIntimated"], figures["bookingNotIntimated"]) == (3, 1, 1, 1)
+    assert figures["bookingDms"] == (figures["bookingSynced"] + figures["bookingDatedElsewhere"]
+                                     + figures["bookingNotInVerigence"])
+    assert figures["bookingInVerigence"] == figures["bookingSynced"] + figures["bookingNotInDms"]
     listed_reports = s.client.get(f"{s.base}/dms-reports").json()["items"]
     assert [r["reportId"] for r in listed_reports] == [made.json()["reportId"]]
     kept = s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}").json()
@@ -225,7 +230,7 @@ def test_delivery_dump_rows_are_marked_inscope_or_outscope(setup) -> None:
     dump_id = _dump(s, m.DELIVERY, [
         {"chassis": this_month, "name": "Young Car"},                                   # no booking date: by age
         {"chassis": "T2C11111", "name": "Old Car"},                                     # made Mar 2026
-        {"chassis": this_month, "name": "Booked Early", "booking_date": date(2026, 8, 20)},
+        {"chassis": this_month[:-1] + "6", "name": "Booked Early", "booking_date": date(2026, 8, 20)},
         {"chassis": None, "name": "No Chassis", "mobile": "9000000009"},
     ])
     with s.journey.engine.begin() as connection:
@@ -338,3 +343,31 @@ def test_a_match_whose_customer_differs_is_listed_for_review(setup) -> None:
     assert any(line.startswith("* Matched, but the customer name differs: 1") for line in kept["statementLines"])
     book = load_workbook(io.BytesIO(s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}/file").content))
     assert "Matched, name differs" in book.sheetnames
+
+
+def test_one_journey_takes_one_dump_row_and_a_repeated_line_is_a_duplicate(setup) -> None:
+    """Seven OTFs of one mobile all matched one Journey, and one chassis sat on three delivery
+    lines (2026-11-19): a Journey now goes to its best row only, a repeated line is DUPLICATE."""
+    s = setup
+    add_extracted_field(s.journey, di_document_id=uuid4(), field_key="booking_reference_number", value="B-13455387")
+    dump_id = _dump(s, m.BOOKING, [
+        {"booking_number": "B-55555555", "name": "P2 Customer", "mobile": "9000000401"},
+        {"booking_number": "B-13455387", "name": "P2 Customer", "mobile": "9000000402"},
+        {"booking_number": "B-13455387", "name": "P2 Customer", "mobile": "9000000403"},
+    ])
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        found = {r["row_no"]: (r["outcome"], r["match_basis"]) for r in connection.execute(text(
+            "SELECT row_no, outcome, match_basis FROM auditcore.p2_dms_dump_rows WHERE dump_id = :d"),
+            {"d": dump_id}).mappings()}
+    assert found[2] == ("MATCHED", "BOOKING_NUMBER")  # the booking number beats the name
+    assert found[3] == ("DUPLICATE", "ROW 2")
+    assert found[1][0] != "MATCHED"                    # the Journey is taken
+
+
+def test_a_surname_alone_is_not_the_customer() -> None:
+    from audit_core.uc03_p2_names import same_person
+    assert not same_person("Binita Pradhan", "PRADHAN")
+    assert not same_person("Deepak Ranjan Pradhan", "M/S. Pradhan Enterprises")
+    assert same_person("A. Sahoo", "Anita Sahoo")
+    assert same_person("Gk and son automobile pvt ltd", "G K & SONS AUTOMOBILES PRIVATE LIMITED")

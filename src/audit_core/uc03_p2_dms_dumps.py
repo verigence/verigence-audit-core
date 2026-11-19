@@ -550,25 +550,32 @@ def _one(found: set[str]) -> str | None:
     return next(iter(found)) if len(found) == 1 else None
 
 
-def match_row(index: JourneyIndex, kind: str, row: dict[str, Any]) -> tuple[str | None, str | None]:
-    """(journey id, basis) or (None, None)."""
+def match_row(index: JourneyIndex, kind: str, row: dict[str, Any], taken: frozenset[str] | set[str] = frozenset()
+              ) -> tuple[str | None, str | None]:
+    """(journey id, basis) or (None, None). ``taken``: Journeys already claimed by another row
+    of the same dump -- a Journey is one vehicle, one row (2026-11-19)."""
+
+    def one(found: set[str]) -> str | None:
+        return _one(set(found) - set(taken))
+
     strong = strong_booking_keys(row.get("booking_number"), row.get("dms_booking_number"))
     for key in sorted(booking_keys(row.get("booking_number"), row.get("dms_booking_number")), key=lambda k: k not in strong):
-        if (jid := _one(index.by_ref.get(key, set()))) is not None and (key in strong or _same_customer(index, jid, row)):
+        if (jid := one(index.by_ref.get(key, set()))) is not None and (key in strong or _same_customer(index, jid, row)):
             return jid, "BOOKING_NUMBER"
     if kind == DELIVERY and (key := chassis_key(row.get("chassis"))) is not None \
-            and (jid := _one(index.by_chassis.get(key, set()))) is not None:
+            and (jid := one(index.by_chassis.get(key, set()))) is not None:
         return jid, "CHASSIS"
-    if (key := row.get("mobile")) and (found := index.by_mobile.get(key)):
-        if (jid := _one(found)) is not None:
+    if (key := row.get("mobile")) and (found := set(index.by_mobile.get(key, set())) - set(taken)):
+        if (jid := one(found)) is not None:
             return jid, "MOBILE"
         # one customer, two bookings: the one of the same model
         same_model_ = {j for j in found if same_model(index.journeys[j]["model"], row.get("model"))}
-        if (jid := _one(same_model_)) is not None:
+        if (jid := one(same_model_)) is not None:
             return jid, "MOBILE"
     name = row.get("customer_name")
     if name:
-        named = {jid for jid, j in index.journeys.items() if any(same_person(name, n) for n in j["names"])}
+        named = {jid for jid, j in index.journeys.items()
+                 if jid not in taken and any(same_person(name, n) for n in j["names"])}
         # A booking row: the customer's name and the booking date the DMS prints, within
         # NAME_DATE_DAYS of the Journey's (2026-11-18: papers often carry no OTF or a misread
         # mobile; the date, not the model, tells two customers of one name apart).
@@ -576,11 +583,24 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any]) -> tuple[str 
         if kind == BOOKING and isinstance(day, date):
             dated = {j for j in named if index.journeys[j].get("bookingDate") is not None
                      and abs((index.journeys[j]["bookingDate"] - day).days) <= NAME_DATE_DAYS}
-            if (jid := _one(dated)) is not None:
+            if (jid := one(dated)) is not None:
                 return jid, "NAME_DATE"
-        if (jid := _one({j for j in named if same_model(index.journeys[j]["model"], row.get("model"))})) is not None:
+        if (jid := one({j for j in named if same_model(index.journeys[j]["model"], row.get("model"))})) is not None:
             return jid, "NAME_MODEL"
     return None, None
+
+
+# The order rows claim Journeys in: the surest match first (2026-11-19).
+_BASIS_RANK = {"CHASSIS": 0, "BOOKING_NUMBER": 1, "MOBILE": 2, "NAME_DATE": 3, "NAME_MODEL": 4}
+
+
+def _line_key(kind: str, row: dict[str, Any]) -> str | None:
+    """What makes two lines of one dump the same vehicle: the chassis (delivery), the OTF /
+    booking number (booking)."""
+    if kind == DELIVERY:
+        return chassis_key(row.get("chassis"))
+    key = _alnum(row.get("dms_booking_number")) or _alnum(row.get("booking_number"))
+    return key if len(key) >= 6 else None
 
 
 def outcome_of(kind: str, row: dict[str, Any], journey: dict[str, Any] | None) -> str:
@@ -683,6 +703,9 @@ def _name_of(connection: Connection, actor_id: str) -> str | None:
 # --------------------------------------------------------------------------- matching a stored dump
 
 OUT_OF_PERIOD = "OUT_OF_PERIOD"
+# A line repeating another line of the same dump (the same chassis / OTF), 2026-11-19: kept,
+# listed, not counted.
+DUPLICATE = "DUPLICATE"
 # A row of a model out of scope (product owner 2026-11-19): kept in the file as uploaded, never
 # matched, counted, shown or reported -- as if it were not in the dump.
 EXCLUDED = "EXCLUDED"
@@ -831,6 +854,24 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
     counts = {MATCHED: 0, NOT_IN_TOOL: 0, MISSING: 0, CANCELLED: 0}
     updates, synced = [], []
     scope = DeliveryScope(connection, tenant_id, dealer_id) if kind == DELIVERY else None
+    # One Journey per row (2026-11-19: one Journey was counted for seven OTFs of one customer):
+    # the rows claim Journeys surest match first -- the matching basis, then the customer's name
+    # agreeing, then a booking not cancelled. A later line with the same chassis / OTF as an
+    # earlier one is a DUPLICATE of it.
+    compared, first_choice = [], {}
+    for row in rows:
+        if row_out_of_scope(dict(row)) is None and not (row["event_date"] is not None
+                                                         and not first <= row["event_date"] <= last):
+            jid0, basis0 = match_row(index, kind, dict(row))
+            agrees0 = bool(jid0) and bool(row["customer_name"]) and any(
+                same_person(row["customer_name"], n) for n in index.journeys[jid0]["names"])
+            first_choice[row["row_no"]] = (_BASIS_RANK.get(basis0 or "", 9), not agrees0,
+                                           "CANCEL" in str(row.get("stage") or "").upper(), row["row_no"])
+            compared.append(row["row_no"])
+    order = {n: i for i, n in enumerate(sorted(compared, key=lambda n: first_choice[n]))}
+    rows = sorted(rows, key=lambda r: order.get(r["row_no"], -1))
+    taken: set[str] = set()
+    seen_lines: dict[str, int] = {}
     for row in rows:
         if (model := row_out_of_scope(dict(row))) is not None:
             updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": None, "b": model,
@@ -842,7 +883,17 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
                             "o": OUT_OF_PERIOD, "ol": resolve_outlet(row["outlet_label"], outlets),
                             "dt": None, "dtb": None, "jc": None, "na": None})
             continue
-        jid, basis = match_row(index, kind, dict(row))
+        if (line := _line_key(kind, dict(row))) is not None and line in seen_lines:
+            updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": None,
+                            "b": f"ROW {seen_lines[line]}", "o": DUPLICATE,
+                            "ol": resolve_outlet(row["outlet_label"], outlets), "dt": None, "dtb": None, "jc": None,
+                            "na": None})
+            continue
+        if line is not None:
+            seen_lines[line] = row["row_no"]
+        jid, basis = match_row(index, kind, dict(row), taken)
+        if jid:
+            taken.add(jid)
         journey = index.journeys.get(jid) if jid else None
         outcome = outcome_of(kind, dict(row), journey)
         counts[outcome] += 1
@@ -1103,7 +1154,7 @@ def read_dms_dump(
     rows = connection.execute(
         text(_ROW_SQL + """
             AND r.dump_id = :id AND (CAST(:o AS text) IS NULL OR r.outcome = CAST(:o AS text))
-            AND r.outcome NOT IN ('OUT_OF_PERIOD', 'EXCLUDED')
+            AND r.outcome NOT IN ('OUT_OF_PERIOD', 'EXCLUDED', 'DUPLICATE')
             ORDER BY CASE r.outcome WHEN 'MISSING' THEN 0 WHEN 'NOT_IN_TOOL' THEN 1 WHEN 'CANCELLED' THEN 2 ELSE 3 END,
                      r.event_date DESC NULLS LAST, r.row_no
         """),
