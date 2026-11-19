@@ -132,7 +132,10 @@ _DELIVERY_COLUMNS: dict[str, tuple[str, ...]] = {
     "model": ("MODEL",),
     "variant": ("VARIENT", "VARIANT"),
     "invoice_number": ("INVOICE NO", "INVOICE NUMBER"),
-    "booking_number": ("BOOKING NO", "BOOKING NUMBER"),
+    # Aditya's delivery report heads its booking number plain BOOKING (B-13421434).
+    "booking_number": ("BOOKING NO", "BOOKING NUMBER", "BOOKING"),
+    # Utkal's prints the booking date: the Deal Type rule reads it (2026-11-19).
+    "booking_date": ("BOOKING DATE",),
     "registration_number": ("REGD.NO", "REGD NO", "REGISTRATION NO", "REG NO"),
     "consultant": ("SC NAME", "CONSULTANT", "FSC", "SALES CONSULTANT"),
 }
@@ -306,6 +309,7 @@ def _rows(kind: str, headers: list[str], body: list[tuple[Any, ...]], sheet: str
 
         row = {
             "event_date": parse_date(cell("event_date")),
+            "booking_date": parse_date(cell("booking_date")) if kind == DELIVERY else None,
             "booking_number": _text(cell("booking_number"), 60),
             "dms_booking_number": _text(cell("dms_booking_number"), 60),
             "customer_name": _text(cell("customer_name"), 300),
@@ -662,6 +666,85 @@ def dump_window(period_month: date, business_date: date) -> tuple[date, date]:
     return period_month, min(business_date, month_end)
 
 
+def chassis_manufacture_month(value: Any, *, today: date | None = None) -> date | None:
+    """The 1st of the month a Mahindra vehicle was made in, from a full VIN or from the last
+    eight characters a delivery report prints (T2H76332: year T = 2026, plant 2, month H =
+    August, serial) -- checked against the VINs of matched Journeys on 2026-11-19."""
+    from audit_core.uc03_p2_journey_classification import (
+        _MONTH_CODES,
+        _YEAR_CODES,
+        vin_manufacture_month,
+    )
+
+    full = vin_manufacture_month(value, today=today)
+    if full is not None:
+        return full
+    short = re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+    if len(short) != 8 or not short[3:].isdigit():
+        return None
+    year, month = _YEAR_CODES.get(short[0]), _MONTH_CODES.get(short[2])
+    if year is None or month is None:
+        return None
+    made = date(year, month, 1)
+    return None if today is not None and made > today else made
+
+
+class DeliveryScope:
+    """The Deal Type rule (uc03_p2_journey_classification) for a delivery dump row
+    (product owner 2026-11-19). A row whose Journey is in Verigence takes the Journey's own
+    Deal Type -- the Team Lead's call included. Any other row: the rule on the row itself --
+    its chassis gives the month of manufacture, its delivery date the age, and the booking
+    date is the one the report prints, else the Journey's, else the dealership's booking dump
+    row with the same booking number / OTF. A booking date after the delivery is not one."""
+
+    def __init__(self, connection: Connection, tenant_id: str, dealer_id: Any) -> None:
+        self.today = _today(connection, tenant_id)
+        self.journey_types = {
+            str(r["journey_id"]): (r["deal_type"], r["deal_type_basis"]) for r in connection.execute(
+                text("""
+                    SELECT c.journey_id, c.deal_type, c.deal_type_basis FROM auditcore.journey_classifications c
+                    JOIN auditcore.journeys j ON j.tenant_id = c.tenant_id AND j.journey_id = c.journey_id
+                    WHERE c.tenant_id = :t AND j.dealer_id = CAST(:d AS uuid) AND c.deal_type IS NOT NULL
+                """),
+                {"t": tenant_id, "d": str(dealer_id)},
+            ).mappings()}
+        self.booked: dict[str, date] = {}
+        for r in connection.execute(
+            text("""
+                SELECT r.booking_number, r.dms_booking_number, r.event_date FROM auditcore.p2_dms_dump_rows r
+                JOIN auditcore.p2_dms_dumps u ON u.tenant_id = r.tenant_id AND u.dump_id = r.dump_id
+                WHERE r.tenant_id = :t AND r.dealer_id = CAST(:d AS uuid) AND r.dump_kind = 'BOOKING'
+                  AND u.status = 'ACTIVE' AND r.event_date IS NOT NULL
+            """),
+            {"t": tenant_id, "d": str(dealer_id)},
+        ).mappings():
+            for key in booking_keys(r["booking_number"], r["dms_booking_number"]):
+                self.booked.setdefault(key, r["event_date"])
+
+    def decide(self, row: dict[str, Any], journey_id: str | None, journey: dict[str, Any] | None
+               ) -> tuple[str | None, str | None]:
+        from audit_core.uc03_p2_journey_classification import LABELS, decide_deal_type
+
+        if journey_id and journey_id in self.journey_types:
+            deal_type, basis = self.journey_types[journey_id]
+            return deal_type, f"As in Verigence ({LABELS.get(deal_type, deal_type)}): {basis or ''}".strip()
+        delivered = row.get("event_date")
+        booked = row.get("booking_date")
+        if booked is not None and delivered is not None and booked > delivered:
+            booked = None
+        if booked is None and journey is not None:
+            booked = journey.get("bookingDate")
+        if booked is None:
+            booked = next((self.booked[k] for k in booking_keys(row.get("booking_number"), row.get("dms_booking_number"))
+                           if k in self.booked), None)
+        vin = re.sub(r"[^A-Z0-9]", "", str(row.get("chassis") or "").upper()) or None
+        made = chassis_manufacture_month(vin, today=self.today)
+        decided = decide_deal_type(booking_date=booked, vin=vin, manufacture_month=made,
+                                   reference_date=delivered if made is not None else None,
+                                   reference_kind="delivery")
+        return decided["deal_type"], decided["deal_type_basis"]
+
+
 def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict[str, int]:
     """Match (again) every row of one dump, store the outcome and mark the Journeys found.
     A row dated outside dump_window is OUT_OF_PERIOD: kept, not compared, not counted."""
@@ -683,10 +766,12 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
     ).mappings().all()
     counts = {MATCHED: 0, NOT_IN_TOOL: 0, MISSING: 0, CANCELLED: 0}
     updates, synced = [], []
+    scope = DeliveryScope(connection, tenant_id, dealer_id) if kind == DELIVERY else None
     for row in rows:
         if row["event_date"] is not None and not first <= row["event_date"] <= last:
             updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": None, "b": None,
-                            "o": OUT_OF_PERIOD, "ol": resolve_outlet(row["outlet_label"], outlets)})
+                            "o": OUT_OF_PERIOD, "ol": resolve_outlet(row["outlet_label"], outlets),
+                            "dt": None, "dtb": None})
             continue
         jid, basis = match_row(index, kind, dict(row))
         journey = index.journeys.get(jid) if jid else None
@@ -694,15 +779,17 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
         counts[outcome] += 1
         outlet_id = (str(journey["outletId"]) if journey and journey["outletId"]
                      else resolve_outlet(row["outlet_label"], outlets))
+        deal_type, deal_basis = (scope.decide(dict(row), jid, journey) if scope is not None and outcome != CANCELLED
+                                 else (None, None))
         updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": jid, "b": basis, "o": outcome,
-                        "ol": outlet_id})
+                        "ol": outlet_id, "dt": deal_type, "dtb": deal_basis})
         if jid and outcome != CANCELLED:
             synced.append(jid)
     if updates:
         connection.execute(
             text("""
                 UPDATE auditcore.p2_dms_dump_rows SET journey_id = CAST(:j AS uuid), match_basis = :b, outcome = :o,
-                       outlet_id = CAST(:ol AS uuid)
+                       outlet_id = CAST(:ol AS uuid), deal_type = :dt, deal_type_basis = :dtb
                 WHERE tenant_id = :t AND dump_id = :id AND row_no = :n
             """),
             updates,
@@ -818,9 +905,9 @@ def upload_dms_dump(
     connection.execute(
         text("""
             INSERT INTO auditcore.p2_dms_dump_rows (tenant_id, dump_id, row_no, dump_kind, dealer_id, outlet_label,
-              event_date, booking_number, dms_booking_number, customer_name, mobile, chassis, invoice_number,
-              registration_number, model, variant, stage, consultant, raw)
-            VALUES (:t, :id, :n, :k, :d, :outlet_label, :event_date, :booking_number, :dms_booking_number,
+              event_date, booking_date, booking_number, dms_booking_number, customer_name, mobile, chassis,
+              invoice_number, registration_number, model, variant, stage, consultant, raw)
+            VALUES (:t, :id, :n, :k, :d, :outlet_label, :event_date, :booking_date, :booking_number, :dms_booking_number,
               :customer_name, :mobile, :chassis, :invoice_number, :registration_number, :model, :variant, :stage,
               :consultant, CAST(:raw AS jsonb))
         """),
@@ -912,6 +999,7 @@ def _row_json(r: Any) -> dict[str, Any]:
         "stage": r["stage"], "consultant": r["consultant"],
         "journeyId": str(r["journey_id"]) if r["journey_id"] else None, "journeyReference": r["journey_reference"],
         "dumpDate": r["business_date"].isoformat(),
+        "dealType": r.get("deal_type"), "dealTypeBasis": r.get("deal_type_basis"),
     }
 
 

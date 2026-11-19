@@ -135,7 +135,7 @@ def dump_pair(connection: Connection, tenant_id: str, dealer_id: str, kind: str,
 _ROWS_SQL = """
     SELECT r.dump_id, r.row_no, r.dump_kind, r.dealer_id, r.outlet_label, r.event_date, r.booking_number,
            r.dms_booking_number, r.customer_name, r.mobile, r.chassis, r.invoice_number, r.registration_number,
-           r.model, r.variant, r.stage, r.consultant, r.outcome, r.match_basis,
+           r.model, r.variant, r.stage, r.consultant, r.outcome, r.match_basis, r.deal_type, r.deal_type_basis,
            CAST(r.journey_id AS text) AS journey_id, j.journey_reference
     FROM auditcore.p2_dms_dump_rows r
     LEFT JOIN auditcore.journeys j ON j.tenant_id = r.tenant_id AND j.journey_id = r.journey_id
@@ -289,6 +289,7 @@ def _item(row: dict[str, Any], mark: dict[str, Any] | None, me: str) -> dict[str
         "registrationNumber": row["registration_number"], "model": row["model"], "variant": row["variant"],
         "stage": row["stage"], "consultant": row["consultant"], "location": row.get("location"),
         "outcome": row["outcome"], "state": row_state(row, mark),
+        "dealType": row.get("deal_type"), "dealTypeBasis": row.get("deal_type_basis"),
         "bookingOnFile": row["outcome"] == NOT_IN_TOOL,
         "journeyId": row["journey_id"], "journeyReference": row["journey_reference"],
         "mark": ({"byName": mark["claimed_by_name"] or mark["claimed_by"], "atUtc": mark["claimed_at_utc"].isoformat(),

@@ -74,6 +74,7 @@ from audit_core.uc03_p2_dms_outlet_report import (
 )
 
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-dms-reports"])
+_SCOPE = {"INSCOPE": "Inscope", "OUTSCOPE": "Outscope", "MR": "MR", "LEASE": "Lease", "BULK": "Bulk"}
 
 
 def _day_dumps(connection: Connection, tenant_id: str, dealer_ids: list[str], day: date) -> list[dict[str, Any]]:
@@ -116,10 +117,37 @@ def _rows(connection: Connection, tenant_id: str, dealers: list[dict[str, Any]],
                 "inVerigence": ("Booking on file, delivery not uploaded" if r["outcome"] == "NOT_IN_TOOL"
                                 else "Not in Verigence"),
                 "journeyReference": r["journey_reference"],
+                "dealType": _SCOPE.get(r.get("deal_type") or "", "Pending" if kind == DELIVERY else None),
                 "intimation": ("Intimated to PC - pending with PC" if state == INTIMATED
                                else "Not intimated to PC - pending with dealership"),
                 "markedBy": (mark["claimed_by_name"] or mark["claimed_by"]) if mark else None,
                 "markedAtUtc": mark["claimed_at_utc"].isoformat() if mark else None,
+            })
+    return out
+
+
+_OUTCOME_WORDS = {"MATCHED": "In Verigence", "NOT_IN_TOOL": "Booking on file, delivery not uploaded",
+                  "MISSING": "Not in Verigence"}
+
+
+def _delivery_scope_rows(connection: Connection, tenant_id: str, dealers: list[dict[str, Any]],
+                         dumps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Every row of the day's delivery dumps with its Inscope / Outscope (2026-11-19)."""
+    names = {d["dealerId"]: d["dealerName"] for d in dealers}
+    out = []
+    for dump in sorted((d for d in dumps if d["dump_kind"] == DELIVERY), key=lambda d: names.get(d["dealer_id"], "")):
+        outlets = outlet_map(connection, tenant_id, dump["dealer_id"])
+        by_id = {str(o["outlet_id"]): o for o in outlets}
+        for r in dump_rows(connection, tenant_id, dump["dump_id"]):
+            anchor = resolve_location(r.get("outlet_label"), outlets)
+            out.append({
+                "dealerName": names.get(dump["dealer_id"]),
+                "location": short_name(by_id[anchor]["outlet_name"]) if anchor in by_id else r.get("outlet_label"),
+                "eventDate": r["event_date"].isoformat() if r["event_date"] else None,
+                "customerName": r["customer_name"], "chassis": r["chassis"], "model": r["model"],
+                "bookingNumber": r["booking_number"], "inVerigence": _OUTCOME_WORDS.get(r["outcome"], r["outcome"]),
+                "journeyReference": r["journey_reference"],
+                "dealType": _SCOPE.get(r.get("deal_type") or "", "Pending"), "dealTypeBasis": r.get("deal_type_basis"),
             })
     return out
 
@@ -135,6 +163,7 @@ def generate_report(connection: Connection, *, tenant_id: str, dealers: list[dic
         match_dump(connection, tenant_id=tenant_id, dump_id=dump["dump_id"])
     report = build_outlet_report(connection, tenant_id=tenant_id, dealers=dealers, day=day, today=today)
     report["rows"] = _rows(connection, tenant_id, dealers, dumps)
+    report["deliveryScope"] = _delivery_scope_rows(connection, tenant_id, dealers, dumps)
     report["notInDump"] = [
         {k: row.get(k) for k in ("dealerName", "outletName", "eventDate", "customerName", "mobile", "chassis",
                                  "model", "journeyReference", "datedBy")}
@@ -242,8 +271,13 @@ def get_dms_report(
 _ROW_COLUMNS = (("Dealer", "dealerName"), ("DMS location", "location"), ("Date", "eventDate"),
                 ("Customer", "customerName"), ("Mobile", "mobile"), ("OTF", "otf"), ("Booking no.", "bookingNumber"),
                 ("Chassis", "chassis"), ("Model", "model"), ("Consultant", "consultant"),
-                ("In Verigence", "inVerigence"), ("Journey", "journeyReference"), ("Intimation", "intimation"),
+                ("In Verigence", "inVerigence"), ("Journey", "journeyReference"), ("Inscope / Outscope", "dealType"),
+                ("Intimation", "intimation"),
                 ("Marked by", "markedBy"), ("Marked at (UTC)", "markedAtUtc"))
+_SCOPE_COLUMNS = (("Dealer", "dealerName"), ("DMS location", "location"), ("Delivery date", "eventDate"),
+                  ("Customer", "customerName"), ("Chassis", "chassis"), ("Model", "model"),
+                  ("Booking no.", "bookingNumber"), ("In Verigence", "inVerigence"), ("Journey", "journeyReference"),
+                  ("Inscope / Outscope", "dealType"), ("Decided on", "dealTypeBasis"))
 _NOT_IN_DUMP_COLUMNS = (("Dealer", "dealerName"), ("Outlet", "outletName"), ("Delivery date", "eventDate"),
                         ("Dated by", "datedBy"), ("Customer", "customerName"), ("Mobile", "mobile"),
                         ("Chassis", "chassis"), ("Model", "model"), ("Journey", "journeyReference"))
@@ -270,6 +304,7 @@ def build_report_excel(report: dict[str, Any]) -> bytes:
     rows = report.get("rows") or []
     sheet("Bookings not in Verigence", _ROW_COLUMNS, [r for r in rows if r["kind"] == BOOKING])
     sheet("Deliveries not in Verigence", _ROW_COLUMNS, [r for r in rows if r["kind"] == DELIVERY])
+    sheet("Delivery dump scope", _SCOPE_COLUMNS, report.get("deliveryScope") or [])
     sheet("In Verigence, not in dump", _NOT_IN_DUMP_COLUMNS, report.get("notInDump") or [])
     pcs = wb.create_sheet("PC intimations")
     pcs.append(["Dealer", "Dump", "PC", "Outlets", "Rows marked", "of which since last dump", "Last marked (UTC)"])
