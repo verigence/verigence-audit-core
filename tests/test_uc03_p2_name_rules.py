@@ -602,3 +602,12 @@ def test_another_dealership_is_caught_against_the_master_whatever_the_booking_fo
                                seller_name="Sarthak Agencies", invoice_number="I1")
     assert _sync(journey) == {"RAISED": 1}
     assert {t["reference"]["documentId"] for t in _tasks(journey)} == {str(other)}
+
+
+def test_a_company_with_initials_apart_and_plural_words_is_the_same() -> None:
+    """2026-11-19: a delivery sheet's "Gk and son automobile pvt ltd" is the Journey's
+    "G K & SONS AUTOMOBILES PRIVATE LIMITED"."""
+    from audit_core.uc03_p2_names import same_person
+
+    assert same_person("Gk and son automobile pvt ltd", "G K & SONS AUTOMOBILES PRIVATE LIMITED")
+    assert not same_person("GK Builders Pvt Ltd", "G K & SONS AUTOMOBILES PRIVATE LIMITED")

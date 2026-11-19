@@ -306,7 +306,16 @@ def same_organisation(left: Any, right: Any) -> bool:
         return False
     if a == b or a[: len(b)] == b or b[: len(a)] == a:
         return True
+    # Initials written apart or together, and a word singular or plural, are the same company
+    # (2026-11-19: "Gk and son automobile pvt ltd" is "G K & SONS AUTOMOBILES PRIVATE LIMITED").
+    if len(_org_key(a)) >= _MISREAD_MIN and _org_key(a) == _org_key(b):
+        return True
     return _tokens_match(a, b) or _close_enough(a, b)
+
+
+def _org_key(tokens: list[str]) -> str:
+    """A company's words written together, each in the singular (SONS -> SON)."""
+    return "".join(t[:-1] if len(t) > 3 and t.endswith("S") else t for t in tokens)
 
 
 def dealership_word(value: Any) -> str | None:
