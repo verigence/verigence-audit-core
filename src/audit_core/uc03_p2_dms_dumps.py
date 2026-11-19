@@ -834,12 +834,13 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
     for row in rows:
         if (model := row_out_of_scope(dict(row))) is not None:
             updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": None, "b": model,
-                            "o": EXCLUDED, "ol": resolve_outlet(row["outlet_label"], outlets), "dt": None, "dtb": None})
+                            "o": EXCLUDED, "ol": resolve_outlet(row["outlet_label"], outlets), "dt": None, "dtb": None,
+                            "jc": None, "na": None})
             continue
         if row["event_date"] is not None and not first <= row["event_date"] <= last:
             updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": None, "b": None,
                             "o": OUT_OF_PERIOD, "ol": resolve_outlet(row["outlet_label"], outlets),
-                            "dt": None, "dtb": None})
+                            "dt": None, "dtb": None, "jc": None, "na": None})
             continue
         jid, basis = match_row(index, kind, dict(row))
         journey = index.journeys.get(jid) if jid else None
@@ -849,15 +850,22 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
                      else resolve_outlet(row["outlet_label"], outlets))
         deal_type, deal_basis = (scope.decide(dict(row), jid, journey) if scope is not None and outcome != CANCELLED
                                  else (None, None))
+        # The customer the dump names is the Journey's? A match on the chassis, booking number or
+        # mobile where it is not is listed for review (2026-11-19).
+        name = row["customer_name"]
+        agrees = (any(same_person(name, n) for n in journey["names"]) if journey is not None and name and journey["names"]
+                  else None)
         updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": jid, "b": basis, "o": outcome,
-                        "ol": outlet_id, "dt": deal_type, "dtb": deal_basis})
+                        "ol": outlet_id, "dt": deal_type, "dtb": deal_basis,
+                        "jc": (journey or {}).get("customer"), "na": agrees})
         if jid and outcome != CANCELLED:
             synced.append(jid)
     if updates:
         connection.execute(
             text("""
                 UPDATE auditcore.p2_dms_dump_rows SET journey_id = CAST(:j AS uuid), match_basis = :b, outcome = :o,
-                       outlet_id = CAST(:ol AS uuid), deal_type = :dt, deal_type_basis = :dtb
+                       outlet_id = CAST(:ol AS uuid), deal_type = :dt, deal_type_basis = :dtb,
+                       journey_customer = :jc, name_agrees = :na
                 WHERE tenant_id = :t AND dump_id = :id AND row_no = :n
             """),
             updates,

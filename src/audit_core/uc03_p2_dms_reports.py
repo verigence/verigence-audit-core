@@ -152,6 +152,39 @@ def _delivery_scope_rows(connection: Connection, tenant_id: str, dealers: list[d
     return out
 
 
+_BASIS_WORDS = {"BOOKING_NUMBER": "Booking number / OTF", "CHASSIS": "Chassis", "MOBILE": "Mobile",
+                "NAME_DATE": "Name + booking date", "NAME_MODEL": "Name + model"}
+
+
+def _name_differs(connection: Connection, tenant_id: str, dealers: list[dict[str, Any]],
+                  dumps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Rows matched to a Journey whose customer is not the one the dump names (2026-11-19):
+    the chassis, booking number or mobile agree, the customer does not -- for review."""
+    names = {d["dealerId"]: d["dealerName"] for d in dealers}
+    rows = connection.execute(
+        text("""
+            SELECT CAST(r.dealer_id AS text) AS dealer_id, r.dump_kind, r.outlet_label, r.event_date, r.customer_name,
+                   r.mobile, r.chassis, r.dms_booking_number, r.booking_number, r.match_basis, r.journey_customer,
+                   j.journey_reference, o.outlet_name
+            FROM auditcore.p2_dms_dump_rows r
+            JOIN auditcore.journeys j ON j.tenant_id = r.tenant_id AND j.journey_id = r.journey_id
+            LEFT JOIN auditcore.dealer_outlets o ON o.tenant_id = j.tenant_id AND o.outlet_id = j.outlet_id
+            WHERE r.tenant_id = :t AND CAST(r.dump_id AS text) = ANY(:ids) AND r.name_agrees IS FALSE
+              AND r.outcome IN ('MATCHED', 'NOT_IN_TOOL')
+            ORDER BY r.dump_kind, r.event_date, r.customer_name
+        """),
+        {"t": tenant_id, "ids": [str(d["dump_id"]) for d in dumps]},
+    ).mappings()
+    return [{
+        "dealerName": names.get(r["dealer_id"]), "kind": r["dump_kind"].title(), "location": r["outlet_label"],
+        "eventDate": r["event_date"].isoformat() if r["event_date"] else None, "dmsCustomer": r["customer_name"],
+        "journeyCustomer": r["journey_customer"], "journeyReference": r["journey_reference"],
+        "journeyOutlet": short_name(r["outlet_name"]) if r["outlet_name"] else None,
+        "matchedOn": _BASIS_WORDS.get(r["match_basis"], r["match_basis"]), "chassis": r["chassis"],
+        "mobile": r["mobile"], "otf": r["dms_booking_number"] or r["booking_number"],
+    } for r in rows]
+
+
 def generate_report(connection: Connection, *, tenant_id: str, dealers: list[dict[str, Any]], day: date,
                     actor_id: str) -> dict[str, Any]:
     today = _today(connection, tenant_id)
@@ -164,6 +197,12 @@ def generate_report(connection: Connection, *, tenant_id: str, dealers: list[dic
     report = build_outlet_report(connection, tenant_id=tenant_id, dealers=dealers, day=day, today=today)
     report["rows"] = _rows(connection, tenant_id, dealers, dumps)
     report["deliveryScope"] = _delivery_scope_rows(connection, tenant_id, dealers, dumps)
+    report["nameDiffers"] = _name_differs(connection, tenant_id, dealers, dumps)
+    report["figures"]["nameDiffers"] = len(report["nameDiffers"])
+    if report["nameDiffers"]:
+        report["statementLines"].append(
+            f"* Matched, but the customer name differs: {len(report['nameDiffers'])} row(s) -- the chassis, booking "
+            "number or mobile agree, the customer does not; review them (sheet \"Matched, name differs\")")
     report["notInDump"] = [
         {k: row.get(k) for k in ("dealerName", "outletName", "eventDate", "customerName", "mobile", "chassis",
                                  "model", "journeyReference", "datedBy")}
@@ -278,6 +317,11 @@ _SCOPE_COLUMNS = (("Dealer", "dealerName"), ("DMS location", "location"), ("Deli
                   ("Customer", "customerName"), ("Chassis", "chassis"), ("Model", "model"),
                   ("Booking no.", "bookingNumber"), ("In Verigence", "inVerigence"), ("Journey", "journeyReference"),
                   ("Inscope / Outscope", "dealType"), ("Decided on", "dealTypeBasis"))
+_NAME_DIFFERS_COLUMNS = (("Dealer", "dealerName"), ("Dump", "kind"), ("DMS location", "location"), ("Date", "eventDate"),
+                         ("DMS customer", "dmsCustomer"), ("Verigence customer", "journeyCustomer"),
+                         ("Journey", "journeyReference"), ("Journey outlet", "journeyOutlet"),
+                         ("Matched on", "matchedOn"), ("Chassis", "chassis"), ("Mobile", "mobile"),
+                         ("OTF / booking no.", "otf"))
 _NOT_IN_DUMP_COLUMNS = (("Dealer", "dealerName"), ("Outlet", "outletName"), ("Delivery date", "eventDate"),
                         ("Dated by", "datedBy"), ("Customer", "customerName"), ("Mobile", "mobile"),
                         ("Chassis", "chassis"), ("Model", "model"), ("Journey", "journeyReference"))
@@ -304,6 +348,7 @@ def build_report_excel(report: dict[str, Any]) -> bytes:
     rows = report.get("rows") or []
     sheet("Bookings not in Verigence", _ROW_COLUMNS, [r for r in rows if r["kind"] == BOOKING])
     sheet("Deliveries not in Verigence", _ROW_COLUMNS, [r for r in rows if r["kind"] == DELIVERY])
+    sheet("Matched, name differs", _NAME_DIFFERS_COLUMNS, report.get("nameDiffers") or [])
     sheet("Delivery dump scope", _SCOPE_COLUMNS, report.get("deliveryScope") or [])
     sheet("In Verigence, not in dump", _NOT_IN_DUMP_COLUMNS, report.get("notInDump") or [])
     pcs = wb.create_sheet("PC intimations")

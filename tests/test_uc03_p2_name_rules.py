@@ -611,3 +611,13 @@ def test_a_company_with_initials_apart_and_plural_words_is_the_same() -> None:
 
     assert same_person("Gk and son automobile pvt ltd", "G K & SONS AUTOMOBILES PRIVATE LIMITED")
     assert not same_person("GK Builders Pvt Ltd", "G K & SONS AUTOMOBILES PRIVATE LIMITED")
+
+
+def test_companies_are_not_matched_on_legal_words_or_initials() -> None:
+    """2026-11-19 audit of the DMS matches: two different companies were matched."""
+    from audit_core.uc03_p2_names import same_person
+
+    assert not same_person("S P COM", "C F S HOME SOLUTIONS PRIVATE LIMITED")
+    assert not same_person("SWITZ FOODS PRIVATE LIMITED", "C F S HOME SOLUTIONS PRIVATE LIMITED")
+    assert same_person("B ONE PVT LTD", "B ONE BUSINESS HOUSE PRIVATE LIMITED")
+    assert same_person("TRIDEVI INFRASTRUCTUR PVT. LTD", "TRIDEVI INFRASTRUCTURE PRIVATE LIMITED")
