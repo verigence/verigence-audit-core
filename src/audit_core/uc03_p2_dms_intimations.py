@@ -136,10 +136,12 @@ _ROWS_SQL = """
     SELECT r.dump_id, r.row_no, r.dump_kind, r.dealer_id, r.outlet_label, r.event_date, r.booking_number,
            r.dms_booking_number, r.customer_name, r.mobile, r.chassis, r.invoice_number, r.registration_number,
            r.model, r.variant, r.stage, r.consultant, r.outcome, r.match_basis, r.deal_type, r.deal_type_basis,
-           CAST(r.journey_id AS text) AS journey_id, j.journey_reference
+           CAST(r.journey_id AS text) AS journey_id, j.journey_reference, CAST(j.outlet_id AS text) AS journey_outlet_id,
+           jo.outlet_name AS journey_outlet_name, j.created_by_display_name AS journey_uploaded_by
     FROM auditcore.p2_dms_dump_rows r
     LEFT JOIN auditcore.journeys j ON j.tenant_id = r.tenant_id AND j.journey_id = r.journey_id
-    WHERE r.tenant_id = :t AND r.dump_id = CAST(:id AS uuid) AND r.outcome NOT IN (:oop, :cancelled)
+    LEFT JOIN auditcore.dealer_outlets jo ON jo.tenant_id = j.tenant_id AND jo.outlet_id = j.outlet_id
+    WHERE r.tenant_id = :t AND r.dump_id = CAST(:id AS uuid) AND r.outcome NOT IN (:oop, :cancelled, 'EXCLUDED')
     ORDER BY r.event_date DESC NULLS LAST, r.row_no
 """
 
@@ -280,8 +282,17 @@ def _matches(row: dict[str, Any], q: str) -> bool:
     return all(w in hay or (len(_alnum(w)) >= 4 and _alnum(w) in alnum_hay) for w in words)
 
 
-def _item(row: dict[str, Any], mark: dict[str, Any] | None, me: str) -> dict[str, Any]:
+def _item(row: dict[str, Any], mark: dict[str, Any] | None, me: str, openable: set[str] | None = None
+          ) -> dict[str, Any]:
+    """``openable``: the outlets whose Journeys the caller may open (None: all). A Journey of
+    another outlet is named with its outlet and who uploaded it, not linked (2026-11-19: a PC
+    of Palasuni Commercial opened a CDA Journey and was told it was not found)."""
+    from audit_core.uc03_p2_dms_outlet_report import short_name
+
     return {
+        "journeyOutlet": short_name(row["journey_outlet_name"]) if row.get("journey_outlet_name") else None,
+        "journeyUploadedBy": row.get("journey_uploaded_by"),
+        "canOpenJourney": bool(row["journey_id"]) and (openable is None or row.get("journey_outlet_id") in openable),
         "dumpId": str(row["dump_id"]), "rowNo": row["row_no"], "kind": row["dump_kind"],
         "eventDate": row["event_date"].isoformat() if row["event_date"] else None,
         "customerName": row["customer_name"], "mobile": row["mobile"], "otf": row["dms_booking_number"],
@@ -334,6 +345,8 @@ def list_intimations(
         return {"kind": kind, "dealerId": did, "dealerName": name, "items": [], "counts": dict.fromkeys(VIEWS, 0),
                 "dump": None}
     rows = _in_scope(dump_rows(connection, tenant_id, latest["dump_id"]), outlets, anchors)
+    openable = ({str(o["outlet_id"]) for o in _pc_outlets(connection, tenant_id, principal.subject)} if is_pc
+                else None)
     marks = live_marks(connection, tenant_id, [did], kind)
     since = previous["business_date"] if previous else None
 
@@ -361,7 +374,7 @@ def list_intimations(
                  "previousDumpDate": since.isoformat() if since else None},
         "counts": {k: len(v) for k, v in groups.items()},
         "newStates": {s: states.get(s, 0) for s in (IN_VERIGENCE, INTIMATED, OPEN)},
-        "items": [{**_item(r, mark_of(r), principal.subject), "carried": not is_new(r)} for r in chosen[:500]],
+        "items": [{**_item(r, mark_of(r), principal.subject, openable), "carried": not is_new(r)} for r in chosen[:500]],
         "truncated": len(chosen) > 500,
     }
 
@@ -401,7 +414,7 @@ def claim_intimation(
     """The PC marks a row as intimated to them."""
     _access(connection, tenant_id, principal, client, _READ, PC_ROLES)
     row = _row_for_mark(connection, tenant_id, principal, command)
-    if row["outcome"] in (OUT_OF_PERIOD, CANCELLED):
+    if row["outcome"] in (OUT_OF_PERIOD, CANCELLED, "EXCLUDED"):
         raise HTTPException(status_code=409, detail="This row is not compared in the dump.")
     if not needs_mark(row):
         raise HTTPException(status_code=409, detail="This one is already in Verigence; it needs no mark.")
