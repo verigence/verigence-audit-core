@@ -180,8 +180,11 @@ def verigence_not_in_dump(connection: Connection, *, tenant_id: str, dump: dict[
     counted = in_period(deliveries(connection, tenant_id=tenant_id, today=today, dealer_id=str(dump["dealer_id"])),
                         first, last)
     rows = []
+    from audit_core.uc03_p2_dms_dumps import out_of_scope_model
+
     for jid, (d, day) in sorted(counted.items(), key=lambda x: (x[1][1], x[1][0].reference or "")):
-        if jid in found:
+        # A delivery of an out-of-scope model is not looked for in the dump (2026-11-19).
+        if jid in found or out_of_scope_model(d.model):
             continue
         rows.append({
             "rowNo": None, "kind": "DELIVERY", "outcome": "NOT_IN_DMS", "matchBasis": d.source,

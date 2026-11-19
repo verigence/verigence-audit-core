@@ -443,7 +443,7 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
                 SELECT dealer_id, dump_kind, outlet_label, outcome, CAST(journey_id AS text) AS journey_id, deal_type,
                        dms_booking_number, booking_number, chassis, invoice_number, customer_name, mobile, event_date
                 FROM auditcore.p2_dms_dump_rows
-                WHERE tenant_id = :t AND CAST(dump_id AS text) = ANY(:ids) AND outcome <> 'OUT_OF_PERIOD'
+                WHERE tenant_id = :t AND CAST(dump_id AS text) = ANY(:ids) AND outcome NOT IN ('OUT_OF_PERIOD', 'EXCLUDED')
             """),
             {"t": tenant_id, "ids": dump_ids},
         ).mappings():

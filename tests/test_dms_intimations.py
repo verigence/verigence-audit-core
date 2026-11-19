@@ -104,13 +104,13 @@ def _dump(s, kind: str, rows: list[dict], back: int = 0) -> str:
         for n, row in enumerate(rows, start=1):
             connection.execute(text("""
                 INSERT INTO auditcore.p2_dms_dump_rows (tenant_id, dump_id, row_no, dump_kind, dealer_id, booking_number,
-                  dms_booking_number, customer_name, mobile, chassis, event_date, booking_date, raw)
+                  dms_booking_number, customer_name, mobile, chassis, event_date, booking_date, model, raw)
                 VALUES (:t, :id, :n, :k, :d, :b, :o, :c, :m, :ch, CAST(:today AS date) - CAST(:back AS integer),
-                        :bd, '{}')
+                        :bd, :model, '{}')
             """), {"t": s.journey.tenant_id, "id": dump_id, "n": n, "k": kind, "d": str(s.journey.dealer_id),
                    "b": row.get("booking_number"), "o": row.get("otf"), "c": row.get("name"), "m": row.get("mobile"),
                    "ch": row.get("chassis"), "back": row.get("back", back), "today": today,
-                   "bd": row.get("booking_date")})
+                   "bd": row.get("booking_date"), "model": row.get("model")})
         dumps.match_dump(connection, tenant_id=s.journey.tenant_id, dump_id=dump_id)
     return dump_id
 
@@ -235,15 +235,60 @@ def test_delivery_dump_rows_are_marked_inscope_or_outscope(setup) -> None:
             {"d": dump_id}).mappings()}
     assert rows["Young Car"][0] == "INSCOPE"
     assert rows["Old Car"][0] == "OUTSCOPE" and "90 days or more" in rows["Old Car"][1]
-    # Not in Verigence: the VIN alone; a booking date the sheet prints is not used (2026-11-19).
-    assert rows["Booked Early"][0] == "INSCOPE" and rows["Booked Early"][1].startswith("Not in Verigence: on the VIN alone")
+    # A booking date the delivery sheet prints decides with the VIN (2026-11-19).
+    assert rows["Booked Early"][0] == "OUTSCOPE" and rows["Booked Early"][1].startswith(
+        "Booking date as on the delivery sheet")
+    assert rows["Young Car"][1].startswith("Not in Verigence: on the VIN alone")
     assert rows["No Chassis"][0] is None
     s.acting["subject"] = s.reviewer
     made = s.client.post(f"{s.base}/dms-reports", json={})
     assert made.status_code == 201, made.text
     f = made.json()["figures"]
-    assert (f["dumpInscope"], f["dumpOutscope"], f["dumpDealTypePending"]) == (2, 1, 1)
+    assert (f["dumpInscope"], f["dumpOutscope"], f["dumpDealTypePending"]) == (1, 2, 1)
     kept = s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}").json()
     assert {r["customerName"]: r["dealType"] for r in kept["deliveryScope"]}["No Chassis"] == "Pending"
     book = load_workbook(io.BytesIO(s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}/file").content))
     assert "Delivery dump scope" in book.sheetnames
+
+
+def test_out_of_scope_models_are_named() -> None:
+    assert dumps.out_of_scope_model("TREO PLUS") == "TREO PLUS"
+    assert dumps.out_of_scope_model("Treo Plus Hiload") == "TREO PLUS"
+    assert dumps.out_of_scope_model("zor grand") == "ZOR GRAND"
+    assert dumps.out_of_scope_model("ZEO") == "ZEO" and dumps.out_of_scope_model("UDO") == "UDO"
+    assert dumps.out_of_scope_model("XUV 3XO") is None and dumps.out_of_scope_model("SCORPIO N") is None
+    assert dumps.out_of_scope_model("ZEOX") is None
+
+
+def test_rows_of_out_of_scope_models_are_left_out(setup) -> None:
+    """ALFA, JEETO, TREO, UDO, ZEO and ZOR GRAND rows: not matched, counted or shown (2026-11-19)."""
+    s = setup
+    dump_id = _dump(s, m.BOOKING, [
+        {"otf": "OTF27A000101", "name": "Three Wheeler", "mobile": "9000000101", "model": "TREO PLUS"},
+        {"otf": "OTF27A000102", "name": "Small Truck", "mobile": "9000000102", "model": "ZOR GRAND"},
+        {"otf": "OTF27A000103", "name": "Car Buyer", "mobile": "9000000103", "model": "XUV 3XO"},
+    ])
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        outcomes = {r["customer_name"]: (r["outcome"], r["match_basis"]) for r in connection.execute(text(
+            "SELECT customer_name, outcome, match_basis FROM auditcore.p2_dms_dump_rows WHERE dump_id = :d"),
+            {"d": dump_id}).mappings()}
+        dump = connection.execute(text("SELECT * FROM auditcore.p2_dms_dumps WHERE dump_id = :d"),
+                                  {"d": dump_id}).mappings().one()
+    assert outcomes["Three Wheeler"] == ("EXCLUDED", "TREO PLUS")
+    assert outcomes["Small Truck"] == ("EXCLUDED", "ZOR GRAND")
+    assert outcomes["Car Buyer"][0] == "MISSING"
+    assert dumps._dump_json(dump)["rows"] == 1 and dumps._dump_json(dump)["fileRows"] == 3
+    listed = s.client.get(f"{s.base}/dms-intimations", params={"kind": "BOOKING", "view": "month"}).json()
+    assert [i["customerName"] for i in listed["items"]] == ["Car Buyer"]
+
+
+def test_a_journey_of_another_outlet_is_named_not_linked() -> None:
+    row = {"dump_id": uuid4(), "row_no": 1, "dump_kind": m.DELIVERY, "event_date": None, "customer_name": "X",
+           "mobile": None, "dms_booking_number": None, "booking_number": None, "chassis": "T2K57261",
+           "invoice_number": None, "registration_number": None, "model": None, "variant": None, "stage": None,
+           "consultant": None, "outcome": "MATCHED", "journey_id": "j-1", "journey_reference": "UTK-SA-261107-006",
+           "journey_outlet_id": "cda", "journey_outlet_name": "Utkal Mahindra - CDA", "journey_uploaded_by": "pc-cda"}
+    item = m._item(row, None, "me", {"palasuni"})
+    assert item["canOpenJourney"] is False and item["journeyOutlet"] == "CDA" and item["journeyUploadedBy"] == "pc-cda"
+    assert m._item(row, None, "me", {"cda"})["canOpenJourney"] is True

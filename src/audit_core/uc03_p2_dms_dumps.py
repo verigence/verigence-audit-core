@@ -53,6 +53,7 @@ the first time and by which upload.
 from __future__ import annotations
 
 import io
+import json
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -657,6 +658,37 @@ def _name_of(connection: Connection, actor_id: str) -> str | None:
 # --------------------------------------------------------------------------- matching a stored dump
 
 OUT_OF_PERIOD = "OUT_OF_PERIOD"
+# A row of a model out of scope (product owner 2026-11-19): kept in the file as uploaded, never
+# matched, counted, shown or reported -- as if it were not in the dump.
+EXCLUDED = "EXCLUDED"
+# Mahindra's last-mile and small commercial vehicles are not audited (product owner
+# 2026-11-19: "these models are out of scope for us.. so dont show them or remove them from
+# the DMS dumps for mahindra whenever gets uploaded").
+OUT_OF_SCOPE_MODELS = ("ALFA LOAD", "ALFA PASSENGER", "JEETO STRONG", "TREO", "TREO AUTO", "TREO PLUS", "UDO", "ZEO",
+                       "ZOR GRAND")
+
+
+def out_of_scope_model(*values: Any) -> str | None:
+    """The out-of-scope model a row's model (or product family) names, if any: the name itself,
+    or the name followed by more words (TREO PLUS HILOAD)."""
+    for value in values:
+        name = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", str(value or "").upper())).strip()
+        if not name:
+            continue
+        for model in sorted(OUT_OF_SCOPE_MODELS, key=len, reverse=True):  # TREO PLUS before TREO
+            if name == model or name.startswith(model + " "):
+                return model
+    return None
+
+
+def row_out_of_scope(row: dict[str, Any]) -> str | None:
+    raw = row.get("raw") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = {}
+    return out_of_scope_model(row.get("model"), raw.get("PRODUCT FAMILY"), raw.get("MODEL"))
 
 
 def dump_window(period_month: date, business_date: date) -> tuple[date, date]:
@@ -692,24 +724,26 @@ def chassis_manufacture_month(value: Any, *, today: date | None = None) -> date 
 class DeliveryScope:
     """The Deal Type rule (uc03_p2_journey_classification) for a delivery dump row.
 
-    Product owner 2026-11-19: "for a delivery dump, we can find a corresponding existing
-    details if it exist in the verigence and if not then VIN".
-    * The row's Journey is in Verigence: the Journey's own Deal Type (the Team Lead's call
-      included); a Journey whose Deal Type is not settled yet (no VIN on file) gets the rule
-      with its booking date and the dump's chassis.
-    * Not in Verigence: the VIN alone -- the month of manufacture read from the chassis, the
-      age at the delivery date (90 days or more = Outscope). A booking date the dealership's
-      sheet prints, or a booking dump, is not used.
+    * A Team Lead's Deal Type on the row's Journey (MR, Lease, Bulk or an override) stands.
+    * The dealership's sheet prints a booking date (Utkal): that booking date and the VIN
+      decide -- it is the DMS's booking date, where Verigence may hold only the day the
+      booking papers were uploaded (product owner 2026-11-19: "Delivery file has booking date,
+      and you still marked the transactions whose booking date are earlier to 1st sep 2026 as
+      in-scope"). A printed booking date after the delivery is not one.
+    * Otherwise the Journey in Verigence: its own Deal Type ("if it exist in the verigence"),
+      or, not settled yet, the rule with its booking date and the dump's chassis.
+    * Not in Verigence: the VIN alone ("if not then VIN").
     * No readable chassis: pending."""
 
     def __init__(self, connection: Connection, tenant_id: str, dealer_id: Any) -> None:
         self.today = _today(connection, tenant_id)
-        self.journey_types = {
-            str(r["journey_id"]): (r["deal_type"], r["deal_type_basis"]) for r in connection.execute(
+        self.journeys = {
+            str(r["journey_id"]): dict(r) for r in connection.execute(
                 text("""
-                    SELECT c.journey_id, c.deal_type, c.deal_type_basis FROM auditcore.journey_classifications c
+                    SELECT c.journey_id, c.deal_type, c.deal_type_basis, c.tl_deal_type, c.tl_reason, c.vin_used
+                    FROM auditcore.journey_classifications c
                     JOIN auditcore.journeys j ON j.tenant_id = c.tenant_id AND j.journey_id = c.journey_id
-                    WHERE c.tenant_id = :t AND j.dealer_id = CAST(:d AS uuid) AND c.deal_type IS NOT NULL
+                    WHERE c.tenant_id = :t AND j.dealer_id = CAST(:d AS uuid)
                 """),
                 {"t": tenant_id, "d": str(dealer_id)},
             ).mappings()}
@@ -718,21 +752,30 @@ class DeliveryScope:
                ) -> tuple[str | None, str | None]:
         from audit_core.uc03_p2_journey_classification import LABELS, decide_deal_type
 
-        if journey_id and journey_id in self.journey_types:
-            deal_type, basis = self.journey_types[journey_id]
-            return deal_type, f"As in Verigence ({LABELS.get(deal_type, deal_type)}): {basis or ''}".strip()
+        known = self.journeys.get(journey_id or "")
+        if known and known["tl_deal_type"]:
+            label = LABELS.get(known["tl_deal_type"], known["tl_deal_type"])
+            return known["tl_deal_type"], f"Set by the Team Lead in Verigence ({label}): {known['tl_reason'] or ''}".strip()
         delivered = row.get("event_date")
-        booked = journey.get("bookingDate") if journey is not None else None
-        vin = re.sub(r"[^A-Z0-9]", "", str(row.get("chassis") or "").upper()) or None
+        printed = row.get("booking_date")
+        if printed is not None and delivered is not None and printed > delivered:
+            printed = None
+        vin = re.sub(r"[^A-Z0-9]", "", str(row.get("chassis") or (known or {}).get("vin_used") or "").upper()) or None
         made = chassis_manufacture_month(vin, today=self.today)
+        if printed is None and known and known["deal_type"]:
+            deal_type = known["deal_type"]
+            return deal_type, f"As in Verigence ({LABELS.get(deal_type, deal_type)}): {known['deal_type_basis'] or ''}".strip()
+        booked = printed if printed is not None else (journey.get("bookingDate") if journey is not None else None)
         decided = decide_deal_type(booking_date=booked, vin=vin, manufacture_month=made,
                                    reference_date=delivered if made is not None else None,
                                    reference_kind="delivery")
-        basis = decided["deal_type_basis"]
-        if journey is None and basis:
+        basis = decided["deal_type_basis"] or ""
+        if printed is not None:
+            basis = "Booking date as on the delivery sheet. " + basis
+        elif journey is None:
             basis = "Not in Verigence: on the VIN alone. " + basis.replace("No booking date yet. ", "").replace(
                 "No booking date yet; ", "")
-        return decided["deal_type"], basis
+        return decided["deal_type"], basis or None
 
 
 def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict[str, int]:
@@ -758,6 +801,10 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
     updates, synced = [], []
     scope = DeliveryScope(connection, tenant_id, dealer_id) if kind == DELIVERY else None
     for row in rows:
+        if (model := row_out_of_scope(dict(row))) is not None:
+            updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": None, "b": model,
+                            "o": EXCLUDED, "ol": resolve_outlet(row["outlet_label"], outlets), "dt": None, "dtb": None})
+            continue
         if row["event_date"] is not None and not first <= row["event_date"] <= last:
             updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": None, "b": None,
                             "o": OUT_OF_PERIOD, "ol": resolve_outlet(row["outlet_label"], outlets),
@@ -815,7 +862,11 @@ def _dump_json(r: Any) -> dict[str, Any]:
         "dumpId": str(r["dump_id"]), "kind": r["dump_kind"], "dealerId": str(r["dealer_id"]),
         "dealerName": r.get("dealer_name"), "businessDate": r["business_date"].isoformat(),
         "periodMonth": r["period_month"].strftime("%Y-%m"), "fileName": r["file_name"], "format": r["file_format"],
-        "status": r["status"], "rows": r["row_count"], "matched": r["matched_count"],
+        # The rows compared: an out-of-scope model or a day outside the dump's days is not one.
+        "status": r["status"],
+        "rows": sum(int(r[k] or 0) for k in ("matched_count", "not_in_tool_count", "missing_count", "cancelled_count"))
+        if r["matched_at_utc"] else r["row_count"],
+        "fileRows": r["row_count"], "matched": r["matched_count"],
         "notInTool": r["not_in_tool_count"], "missing": r["missing_count"], "cancelled": r["cancelled_count"],
         "uploadedBy": r["uploaded_by_name"] or r["uploaded_by"], "uploadedAtUtc": r["uploaded_at_utc"].isoformat(),
         "matchedAtUtc": r["matched_at_utc"].isoformat() if r["matched_at_utc"] else None,
@@ -1013,7 +1064,7 @@ def read_dms_dump(
     rows = connection.execute(
         text(_ROW_SQL + """
             AND r.dump_id = :id AND (CAST(:o AS text) IS NULL OR r.outcome = CAST(:o AS text))
-            AND r.outcome <> 'OUT_OF_PERIOD'
+            AND r.outcome NOT IN ('OUT_OF_PERIOD', 'EXCLUDED')
             ORDER BY CASE r.outcome WHEN 'MISSING' THEN 0 WHEN 'NOT_IN_TOOL' THEN 1 WHEN 'CANCELLED' THEN 2 ELSE 3 END,
                      r.event_date DESC NULLS LAST, r.row_no
         """),
@@ -1211,7 +1262,8 @@ def dump_calendar(connection: Connection, *, tenant_id: str, dealer_ids: list[st
     ).mappings().all()
     dumps = connection.execute(
         text("""
-            SELECT dealer_id, dump_kind, business_date, dump_id, missing_count, not_in_tool_count, row_count
+            SELECT dealer_id, dump_kind, business_date, dump_id, missing_count, not_in_tool_count,
+                   COALESCE(matched_count + not_in_tool_count + missing_count + cancelled_count, row_count) AS row_count
             FROM auditcore.p2_dms_dumps
             WHERE tenant_id = :t AND status = 'ACTIVE' AND business_date BETWEEN :f AND :l
               AND CAST(dealer_id AS text) = ANY(:ds)
