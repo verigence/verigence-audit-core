@@ -92,6 +92,7 @@ MAP_ROLES = ("TL",)
 
 DMS_KEYS = ("bookingDms", "bookingSynced", "bookingNotInVerigence", "bookingCancelled", "bookingIntimated",
             "bookingNotIntimated", "deliveryDump", "deliverySynced", "deliveryNotUploaded", "deliveryNotInVerigence",
+            "dumpInscope", "dumpOutscope", "dumpOtherDealType", "dumpDealTypePending",
             "deliveryIntimated", "deliveryNotIntimated")
 VERIGENCE_KEYS = ("bookingInVerigence", "bookingDatedByUpload", "deliveryInVerigence", "deliveryDatedWithoutGatePass",
                   "deliveryNotInDms", "inscope", "outscope", "otherDealType",
@@ -206,6 +207,10 @@ def dms_figures(rows: list[dict[str, Any]], outlets: list[dict[str, Any]]
             figures["deliverySynced"] += outcome == MATCHED
             figures["deliveryNotUploaded"] += outcome == NOT_IN_TOOL
             figures["deliveryNotInVerigence"] += outcome == MISSING
+            # The Deal Type rule on the dump's own rows (2026-11-19): uc03_p2_dms_dumps.DeliveryScope.
+            scope = str(r.get("deal_type") or "")
+            figures["dumpInscope" if scope == "INSCOPE" else "dumpOutscope" if scope == "OUTSCOPE"
+                    else "dumpOtherDealType" if scope in ("MR", "LEASE", "BULK") else "dumpDealTypePending"] += 1
             if outcome != MATCHED:
                 figures["deliveryIntimated" if r.get("intimated") else "deliveryNotIntimated"] += 1
     return dict(located), dict(unmapped)
@@ -435,7 +440,7 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
     if dump_ids:
         for r in connection.execute(
             text("""
-                SELECT dealer_id, dump_kind, outlet_label, outcome, CAST(journey_id AS text) AS journey_id,
+                SELECT dealer_id, dump_kind, outlet_label, outcome, CAST(journey_id AS text) AS journey_id, deal_type,
                        dms_booking_number, booking_number, chassis, invoice_number, customer_name, mobile, event_date
                 FROM auditcore.p2_dms_dump_rows
                 WHERE tenant_id = :t AND CAST(dump_id AS text) = ANY(:ids) AND outcome <> 'OUT_OF_PERIOD'
@@ -558,6 +563,10 @@ EXCEL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("Not in Verigence", "deliveryNotInVerigence", "Total delivery"),
     ("In Verigence, not in dump", "deliveryNotInDms", "Total delivery"),
     ("Dump less Verigence", "deliveryGap", "Total delivery"),
+    ("Inscope", "dumpInscope", "Delivery bifurcation (dump)"),
+    ("Outscope", "dumpOutscope", "Delivery bifurcation (dump)"),
+    ("MR / Lease / Bulk", "dumpOtherDealType", "Delivery bifurcation (dump)"),
+    ("Type pending", "dumpDealTypePending", "Delivery bifurcation (dump)"),
     ("Inscope", "inscope", "Delivery bifurcation (Verigence)"),
     ("Outscope", "outscope", "Delivery bifurcation (Verigence)"),
     ("MR / Lease / Bulk", "otherDealType", "Delivery bifurcation (Verigence)"),
@@ -576,7 +585,8 @@ def build_outlet_report_excel(report: dict[str, Any]) -> bytes:
     ws = wb.active
     ws.title = "Outlet report"
     dark, white = PatternFill("solid", fgColor="161616"), Font(bold=True, color="FFFFFF")
-    groups = {"Booking": "0F62FE", "Total delivery": "8A3800", "Delivery bifurcation (Verigence)": "198038",
+    groups = {"Booking": "0F62FE", "Total delivery": "8A3800", "Delivery bifurcation (dump)": "005D5D",
+              "Delivery bifurcation (Verigence)": "198038",
               "Gate register": "525252"}
     sub = PatternFill("solid", fgColor="E8DAFF")
     tot = PatternFill("solid", fgColor="D0E2FF")
