@@ -292,3 +292,13 @@ def test_a_journey_of_another_outlet_is_named_not_linked() -> None:
     item = m._item(row, None, "me", {"palasuni"})
     assert item["canOpenJourney"] is False and item["journeyOutlet"] == "CDA" and item["journeyUploadedBy"] == "pc-cda"
     assert m._item(row, None, "me", {"cda"})["canOpenJourney"] is True
+
+
+def test_an_unreadable_chassis_falls_back_to_the_journey_vin() -> None:
+    scope = dumps.DeliveryScope.__new__(dumps.DeliveryScope)
+    scope.today = date(2026, 11, 19)
+    scope.journeys = {"j": {"tl_deal_type": None, "tl_reason": None, "deal_type": None, "deal_type_basis": None,
+                            "vin_used": "MA1NS2NP1T2K57261"}}
+    deal_type, basis = scope.decide({"chassis": "T1", "event_date": date(2026, 11, 14),
+                                     "booking_date": date(2026, 11, 7)}, "j", {"bookingDate": None})
+    assert deal_type == "INSCOPE" and "T2K57261" in basis

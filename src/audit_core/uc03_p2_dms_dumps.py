@@ -760,8 +760,14 @@ class DeliveryScope:
         printed = row.get("booking_date")
         if printed is not None and delivered is not None and printed > delivered:
             printed = None
-        vin = re.sub(r"[^A-Z0-9]", "", str(row.get("chassis") or (known or {}).get("vin_used") or "").upper()) or None
-        made = chassis_manufacture_month(vin, today=self.today)
+        # The sheet's chassis; where it cannot be read (T1, 7653946740), the Journey's VIN.
+        vin, made = None, None
+        for candidate in (row.get("chassis"), (known or {}).get("vin_used")):
+            value = re.sub(r"[^A-Z0-9]", "", str(candidate or "").upper()) or None
+            if value and (month := chassis_manufacture_month(value, today=self.today)) is not None:
+                vin, made = value, month
+                break
+            vin = vin or value
         if printed is None and known and known["deal_type"]:
             deal_type = known["deal_type"]
             return deal_type, f"As in Verigence ({LABELS.get(deal_type, deal_type)}): {known['deal_type_basis'] or ''}".strip()
