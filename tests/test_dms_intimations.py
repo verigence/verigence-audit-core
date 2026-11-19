@@ -235,13 +235,14 @@ def test_delivery_dump_rows_are_marked_inscope_or_outscope(setup) -> None:
             {"d": dump_id}).mappings()}
     assert rows["Young Car"][0] == "INSCOPE"
     assert rows["Old Car"][0] == "OUTSCOPE" and "90 days or more" in rows["Old Car"][1]
-    assert rows["Booked Early"][0] == "OUTSCOPE" and "before 1 Sep 2026" in rows["Booked Early"][1]
+    # Not in Verigence: the VIN alone; a booking date the sheet prints is not used (2026-11-19).
+    assert rows["Booked Early"][0] == "INSCOPE" and rows["Booked Early"][1].startswith("Not in Verigence: on the VIN alone")
     assert rows["No Chassis"][0] is None
     s.acting["subject"] = s.reviewer
     made = s.client.post(f"{s.base}/dms-reports", json={})
     assert made.status_code == 201, made.text
     f = made.json()["figures"]
-    assert (f["dumpInscope"], f["dumpOutscope"], f["dumpDealTypePending"]) == (1, 2, 1)
+    assert (f["dumpInscope"], f["dumpOutscope"], f["dumpDealTypePending"]) == (2, 1, 1)
     kept = s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}").json()
     assert {r["customerName"]: r["dealType"] for r in kept["deliveryScope"]}["No Chassis"] == "Pending"
     book = load_workbook(io.BytesIO(s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}/file").content))
