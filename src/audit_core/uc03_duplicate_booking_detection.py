@@ -59,6 +59,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from typing import Any
 from uuid import UUID
@@ -125,7 +127,7 @@ _SEVERITY_BY_BASIS: dict[str, str] = {
     # the same mobile only, at another dealership (product owner 2026-11-04): a
     # duplicate booking of less probability
     "MOBILE_OTHER_DEALERSHIP": "LOW",
-    "SURNAME_AND_PINCODE": "MEDIUM",
+    "SURNAME_AND_PINCODE": "MEDIUM",  # no longer raised (19 Nov 2026); kept to read old findings
     "SIMILAR_ADDRESS": "LOW",  # no longer raised; kept to read old findings
 }
 
@@ -742,11 +744,11 @@ def _match_basis(signals: dict[str, Any], candidate: dict[str, Any]) -> str | No
         if signals.get("dealer_id") and candidate.get("dealer_id") and signals["dealer_id"] != candidate["dealer_id"]:
             return "MOBILE_OTHER_DEALERSHIP"
         return "MOBILE"
-    if (
-        signals["surname"] and candidate["surname"] and signals["surname"] == candidate["surname"]
-        and signals["pincode"] and candidate["pincode"] and signals["pincode"] == candidate["pincode"]
-    ):
-        return "SURNAME_AND_PINCODE"
+    # The same surname and pincode no longer pairs two bookings (product owner
+    # 19 Nov 2026): in Odisha a Sahoo, Barik or Naik shares a pincode with many
+    # unrelated customers -- 39 of 42 open "possible duplicate" flags were raised
+    # on it, one Barik booking "matched" by four different Bariks. A surname with
+    # the given name too (NAME_AND_ADDRESS, above) still does.
     return None
 
 
@@ -849,6 +851,103 @@ def _matched_fields(basis: str, signals: dict[str, Any], candidate: dict[str, An
 # accessory invoice or credit note may be filed on the wrong booking, so it
 # does not count). One shared number keeps the pair; with nothing to compare,
 # the pair stays too.
+_MIN_NUMBER_LENGTH = 5
+
+
+# A receipt is one payment: the same receipt NUMBER on two bookings is the same
+# receipt only when its AMOUNT and DATE are the same too (product owner 19 Nov
+# 2026). A number alone is one misread digit away from another receipt of the
+# same series: AMC-C/5872/26-27 was read off Hemanta Sahoo's Rs 1,99,000 cash
+# receipt and off Ranjubala Pradhan's Rs 62,500 one of the same day (her next
+# receipt is 5873) -- different customers, amounts and purposes, flagged as one
+# payment on two bookings. Of 14 open receipt pairs on 19 Nov, 4 were such
+# misreads; the other 10 carried the same number, amount, payer and date.
+# The amount and date are read off the same receipt document as its number; a
+# receipt whose amount or date was not read cannot be confirmed and does not pair.
+_RECEIPT_AMOUNT_DATE = """
+           (SELECT a.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields a
+             WHERE a.tenant_id = f.tenant_id AND a.journey_id = f.journey_id
+               AND a.di_document_id = f.di_document_id AND a.field_key = 'amount_paid'
+               AND a.effective_value IS NOT NULL AND a.effective_value <> 'null'::jsonb
+             ORDER BY a.confidence_score DESC NULLS LAST, a.updated_at_utc DESC LIMIT 1) AS amount,
+           (SELECT d.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields d
+             WHERE d.tenant_id = f.tenant_id AND d.journey_id = f.journey_id
+               AND d.di_document_id = f.di_document_id AND d.field_key = 'receipt_date'
+               AND d.effective_value IS NOT NULL AND d.effective_value <> 'null'::jsonb
+             ORDER BY d.confidence_score DESC NULLS LAST, d.updated_at_utc DESC LIMIT 1) AS receipt_date"""
+_AMOUNT_TEXT = re.compile(r"[^0-9.]")
+_DATE_FORMATS: tuple[str, ...] = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y",
+                                  "%d-%b-%Y", "%d %b %Y", "%d-%b-%y", "%Y/%m/%d")
+
+
+def _receipt_amount(value: Any) -> Decimal | None:
+    """The amount in rupees, whatever its separators ("1,99,000.00", 199000)."""
+    cleaned = _AMOUNT_TEXT.sub("", str(value or ""))
+    if not cleaned or cleaned.count(".") > 1:
+        return None
+    try:
+        amount = Decimal(cleaned)
+    except InvalidOperation:
+        return None
+    return amount.quantize(Decimal("0.01")) if amount > 0 else None
+
+
+def _receipt_date(value: Any) -> str | None:
+    """The receipt date as YYYY-MM-DD, or None when it cannot be read as a date."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    candidate = raw[:10] if re.match(r"^\d{4}-\d{2}-\d{2}", raw) else raw
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(candidate, fmt).replace(tzinfo=UTC).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _receipt_key(number: str, amount: Any, receipt_date: Any) -> str | None:
+    """One receipt: its number, amount and date together. None when the amount
+    or date was not read -- the receipt cannot be confirmed as the same."""
+    rupees, day = _receipt_amount(amount), _receipt_date(receipt_date)
+    if rupees is None or day is None:
+        return None
+    return f"{number}|{rupees}|{day}"
+
+
+def _receipt_shown(key: str) -> str:
+    """AMCC58722627 (Rs 62,500.00, 2026-10-15) -- what the reviewer reads."""
+    number, rupees, day = key.split("|")
+    return f"{number} (Rs {_rupees_text(Decimal(rupees))}, {day})"
+
+
+def _rupees_text(amount: Decimal) -> str:
+    whole, _, paise = f"{amount:.2f}".partition(".")
+    head, tail = whole[:-3], whole[-3:]
+    groups = []
+    while len(head) > 2:
+        groups.insert(0, head[-2:])
+        head = head[:-2]
+    if head:
+        groups.insert(0, head)
+    return ",".join([*groups, tail]) + f".{paise}"
+
+
+# A booking or receipt number carries digits (product owner 19 Nov 2026): the
+# booking form's label "ORDER" was read as the booking number of SHI-KB-261023-009
+# and SHI-KB-261024-002, pairing B-ONE BUSINESS HOUSE with Siddharth Kumar Rath.
+# A word is a label, not a number; at least _MIN_NUMBER_DIGITS digits are needed.
+_MIN_NUMBER_DIGITS = 4
+
+
+def _usable_number(kind: str, number: str) -> bool:
+    if len(number) < _MIN_NUMBER_LENGTH:
+        return False
+    if kind in ("B", "R"):
+        return sum(1 for character in number if character.isdigit()) >= _MIN_NUMBER_DIGITS
+    return True
+
+
 _BOOKING_NUMBERS_SQL = """
     SELECT CASE
              WHEN e.document_type_key IN ('booking_docket', 'booking_form') AND f.field_key = 'booking_reference_number'
@@ -857,7 +956,8 @@ _BOOKING_NUMBERS_SQL = """
                THEN 'R'
              WHEN f.field_key IN ('chassis_number', 'vin_number') THEN 'C'
            END AS kind,
-           upper(regexp_replace(f.effective_value #>> '{}', '[^A-Za-z0-9]', '', 'g')) AS number
+           upper(regexp_replace(f.effective_value #>> '{}', '[^A-Za-z0-9]', '', 'g')) AS number,
+           """ + _RECEIPT_AMOUNT_DATE + """
     FROM auditcore.journey_document_extracted_fields f
     JOIN auditcore.evidence e
       ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id AND e.di_document_id = f.di_document_id
@@ -873,7 +973,6 @@ _BOOKING_NUMBERS_SQL = """
       )
       AND """ + _NOT_TAKEN_OUT + """
 """
-_MIN_NUMBER_LENGTH = 5
 _CHASSIS_TAIL = 8
 
 
@@ -882,11 +981,16 @@ def _booking_numbers(connection: Connection, *, tenant_id: str, journey_id: UUID
     for row in connection.execute(
         text(_BOOKING_NUMBERS_SQL), {"tenant_id": tenant_id, "journey_id": journey_id}
     ).mappings().all():
-        number = str(row["number"] or "")
-        if row["kind"] not in out or len(number) < _MIN_NUMBER_LENGTH:
+        number, kind = str(row["number"] or ""), row["kind"]
+        if kind not in out or not _usable_number(kind, number):
+            continue
+        if kind == "R":
+            key = _receipt_key(number, row["amount"], row["receipt_date"])
+            if key is not None:
+                out["R"].add(key)
             continue
         # A chassis is printed in full or by its last digits ("T2H36974").
-        out[row["kind"]].add(number[-_CHASSIS_TAIL:] if row["kind"] == "C" else number)
+        out[kind].add(number[-_CHASSIS_TAIL:] if kind == "C" else number)
     # The vehicle model (2026-11-02): its identity across spellings, the
     # Bolero family split by series (#468).
     vehicle = connection.execute(
@@ -941,7 +1045,7 @@ def relative_booking(own: dict[str, set[str]], theirs: dict[str, set[str]]) -> b
 # dealership; a VIN anywhere in the Project.
 _NUMBER_BASES = (("C", "VIN"), ("B", "OTF"), ("R", "RECEIPT"))
 _SHARED_NUMBERS_SQL = """
-    SELECT DISTINCT v.journey_id, v.kind, v.number
+    SELECT DISTINCT v.journey_id, v.kind, v.number, v.amount, v.receipt_date
     FROM (
         SELECT f.journey_id, j.dealer_id,
                CASE
@@ -951,7 +1055,8 @@ _SHARED_NUMBERS_SQL = """
                       AND f.field_key = 'receipt_number' THEN 'R'
                  ELSE 'C'
                END AS kind,
-               upper(regexp_replace(f.effective_value #>> '{}', '[^A-Za-z0-9]', '', 'g')) AS number
+               upper(regexp_replace(f.effective_value #>> '{}', '[^A-Za-z0-9]', '', 'g')) AS number,
+               """ + _RECEIPT_AMOUNT_DATE + """
         FROM auditcore.journey_document_extracted_fields f
         JOIN auditcore.evidence e
           ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id AND e.di_document_id = f.di_document_id
@@ -987,17 +1092,25 @@ def shared_numbers(connection: Connection, *, tenant_id: str, journey_id: UUID,
     rows = connection.execute(
         text(_SHARED_NUMBERS_SQL),
         {"tenant_id": tenant_id, "journey_id": journey_id, "tail": _CHASSIS_TAIL, "dealer_id": dealer_id,
-         "chassis": sorted(own["C"]), "bookings": sorted(own["B"]), "receipts": sorted(own["R"])},
+         "chassis": sorted(own["C"]), "bookings": sorted(own["B"]),
+         "receipts": sorted({key.split("|")[0] for key in own["R"]})},
     ).mappings().all()
     rank = {kind: i for i, (kind, _) in enumerate(_NUMBER_BASES)}
     basis_of = dict(_NUMBER_BASES)
     out: dict[UUID, tuple[str, str]] = {}
     for row in sorted(rows, key=lambda r: rank[r["kind"]]):
-        number = str(row["number"] or "")
-        if len(number) < _MIN_NUMBER_LENGTH:
+        number, kind = str(row["number"] or ""), row["kind"]
+        if not _usable_number(kind, number):
             continue
-        shown = number[-_CHASSIS_TAIL:] if row["kind"] == "C" else number
-        out.setdefault(row["journey_id"], (basis_of[row["kind"]], shown))
+        if kind == "R":
+            # The same number only: the same receipt when its amount and date agree too.
+            key = _receipt_key(number, row["amount"], row["receipt_date"])
+            if key is None or key not in own["R"]:
+                continue
+            shown = _receipt_shown(key)
+        else:
+            shown = number[-_CHASSIS_TAIL:] if kind == "C" else number
+        out.setdefault(row["journey_id"], (basis_of[kind], shown))
     return out
 
 
@@ -1253,6 +1366,33 @@ def _number_description(connection: Connection, *, tenant_id: str, basis: str, n
     return f"{what} is also on {other}. {why}{who}"
 
 
+# Why a pair no longer counts, by what it was raised on (19 Nov 2026): the
+# system remark on the cleared finding says it plainly.
+_CLEARED_NOTE_BY_BASIS: dict[str, str] = {
+    "RECEIPT": ("Not a duplicate: no receipt with the same number, amount and date is on the other booking. "
+                "A receipt number read alone can be a misread (rule of 19 Nov 2026)."),
+    "OTF": ("Not a duplicate: no booking number with digits is shared with the other booking. A word such as "
+            "ORDER is a form label, not a booking number (rule of 19 Nov 2026)."),
+    "SURNAME_AND_PINCODE": ("Not a duplicate: the same surname and pincode does not identify the same customer "
+                            "(rule of 19 Nov 2026)."),
+}
+_CLEARED_NOTE = "No longer matches an earlier booking after correction."
+
+
+def _cleared_note(connection: Connection, *, tenant_id: str, finding_id: UUID) -> str:
+    basis = connection.execute(
+        text(
+            """
+            SELECT safe_payload ->> 'matchBasis' FROM auditcore.audit_finding_events
+            WHERE tenant_id = :t AND audit_finding_id = :f AND event_type = 'RAISED'
+            ORDER BY occurred_at_utc LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "f": finding_id},
+    ).scalar_one_or_none()
+    return _CLEARED_NOTE_BY_BASIS.get(str(basis or ""), _CLEARED_NOTE)
+
+
 def sync_duplicate_booking_detection(
     connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str
 ) -> dict[str, Any]:
@@ -1431,7 +1571,7 @@ def sync_duplicate_booking_detection(
                 finding_id=finding["audit_finding_id"],
                 actor_id=None,
                 correlation_id=correlation_id,
-                note="No longer matches an earlier booking after correction.",
+                note=_cleared_note(connection, tenant_id=tenant_id, finding_id=finding["audit_finding_id"]),
             )
             resolved += 1
 
