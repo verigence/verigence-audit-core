@@ -76,7 +76,6 @@ from audit_core.uc03_p2_dms_dumps import (
     CANCELLED,
     DELIVERY,
     MATCHED,
-    MISSING,
     NOT_IN_TOOL,
     READ_ROLES,
     _access,
@@ -90,12 +89,19 @@ router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-dms-o
 # Who changes the DMS location map: the Team Lead (and an administrator).
 MAP_ROLES = ("TL",)
 
-DMS_KEYS = ("bookingDms", "bookingSynced", "bookingNotInVerigence", "bookingCancelled", "bookingIntimated",
-            "bookingNotIntimated", "deliveryDump", "deliverySynced", "deliveryNotUploaded", "deliveryNotInVerigence",
+# The figures add up (product owner 2026-11-19, "numbers are not matching up"):
+#   As per DMS     = synced + in Verigence dated outside the period + (delivery not uploaded)
+#                    + not in Verigence
+#   In Verigence   = synced + in Verigence, not in the DMS + not compared (no dump that day)
+# "Synced" is a dump row whose Journey Verigence also counts in the same days; a row found in
+# Verigence whose Journey Verigence dates elsewhere is shown apart, not as synced.
+DMS_KEYS = ("bookingDms", "bookingSynced", "bookingDatedElsewhere", "bookingNotInVerigence", "bookingCancelled",
+            "bookingIntimated", "bookingNotIntimated", "deliveryDump", "deliverySynced", "deliveryDatedElsewhere",
+            "deliveryNotUploaded", "deliveryNotInVerigence",
             "dumpInscope", "dumpOutscope", "dumpOtherDealType", "dumpDealTypePending",
             "deliveryIntimated", "deliveryNotIntimated")
-VERIGENCE_KEYS = ("bookingInVerigence", "bookingDatedByUpload", "deliveryInVerigence", "deliveryDatedWithoutGatePass",
-                  "deliveryNotInDms", "inscope", "outscope", "otherDealType",
+VERIGENCE_KEYS = ("bookingInVerigence", "bookingDatedByUpload", "bookingNotInDms", "bookingNotCompared",
+                  "deliveryInVerigence", "deliveryDatedWithoutGatePass", "deliveryNotInDms", "deliveryNotCompared", "inscope", "outscope", "otherDealType",
                   "dealTypePending", "gateRegister", "registersMissed", "countsPending")
 
 
@@ -178,11 +184,14 @@ def _latest_dumps(connection: Connection, tenant_id: str, dealer_ids: list[str],
     return {(str(r["dealer_id"]), r["dump_kind"]): dict(r) for r in rows}
 
 
-def dms_figures(rows: list[dict[str, Any]], outlets: list[dict[str, Any]]
+def dms_figures(rows: list[dict[str, Any]], outlets: list[dict[str, Any]], booked: set[str] | None = None,
+                delivered: set[str] | None = None
                 ) -> tuple[dict[str, dict[str, int]], dict[str, dict[str, int]]]:
     """Per DMS location (anchor outlet id) and per unmapped location name: the dump
-    rows' figures. ``rows``: dump_kind, outlet_label, outcome, intimated (a PC's mark on a row
-    Verigence does not hold: uc03_p2_dms_intimations, 2026-11-18)."""
+    rows' figures. ``rows``: dump_kind, outlet_label, outcome, journey_id, intimated (a PC's mark
+    on a row Verigence does not hold: uc03_p2_dms_intimations, 2026-11-18). ``booked`` /
+    ``delivered``: the Journeys Verigence counts in the same days -- a row whose Journey is not
+    among them is "in Verigence, dated outside the period", not synced (None: all synced)."""
     located: dict[str, dict[str, int]] = defaultdict(lambda: _zero(DMS_KEYS))
     unmapped: dict[str, dict[str, int]] = defaultdict(lambda: _zero(DMS_KEYS))
     cache: dict[str, str | None] = {}
@@ -198,15 +207,23 @@ def dms_figures(rows: list[dict[str, Any]], outlets: list[dict[str, Any]]
                 figures["bookingCancelled"] += 1
                 continue
             figures["bookingDms"] += 1
-            figures["bookingSynced"] += outcome == MATCHED
-            figures["bookingNotInVerigence"] += outcome == MISSING
+            if outcome == MATCHED:
+                figures["bookingSynced" if booked is None or r.get("journey_id") in booked
+                        else "bookingDatedElsewhere"] += 1
+            else:
+                figures["bookingNotInVerigence"] += 1
             if outcome != MATCHED:
                 figures["bookingIntimated" if r.get("intimated") else "bookingNotIntimated"] += 1
         else:
             figures["deliveryDump"] += 1
-            figures["deliverySynced"] += outcome == MATCHED
-            figures["deliveryNotUploaded"] += outcome == NOT_IN_TOOL
-            figures["deliveryNotInVerigence"] += outcome == MISSING
+            if delivered is not None and r.get("journey_id") in delivered:
+                figures["deliverySynced"] += 1  # Verigence counts its delivery in the same days
+            elif outcome == MATCHED:
+                figures["deliverySynced" if delivered is None else "deliveryDatedElsewhere"] += 1
+            elif outcome == NOT_IN_TOOL:
+                figures["deliveryNotUploaded"] += 1
+            else:
+                figures["deliveryNotInVerigence"] += 1
             # The Deal Type rule on the dump's own rows (2026-11-19): uc03_p2_dms_dumps.DeliveryScope.
             scope = str(r.get("deal_type") or "")
             figures["dumpInscope" if scope == "INSCOPE" else "dumpOutscope" if scope == "OUTSCOPE"
@@ -227,25 +244,27 @@ _BOOKINGS_SQL = """
           AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
         GROUP BY ub.journey_id
     )
-    SELECT j.outlet_id, count(*) AS n,
-           count(*) FILTER (WHERE b.booking_date IS NULL OR b.booking_date > CAST(:today AS date)) AS by_upload
+    SELECT CAST(j.journey_id AS text) AS journey_id, CAST(j.outlet_id AS text) AS outlet_id,
+           COALESCE(CASE WHEN b.booking_date <= CAST(:today AS date) THEN b.booking_date END, up.day) AS day,
+           (b.booking_date IS NULL OR b.booking_date > CAST(:today AS date)) AS by_upload
     FROM auditcore.journeys j
     LEFT JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
     LEFT JOIN up ON up.journey_id = j.journey_id
     WHERE j.tenant_id = :t AND CAST(j.outlet_id AS text) = ANY(:ids)
-      AND COALESCE(CASE WHEN b.booking_date <= CAST(:today AS date) THEN b.booking_date END, up.day)
-          BETWEEN :f AND :bd
-    GROUP BY j.outlet_id
 """
 
 def verigence_figures(connection: Connection, tenant_id: str, outlets: list[dict[str, Any]], first: date,
                       booking_to: date, delivery_to: date, today: date,
                       dump_journeys: set[str] | None = None,
-                      missed: dict[str, list[date]] | None = None) -> dict[str, dict[str, int]]:
+                      missed: dict[str, list[date]] | None = None,
+                      booking_dump_journeys: set[str] | None = None,
+                      seen: dict[str, Any] | None = None) -> dict[str, dict[str, int]]:
     """Per Verigence outlet: bookings from the 1st to ``booking_to``; deliveries in the tool
     (with Deal Type) and the gate register from the 1st to ``delivery_to``. ``dump_journeys``:
     the Journeys the dealership's delivery dump found (None: no dump on file). ``missed``, when
-    given, gets each outlet's days with no gate register.
+    given, gets each outlet's days with no gate register. ``booking_dump_journeys``: the Journeys
+    the booking dump found (None: no dump). ``seen``, when given, gets the Journeys counted
+    ("booked", "delivered") and every Journey's dating ("bookingDays", "deliveries").
 
     What was intimated to the PC is no longer asked at the gate register (product owner
     2026-11-18): it comes from the PCs' marks on the dumps (dms_figures)."""
@@ -256,15 +275,27 @@ def verigence_figures(connection: Connection, tenant_id: str, outlets: list[dict
     out: dict[str, dict[str, int]] = {oid: _zero(VERIGENCE_KEYS) for oid in ids}
     if not ids:
         return out
-    for r in connection.execute(text(_BOOKINGS_SQL),
-                                {"t": tenant_id, "ids": ids, "f": first, "bd": booking_to, "today": today}).mappings():
-        out[str(r["outlet_id"])]["bookingInVerigence"] = int(r["n"])
+    booked: set[str] = set()
+    booking_days: dict[str, tuple[date, bool]] = {}
+    for r in connection.execute(text(_BOOKINGS_SQL), {"t": tenant_id, "ids": ids, "today": today}).mappings():
+        if r["day"] is None:
+            continue
+        booking_days[r["journey_id"]] = (r["day"], bool(r["by_upload"]))
+        if not first <= r["day"] <= booking_to:
+            continue
+        booked.add(r["journey_id"])
+        figures = out[r["outlet_id"]]
+        figures["bookingInVerigence"] += 1
         # no booking form date read: dated by the day the booking documents were uploaded
-        out[str(r["outlet_id"])]["bookingDatedByUpload"] = int(r["by_upload"])
+        figures["bookingDatedByUpload"] += bool(r["by_upload"])
+        if booking_dump_journeys is not None and r["journey_id"] not in booking_dump_journeys:
+            figures["bookingNotInDms"] += 1
     # The delivery day (product owner 2026-11-17): the gate pass's, else the NDC's printed
     # delivery date, else the latest payment receipt -- delivery files on file only.
-    counted = in_period(deliveries(connection, tenant_id=tenant_id, today=today, outlet_ids=ids),
-                        first, min(delivery_to, today))
+    every = deliveries(connection, tenant_id=tenant_id, today=today, outlet_ids=ids)
+    counted = in_period(every, first, min(delivery_to, today))
+    if seen is not None:
+        seen.update(booked=booked, bookingDays=booking_days, delivered=set(counted), deliveries=every)
     for jid, (delivery, _day) in counted.items():
         figures = out.get(delivery.outlet_id or "")
         if figures is None:
@@ -310,12 +341,14 @@ def _add(into: dict[str, int], more: dict[str, int]) -> None:
         into[key] = into.get(key, 0) + value
 
 
-def _gaps(figures: dict[str, int]) -> dict[str, int]:
-    """DMS less Verigence (what Verigence still lacks against the DMS), where both are known."""
+def _gaps(figures: dict[str, int], booking: bool = True, delivery: bool = True) -> dict[str, int]:
+    """DMS less Verigence (what Verigence still lacks against the DMS), only for a dump on file:
+    a dealership with no dump of a kind that day has no gap of that kind (2026-11-19: its
+    Verigence figures had been taken from the other dealerships' gap)."""
     out = dict(figures)
     if "bookingDms" in figures:
-        out["bookingGap"] = figures["bookingDms"] - figures.get("bookingInVerigence", 0)
-        out["deliveryGap"] = figures["deliveryDump"] - figures.get("deliveryInVerigence", 0)
+        out["bookingGap"] = figures["bookingDms"] - figures.get("bookingInVerigence", 0) if booking else None
+        out["deliveryGap"] = figures["deliveryDump"] - figures.get("deliveryInVerigence", 0) if delivery else None
     return out
 
 
@@ -427,6 +460,21 @@ def statement_lines(dealers: list[dict[str, Any]]) -> list[str]:
             + (f", {i['leaveDays']} on leave" if i["leaveDays"] else "")
             for i in items) or "none"
         lines.append(f"* PC not available (outlets impacted): {text_}")
+        for kind in st.get("noDump") or []:
+            lines.append(f"* No {kind.lower()} dump uploaded for the day: its {kind.lower()}s in Verigence are not "
+                         "compared")
+        f = st.get("figures") or {}
+        if "bookingDms" in f and BOOKING not in (st.get("noDump") or []):
+            lines.append(
+                f"* Bookings: DMS {f['bookingDms']} = synced {f['bookingSynced']} + in Verigence dated outside the "
+                f"period {f['bookingDatedElsewhere']} + not in Verigence {f['bookingNotInVerigence']}; Verigence "
+                f"{f['bookingInVerigence']} = synced {f['bookingSynced']} + not in the DMS {f['bookingNotInDms']}")
+        if "deliveryDump" in f and DELIVERY not in (st.get("noDump") or []):
+            lines.append(
+                f"* Deliveries: dump {f['deliveryDump']} = synced {f['deliverySynced']} + in Verigence dated outside "
+                f"the period {f['deliveryDatedElsewhere']} + delivery not uploaded {f['deliveryNotUploaded']} + not "
+                f"in Verigence {f['deliveryNotInVerigence']}; Verigence {f['deliveryInVerigence']} = synced "
+                f"{f['deliverySynced']} + not in the dump {f['deliveryNotInDms']}")
     return lines
 
 
@@ -440,10 +488,13 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
     if dump_ids:
         for r in connection.execute(
             text("""
-                SELECT dealer_id, dump_kind, outlet_label, outcome, CAST(journey_id AS text) AS journey_id, deal_type,
-                       dms_booking_number, booking_number, chassis, invoice_number, customer_name, mobile, event_date
-                FROM auditcore.p2_dms_dump_rows
-                WHERE tenant_id = :t AND CAST(dump_id AS text) = ANY(:ids) AND outcome NOT IN ('OUT_OF_PERIOD', 'EXCLUDED')
+                SELECT r.dealer_id, r.dump_kind, r.outlet_label, r.outcome, CAST(r.journey_id AS text) AS journey_id,
+                       r.deal_type, r.dms_booking_number, r.booking_number, r.chassis, r.invoice_number,
+                       r.customer_name, r.mobile, r.event_date, j.journey_reference
+                FROM auditcore.p2_dms_dump_rows r
+                LEFT JOIN auditcore.journeys j ON j.tenant_id = r.tenant_id AND j.journey_id = r.journey_id
+                WHERE r.tenant_id = :t AND CAST(r.dump_id AS text) = ANY(:ids)
+                  AND r.outcome NOT IN ('OUT_OF_PERIOD', 'EXCLUDED', 'DUPLICATE')
             """),
             {"t": tenant_id, "ids": dump_ids},
         ).mappings():
@@ -455,12 +506,13 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
         for r in rows:
             r["intimated"] = (did, r["dump_kind"], row_key(r["dump_kind"], r)) in marks
     project = {**_zero(DMS_KEYS), **_zero(VERIGENCE_KEYS)}
+    project_gaps = {"bookingGap": 0, "deliveryGap": 0}
     out_dealers = []
+    dated_elsewhere: list[dict[str, Any]] = []
     for dealer in dealers:
         did = dealer["dealerId"]
         outlets = outlet_map(connection, tenant_id, did)
         by_id = {str(o["outlet_id"]): o for o in outlets}
-        located, unmapped = dms_figures(rows_by_dealer.get(did, []), outlets)
         booking, delivery = dumps.get((did, BOOKING)), dumps.get((did, DELIVERY))
         # Like with like: Verigence is counted up to the last day the dealership's dump covers
         # (a dump of the 5th carries the 1st to the 4th), else up to the report's day.
@@ -470,11 +522,22 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
         booking_to = max(first, dump_window(booking["period_month"], booking["business_date"])[1]) if booking else day
         delivery_to = (max(first, dump_window(delivery["period_month"], delivery["business_date"])[1])
                        if delivery else day)
-        dump_journeys = ({r["journey_id"] for r in rows_by_dealer.get(did, [])
+        dealer_rows = rows_by_dealer.get(did, [])
+        dump_journeys = ({r["journey_id"] for r in dealer_rows
                           if r["dump_kind"] == DELIVERY and r["journey_id"]} if delivery else None)
+        booking_journeys = ({r["journey_id"] for r in dealer_rows
+                             if r["dump_kind"] == BOOKING and r["journey_id"]} if booking else None)
         missed: dict[str, list[date]] = {}
+        seen: dict[str, Any] = {}
         verigence = verigence_figures(connection, tenant_id, outlets, first, booking_to, delivery_to, today,
-                                      dump_journeys, missed)
+                                      dump_journeys, missed, booking_journeys, seen)
+        for figures in verigence.values():  # no dump that day: Verigence's side is not compared
+            if booking is None:
+                figures["bookingNotCompared"] = figures["bookingInVerigence"]
+            if delivery is None:
+                figures["deliveryNotCompared"] = figures["deliveryInVerigence"]
+        located, unmapped = dms_figures(dealer_rows, outlets, seen["booked"], seen["delivered"])
+        dated_elsewhere += _dated_elsewhere(dealer["dealerName"], dealer_rows, seen, first, booking_to, delivery_to)
         members: dict[str, list[str]] = defaultdict(list)
         for o in outlets:
             anchor = str(o["dms_outlet_id"])
@@ -491,7 +554,8 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
                                     "figures": verigence[oid]})
             dms = located.get(anchor, _zero(DMS_KEYS))
             location = {"dmsOutletId": anchor, "name": short_name(by_id[anchor]["outlet_name"]),
-                        "outlets": outlet_rows, "figures": _gaps({**dms, **summed})}
+                        "outlets": outlet_rows,
+                        "figures": _gaps({**dms, **summed}, booking is not None, delivery is not None)}
             locations.append(location)
             _add(total, dms)
             _add(total, summed)
@@ -504,13 +568,58 @@ def build_outlet_report(connection: Connection, *, tenant_id: str, dealers: list
             "bookingDumpDate": booking["business_date"].isoformat() if booking else None,
             "deliveryDumpDate": delivery["business_date"].isoformat() if delivery else None,
             "bookingsTo": booking_to.isoformat(), "deliveriesTo": delivery_to.isoformat(),
-            "locations": locations, "unmapped": unmapped_rows, "figures": _gaps(total),
-            "statement": dealer_statement(connection, tenant_id, outlets, missed, first, min(delivery_to, today), today),
+            "locations": locations, "unmapped": unmapped_rows,
+            "figures": (dealer_figures := _gaps(total, booking is not None, delivery is not None)),
+            "statement": {**dealer_statement(connection, tenant_id, outlets, missed, first, min(delivery_to, today),
+                                             today),
+                          "noDump": [k for k, d in ((BOOKING, booking), (DELIVERY, delivery)) if d is None],
+                          "figures": dealer_figures},
         })
         _add(project, total)
+        for key in project_gaps:
+            project_gaps[key] += dealer_figures.get(key) or 0
     return {"date": day.isoformat(), "month": first.strftime("%Y-%m"), "today": today.isoformat(),
-            "dealers": out_dealers, "figures": _gaps(project),
+            "dealers": out_dealers, "figures": {**project, **project_gaps},
+            "datedElsewhere": dated_elsewhere,
             "statementLines": statement_lines(out_dealers)}
+
+
+def _dated_elsewhere(dealer_name: str, rows: list[dict[str, Any]], seen: dict[str, Any], first: date,
+                     booking_to: date, delivery_to: date) -> list[dict[str, Any]]:
+    """Dump rows found in Verigence whose Journey Verigence dates outside the dump's days --
+    with the date Verigence holds and what it is dated by, for review (2026-11-19)."""
+    from audit_core.uc03_p2_delivery_dates import SOURCE_LABELS
+
+    out = []
+    for r in rows:
+        jid = r.get("journey_id")
+        if not jid or r["outcome"] != MATCHED:
+            continue
+        if r["dump_kind"] == BOOKING:
+            if jid in seen["booked"]:
+                continue
+            day, by_upload = seen["bookingDays"].get(jid, (None, False))
+            dated_by = ("No booking date" if day is None else "Upload day (no booking form date)" if by_upload
+                        else "Booking form")
+            period_to = booking_to
+        else:
+            if jid in seen["delivered"]:
+                continue
+            found = seen["deliveries"].get(jid)
+            days = sorted(found.days) if found else []
+            day = days[-1] if days else None
+            dated_by = SOURCE_LABELS.get(found.source, found.source) if found else (
+                "No delivery date read (no gate pass, NDC or receipt date)")
+            period_to = delivery_to
+        out.append({
+            "dealerName": dealer_name, "kind": r["dump_kind"].title(), "location": r.get("outlet_label"),
+            "dmsDate": r["event_date"].isoformat() if r.get("event_date") else None,
+            "customerName": r.get("customer_name"), "otf": r.get("dms_booking_number") or r.get("booking_number"),
+            "chassis": r.get("chassis"), "journeyReference": r.get("journey_reference"),
+            "verigenceDate": day.isoformat() if day else None, "datedBy": dated_by,
+            "period": f"{first.isoformat()} to {period_to.isoformat()}",
+        })
+    return sorted(out, key=lambda x: (x["dealerName"] or "", x["kind"], x["dmsDate"] or ""))
 
 
 # --------------------------------------------------------------------------- endpoints
@@ -548,7 +657,10 @@ EXCEL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("In Verigence", "bookingInVerigence", "Booking"),
     ("of which no booking form date", "bookingDatedByUpload", "Booking"),
     ("Synced with DMS", "bookingSynced", "Booking"),
+    ("In Verigence, dated outside the period", "bookingDatedElsewhere", "Booking"),
     ("Not in Verigence", "bookingNotInVerigence", "Booking"),
+    ("In Verigence, not in DMS", "bookingNotInDms", "Booking"),
+    ("Not compared (no dump)", "bookingNotCompared", "Booking"),
     ("Intimated to PC, not in Verigence", "bookingIntimated", "Booking"),
     ("Not intimated to PC", "bookingNotIntimated", "Booking"),
     ("DMS less Verigence", "bookingGap", "Booking"),
@@ -557,11 +669,13 @@ EXCEL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("In Verigence", "deliveryInVerigence", "Total delivery"),
     ("of which dated without gate pass", "deliveryDatedWithoutGatePass", "Total delivery"),
     ("Synced with dump", "deliverySynced", "Total delivery"),
+    ("In Verigence, dated outside the period", "deliveryDatedElsewhere", "Total delivery"),
     ("Intimated to PC, not uploaded", "deliveryIntimated", "Total delivery"),
     ("Not intimated to PC", "deliveryNotIntimated", "Total delivery"),
     ("Delivery not uploaded", "deliveryNotUploaded", "Total delivery"),
     ("Not in Verigence", "deliveryNotInVerigence", "Total delivery"),
     ("In Verigence, not in dump", "deliveryNotInDms", "Total delivery"),
+    ("Not compared (no dump)", "deliveryNotCompared", "Total delivery"),
     ("Dump less Verigence", "deliveryGap", "Total delivery"),
     ("Inscope", "dumpInscope", "Delivery bifurcation (dump)"),
     ("Outscope", "dumpOutscope", "Delivery bifurcation (dump)"),
@@ -671,7 +785,12 @@ def build_outlet_report_excel(report: dict[str, Any]) -> bytes:
          "Intimation tab) -- pending with the PC. Not intimated to PC: no PC marked it -- pending with the dealership. "
          "A row in Verigence needs no mark. Nothing here is asked at the gate register any more."),
         "Gate register: the PC's daily register, its count of deliveries; registers missed are listed on the Statement sheet.",
-        "Synced = a DMS row found in Verigence. Not in Verigence = no journey at all. Delivery not uploaded = journey found, delivery file not uploaded.",
+        ("Synced = a DMS row whose journey Verigence counts in the same days. In Verigence, dated outside the period = "
+         "the journey is in Verigence but Verigence dates it on another day (sheet 'Dated outside the period'). Not in "
+         "Verigence = no journey at all. Delivery not uploaded = journey found, delivery file not uploaded."),
+        ("The figures add up: As per DMS = synced + dated outside the period + delivery not uploaded + not in "
+         "Verigence; In Verigence = synced + not in DMS + not compared. One journey is matched to one DMS row only; a "
+         "line repeating an earlier line's chassis / OTF is a duplicate and is left out."),
         "Cancelled bookings in the DMS are left out of 'As per DMS'.",
     ):
         notes.append([line])
