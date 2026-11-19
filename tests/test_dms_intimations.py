@@ -320,3 +320,21 @@ def test_an_otf_running_number_alone_needs_the_same_customer(setup) -> None:
             {"d": dump_id}).mappings()}
     assert found["Sahoo Agency"] == ("MISSING", None)
     assert found["P2 Customer"] == ("MATCHED", "BOOKING_NUMBER")
+
+
+def test_a_match_whose_customer_differs_is_listed_for_review(setup) -> None:
+    """The booking number agrees, the customer does not (2026-11-19): matched, and listed."""
+    s = setup
+    add_extracted_field(s.journey, di_document_id=uuid4(), field_key="booking_reference_number", value="B-13455387")
+    _dump(s, m.BOOKING, [{"booking_number": "B-13455387", "name": "Somebody Else Entirely", "mobile": "9000000301"},
+                         {"booking_number": "B-99999999", "name": "Not Here", "mobile": "9000000302"}])
+    s.acting["subject"] = s.reviewer
+    made = s.client.post(f"{s.base}/dms-reports", json={})
+    assert made.status_code == 201, made.text
+    assert made.json()["figures"]["nameDiffers"] == 1
+    kept = s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}").json()
+    [row] = kept["nameDiffers"]
+    assert row["dmsCustomer"] == "Somebody Else Entirely" and row["matchedOn"] == "Booking number / OTF"
+    assert any(line.startswith("* Matched, but the customer name differs: 1") for line in kept["statementLines"])
+    book = load_workbook(io.BytesIO(s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}/file").content))
+    assert "Matched, name differs" in book.sheetnames
