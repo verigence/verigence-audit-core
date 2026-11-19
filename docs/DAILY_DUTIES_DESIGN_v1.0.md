@@ -99,6 +99,7 @@ work done? It only reads, and reads once for the whole batch.
 | `BANK_STATEMENT` | A statement of the outlet or of its dealership uploaded on or after the item's day | yes |
 | `VEHICLE_PHOTOS` | Every delivery of the day has a vehicle photo. Deliveries of a day: Journeys whose vehicle gate pass is dated that day (the gate register's rule) and Journeys photographed that day | no |
 | `UPLOADS` | Journeys uploaded to at the outlet that day (My Tracker's rule; direct, bulk and Drive) against the counts of the "files received" duty of the same outlet and day | no |
+| `OPEN_TASKS` | The PC tasks on the outlet's Journeys (the Tasks screen): a PC acted on at least one that day. Actions and closings are the Project Tracker's own lists. The note carries the numbers ("Worked on 14 tasks, 9 closed, 230 still open") | no |
 
 **Final or not.** An uploaded register stays uploaded, so the system ticks at
 once. "Every delivery of today has photos" is only true *so far* while the day
@@ -116,12 +117,25 @@ So a duty the system ticked never comes back.
 | Physical delivery verification | N | System (`VEHICLE_PHOTOS`); PC confirms a day with no deliveries | Carried, "Photos on 3 of 5 deliveries" |
 | Bank statement | when given | System (`BANK_STATEMENT`), or "Not received today" | One open item rolls forward |
 | Cash ledger | N-1 | PC: amount and number of transactions, or "Not received today" | That day's ledger is carried and asked again |
+| Work on open tasks | N | System (`OPEN_TASKS`); PC confirms an outlet with no open task | Not carried: a reason at day close, the day is Incomplete |
 
 - **Gate register**: captured once, for N-1. Its flow, screens and upload windows
-  are unchanged, and so is the existing Daily Gate Pass task (the daily report, My
-  Tracker, Project Tracker and Performance read it). Known difference, still to
-  settle: that task is marked Incomplete at the end of N+1, the duty line is
-  carried for the carry days.
+  are unchanged. The Task Manager's Daily Gate Pass task is **retired** (product
+  owner, 2026-11-19: "i dont want to show gatepass twice... we will use now the
+  daily tracker with this new tasks only"): it is no longer raised, its system
+  schedule is archived and the open tasks were withdrawn (CANCELLED, outcome
+  RETIRED). Finished and incomplete ones stay as history. The gate register figures
+  of the daily report, My Tracker, Project Tracker and Performance read the
+  register itself (`p2_gate_passes`), not the task, and are unchanged.
+  `AUDIT_CORE_GATE_PASS_DAILY_TASK=on` raises the task again.
+- **Work on open tasks** (product owner, 2026-11-19: "one duty of working on the
+  Tasks which has been accumulated or raised as we upload the files"): read from
+  the tasks. A day counts as worked when a PC of the outlet acted on at least one
+  PC task of the outlet's Journeys; there is no daily target number yet, the
+  numbers are shown instead. Not counted: what the system closes by itself (a
+  missing document task that closes when the document is uploaded from the booking
+  screen) and what a Team Lead or Reviewer does. Not carried forward (carry days
+  0): a day's work on the tasks cannot be made up the next day.
 - **Physical delivery verification**: for the deliveries happening on that day.
   Photos are the booking's existing Vehicle photos; a typed VIN does not count.
 - **Bank statement**: timing depends on the dealership. One PC picks it up: the
@@ -214,8 +228,8 @@ SuperAdmin: the same team view, definitions and settings under
 
 ## 11. Not in version 1
 
-- The existing Daily Gate Pass task still shows in the PC's task list beside the
-  duty line.
+- No daily target for "Work on open tasks" (a number of tasks, or nothing older
+  than N days): one task worked on counts the day.
 - Reasons are not accepted or rejected by the TL.
 - No WhatsApp reminders; no leave feed from myHR (a PC on leave is a reason).
 - No comparison of the cash ledger with cash receipts.
@@ -238,3 +252,9 @@ SuperAdmin: the same team view, definitions and settings under
 - Reasons: see-only for the TL to start with.
 - Carry-forward: configurable, starting at 5 days.
 - Duty list: changed only by Executive and SuperAdmin.
+
+Product owner, 2026-11-19:
+
+- The gate pass is not shown twice: the Daily Gate Pass task and its system
+  schedule are retired; the daily duties carry the gate register.
+- One more duty: working on the tasks accumulated or raised as files are uploaded.

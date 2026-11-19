@@ -16,7 +16,10 @@ apart from the Journey task lifecycle (uc03_p2_tasks), which is untouched:
 - the Daily Gate Pass task: one per outlet with an active PC and day (Sunday
   too, from SUNDAY_GATE_REGISTER_FROM),
   closed by the system when that outlet's gate pass of the day is finished,
-  incomplete when it is not finished by 23:59 IST the next day.
+  incomplete when it is not finished by 23:59 IST the next day. RETIRED on
+  2026-11-19: the gate out register is a daily duty now (daily_duties), so
+  this task is no longer raised and the open ones are withdrawn, unless
+  AUDIT_CORE_GATE_PASS_DAILY_TASK=on (see retire_gate_pass_daily_tasks).
 
 Everything is per Project: every query runs under the tenant's RLS context.
 """
@@ -1398,12 +1401,80 @@ def restore_suspended_gate_pass_tl_tasks(connection: Connection, *, tenant_id: s
     return len(rows)
 
 
+# --------------------------------------------------------------------------- the PC's Daily Gate Pass task
+# Retired (product owner 2026-11-19): "i dont want to show gatepass twice... lets close that task
+# and also remove all the system tasks for it... we will use now the daily tracker with this new
+# tasks only". The gate out register is a daily duty now (daily_duties, checker GATE_REGISTER):
+# one line on the PC's list, carried and reasoned like every other duty. So the Task Manager no
+# longer raises the Daily Gate Pass task, the open ones are withdrawn and the Project's system
+# schedule is archived. The register itself -- its screens, upload windows, calendar, the
+# consolidated view, My Tracker, the check-out check -- reads p2_gate_passes and is untouched.
+# AUDIT_CORE_GATE_PASS_DAILY_TASK=on (API and worker) raises the task again; unset or anything
+# else keeps it retired.
+GATE_PASS_DAILY_TASK_SETTING = "AUDIT_CORE_GATE_PASS_DAILY_TASK"
+RETIRED_OUTCOME = "RETIRED"
+RETIRED_REASON = ("Retired by the product owner (19 Nov 2026): the gate out register is a daily duty now, "
+                  "so the Daily Gate Pass task is no longer raised.")
+
+
+def gate_pass_daily_task_enabled(environ: Any = None) -> bool:
+    value = str((os.environ if environ is None else environ).get(GATE_PASS_DAILY_TASK_SETTING, "off"))
+    return value.strip().lower() in {"on", "true", "1", "yes", "enabled"}
+
+
+def retire_gate_pass_daily_tasks(connection: Connection, *, tenant_id: str, now: datetime | None = None) -> int:
+    """While retired: archive the Project's Daily Gate Pass schedule and take every open Daily
+    Gate Pass task off the PCs' lists. CANCELLED (the status for a system-withdrawn task), marked
+    outcome RETIRED with the status it had. Tasks already finished or marked incomplete are
+    history and stay as they are. Idempotent: run on every worker pass, it touches only what is
+    still open."""
+    now = now or datetime.now(UTC)
+    connection.execute(
+        text("UPDATE auditcore.p2_task_schedules SET schedule_status = 'ARCHIVED', updated_at_utc = :now "
+             "WHERE tenant_id = :t AND system_kind = :kind AND schedule_status <> 'ARCHIVED'"),
+        {"t": tenant_id, "kind": GATE_PASS_SYSTEM_KIND, "now": now},
+    )
+    rows = connection.execute(
+        text("""
+            UPDATE auditcore.p2_tasks t
+            SET task_status = 'CANCELLED', updated_at_utc = :now,
+                completion_result = t.completion_result || jsonb_build_object(
+                  'outcome', CAST(:outcome AS text), 'reason', CAST(:reason AS text),
+                  'retiredAtUtc', CAST(:now AS timestamptz), 'statusBeforeRetirement', t.task_status,
+                  'setting', CAST(:setting AS text))
+            WHERE t.tenant_id = :t AND t.task_type = :type
+              AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')
+            RETURNING t.task_id
+        """),
+        {"t": tenant_id, "type": GATE_PASS_TASK, "now": now, "outcome": RETIRED_OUTCOME, "reason": RETIRED_REASON,
+         "setting": GATE_PASS_DAILY_TASK_SETTING},
+    ).scalars().all()
+    for task_id in rows:
+        _event(connection, tenant_id=tenant_id, task_id=task_id, event_type="CANCELLED", caller=None,
+               comment=RETIRED_REASON, details={"retired": True, "by": "SYSTEM",
+                                                "setting": GATE_PASS_DAILY_TASK_SETTING})
+    return len(rows)
+
+
 def run_tick(connection: Connection, *, tenant_id: str, now: datetime | None = None,
              claimed_by: str | None = None) -> dict[str, int]:
-    """The worker's Task Manager pass for one Project: seed the gate pass
-    schedule, raise today's due occurrences, settle gate pass tasks."""
+    """The worker's Task Manager pass for one Project: raise today's due
+    occurrences. The Daily Gate Pass task is retired (see above): its schedule
+    is seeded and its tasks settled only where the setting raises it again."""
     now = now or datetime.now(UTC)
-    ensure_system_schedules(connection, tenant_id=tenant_id, now=now)
+    gate_pass_task = gate_pass_daily_task_enabled()
+    retired = 0
+    if gate_pass_task:
+        ensure_system_schedules(connection, tenant_id=tenant_id, now=now)
+        # Switched on again after a retirement: the schedule it archived runs again. The
+        # tasks it withdrew were for days gone by and stay withdrawn.
+        connection.execute(
+            text("UPDATE auditcore.p2_task_schedules SET schedule_status = 'ACTIVE', updated_at_utc = :now "
+                 "WHERE tenant_id = :t AND system_kind = :kind AND schedule_status = 'ARCHIVED'"),
+            {"t": tenant_id, "kind": GATE_PASS_SYSTEM_KIND, "now": now},
+        )
+    else:
+        retired = retire_gate_pass_daily_tasks(connection, tenant_id=tenant_id, now=now)
     today = ist_today(now)
     now_ist = now.astimezone(IST).time()
     schedules = connection.execute(
@@ -1417,9 +1488,12 @@ def run_tick(connection: Connection, *, tenant_id: str, now: datetime | None = N
         if now_ist >= schedule["run_time_ist"] and occurs_on(schedule, today):
             raised += generate_occurrence(connection, tenant_id=tenant_id, schedule=schedule, day=today, now=now,
                                           claimed_by=claimed_by)
-    closed = close_gate_pass_tasks(connection, tenant_id=tenant_id)
-    failed = fail_unfinished_gate_passes(connection, tenant_id=tenant_id, now=now)
-    result = {"raised": raised, "gatePassClosed": closed, "gatePassIncomplete": failed}
+    closed = failed = 0
+    if gate_pass_task:
+        closed = close_gate_pass_tasks(connection, tenant_id=tenant_id)
+        failed = fail_unfinished_gate_passes(connection, tenant_id=tenant_id, now=now)
+    result = {"raised": raised, "gatePassClosed": closed, "gatePassIncomplete": failed,
+              "gatePassDailyTasksRetired": retired}
     if not gate_pass_tl_tasks_enabled():
         result["gatePassTlTasksSuspended"] = suspend_gate_pass_tl_tasks(connection, tenant_id=tenant_id, now=now)
     return result

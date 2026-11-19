@@ -124,6 +124,11 @@ STANDARD_DUTIES: tuple[dict[str, Any], ...] = (
      "inputs": [{"key": "amount", "label": "Amount", "type": "AMOUNT", "required": True},
                 {"key": "transactions", "label": "Number of transactions", "type": "NUMBER", "required": True}],
      "allowNotReceived": True, "sortOrder": 60},
+    # A day's work on the tasks cannot be done the next day: nothing is carried (carryDays 0).
+    {"standardCode": "OPEN_TASKS", "title": "Work on open tasks",
+     "description": "Work on the tasks raised on your outlet's files: the pending ones and those raised by "
+                    "today's uploads. Open the Tasks screen.",
+     "closeMode": "AUTO", "checkerCode": "OPEN_TASKS", "carryDays": 0, "sortOrder": 70},
 )
 
 
