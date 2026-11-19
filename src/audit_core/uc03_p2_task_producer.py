@@ -53,6 +53,7 @@ from audit_core.uc03_p2_stage import (
     unreviewed_fields,
 )
 from audit_core.uc03_p2_tasks import record_task_event
+from audit_core.uc03_task_switches import closed_by_switch, off_result
 
 _OPEN = ("READY", "IN_PROGRESS", "RETURNED", "ACTION_COMPLETED", "VERIFYING")
 _PRIORITY_BY_SEVERITY = {"CRITICAL": "URGENT", "HIGH": "HIGH", "MEDIUM": "NORMAL", "LOW": "LOW", "INFO": "LOW"}
@@ -444,6 +445,11 @@ def raise_or_refresh(
     if source_code in INFORMATIONAL_TASK_CODES:
         return cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
                                       dedupe_key=dedupe_key, result=INFORMATIONAL_TASK_RESULT), "SUPPRESSED"
+    switched_off = off_result(connection, tenant_id, source_code)
+    if switched_off is not None:
+        # Switched off for the Project in Project Administration (2026-11-19).
+        return cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                      dedupe_key=dedupe_key, result=switched_off), "SUPPRESSED"
     template = registry.tasks[task_type]
     priority = _PRIORITY_BY_SEVERITY.get(severity, "NORMAL")
     reference = {**reference, "issueHash": _issue_hash(reference)}
@@ -510,7 +516,10 @@ def raise_or_refresh(
                 and not _documents_in_flight(connection, tenant_id=tenant_id, journey_id=journey_id)):
             new_status, outcome = "RETURNED", "RETURNED"
     elif status == "CANCELLED":
-        return task_id, "CANCELLED"
+        if not closed_by_switch(result):
+            return task_id, "CANCELLED"
+        # Closed when its kind was switched off; the kind is on again (2026-11-19).
+        new_status, outcome = "READY", "REOPENED"
 
     # A check that moved to another executor keeps its code, and so its task
     # (2026-11-15: twelve Rule Engine checks now run in Audit Core): the task
@@ -694,6 +703,13 @@ def apply_control_transitions(
         if control is None:
             continue
         key = f"control:{journey_id}:{control.code}"
+        switched_off = off_result(connection, tenant_id, control.code)
+        if switched_off is not None:
+            # Switched off for the Project in Project Administration (2026-11-19).
+            cancel_suppressed_task(connection, tenant_id=tenant_id, journey_id=journey_id, dedupe_key=key,
+                                   result=switched_off)
+            counts["SWITCHED_OFF"] = counts.get("SWITCHED_OFF", 0) + 1
+            continue
         if control.code in SUPPRESSED_TASK_CODES:
             # Cash transactions raise no tasks (product owner, 2026-10-31):
             # whatever the result, no task; one left open is cancelled.

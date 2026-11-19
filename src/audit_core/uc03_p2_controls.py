@@ -119,6 +119,15 @@ def write_control_state(
     finding_id: UUID | None = None,
     fact_version: int | None = None,
 ) -> Transition:
+    from audit_core.uc03_task_switches import off_result, void_open_findings
+
+    switched_off = off_result(connection, tenant_id, control.code)
+    if switched_off is not None:
+        # Switched off for the Project in Project Administration (2026-11-19): not
+        # applicable, no finding; one opened by the run is voided.
+        status, reason, finding_id, details = "NOT_APPLICABLE", switched_off["reason"], None, {}
+        void_open_findings(connection, tenant_id=tenant_id, code=control.code, note=switched_off["reason"],
+                           journey_id=journey_id)
     stored = connection.execute(
         text(
             """

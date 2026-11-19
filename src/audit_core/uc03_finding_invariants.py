@@ -147,7 +147,10 @@ def finding_may_open(connection: Connection, *, tenant_id: str, journey_id: UUID
         return True
     result = dict(row["completion_result"] or {})
     if row["task_status"] == "CANCELLED":
-        return False
+        # Closed when its kind was switched off: back on, it may open again (2026-11-19).
+        from audit_core.uc03_task_switches import closed_by_switch, off_result
+
+        return closed_by_switch(result) and off_result(connection, tenant_id, code) is None
     return not (row["task_status"] == "VERIFIED_COMPLETE" and (result.get("verdict") or result.get("acceptedIssueHash")))
 
 
