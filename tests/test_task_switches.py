@@ -184,11 +184,11 @@ def api(journey):
 def test_only_project_administration_lists_and_changes_the_switches(journey, api):
     _early_payment(journey)
     _evaluate(journey)
-    for role in ("PC", "TL", "PM"):
+    for role in ("PC", "TL", "PM", "TENANT_ADMIN"):
         api.acting["role"] = role
         assert api.client.get(api.base).status_code == 403
         assert api.client.put(f"{api.base}/{CODE}", json={"enabled": False, "reason": "no"}).status_code == 403
-    api.acting["role"] = "TENANT_ADMIN"
+    api.acting["role"] = "SUPER_ADMIN"
     listed = api.client.get(api.base).json()
     items = {i["code"]: i for i in listed["items"]}
     assert items[CODE]["enabled"] is True and items[CODE]["open"] == 1 and items[CODE]["owner"] == "Team Lead"
@@ -201,5 +201,3 @@ def test_only_project_administration_lists_and_changes_the_switches(journey, api
     assert done.status_code == 200 and done.json()["tasksClosed"] == 1
     after = {i["code"]: i for i in api.client.get(api.base).json()["items"]}[CODE]
     assert (after["enabled"], after["open"], after["reason"]) == (False, 0, "Not relevant now")
-    api.acting["role"] = "SUPER_ADMIN"
-    assert api.client.get(api.base).status_code == 200

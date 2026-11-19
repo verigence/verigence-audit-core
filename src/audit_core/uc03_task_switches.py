@@ -26,7 +26,7 @@ Switched on again: the tasks it closed may be raised again, and every booking's 
 are run again (a RULES_RERUN job and a stage recompute per booking), so what still fails
 comes back with today's figures.
 
-Only Project Administration (Tenant Admin, Super Admin) lists or changes the switches.
+Only Project Administration (Super Admin) lists or changes the switches.
 Tasks a person raises (manual tasks, a Reviewer's closure, the Team Lead's review) are not
 in the list: they are not produced by a check.
 """
@@ -48,7 +48,9 @@ from audit_core.security_authorization import (
 )
 
 SWITCHED_OFF = "SWITCHED_OFF"
-ADMIN_ROLES = ("SUPER_ADMIN", "TENANT_ADMIN")
+# Project Administration is the Super Admin's (verigence-web, ProjectAdministrationPage, 19 Nov:
+# "all project specific tasks should be under project administration").
+ADMIN_ROLES = ("SUPER_ADMIN",)
 MIN_REASON = 5
 # The tasks a check or a producer raises (p2_tasks.source_type); not the ones a person
 # raises or the review steps (REVIEW, HUMAN_ACTION, SCHEDULE, GATE_PASS, TASK_MANAGER).
@@ -313,7 +315,7 @@ router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-task-
 
 def _admin(connection: Connection, tenant_id: str, principal: HumanPrincipal,
            client: SecurityAuthorizationClient) -> str | None:
-    """Project Administration only: Tenant Admin or Super Admin. Returns the caller's name."""
+    """Project Administration only: the Super Admin. Returns the caller's name."""
     from audit_core.uc03_p2_access import authorize_p2_any
     from audit_core.uc03_p2_dms_dumps import _name_of
 
