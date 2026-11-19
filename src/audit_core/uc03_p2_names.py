@@ -137,7 +137,9 @@ def _tokens_match(left: list[str], right: list[str]) -> bool:
             hit = next((t for t in unused if len(t) > 2 and sound_key(t) == sound_key(token)), None)
         if hit is None:
             hit = next((t for t in unused if _initial_matches(token, t) or _initial_matches(t, token)), None)
-        else:
+        elif len(token) > 1:
+            # A shared one-letter word is an initial, not a word in common (2026-11-19:
+            # "S P COM" was taken for "C F S HOME SOLUTIONS" on the S alone).
             whole += 1
         if hit is None:
             return False
@@ -199,16 +201,25 @@ def same_person(left: Any, right: Any) -> bool:
     Also (2026-10-28): the same letters split differently ("RASMIRANJAN" /
     "RASMI RANJAN"), one word one letter apart, and -- for a company buying --
     the same company once the legal suffixes go ("PVT LTD" / "PRIVATE LIMITED")."""
-    a, b = person_tokens(left), person_tokens(right)
+    # A company is compared as a company: its legal words (Private, Limited) are not words of
+    # the name (2026-11-19: "SWITZ FOODS PRIVATE LIMITED" was taken for "C F S HOME SOLUTIONS
+    # PRIVATE LIMITED" on PRIVATE LIMITED and the initials S, F).
+    if _is_company(left) or _is_company(right):
+        return same_organisation(left, right) or _same_person_tokens(person_tokens(left), person_tokens(right),
+                                                                     company=True)
+    return _same_person_tokens(person_tokens(left), person_tokens(right))
+
+
+def _same_person_tokens(a: list[str], b: list[str], *, company: bool = False) -> bool:
+    if company:
+        legal = _ORG_SUFFIXES | _COMPANY_WORDS
+        a, b = [t for t in a if t not in legal], [t for t in b if t not in legal]
     if _tokens_match(a, b) or _close_enough(a, b) or _misread_once(a, b):
         return True
     if a and b and "".join(a) == "".join(b):
         return True
-    if a and b and _sounds_alike(a, b):
-        return True  # one word written as two, spelt as it sounds (Soumyaranjan / Saumya Ranjan)
-    if _is_company(left) or _is_company(right):
-        return same_organisation(left, right)
-    return False
+    # one word written as two, spelt as it sounds (Soumyaranjan / Saumya Ranjan)
+    return bool(a and b and _sounds_alike(a, b))
 
 
 _COMPANY_WORDS = frozenset({"PVT", "PRIVATE", "LTD", "LIMITED", "LLP", "PVTLTD", "TRUST", "SOCIETY",
