@@ -148,11 +148,18 @@ def deliveries(connection: Connection, *, tenant_id: str, today: date, outlet_id
     return out
 
 
-def in_period(found: dict[str, Delivery], first: date, last: date) -> dict[str, tuple[Delivery, date]]:
-    """The deliveries that count in first..last, with the day each counts on."""
+def in_period(found: dict[str, Delivery], first: date, last: date,
+              dms_days: dict[str, date] | None = None) -> dict[str, tuple[Delivery, date]]:
+    """The deliveries that count in first..last, with the day each counts on. ``dms_days``: the
+    delivery date the DMS gives a Journey (uc03_p2_dms_dumps.dms_dates) -- it decides over the date
+    read from the papers (product owner 2026-11-19: the DMS is the source of truth)."""
     out = {}
     for jid, delivery in found.items():
-        day = delivery.day_in(first, last)
+        dms_day = (dms_days or {}).get(jid)
+        if dms_day is not None:
+            day = dms_day if first <= dms_day <= last else None
+        else:
+            day = delivery.day_in(first, last)
         if day is not None:
             out[jid] = (delivery, day)
     return out
@@ -177,8 +184,12 @@ def verigence_not_in_dump(connection: Connection, *, tenant_id: str, dump: dict[
     names = {str(r[0]): r[1] for r in connection.execute(
         text("SELECT outlet_id, outlet_name FROM auditcore.dealer_outlets WHERE tenant_id = :t AND dealer_id = :d"),
         {"t": tenant_id, "d": str(dump["dealer_id"])})}
+    from audit_core.uc03_p2_dms_dumps import DELIVERY, dms_dates
+
+    # A delivery the DMS dates outside these days (in another dump) is not looked for in this one.
+    dated = dms_dates(connection, tenant_id, str(dump["dealer_id"]), dump["business_date"])[DELIVERY]
     counted = in_period(deliveries(connection, tenant_id=tenant_id, today=today, dealer_id=str(dump["dealer_id"])),
-                        first, last)
+                        first, last, dated)
     rows = []
     from audit_core.uc03_p2_dms_dumps import out_of_scope_model
 
