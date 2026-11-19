@@ -1,7 +1,7 @@
 """The phone's location in the background and readings sent later (product owner,
 2026-11-16): "offline check for the location on the mobile device ... though app may
 be in background or may be killed". Everyone who marks attendance on the phone is
-tracked from check-in to check-out, within 10:00-19:30 IST. Real Postgres; Security
+tracked from check-in to check-out (until 19 Nov 2026 only within 10:00-19:30 IST). Real Postgres; Security
 is a double."""
 from __future__ import annotations
 
@@ -31,6 +31,10 @@ FAR = (20.5900, 85.8800)  # ~11 km
 
 def _ist(hour: int, minute: int = 0, day: int = 16) -> datetime:
     return datetime(2026, 11, day, hour, minute, tzinfo=IST)
+
+
+REAL_IN_WINDOW = checks.in_window
+REAL_TRACKING_HOURS = checks.in_tracking_hours
 
 
 # --------------------------------------------------------------------------- pure rules
@@ -72,8 +76,16 @@ def test_hours_on_dealguard_issues_and_gaps():
     assert checks.longest_gap_minutes([_ist(10)]) is None
 
 
-def test_tracking_until_is_the_days_window_end():
-    assert tracking.tracking_until(_ist(9, 15)) == _ist(19, 30).astimezone(UTC)
+def test_tracking_runs_until_check_out_and_stops_with_the_day_at_the_latest():
+    """Product owner, 19 Nov 2026: "what is problem to continue reading till the time check out
+    doesnt happen... pls change". No 19:30: a key stops by itself only when the day ends."""
+    midnight = _ist(0, 0, day=17).astimezone(UTC)
+    assert tracking.tracking_until(_ist(9, 15)) == midnight
+    assert tracking.tracking_until(_ist(22, 40)) == midnight
+    # The phone's own recording has the window's start and no end; DealGuard's checks keep 19:30.
+    assert not REAL_TRACKING_HOURS(_ist(9, 59))
+    assert all(REAL_TRACKING_HOURS(_ist(h, m)) for h, m in ((10, 0), (19, 29), (19, 45), (21, 10), (23, 59)))
+    assert REAL_IN_WINDOW(_ist(19, 29)) and not REAL_IN_WINDOW(_ist(19, 45))
     assert tracking.key_hash("abc") == tracking.key_hash("abc") != tracking.key_hash("abd")
 
 
@@ -103,7 +115,8 @@ def setup(monkeypatch):
     app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=acting["subject"])
     app.dependency_overrides[get_security_authorization_client] = lambda: AllowAllAuthorization()
     monkeypatch.setattr(checks, "in_window", lambda now: True)
-    monkeypatch.setattr(tracking, "in_window", lambda now: True)
+    monkeypatch.setattr(checks, "in_tracking_hours", lambda now: True)
+    monkeypatch.setattr(tracking, "in_tracking_hours", lambda now: True)
     client = TestClient(app, raise_server_exceptions=False)
     try:
         yield SimpleNamespace(journey=journey, engine=engine, client=client, acting=acting, tl=tl,
@@ -165,7 +178,9 @@ def test_everyone_who_marks_attendance_gets_a_key_and_their_readings_are_logged(
     # A TL is tracked too, judged against their outlets in any role (Project-wide here).
     start = _start(s, s.tl, _ist(9, 40))
     assert start.tracking is True and start.tenantId == s.tenant and start.key
-    assert start.trackingUntilUtc == _ist(19, 30).astimezone(UTC)
+    assert start.trackingUntilUtc == _ist(0, 0, day=17).astimezone(UTC)
+    # The hours the phone reads in come from here: released apps follow without an update.
+    assert start.window == {"from": "10:00", "to": "24:00"}
     assert start.path == f"/p2/v1/tenants/{s.tenant}/location-tracking/checks"
     with s.engine.begin() as connection:
         set_tenant_context(connection, s.tenant)
@@ -199,21 +214,53 @@ def test_check_out_stops_the_key_but_keeps_what_was_read_before(setup):
     sent = _send(s, start.key, [_reading(NEARBY, _ist(14, 40)), _reading(NEARBY, _ist(15, 20))], now=_ist(16))
     assert [r.recorded for r in sent.results] == [True, False]
     assert sent.results[1].reason == "TRACKING_STOPPED" and sent.trackingActive is False
-    # Still accepted for 48 hours after the window, then refused.
-    assert _send(s, start.key, [_reading(NEARBY, _ist(14, 50))], now=_ist(19, 0, day=18)) is not None
-    assert _send(s, start.key, [_reading(NEARBY, _ist(14, 55))], now=_ist(19, 31, day=18)) is None
+    # Still accepted for 48 hours after the day, then refused.
+    assert _send(s, start.key, [_reading(NEARBY, _ist(14, 50))], now=_ist(23, 30, day=18)) is not None
+    assert _send(s, start.key, [_reading(NEARBY, _ist(14, 55))], now=_ist(0, 1, day=19)) is None
 
 
-def test_a_new_check_in_stops_the_other_phone_and_no_key_after_the_window(setup):
+def test_a_new_check_in_stops_the_other_phone_and_a_late_one_is_recorded_too(setup):
     s = setup
     first = _start(s, s.journey.actor_id, _ist(10))
     second = _start(s, s.journey.actor_id, _ist(11))
     assert _send(s, first.key, [_reading(NEARBY, _ist(11, 30))], now=_ist(11, 31)).trackingActive is False
     assert _send(s, second.key, [_reading(NEARBY, _ist(11, 40))], now=_ist(11, 41)).trackingActive is True
+    # Checked in again in the evening (after a correction, say): recorded like any other time.
     late = _start(s, s.journey.actor_id, _ist(19, 45))
-    assert late.tracking is False and late.reason == "WINDOW_OVER"
+    assert late.tracking is True and late.trackingUntilUtc == _ist(0, 0, day=17).astimezone(UTC)
     stranger = _start(s, f"nobody-{uuid4().hex[:6]}", _ist(10))
     assert stranger.tracking is False and stranger.reason == "NO_PROJECT"
+
+
+def test_a_pc_working_late_is_recorded_until_check_out(setup, monkeypatch):
+    """Product owner, 19 Nov 2026: "PC can work late at times"; the phone reads until check-out."""
+    s = setup
+    monkeypatch.setattr(checks, "in_window", REAL_IN_WINDOW)
+    monkeypatch.setattr(checks, "in_tracking_hours", REAL_TRACKING_HOURS)
+    monkeypatch.setattr(tracking, "in_tracking_hours", REAL_TRACKING_HOURS)
+    pc = s.journey.actor_id
+    start = _start(s, pc, _ist(9, 30))
+    sent = _send(s, start.key, [_reading(NEARBY, _ist(9, 40)), _reading(NEARBY, _ist(18, 50)),
+                                _reading(NEARBY, _ist(19, 50)), _reading(FAR, _ist(21, 10))], now=_ist(21, 11))
+    # Before 10:00 is still not read; 19:50 and 21:10 are, where they used to be refused.
+    assert [(r.recorded, r.reason) for r in sent.results] == [
+        (False, "OUTSIDE_HOURS"), (True, None), (True, None), (True, None)]
+    assert sent.trackingActive is True
+    assert [r["checked_at_utc"].astimezone(IST).strftime("%H:%M") for r in _rows(s)] == ["18:50", "19:50", "21:10"]
+    # DealGuard's own check keeps its hours.
+    with s.engine.begin() as connection:
+        own = checks.record_location_check(
+            connection, tenant_id=s.tenant, actor_id=pc, now=_ist(21, 15),
+            command=checks.LocationCheckCommand(**{**_reading(NEARBY, _ist(21, 15)), "queued": False}))
+    assert (own.recorded, own.reason) == (False, "OUTSIDE_HOURS")
+    # Check-out at 21:30 stops it: what was read before counts, what comes after does not.
+    with s.engine.begin() as connection:
+        set_tenant_context(connection, s.tenant)
+        connection.execute(text("UPDATE auditcore.p2_location_tracking_keys SET revoked_at_utc=:at WHERE tenant_id=:t"),
+                           {"at": _ist(21, 30), "t": s.tenant})
+    after = _send(s, start.key, [_reading(NEARBY, _ist(21, 25)), _reading(NEARBY, _ist(21, 45))], now=_ist(21, 46))
+    assert [(r.recorded, r.reason) for r in after.results] == [(True, None), (False, "TRACKING_STOPPED")]
+    assert after.trackingActive is False
 
 
 def test_the_days_log_names_every_pc_and_why(setup):

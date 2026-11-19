@@ -156,6 +156,17 @@ def in_window(now: datetime) -> bool:
     return start <= local < end
 
 
+# The phone's own recording (BACKGROUND) runs from check-in until check-out, however late that
+# is (product owner, 19 Nov 2026: "what is problem to continue reading till the time check out
+# doesnt happen... pls change"; a PC can work late). Its hours start with the window and have no
+# end of their own: check-out stops it, and a forgotten check-out stops with the day.
+TRACKING_DAY_END = "24:00"
+
+
+def in_tracking_hours(moment: datetime) -> bool:
+    return moment.astimezone(IST).time() >= WINDOW_START
+
+
 def pc_outlets_with_coordinates(
     connection: Connection, *, tenant_id: str, actor_id: str, role: str | None = "PC",
 ) -> list[dict[str, Any]]:
@@ -289,7 +300,8 @@ def record_location_check(
     moment = check_moment(command, now)
     if moment is None:
         return LocationCheckResult(recorded=False, reason="TOO_OLD")
-    if not in_window(moment):
+    # DealGuard's own checks keep their hours; the phone's recording runs until check-out.
+    if not (in_tracking_hours(moment) if trigger == "BACKGROUND" else in_window(moment)):
         return LocationCheckResult(recorded=False, reason="OUTSIDE_HOURS")
     local = moment.astimezone(IST)
     hour_start = local.replace(minute=0, second=0, microsecond=0)

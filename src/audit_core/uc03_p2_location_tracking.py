@@ -4,13 +4,16 @@
 "can you pls do offline check for the location on the mobile device ... though
 app may be in background or may be killed.. some way to collect the data".
 Decided the same day: everyone who marks attendance on the phone is tracked,
-from their myHR check-in to their check-out, within 10:00-19:30 IST.
+from their myHR check-in to their check-out, within 10:00-19:30 IST. Changed on
+2026-11-19 ("what is problem to continue reading till the time check out doesnt
+happen... pls change"): it runs until check-out, however late; a check-out that
+never comes stops with the day.
 
 The Android app starts a tracking service when the person checks in. The service
 keeps running when the app is put in the background or swiped away, reads the
 location every TRACKING_INTERVAL_MINUTES, keeps each reading on the phone when
 there is no network, and sends what it holds whenever it can. It stops at
-check-out, at 19:30 IST, or when the server says the key is no longer active.
+check-out, at the end of the day, or when the server says the key is no longer active.
 
 The service cannot use the person's sign-in token: it runs while the app is
 closed, when the token cannot be refreshed. So at check-in the app asks for a
@@ -23,7 +26,7 @@ tracking key:
 
 A key adds location readings for one person in one Project and nothing else. A
 reading counts only when it was read before the key was stopped and within the
-day's window; the key itself is accepted for QUEUED_MAX_AGE after the window, so
+day; the key itself is accepted for QUEUED_MAX_AGE after the day ends, so
 readings kept on an offline phone can still be sent. Only the key's SHA-256 is
 stored. Readings land in ``p2_location_checks`` as BACKGROUND checks, judged
 against the person's outlets in any role (uc03_p2_location_checks).
@@ -32,7 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -45,13 +48,13 @@ from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.security import HumanPrincipal
 from audit_core.uc03_p2_location_checks import (
     QUEUED_MAX_AGE,
+    TRACKING_DAY_END,
     TRACKING_INTERVAL_MINUTES,
-    WINDOW_END,
     WINDOW_START,
     LocationCheckCommand,
     LocationCheckResult,
     check_moment,
-    in_window,
+    in_tracking_hours,
     record_location_check,
 )
 from audit_core.uc03_p2_object_keys import IST
@@ -71,9 +74,10 @@ def key_hash(key: str) -> str:
 
 
 def tracking_until(created: datetime) -> datetime:
-    """The end of the day's window (IST) on the day the key was made."""
+    """When a key made at ``created`` stops by itself: the end of that day (IST). Check-out stops
+    it before that; this is only for a check-out that never comes."""
     local = created.astimezone(IST)
-    return datetime.combine(local.date(), WINDOW_END, IST).astimezone(UTC)
+    return (datetime.combine(local.date(), time(0, 0), IST) + timedelta(days=1)).astimezone(UTC)
 
 
 def my_projects(connection: Connection, *, actor_id: str) -> list[dict[str, Any]]:
@@ -102,7 +106,7 @@ class TrackingStartCommand(BaseModel):
 
 class TrackingStart(BaseModel):
     tracking: bool
-    # Why not: NO_PROJECT (no Project to log against) or WINDOW_OVER (after 19:30 IST).
+    # Why not: NO_PROJECT (no Project to log against) or WINDOW_OVER (the day is over).
     reason: str | None = None
     tenantId: str | None = None
     projectName: str | None = None
@@ -110,7 +114,9 @@ class TrackingStart(BaseModel):
     trackingUntilUtc: datetime | None = None
     sendUntilUtc: datetime | None = None
     intervalMinutes: int = TRACKING_INTERVAL_MINUTES
-    window: dict[str, str] = {"from": WINDOW_START.strftime("%H:%M"), "to": WINDOW_END.strftime("%H:%M")}
+    # The hours the phone reads in: from the window's start to the end of the day (check-out
+    # stops it). The phone takes them from here, so released apps follow without an update.
+    window: dict[str, str] = {"from": WINDOW_START.strftime("%H:%M"), "to": TRACKING_DAY_END}
     path: str | None = None
 
 
@@ -196,7 +202,7 @@ class TrackingReadings(BaseModel):
 
 class TrackingReadingsResult(BaseModel):
     results: list[LocationCheckResult]
-    # False: the phone stops tracking (checked out, past 19:30, or a newer key on another phone).
+    # False: the phone stops tracking (checked out, the day is over, or a newer key on another phone).
     trackingActive: bool
     trackingUntilUtc: datetime
 
@@ -228,7 +234,7 @@ def record_readings(
     results: list[LocationCheckResult] = []
     for reading in readings.checks:
         moment = check_moment(reading, now)
-        if moment is not None and in_window(moment) and moment > stop:
+        if moment is not None and in_tracking_hours(moment) and moment > stop:
             # Read after check-out (or after another phone took over): not this key's.
             results.append(LocationCheckResult(recorded=False, reason="TRACKING_STOPPED"))
             continue
