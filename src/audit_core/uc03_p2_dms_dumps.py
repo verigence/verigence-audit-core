@@ -356,6 +356,30 @@ def booking_keys(booking_number: Any, dms_booking_number: Any) -> set[str]:
     return {k for k in keys if _usable_key(k)}
 
 
+def strong_booking_keys(booking_number: Any, dms_booking_number: Any) -> set[str]:
+    """The keys that name one booking on their own: the B-number, and the OTF with its series
+    (27F021913). The OTF's numeric tail alone (21913) is a running number that repeats across
+    OTF series -- Utkal's OTF27F021913 (Sahoo Agency) and Doolla Raju's booking form "21913"
+    (product owner 2026-11-19) -- so a match on it needs the customer to agree."""
+    keys: set[str] = set()
+    b = _alnum(booking_number)
+    if b:
+        keys.add(b.removeprefix("B") if re.fullmatch(r"B\d{5,}", b) else b)
+    otf = _alnum(dms_booking_number)
+    if otf:
+        keys.add(otf.removeprefix("OTF"))
+    return {k for k in keys if _usable_key(k)}
+
+
+def _same_customer(index: JourneyIndex, jid: str, row: dict[str, Any]) -> bool:
+    """The dump row's customer is the Journey's: the same mobile, or the same person's name."""
+    mobile = row.get("mobile")
+    if mobile and jid in index.by_mobile.get(mobile, set()):
+        return True
+    name = row.get("customer_name")
+    return bool(name) and any(same_person(name, n) for n in index.journeys[jid]["names"])
+
+
 def journey_ref_keys(reference: Any) -> set[str]:
     """The keys a Journey's booking number (as the booking form prints it) is known by."""
     raw = _alnum(reference)
@@ -528,8 +552,9 @@ def _one(found: set[str]) -> str | None:
 
 def match_row(index: JourneyIndex, kind: str, row: dict[str, Any]) -> tuple[str | None, str | None]:
     """(journey id, basis) or (None, None)."""
-    for key in booking_keys(row.get("booking_number"), row.get("dms_booking_number")):
-        if (jid := _one(index.by_ref.get(key, set()))) is not None:
+    strong = strong_booking_keys(row.get("booking_number"), row.get("dms_booking_number"))
+    for key in sorted(booking_keys(row.get("booking_number"), row.get("dms_booking_number")), key=lambda k: k not in strong):
+        if (jid := _one(index.by_ref.get(key, set()))) is not None and (key in strong or _same_customer(index, jid, row)):
             return jid, "BOOKING_NUMBER"
     if kind == DELIVERY and (key := chassis_key(row.get("chassis"))) is not None \
             and (jid := _one(index.by_chassis.get(key, set()))) is not None:

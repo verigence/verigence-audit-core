@@ -302,3 +302,21 @@ def test_an_unreadable_chassis_falls_back_to_the_journey_vin() -> None:
     deal_type, basis = scope.decide({"chassis": "T1", "event_date": date(2026, 11, 14),
                                      "booking_date": date(2026, 11, 7)}, "j", {"bookingDate": None})
     assert deal_type == "INSCOPE" and "T2K57261" in basis
+
+
+def test_an_otf_running_number_alone_needs_the_same_customer(setup) -> None:
+    """A booking form prints only the OTF's running number (21913); another customer's OTF of
+    another series (OTF27F021913, Sahoo Agency) is not that booking (product owner 2026-11-19)."""
+    s = setup
+    add_extracted_field(s.journey, di_document_id=uuid4(), field_key="booking_reference_number", value="21913")
+    dump_id = _dump(s, m.BOOKING, [
+        {"otf": "OTF27F021913", "name": "Sahoo Agency", "mobile": "9000000201"},
+        {"otf": "OTF27A021913", "name": "P2 Customer", "mobile": "9000000202"},
+    ])
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        found = {r["customer_name"]: (r["outcome"], r["match_basis"]) for r in connection.execute(text(
+            "SELECT customer_name, outcome, match_basis FROM auditcore.p2_dms_dump_rows WHERE dump_id = :d"),
+            {"d": dump_id}).mappings()}
+    assert found["Sahoo Agency"] == ("MISSING", None)
+    assert found["P2 Customer"] == ("MATCHED", "BOOKING_NUMBER")
