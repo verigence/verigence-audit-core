@@ -81,6 +81,15 @@ must be someone the reassigning person may assign to. Recorded as a
 
 ## 5. Daily Gate Pass task (system-reviewed)
 
+> **Retired 2026-11-19** (product owner: "i dont want to show gatepass twice... lets
+> close that task and also remove all the system tasks for it"). The gate out
+> register is a daily duty (`DAILY_DUTIES_DESIGN_v1.0.md`). By default the worker no
+> longer seeds the schedule or raises the task: on each pass it archives the
+> `GATE_PASS` schedule and withdraws the open tasks (CANCELLED, outcome `RETIRED`,
+> `task_manager.retire_gate_pass_daily_tasks`). Finished and incomplete tasks stay
+> as history. `AUDIT_CORE_GATE_PASS_DAILY_TASK=on` runs everything below again.
+> The rest of this section describes the task as it ran until then.
+
 - One system schedule per Project (`system_kind='GATE_PASS'`, `OUTLET_PCS`,
   daily, Mon–Sat), seeded by the worker; Executive / Superadmin can pause it.
 - One `OUTLET` task per outlet with an active PC, per working day N, assigned

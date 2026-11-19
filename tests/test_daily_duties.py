@@ -191,18 +191,21 @@ def test_the_standard_duties_are_added_once_and_each_can_be_changed(project):
     p = project
     with _Db(p) as c:
         assert dd.add_standard_duties(c, tenant_id=p.tenant, caller=_caller(p, "EXECUTIVE"), now=_at(MON, 8)) == {
-            "added": 6}
+            "added": 7}
         assert dd.add_standard_duties(c, tenant_id=p.tenant, caller=_caller(p, "EXECUTIVE"), now=_at(MON, 8)) == {
             "added": 0}
         listed = dd.list_duties(c, tenant_id=p.tenant, caller=_caller(p, "TL"))
     assert [d["standardCode"] for d in listed["items"]] == [
-        "GATE_REGISTER", "INTIMATION", "UPLOADS", "PHYSICAL_VERIFICATION", "BANK_STATEMENT", "CASH_LEDGER"]
+        "GATE_REGISTER", "INTIMATION", "UPLOADS", "PHYSICAL_VERIFICATION", "BANK_STATEMENT", "CASH_LEDGER",
+        "OPEN_TASKS"]
     assert listed["canManage"] is False and listed["standardMissing"] == []
     by_code = {d["standardCode"]: d for d in listed["items"]}
     # Asked of the PC: the files received and the cash ledger. Read from the system: the rest.
     assert {c: d["closeMode"] for c, d in by_code.items()} == {
         "GATE_REGISTER": "AUTO", "INTIMATION": "TICK", "UPLOADS": "AUTO", "PHYSICAL_VERIFICATION": "AUTO",
-        "BANK_STATEMENT": "AUTO", "CASH_LEDGER": "TICK"}
+        "BANK_STATEMENT": "AUTO", "CASH_LEDGER": "TICK", "OPEN_TASKS": "AUTO"}
+    # A day's work on the tasks is not made up the next day.
+    assert by_code["OPEN_TASKS"]["carryDays"] == 0 and by_code["OPEN_TASKS"]["checkerCode"] == "OPEN_TASKS"
     assert by_code["CASH_LEDGER"]["dayOffset"] == -1 and by_code["CASH_LEDGER"]["allowNotReceived"]
     assert by_code["BANK_STATEMENT"]["rolling"] and by_code["GATE_REGISTER"]["weekdays"] == [1, 2, 3, 4, 5, 6, 7]
     with _Db(p) as c:
@@ -640,6 +643,79 @@ def test_the_bank_statement_ticks_itself_for_the_outlet_or_its_dealership(projec
     assert states == {TUE.isoformat(): ["DONE_LATE"], MON.isoformat(): ["PENDING"]}
 
 
+def _task(p, *, journey=None, role: str = "PC", status: str = "READY", scope: str = "JOURNEY") -> str:
+    """A task on a Journey of the outlet (the Tasks screen), as an upload raises it."""
+    task_id = str(uuid4())
+    with _Db(p) as c:
+        c.execute(
+            text("""
+                INSERT INTO auditcore.p2_tasks (tenant_id, task_id, root_task_id, journey_id, task_type, category,
+                  origin_kind, source_type, dedupe_key, title, description, assigned_role_code, allowed_actions,
+                  completion_protocol, task_status, scope_kind)
+                VALUES (:t, :id, :id, :j, 'DOCUMENT_MISSING', 'DOCUMENT', 'SYSTEM', 'RULE', :dk, 'Upload the invoice',
+                  'x', :role, '[]'::jsonb, 'MACHINE_VERIFIED', :status, :scope)
+            """),
+            {"t": p.tenant, "id": task_id, "j": str(journey or p.journey.journey_id), "dk": f"dd:{task_id}",
+             "role": role, "status": status, "scope": scope})
+    return task_id
+
+
+def _task_event(p, task_id: str, event: str, at: datetime, *, actor: str | None = None, role: str = "PC") -> None:
+    with _Db(p) as c:
+        c.execute(
+            text("INSERT INTO auditcore.p2_task_events (tenant_id, task_id, event_type, actor_id, actor_role_code, "
+                 "created_at_utc) VALUES (:t, :task, :e, :a, :r, :at)"),
+            {"t": p.tenant, "task": task_id, "e": event, "a": actor or p.people["PC"], "r": role, "at": at})
+        if event == "CLOSE_TASK":
+            c.execute(text("UPDATE auditcore.p2_tasks SET task_status = 'VERIFIED_COMPLETE' "
+                           "WHERE tenant_id = :t AND task_id = :id"), {"t": p.tenant, "id": task_id})
+
+
+def test_working_on_the_open_tasks_is_read_from_the_tasks(project):
+    """Product owner, 19 Nov 2026: "one duty of working on the Tasks which has been
+    accumulated or raised as we upload the files"."""
+    p = project
+    title = "Work on open tasks"
+    _on(p)
+    _duty(p, title=title, closeMode="AUTO", checkerCode="OPEN_TASKS", carryDays=0)
+    # No task on the outlet's files: nothing to judge by, the PC confirms.
+    nothing = _one(_day(p), title)
+    assert nothing["progress"]["state"] == "NOTHING" and nothing["canTick"]
+    assert nothing["nilLabel"] == "No open tasks"
+    first, second, third = _task(p), _task(p), _task(p)
+    _task(p, role="TL")  # a Team Lead's task is not the PC's backlog
+    waiting = _one(_day(p, hh=12), title)
+    assert waiting["status"] == "PENDING" and not waiting["canTick"]
+    assert waiting["progress"]["note"] == "3 open tasks, none worked on today"
+    with pytest.raises(dd.DutyError, match="Give a reason"):
+        _close(p)
+    # What the system does on its own, and what a Team Lead does, is not the PC working on tasks.
+    _task_event(p, first, "COMPLETED", _at(MON, 12, 30), actor="SYSTEM", role="SYSTEM")
+    _task_event(p, first, "ADD_COMMENT", _at(MON, 12, 40), actor=p.people["TL"], role="TL")
+    _task_event(p, first, "CREATED", _at(MON, 12, 45))  # not an action on the task
+    assert _one(_day(p, hh=13), title)["status"] == "PENDING"
+    # The PC works on two tasks and closes one: on track while Monday runs, no reason needed.
+    _task_event(p, first, "ADD_COMMENT", _at(MON, 14))
+    _task_event(p, second, "UPLOAD_DOCUMENT", _at(MON, 15))
+    _task_event(p, second, "CLOSE_TASK", _at(MON, 15, 5))
+    on_track = _day(p, hh=16)
+    item = _one(on_track, title)
+    assert item["status"] == "ON_TRACK" and on_track["counts"]["needReason"] == 0
+    assert item["progress"]["note"] == "Worked on 2 tasks, 1 closed, 2 still open"
+    assert _close(p)["dayClosedAt"] is not None
+    # Tuesday: Monday is ticked with Monday's numbers; Tuesday starts again with what is open.
+    tuesday = _day(p, day=TUE, hh=10)
+    assert [i["dutyDate"] for i in _items(tuesday) if i["title"] == title] == [TUE.isoformat()]
+    assert _one(tuesday, title)["progress"]["note"] == "2 open tasks, none worked on today"
+    team = _team(p, start=MON, end=WED, day=WED)
+    cells = {d["date"]: next(i for i in d["outlets"][0]["items"] if i["title"] == title) for d in team["days"]}
+    assert (cells[MON.isoformat()]["state"], cells[MON.isoformat()]["comment"]) == (
+        "DONE", "Worked on 2 tasks, 1 closed")
+    # Nothing was worked on Tuesday and it is not carried: Tuesday is incomplete.
+    assert cells[TUE.isoformat()]["state"] == "INCOMPLETE"
+    assert third  # still open, never touched
+
+
 def test_a_checker_that_fails_never_takes_the_list_down(project, monkeypatch):
     p = project
     _on(p)
@@ -716,13 +792,13 @@ def test_http_routes_and_role_gates(project):
 
     assert client.get(f"{base}/settings").json()["enabled"] is False
     assert client.put(f"{base}/settings", json={"enabled": True}).json()["enabled"] is True
-    assert client.post(f"{base}/definitions/standard").json() == {"added": 6}
+    assert client.post(f"{base}/definitions/standard").json() == {"added": 7}
     made = client.post(f"{base}/definitions", json={
         "title": "Count the stock", "inputs": [{"label": "Vehicles", "type": "NUMBER"}], "allowNotReceived": True})
     assert made.status_code == 201
     duty_id = made.json()["dutyId"]
     assert client.patch(f"{base}/definitions/{duty_id}", json={"sortOrder": 5}).json()["sortOrder"] == 5
-    assert len(client.get(f"{base}/definitions").json()["items"]) == 7
+    assert len(client.get(f"{base}/definitions").json()["items"]) == 8
 
     acting["subject"] = p.people["TL"]
     assert client.put(f"{base}/settings", json={"enabled": False}).status_code == 403
@@ -757,7 +833,7 @@ def test_http_routes_and_role_gates(project):
         admin_context=SecurityAdminContext(user_id="super-admin-1", is_super_admin=True, admin_scopes=()))
     admin = f"/v1/admin/tenants/{p.tenant}/duties"
     assert client.get(f"{admin}/team").json()["enabled"] is True
-    assert len(client.get(f"{admin}/definitions").json()["items"]) == 7
+    assert len(client.get(f"{admin}/definitions").json()["items"]) == 8
     assert client.post(f"{admin}/definitions", json={"title": "Audit"}).status_code == 201
     assert client.patch(f"{admin}/definitions/{duty_id}", json={"status": "INACTIVE"}).json()["status"] == "INACTIVE"
     assert client.post(f"{admin}/definitions/standard").json() == {"added": 0}

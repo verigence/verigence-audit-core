@@ -129,8 +129,10 @@ def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(set
 
     # The PC sees the rows since the last dump; the earlier open row apart; search over the month.
     listed = s.client.get(f"{s.base}/dms-intimations", params={"kind": "BOOKING"}).json()
-    assert [i["customerName"] for i in listed["items"]] == ["Bina Rout"]
-    assert listed["counts"] == {"new": 1, "open": 1, "month": 3}
+    # The rows since the last dump, and the earlier row nobody has marked carried with them
+    # (2026-11-19); the earlier row in Verigence is not.
+    assert [(i["customerName"], i["carried"]) for i in listed["items"]] == [("Bina Rout", False), ("Asha Das", True)]
+    assert listed["counts"] == {"new": 2, "open": 1, "month": 3}
     found = s.client.get(f"{s.base}/dms-intimations", params={"kind": "BOOKING", "q": "90000 00001"}).json()
     assert [i["customerName"] for i in found["items"]] == ["Asha Das"]
     in_tool = s.client.get(f"{s.base}/dms-intimations", params={"kind": "BOOKING", "q": "OTF27A090950"}).json()
@@ -145,6 +147,9 @@ def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(set
     assert s.client.post(f"{s.base}/dms-intimations/claim", json=asha).json()["state"] == m.INTIMATED
     assert s.client.post(f"{s.base}/dms-intimations/withdraw", json=asha).json()["state"] == m.OPEN
     assert s.client.post(f"{s.base}/dms-intimations/claim", json=asha).status_code == 200
+    # Once marked, the earlier row is no longer carried.
+    after = s.client.get(f"{s.base}/dms-intimations", params={"kind": "BOOKING"}).json()
+    assert [i["customerName"] for i in after["items"]] == ["Bina Rout"]
 
     # The mark is kept by the OTF: the next day's dump finds it marked.
     tomorrow = _dump(s, m.BOOKING, [{"otf": "OTF27A000001", "name": "ASHA DAS", "back": 2}])

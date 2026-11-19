@@ -5,8 +5,8 @@ cash register and all, for others like physical deliveries it can be read direct
 from the system."
 
 A checker answers one question for a batch of duty items, each an (outlet, day): is
-the work done? It only reads -- the gate register, the uploads, the vehicle photos
-and the bank statements know nothing of duties -- and it reads once for the whole
+the work done? It only reads -- the gate register, the uploads, the vehicle photos,
+the bank statements and the tasks know nothing of duties -- and it reads once for the whole
 batch, never once per item. When one of those modules changes, its checker here is
 the only thing that follows.
 
@@ -29,6 +29,11 @@ from typing import Any
 from sqlalchemy import Connection, text
 
 from audit_core.uc03_p2_object_keys import IST
+
+# What counts as a person working on a task, and closing one: the Project Tracker's own
+# lists, so the duty and the tracker never count differently.
+from audit_core.uc03_p2_project_tracker import _CLOSING_EVENTS as TASK_CLOSING_EVENTS
+from audit_core.uc03_p2_project_tracker import _WORK_EVENTS as TASK_WORK_EVENTS
 
 _TZ = "Asia/Kolkata"
 
@@ -264,6 +269,81 @@ def check_uploads(connection: Connection, tenant_id: str, items: list[dict[str, 
 
 
 # A new system-checked duty is one more row here.
+# --------------------------------------------------------------------------- open tasks
+
+_TASK_OPEN = "t.task_status NOT IN ('VERIFIED_COMPLETE', 'CANCELLED', 'FAILED', 'DEAD_LETTER')"
+
+
+def check_open_tasks(connection: Connection, tenant_id: str, items: list[dict[str, Any]],
+                     today: date) -> dict[str, dict[str, Any]]:
+    """The PCs of the outlet worked on the tasks raised on its files (product owner,
+    19 Nov 2026: "one duty of working on the Tasks which has been accumulated or raised
+    as we upload the files").
+
+    The tasks are the PC tasks on the outlet's Journeys (the Tasks screen). A day counts
+    as worked when a PC acted on at least one of them that day; the note carries the
+    numbers -- how many were worked on, how many of those closed, how many are still
+    open -- so the Team Lead reads the volume, not only the tick. With nothing open and
+    nothing worked on there is nothing to judge by: the PC confirms."""
+    outlets, first, last = _span(items)
+    worked: dict[tuple[str, date], dict[str, Any]] = {}
+    for r in connection.execute(
+        text("""
+            SELECT j.outlet_id::text AS outlet_id, ((te.created_at_utc AT TIME ZONE :tz)::date) AS day,
+                   count(DISTINCT te.task_id) AS worked,
+                   count(DISTINCT te.task_id) FILTER (WHERE te.event_type = ANY(:closing)) AS closed,
+                   max(te.created_at_utc) AS last_at,
+                   (array_agg(te.actor_id ORDER BY te.created_at_utc DESC))[1] AS last_actor
+            FROM auditcore.p2_task_events te
+            JOIN auditcore.p2_tasks t ON t.tenant_id = te.tenant_id AND t.task_id = te.task_id
+            JOIN auditcore.journeys j ON j.tenant_id = t.tenant_id AND j.journey_id = t.journey_id
+            WHERE te.tenant_id = :t AND te.created_at_utc >= :s AND te.created_at_utc < :e
+              AND te.actor_id IS NOT NULL AND upper(te.actor_id) <> 'SYSTEM'
+              AND upper(COALESCE(te.actor_role_code, '')) = 'PC' AND te.event_type = ANY(:work)
+              AND t.scope_kind = 'JOURNEY' AND upper(t.assigned_role_code) = 'PC'
+              AND j.outlet_id = ANY(CAST(:o AS uuid[]))
+            GROUP BY 1, 2
+        """),
+        {"t": tenant_id, "tz": _TZ, "o": outlets, "s": _ist_start(first), "e": _ist_start(last + timedelta(days=1)),
+         "work": list(TASK_WORK_EVENTS), "closing": list(TASK_CLOSING_EVENTS)},
+    ).mappings():
+        worked[(r["outlet_id"], r["day"])] = dict(r)
+    still_open = {
+        r["outlet_id"]: int(r["n"]) for r in connection.execute(
+            text(f"""
+                SELECT j.outlet_id::text AS outlet_id, count(*) AS n
+                FROM auditcore.p2_tasks t
+                JOIN auditcore.journeys j ON j.tenant_id = t.tenant_id AND j.journey_id = t.journey_id
+                WHERE t.tenant_id = :t AND t.scope_kind = 'JOURNEY' AND upper(t.assigned_role_code) = 'PC'
+                  AND {_TASK_OPEN} AND j.outlet_id = ANY(CAST(:o AS uuid[]))
+                GROUP BY 1
+            """),
+            {"t": tenant_id, "o": outlets},
+        ).mappings()
+    }
+    out: dict[str, dict[str, Any]] = {}
+    for item in items:
+        row = worked.get((item["outlet_id"], item["for_date"]))
+        open_now = still_open.get(item["outlet_id"], 0)
+        # "Still open" is what is open now: it is said of today only, never of a past day.
+        tail = f", {open_now} still open" if item["for_date"] >= today else ""
+        if row is not None:
+            n, closed = int(row["worked"]), int(row["closed"])
+            out[str(item["item_id"])] = _answer(
+                "DONE", f"Worked on {n} task{'' if n == 1 else 's'}, {closed} closed{tail}",
+                done=n, total=None, at=row["last_at"], actor=row["last_actor"])
+        elif open_now == 0 and item["for_date"] >= today:
+            out[str(item["item_id"])] = _answer("NOTHING", "No open task on this outlet's files", done=0, total=0)
+        elif item["for_date"] >= today:
+            out[str(item["item_id"])] = _answer(
+                "PENDING", f"{open_now} open task{'' if open_now == 1 else 's'}, none worked on today",
+                done=0, total=None)
+        else:
+            out[str(item["item_id"])] = _answer(
+                "PENDING", f"No task was worked on {_label(item['for_date'])}", done=0, total=None)
+    return out
+
+
 CHECKERS: dict[str, dict[str, Any]] = {
     "GATE_REGISTER": {
         "label": "Gate out register uploaded, counts entered", "check": check_gate_register, "final": True,
@@ -284,5 +364,10 @@ CHECKERS: dict[str, dict[str, Any]] = {
         "label": "Bank statement uploaded", "check": check_bank_statement, "final": True,
         "hint": "This ticks itself when the bank statement is uploaded in Bank statements.",
         "nilLabel": None,
+    },
+    "OPEN_TASKS": {
+        "label": "Tasks on the outlet's files worked on", "check": check_open_tasks, "final": False,
+        "hint": "This ticks itself when you work on the open tasks of your outlet's files, on the Tasks screen.",
+        "nilLabel": "No open tasks",
     },
 }

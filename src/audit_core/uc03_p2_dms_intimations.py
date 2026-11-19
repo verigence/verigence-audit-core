@@ -19,9 +19,13 @@ The rows      the dealership's latest dump of the kind (booking or delivery) in 
               the DMS locations their outlets stand under (Aditya's CUTTACK carries every
               Aditya outlet but JAJPUR), and rows naming no location.
 Default view  rows dated after the day of the dealership's previous dump of the kind (the
-              days between the two dumps); "earlier, still open" are the earlier rows not
-              in Verigence and not marked; "whole month" all. A search (name, mobile, OTF,
-              booking number, chassis, invoice) runs over the whole month.
+              days between the two dumps), and every earlier row of the month still not in
+              Verigence and not marked intimated -- carried into each new dump until a PC
+              marks it or it reaches Verigence (2026-11-19: "the bookings which were not
+              intimated in past may have been intimated ... let the PC have the view for all
+              the bookings which hasnt been confirmed by him as intimated whenever the new
+              dumps get uploaded"). "open" is the carried part alone; "month" all. A search
+              (name, mobile, OTF, booking number, chassis, invoice) runs over the whole month.
 The mark      a row in Verigence needs none (the PC has its papers). Any other row the PC
               marks "intimated to me". The mark is kept by the row's identity (OTF /
               booking number for a booking; chassis / invoice for a delivery), so it holds
@@ -338,9 +342,12 @@ def list_intimations(
     def is_new(r: dict[str, Any]) -> bool:
         return since is None or r["event_date"] is None or r["event_date"] > since
 
+    carried = [r for r in rows if not is_new(r) and row_state(r, mark_of(r)) == OPEN]
+    carried_ids = {id(r) for r in carried}
     groups = {
-        "new": [r for r in rows if is_new(r)],
-        "open": [r for r in rows if not is_new(r) and row_state(r, mark_of(r)) == OPEN],
+        # The days since the previous dump, and the earlier rows nobody has marked yet.
+        "new": [r for r in rows if is_new(r) or id(r) in carried_ids],
+        "open": carried,
         "month": rows,
     }
     chosen = [r for r in rows if _matches(r, q)] if (q or "").strip() else groups[view]
@@ -353,7 +360,7 @@ def list_intimations(
                  "previousDumpDate": since.isoformat() if since else None},
         "counts": {k: len(v) for k, v in groups.items()},
         "newStates": {s: states.get(s, 0) for s in (IN_VERIGENCE, INTIMATED, OPEN)},
-        "items": [_item(r, mark_of(r), principal.subject) for r in chosen[:500]],
+        "items": [{**_item(r, mark_of(r), principal.subject), "carried": not is_new(r)} for r in chosen[:500]],
         "truncated": len(chosen) > 500,
     }
 
