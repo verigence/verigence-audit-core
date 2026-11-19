@@ -276,7 +276,8 @@ def _gate_pass(p, day: date, *, finished: bool) -> None:
                "day": day, "done": _at(day, 18) if finished else None})
 
 
-def test_gate_pass_task_is_system_reviewed(project):
+def test_gate_pass_task_is_system_reviewed(project, monkeypatch):
+    monkeypatch.setenv(tm.GATE_PASS_DAILY_TASK_SETTING, "on")  # the task as it ran until 19 Nov 2026
     p = project
     with _db(p) as c:
         tm.ensure_system_schedules(c, tenant_id=p.tenant, now=_at(MONDAY, 7, 0))
@@ -464,7 +465,8 @@ def test_every_day_has_its_own_gate_register_from_15_november():
     assert not tm.occurs_on(_schedule(weekdays=[1, 2, 3, 4, 5, 6, 7]), date(2026, 11, 22))
 
 
-def test_monday_gate_pass_task_names_both_days(project):
+def test_monday_gate_pass_task_names_both_days(project, monkeypatch):
+    monkeypatch.setenv(tm.GATE_PASS_DAILY_TASK_SETTING, "on")  # the task as it ran until 19 Nov 2026
     p = project
     with _db(p) as c:
         tm.ensure_system_schedules(c, tenant_id=p.tenant, now=_at(MONDAY, 7, 0))
@@ -477,8 +479,9 @@ def test_monday_gate_pass_task_names_both_days(project):
     assert task["reference"]["coversDates"] == ["2026-11-01", "2026-11-02"]
 
 
-def test_gate_pass_task_is_raised_for_satellite_outlets_too(project):
+def test_gate_pass_task_is_raised_for_satellite_outlets_too(project, monkeypatch):
     """Every outlet with a PC has a gate register, satellites included (product owner 2026-11-02)."""
+    monkeypatch.setenv(tm.GATE_PASS_DAILY_TASK_SETTING, "on")  # the task as it ran until 19 Nov 2026
     p = project
     with _db(p) as c:
         c.execute(text("UPDATE auditcore.dealer_outlets SET outlet_classification='SATELLITE' "
@@ -492,6 +495,108 @@ def test_gate_pass_task_is_raised_for_satellite_outlets_too(project):
         tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY, 8))
         [task] = tm.list_tasks(c, tenant_id=p.tenant, caller=_caller(p, "PC2"), view="mine")["items"]
     assert task["status"] == "READY" and task["kind"] == "GATE_PASS"
+
+
+def _gate_pass_tasks(p) -> list[dict]:
+    with _db(p) as c:
+        return [dict(r) for r in c.execute(
+            text("SELECT task_id, task_status, occurrence_date, completion_result FROM auditcore.p2_tasks "
+                 "WHERE tenant_id = :t AND task_type = :type ORDER BY occurrence_date"),
+            {"t": p.tenant, "type": tm.GATE_PASS_TASK}).mappings()]
+
+
+def _schedule_status(p) -> list[str]:
+    with _db(p) as c:
+        return list(c.execute(
+            text("SELECT schedule_status FROM auditcore.p2_task_schedules WHERE tenant_id = :t AND system_kind = :k"),
+            {"t": p.tenant, "k": tm.GATE_PASS_SYSTEM_KIND}).scalars())
+
+
+def test_the_daily_gate_pass_task_is_retired(project, monkeypatch):
+    """Product owner, 19 Nov 2026: "i dont want to show gatepass twice... lets close that
+    task and also remove all the system tasks for it... we will use now the daily tracker
+    with this new tasks only". The gate out register is a daily duty; the task is not raised,
+    its schedule is archived and the open ones leave the PCs' lists. What is finished or
+    marked incomplete is history and stays."""
+    p = project
+    tuesday, wednesday = MONDAY + timedelta(days=1), MONDAY + timedelta(days=2)
+    # As it ran: Monday's task closed by the register, Tuesday's incomplete, Wednesday's open.
+    monkeypatch.setenv(tm.GATE_PASS_DAILY_TASK_SETTING, "on")
+    with _db(p) as c:
+        tm.ensure_system_schedules(c, tenant_id=p.tenant, now=_at(MONDAY, 7, 0))
+        c.execute(text("UPDATE auditcore.p2_task_schedules SET starts_on = :d WHERE tenant_id = :t"),
+                  {"d": MONDAY, "t": p.tenant})
+        tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY, 7, 5))
+    _gate_pass(p, MONDAY, finished=True)
+    with _db(p) as c:
+        tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY, 19))
+        tm.run_tick(c, tenant_id=p.tenant, now=_at(tuesday, 7, 5))
+        tm.run_tick(c, tenant_id=p.tenant, now=_at(wednesday, 7, 5))
+        tm.run_tick(c, tenant_id=p.tenant, now=_at(wednesday + timedelta(days=1), 0, 5))
+    assert [t["task_status"] for t in _gate_pass_tasks(p)] == ["VERIFIED_COMPLETE", "FAILED", "READY"]
+    assert _schedule_status(p) == ["ACTIVE"]
+
+    monkeypatch.delenv(tm.GATE_PASS_DAILY_TASK_SETTING)  # the default: retired
+    thursday = wednesday + timedelta(days=1)
+    with _db(p) as c:
+        tick = tm.run_tick(c, tenant_id=p.tenant, now=_at(thursday, 7, 5))
+        assert (tick["raised"], tick["gatePassDailyTasksRetired"]) == (0, 1)
+        again = tm.run_tick(c, tenant_id=p.tenant, now=_at(thursday, 7, 10))  # every pass: nothing left to do
+        assert (again["raised"], again["gatePassDailyTasksRetired"], again["gatePassIncomplete"]) == (0, 0, 0)
+        assert tm.list_tasks(c, tenant_id=p.tenant, caller=_caller(p, "PC2"), view="mine")["items"] == []
+        assert tm.list_schedules(c, tenant_id=p.tenant, caller=_caller(p, "EXECUTIVE")) == []
+    monday_task, tuesday_task, withdrawn = _gate_pass_tasks(p)
+    assert [monday_task["task_status"], tuesday_task["task_status"]] == ["VERIFIED_COMPLETE", "FAILED"]
+    assert withdrawn["task_status"] == "CANCELLED"
+    assert withdrawn["completion_result"]["outcome"] == "RETIRED"
+    assert withdrawn["completion_result"]["statusBeforeRetirement"] == "READY"
+    assert "daily duty" in withdrawn["completion_result"]["reason"]
+    assert _schedule_status(p) == ["ARCHIVED"]
+    with _db(p) as c:
+        event = c.execute(text("SELECT comment, details FROM auditcore.p2_task_events WHERE tenant_id = :t "
+                               "AND task_id = :i AND event_type = 'CANCELLED'"),
+                          {"t": p.tenant, "i": withdrawn["task_id"]}).mappings().one()
+    assert event["details"]["retired"] is True and "daily duty" in event["comment"]
+
+    # A Project that never had the task gets no schedule at all while it is retired.
+    with _db(p) as c:
+        c.execute(text("DELETE FROM auditcore.p2_scheduled_runs WHERE tenant_id = :t"), {"t": p.tenant})
+        c.execute(text("DELETE FROM auditcore.p2_task_events WHERE tenant_id = :t"), {"t": p.tenant})
+        c.execute(text("DELETE FROM auditcore.p2_tasks WHERE tenant_id = :t"), {"t": p.tenant})
+        c.execute(text("DELETE FROM auditcore.p2_task_schedules WHERE tenant_id = :t"), {"t": p.tenant})
+        assert tm.run_tick(c, tenant_id=p.tenant, now=_at(thursday, 8))["raised"] == 0
+    assert _schedule_status(p) == [] and _gate_pass_tasks(p) == []
+
+
+def test_the_daily_gate_pass_task_can_be_switched_on_again(project, monkeypatch):
+    p = project
+    monkeypatch.setenv(tm.GATE_PASS_DAILY_TASK_SETTING, "on")
+    with _db(p) as c:
+        tm.ensure_system_schedules(c, tenant_id=p.tenant, now=_at(MONDAY, 7, 0))
+        c.execute(text("UPDATE auditcore.p2_task_schedules SET starts_on = :d WHERE tenant_id = :t"),
+                  {"d": MONDAY, "t": p.tenant})
+        assert tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY, 7, 5))["raised"] == 1
+    monkeypatch.setenv(tm.GATE_PASS_DAILY_TASK_SETTING, "off")
+    with _db(p) as c:
+        assert tm.run_tick(c, tenant_id=p.tenant, now=_at(MONDAY, 9))["gatePassDailyTasksRetired"] == 1
+    assert _schedule_status(p) == ["ARCHIVED"]
+    monkeypatch.setenv(tm.GATE_PASS_DAILY_TASK_SETTING, "on")
+    tuesday = MONDAY + timedelta(days=1)
+    with _db(p) as c:
+        tick = tm.run_tick(c, tenant_id=p.tenant, now=_at(tuesday, 7, 5))
+    assert tick["raised"] == 1 and tick["gatePassDailyTasksRetired"] == 0
+    assert _schedule_status(p) == ["ACTIVE"]
+    # Monday's withdrawn task stays withdrawn; Tuesday's is raised.
+    assert [t["task_status"] for t in _gate_pass_tasks(p)] == ["CANCELLED", "READY"]
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (None, False), ("", False), ("off", False), ("0", False), ("no", False), ("anything", False),
+    ("on", True), ("ON", True), (" true ", True), ("1", True), ("yes", True), ("enabled", True),
+])
+def test_the_daily_gate_pass_task_setting(value, expected):
+    environ = {} if value is None else {tm.GATE_PASS_DAILY_TASK_SETTING: value}
+    assert tm.gate_pass_daily_task_enabled(environ) is expected
 
 
 def _tl_outlet_task(p, *, outlet: bool = True) -> str:

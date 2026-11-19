@@ -845,6 +845,9 @@ def test_suspended_no_team_lead_task_is_raised_but_the_comparison_is_kept(setup,
 def test_open_team_lead_gate_pass_tasks_are_withdrawn_and_others_stay(setup, monkeypatch):
     from audit_core import task_manager as tm
 
+    # The PC's Daily Gate Pass task has its own switch (retired 19 Nov 2026): on here, so
+    # that what is tested is that the Team Lead switch touches the Team Lead's tasks only.
+    monkeypatch.setenv(tm.GATE_PASS_DAILY_TASK_SETTING, "on")
     s = setup
     gp = _upload(s).json()["gatePassId"]
     assert _register(s, gp, 3, 1).json()["taskRaised"] is True       # switch on: raised
