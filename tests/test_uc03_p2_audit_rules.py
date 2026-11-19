@@ -565,25 +565,28 @@ def test_cash_limit_tcs_and_payment_before_booking(journey):
     result = _run(journey, "BOOKING")
     assert result["CASH_ABOVE_LIMIT"].outcome == "FAIL" and "₹2,50,000 in cash" in result["CASH_ABOVE_LIMIT"].reason
     assert result["PAYMENT_BEFORE_BOOKING"].outcome == "FAIL"
-    assert "₹10,000 on 01 Sep 2026 (receipt R-0): dated more than a day before the booking on 10 Sep 2026" in \
+    assert "₹10,000 on 01 Sep 2026 (receipt R-0): dated 3 or more days before the booking on 10 Sep 2026" in \
         result["PAYMENT_BEFORE_BOOKING"].reason
     assert result["TCS_SHORT"].outcome == "FAIL"
     assert "less than 1% of the ex-showroom price ₹15,00,000 (₹15,000): ₹10,000 short" in result["TCS_SHORT"].reason
 
 
-def test_a_payment_one_day_before_the_booking_docket_is_an_observation(journey):
-    """Product owner 2026-11-14: the token is taken the day before the docket
-    is entered in the DMS -- up to one day before is an observation, not a
-    finding; more than a day stays a finding."""
+def test_a_payment_less_than_3_days_before_the_booking_docket_is_an_observation(journey):
+    """Product owner 2026-11-14: the token is taken before the docket is entered in the
+    DMS -- an observation, not a finding. 2026-11-19: "payment dated before booking tasks
+    can be move to informational if it is for less than 3 days gap"."""
     add_ready_document(journey, "booking_form", booking_date="2026-09-10")
     _receipt(journey, "21000", date(2026, 9, 9), "R-9")
+    _receipt(journey, "4000", date(2026, 9, 8), "R-8")
     outcome = _run(journey, "BOOKING")["PAYMENT_BEFORE_BOOKING"]
     assert outcome.outcome == "PASS"
-    assert "Observation: ₹21,000 on 09 Sep 2026 (receipt R-9) received the day before" in outcome.reason
-    assert len(outcome.details["observations"]) == 1
-    _receipt(journey, "5000", date(2026, 9, 8), "R-8")
+    assert "Observation: ₹4,000 on 08 Sep 2026 (receipt R-8); ₹21,000 on 09 Sep 2026 (receipt R-9) received " \
+           "before the booking docket, within the 2 days allowed (informational, no task)." in outcome.reason
+    assert len(outcome.details["observations"]) == 2
+    _receipt(journey, "5000", date(2026, 9, 7), "R-7")
     outcome = _run(journey, "BOOKING")["PAYMENT_BEFORE_BOOKING"]
-    assert outcome.outcome == "FAIL" and "₹5,000 on 08 Sep 2026 (receipt R-8): dated more than a day" in outcome.reason
+    assert outcome.outcome == "FAIL"
+    assert "₹5,000 on 07 Sep 2026 (receipt R-7): dated 3 or more days before the booking" in outcome.reason
     assert "R-9" not in outcome.reason.split("Observation")[0]
 
 
@@ -715,9 +718,37 @@ def test_the_delivery_review_waits_for_every_verdict(journey):
 # ------------------------------------ the documents window and the night
 
 
+def _delivery_in_time_check(journey, enabled: bool) -> None:
+    _sql(journey, "INSERT INTO auditcore.tenant_rule_config (tenant_id, delivery_in_time_check_enabled) "
+                  "VALUES (:t, :e) ON CONFLICT (tenant_id) DO UPDATE "
+                  "SET delivery_in_time_check_enabled=EXCLUDED.delivery_in_time_check_enabled", e=enabled)
+
+
+def test_delivery_in_time_is_switched_off_by_default_and_its_task_closes(journey):
+    """Product owner 2026-11-19: "for the time being supress the tasks for delay in delivery --
+    delivery not completed in time.. may we introduce it later"."""
+    _delivery_in_time_check(journey, True)
+    add_ready_document(journey, "gate_pass", delivery_date=(TODAY - timedelta(days=8)).isoformat())
+    _recompute(journey)
+    _evaluate(journey, "NATIVE:DELIVERY")
+    assert _states(journey)["DELIVERY_NOT_COMPLETED_IN_TIME"]["control_status"] == "FAIL"
+    assert _task(journey, "DELIVERY_NOT_COMPLETED_IN_TIME")["task_status"] == "READY"
+    _delivery_in_time_check(journey, False)
+    off = _run(journey, "DELIVERY")["DELIVERY_NOT_COMPLETED_IN_TIME"]
+    assert off.outcome == "PASS" and "switched off" in off.reason
+    _evaluate(journey, "NATIVE:DELIVERY")
+    assert _states(journey)["DELIVERY_NOT_COMPLETED_IN_TIME"]["control_status"] == "PASS"
+    assert _task(journey, "DELIVERY_NOT_COMPLETED_IN_TIME")["task_status"] != "READY"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert schedule_delivery_completion_check(connection, tenant_id=journey.tenant_id,
+                                                  journey_id=journey.journey_id) is None
+
+
 def test_a_date_before_the_floor_never_starts_the_delivery_clock(journey):
     """#19 (2026-09-30): a gate pass read as 2019 is a misreading the PC is
     asked to fix; the delivery window is not counted from it."""
+    _delivery_in_time_check(journey, True)
     add_ready_document(journey, "gate_pass", delivery_date="12/03/2019")
     _recompute(journey)
     assert _run(journey, "DELIVERY")["DELIVERY_NOT_COMPLETED_IN_TIME"].outcome == "PASS"
@@ -728,6 +759,7 @@ def test_a_date_before_the_floor_never_starts_the_delivery_clock(journey):
 
 
 def test_delivery_not_completed_in_time_lists_everything_pending_for_the_tl(journey):
+    _delivery_in_time_check(journey, True)
     assert _run(journey, "DELIVERY")["DELIVERY_NOT_COMPLETED_IN_TIME"].outcome == "PASS"
     add_ready_document(journey, "insurance_cover", policy_start_date=(TODAY - timedelta(days=3)).isoformat())
     add_ready_document(journey, "customer_invoice_dms", invoice_date=(TODAY - timedelta(days=2)).isoformat())
@@ -754,6 +786,7 @@ def test_delivery_not_completed_in_time_lists_everything_pending_for_the_tl(jour
 
 
 def test_the_seventh_day_event_follows_the_earliest_printed_date(journey):
+    _delivery_in_time_check(journey, True)
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         assert schedule_delivery_completion_check(connection, tenant_id=journey.tenant_id,
