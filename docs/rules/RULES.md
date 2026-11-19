@@ -94,3 +94,9 @@ rule once, with what it replaced and where it is read, is what stops that.
 | Rule | Since | Read by |
 |---|---|---|
 | A Team Lead or Reviewer marks a booking verified once its figures were checked against its papers; the system compares it every night (Jobs page, 9:40 pm), after each deploy and on demand; a change that moves its figures goes live and is reported, it does not block. | 17 Nov 2026 | `uc03_verified_bookings`, Verified bookings page, Journey 360 mark, `pr-figures-check` workflow |
+
+## Task switches (Project Administration)
+
+| Rule | Since | Replaces | Read by | Job for bookings before |
+|---|---|---|---|---|
+| A kind of task (its check or producer code) can be switched off or on per Project in Project Administration → Tasks, by a Tenant Admin or Super Admin, with a reason. Off: the check does not run for the Project (not applicable, no finding), no task of that kind is raised, and at once its open tasks are closed ("Switched off for this Project by … on …: reason"), its open findings voided and it leaves the Journey 360 check lists; nothing is deleted. On again: the tasks it closed may come back, and every booking is checked again. "Accessories fitted are billed" and "Delivery not completed in time" are off until a Project switches them on. Every change is kept. | 19 Nov 2026 | per-Project columns in tenant_rule_config for those two checks (0213, 0244) | `uc03_task_switches`, `raise_or_refresh`, `apply_control_transitions`, `write_control_state`, `run_p2_audit_rules`, Journey 360 `compliance` | switching on queues RULES_RERUN and a stage recompute for every booking |

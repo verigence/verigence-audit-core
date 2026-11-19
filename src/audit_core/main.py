@@ -202,6 +202,7 @@ from audit_core.uc03_rule_status_report import router as uc03_rule_status_report
 from audit_core.uc03_run_all_rules import router as uc03_run_all_rules_router
 from audit_core.uc03_sku_attention import router as uc03_sku_attention_router
 from audit_core.uc03_sku_standard import router as uc03_sku_standard_router
+from audit_core.uc03_task_switches import router as uc03_task_switches_router
 from audit_core.uc03_tl_scope_alignment import install_tl_scope_alignment
 from audit_core.uc03_tl_supervisory import router as uc03_tl_supervisory_router
 from audit_core.uc03_unified_document_capture import (
@@ -397,6 +398,7 @@ def create_app() -> FastAPI:
     application.include_router(uc03_p2_scheme_dumps_router)
     application.include_router(uc03_verified_bookings_router)
     application.include_router(uc03_observation_severity_router)
+    application.include_router(uc03_task_switches_router)
     # before the statements router: /bank-statements/accounts is not a /bank-statements/{statement_id}
     application.include_router(uc03_p2_bank_register_router)
     application.include_router(uc03_p2_bank_statements_router)

@@ -4488,7 +4488,12 @@ def compliance(connection: Connection, *, tenant_id: str, journey_id: UUID) -> d
     ).mappings().all()
     state = {str(r["control_code"]): r for r in rows}
     groups: dict[str, list[dict[str, Any]]] = {"BOOKING": [], "DELIVERY": []}
+    from audit_core.uc03_task_switches import switched_off
+
+    off = switched_off(connection, tenant_id)
     for control in registry.controls.values():
+        if control.code in off:
+            continue  # switched off for the Project: not shown (2026-11-19)
         row = state.get(control.code)
         details = (row["details"] if row else None) or {}
         item = {
@@ -4937,9 +4942,12 @@ def audit(connection: Connection, *, tenant_id: str, journey_id: UUID, limit: in
                 "details": dict(row["details"] or {}) if row else {},
             })
         controls = []
+        from audit_core.uc03_task_switches import switched_off
+
+        off = switched_off(connection, tenant_id)
         for control in registry.controls.values():
-            if not control.applies_to_stage(stage_code):
-                continue
+            if not control.applies_to_stage(stage_code) or control.code in off:
+                continue  # switched off for the Project: not shown (2026-11-19)
             row = control_state.get(control.code)
             if row is None:
                 continue

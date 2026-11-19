@@ -527,9 +527,10 @@ def test_trade_in_resale_window_and_loss(journey):
 
 
 def _accessories_check(journey, enabled: bool) -> None:
-    _sql(journey, "INSERT INTO auditcore.tenant_rule_config (tenant_id, accessories_fitted_check_enabled) "
-                  "VALUES (:t, :e) ON CONFLICT (tenant_id) DO UPDATE "
-                  "SET accessories_fitted_check_enabled=EXCLUDED.accessories_fitted_check_enabled", e=enabled)
+    # Project Administration's task switch (uc03_task_switches, 2026-11-19).
+    _sql(journey, "INSERT INTO auditcore.p2_task_switches (tenant_id, source_code, enabled, reason) "
+                  "VALUES (:t, 'ACCESSORIES_FITTED_UNCONFIRMED', :e, 'test') ON CONFLICT (tenant_id, source_code) DO UPDATE "
+                  "SET enabled=EXCLUDED.enabled", e=enabled)
 
 
 def test_accessories_fitted_is_not_asked_while_the_project_has_it_switched_off(journey):
@@ -537,13 +538,14 @@ def test_accessories_fitted_is_not_asked_while_the_project_has_it_switched_off(j
     we may introduce it later". Off by default; the Project's switch brings it back."""
     _deliver(journey, TODAY - timedelta(days=1))
     result = _run(journey, "DELIVERY")
-    assert result["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "PASS"
-    assert "switched off" in result["ACCESSORIES_FITTED_UNCONFIRMED"].reason
+    # Switched off in Project Administration (uc03_task_switches): the check is not run.
+    assert result["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "SKIPPED"
+    assert "Switched off" in result["ACCESSORIES_FITTED_UNCONFIRMED"].reason
     assert result["ACCESSORY_FITTED_UNBILLED"].outcome == "SKIPPED"
     _accessories_check(journey, True)
     assert _run(journey, "DELIVERY")["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "FAIL"
     _accessories_check(journey, False)
-    assert _run(journey, "DELIVERY")["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "PASS"
+    assert _run(journey, "DELIVERY")["ACCESSORIES_FITTED_UNCONFIRMED"].outcome == "SKIPPED"
 
 
 def test_accessories_fitted_is_asked_once_the_car_is_delivered(journey):
@@ -719,9 +721,10 @@ def test_the_delivery_review_waits_for_every_verdict(journey):
 
 
 def _delivery_in_time_check(journey, enabled: bool) -> None:
-    _sql(journey, "INSERT INTO auditcore.tenant_rule_config (tenant_id, delivery_in_time_check_enabled) "
-                  "VALUES (:t, :e) ON CONFLICT (tenant_id) DO UPDATE "
-                  "SET delivery_in_time_check_enabled=EXCLUDED.delivery_in_time_check_enabled", e=enabled)
+    # Project Administration's task switch (uc03_task_switches, 2026-11-19).
+    _sql(journey, "INSERT INTO auditcore.p2_task_switches (tenant_id, source_code, enabled, reason) "
+                  "VALUES (:t, 'DELIVERY_NOT_COMPLETED_IN_TIME', :e, 'test') ON CONFLICT (tenant_id, source_code) DO UPDATE "
+                  "SET enabled=EXCLUDED.enabled", e=enabled)
 
 
 def test_delivery_in_time_is_switched_off_by_default_and_its_task_closes(journey):
@@ -735,9 +738,9 @@ def test_delivery_in_time_is_switched_off_by_default_and_its_task_closes(journey
     assert _task(journey, "DELIVERY_NOT_COMPLETED_IN_TIME")["task_status"] == "READY"
     _delivery_in_time_check(journey, False)
     off = _run(journey, "DELIVERY")["DELIVERY_NOT_COMPLETED_IN_TIME"]
-    assert off.outcome == "PASS" and "switched off" in off.reason
+    assert off.outcome == "SKIPPED" and "Switched off" in off.reason
     _evaluate(journey, "NATIVE:DELIVERY")
-    assert _states(journey)["DELIVERY_NOT_COMPLETED_IN_TIME"]["control_status"] == "PASS"
+    assert _states(journey)["DELIVERY_NOT_COMPLETED_IN_TIME"]["control_status"] == "NOT_APPLICABLE"
     assert _task(journey, "DELIVERY_NOT_COMPLETED_IN_TIME")["task_status"] != "READY"
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)

@@ -149,20 +149,22 @@ class _Facts:
         return [dict(r) for r in self.connection.execute(text(sql), self._params).mappings().all()]
 
     @cached_property
+    def _switched_off(self) -> frozenset[str]:
+        from audit_core.uc03_task_switches import switched_off
+
+        return switched_off(self.connection, self.tenant_id)
+
+    @cached_property
     def accessories_fitted_check_enabled(self) -> bool:
-        """The Project's switch for the "accessories fitted are billed" question
-        (tenant_rule_config, migration 0213): off unless the Project has it on."""
-        return bool(self.connection.execute(
-            text("SELECT accessories_fitted_check_enabled FROM auditcore.tenant_rule_config WHERE tenant_id=:t"),
-            {"t": self.tenant_id}).scalar_one_or_none())
+        """The "accessories fitted are billed" question: on unless switched off for the
+        Project in Project Administration (uc03_task_switches; 0213, moved 0245)."""
+        return "ACCESSORIES_FITTED_UNCONFIRMED" not in self._switched_off
 
     @cached_property
     def delivery_in_time_check_enabled(self) -> bool:
-        """The Project's switch for "Delivery not completed in time" (tenant_rule_config,
-        migration 0244): off unless the Project has it on."""
-        return bool(self.connection.execute(
-            text("SELECT delivery_in_time_check_enabled FROM auditcore.tenant_rule_config WHERE tenant_id=:t"),
-            {"t": self.tenant_id}).scalar_one_or_none())
+        """"Delivery not completed in time": on unless switched off for the Project in
+        Project Administration (uc03_task_switches; 0244, moved 0245)."""
+        return "DELIVERY_NOT_COMPLETED_IN_TIME" not in self._switched_off
 
     @cached_property
     def sheet(self) -> dict[str, Any]:
@@ -1817,10 +1819,23 @@ def run_p2_audit_rules(
 ) -> list[RuleOutcome]:
     """Run the stage's rules, log each outcome, return them. A rule that
     breaks reports ERROR (the unit retries) without stopping the others."""
+    from audit_core.uc03_task_switches import switched_off
+
     facts = _Facts(connection, tenant_id, journey_id)
     outcomes: list[RuleOutcome] = []
+    off = switched_off(connection, tenant_id)
     for rule in {"BOOKING": _BOOKING_RULES, "DELIVERY": _DELIVERY_RULES}.get(stage, ()):
         code = rule.__name__.upper()
+        if code in off:
+            # Switched off for the Project in Project Administration (2026-11-19): not run.
+            result = RuleOutcome(code, "SKIPPED", "Switched off for this Project.")
+            _sync_finding(connection, tenant_id=tenant_id, journey_id=journey_id, stage=stage, result=result,
+                          correlation_id=correlation_id)
+            record_execution(connection, tenant_id=tenant_id, journey_id=journey_id, rule_code=code,
+                             triggering_event=triggering_event, outcome=result.outcome, reason=result.reason,
+                             audit_finding_id=None, correlation_id=correlation_id)
+            outcomes.append(result)
+            continue
         try:
             result = rule(facts)
         except Exception:
