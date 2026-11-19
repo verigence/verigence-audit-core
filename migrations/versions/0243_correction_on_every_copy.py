@@ -1,4 +1,4 @@
-"""0240_correction_on_every_copy -- a value the PC corrected is corrected on every stored copy
+"""0243_correction_on_every_copy -- a value the PC corrected is corrected on every stored copy
 of it, so its manual verification task can close.
 
 Product owner, 2026-11-18: "reoccuring error... PC closed manual verification but it is not
@@ -23,8 +23,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0240_correction_on_every_copy"
-down_revision = "0239_observation_severity"
+revision = "0243_correction_on_every_copy"
+down_revision = "0242_daily_duties"
 branch_labels = None
 depends_on = None
 
