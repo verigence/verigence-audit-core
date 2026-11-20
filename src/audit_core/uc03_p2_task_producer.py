@@ -516,9 +516,15 @@ def raise_or_refresh(
                 and not _documents_in_flight(connection, tenant_id=tenant_id, journey_id=journey_id)):
             new_status, outcome = "RETURNED", "RETURNED"
     elif status == "CANCELLED":
-        if not closed_by_switch(result):
+        from audit_core.uc03_finding_invariants import cancelled_with_its_finding
+
+        if not (closed_by_switch(result) or cancelled_with_its_finding(
+                connection, tenant_id=tenant_id, task_status=status, result=result,
+                reference=dict(existing["reference"] or {}))):
             return task_id, "CANCELLED"
-        # Closed when its kind was switched off; the kind is on again (2026-11-19).
+        # Closed when its kind was switched off and the kind is on again
+        # (2026-11-19), or cancelled only with a finding the system closed and
+        # the check fails again (2026-11-20): the task comes back.
         new_status, outcome = "READY", "REOPENED"
 
     # A check that moved to another executor keeps its code, and so its task
