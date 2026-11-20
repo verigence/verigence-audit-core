@@ -134,6 +134,8 @@ def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(set
     # (2026-11-19); the earlier row in Verigence is not.
     assert [(i["customerName"], i["carried"]) for i in listed["items"]] == [("Bina Rout", False), ("Asha Das", True)]
     assert listed["counts"] == {"new": 2, "open": 1, "month": 3}
+    # No report generated from this dump yet: no note on the screen.
+    assert listed["report"] is None
     found = s.client.get(f"{s.base}/dms-intimations", params={"kind": "BOOKING", "q": "90000 00001"}).json()
     assert [i["customerName"] for i in found["items"]] == ["Asha Das"]
     in_tool = s.client.get(f"{s.base}/dms-intimations", params={"kind": "BOOKING", "q": "OTF27A090950"}).json()
@@ -188,6 +190,14 @@ def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(set
         "Asha Das": "Intimated to PC - pending with PC", "Bina Rout": "Not intimated to PC - pending with dealership"}
     book = load_workbook(io.BytesIO(s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}/file").content))
     assert book.sheetnames[:2] == ["Outlet report", "Statement"]
+    # The PC's screen now says the report has been generated from this dump (2026-11-20);
+    # marks can still change.
+    s.acting["subject"] = s.journey.actor_id
+    note = s.client.get(f"{s.base}/dms-intimations", params={"kind": "BOOKING"}).json()["report"]
+    assert note["reportId"] == made.json()["reportId"] and note["reportDate"] == _today().isoformat()
+    assert note["generatedBy"]
+    assert s.client.post(f"{s.base}/dms-intimations/withdraw", json=asha).status_code == 200
+    s.acting["subject"] = s.reviewer
     assert "Bookings not in Verigence" in book.sheetnames and "PC intimations" in book.sheetnames
     # A day with no dump: nothing to generate.
     assert s.client.post(f"{s.base}/dms-reports",
