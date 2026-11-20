@@ -310,8 +310,10 @@ def active_source_rows(connection: Connection, *, tenant_id: str, journey_id: UU
     re-processed last. Two spellings of one type on one document (rows
     written before migration 0153) are one source: the newest row stands,
     so a stale spelling never wins (review S6)."""
-    rows = connection.execute(
-        text(
+    # Asked for on every build of the Deal: read once per worker job (audit_core.job_reads).
+    return job_reads.rows(
+        connection,
+        (
             f"""
             SELECT line_kind, component_key, source_document_type, amount, source_document_id, source_evidence_id
             FROM (
@@ -329,8 +331,7 @@ def active_source_rows(connection: Connection, *, tenant_id: str, journey_id: UU
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().all()
-    return [dict(row) for row in rows]
+    )
 
 
 def load_source_breakdown(

@@ -108,13 +108,24 @@ def off_result(connection: Connection, tenant_id: str, code: str | None) -> dict
     while the kind is on."""
     if not code:
         return None
-    # Asked for every check of every job: answered once per job (audit_core.job_reads).
-    row = job_reads.one(
-        connection,
-        "SELECT enabled, reason, changed_by_name, changed_at_utc FROM auditcore.p2_task_switches "
-        "WHERE tenant_id=:t AND source_code=:c",
-        {"t": tenant_id, "c": code},
-    )
+    if job_reads.active(connection):
+        # Asked for every check of every worker job: inside a job the Project's
+        # switches are read once, all of them, and looked up here (audit_core.job_reads).
+        row = next((dict(r) for r in job_reads.rows(
+            connection,
+            "SELECT source_code, enabled, reason, changed_by_name, changed_at_utc "
+            "FROM auditcore.p2_task_switches WHERE tenant_id=:t",
+            {"t": tenant_id},
+        ) if r["source_code"] == code), None)
+        if row is not None:
+            del row["source_code"]
+    else:
+        row = job_reads.one(
+            connection,
+            "SELECT enabled, reason, changed_by_name, changed_at_utc FROM auditcore.p2_task_switches "
+            "WHERE tenant_id=:t AND source_code=:c",
+            {"t": tenant_id, "c": code},
+        )
     if _is_on(code, row):
         return None
     if row is None:
