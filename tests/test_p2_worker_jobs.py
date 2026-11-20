@@ -74,10 +74,18 @@ def test_a_job_whose_worker_stopped_is_taken_again_or_closed():
                            "started_at_utc=now()-interval '20 minutes', heartbeat_at_utc=now()-interval '10 minutes' "
                            "WHERE tag='t:drop'"))
         assert worker.reclaim_stalled_jobs(engine) == {"resumed": 0, "closed": 1}
-        # Past its time limit with a live heartbeat: taken again.
+        # Past its time limit with a live heartbeat: still running, left to finish -- two copies
+        # side by side would have the second submit the bulk the first is filling (2026-11-20).
         with engine.begin() as c:
             set_platform_super_admin_context(c)
             c.execute(text("UPDATE auditcore.p2_worker_jobs SET started_at_utc=now()-interval '2 hours' "
+                           "WHERE tag='t:alive'"))
+        assert worker.reclaim_stalled_jobs(engine) == {"resumed": 0, "closed": 0}
+        assert _status(engine)["DRIVE_RUN"] == "RUNNING"
+        # Past the hard limit while still beating: hung, taken again.
+        with engine.begin() as c:
+            set_platform_super_admin_context(c)
+            c.execute(text("UPDATE auditcore.p2_worker_jobs SET started_at_utc=now()-interval '7 hours' "
                            "WHERE tag='t:alive'"))
         assert worker.reclaim_stalled_jobs(engine) == {"resumed": 1, "closed": 0}
         claimed = worker.claim_worker_jobs(engine)

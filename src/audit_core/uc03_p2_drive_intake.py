@@ -911,6 +911,36 @@ def _journey(connection: Connection, tenant_id: str, journey_id: Any) -> dict[st
     return {"journey_id": me.journey_id, "journey_reference": me.reference, "closed": me.closed}
 
 
+def _kept_after_deletion(connection: Connection, tenant_id: str, journey_id: Any) -> dict[str, Any] | None:
+    """The folder's journey was deleted as a copy of another booking -- joined by a bulk
+    upload, a duplicate booking, the same file uploaded again: the booking its pages went to
+    (``kept_journey_id``), followed as far as one still there. 20 Nov 2026: Sabita Sahoo's and
+    Sarat Chandra Mohanty's photos waited on journeys joined to their bookings on 17 Nov."""
+    if not journey_id:
+        return None
+    from audit_core.uc03_p2_bulk_upload import _earlier_join
+
+    seen: set[str] = set()
+    current: Any = journey_id
+    for _ in range(5):
+        seen.add(str(current))
+        kept = connection.execute(
+            text("SELECT kept_journey_id FROM auditcore.p2_journey_deletions WHERE tenant_id=:t AND journey_id=:j "
+                 "AND kept_journey_id IS NOT NULL ORDER BY requested_at_utc DESC LIMIT 1"),
+            {"t": tenant_id, "j": current},
+        ).scalar_one_or_none()
+        if kept is None:
+            joined = _earlier_join(connection, tenant_id, UUID(str(current)))
+            kept = joined["kept_journey_id"] if joined else None
+        if kept is None or str(kept) in seen:
+            return None
+        found = _journey(connection, tenant_id, kept)
+        if found is not None:
+            return found
+        current = kept
+    return None
+
+
 def journey_for_folder(connection: Connection, tenant_id: str, folder: dict[str, Any] | None) -> dict[str, Any] | None:
     """The journey a customer's folder is, known before anything is read (see the module's
     note), with ``closed``; None when its files are to be read on a journey of their own. A
@@ -920,6 +950,14 @@ def journey_for_folder(connection: Connection, tenant_id: str, folder: dict[str,
     own = _journey(connection, tenant_id, folder["journey_id"])
     if own is not None:
         return own
+    kept = _kept_after_deletion(connection, tenant_id, folder["journey_id"])
+    if kept is not None:
+        connection.execute(
+            text("UPDATE auditcore.p2_drive_folders SET journey_id=:j, updated_at_utc=now() "
+                 "WHERE tenant_id=:t AND drive_folder_id=:f"),
+            {"j": kept["journey_id"], "t": tenant_id, "f": folder["drive_folder_id"]},
+        )
+        return kept
     key, outlet_id = folder["number_key"], folder["outlet_id"]
     if not key or not outlet_id:
         return None
@@ -1234,7 +1272,13 @@ def submit_left_behind(engine: Engine, tenant_id: str, *, run_id: Any = None,
                        OR CAST(:run AS uuid) IS NULL
                           AND COALESCE((SELECT max(f.created_at_utc) FROM auditcore.p2_bulk_files f
                                          WHERE f.tenant_id=u.tenant_id AND f.bulk_id=u.bulk_id),
-                                       u.created_at_utc) < :before)
+                                       u.created_at_utc) < :before
+                          -- never the bulk of a run whose job is still alive (heartbeat beating)
+                          AND NOT EXISTS (SELECT 1 FROM auditcore.p2_worker_jobs w
+                                          WHERE w.job_kind='DRIVE_RUN' AND w.status='RUNNING'
+                                            AND w.tag = u.tenant_id || ':' || CAST(u.drive_run_id AS varchar)
+                                            AND COALESCE(w.heartbeat_at_utc, w.started_at_utc) > now() - interval '5 minutes'
+                                            AND w.started_at_utc > now() - interval '6 hours'))
                 ORDER BY u.created_at_utc
                 """
             ),

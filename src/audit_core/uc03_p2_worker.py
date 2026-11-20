@@ -5531,6 +5531,15 @@ def reclaim_stalled_jobs(engine: Engine) -> dict[str, int]:
                 continue
             why = ("the worker stopped while it ran (a restart or deploy)" if stale
                    else f"it ran past its time limit of {limit // 60} minutes")
+            hung = float(row["ran"] or 0) > _JOB_TIME_LIMIT_SECONDS
+            if row["job_kind"] in _RESUMABLE_JOBS and not stale and not hung:
+                # Past its time but its heartbeat still beats: it is running. Taken again now, two
+                # copies would run side by side -- a Drive run's second copy would submit the bulk
+                # the first is still filling (2026-11-20 review). Left to finish; only a stopped
+                # heartbeat (a restart), or the hard limit (a hung job), has it taken again.
+                logger.warning("p2_worker_job_overdue_but_alive", job_id=str(row["job_id"]),
+                               job_kind=row["job_kind"], ran_seconds=int(float(row["ran"] or 0)))
+                continue
             if row["job_kind"] in _RESUMABLE_JOBS and int(row["attempts"] or 0) < _JOB_MAX_ATTEMPTS:
                 connection.execute(
                     text("UPDATE auditcore.p2_worker_jobs SET status = 'PENDING', worker_id = NULL, "
