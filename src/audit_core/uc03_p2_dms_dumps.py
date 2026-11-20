@@ -864,6 +864,10 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
              "WHERE tenant_id = :t AND dump_id = :id"),
         {"t": tenant_id, "id": str(dump_id)},
     ).mappings().one()
+    # Matching is Python work between statements of one transaction: past the pool's 60 s
+    # idle-in-transaction limit Postgres ends the session and the upload fails (2026-11-20,
+    # Utkal's booking dump). This transaction alone may wait longer (dependencies.py).
+    connection.execute(text("SET LOCAL idle_in_transaction_session_timeout = '5min'"))
     first, last = dump_window(dump["period_month"], dump["business_date"])
     kind, dealer_id = dump["dump_kind"], dump["dealer_id"]
     index = build_index(connection, tenant_id=tenant_id, dealer_id=dealer_id)
