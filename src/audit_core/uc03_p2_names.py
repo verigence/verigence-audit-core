@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Any
 
 _HONORIFICS = frozenset({
@@ -98,7 +99,8 @@ _DIGRAPHS = (("BH", "B"), ("PH", "F"), ("SH", "S"), ("TH", "T"), ("DH", "D"), ("
              ("JH", "J"), ("CHH", "C"), ("CH", "C"), ("OO", "U"), ("EE", "I"), ("AA", "A"), ("RU", "RI"))
 
 
-def sound_key(word: str) -> str:
+@lru_cache(maxsize=65536)
+def _sound_key(word: str) -> str:
     """How a name word sounds, as Odia names are spelt in English: Sahu and
     Sahoo, Dilip and Dillip, Choudhury and Chhoudhury, Prabhat and Pravat,
     Behera and Bihera are one word (2026-11-16). Aspirates and doubled letters
@@ -109,6 +111,10 @@ def sound_key(word: str) -> str:
     key = key.replace("V", "B").replace("W", "B").replace("Y", "I").replace("Z", "J")
     key = re.sub(r"(.)\1+", r"\1", key)
     return key[:-1] if len(key) > 3 and key.endswith("A") else key
+
+
+def sound_key(word: str) -> str:
+    return _sound_key(str(word))
 
 
 def org_tokens(value: Any) -> list[str]:
@@ -151,9 +157,17 @@ def _tokens_match(left: list[str], right: list[str]) -> bool:
     return whole > 0
 
 
+def _ratio_at_least(a: str, b: str, threshold: float) -> bool:
+    """SequenceMatcher(a, b).ratio() >= threshold, without computing the ratio when its cheap
+    upper bounds (real_quick_ratio, quick_ratio) already fall short -- the same answer."""
+    matcher = SequenceMatcher(None, a, b)
+    return (matcher.real_quick_ratio() >= threshold and matcher.quick_ratio() >= threshold
+            and matcher.ratio() >= threshold)
+
+
 def _close_enough(left: list[str], right: list[str]) -> bool:
     a, b = " ".join(sorted(left)), " ".join(sorted(right))
-    return bool(a and b) and SequenceMatcher(None, a, b).ratio() >= _SAME_RATIO
+    return bool(a and b) and _ratio_at_least(a, b, _SAME_RATIO)
 
 
 _SOUND_RATIO = 0.92
@@ -167,7 +181,7 @@ def _sounds_alike(left: list[str], right: list[str]) -> bool:
         a, b = sound_key("".join(x)), sound_key("".join(y))
         if a == b:
             return True
-        if min(len(a), len(b)) >= _SOUND_MIN and SequenceMatcher(None, a, b).ratio() >= _SOUND_RATIO \
+        if min(len(a), len(b)) >= _SOUND_MIN and _ratio_at_least(a, b, _SOUND_RATIO) \
                 and not _differs_at_a_word_start(x, y):
             return True
     return False
@@ -200,6 +214,16 @@ def _differs_at_a_word_start(left: list[str], right: list[str]) -> bool:
 
 
 def same_person(left: Any, right: Any) -> bool:
+    """Whether two printed names are the same customer (see _same_person). Every rule reads a
+    name only as str(value or ""), so the answer is memoised on that text: a DMS booking dump
+    compares each of its rows with every Journey's names, several times over, and uncached the
+    upload's matching outlived the database's 60 s idle-in-transaction limit and failed
+    (2026-11-20, Utkal's 441-row booking dump: five uploads, HTTP 500 after 66-81 s)."""
+    return _same_person(str(left or ""), str(right or ""))
+
+
+@lru_cache(maxsize=262144)
+def _same_person(left: str, right: str) -> bool:
     """Whether two printed names are the same customer.
 
     Also (2026-10-28): the same letters split differently ("RASMIRANJAN" /
