@@ -84,6 +84,24 @@ def test_utkal_form_responses_are_read_from_their_own_sheet() -> None:
     assert row["event_date"] == date(2026, 11, 1) and row["chassis"] == "T6J57000" and row["outlet_label"] == "CDA"
 
 
+def test_of_two_columns_of_one_name_the_one_with_values_is_read() -> None:
+    """Utkal's delivery sheet of 19/20 Nov 2026 heads two columns BOOKING DATE, the first empty:
+    the empty one was read and August bookings were marked Inscope on the VIN alone."""
+    headers = ["Timestamp", "Location", "CUSTOMER NAME", "CONT NO", "BOOKING DATE", "MODEL", "CHASSIS NO",
+               "BOOKING DATE", "DELIVERY DATE", "FSC"]
+    data = _book({"Form Responses 1": [headers, [datetime(2026, 11, 10, 14, 3), "CDA", "Ayvens India Pvt Ltd",
+                                                 9437033732, None, "XUV 3XO", "T2K55617", datetime(2026, 8, 11),
+                                                 datetime(2026, 11, 6), "Swati Sangita Das"]]})
+    row = m.parse_workbook(data).rows[0]
+    assert row["booking_date"] == date(2026, 8, 11) and row["event_date"] == date(2026, 11, 6)
+
+
+def test_a_date_kept_as_iso_text_is_read() -> None:
+    assert m.parse_date("2026-08-11T00:00:00") == date(2026, 8, 11)
+    assert m.parse_date("2026-11-10T14:03:33.568000") == date(2026, 11, 10)
+    assert m.parse_date("not a date") is None
+
+
 def test_booking_keys_meet_the_booking_forms_numbers() -> None:
     keys = m.booking_keys("B-13455387", "OTF27C022672")
     assert m.journey_ref_keys("B-13455387") & keys  # Aditya prints the B-number

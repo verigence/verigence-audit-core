@@ -265,6 +265,39 @@ def test_delivery_dump_rows_are_marked_inscope_or_outscope(setup) -> None:
     assert "Delivery dump scope" in book.sheetnames
 
 
+def test_an_uploaded_delivery_sheet_s_booking_date_decides_the_deal_type(setup) -> None:
+    """Uploaded as Utkal's sheet comes (two columns BOOKING DATE, the first empty): a booking of
+    August with a VIN of this year is Outscope, not Inscope (product owner 2026-11-20)."""
+    from openpyxl import Workbook
+
+    s = setup
+    today = _today()
+    year = "ABCDEFGHJKLMNPRSTVWXY"[today.year - 2010]
+    young = f"{year}2{'ABCDEFGHJKLM'[today.month - 1]}55617"
+    book = Workbook()
+    sheet = book.active
+    sheet.append(["Timestamp", "Location", "CUSTOMER NAME", "CONT NO", "BOOKING DATE", "MODEL", "CHASSIS NO",
+                  "BOOKING DATE", "DELIVERY DATE", "FSC"])
+    # Excel cells carry no time zone.
+    on_day = datetime.combine(today, datetime.min.time())
+    sheet.append([on_day, "CDA", "Lease Co Pvt Ltd", 9437033732, None, "XUV 3XO", young,
+                  datetime.combine(date(2026, 8, 11), datetime.min.time()), on_day, "FSC"])
+    out = io.BytesIO()
+    book.save(out)
+    s.acting["subject"] = s.reviewer
+    made = s.client.post(f"{s.base}/dms-dumps", data={"dealerId": str(s.journey.dealer_id)},
+                         files={"file": ("delivery.xlsx", out.getvalue(),
+                                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+    assert made.status_code == 201, made.text
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        row = connection.execute(text(
+            "SELECT booking_date, deal_type, deal_type_basis FROM auditcore.p2_dms_dump_rows WHERE dump_id = :d"),
+            {"d": made.json()["dumpId"]}).mappings().one()
+    assert row["booking_date"] == date(2026, 8, 11)
+    assert row["deal_type"] == "OUTSCOPE" and row["deal_type_basis"].startswith("Booking date as on the delivery sheet")
+
+
 def test_out_of_scope_models_are_named() -> None:
     assert dumps.out_of_scope_model("TREO PLUS") == "TREO PLUS"
     assert dumps.out_of_scope_model("Treo Plus Hiload") == "TREO PLUS"
