@@ -26,6 +26,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core import job_reads
 from audit_core.logging_config import release_version
 from audit_core.uc03_deal_source_history import active_source_rows
 from audit_core.uc03_deal_source_policy import (
@@ -2100,8 +2101,10 @@ def _commercial_lines(connection: Connection, params: dict[str, Any]) -> list[An
 
 
 def _discount_applications(connection: Connection, params: dict[str, Any]) -> list[Any]:
-    return connection.execute(
-        text(
+    # The Deal is built several times in one worker job: read once per job (audit_core.job_reads).
+    return job_reads.rows(
+        connection,
+        (
             """
             SELECT da.discount_key, da.standard_eligible_amount, da.actual_discount_amount,
                    da.eligibility_result, da.evidence_status, da.actual_source_kind, da.discount_scheme_version_id,
@@ -2138,12 +2141,13 @@ def _discount_applications(connection: Connection, params: dict[str, Any]) -> li
             """
         ),
         params,
-    ).mappings().all()
+    )
 
 
 def _deal_sku(connection: Connection, params: dict[str, Any]) -> Any:
-    return connection.execute(
-        text(
+    found = job_reads.rows(
+        connection,
+        (
             """
             SELECT pl.price_list_name, plv.version_no, plv.effective_from,
                    jp.model_name_snapshot AS model, jp.variant_name_snapshot AS variant,
@@ -2163,7 +2167,8 @@ def _deal_sku(connection: Connection, params: dict[str, Any]) -> Any:
             """
         ),
         params,
-    ).mappings().first()
+    )
+    return found[0] if found else None
 
 
 def _standard_unavailable(price_plan: dict[str, Any] | None) -> Any:
@@ -2181,8 +2186,9 @@ def _proof_on_file(connection: Connection, params: dict[str, Any]) -> set[str]:
     from audit_core.uc03_vehicle_rc import new_vehicle_rc_sql
 
     return {
-        str(r[0]) for r in connection.execute(
-            text(
+        str(r["document_type_key"]) for r in job_reads.rows(
+            connection,
+            (
                 """
                 SELECT DISTINCT e.document_type_key FROM auditcore.evidence e
                 WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='ACTIVE'
@@ -2192,7 +2198,7 @@ def _proof_on_file(connection: Connection, params: dict[str, Any]) -> set[str]:
                 """
             ),
             params,
-        ).all()
+        )
     }
 
 
@@ -3808,9 +3814,10 @@ def _document_facts(
 ) -> list[dict[str, Any]]:
     """Every ACTIVE document of the given types, newest first, with its
     fields as the PC left them (corrected values win over extracted ones)."""
-    rows = connection.execute(
-        text(
-            """
+    # Asked for many times in one worker job: answered once per job (audit_core.job_reads).
+    rows = job_reads.rows(
+        connection,
+        """
             SELECT e.di_document_id, e.document_type_key, e.linked_at_utc, f.field_key, f.effective_value
             FROM auditcore.evidence e
             JOIN auditcore.journey_document_extracted_fields f
@@ -3818,10 +3825,9 @@ def _document_facts(
             WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='ACTIVE'
               AND e.document_type_key = ANY(:types)
             ORDER BY e.linked_at_utc DESC, e.di_document_id, f.field_key
-            """
-        ),
+            """,
         {"t": tenant_id, "j": journey_id, "types": list(di_types)},
-    ).mappings().all()
+    )
     documents: dict[str, dict[str, Any]] = {}
     for row in rows:
         doc = documents.setdefault(str(row["di_document_id"]), {

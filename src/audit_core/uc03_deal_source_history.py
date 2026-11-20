@@ -38,6 +38,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core import job_reads
 from audit_core.uc03_deal_source_policy import invoice_withheld
 
 LineKind = str  # "COMMERCIAL" | "DISCOUNT"
@@ -83,6 +84,12 @@ def record_source_value(
     # invoice records nothing in the Deal (the document stays on file).
     if invoice_withheld(connection, tenant_id=tenant_id, document_type=source_document_type):
         return
+    component_key = component_key.strip().lower()
+    source_document_type = normalise_document_type(source_document_type)
+    if _already_on_file(connection, tenant_id=tenant_id, journey_id=journey_id, line_kind=line_kind,
+                        component_key=component_key, source_document_type=source_document_type,
+                        amount=amount, evidence_id=evidence_id, document_id=document_id):
+        return
     connection.execute(
         text(
             f"""
@@ -108,13 +115,55 @@ def record_source_value(
             "tenant_id": tenant_id,
             "journey_id": journey_id,
             "line_kind": line_kind,
-            "component_key": component_key.strip().lower(),
-            "source_document_type": normalise_document_type(source_document_type),
+            "component_key": component_key,
+            "source_document_type": source_document_type,
             "amount": amount,
             "evidence_id": evidence_id,
             "document_id": document_id,
         },
     )
+
+
+def _already_on_file(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, line_kind: str, component_key: str,
+    source_document_type: str, amount: Decimal, evidence_id: UUID | None, document_id: UUID | None,
+) -> bool:
+    """Whether the row this value would be written to already says exactly this:
+    the same amount, the same evidence, not withdrawn. Writing it again changes
+    nothing (the statement above keeps ``updated_at_utc`` when the amount has not
+    moved), and that is what a recompute of an unchanged Journey did for every
+    figure of every document: 235,000 such writes a day on a table of 34,000
+    rows (live, 16-20 Nov 2026).
+
+    Looked up only inside a worker job, where the Journey's rows are read once
+    and held until the job next writes (audit_core.job_reads); elsewhere the
+    write goes out as it always did."""
+    if not job_reads.active(connection):
+        return False
+    try:
+        amount = Decimal(amount)
+    except (ArithmeticError, TypeError, ValueError):
+        return False
+    wanted = (line_kind, component_key, source_document_type, str(document_id or _NO_DOCUMENT))
+    for row in job_reads.rows(
+        connection,
+        """
+        SELECT line_kind, component_key, source_document_type, source_document_id, amount,
+               source_evidence_id, withdrawn_at_utc
+        FROM auditcore.commercial_line_source_values
+        WHERE tenant_id=:tenant_id AND journey_id=:journey_id
+        """,
+        {"tenant_id": tenant_id, "journey_id": journey_id},
+    ):
+        if (str(row["line_kind"]), str(row["component_key"]), str(row["source_document_type"]),
+                str(row["source_document_id"] or _NO_DOCUMENT)) != wanted:
+            continue
+        return (
+            row["withdrawn_at_utc"] is None
+            and row["amount"] is not None and Decimal(row["amount"]) == amount
+            and str(row["source_evidence_id"] or "") == str(evidence_id or "")
+        )
+    return False
 
 
 # A source row counts while its document is on file: no evidence row at all
@@ -261,8 +310,10 @@ def active_source_rows(connection: Connection, *, tenant_id: str, journey_id: UU
     re-processed last. Two spellings of one type on one document (rows
     written before migration 0153) are one source: the newest row stands,
     so a stale spelling never wins (review S6)."""
-    rows = connection.execute(
-        text(
+    # Asked for on every build of the Deal: read once per worker job (audit_core.job_reads).
+    return job_reads.rows(
+        connection,
+        (
             f"""
             SELECT line_kind, component_key, source_document_type, amount, source_document_id, source_evidence_id
             FROM (
@@ -280,8 +331,7 @@ def active_source_rows(connection: Connection, *, tenant_id: str, journey_id: UU
             """
         ),
         {"tenant_id": tenant_id, "journey_id": journey_id},
-    ).mappings().all()
-    return [dict(row) for row in rows]
+    )
 
 
 def load_source_breakdown(

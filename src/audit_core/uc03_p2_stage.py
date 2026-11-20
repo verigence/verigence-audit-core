@@ -28,6 +28,7 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core import job_reads
 from audit_core.uc03_booking_confirmation_rules import _minimum_booking_amount
 from audit_core.uc03_customer_ledger import LEDGER_DI_TYPE, PAYMENT_LEDGER_NAME
 from audit_core.uc03_deal_source_policy import (
@@ -91,9 +92,11 @@ def ready_document_count(
     # each template counts only its own.
     ledger = "" if not _shares_ledger_type(template) else (
         "AND " + ("" if template.key == PAYMENT_LEDGER_TEMPLATE else "NOT ") + payment_ledger_sql("e"))
+    # Asked once per requirement on every recompute: answered once per job (audit_core.job_reads).
     return int(
-        connection.execute(
-            text(
+        job_reads.scalar(
+            connection,
+            (
                 """
                 SELECT COUNT(DISTINCT e.di_document_id)
                 FROM auditcore.evidence e
@@ -119,7 +122,7 @@ def ready_document_count(
                 "journey_id": journey_id,
                 "document_types": _evidence_types(template),
             },
-        ).scalar_one()
+        )
         or 0
     )
 

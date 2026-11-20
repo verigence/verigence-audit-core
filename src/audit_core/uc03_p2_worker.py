@@ -50,7 +50,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError
 from sqlalchemy import Connection, Engine, text
 
-from audit_core import job_schedule, sleep_window
+from audit_core import job_reads, job_schedule, sleep_window
 from audit_core import uc03_p2_runtime as _runtime
 from audit_core.config import SettingsError, load_settings
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
@@ -4966,8 +4966,11 @@ def _process_in_context(engine: Engine, work: WorkItem) -> None:
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(**_work_fields(work))
     try:
+        # What the job reads of its Journey it reads once (audit_core.job_reads,
+        # 2026-11-20): held only until its transaction next writes.
+        job_reads.install(engine)
         # A deadlock inside a step fails the item, which is retried (uc03_db_transient).
-        with work_item_scope():
+        with work_item_scope(), job_reads.job():
             process_work(engine, work)
     finally:
         structlog.contextvars.clear_contextvars()

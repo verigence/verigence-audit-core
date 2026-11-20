@@ -40,6 +40,7 @@ from uuid import UUID
 from fastapi import APIRouter, Body, Depends, HTTPException
 from sqlalchemy import Connection, text
 
+from audit_core import job_reads
 from audit_core.dependencies import get_connection, get_human_principal
 from audit_core.security import HumanPrincipal
 from audit_core.security_authorization import (
@@ -107,12 +108,24 @@ def off_result(connection: Connection, tenant_id: str, code: str | None) -> dict
     while the kind is on."""
     if not code:
         return None
-    row = connection.execute(
-        text("SELECT enabled, reason, changed_by_name, changed_at_utc FROM auditcore.p2_task_switches "
-             "WHERE tenant_id=:t AND source_code=:c"),
-        {"t": tenant_id, "c": code},
-    ).mappings().one_or_none()
-    row = dict(row) if row is not None else None
+    if job_reads.active(connection):
+        # Asked for every check of every worker job: inside a job the Project's
+        # switches are read once, all of them, and looked up here (audit_core.job_reads).
+        row = next((dict(r) for r in job_reads.rows(
+            connection,
+            "SELECT source_code, enabled, reason, changed_by_name, changed_at_utc "
+            "FROM auditcore.p2_task_switches WHERE tenant_id=:t",
+            {"t": tenant_id},
+        ) if r["source_code"] == code), None)
+        if row is not None:
+            del row["source_code"]
+    else:
+        row = job_reads.one(
+            connection,
+            "SELECT enabled, reason, changed_by_name, changed_at_utc FROM auditcore.p2_task_switches "
+            "WHERE tenant_id=:t AND source_code=:c",
+            {"t": tenant_id, "c": code},
+        )
     if _is_on(code, row):
         return None
     if row is None:

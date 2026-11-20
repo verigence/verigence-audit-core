@@ -201,3 +201,36 @@ def test_only_project_administration_lists_and_changes_the_switches(journey, api
     assert done.status_code == 200 and done.json()["tasksClosed"] == 1
     after = {i["code"]: i for i in api.client.get(api.base).json()["items"]}[CODE]
     assert (after["enabled"], after["open"], after["reason"]) == (False, 0, "Not relevant now")
+
+
+# ── inside a worker job the Project's switches are read once (2026-11-20, hosting cost) ──
+def test_inside_a_worker_job_the_switches_are_read_once_and_say_the_same(journey):
+    from sqlalchemy import event
+
+    from audit_core import job_reads
+    from audit_core.uc03_task_switches import off_result
+
+    _switch(journey, False, reason="Not relevant for now")
+    codes = [CODE, "ACCESSORIES_FITTED_UNCONFIRMED", "DUPLICATE_RECEIPT", None]
+
+    def answers(connection):
+        return [off_result(connection, journey.tenant_id, code) for code in codes]
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        plain = answers(connection)
+    assert [bool(a) for a in plain] == [True, True, False, False]
+    assert "Amit Admin" in plain[0]["reason"] and "Not relevant for now" in plain[0]["reason"]
+
+    seen: list[str] = []
+    event.listen(journey.engine, "before_cursor_execute", lambda c, cur, s, p, ctx, m: seen.append(s))
+    job_reads.install(journey.engine)
+    with job_reads.job(), journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert answers(connection) == plain
+        assert answers(connection) == plain
+        assert sum("FROM auditcore.p2_task_switches" in s for s in seen) == 1
+        # Switched back on inside the job: the job's own write is seen at once.
+        set_switch(connection, tenant_id=journey.tenant_id, code=CODE, enabled=True, reason="Back on",
+                   actor_id="admin-1", actor_name="Amit Admin")
+        assert off_result(connection, journey.tenant_id, CODE) is None
