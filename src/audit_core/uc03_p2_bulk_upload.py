@@ -752,6 +752,49 @@ def _folder_numbers(connection: Connection, tenant_id: str, journey_id: UUID) ->
     ).scalars().all() if (code := normalize_booking_reference(raw)))
 
 
+BULK_JOIN_KIND = "BULK_JOIN"
+_JOIN_REASON = "Bulk upload: read and joined to the customer's booking "
+# Removing the read journey after its pages were carried is tried again at each settle; after
+# this many failed tries the files are recorded on the booking anyway (their pages are there).
+_JOIN_DELETE_TRIES = 5
+
+
+def _earlier_join(connection: Connection, tenant_id: str, journey_id: UUID) -> dict[str, Any] | None:
+    """The join a settle already started for this read journey -- its pages carried to the
+    customer's booking, then the read journey's deletion begun -- with the booking it went to
+    (``kept_journey_id``; for joins recorded before 2026-11-20, found from the reason's
+    reference), whether the journey is gone, and how many deletion tries failed."""
+    rows = connection.execute(
+        text(
+            """
+            SELECT deletion_status, kept_journey_id, kept_journey_reference, reason
+            FROM auditcore.p2_journey_deletions
+            WHERE tenant_id=:t AND journey_id=:j AND deleted_by_role='SYSTEM' AND reason LIKE :like
+            ORDER BY requested_at_utc DESC
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "like": _JOIN_REASON + "%"},
+    ).mappings().all()
+    if not rows:
+        return None
+    kept_id = next((r["kept_journey_id"] for r in rows if r["kept_journey_id"]), None)
+    kept_ref = next((r["kept_journey_reference"] for r in rows if r["kept_journey_reference"]), None)
+    if kept_ref is None:
+        kept_ref = rows[0]["reason"][len(_JOIN_REASON):].split()[0].rstrip(".,;:") or None
+    if kept_id is None and kept_ref:
+        kept_id = connection.execute(
+            text("SELECT journey_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_reference=:r"),
+            {"t": tenant_id, "r": kept_ref},
+        ).scalar_one_or_none()
+    gone = connection.execute(
+        text("SELECT NOT EXISTS (SELECT 1 FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j)"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
+    return {"kept_journey_id": kept_id, "kept_reference": kept_ref,
+            "gone": bool(gone) or any(r["deletion_status"] == "COMPLETED" for r in rows),
+            "failed": sum(1 for r in rows if r["deletion_status"] == "FAILED")}
+
+
 def run_bulk_settle(engine: Engine, tag: str, tenant_ids: list[str] | None = None) -> dict[str, Any]:
     """BULK_SETTLE: each journey of the drop that has finished reading joins the customer's
     booking (its new pages carried, the journey deleted) or stays as the new booking."""
@@ -776,7 +819,50 @@ def run_bulk_settle(engine: Engine, tag: str, tenant_ids: list[str] | None = Non
                  "AND outcome='READING' AND journey_id IS NOT NULL"), {"t": tenant_id, "b": bulk_id},
         ).scalars().all()]
     settled: dict[str, int] = {}
+    files_sql = ("UPDATE auditcore.p2_bulk_files SET outcome=:o, placed_journey_id=:p, placed_reference=:r, "
+                 "detail=:d, updated_at_utc=now() WHERE tenant_id=:t AND journey_id=:j AND outcome='READING'")
+
+    def record(journey_id: UUID, outcome: str, placed: Any, ref: Any, detail: str) -> None:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            connection.execute(text(files_sql), {"o": outcome, "p": placed, "r": ref, "d": detail[:500],
+                                                 "t": tenant_id, "j": journey_id})
+        settled[outcome] = settled.get(outcome, 0) + 1
+        logger.info("p2_bulk_journey_settled", tenant_id=tenant_id, bulk_id=str(bulk_id), journey_id=str(journey_id),
+                    outcome=outcome, target=str(placed))
+
+    def remove_read_journey(journey_id: UUID, target_id: Any, target_ref: Any) -> None:
+        system_delete_journey(
+            engine, tenant_id=tenant_id, journey_id=journey_id, reason=f"{_JOIN_REASON}{target_ref}",
+            correlation_id=f"p2-bulk-settle:{journey_id}", security_client=get_security_oauth_client(),
+            v2_client=get_di_capture_v2_client(), storage=get_p2_document_storage(),
+            record_details=lambda _c: {"deletion_kind": BULK_JOIN_KIND, "kept_journey_id": target_id,
+                                       "kept_journey_reference": target_ref},
+        )
+
     for journey_id in journeys:
+        # A join an earlier settle started (a worker restart, or the read journey's deletion
+        # failing part way after its pages were carried): its pages are on the customer's
+        # booking -- recorded there, the deletion finished first if it was not. Never recorded
+        # on the deleted journey (19 Nov review: 9 files said "kept for review" on journeys
+        # already gone, and the Drive folders learnt those journeys).
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            joined = _earlier_join(connection, tenant_id, journey_id)
+        if joined is not None and joined["kept_journey_id"] is not None:
+            target_id, target_ref = joined["kept_journey_id"], joined["kept_reference"]
+            if not joined["gone"]:
+                try:
+                    remove_read_journey(journey_id, target_id, target_ref)
+                except Exception:
+                    logger.warning("p2_bulk_join_delete_failed", tenant_id=tenant_id, journey_id=str(journey_id),
+                                   exc_info=True)
+                    if joined["failed"] + 1 < _JOIN_DELETE_TRIES:
+                        continue  # tried again at the next settle
+            record(journey_id, "ADDED_TO_BOOKING", target_id, target_ref,
+                   f"Added to {target_ref}: its pages were carried there"
+                   + ("" if joined["gone"] else " (the read journey could not be removed)"))
+            continue
         with engine.begin() as connection:
             set_tenant_context(connection, tenant_id)
             if _still_reading(connection, tenant_id, journey_id):
@@ -793,8 +879,6 @@ def run_bulk_settle(engine: Engine, tag: str, tenant_ids: list[str] | None = Non
                     booking_identified(me, target)
                     or _folder_numbers(connection, tenant_id, journey_id) & target.booking_refs):
                 unsure = "no booking reference number (OTF) in common"
-        files_sql = ("UPDATE auditcore.p2_bulk_files SET outcome=:o, placed_journey_id=:p, placed_reference=:r, "
-                     "detail=:d, updated_at_utc=now() WHERE tenant_id=:t AND journey_id=:j AND outcome='READING'")
         if target is None or me is None:
             outcome, placed, ref = "NEW_BOOKING", journey_id, me.reference if me else None
             detail = "No open booking of this customer at the outlet: a new booking"
@@ -805,26 +889,24 @@ def run_bulk_settle(engine: Engine, tag: str, tenant_ids: list[str] | None = Non
             try:
                 carried = carry_documents(engine, tenant_id=tenant_id, new_journey_id=journey_id,
                                           existing_journey_id=target.journey_id)
-                system_delete_journey(
-                    engine, tenant_id=tenant_id, journey_id=journey_id,
-                    reason=f"Bulk upload: read and joined to the customer's booking {target.reference}",
-                    correlation_id=f"p2-bulk-settle:{journey_id}", security_client=get_security_oauth_client(),
-                    v2_client=get_di_capture_v2_client(), storage=get_p2_document_storage(),
-                )
-                outcome, placed, ref = "ADDED_TO_BOOKING", target.journey_id, target.reference
-                detail = (f"Added to {target.reference}: {', '.join(carried).replace('_', ' ')}" if carried
-                          else f"Nothing new for {target.reference}: every page was already on it")
-            except Exception as exc:  # kept, never half-done: the journey and its pages stay
+            except Exception as exc:  # nothing carried: the read journey and its pages stay
                 logger.warning("p2_bulk_join_failed", tenant_id=tenant_id, journey_id=str(journey_id), exc_info=True)
                 outcome, placed, ref = "KEPT_FOR_REVIEW", journey_id, me.reference
                 detail = f"Kept for review next to {target.reference}: it could not be joined ({type(exc).__name__})"
-        with engine.begin() as connection:
-            set_tenant_context(connection, tenant_id)
-            connection.execute(text(files_sql), {"o": outcome, "p": placed, "r": ref, "d": detail[:500],
-                                                 "t": tenant_id, "j": journey_id})
-        settled[outcome] = settled.get(outcome, 0) + 1
-        logger.info("p2_bulk_journey_settled", tenant_id=tenant_id, bulk_id=str(bulk_id), journey_id=str(journey_id),
-                    outcome=outcome, target=str(placed))
+            else:
+                # The pages are on the booking now. Removing the read journey can fail part way
+                # (Document Intelligence, R2): the files then stay READING, and the next settle
+                # finishes the removal and records them on the booking (_earlier_join).
+                try:
+                    remove_read_journey(journey_id, target.journey_id, target.reference)
+                except Exception:
+                    logger.warning("p2_bulk_join_delete_failed", tenant_id=tenant_id, journey_id=str(journey_id),
+                                   exc_info=True)
+                    continue
+                outcome, placed, ref = "ADDED_TO_BOOKING", target.journey_id, target.reference
+                detail = (f"Added to {target.reference}: {', '.join(carried).replace('_', ' ')}" if carried
+                          else f"Nothing new for {target.reference}: every page was already on it")
+        record(journey_id, outcome, placed, ref, detail)
     done = _finish_if_settled(engine, tenant_id, bulk_id)
     if not done:
         # Some journeys are still being read: settled again shortly (a job is polled each minute).

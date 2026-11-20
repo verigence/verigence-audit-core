@@ -862,3 +862,47 @@ def test_the_clock_submits_a_bulk_left_by_a_run_that_never_started_again(s):
     assert _rows(s, "SELECT 1 FROM auditcore.p2_worker_jobs WHERE job_kind='BULK_UPLOAD' AND status='PENDING' "
                     "AND tag=:tag", tag=f"{s.t}:{bulk['bulk_id']}")
     assert drive.submit_left_behind(s.engine, s.t) == 0  # once only
+
+
+def test_a_file_in_the_photos_folder_of_a_folder_with_no_documents_is_read_the_next_day(s):
+    """16 Nov 2026: a booking PDF put in Photos_other_docs, with nothing in Documents, waited
+    for good. Every file in Drive is read: past its day it goes as a document."""
+    outlet = _tree(s)
+    customer = s.fake.folder("Ayush-13516133", outlet)
+    s.fake.put("Ayush Booking.pdf", s.fake.folder("Photos_other_docs", customer), b"%PDF ayush", "application/pdf")
+    other = s.fake.folder("Ravi-555", outlet)
+    s.fake.put("docket.pdf", other, b"%PDF ravi")
+    s.fake.put("car.jpg", s.fake.folder("Photos_other_docs", other), b"jpeg ravi", "image/jpeg")
+    run = _run(s)
+    assert run["documents"] == 1 and run["photosWaiting"] == 2
+    assert drive.read_lonely_photos(s.engine, s.t) == 0  # the same day: it still waits
+    _exec(s, "UPDATE auditcore.p2_drive_files SET seen_at_utc=now() - interval '1 day' WHERE tenant_id=:t")
+    run = _run(s)
+    assert run["documents"] == 1
+    files = _files(s)
+    assert files["Ayush Booking.pdf"]["lane"] == "DOCUMENT" and files["Ayush Booking.pdf"]["file_status"] == "TAKEN"
+    # A photo of a customer whose documents are in Drive keeps waiting for their journey.
+    assert files["car.jpg"]["lane"] == "PHOTO"
+    [bulk_file] = [f for f in _bulk_files(s) if f["original_filename"] == "Ayush Booking.pdf"]
+    assert bulk_file["booking_number"] == "13516133"
+
+
+def test_a_folder_whose_journey_was_joined_to_the_customers_booking_follows_it(s):
+    """20 Nov 2026: Sabita Sahoo's and Sarat Chandra Mohanty's photos waited for good -- their
+    folders knew the journey read for them, which was joined to their booking and deleted."""
+    outlet = _tree(s)
+    customer = s.fake.folder("Sabita-13475852", outlet)
+    s.fake.put("photo.jpg", s.fake.folder("Photos_other_docs", customer), b"jpeg sabita", "image/jpeg")
+    _sync(s)
+    gone = uuid4()
+    _exec(s, "UPDATE auditcore.p2_drive_folders SET journey_id=:g WHERE tenant_id=:t AND drive_folder_id=:f",
+          g=gone, f=customer)
+    _exec(s, "INSERT INTO auditcore.p2_journey_deletions (tenant_id, journey_id, reason, deleted_by_actor_id, "
+             "deleted_by_role, deletion_status, deletion_kind, kept_journey_id) VALUES (:t, :g, "
+             "'Bulk upload: read and joined to the customer''s booking X', 'system', 'SYSTEM', 'COMPLETED', "
+             "'BULK_JOIN', :k)", g=gone, k=s.journey.journey_id)
+    run = _run(s)
+    assert run["photos"] == 1 and run["photosWaiting"] == 0
+    [folder] = _rows(s, "SELECT * FROM auditcore.p2_drive_folders WHERE tenant_id=:t AND drive_folder_id=:f", f=customer)
+    assert folder["journey_id"] == s.journey.journey_id
+    assert _files(s)["photo.jpg"]["journey_id"] == s.journey.journey_id

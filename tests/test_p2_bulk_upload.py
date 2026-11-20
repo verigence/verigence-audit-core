@@ -343,3 +343,75 @@ def test_a_drop_cut_short_by_a_restart_runs_again_cleanly(s):
     again = {f["original_filename"]: f for f in _files(s, bulk_id)}
     assert {f["outcome"] for f in again.values()} == {"READING"}
     assert all(again[n]["journey_id"] == first[n]["journey_id"] for n in again)
+
+
+def _joinable_drop(s) -> tuple[str, dict]:
+    """A delivery file read on its own journey, the customer's booking (same OTF) waiting."""
+    booking = s.journey
+    _identity(booking, otf="B-13324474")
+    shared = uuid4().hex
+    _read(s, booking.journey_id, shas=[shared], kinds=["pan_card"])
+    bulk_id = _drop(s, {"Asha Das delivery.pdf": b"%PDF delivery file"})
+    _run_upload(s, bulk_id)
+    [file] = _files(s, bulk_id)
+    read_on = _read(s, file["journey_id"], shas=[shared, uuid4().hex], kinds=["pan_card", "tax_invoice_tally"])
+    _identity(read_on, otf="B-13324474")
+    return bulk_id, file
+
+
+def test_a_join_whose_read_journey_could_not_be_removed_is_finished_and_recorded_on_the_booking(s, monkeypatch):
+    """17 Nov 2026 (Sabita Sahoo, Sarat Chandra Mohanty): the pages were carried to the booking,
+    removing the read journey failed part way, and the files were recorded "kept for review" on
+    a journey that was then gone. The pages are on the booking: the files stay READING, the next
+    settle finishes the removal and records them there."""
+    from audit_core import uc03_p2_journey_delete
+
+    bulk_id, file = _joinable_drop(s)
+    real = uc03_p2_journey_delete.system_delete_journey
+    calls = []
+
+    def failing(*args, **kwargs):
+        calls.append(kwargs["journey_id"])
+        if len(calls) == 1:
+            raise uc03_p2_journey_delete.DependencyUnavailableError("Document Intelligence did not answer")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(uc03_p2_journey_delete, "system_delete_journey", failing)
+    first = _settle(s, bulk_id)
+    assert first["settled"] == {} and not first["done"]
+    [still] = _files(s, bulk_id)
+    assert still["outcome"] == "READING"
+    second = _settle(s, bulk_id)
+    assert second["settled"] == {"ADDED_TO_BOOKING": 1} and second["done"]
+    [file] = _files(s, bulk_id)
+    assert file["outcome"] == "ADDED_TO_BOOKING" and file["placed_journey_id"] == s.journey.journey_id
+    assert not _exists(s, file["journey_id"])
+    with s.journey.engine.begin() as c:
+        set_tenant_context(c, s.journey.tenant_id)
+        row = c.execute(text("SELECT deletion_kind, kept_journey_id FROM auditcore.p2_journey_deletions "
+                             "WHERE tenant_id=:t AND journey_id=:j AND deletion_status='COMPLETED'"),
+                        {"t": s.journey.tenant_id, "j": file["journey_id"]}).mappings().one()
+    assert row["deletion_kind"] == "BULK_JOIN" and row["kept_journey_id"] == s.journey.journey_id
+
+
+def test_a_join_finished_before_a_restart_is_recorded_on_the_booking_not_the_deleted_journey(s):
+    """The worker stopped after the read journey was deleted but before its files were marked
+    (or a join recorded before 20 Nov, with only the booking's reference in its reason)."""
+    from audit_core import uc03_p2_journey_delete, uc03_p2_storage, uc03_p2_worker
+
+    bulk_id, file = _joinable_drop(s)
+    with s.journey.engine.begin() as c:
+        set_tenant_context(c, s.journey.tenant_id)
+        ref = c.execute(text("SELECT journey_reference FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+                        {"t": s.journey.tenant_id, "j": s.journey.journey_id}).scalar_one()
+    uc03_p2_journey_delete.system_delete_journey(
+        s.journey.engine, tenant_id=s.journey.tenant_id, journey_id=file["journey_id"],
+        reason=f"Bulk upload: read and joined to the customer's booking {ref}", correlation_id="t",
+        security_client=uc03_p2_worker.get_security_oauth_client(), v2_client=uc03_p2_worker.get_di_capture_v2_client(),
+        storage=uc03_p2_storage.get_p2_document_storage(),
+    )
+    result = _settle(s, bulk_id)
+    assert result["settled"] == {"ADDED_TO_BOOKING": 1} and result["done"]
+    [file] = _files(s, bulk_id)
+    assert file["outcome"] == "ADDED_TO_BOOKING" and file["placed_journey_id"] == s.journey.journey_id
+    assert file["placed_reference"] == ref
