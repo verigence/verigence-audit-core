@@ -57,6 +57,7 @@ from uuid import UUID
 import structlog
 from sqlalchemy import Connection, text
 
+from audit_core import job_reads
 from audit_core.uc03_deal_source_policy import (
     ACCOUNT_STATEMENT_TYPE,
     INVOICE_SOURCE_TYPES,
@@ -1660,9 +1661,10 @@ def load_ledger_documents(
 ) -> list[dict[str, Any]]:
     """Every ACTIVE document of this type (the customer ledger unless told
     otherwise) of the Journey, newest first, with its fields as the PC left them."""
-    rows = connection.execute(
-        text(
-            """
+    # Asked for many times in one worker job: answered once per job (audit_core.job_reads).
+    rows = job_reads.rows(
+        connection,
+        """
             SELECT e.evidence_id, e.di_document_id, e.linked_at_utc, f.field_key, f.effective_value
             FROM auditcore.evidence e
             JOIN auditcore.journey_document_extracted_fields f
@@ -1670,10 +1672,9 @@ def load_ledger_documents(
             WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='ACTIVE'
               AND e.document_type_key = :type
             ORDER BY e.linked_at_utc DESC, e.di_document_id, f.field_key, f.source_fact_version
-            """
-        ),
+            """,
         {"t": tenant_id, "j": journey_id, "type": document_type},
-    ).mappings().all()
+    )
     documents: dict[str, dict[str, Any]] = {}
     for row in rows:
         doc = documents.setdefault(str(row["di_document_id"]), {

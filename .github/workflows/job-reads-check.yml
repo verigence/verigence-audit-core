@@ -1,0 +1,152 @@
+name: Worker jobs check (copy of the live database)
+
+# What a change to how the P2 worker reads moves on real bookings and how many
+# statements it saves (product owner 2026-11-20, hosting cost). The base code and
+# the change each run the worker's own jobs -- rebuild the booking, run every
+# check -- on its own copy of the live database (two Neon branches taken at the
+# same point), and every row the two runs left behind is compared.
+#
+# Never the live database: each side swaps the live endpoint in the database
+# address for its copy's, refuses to continue if the live endpoint is still in
+# it, and tools/job_reads_check.py refuses a database without the marker table
+# that exists on the copies only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Code to compare against
+        default: dev
+        required: false
+      base_endpoint:
+        description: Neon endpoint id of the copy the base code runs on
+        required: true
+      head_endpoint:
+        description: Neon endpoint id of the copy this change runs on
+        required: true
+      journeys:
+        description: How many bookings
+        default: '40'
+        required: false
+  push:
+    branches: ['perf/p2-job-reads']
+    paths:
+      - '.github/workflows/job-reads-check.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: job-reads-check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The copies made on 21 Nov 2026 for the first run (branches job-reads-check-*).
+  DEFAULT_BASE_ENDPOINT: ep-summer-voice-ay7bnk70
+  DEFAULT_HEAD_ENDPOINT: ep-lingering-wave-ayy0wkxg
+  LIVE_ENDPOINT: ep-royal-pond-ayci3m0f
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [base, head]
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      # The live Project (Mahindra Orissa).
+      JOBCHECK_TENANT: afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
+      APP_ENV: ci
+      # No night's sleep, no outside service: the jobs run on the copy alone.
+      VERIGENCE_SLEEP_WINDOW_IST: 'off'
+    steps:
+      - name: Check out this change
+        uses: actions/checkout@v4
+        with:
+          path: head
+      - name: Check out the base
+        if: ${{ matrix.side == 'base' }}
+        uses: actions/checkout@v4
+        with:
+          path: base
+          ref: ${{ inputs.base_ref || 'dev' }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install the code to run
+        run: |
+          python -m pip install "./${{ matrix.side }}" 'psycopg[binary]>=3.2,<4'
+          npm install --global @railway/cli@5.70.0
+      - name: Reach this side's copy (never the live database)
+        shell: bash
+        env:
+          COPY_ENDPOINT: ${{ matrix.side == 'base' && (inputs.base_endpoint || env.DEFAULT_BASE_ENDPOINT) || (inputs.head_endpoint || env.DEFAULT_HEAD_ENDPOINT) }}
+        run: |
+          set -euo pipefail
+          test -n "${RAILWAY_API_TOKEN:-}"
+          test -n "$COPY_ENDPOINT" && test "$COPY_ENDPOINT" != "$LIVE_ENDPOINT"
+          cd head
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/vars.json
+          url="$(python - <<'PY'
+          import json, os
+          from urllib.parse import urlparse
+          v = json.load(open('/tmp/vars.json'))
+          live, copy = os.environ['LIVE_ENDPOINT'], os.environ['COPY_ENDPOINT']
+          for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
+              value = (v.get(key) or '').replace('postgresql+psycopg://', 'postgresql://', 1)
+              host = (urlparse(value).hostname or '').lower()
+              if value and live in host:
+                  swapped = value.replace(live, copy)
+                  assert live not in swapped and copy in (urlparse(swapped).hostname or '')
+                  print(swapped)
+                  break
+          PY
+          )"
+          rm -f /tmp/vars.json
+          test -n "$url"
+          echo "::add-mask::$url"
+          case "$url" in *"$LIVE_ENDPOINT"*) echo "The live endpoint is still in the address"; exit 1;; esac
+          echo "JOBCHECK_DATABASE_URL=$url" >> "$GITHUB_ENV"
+      # Both copies hold the same rows, so both sides pick the same bookings.
+      - name: Pick the bookings
+        run: python head/tools/job_reads_check.py pick --tenant "$JOBCHECK_TENANT" --out /tmp/journeys.json --n "${{ inputs.journeys || '40' }}"
+      - name: Run the worker's jobs
+        run: python head/tools/job_reads_check.py run --tenant "$JOBCHECK_TENANT" --journeys /tmp/journeys.json --out "/tmp/${{ matrix.side }}.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jobs-${{ matrix.side }}
+          path: |
+            /tmp/${{ matrix.side }}.json
+            /tmp/journeys.json
+          retention-days: 7
+
+  compare:
+    needs: run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out this change
+        uses: actions/checkout@v4
+        with:
+          path: head
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/jobs
+      - name: Compare
+        run: |
+          cmp /tmp/jobs/jobs-base/journeys.json /tmp/jobs/jobs-head/journeys.json
+          python head/tools/job_reads_check.py diff /tmp/jobs/jobs-base/base.json /tmp/jobs/jobs-head/head.json --out /tmp/report.md
+          cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jobs-report
+          path: /tmp/report.md
+          retention-days: 30

@@ -50,7 +50,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError
 from sqlalchemy import Connection, Engine, text
 
-from audit_core import job_schedule, sleep_window
+from audit_core import job_reads, job_schedule, sleep_window
 from audit_core import uc03_p2_runtime as _runtime
 from audit_core.config import SettingsError, load_settings
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
@@ -420,10 +420,34 @@ _CLAIM_SQL = text(
 )
 
 
+# Whether anything of the Project could be claimed at all: the rows _CLAIM_SQL's
+# ``ready`` starts from, before its deletion hold and its ordering. Asked first
+# (2026-11-20, hosting cost): the two workers asked the full claim of every
+# Project every second and nine times in ten there was nothing waiting -- 4 KB of
+# SQL each time, about 1.3 GB a day of billed traffic to Neon from polling alone.
+# Nothing waiting here means the claim would have returned nothing; anything
+# waiting and the claim runs exactly as before, in the same transaction.
+_WAITING_SQL = text(
+    """
+    SELECT EXISTS (
+        SELECT 1 FROM auditcore.p2_work_queue
+        WHERE tenant_id=:tenant_id
+          AND (
+            work_status IN ('PENDING','RETRY_WAIT')
+            OR (work_status IN ('CLAIMED','PROCESSING') AND lease_expires_at_utc <= now())
+          )
+          AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= now())
+    )
+    """
+)
+
+
 def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkItem]:
     claimed: list[WorkItem] = []
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
+        if not connection.execute(_WAITING_SQL, {"tenant_id": tenant_id}).scalar_one():
+            return claimed
         rows = connection.execute(
             _CLAIM_SQL,
             {"tenant_id": tenant_id, "limit": limit, "per_journey": _PER_JOURNEY_CONCURRENCY,
@@ -4966,8 +4990,11 @@ def _process_in_context(engine: Engine, work: WorkItem) -> None:
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(**_work_fields(work))
     try:
+        # What the job reads of its Journey it reads once (audit_core.job_reads,
+        # 2026-11-20): held only until its transaction next writes.
+        job_reads.install(engine)
         # A deadlock inside a step fails the item, which is retried (uc03_db_transient).
-        with work_item_scope():
+        with work_item_scope(), job_reads.job():
             process_work(engine, work)
     finally:
         structlog.contextvars.clear_contextvars()
