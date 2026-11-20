@@ -133,6 +133,9 @@ _LEAD_ROLES = frozenset({"TL", "PM", "EXECUTIVE", "EXEC", "REVIEWER"})
 DOCUMENT_TYPES = frozenset({"application/pdf", "image/jpeg", "image/png"})
 MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
 _STALE_CLAIM = timedelta(hours=2)
+# A Drive bulk upload that has had no file added for this long, and was never submitted, was
+# left by a run the worker was stopped in (a deploy, 19 Nov 2026: 34 of 45 files taken, never read).
+_ORPHAN_QUIET = timedelta(minutes=15)
 _NAME_NOISE = frozenset({"OTF", "BOOKING", "BKG", "NO", "NUMBER", "DELIVERY", "FILE", "FILES", "CUSTOMER", "MOBILE",
                          "MOB", "PH", "PHONE"})
 _PHOTO_FOLDER = re.compile(r"^\s*(photo|pic)", re.IGNORECASE)
@@ -1090,7 +1093,7 @@ def _group_key(file: dict[str, Any], folder: dict[str, Any] | None) -> str | Non
 def _take_documents(engine: Engine, tenant_id: str, run: dict[str, Any], client: DriveClient,
                     outlet: dict[str, Any], pc: dict[str, Any], files: list[dict[str, Any]]) -> dict[str, int]:
     """The outlet's waiting documents of one PC: a bulk upload, submitted for them."""
-    from audit_core.uc03_p2_bulk_upload import JOB_UPLOAD, bulk_folder, request_job
+    from audit_core.uc03_p2_bulk_upload import bulk_folder
     from audit_core.uc03_p2_storage import get_p2_document_storage
 
     storage = get_p2_document_storage()
@@ -1150,14 +1153,67 @@ def _take_documents(engine: Engine, tenant_id: str, run: dict[str, Any], client:
             _fail_file(engine, tenant_id, file, exc)
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
-        connection.execute(
-            text("UPDATE auditcore.p2_bulk_uploads SET status = CASE WHEN :n > 0 THEN status ELSE 'FAILED' END, "
-                 "file_count=:n, submitted_at_utc=now(), updated_at_utc=now() WHERE tenant_id=:t AND bulk_id=:b"),
-            {"n": out["taken"], "t": tenant_id, "b": bulk["bulk_id"]},
-        )
-        if out["taken"]:
-            request_job(connection, kind=JOB_UPLOAD, tenant_id=tenant_id, bulk_id=bulk["bulk_id"], by=SYSTEM_ACTOR)
+        submit_bulk(connection, tenant_id, bulk["bulk_id"])
     return out
+
+
+def submit_bulk(connection: Connection, tenant_id: str, bulk_id: Any) -> int | None:
+    """Submit a Drive bulk upload for reading: its file count is what was put into it (counted,
+    not carried in memory, so a run stopped half-way is submitted whole), and the reading job is
+    asked for. Once only: a bulk already submitted is left as it is (None)."""
+    from audit_core.uc03_p2_bulk_upload import JOB_UPLOAD, request_job
+
+    n = connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_bulk_uploads u
+               SET file_count = c.n, submitted_at_utc = now(), updated_at_utc = now(),
+                   status = CASE WHEN c.n > 0 THEN u.status ELSE 'FAILED' END
+              FROM (SELECT count(*) AS n FROM auditcore.p2_bulk_files
+                     WHERE tenant_id=:t AND bulk_id=:b) c
+             WHERE u.tenant_id=:t AND u.bulk_id=:b AND u.submitted_at_utc IS NULL
+            RETURNING c.n
+            """
+        ),
+        {"t": tenant_id, "b": bulk_id},
+    ).scalar_one_or_none()
+    if n:
+        request_job(connection, kind=JOB_UPLOAD, tenant_id=tenant_id, bulk_id=bulk_id, by=SYSTEM_ACTOR)
+    return n
+
+
+def submit_left_behind(engine: Engine, tenant_id: str, *, run_id: Any = None,
+                       quiet: timedelta = _ORPHAN_QUIET) -> int:
+    """Drive bulk uploads a stopped run took files into but never submitted, submitted now.
+    With ``run_id`` (the run starting again): its own, at once -- its earlier attempt is over.
+    Without (the clock): any whose last file went in more than ``quiet`` ago, so a run that
+    never starts again (closed by hand, failed) does not lose its files either."""
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        left = connection.execute(
+            text(
+                """
+                SELECT u.bulk_id FROM auditcore.p2_bulk_uploads u
+                WHERE u.tenant_id=:t AND u.source='DRIVE' AND u.submitted_at_utc IS NULL
+                  AND u.status IN ('OPEN', 'SUBMITTED')
+                  AND (CAST(:run AS uuid) IS NOT NULL AND u.drive_run_id = CAST(:run AS uuid)
+                       OR CAST(:run AS uuid) IS NULL
+                          AND COALESCE((SELECT max(f.created_at_utc) FROM auditcore.p2_bulk_files f
+                                         WHERE f.tenant_id=u.tenant_id AND f.bulk_id=u.bulk_id),
+                                       u.created_at_utc) < :before)
+                ORDER BY u.created_at_utc
+                """
+            ),
+            {"t": tenant_id, "run": str(run_id) if run_id else None, "before": datetime.now(UTC) - quiet},
+        ).scalars().all()
+        done = 0
+        for bulk_id in left:
+            n = submit_bulk(connection, tenant_id, bulk_id)
+            if n is not None:
+                done += 1
+                logger.warning("p2_drive_bulk_left_behind_submitted", tenant_id=tenant_id, bulk_id=str(bulk_id),
+                               run_id=str(run_id) if run_id else None, files=n)
+    return done
 
 
 def _attach_photo(engine: Engine, tenant_id: str, client: DriveClient, file: dict[str, Any],
@@ -1274,6 +1330,9 @@ def run_drive_intake(engine: Engine, tag: str, tenant_ids: list[str] | None = No
                  detail=f"{type(exc).__name__}: {exc}"[:1000])
         _note_connection(engine, tenant_id, error=str(exc), lost=isinstance(exc, DriveAuthorizationLost))
         raise
+    # A run started again after the worker was stopped (a deploy) first submits what its
+    # earlier attempt took: those files are TAKEN, so the claim below no longer sees them.
+    submit_left_behind(engine, tenant_id, run_id=run_id)
     files = _claim(engine, tenant_id, run)
     submitter = run["requested_by_actor_id"] if run["run_trigger"] == "PC_SUBMIT" else None
     documents: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -1328,6 +1387,9 @@ def settle(engine: Engine, tenant_id: str, client: DriveClient | None = None, *,
     are all settled is done. ``open_drive=False`` (the worker's clock): only Verigence's own
     records -- photos that wait are added at the next run."""
     done = {"folders": 0, "photos": 0, "runs": 0}
+    left_behind = submit_left_behind(engine, tenant_id)
+    if left_behind:
+        done["leftBehind"] = left_behind
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
         placed = connection.execute(
