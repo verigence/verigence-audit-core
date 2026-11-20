@@ -59,7 +59,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from difflib import SequenceMatcher
 from typing import Any
@@ -118,6 +117,10 @@ _SEVERITY_BY_BASIS: dict[str, str] = {
     "VIN": "CRITICAL",
     "OTF": "CRITICAL",
     "RECEIPT": "CRITICAL",
+    # The same receipt on two bookings of different vehicles (product owner
+    # 20 Nov 2026): not a duplicate booking -- a receipt is unique, so it is
+    # reported for the Team Lead to decide which booking it pays for.
+    "SHARED_RECEIPT": "MEDIUM",
     "PAN": "CRITICAL",
     "AADHAAR": "CRITICAL",
     "CUSTOMER_MATCHES_RELATIVE": "MEDIUM",
@@ -144,6 +147,7 @@ _CONFIDENCE_PERCENT_BY_BASIS: dict[str, int] = {
     "VIN": 99,
     "OTF": 99,
     "RECEIPT": 95,
+    "SHARED_RECEIPT": 95,
     "PAN": 99,
     "AADHAAR": 99,
     "CUSTOMER_MATCHES_RELATIVE": 60,
@@ -177,6 +181,7 @@ _BASIS_LABEL: dict[str, str] = {
     "VIN": "same vehicle (VIN / chassis)",
     "OTF": "same booking number (OTF)",
     "RECEIPT": "same receipt number",
+    "SHARED_RECEIPT": "same receipt on two vehicles",
     "PAN": "PAN",
     "AADHAAR": "Aadhaar",
     "CUSTOMER_MATCHES_RELATIVE": "customer name matches a relative on the other booking",
@@ -855,15 +860,15 @@ _MIN_NUMBER_LENGTH = 5
 
 
 # A receipt is one payment: the same receipt NUMBER on two bookings is the same
-# receipt only when its AMOUNT and DATE are the same too (product owner 19 Nov
-# 2026). A number alone is one misread digit away from another receipt of the
-# same series: AMC-C/5872/26-27 was read off Hemanta Sahoo's Rs 1,99,000 cash
-# receipt and off Ranjubala Pradhan's Rs 62,500 one of the same day (her next
-# receipt is 5873) -- different customers, amounts and purposes, flagged as one
-# payment on two bookings. Of 14 open receipt pairs on 19 Nov, 4 were such
-# misreads; the other 10 carried the same number, amount, payer and date.
-# The amount and date are read off the same receipt document as its number; a
-# receipt whose amount or date was not read cannot be confirmed and does not pair.
+# receipt only when the PAYER'S NAME and the AMOUNT on it are the same too
+# (product owner 20 Nov 2026: "receipt number is quite impossible to be same ..
+# if same check if the name of the person and amount is same, only"; on 19 Nov
+# it was number, amount and date). A number alone is one misread digit away
+# from another receipt of the same series: AMC-C/5872/26-27 was read off Hemanta
+# Sahoo's Rs 1,99,000 cash receipt and off Ranjubala Pradhan's Rs 62,500 one.
+# The payer and amount are read off the same receipt document as its number; a
+# receipt whose amount or payer was not read cannot be confirmed and does not
+# pair.
 _RECEIPT_AMOUNT_DATE = """
            (SELECT a.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields a
              WHERE a.tenant_id = f.tenant_id AND a.journey_id = f.journey_id
@@ -872,12 +877,10 @@ _RECEIPT_AMOUNT_DATE = """
              ORDER BY a.confidence_score DESC NULLS LAST, a.updated_at_utc DESC LIMIT 1) AS amount,
            (SELECT d.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields d
              WHERE d.tenant_id = f.tenant_id AND d.journey_id = f.journey_id
-               AND d.di_document_id = f.di_document_id AND d.field_key = 'receipt_date'
+               AND d.di_document_id = f.di_document_id AND d.field_key = 'customer_name'
                AND d.effective_value IS NOT NULL AND d.effective_value <> 'null'::jsonb
-             ORDER BY d.confidence_score DESC NULLS LAST, d.updated_at_utc DESC LIMIT 1) AS receipt_date"""
+             ORDER BY d.confidence_score DESC NULLS LAST, d.updated_at_utc DESC LIMIT 1) AS payer"""
 _AMOUNT_TEXT = re.compile(r"[^0-9.]")
-_DATE_FORMATS: tuple[str, ...] = ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y",
-                                  "%d-%b-%Y", "%d %b %Y", "%d-%b-%y", "%Y/%m/%d")
 
 
 def _receipt_amount(value: Any) -> Decimal | None:
@@ -892,33 +895,50 @@ def _receipt_amount(value: Any) -> Decimal | None:
     return amount.quantize(Decimal("0.01")) if amount > 0 else None
 
 
-def _receipt_date(value: Any) -> str | None:
-    """The receipt date as YYYY-MM-DD, or None when it cannot be read as a date."""
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    candidate = raw[:10] if re.match(r"^\d{4}-\d{2}-\d{2}", raw) else raw
-    for fmt in _DATE_FORMATS:
-        try:
-            return datetime.strptime(candidate, fmt).replace(tzinfo=UTC).date().isoformat()
-        except ValueError:
-            continue
-    return None
+# The payer as printed: "RANJUBALA PRADHAN-AYHPP9337L", "Hemanta Sahoo-R270866730"
+# -- a PAN or customer code after the name is not the name.
+_NAME_TOKEN = re.compile(r"[A-Z0-9]+")
+_SAME_PAYER_RATIO = 0.85
 
 
-def _receipt_key(number: str, amount: Any, receipt_date: Any) -> str | None:
-    """One receipt: its number, amount and date together. None when the amount
-    or date was not read -- the receipt cannot be confirmed as the same."""
-    rupees, day = _receipt_amount(amount), _receipt_date(receipt_date)
-    if rupees is None or day is None:
+def _payer_name(value: Any) -> str | None:
+    """The payer's name on a receipt: its words, no code or PAN, upper case."""
+    words = [w for w in _NAME_TOKEN.findall(str(value or "").upper()) if not any(c.isdigit() for c in w)]
+    name = " ".join(words)
+    return name if len(name.replace(" ", "")) >= _MINIMUM_NAME_LENGTH else None
+
+
+def _same_payer(a: str, b: str) -> bool:
+    """The same payer, a misread letter allowed ("SEIKH" / "SEIKH", "BIBI" / "BIBl")."""
+    return a == b or SequenceMatcher(None, a, b).ratio() >= _SAME_PAYER_RATIO
+
+
+def _receipt_key(number: str, amount: Any, payer: Any) -> str | None:
+    """One receipt: its number, amount and payer together. None when the amount
+    or payer was not read -- the receipt cannot be confirmed as the same."""
+    rupees, name = _receipt_amount(amount), _payer_name(payer)
+    if rupees is None or name is None:
         return None
-    return f"{number}|{rupees}|{day}"
+    return f"{number}|{rupees}|{name}"
+
+
+def same_receipt(a: str, b: str) -> bool:
+    """Two receipt keys name one receipt: the same number and amount, the same payer."""
+    if a.count("|") != 2 or b.count("|") != 2:
+        return a == b
+    number_a, rupees_a, name_a = a.split("|")
+    number_b, rupees_b, name_b = b.split("|")
+    return number_a == number_b and rupees_a == rupees_b and _same_payer(name_a, name_b)
+
+
+def _shares_receipt(left: set[str], right: set[str]) -> bool:
+    return any(same_receipt(a, b) for a in left for b in right)
 
 
 def _receipt_shown(key: str) -> str:
-    """AMCC58722627 (Rs 62,500.00, 2026-10-15) -- what the reviewer reads."""
-    number, rupees, day = key.split("|")
-    return f"{number} (Rs {_rupees_text(Decimal(rupees))}, {day})"
+    """AMCB308092627 (Rs 5,000.00, DILLIP RAY) -- what the reviewer reads."""
+    number, rupees, name = key.split("|")
+    return f"{number} (Rs {_rupees_text(Decimal(rupees))}, {name})"
 
 
 def _rupees_text(amount: Decimal) -> str:
@@ -985,7 +1005,7 @@ def _booking_numbers(connection: Connection, *, tenant_id: str, journey_id: UUID
         if kind not in out or not _usable_number(kind, number):
             continue
         if kind == "R":
-            key = _receipt_key(number, row["amount"], row["receipt_date"])
+            key = _receipt_key(number, row["amount"], row["payer"])
             if key is not None:
                 out["R"].add(key)
             continue
@@ -1020,7 +1040,7 @@ def different_bookings(left: dict[str, set[str]], right: dict[str, set[str]], *,
     at another, nothing in common). A shared number always keeps the pair: a
     misread model never splits one booking (Monika Sahu's copies share a
     receipt)."""
-    if any(left[kind] & right[kind] for kind in ("B", "R", "C")):
+    if any(left[kind] & right[kind] for kind in ("B", "C")) or _shares_receipt(left["R"], right["R"]):
         return False
     if (left["B"] and right["B"]) or (left["C"] and right["C"]):
         return True
@@ -1036,6 +1056,16 @@ def relative_booking(own: dict[str, set[str]], theirs: dict[str, set[str]]) -> b
     return bool(own.get("M") and theirs.get("M") and own["M"] & theirs["M"]) and not theirs.get("C")
 
 
+def two_vehicles(left: dict[str, set[str]], right: dict[str, set[str]]) -> bool:
+    """Two bookings are two vehicles when both carry a chassis and no chassis
+    is shared, or both carry a model and the models differ (product owner
+    20 Nov 2026: "same PAN is ok for different models and different chasis").
+    A booking with no chassis or model read yet proves nothing."""
+    if left["C"] and right["C"]:
+        return not left["C"] & right["C"]
+    return bool(left.get("M") and right.get("M") and not left["M"] & right["M"])
+
+
 # The booking's own numbers on another live booking (closing list item 6,
 # product owner 2026-11-16, check catalogue C1/C2): the same vehicle (its VIN,
 # or the chassis ending a document prints), the same booking number (OTF) or
@@ -1045,7 +1075,7 @@ def relative_booking(own: dict[str, set[str]], theirs: dict[str, set[str]]) -> b
 # dealership; a VIN anywhere in the Project.
 _NUMBER_BASES = (("C", "VIN"), ("B", "OTF"), ("R", "RECEIPT"))
 _SHARED_NUMBERS_SQL = """
-    SELECT DISTINCT v.journey_id, v.kind, v.number, v.amount, v.receipt_date
+    SELECT DISTINCT v.journey_id, v.kind, v.number, v.amount, v.payer
     FROM (
         SELECT f.journey_id, j.dealer_id,
                CASE
@@ -1103,11 +1133,12 @@ def shared_numbers(connection: Connection, *, tenant_id: str, journey_id: UUID,
         if not _usable_number(kind, number):
             continue
         if kind == "R":
-            # The same number only: the same receipt when its amount and date agree too.
-            key = _receipt_key(number, row["amount"], row["receipt_date"])
-            if key is None or key not in own["R"]:
+            # The same number only: the same receipt when its payer and amount agree too.
+            key = _receipt_key(number, row["amount"], row["payer"])
+            mine = next((k for k in sorted(own["R"]) if key is not None and same_receipt(k, key)), None)
+            if mine is None:
                 continue
-            shown = _receipt_shown(key)
+            shown = _receipt_shown(mine)
         else:
             shown = number[-_CHASSIS_TAIL:] if kind == "C" else number
         out.setdefault(row["journey_id"], (basis_of[kind], shown))
@@ -1356,6 +1387,7 @@ _NUMBER_TITLES = {
     "VIN": "The same vehicle is on another booking",
     "OTF": "The same booking number is on another booking",
     "RECEIPT": "The same receipt number is on another booking",
+    "SHARED_RECEIPT": "The same receipt is on a booking of another vehicle",
 }
 
 
@@ -1363,12 +1395,52 @@ def _number_title(basis: str) -> str:
     return _NUMBER_TITLES[basis]
 
 
+def _vehicle_text(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str:
+    row = connection.execute(
+        text("SELECT model_name_snapshot, variant_name_snapshot FROM auditcore.journey_products "
+             "WHERE tenant_id=:t AND journey_id=:j ORDER BY updated_at_utc DESC LIMIT 1"),
+        {"t": tenant_id, "j": journey_id},
+    ).first()
+    return " ".join(str(part) for part in (row or ()) if part) or "vehicle not read"
+
+
+def _receipt_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID, number: str) -> str | None:
+    """What the receipt says it was paid towards ("TOWARDS BOOKING OF SUPRO EXCEL")."""
+    remarks = connection.execute(
+        text("""
+            SELECT r.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields n
+            JOIN auditcore.evidence e ON e.tenant_id = n.tenant_id AND e.journey_id = n.journey_id
+             AND e.di_document_id = n.di_document_id AND e.association_status = 'ACTIVE'
+            JOIN auditcore.journey_document_extracted_fields r ON r.tenant_id = n.tenant_id
+             AND r.journey_id = n.journey_id AND r.di_document_id = n.di_document_id AND r.field_key = 'remarks'
+            WHERE n.tenant_id = :t AND n.journey_id = :j AND n.field_key = 'receipt_number'
+              AND upper(regexp_replace(n.effective_value #>> '{}', '[^A-Za-z0-9]', '', 'g')) = :n
+              AND r.effective_value IS NOT NULL AND r.effective_value <> 'null'::jsonb
+            LIMIT 1
+        """),
+        {"t": tenant_id, "j": journey_id, "n": number},
+    ).scalar_one_or_none()
+    text_ = " ".join(str(remarks or "").split())
+    return (text_[:157] + "...") if len(text_) > 160 else (text_ or None)
+
+
 def _number_description(connection: Connection, *, tenant_id: str, basis: str, number: str,
-                        other_journey_id: UUID, identity: str | None) -> str:
+                        other_journey_id: UUID, identity: str | None, journey_id: UUID | None = None) -> str:
     other = connection.execute(
         text("SELECT journey_reference FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
         {"t": tenant_id, "j": other_journey_id},
     ).scalar_one_or_none() or "another booking"
+    if basis == "SHARED_RECEIPT":
+        bare = number.split(" ")[0]
+        this_vehicle = (_vehicle_text(connection, tenant_id=tenant_id, journey_id=journey_id)
+                        if journey_id else "this vehicle")
+        other_vehicle = _vehicle_text(connection, tenant_id=tenant_id, journey_id=other_journey_id)
+        remarks = _receipt_remarks(connection, tenant_id=tenant_id, journey_id=journey_id or other_journey_id,
+                                   number=bare)
+        says = f' The receipt reads: "{remarks}".' if remarks else ""
+        return (f"Receipt {number} is on this booking ({this_vehicle}) and on {other} ({other_vehicle}), a "
+                f"different vehicle. A receipt is issued once: decide which booking it pays for, or whether "
+                f"it pays for both.{says}")
     what = {"VIN": f"Chassis ...{number}", "OTF": f"Booking number {number}", "RECEIPT": f"Receipt {number}"}[basis]
     why = {"VIN": "A vehicle is sold once: confirm which booking holds it.",
            "OTF": "A booking number names one booking: confirm which one it is.",
@@ -1381,8 +1453,10 @@ def _number_description(connection: Connection, *, tenant_id: str, basis: str, n
 # Why a pair no longer counts, by what it was raised on (19 Nov 2026): the
 # system remark on the cleared finding says it plainly.
 _CLEARED_NOTE_BY_BASIS: dict[str, str] = {
-    "RECEIPT": ("Not a duplicate: no receipt with the same number, amount and date is on the other booking. "
-                "A receipt number read alone can be a misread (rule of 19 Nov 2026)."),
+    "RECEIPT": ("Not a duplicate: no receipt with the same number, payer and amount is on the other booking. "
+                "A receipt number read alone can be a misread (rule of 20 Nov 2026)."),
+    "SHARED_RECEIPT": ("Cleared: no receipt with the same number, payer and amount is on the other booking any "
+                       "more (rule of 20 Nov 2026)."),
     "OTF": ("Not a duplicate: no booking number with digits is shared with the other booking. A word such as "
             "ORDER is a form label, not a booking number (rule of 19 Nov 2026)."),
     "SURNAME_AND_PINCODE": ("Not a duplicate: the same surname and pincode does not identify the same customer "
@@ -1461,6 +1535,11 @@ def sync_duplicate_booking_detection(
             if _withdrawn(connection, tenant_id=tenant_id, journey_id=candidate["journey_id"]):
                 continue  # cancelled or closed as a duplicate: never paired
             theirs = _booking_numbers(connection, tenant_id=tenant_id, journey_id=candidate["journey_id"])
+            if number is not None and number[0] == "RECEIPT" and two_vehicles(own_numbers, theirs):
+                # The same receipt on two vehicles (20 Nov 2026): not a duplicate
+                # booking, but a receipt is unique -- the Team Lead decides which
+                # booking it pays for, or whether it pays for both.
+                basis, number = "SHARED_RECEIPT", ("SHARED_RECEIPT", number[1])
             if number is None and different_bookings(own_numbers, theirs, by_model=basis in _SAME_CUSTOMER_BASES):
                 continue  # the same customer's other booking; any open finding resolves below
             if number is None and basis == "CUSTOMER_MATCHES_RELATIVE" and not relative_booking(own_numbers, theirs):
@@ -1535,7 +1614,8 @@ def sync_duplicate_booking_detection(
                 title=_number_title(basis) if number else "Possible duplicate booking for the same customer",
                 description=(
                     _number_description(connection, tenant_id=tenant_id, basis=basis, number=number[1],
-                                        other_journey_id=candidate["journey_id"], identity=identity)
+                                        other_journey_id=candidate["journey_id"], identity=identity,
+                                        journey_id=journey_id)
                     if number else
                     f"This customer appears to match an earlier booking on this "
                     f"tenant ({_BASIS_LABEL[basis]} match). Confirm whether this "

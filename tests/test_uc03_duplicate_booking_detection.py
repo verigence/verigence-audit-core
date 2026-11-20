@@ -1258,8 +1258,9 @@ def test_a_pan_or_aadhaar_match_is_100_with_the_mobile_90_without() -> None:
 # ── a receipt is its number, amount and date; a booking number has digits (19 Nov 2026) ──
 
 
-def _receipt(c, *, journey_id, number, amount=None, receipt_date=None, document_type_key="dealer_receipt"):
-    """One receipt document on the journey: its number, amount and date read off it."""
+def _receipt(c, *, journey_id, number, amount=None, receipt_date=None, payer="SEKH ASAKAR ALLI-AZYPA8525F",
+             document_type_key="dealer_receipt"):
+    """One receipt document on the journey: its number, amount, payer and date read off it."""
     doc = uuid4()
     customer_id = c.execute(text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
                             {"t": c.tenant_id, "j": journey_id}).scalar_one()
@@ -1269,7 +1270,8 @@ def _receipt(c, *, journey_id, number, amount=None, receipt_date=None, document_
              "VALUES (:t, :j, :c, :s, :d, :k, 'JOURNEY_DOCUMENT', 'BOOKING', 'ACTIVE') RETURNING evidence_id"),
         {"t": c.tenant_id, "j": journey_id, "c": customer_id, "s": uuid4(), "d": doc, "k": document_type_key},
     ).scalar_one()
-    for field_key, value in (("receipt_number", number), ("amount_paid", amount), ("receipt_date", receipt_date)):
+    for field_key, value in (("receipt_number", number), ("amount_paid", amount), ("receipt_date", receipt_date),
+                             ("customer_name", payer)):
         if value is None:
             continue
         c.execute(
@@ -1300,10 +1302,11 @@ def test_the_same_receipt_number_with_another_amount_is_a_misread_not_a_duplicat
     assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
 
 
-def test_the_same_receipt_number_and_amount_on_another_date_is_not_a_duplicate(two_journeys) -> None:
+def test_the_same_receipt_number_and_amount_from_another_payer_is_not_a_duplicate(two_journeys) -> None:
+    """20 Nov 2026: the same receipt is the same number, payer and amount."""
     c = two_journeys
-    _receipt(c, journey_id=c.journey_a, number="AMC-B/30264/26-27", amount="60000", receipt_date="2026-10-16")
-    _receipt(c, journey_id=c.journey_b, number="AMC-B/30264/26-27", amount="60000", receipt_date="2026-10-19")
+    _receipt(c, journey_id=c.journey_a, number="AMC-B/30264/26-27", amount="60000", payer="MINATI JENA-CJNPJ7835E")
+    _receipt(c, journey_id=c.journey_b, number="AMC-B/30264/26-27", amount="60000", payer="HDFC Bank (Financer)")
     _sync_both(c)
     assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
 
@@ -1323,7 +1326,7 @@ def test_the_same_receipt_with_its_amount_and_date_names_them_on_the_finding(two
     _receipt(c, journey_id=c.journey_b, number="AMC-C/5141/26-27", amount="10000.00", receipt_date="17-09-2026")
     _assert_exactly_one_flagged_as_duplicate_of_the_other(c)
     findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
-    assert "Receipt AMCC51412627 (Rs 10,000.00, 2026-09-17) is also on" in findings[0]["description"]
+    assert "Receipt AMCC51412627 (Rs 10,000.00, SEKH ASAKAR ALLI) is also on" in findings[0]["description"]
 
 
 def test_a_form_label_read_as_the_booking_number_never_pairs(two_journeys) -> None:
@@ -1361,14 +1364,18 @@ def test_a_receipt_pair_that_no_longer_matches_says_why(two_journeys) -> None:
     _sync_both(c)
     assert _open_findings(c, flagged) == []
     assert _resolution_note(c, flagged).startswith(
-        "Not a duplicate: no receipt with the same number, amount and date")
+        "Not a duplicate: no receipt with the same number, payer and amount")
 
 
 def test_receipt_amount_and_date_are_read_whatever_their_format() -> None:
-    assert dbd._receipt_key("A12345", "1,99,000.00", "15/10/2026") == "A12345|199000.00|2026-10-15"
-    assert dbd._receipt_key("A12345", 199000, "2026-10-15T00:00:00") == "A12345|199000.00|2026-10-15"
-    assert dbd._receipt_key("A12345", "", "2026-10-15") is None
-    assert dbd._receipt_key("A12345", "500", "not a date") is None
+    assert dbd._receipt_key("A12345", "1,99,000.00", "RANJUBALA PRADHAN-AYHPP9337L") == \
+        "A12345|199000.00|RANJUBALA PRADHAN"
+    assert dbd._receipt_key("A12345", 199000, "Ranjubala Pradhan-R270721597") == "A12345|199000.00|RANJUBALA PRADHAN"
+    assert dbd._receipt_key("A12345", "", "RANJUBALA PRADHAN") is None
+    assert dbd._receipt_key("A12345", "500", "-R270721597") is None
+    # a misread letter in the payer is the same payer; another payer is not
+    assert dbd.same_receipt("A1|5000.00|MAHIRUN BIBI", "A1|5000.00|MAHIRUN BlBI")
+    assert not dbd.same_receipt("A1|60000.00|MINATI JENA", "A1|60000.00|HDFC BANK FINANCER")
     assert not dbd._usable_number("B", "ORDER") and dbd._usable_number("B", "B1322554")
 
 
@@ -1425,3 +1432,70 @@ def test_a_team_leads_verdict_on_a_duplicate_still_stands(two_journeys) -> None:
     _close_as_task_cancelled(c, flagged, disposition="FALSE_POSITIVE", by="tl-1")
     _sync_both(c)
     assert _open_findings(c, flagged) == []
+
+
+# ── a receipt is unique; two vehicles are not a duplicate booking (product owner 20 Nov 2026) ──
+
+
+def _chassis_on(c, journey_id, chassis: str) -> None:
+    _document(c, journey_id=journey_id, document_type_key="customer_invoice_dms", field_key="chassis_number",
+              value=chassis)
+
+
+def _the_finding(c) -> dict:
+    findings = _open_findings(c, c.journey_a) + _open_findings(c, c.journey_b)
+    assert len(findings) == 1, findings
+    return findings[0]
+
+
+def test_the_same_receipt_on_two_vehicles_goes_to_the_team_lead_not_as_a_duplicate(two_journeys) -> None:
+    """Live 20 Nov 2026: receipt AMC-B/30809/26-27 (Rs 5,000, Dillip Ray, "towards booking of
+    Supro Excel") on Dillip Ray's Scorpio and on Samir Ray's Supro."""
+    c = two_journeys
+    _model_on(c, c.journey_a, "SCORPIO")
+    _model_on(c, c.journey_b, "SUPRO")
+    for j in (c.journey_a, c.journey_b):
+        _receipt(c, journey_id=j, number="AMC-B/30809/26-27", amount="5000", payer="DILLIP RAY-DDCPR8722J")
+    _sync_both(c)
+    finding = _the_finding(c)
+    assert finding["severity"] == "MEDIUM"
+    assert "different vehicle" in finding["description"] and "decide which booking it pays for" in finding["description"]
+    basis = c.execute(text("SELECT e.safe_payload->>'matchBasis' FROM auditcore.audit_finding_events e "
+                           "WHERE e.audit_finding_id=:f AND e.event_type='RAISED'"),
+                      {"f": finding["audit_finding_id"]}).scalar_one()
+    assert basis == "SHARED_RECEIPT"
+
+
+def test_the_same_receipt_with_different_chassis_is_two_vehicles(two_journeys) -> None:
+    """Renewable Envirogic: one Rs 15.4L receipt on two Maxx City bookings, chassis T6J21387 and T6J29723."""
+    c = two_journeys
+    _model_on(c, c.journey_a, "MAXX CITY")
+    _model_on(c, c.journey_b, "MAXX CITY")
+    _chassis_on(c, c.journey_a, "MA1RV2TUKT6J21387")
+    _chassis_on(c, c.journey_b, "MA1RV2TUKT6J29723")
+    for j in (c.journey_a, c.journey_b):
+        _receipt(c, journey_id=j, number="AMC-B/27806/26-27", amount="1540000",
+                 payer="RENEWABLE ENVIROGIC PRIVATE LIMITED-21AAJCR3111R1ZB")
+    _sync_both(c)
+    assert _the_finding(c)["description"].startswith("Receipt AMCB278062627 (Rs 15,40,000.00, RENEWABLE")
+
+
+def test_the_same_receipt_on_the_same_vehicle_is_a_duplicate_booking(two_journeys) -> None:
+    c = two_journeys
+    _model_on(c, c.journey_a, "MAXX CITY")
+    _model_on(c, c.journey_b, "MAXX CITY")
+    for j in (c.journey_a, c.journey_b):
+        _receipt(c, journey_id=j, number="AMP-B/06345/26-27", amount="73000", payer="SEIKH GOLAM MURTEJA")
+    _sync_both(c)
+    assert "is also on" in _the_finding(c)["description"]
+    assert _the_finding(c)["severity"] == "CRITICAL"
+
+
+def test_the_same_pan_on_two_chassis_is_the_customers_second_vehicle(two_journeys) -> None:
+    """20 Nov 2026: "same PAN is ok for different models and different chasis"."""
+    c = two_journeys
+    for j, chassis in ((c.journey_a, "MA1RY2JNKT5J32052"), (c.journey_b, "MA1NB2YX2T6E68178")):
+        _set_field(c, journey_id=j, document_type_key="pan_card", field_key="pan_number", value="ALUPM2756L")
+        _chassis_on(c, j, chassis)
+    _sync_both(c)
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
