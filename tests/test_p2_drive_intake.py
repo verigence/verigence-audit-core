@@ -802,3 +802,63 @@ def test_a_customer_is_found_by_name_or_otf_over_every_day(s):
     assert customer["bookingNumber"] == "456909" and [f["filename"] for f in customer["files"]] == ["docket.pdf"]
     _as(s, str(uuid4()))  # a PC of no outlet sees nothing
     assert found("456909") == []
+
+
+def test_a_run_the_worker_was_stopped_in_loses_no_file(s, monkeypatch):
+    """19 Nov 2026: a deploy stopped the worker while the end-of-day run was taking a PC's
+    files; 34 were taken into a bulk upload that was never submitted, and the run, started
+    again, took only the other 11 -- 46 files uploaded, 11 journeys. Every file is read."""
+    outlet = _tree(s)
+    for n in range(4):
+        s.fake.put(f"booking {n}.pdf", s.fake.folder(f"Customer{n}-10{n}", outlet), f"%PDF {n}".encode())
+    real = drive._take_documents
+    taken: list[str] = []
+
+    def stopped(engine, tenant_id, run, client, outlet_row, pc, files):
+        # The first attempt puts two files in and is stopped before submitting.
+        try:
+            real(engine, tenant_id, run, client, outlet_row, pc, files[:2])
+        finally:
+            taken.extend(f["file_name"] for f in files[:2])
+        raise SystemExit("worker stopped")
+
+    created = s.client.post(f"{s.base}/drive/runs", json={"outletId": str(s.journey.outlet_id)})
+    run_id = created.json()["runId"]
+    real_submit = drive.submit_bulk
+    monkeypatch.setattr(drive, "submit_bulk", lambda *a, **k: None)
+    monkeypatch.setattr(drive, "_take_documents", stopped)
+    with pytest.raises(SystemExit):
+        drive.run_drive_intake(s.engine, f"{s.t}:{run_id}")
+    monkeypatch.setattr(drive, "submit_bulk", real_submit)
+    monkeypatch.setattr(drive, "_take_documents", real)
+    [orphan] = _rows(s, "SELECT * FROM auditcore.p2_bulk_uploads WHERE tenant_id=:t AND drive_run_id=:r", r=run_id)
+    assert orphan["submitted_at_utc"] is None and len(taken) == 2
+
+    # The worker comes back and the run's job starts again.
+    drive.run_drive_intake(s.engine, f"{s.t}:{run_id}")
+    bulks = _rows(s, "SELECT * FROM auditcore.p2_bulk_uploads WHERE tenant_id=:t AND drive_run_id=:r", r=run_id)
+    assert sorted(b["file_count"] for b in bulks) == [2, 2]
+    assert all(b["submitted_at_utc"] is not None for b in bulks)
+    jobs = _rows(s, "SELECT tag FROM auditcore.p2_worker_jobs WHERE job_kind='BULK_UPLOAD' AND status='PENDING' "
+                    "AND tag LIKE :mine", mine=f"{s.t}:%")
+    assert {j["tag"] for j in jobs} == {f"{s.t}:{b['bulk_id']}" for b in bulks}
+    assert {f["file_status"] for f in _files(s).values()} == {"TAKEN"}
+
+
+def test_the_clock_submits_a_bulk_left_by_a_run_that_never_started_again(s):
+    outlet = _tree(s)
+    s.fake.put("booking.pdf", s.fake.folder("Ravi-555", outlet), b"%PDF ravi")
+    _run(s)
+    [bulk] = _rows(s, "SELECT * FROM auditcore.p2_bulk_uploads WHERE tenant_id=:t")
+    # As the 13 Nov run was: taken, never submitted, the run closed by hand.
+    _exec(s, "UPDATE auditcore.p2_bulk_uploads SET submitted_at_utc=NULL, file_count=0 WHERE tenant_id=:t")
+    _exec(s, "DELETE FROM auditcore.p2_worker_jobs WHERE job_kind='BULK_UPLOAD' AND tag=:tag",
+          tag=f"{s.t}:{bulk['bulk_id']}")
+    assert drive.submit_left_behind(s.engine, s.t) == 0  # still within the quiet time
+    _exec(s, "UPDATE auditcore.p2_bulk_files SET created_at_utc=now() - interval '20 minutes' WHERE tenant_id=:t")
+    assert drive.settle(s.engine, s.t).get("leftBehind") == 1
+    [bulk] = _rows(s, "SELECT * FROM auditcore.p2_bulk_uploads WHERE tenant_id=:t")
+    assert bulk["file_count"] == 1 and bulk["submitted_at_utc"] is not None
+    assert _rows(s, "SELECT 1 FROM auditcore.p2_worker_jobs WHERE job_kind='BULK_UPLOAD' AND status='PENDING' "
+                    "AND tag=:tag", tag=f"{s.t}:{bulk['bulk_id']}")
+    assert drive.submit_left_behind(s.engine, s.t) == 0  # once only
