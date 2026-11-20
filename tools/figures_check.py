@@ -27,6 +27,7 @@ import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from typing import Any
 from uuid import UUID
 
@@ -68,6 +69,22 @@ def _read_only(engine, tenant_id: str):
             return self.ctx.__exit__(*exc)
 
     return _Txn()
+
+
+@contextmanager
+def _as_a_worker_job(engine):
+    """Build the booking the way the P2 worker does: what it reads of the booking it
+    reads once (audit_core.job_reads, 2026-11-20). A code version without that layer
+    reads every time, so a pull request that changes what is held is compared against
+    plain reads of the same bookings."""
+    try:
+        from audit_core import job_reads
+    except ImportError:
+        yield
+        return
+    job_reads.install(engine)
+    with job_reads.job():
+        yield
 
 
 def _plain(value: Any) -> Any:
@@ -152,6 +169,10 @@ def capture(args) -> None:
     started = time.monotonic()
 
     def one(row) -> tuple[str, dict[str, Any]]:
+        with _as_a_worker_job(engine):
+            return built(row)
+
+    def built(row) -> tuple[str, dict[str, Any]]:
         journey_id = UUID(str(row["journey_id"]))
         item: dict[str, Any] = {}
         with _read_only(engine, args.tenant) as c:

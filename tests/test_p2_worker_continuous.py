@@ -131,3 +131,59 @@ def test_page_work_and_journey_work_never_overlap(journey, monkeypatch):
         connection.execute(text("UPDATE auditcore.p2_work_queue SET work_status='COMPLETED' "
                                 "WHERE tenant_id=:t AND work_key=:k"), {"t": journey.tenant_id, "k": check[0]})
     assert _claim_keys(journey) == later
+
+
+# ── polling (2026-11-20, hosting cost): the short question before the full claim ──
+def _sent(journey):
+    from sqlalchemy import event
+
+    seen: list[str] = []
+    event.listen(journey.engine, "before_cursor_execute", lambda c, cur, s, p, ctx, m: seen.append(s))
+    return seen
+
+
+def _full_claims(seen) -> int:
+    return sum("WITH inflight AS" in s for s in seen)
+
+
+def test_with_nothing_waiting_the_full_claim_is_not_sent(journey):
+    seen = _sent(journey)
+    assert _claim_keys(journey) == []
+    assert _full_claims(seen) == 0
+    assert sum("SELECT EXISTS" in s and "p2_work_queue" in s for s in seen) == 1
+
+
+def test_work_not_yet_due_is_not_worth_the_full_claim(journey):
+    keys = _enqueue(journey, 2)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_work_queue SET work_status='RETRY_WAIT', "
+                 "next_attempt_at_utc=now() + interval '10 minutes' WHERE tenant_id=:t AND work_key=ANY(:k)"),
+            {"t": journey.tenant_id, "k": keys})
+    seen = _sent(journey)
+    assert _claim_keys(journey) == []
+    assert _full_claims(seen) == 0
+
+
+def test_waiting_work_is_claimed_as_before(journey):
+    keys = _enqueue(journey, 2)
+    seen = _sent(journey)
+    assert sorted(_claim_keys(journey)) == sorted(keys)
+    assert _full_claims(seen) == 1
+    # Both now run under a lease: nothing is waiting, so the next poll is the short one.
+    assert _claim_keys(journey) == []
+    assert _full_claims(seen) == 1
+
+
+def test_work_whose_worker_died_is_still_found(journey):
+    keys = _enqueue(journey, 1)
+    assert _claim_keys(journey) == keys
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_work_queue SET lease_expires_at_utc=now() - interval '1 second' "
+                 "WHERE tenant_id=:t AND work_key=ANY(:k)"), {"t": journey.tenant_id, "k": keys})
+    seen = _sent(journey)
+    assert _claim_keys(journey) == keys
+    assert _full_claims(seen) == 1

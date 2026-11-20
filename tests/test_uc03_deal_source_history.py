@@ -147,3 +147,76 @@ def test_two_documents_of_one_type_keep_a_row_each(journey) -> None:
         ("customer_invoice_dms", first, Decimal("852000.00")),
         ("customer_invoice_dms", second, Decimal("862600.44")),
     }
+
+
+# ── a value already on file as it stands is not written again inside a worker job
+#    (2026-11-20, hosting cost) ────────────────────────────────────────────────
+def _source_writes(c):
+    from sqlalchemy import event
+
+    seen: list[str] = []
+    event.listen(c.engine, "before_cursor_execute", lambda conn, cur, s, p, ctx, m: seen.append(s))
+    return lambda: sum("INSERT INTO auditcore.commercial_line_source_values" in s for s in seen)
+
+
+def _record(c, amount, **over) -> None:
+    record_source_value(c, **{
+        "tenant_id": c.tenant_id, "journey_id": c.journey_id, "line_kind": "COMMERCIAL",
+        "component_key": " Ex_Showroom_Price ", "source_document_type": "Tax Invoice Tally",
+        "amount": amount, **over})
+
+
+def _stored(c):
+    return [tuple(row) for row in c.execute(text(
+        "SELECT component_key, source_document_type, amount, source_document_id, source_evidence_id, "
+        "withdrawn_at_utc, updated_at_utc FROM auditcore.commercial_line_source_values "
+        "WHERE tenant_id=:t AND journey_id=:j ORDER BY 1, 2, 4"), {"t": c.tenant_id, "j": c.journey_id})]
+
+
+def test_outside_a_job_every_value_is_written_as_before(journey) -> None:
+    c = journey
+    writes = _source_writes(c)
+    _record(c, Decimal(1500000))
+    _record(c, Decimal(1500000))
+    assert writes() == 2
+
+
+def test_inside_a_job_an_unchanged_value_is_not_written_again(journey) -> None:
+    from audit_core import job_reads
+
+    c = journey
+    job_reads.install(c.engine)
+    writes = _source_writes(c)
+    document = uuid4()
+    with job_reads.job():
+        _record(c, Decimal(1500000))
+        _record(c, Decimal(42000), component_key="insurance", document_id=document)
+        before = _stored(c)
+        assert writes() == 2
+        for _ in range(3):  # the recompute of an unchanged Journey
+            _record(c, Decimal("1500000.00"))
+            _record(c, Decimal(42000), component_key="insurance", document_id=document)
+        assert writes() == 2
+        assert _stored(c) == before
+        # A figure that moved, another document, another type: each is written.
+        _record(c, Decimal(1510000))
+        _record(c, Decimal(42000), component_key="insurance", document_id=uuid4())
+        _record(c, Decimal(1500000), source_document_type="booking_form")
+        assert writes() == 5
+        assert len(_stored(c)) == 4
+        assert {row[2] for row in _stored(c) if row[0] == "ex_showroom_price"} == {Decimal(1510000), Decimal(1500000)}
+
+
+def test_inside_a_job_a_withdrawn_value_is_put_back(journey) -> None:
+    from audit_core import job_reads
+
+    c = journey
+    job_reads.install(c.engine)
+    writes = _source_writes(c)
+    with job_reads.job():
+        _record(c, Decimal(900))
+        c.execute(text("UPDATE auditcore.commercial_line_source_values SET withdrawn_at_utc=now() "
+                       "WHERE tenant_id=:t AND journey_id=:j"), {"t": c.tenant_id, "j": c.journey_id})
+        _record(c, Decimal(900))
+        assert writes() == 2
+        assert [row[5] for row in _stored(c)] == [None]
