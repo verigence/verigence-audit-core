@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -133,7 +133,7 @@ def _open_findings(c, journey_id) -> list[dict]:
     return [
         dict(row)
         for row in c.execute(
-            text("SELECT rule_key, severity, description FROM auditcore.audit_findings "
+            text("SELECT audit_finding_id, rule_key, severity, description FROM auditcore.audit_findings "
                  "WHERE tenant_id=:t AND journey_id=:j AND finding_type_code='DUPLICATE_BOOKING' "
                  "AND finding_status IN ('OPEN','ACKNOWLEDGED')"),
             {"t": c.tenant_id, "j": journey_id},
@@ -1370,3 +1370,58 @@ def test_receipt_amount_and_date_are_read_whatever_their_format() -> None:
     assert dbd._receipt_key("A12345", "", "2026-10-15") is None
     assert dbd._receipt_key("A12345", "500", "not a date") is None
     assert not dbd._usable_number("B", "ORDER") and dbd._usable_number("B", "B1322554")
+
+
+# ── a duplicate the system closed with its cancelled task is reported again (2026-11-20) ──
+
+
+def _close_as_task_cancelled(c, journey_id, *, disposition=None, by=None) -> str:
+    """What the invariants did to UTK-BP-261102-004: the open flag closed
+    "Its task was cancelled", its task cancelled with an earlier, voided flag."""
+    fid = str(_open_findings(c, journey_id)[0]["audit_finding_id"])
+    earlier = c.execute(
+        text("INSERT INTO auditcore.audit_findings (tenant_id, journey_id, finding_type_code, severity, "
+             "finding_status, title, description, stage_code, origin_kind, origin_role_snapshot, rule_key, "
+             "blocking_completion, finding_class) SELECT tenant_id, journey_id, finding_type_code, severity, "
+             "'VOIDED', title, description, stage_code, origin_kind, origin_role_snapshot, rule_key, "
+             "blocking_completion, finding_class FROM auditcore.audit_findings WHERE audit_finding_id=:f "
+             "RETURNING audit_finding_id"), {"f": fid}).scalar_one()
+    c.execute(text("UPDATE auditcore.audit_findings SET finding_status='RESOLVED', disposition=:d, "
+                   "resolved_by_actor_id=:by, resolved_at_utc=now() WHERE audit_finding_id=:f"),
+              {"f": fid, "d": disposition, "by": by})
+    c.execute(
+        text("INSERT INTO auditcore.p2_tasks (tenant_id, journey_id, task_type, category, origin_kind, source_type, "
+             "source_code, dedupe_key, title, description, reference, severity, priority, assigned_role_code, "
+             "allowed_actions, completion_protocol, task_status, completion_result) VALUES (:t, :j, "
+             "'FINDING_REVIEW', 'Customer & Dealer Identity', 'SYSTEM', 'RULE', 'DUPLICATE_BOOKING', :key, 'x', "
+             "'x', CAST(:ref AS jsonb), 'HIGH', 'HIGH', 'TL', '[]'::jsonb, 'MACHINE_VERIFIED', 'CANCELLED', "
+             "CAST(:res AS jsonb))"),
+        {"t": c.tenant_id, "j": journey_id, "key": f"control:{journey_id}:DUPLICATE_BOOKING",
+         "ref": json.dumps({"findingId": str(earlier)}), "res": json.dumps({"outcome": "FINDING_CLOSED"})},
+    )
+    return fid
+
+
+def _pan_pair(c) -> UUID:
+    for j in (c.journey_a, c.journey_b):
+        _set_field(c, journey_id=j, document_type_key="pan_card", field_key="pan_number", value="ABCDE1234F")
+    _sync_both(c)
+    return c.journey_a if _open_findings(c, c.journey_a) else c.journey_b
+
+
+def test_a_genuine_duplicate_closed_with_its_cancelled_task_is_reported_again(two_journeys) -> None:
+    c = two_journeys
+    flagged = _pan_pair(c)
+    closed = _close_as_task_cancelled(c, flagged)
+    assert _open_findings(c, flagged) == []
+    _sync_both(c)
+    reopened = _open_findings(c, flagged)
+    assert len(reopened) == 1 and str(reopened[0]["audit_finding_id"]) != closed
+
+
+def test_a_team_leads_verdict_on_a_duplicate_still_stands(two_journeys) -> None:
+    c = two_journeys
+    flagged = _pan_pair(c)
+    _close_as_task_cancelled(c, flagged, disposition="FALSE_POSITIVE", by="tl-1")
+    _sync_both(c)
+    assert _open_findings(c, flagged) == []

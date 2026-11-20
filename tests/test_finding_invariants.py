@@ -176,3 +176,67 @@ def test_task_closes_when_its_finding_closed(journey):
     assert _enforce(journey)["task:finding_already_closed"] == 1
     assert _task_status(journey, task) == "CANCELLED"
     assert _task_status(journey, waiting) == "READY"  # its waiting is the ask
+
+
+# ── a duplicate is reported: a task cancelled with a closed finding comes back (2026-11-20) ──
+
+
+def _close(journey, fid, status, *, disposition=None, by=None):
+    _sql(journey, "UPDATE auditcore.audit_findings SET finding_status=:s, disposition=:d, resolved_by_actor_id=:by "
+                  "WHERE tenant_id=:t AND audit_finding_id=:f", s=status, d=disposition, by=by, f=fid)
+
+
+def _task_row(journey, tid):
+    return _sql(journey, "SELECT task_status, reference->>'findingId' f FROM auditcore.p2_tasks "
+                         "WHERE tenant_id=:t AND task_id=:id", id=tid).one()
+
+
+def test_the_open_task_of_a_voided_finding_is_taken_over_by_the_one_raised_again(journey):
+    """UTK-BP-261102-004: the duplicate flag on the chassis was voided and raised
+    again on the receipt; its task stayed on the voided one and was cancelled."""
+    voided = _finding(journey, "DUPLICATE_BOOKING")
+    _close(journey, voided, "VOIDED")
+    again = _finding(journey, "DUPLICATE_BOOKING")
+    _state(journey, "DUPLICATE_BOOKING", "FAIL")
+    task = _task(journey, "DUPLICATE_BOOKING", finding=voided)
+    counts = _enforce(journey)
+    assert counts["task:linked_to_finding"] == 1 and not counts["task:finding_already_closed"]
+    assert tuple(_task_row(journey, task)) == ("READY", again)
+    assert _finding_status(journey, again)[0] == "OPEN"
+    assert not _enforce(journey)
+
+
+def test_a_task_cancelled_with_a_finding_the_system_closed_comes_back(journey):
+    voided = _finding(journey, "DUPLICATE_BOOKING")
+    _close(journey, voided, "VOIDED")
+    again = _finding(journey, "DUPLICATE_BOOKING")
+    _state(journey, "DUPLICATE_BOOKING", "FAIL")
+    task = _task(journey, "DUPLICATE_BOOKING", status="CANCELLED", finding=voided,
+                 result={"outcome": "FINDING_CLOSED"})
+    counts = _enforce(journey)
+    assert not counts["finding:TASK_CANCELLED"]
+    assert _finding_status(journey, again)[0] == "OPEN"
+    assert tuple(_task_row(journey, task)) == ("READY", again)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert finding_may_open(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                                code="DUPLICATE_BOOKING")
+
+
+@pytest.mark.parametrize(("result", "closed_by"), [
+    ({"outcome": "CHECK_RETIRED"}, None),             # a cleanup
+    ({"outcome": "FINDING_CLOSED"}, "tl-1"),          # its finding closed by a person
+])
+def test_a_task_a_person_or_a_cleanup_cancelled_still_closes_the_finding(journey, result, closed_by):
+    earlier = _finding(journey, "DUPLICATE_BOOKING")
+    _close(journey, earlier, "RESOLVED", disposition="FALSE_POSITIVE" if closed_by else None, by=closed_by)
+    fid = _finding(journey, "DUPLICATE_BOOKING")
+    _state(journey, "DUPLICATE_BOOKING", "FAIL")
+    task = _task(journey, "DUPLICATE_BOOKING", status="CANCELLED", finding=earlier, result=result)
+    assert _enforce(journey)["finding:TASK_CANCELLED"] == 1
+    assert _finding_status(journey, fid)[0] == "RESOLVED"
+    assert _task_status(journey, task) == "CANCELLED"
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        assert not finding_may_open(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id,
+                                    code="DUPLICATE_BOOKING")

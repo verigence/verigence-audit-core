@@ -15,12 +15,15 @@ evaluation of its checks and, for what is on file, by the worker job
    - a person already decided it on its task (a Team Lead's verdict, or an
      exception accepted): the finding closes with that decision,
    - its task was cancelled (a check retired for tasks, a cleanup): no task
-     will come back for it, so the finding closes too,
+     will come back for it, so the finding closes too -- but not a task that
+     was cancelled only because an earlier finding of the check was closed by
+     the system (``cancelled_with_its_finding``): that task comes back,
    - the check raises no task by a product owner decision (cash, the
      booking form): it is informational, recorded and closed.
 2. Every finding left open has exactly one open task: the one the check
-   raised is linked to it, a missing one is raised, and a second one for the
-   same finding is cancelled.
+   raised is linked to it (taken over from a finding of the check the system
+   closed, when the check raised its finding again on another basis), a
+   missing one is raised, and a second one for the same finding is cancelled.
 3. An open task whose finding has closed closes too, unless its check's
    waiting is the ask (the booking date to correct).
 
@@ -61,6 +64,43 @@ class Decision:
 
 
 KEEP = Decision("KEEP", "KEEP", "")
+
+
+# A task cancelled only because the finding behind it was closed by the
+# system -- voided when the check raised it again on another basis, cleared,
+# or closed while the check could not decide -- is not a decision about the
+# check. When the check fails again its task comes back and its finding is
+# reported (product owner 20 Nov 2026: "if something is duplicate, it has to be
+# reported"). Before, such a task stayed cancelled and closed every new finding
+# of the check (UTK-BP-261102-004: its duplicate flag, voided and raised again
+# on the receipt, lost its task with the voided one and was closed "Its task
+# was cancelled"; eight more duplicates on Mahindra Orissa were hidden so).
+# A person's decision, a check switched off and a cleanup stay as they are.
+REVIVABLE_OUTCOMES = frozenset({"FINDING_CLOSED", "CHECK_CANNOT_DECIDE"})
+PERSON_DISPOSITIONS = ("CONFIRMED_BREACH", "FALSE_POSITIVE")
+
+
+def cancelled_with_its_finding(
+    connection: Connection, *, tenant_id: str, task_status: str | None, result: dict[str, Any] | None,
+    reference: dict[str, Any] | None,
+) -> bool:
+    """Whether a cancelled task was cancelled only with a finding the system closed."""
+    if task_status != "CANCELLED" or str((result or {}).get("outcome") or "") not in REVIVABLE_OUTCOMES:
+        return False
+    finding_id = str((reference or {}).get("findingId") or "")
+    if not finding_id:
+        return False
+    row = connection.execute(
+        text("SELECT finding_status, disposition, resolved_by_actor_id FROM auditcore.audit_findings "
+             "WHERE tenant_id=:t AND audit_finding_id = CAST(:f AS uuid)"),
+        {"t": tenant_id, "f": finding_id},
+    ).mappings().one_or_none()
+    if row is None:
+        return False
+    if row["finding_status"] == "VOIDED":
+        return True
+    return (row["finding_status"] == "RESOLVED" and row["resolved_by_actor_id"] is None
+            and row["disposition"] not in PERSON_DISPOSITIONS)
 
 
 def base_code(rule_key: str | None) -> tuple[str, bool]:
@@ -140,7 +180,8 @@ def finding_may_open(connection: Connection, *, tenant_id: str, journey_id: UUID
     if code in taskless_codes():
         return False
     row = connection.execute(
-        text("SELECT task_status, completion_result FROM auditcore.p2_tasks WHERE tenant_id=:t AND dedupe_key=:k"),
+        text("SELECT task_status, completion_result, reference FROM auditcore.p2_tasks "
+             "WHERE tenant_id=:t AND dedupe_key=:k"),
         {"t": tenant_id, "k": f"control:{journey_id}:{code}"},
     ).mappings().one_or_none()
     if row is None:
@@ -150,7 +191,11 @@ def finding_may_open(connection: Connection, *, tenant_id: str, journey_id: UUID
         # Closed when its kind was switched off: back on, it may open again (2026-11-19).
         from audit_core.uc03_task_switches import closed_by_switch, off_result
 
-        return closed_by_switch(result) and off_result(connection, tenant_id, code) is None
+        if closed_by_switch(result):
+            return off_result(connection, tenant_id, code) is None
+        # Cancelled only with a finding the system closed: the check is reported again (2026-11-20).
+        return cancelled_with_its_finding(connection, tenant_id=tenant_id, task_status="CANCELLED",
+                                          result=result, reference=dict(row["reference"] or {}))
     return not (row["task_status"] == "VERIFIED_COMPLETE" and (result.get("verdict") or result.get("acceptedIssueHash")))
 
 
@@ -285,13 +330,18 @@ def enforce_journey(
         {"t": tenant_id, "j": journey_id},
     ).mappings().all()]
     open_tasks = [t for t in tasks if t["task_status"] in OPEN_TASK]
+    open_finding_ids = {str(f["audit_finding_id"]) for f in findings}
 
     def tasks_for(finding: dict[str, Any], code: str) -> list[dict[str, Any]]:
         fid = str(finding["audit_finding_id"])
         key = f"control:{journey_id}:{code}"
+        # The check's own task, still on a finding of the check that is no
+        # longer open (voided when raised again on another basis), is taken
+        # over by the open one -- not cancelled with the closed one (2026-11-20).
         return [t for t in open_tasks
                 if (t["reference"] or {}).get("findingId") == fid
-                or ((t["reference"] or {}).get("findingId") in (None, "") and t["dedupe_key"] == key)]
+                or (t["dedupe_key"] == key
+                    and str((t["reference"] or {}).get("findingId") or "") not in open_finding_ids)]
 
     def control_task(code: str) -> dict[str, Any] | None:
         key = f"control:{journey_id}:{code}"
@@ -306,12 +356,15 @@ def enforce_journey(
         result = dict((own or {}).get("completion_result") or {})
         decided = (own is not None and own["task_status"] == "VERIFIED_COMPLETE"
                    and bool(result.get("verdict") or result.get("acceptedIssueHash")))
+        cancelled = own is not None and own["task_status"] == "CANCELLED" and not cancelled_with_its_finding(
+            connection, tenant_id=tenant_id, task_status=own["task_status"], result=result,
+            reference=dict(own["reference"] or {}))
         decision = decide(
             rule_key=finding["rule_key"], origin_kind=finding["origin_kind"],
             control_status=(state or {}).get("control_status"),
             person_decision=result if decided else None,
             rule_engine_on=rule_engine_on, registry=registry,
-            task_cancelled=result if own is not None and own["task_status"] == "CANCELLED" else None,
+            task_cancelled=result if cancelled else None,
         )
         if decision.action == "CLOSE":
             counts[f"finding:{decision.reason}"] += 1
@@ -340,6 +393,8 @@ def enforce_journey(
             if commit:
                 _link_task(connection, tenant_id=tenant_id, task_id=keep["task_id"],
                            finding_id=finding["audit_finding_id"])
+            # Linked now: rule 3 below no longer sees it on the closed finding.
+            keep["reference"] = {**(keep["reference"] or {}), "findingId": str(finding["audit_finding_id"])}
         for task in extra:
             counts["task:duplicate_cancelled"] += 1
             if commit:
@@ -427,6 +482,7 @@ def run_finding_invariants(engine: Engine, tag: str, tenant_ids: list[str]) -> d
 
 __all__ = [
     "base_code",
+    "cancelled_with_its_finding",
     "decide",
     "enforce_after_evaluation",
     "enforce_journey",

@@ -1277,9 +1277,21 @@ def _void_cleared_finding(
                 ),
                 {"tenant_id": tenant_id, "journey_id": journey_id, "stage": _STAGE, "rule_key": rule_key},
             ).mappings().one_or_none()
-            if (row is None or row["finding_status"] != "RESOLVED" or row["disposition"] != "FIXED"
-                    or row["resolved_by_actor_id"] is not None):
+            if row is None or row["finding_status"] != "RESOLVED" or row["resolved_by_actor_id"] is not None:
                 return False
+            if row["disposition"] != "FIXED":
+                # Closed by the system for another reason (its task cancelled
+                # with an earlier finding of the pair): raised again when its
+                # task can come back -- a duplicate is reported (2026-11-20).
+                # A Team Lead's verdict, a check switched off, a cleanup stay.
+                from audit_core.uc03_finding_invariants import (
+                    PERSON_DISPOSITIONS,
+                    finding_may_open,
+                )
+
+                if row["disposition"] in PERSON_DISPOSITIONS or not finding_may_open(
+                        connection, tenant_id=tenant_id, journey_id=journey_id, code=_RULE_PREFIX):
+                    return False
             note = "Matches the other booking again after it was cleared; raised again with what matches now."
             voided = connection.execute(
                 text(
