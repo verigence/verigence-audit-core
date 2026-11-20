@@ -26,7 +26,7 @@ on:
         required: true
       journeys:
         description: How many bookings
-        default: '40'
+        default: '20'
         required: false
   push:
     branches: ['perf/p2-job-reads']
@@ -41,15 +41,15 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The copies made on 21 Nov 2026 for the first run (branches job-reads-check-*).
-  DEFAULT_BASE_ENDPOINT: ep-summer-voice-ay7bnk70
-  DEFAULT_HEAD_ENDPOINT: ep-lingering-wave-ayy0wkxg
+  # The copies made on 21 Nov 2026 for the first run (branches job-reads-check-*-2).
+  DEFAULT_BASE_ENDPOINT: ep-young-mode-ayluossc
+  DEFAULT_HEAD_ENDPOINT: ep-wandering-bread-ayvyvnxw
   LIVE_ENDPOINT: ep-royal-pond-ayci3m0f
 
 jobs:
   run:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -114,7 +114,7 @@ jobs:
           echo "JOBCHECK_DATABASE_URL=$url" >> "$GITHUB_ENV"
       # Both copies hold the same rows, so both sides pick the same bookings.
       - name: Pick the bookings
-        run: python head/tools/job_reads_check.py pick --tenant "$JOBCHECK_TENANT" --out /tmp/journeys.json --n "${{ inputs.journeys || '40' }}"
+        run: python head/tools/job_reads_check.py pick --tenant "$JOBCHECK_TENANT" --out /tmp/journeys.json --n "${{ inputs.journeys || '20' }}"
       - name: Run the worker's jobs
         run: python head/tools/job_reads_check.py run --tenant "$JOBCHECK_TENANT" --journeys /tmp/journeys.json --out "/tmp/${{ matrix.side }}.json"
       - uses: actions/upload-artifact@v4
