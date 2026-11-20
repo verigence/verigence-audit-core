@@ -65,13 +65,70 @@ _install_lock = threading.Lock()
 # Counted per thread and read by tests and the figures check; never by a decision.
 _counts = threading.local()
 
-_COMMENTS = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+_DOLLAR_TAG = re.compile(r"\$(?:[A-Za-z_]\w*)?\$")
+
+
+def _code(statement: str) -> str | None:
+    """The statement without its comments and with every quoted value emptied, so
+    a word inside a comment or a string is never taken for SQL. None when a string
+    or a comment never ends: such a statement is not understood, and what is not
+    understood forgets everything."""
+    out: list[str] = []
+    i, n = 0, len(statement)
+    while i < n:
+        ch = statement[i]
+        two = statement[i:i + 2]
+        if two == "--":
+            end = statement.find("\n", i)
+            i = n if end < 0 else end
+            out.append(" ")
+        elif two == "/*":
+            end = statement.find("*/", i + 2)
+            if end < 0:
+                return None
+            i = end + 2
+            out.append(" ")
+        elif ch == "'":
+            # E'...' strings escape with a backslash; all strings double the quote.
+            escapes = i > 0 and statement[i - 1] in "eE" and not (i > 1 and (statement[i - 2].isalnum() or statement[i - 2] == "_"))
+            i += 1
+            while i < n:
+                if escapes and statement[i] == "\\":
+                    i += 2
+                elif statement[i] != "'":
+                    i += 1
+                elif statement[i + 1:i + 2] == "'":
+                    i += 2
+                else:
+                    break
+            if i >= n:
+                return None
+            i += 1
+            out.append("''")
+        elif ch == '"':
+            end = statement.find('"', i + 1)
+            if end < 0:
+                return None
+            out.append(statement[i:end + 1])
+            i = end + 1
+        elif ch == "$" and (tag := _DOLLAR_TAG.match(statement, i)) is not None:
+            end = statement.find(tag.group(0), tag.end())
+            if end < 0:
+                return None
+            i = end + len(tag.group(0))
+            out.append("''")
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 _LOCKING = re.compile(r"\bFOR\s+(?:NO\s+KEY\s+UPDATE|UPDATE|KEY\s+SHARE|SHARE)\b", re.IGNORECASE)
 _CHANGES = re.compile(
     r"\b(?:INSERT|UPDATE|DELETE|MERGE|TRUNCATE|CALL|COPY|DO|CREATE|ALTER|DROP|GRANT|REVOKE|REFRESH|LOCK|"
     r"NOTIFY|LISTEN|UNLISTEN|VACUUM|ANALYZE|SET|RESET|EXECUTE|PREPARE|INTO)\b"
     r"|\bauditcore\s*\.\s*\w+\s*\("
-    r"|\b(?:set_config|nextval|setval|pg_notify|pg_advisory\w*|pg_try_advisory\w*|lo_\w+|dblink\w*)\s*\(",
+    r"|\b(?:set_config|nextval|setval|pg_notify|pg_advisory\w*|pg_try_advisory\w*|lo_\w+|dblink\w*)\s*\("
+    # Not the same answer twice: a read that calls one of these is never held.
+    r"|\b(?:clock_timestamp|statement_timestamp|timeofday|random|gen_random_uuid|uuid_generate_v\w+|txid_current)\s*\(",
     re.IGNORECASE,
 )
 # Tables a job writes all the way through whose rows are nobody else's business:
@@ -101,8 +158,8 @@ _NEUTRAL = re.compile(r"\s*(?:SAVEPOINT|RELEASE(?:\s+SAVEPOINT)?)\b", re.IGNOREC
 def is_plain_read(statement: str) -> bool:
     """A SELECT (or WITH ... SELECT) that takes no lock, changes no row and calls
     nothing that could: the only kind of statement that may be held."""
-    sql = _COMMENTS.sub(" ", statement)
-    if not _READ_START.match(sql):
+    sql = _code(statement)
+    if sql is None or not _READ_START.match(sql):
         return False
     if _LOCKING.search(sql):
         return False
@@ -112,7 +169,9 @@ def is_plain_read(statement: str) -> bool:
 def leaves_rows_alone(statement: str) -> bool:
     """What may run without forgetting what the job holds: a plain read, a read
     that locks the rows it reads, a savepoint opened or released."""
-    sql = _COMMENTS.sub(" ", statement)
+    sql = _code(statement)
+    if sql is None:
+        return False
     if _NEUTRAL.match(sql):
         return True
     if not _READ_START.match(sql):
@@ -123,8 +182,8 @@ def leaves_rows_alone(statement: str) -> bool:
 def only_table_written(statement: str) -> str | None:
     """The one table of ``OWN_ROWS_ONLY`` a plain INSERT / UPDATE / DELETE writes,
     or None when the statement is anything else (then everything is forgotten)."""
-    sql = _COMMENTS.sub(" ", statement)
-    target = _PLAIN_WRITE.match(sql)
+    sql = _code(statement)
+    target = _PLAIN_WRITE.match(sql) if sql is not None else None
     if target is None:
         return None
     table = target.group(1).lower()
@@ -136,7 +195,7 @@ def only_table_written(statement: str) -> str | None:
 
 def tables_read(statement: str) -> frozenset[str]:
     """Every table of the schema a read names."""
-    return frozenset(name.lower() for name in _NAMES.findall(_COMMENTS.sub(" ", statement)))
+    return frozenset(name.lower() for name in _NAMES.findall(_code(statement) or ""))
 
 
 def _forget(connection: Connection) -> None:

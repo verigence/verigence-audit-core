@@ -362,3 +362,40 @@ def test_a_read_that_names_no_table_of_the_schema_is_never_held(engine):
         job_reads.rows(c, "SELECT count(*) AS n FROM pg_class WHERE relname=:r", {"r": "x"})
         job_reads.rows(c, "SELECT count(*) AS n FROM pg_class WHERE relname=:r", {"r": "x"})
     assert sum("FROM pg_class WHERE relname" in s for s in seen) == 2
+
+
+# ── a word inside a comment or a quoted value is never taken for SQL ──────────
+@pytest.mark.parametrize(("statement", "code"), [
+    ("SELECT 'it''s -- not a comment' AS a -- the car sold's own RC\nFROM t", "SELECT '' AS a  \nFROM t"),
+    ("SELECT /* DELETE\n FROM x */ 1", "SELECT   1"),
+    ("SELECT E'a\\'b; DELETE FROM t' , \"col--umn\"", "SELECT E'' , \"col--umn\""),
+    ("SELECT $$ UPDATE t SET a=1 $$, $fn$ x $fn$", "SELECT '', ''"),
+    ("SELECT a #>> '{}' FROM t WHERE b ~ '^T[0-9]{4}'", "SELECT a #>> '' FROM t WHERE b ~ ''"),
+])
+def test_what_is_left_of_a_statement_is_its_sql(statement, code):
+    assert job_reads._code(statement) == code
+
+
+@pytest.mark.parametrize("statement", ["SELECT 'never ends", "SELECT 1 /* never ends", 'SELECT "never ends', "SELECT $a$ never ends"])
+def test_a_statement_that_cannot_be_read_forgets_everything(statement):
+    assert job_reads._code(statement) is None
+    assert not job_reads.is_plain_read(statement)
+    assert not job_reads.leaves_rows_alone(statement)
+    assert job_reads.only_table_written("UPDATE auditcore.rule_executions SET a='never ends") is None
+
+
+def test_quoted_words_do_not_decide():
+    read = "SELECT 1 FROM auditcore.p2_work_queue WHERE work_type <> 'DELETE' AND note = 'SET; UPDATE; set_config('"
+    assert job_reads.is_plain_read(read)
+    hidden = "SELECT '--' AS dash, x FROM (WITH gone AS (DELETE FROM auditcore.evidence RETURNING 1) SELECT 1 x FROM gone) q"
+    assert not job_reads.is_plain_read(hidden) and not job_reads.leaves_rows_alone(hidden)
+    assert job_reads.tables_read("SELECT to_regclass('auditcore.in_a_string') FROM auditcore.evidence") == {"evidence"}
+    assert job_reads.only_table_written(
+        "UPDATE auditcore.rule_executions SET reason='see auditcore.fn(x); DELETE' WHERE a=1") == "rule_executions"
+
+
+@pytest.mark.parametrize("statement", [
+    "SELECT clock_timestamp()", "SELECT random() FROM auditcore.evidence", "SELECT gen_random_uuid()",
+])
+def test_a_read_that_is_not_the_same_twice_is_never_held(statement):
+    assert not job_reads.is_plain_read(statement)

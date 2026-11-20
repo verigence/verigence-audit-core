@@ -41,9 +41,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # The copies made on 21 Nov 2026 for the first run (branches job-reads-check-*-3).
-  DEFAULT_BASE_ENDPOINT: ep-dry-grass-ayuvzep7
-  DEFAULT_HEAD_ENDPOINT: ep-patient-paper-ays7a342
+  # The copies made on 21 Nov 2026 for the first run (branches job-reads-check-*-4).
+  DEFAULT_BASE_ENDPOINT: ep-green-frost-ayntnpoe
+  DEFAULT_HEAD_ENDPOINT: ep-super-hat-ayhb8bf9
   LIVE_ENDPOINT: ep-royal-pond-ayci3m0f
 
 jobs:
