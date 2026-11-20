@@ -416,6 +416,10 @@ def _extract_signals(rows: list[Any], *, gst: str | None) -> dict[str, Any] | No
 # of). Out means its evidence is FOREIGN, or it was read from a file taken
 # out (identity_enforced_at_utc) -- a copy of it voided earlier, when its
 # pages were grouped again, still names the same customer.
+# Nor is a document a person removed from the booking (P2_DOCUMENT_VOIDED), or one gone from
+# Document Intelligence (2026-11-20: Prasana Kumar Senapati's PAN card, uploaded to Jagannath
+# Power and Infra's ADI-RD-261022-021 on 22 Oct and removed on 9 Nov, still paired the two at
+# "100%"). A page regrouped into another document (P2_MERGED_INTO_DOCUMENT) still counts.
 _NOT_TAKEN_OUT = """NOT EXISTS (
                       SELECT 1 FROM auditcore.evidence fe
                       WHERE fe.tenant_id = f.tenant_id AND fe.journey_id = f.journey_id
@@ -425,7 +429,16 @@ _NOT_TAKEN_OUT = """NOT EXISTS (
                       JOIN auditcore.p2_upload_batches fb
                         ON fb.tenant_id = fq.tenant_id AND fb.batch_id = fq.batch_id
                       WHERE fq.tenant_id = f.tenant_id AND fq.journey_id = f.journey_id
-                        AND fq.di_document_id = f.di_document_id AND fb.identity_enforced_at_utc IS NOT NULL)"""
+                        AND fq.di_document_id = f.di_document_id AND fb.identity_enforced_at_utc IS NOT NULL)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM auditcore.evidence ve
+                      WHERE ve.tenant_id = f.tenant_id AND ve.journey_id = f.journey_id
+                        AND ve.di_document_id = f.di_document_id AND ve.association_status = 'VOIDED'
+                        AND ve.void_reason IN ('P2_DOCUMENT_VOIDED', 'DI_DOCUMENT_NOT_FOUND')
+                        AND NOT EXISTS (
+                            SELECT 1 FROM auditcore.evidence ae
+                            WHERE ae.tenant_id = f.tenant_id AND ae.journey_id = f.journey_id
+                              AND ae.di_document_id = f.di_document_id AND ae.association_status = 'ACTIVE'))"""
 
 
 def _identity_signals(

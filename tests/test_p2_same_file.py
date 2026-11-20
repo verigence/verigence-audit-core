@@ -42,10 +42,13 @@ from audit_core.uc03_p2_same_file import (
     SAME_DEALERSHIP_TITLE,
     FileIdentity,
     alert_body,
+    booking_identified,
     cross_outlet_fields,
     cross_outlet_probability,
     is_individual_pan,
+    kept_of,
     matched_fields,
+    part_of_sale_fields,
     run_same_file_delete,
     same_name,
     sync_same_file_detection,
@@ -1587,3 +1590,113 @@ def test_the_same_booking_merged_is_not_told():
     assert is_silent_merge("SAME_FILE_UPLOADED", {"outcome": "PENDING_DELETE"})
     assert not is_silent_merge("SAME_FILE_UPLOADED", {"outcome": "KEPT_NO_BOOKING_REFERENCE"})
     assert not is_silent_merge("DUPLICATE_ACROSS_OUTLETS", {"outcome": "DELETED"})
+
+
+
+# ── a file with no customer on it joins its booking (product owner 2026-11-20) ──
+_RECEIPT = "AMC-C/5141/26-27"
+_RECEIPT_KEY = "AMCC51412627|10000.00|SEKH ASAKAR ALLI"
+
+
+def _nameless(**overrides) -> FileIdentity:
+    """A receipt or delivery papers uploaded alone: no PAN, Aadhaar, mobile or GSTIN."""
+    values = {"pan": None, "mobile": None, "name": None, "model_name": None, "booking_refs": frozenset(),
+              "booking_ref_display": None, **overrides}
+    return _identity(**values)
+
+
+def test_a_nameless_file_with_the_same_receipt_is_part_of_the_booking():
+    dealer = uuid4()
+    booking = _identity(dealer_id=dealer, receipt_keys=frozenset({_RECEIPT_KEY}))
+    copy = _nameless(dealer_id=dealer, receipt_keys=frozenset({"AMCC51412627|10000.00|SEKH ASAKAR ALLl"}))
+    assert part_of_sale_fields(copy, booking) is not None
+    assert booking_identified(copy, booking)
+    # the booking with the customer is kept, however many pages the copy holds
+    assert kept_of([copy, booking], {copy.journey_id: 11, booking.journey_id: 2}) is booking
+
+
+def test_a_nameless_file_with_the_same_chassis_is_part_of_the_booking():
+    dealer = uuid4()
+    booking = _identity(dealer_id=dealer, chassis=frozenset({"T5K46116"}))
+    copy = _nameless(dealer_id=dealer, chassis=frozenset({"T5K46116"}), model_name="MAXX HD")
+    assert part_of_sale_fields(copy, booking) is not None
+
+
+@pytest.mark.parametrize("copy_overrides", [
+    {"receipt_keys": frozenset({"AMCC51412627|10000.00|ANOTHER PAYER"})},          # another payer
+    {"receipt_keys": frozenset({"AMCC51412627|62500.00|SEKH ASAKAR ALLI"})},       # another amount
+    {"receipt_keys": frozenset({_RECEIPT_KEY}), "chassis": frozenset({"T6J29723"})},  # two vehicles
+    {"receipt_keys": frozenset({_RECEIPT_KEY}), "model_name": "SCORPIO"},          # another model
+])
+def test_a_nameless_file_is_not_joined_without_the_same_receipt_or_vehicle(copy_overrides):
+    dealer = uuid4()
+    booking = _identity(dealer_id=dealer, receipt_keys=frozenset({_RECEIPT_KEY}), chassis=frozenset({"T6J21387"}))
+    assert part_of_sale_fields(_nameless(dealer_id=dealer, **copy_overrides), booking) is None
+
+
+def test_two_named_files_or_two_dealerships_are_left_to_the_other_rules():
+    dealer = uuid4()
+    booking = _identity(dealer_id=dealer, receipt_keys=frozenset({_RECEIPT_KEY}))
+    assert part_of_sale_fields(_identity(dealer_id=dealer, receipt_keys=frozenset({_RECEIPT_KEY})), booking) is None
+    assert part_of_sale_fields(_nameless(dealer_id=uuid4(), receipt_keys=frozenset({_RECEIPT_KEY})), booking) is None
+    assert part_of_sale_fields(_nameless(dealer_id=dealer, receipt_keys=frozenset({_RECEIPT_KEY})),
+                               _nameless(dealer_id=dealer, receipt_keys=frozenset({_RECEIPT_KEY}))) is None
+
+
+def _receipt_on(journey: P2Journey, *, number=_RECEIPT, amount="10000", payer="SEKH ASAKAR ALLI-AZYPA8525F") -> None:
+    doc = uuid4()
+    add_evidence(journey, di_document_id=doc, document_type_key="dealer_receipt")
+    for field_key, value in (("receipt_number", number), ("amount_paid", amount), ("customer_name", payer)):
+        add_extracted_field(journey, di_document_id=doc, field_key=field_key, value=value,
+                            document_type="dealer_receipt")
+
+
+def _chassis_on(journey: P2Journey, chassis: str) -> None:
+    doc = uuid4()
+    add_evidence(journey, di_document_id=doc, document_type_key="customer_invoice_dms")
+    add_extracted_field(journey, di_document_id=doc, field_key="chassis_number", value=chassis,
+                        document_type="customer_invoice_dms")
+
+
+def _named_and_nameless(tenant: P2Journey) -> tuple[P2Journey, P2Journey]:
+    now = datetime.now(UTC)
+    booking = _journey(tenant, ref=f"BOOK-{uuid4().hex[:6]}", created=now - timedelta(days=5))
+    copy = _journey(tenant, ref=f"ID-{uuid4().hex[:6]}", created=now - timedelta(minutes=5))
+    _file(booking, model="MAXX HD")
+    for number in (1, 2, 3, 4, 5):
+        add_page(copy, page_number=number, status="READY")  # the copy holds more pages
+    _no_stored_pages(copy)
+    return booking, copy
+
+
+def test_the_receipt_uploaded_alone_is_deleted_and_the_booking_kept(tenant):
+    """Live: ADI-RD-261118-009, Jagannath Maity's receipt alone, beside his booking ADI-RD-261113-019."""
+    booking, copy = _named_and_nameless(tenant)
+    _receipt_on(booking)
+    _receipt_on(copy, payer="Sekh Asakar Alli")
+    result = _detect(copy)
+    assert result.get("raised") == 1, result
+    (alert,) = [a for a in _alerts(tenant) if a["alert_kind"] == ALERT_KIND]
+    assert alert["subject_journey_id"] == copy.journey_id and alert["related_journey_id"] == booking.journey_id
+    assert alert["outcome"] == "PENDING_DELETE"
+    assert [q["journey_id"] for q in _queued(tenant)] == [copy.journey_id]
+
+
+def test_the_delivery_papers_uploaded_alone_join_by_the_chassis_from_the_booking_side(tenant):
+    """Live: UTK-PP-261106-001 (no customer, chassis T5K46116) and Deepak Mallik's UTK-PP-261112-001."""
+    booking, copy = _named_and_nameless(tenant)
+    _chassis_on(booking, "MA1RV2TUKT5K46116")
+    _chassis_on(copy, "T5K46116")
+    result = _detect(booking)  # found from the booking's side too
+    assert result.get("raised") == 1, result
+    assert [q["journey_id"] for q in _queued(tenant)] == [copy.journey_id]
+
+
+def test_a_nameless_file_of_another_vehicle_is_left_alone(tenant):
+    booking, copy = _named_and_nameless(tenant)
+    _receipt_on(booking)
+    _receipt_on(copy)
+    _chassis_on(booking, "MA1RV2TUKT6J21387")
+    _chassis_on(copy, "MA1RV2TUKT6J29723")
+    assert _detect(copy).get("raised", 0) == 0
+    assert _queued(tenant) == []

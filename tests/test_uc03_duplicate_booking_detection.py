@@ -1499,3 +1499,35 @@ def test_the_same_pan_on_two_chassis_is_the_customers_second_vehicle(two_journey
         _chassis_on(c, j, chassis)
     _sync_both(c)
     assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+
+
+def _pan_card_status(c, journey_id, *, status: str, reason: str | None) -> None:
+    """The PAN card's document on the booking, with an evidence row in this state."""
+    doc, customer_id = c.execute(text(
+        "SELECT f.di_document_id, j.customer_id FROM auditcore.journey_document_extracted_fields f "
+        "JOIN auditcore.journeys j ON j.journey_id = f.journey_id "
+        "WHERE f.tenant_id=:t AND f.journey_id=:j AND f.field_key='pan_number'"),
+        {"t": c.tenant_id, "j": journey_id}).one()
+    c.execute(text("INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id, di_document_id, "
+                   "document_type_key, evidence_purpose, process_area, association_status, void_reason) "
+                   "VALUES (:t, :j, :c, :s, :d, 'pan_card', 'JOURNEY_DOCUMENT', 'BOOKING', :st, :r)"),
+              {"t": c.tenant_id, "j": journey_id, "c": customer_id, "s": uuid4(), "d": doc, "st": status, "r": reason})
+
+
+def test_a_pan_card_removed_from_the_booking_no_longer_pairs_it(two_journeys) -> None:
+    """Live 20 Nov 2026: Prasana Kumar Senapati's PAN card was uploaded to Jagannath Power and
+    Infra's booking and removed by the team; it still paired the two at 100%."""
+    c = two_journeys
+    for j in (c.journey_a, c.journey_b):
+        _set_field(c, journey_id=j, document_type_key="pan_card", field_key="pan_number", value="AONPS0726E")
+    _pan_card_status(c, c.journey_a, status="VOIDED", reason="P2_DOCUMENT_VOIDED")
+    _sync_both(c)
+    assert _open_findings(c, c.journey_a) == [] and _open_findings(c, c.journey_b) == []
+
+
+def test_a_pan_card_regrouped_into_another_document_still_pairs(two_journeys) -> None:
+    c = two_journeys
+    for j in (c.journey_a, c.journey_b):
+        _set_field(c, journey_id=j, document_type_key="pan_card", field_key="pan_number", value="AONPS0726E")
+    _pan_card_status(c, c.journey_a, status="VOIDED", reason="P2_MERGED_INTO_DOCUMENT")
+    _assert_exactly_one_flagged_as_duplicate_of_the_other(c)

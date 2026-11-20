@@ -174,9 +174,13 @@ from sqlalchemy import Connection, Engine, text
 
 from audit_core.errors import ConflictError, NotFoundError
 from audit_core.uc03_duplicate_booking_detection import (
+    _CHASSIS_TAIL,
     _buyer_gstin,
     _normalize_mobile,
     _placeholder,
+    _receipt_key,
+    _shares_receipt,
+    _usable_number,
     _valid_aadhaar,
     _valid_gstin,
     _valid_pan,
@@ -319,6 +323,30 @@ _IDENTITY_SQL = f"""
                AND f.field_key = 'receipt_number' AND f.source_document_type_key = 'dealer_receipt'
                AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
                AND {_ON_ACTIVE_DOCUMENT}) AS receipt_numbers,
+           -- 2026-11-20: each receipt as number, amount and payer (chr(31) between), the
+           -- strong identity of a receipt; and the chassis read off the vehicle documents.
+           (SELECT array_agg(DISTINCT concat_ws(chr(31), f.effective_value #>> '{{}}',
+                     (SELECT a.effective_value #>> '{{}}' FROM auditcore.journey_document_extracted_fields a
+                       WHERE a.tenant_id = f.tenant_id AND a.journey_id = f.journey_id
+                         AND a.di_document_id = f.di_document_id AND a.field_key = 'amount_paid'
+                         AND a.effective_value IS NOT NULL AND a.effective_value <> 'null'::jsonb LIMIT 1),
+                     (SELECT p.effective_value #>> '{{}}' FROM auditcore.journey_document_extracted_fields p
+                       WHERE p.tenant_id = f.tenant_id AND p.journey_id = f.journey_id
+                         AND p.di_document_id = f.di_document_id AND p.field_key = 'customer_name'
+                         AND p.effective_value IS NOT NULL AND p.effective_value <> 'null'::jsonb LIMIT 1)))
+              FROM auditcore.journey_document_extracted_fields f
+             WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+               AND f.field_key = 'receipt_number' AND f.source_document_type_key IN ('dealer_receipt', 'payment_receipt')
+               AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+               AND {_ON_ACTIVE_DOCUMENT}) AS receipt_rows,
+           (SELECT array_agg(DISTINCT f.effective_value #>> '{{}}')
+              FROM auditcore.journey_document_extracted_fields f
+             WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
+               AND f.field_key IN ('chassis_number', 'vin_number')
+               AND f.source_document_type_key IN ('customer_invoice_dms', 'tax_invoice_tally', 'insurance_cover',
+                                                  'vehicle_rc', 'rto_challan')
+               AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+               AND {_ON_ACTIVE_DOCUMENT}) AS chassis_values,
            (SELECT array_agg(DISTINCT f.effective_value #>> '{{}}')
               FROM auditcore.journey_document_extracted_fields f
              WHERE f.tenant_id = j.tenant_id AND f.journey_id = j.journey_id
@@ -363,6 +391,24 @@ _SAME_CUSTOMER_SQL = f"""
                         AND oj.journey_id = f.journey_id AND oj.dealer_id = CAST(:dealer_id AS uuid)))
         OR (f.field_key IN ('gstin', 'buyer_gstin', 'customer_gstin') AND CAST(:gstin AS text) IS NOT NULL
             AND upper(regexp_replace(COALESCE(f.effective_value #>> '{{}}', ''), '[^A-Za-z0-9]', '', 'g')) = :gstin))
+      AND {_ON_ACTIVE_DOCUMENT}
+"""
+
+# 2026-11-20: the dealership's other journeys carrying one of these receipt numbers or chassis.
+_SAME_SALE_NUMBERS_SQL = f"""
+    SELECT DISTINCT f.journey_id
+    FROM auditcore.journey_document_extracted_fields f
+    JOIN auditcore.journeys oj ON oj.tenant_id = f.tenant_id AND oj.journey_id = f.journey_id
+    WHERE f.tenant_id = :tenant_id AND f.journey_id <> :journey_id AND oj.dealer_id = CAST(:dealer_id AS uuid)
+      AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
+      AND ((f.field_key = 'receipt_number' AND f.source_document_type_key IN ('dealer_receipt', 'payment_receipt')
+            AND upper(regexp_replace(f.effective_value #>> '{{}}', '[^A-Za-z0-9]', '', 'g'))
+                = ANY(CAST(:receipts AS text[])))
+        OR (f.field_key IN ('chassis_number', 'vin_number')
+            AND f.source_document_type_key IN ('customer_invoice_dms', 'tax_invoice_tally', 'insurance_cover',
+                                               'vehicle_rc', 'rto_challan')
+            AND right(upper(regexp_replace(f.effective_value #>> '{{}}', '[^A-Za-z0-9]', '', 'g')), :tail)
+                = ANY(CAST(:chassis AS text[]))))
       AND {_ON_ACTIVE_DOCUMENT}
 """
 
@@ -417,6 +463,17 @@ class FileIdentity:
     # one read with the highest confidence called the same customer two people.
     pans: frozenset[str] = frozenset()
     aadhaars: frozenset[str] = frozenset()
+    # 2026-11-20: its receipts as number|amount|payer (uc03_duplicate_booking_detection._receipt_key)
+    # and the chassis on its vehicle documents (last eight characters) -- what joins a file with
+    # no customer on it to its booking (part_of_sale_fields).
+    receipt_keys: frozenset[str] = frozenset()
+    chassis: frozenset[str] = frozenset()
+
+    @property
+    def nameless(self) -> bool:
+        """No customer on the file: no PAN, Aadhaar, mobile or GSTIN read -- a receipt or the
+        delivery papers uploaded on their own."""
+        return not (self.pans or self.aadhaars or self.pan or self.aadhaar or self.mobile or self.gstin)
 
     @property
     def model_key(self) -> str:
@@ -520,8 +577,29 @@ def _identities(connection: Connection, *, tenant_id: str, journey_ids: Iterable
             gstin=next((g for g in (_valid_gstin(v) for v in row["gstins"] or []) if g), None),
             pans=frozenset(p for p in (_valid_pan(v) for v in row["pan_values"] or []) if p),
             aadhaars=frozenset(a for a in (_valid_aadhaar(v) for v in row["aadhaar_values"] or []) if a),
+            receipt_keys=_receipt_keys(row["receipt_rows"]),
+            chassis=_chassis(row["chassis_values"], row["vin"]),
         )
     return out
+
+
+def _receipt_keys(rows: Iterable[Any] | None) -> frozenset[str]:
+    out = set()
+    for row in rows or []:
+        number, amount, payer = (str(row or "").split(chr(31)) + ["", "", ""])[:3]
+        code = re.sub(r"[^A-Z0-9]", "", number.upper())
+        if _usable_number("R", code) and (key := _receipt_key(code, amount, payer)):
+            out.add(key)
+    return frozenset(out)
+
+
+def _chassis(values: Iterable[Any] | None, vin: Any) -> frozenset[str]:
+    out = set()
+    for value in [*(values or []), vin]:
+        code = re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+        if len(code) >= _CHASSIS_TAIL:
+            out.add(code[-_CHASSIS_TAIL:])
+    return frozenset(out)
 
 
 _BOOKING_REF_TOKEN = re.compile(r"[A-Z]+|[0-9]+")
@@ -804,6 +882,50 @@ def same_sale_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str
     return fields
 
 
+def part_of_sale_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
+    """A file with no customer on it, joined to its booking (product owner 2026-11-20: "one with
+    ID needs to be junk"). A receipt or the delivery papers uploaded on their own carry no PAN,
+    Aadhaar, mobile or GSTIN, so the customer's journey is named by an ID and the rules above,
+    which all need one of those, could never join it: ADI-RD-261116-037 (Sekh Asakar Alli's
+    delivery papers), ADI-BM-261116-002 (Mahirun Bibi's), UTK-PP-261106-001 (Deepak Mallik's),
+    ADI-RD-261118-009 and SHI-KB-261024-007 (a receipt each) stayed as duplicates.
+
+    Exactly one of the two is nameless; both of one dealership; and the same receipt (number,
+    payer and amount) or the same chassis on both. Never two vehicles: chassis read on both with
+    none in common, or models read on both and different. The booking with the customer is kept
+    (kept_of); the nameless one is the copy."""
+    if not (new.dealer_id and new.dealer_id == existing.dealer_id):
+        return None
+    if new.nameless == existing.nameless:
+        return None
+    if new.chassis and existing.chassis and not new.chassis & existing.chassis:
+        return None
+    same_vehicle = bool(new.chassis & existing.chassis)
+    if not same_vehicle and new.model_key and existing.model_key and new.model_key != existing.model_key:
+        return None
+    receipt = _shares_receipt(new.receipt_keys, existing.receipt_keys)
+    if not (same_vehicle or receipt):
+        return None
+    fields: list[dict[str, Any]] = []
+    if receipt:
+        number = next(key for key in sorted(new.receipt_keys)
+                      if _shares_receipt({key}, existing.receipt_keys)).split("|")[0]
+        fields.append({"field": "receipt", "label": "Dealer receipt (number, payer and amount)",
+                       "newValue": number, "existingValue": number, "exact": True})
+    if same_vehicle:
+        tail = min(new.chassis & existing.chassis)
+        fields.append({"field": "vin", "label": "Chassis", "newValue": tail, "existingValue": tail, "exact": True})
+    fields += [
+        {"field": "name", "label": "Customer name", "newValue": new.name, "existingValue": existing.name,
+         "exact": new.name == existing.name},
+        {"field": "model", "label": "Model", "newValue": new.model_name, "existingValue": existing.model_name,
+         "exact": new.model_name == existing.model_name},
+        {"field": "outlet", "label": "Outlet", "newValue": _place(new.dealer_name, new.outlet_name),
+         "existingValue": _place(existing.dealer_name, existing.outlet_name), "exact": same_outlet(new, existing)},
+    ]
+    return fields
+
+
 def one_booking_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
     """The one rule (product owner 2026-11-14): one dealership, the same model, and the same
     PAN, Aadhaar, mobile or GSTIN -- any one. Never when a PAN or an Aadhaar is read on both and
@@ -852,7 +974,7 @@ def same_file_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str
     receipt) no longer decide it -- requiring them is what kept letting duplicates through.
     The same receipt number still finds one sale whose model was written differently on the
     booking form and on the invoice (same_sale_fields, 2026-11-12): more duplicates, not fewer."""
-    return one_booking_fields(new, existing) or same_sale_fields(new, existing)
+    return one_booking_fields(new, existing) or same_sale_fields(new, existing) or part_of_sale_fields(new, existing)
 
 
 def page_counts(connection: Connection, *, tenant_id: str, journey_ids: Iterable[UUID]) -> dict[UUID, int]:
@@ -867,8 +989,10 @@ def page_counts(connection: Connection, *, tenant_id: str, journey_ids: Iterable
 
 def kept_of(group: list[FileIdentity], pages: dict[UUID, int]) -> FileIdentity:
     """The journey kept: more pages; on a tie the newer one ("new file has pages equal to or more
-    than first file: delete the previous booking", 2026-11-14)."""
-    return max(group, key=lambda identity: (pages.get(identity.journey_id, 0), identity.order_key))
+    than first file: delete the previous booking", 2026-11-14). A journey with the customer on it
+    is always kept over one without (2026-11-20: the one named by an ID is the junk)."""
+    return max(group, key=lambda identity: (not identity.nameless, pages.get(identity.journey_id, 0),
+                                            identity.order_key))
 
 
 def pages_in_flight(connection: Connection, *, tenant_id: str, journey_id: UUID) -> bool:
@@ -895,6 +1019,9 @@ def booking_identified(new: FileIdentity, existing: FileIdentity) -> bool:
     second booking has its own receipt and its own vehicle: one receipt number, or one VIN,
     is one booking, so a misread OTF no longer keeps the copy."""
     if booking_reference_shared(new, existing) or same_sale_fields(new, existing) is not None:
+        return True
+    # A file with no customer on it, joined by its receipt or chassis (2026-11-20).
+    if part_of_sale_fields(new, existing) is not None:
         return True
     # A dealer receipt number is the dealership's own series, not an outlet's: the same receipt
     # and the same customer at two outlets of one dealership is one booking too (2026-11-17:
@@ -1478,7 +1605,8 @@ def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correla
     # The customer, mobile and model are enough to look (a duplicate across outlets needs no
     # name); the same file still needs everything (matched_fields).
     # A journey known only by its PAN / Aadhaar and receipt can still be the same sale.
-    if me is None or me.closed or not (_all_pans(me) or _all_aadhaars(me) or me.mobile or me.gstin):
+    if me is None or me.closed or not (_all_pans(me) or _all_aadhaars(me) or me.mobile or me.gstin
+                                       or me.receipt_keys or me.chassis):
         return {"examined": 0, "raised": 0}
     candidate_ids = [
         UUID(str(v)) for v in connection.execute(
@@ -1488,8 +1616,21 @@ def _detect(connection: Connection, *, tenant_id: str, journey_id: UUID, correla
              "aadhaar": ",".join(sorted(_all_aadhaars(me))) or None,
              "mobile": me.mobile, "gstin": me.gstin, "dealer_id": str(me.dealer_id) if me.dealer_id else None},
         ).scalars().all()
-    ]
+    ] if not me.nameless else []
+    # 2026-11-20: the journeys of the dealership on the same receipt number or chassis, where one
+    # of the two has no customer on it (part_of_sale_fields decides).
+    candidate_ids += [
+        UUID(str(v)) for v in connection.execute(
+            text(_SAME_SALE_NUMBERS_SQL),
+            {"tenant_id": tenant_id, "journey_id": journey_id, "dealer_id": str(me.dealer_id) if me.dealer_id else None,
+             "receipts": sorted({key.split("|")[0] for key in me.receipt_keys}), "chassis": sorted(me.chassis),
+             "tail": _CHASSIS_TAIL},
+        ).scalars().all()
+        if UUID(str(v)) not in candidate_ids
+    ] if me.dealer_id and (me.receipt_keys or me.chassis) else []
     others = _identities(connection, tenant_id=tenant_id, journey_ids=candidate_ids)
+    if me.nameless:
+        others = {k: v for k, v in others.items() if not v.nameless}
     # A journey being read for a PC's bulk upload is left to BULK_SETTLE (2026-11-03): it
     # joins the customer's booking quietly instead of alerting the Project.
     from audit_core.uc03_p2_bulk_upload import reading_for_bulk
