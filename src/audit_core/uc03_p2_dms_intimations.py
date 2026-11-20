@@ -33,6 +33,13 @@ The mark      a row in Verigence needs none (the PC has its papers). Any other r
 The alert     an upload alerts the PCs of the dealership's outlets on every screen.
 The counter   on demand, for whoever generates the report: per PC of the dealership, how
               many rows they have marked, and the rows still open.
+The report    once the DMS report has been generated from the dump the PC sees, the screen
+              says so (2026-11-20: "once the report is generated, then we should put a note on
+              the intimation screen and pop that Report has been already generated. If you want
+              to make the changes, pls let Reviewer/TL knows so that they can re-generate the
+              report. or they can wait for next Dump to be uploded to sync with verigence").
+              Marks stay open to change; a change reaches a report only when it is generated
+              again or from the next dump.
 
 ``GET  /p2/v1/tenants/{t}/dms-intimations/setup``
 ``GET  /p2/v1/tenants/{t}/dms-intimations?kind=BOOKING&dealerId=&view=new|open|month&q=``
@@ -130,6 +137,29 @@ def dump_pair(connection: Connection, tenant_id: str, dealer_id: str, kind: str,
     latest = dict(rows[0]) if rows else None
     previous = (dict(rows[1]) if len(rows) > 1 and rows[1]["period_month"] == rows[0]["period_month"] else None)
     return latest, previous
+
+
+def report_of_dump(connection: Connection, tenant_id: str, dealer_id: str, dump: dict[str, Any]
+                   ) -> dict[str, Any] | None:
+    """The latest DMS report generated from this dump: a report of the dump's day covering its
+    dealership, generated after the dump was uploaded (a report of the day's earlier upload of
+    the same dump is of another file). None when no report has been generated from it yet."""
+    row = connection.execute(
+        text("""
+            SELECT report_id, report_date, generated_by, generated_by_name, generated_at_utc
+            FROM auditcore.p2_dms_reports
+            WHERE tenant_id = :t AND report_date = :d AND :dealer = ANY(dealer_ids)
+              AND generated_at_utc >= :uploaded
+            ORDER BY generated_at_utc DESC
+            LIMIT 1
+        """),
+        {"t": tenant_id, "d": dump["business_date"], "dealer": dealer_id, "uploaded": dump["uploaded_at_utc"]},
+    ).mappings().one_or_none()
+    if row is None:
+        return None
+    return {"reportId": str(row["report_id"]), "reportDate": row["report_date"].isoformat(),
+            "generatedBy": row["generated_by_name"] or row["generated_by"],
+            "generatedAtUtc": row["generated_at_utc"].isoformat()}
 
 
 _ROWS_SQL = """
@@ -372,6 +402,7 @@ def list_intimations(
         "kind": kind, "dealerId": did, "dealerName": name, "view": view, "q": q or None,
         "dump": {"dumpId": str(latest["dump_id"]), "dumpDate": latest["business_date"].isoformat(),
                  "previousDumpDate": since.isoformat() if since else None},
+        "report": report_of_dump(connection, tenant_id, did, latest),
         "counts": {k: len(v) for k, v in groups.items()},
         "newStates": {s: states.get(s, 0) for s in (IN_VERIGENCE, INTIMATED, OPEN)},
         "items": [{**_item(r, mark_of(r), principal.subject, openable), "carried": not is_new(r)} for r in chosen[:500]],
