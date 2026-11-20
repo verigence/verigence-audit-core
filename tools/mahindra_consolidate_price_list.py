@@ -6,12 +6,10 @@ Usage: python tools/mahindra_consolidate_price_list.py PVCV.xlsx EV.xlsx PREVIOU
 
 Every row must reconcile (components + registration = on-road, both bases) or it stops.
 Built for November 2026 (4 Nov list); a new dealer tab must be added to SHEETS."""
-import json
-import re
-import sys
+import re, sys, json
 from decimal import Decimal
+from openpyxl import load_workbook, Workbook
 
-from openpyxl import Workbook, load_workbook
 
 PVCV, EV, OCT, OUT = sys.argv[1:5]
 
