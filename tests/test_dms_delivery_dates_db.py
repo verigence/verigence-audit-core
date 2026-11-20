@@ -227,3 +227,52 @@ def test_dms_rematch_job_dry_run_then_commit(dealer):
                               "AND outcome <> 'MISSING'"), {"t": dealer.tenant_id}).scalar_one() == 0
     done = run_dms_rematch(dealer.engine, f"{dealer.tenant_id}:dms-rematch-test-commit", [])
     assert done["commit"] is True and done["failed"] == 0
+
+
+def test_a_generated_report_is_corrected_in_place(dealer):
+    """DMS_REPORT_REBUILD (product owner, 20 Nov 2026: "correct the already generated report"):
+    the stored report keeps its id, date and author; its figures are counted again; a dry run
+    writes nothing."""
+    from uuid import uuid4 as new_id
+
+    from audit_core.uc03_dms_report_rebuild import run_dms_report_rebuild
+
+    report_id = new_id()
+    old = {"bookingDms": 0, "bookingSynced": 0, "bookingDatedElsewhere": 0, "deliveryDump": 2, "deliverySynced": 5,
+           "deliveryInVerigence": 4, "deliveryDatedElsewhere": 1}
+    with dealer.engine.begin() as c:
+        c.execute(text("""INSERT INTO auditcore.p2_dms_reports (tenant_id, report_id, report_date, period_month,
+                dealer_ids, generated_by, generated_by_name, figures, report)
+                VALUES (:t, :id, '2026-11-06', '2026-11-01', :ds, 'reviewer-1', 'Reviewer One',
+                        CAST(:f AS jsonb), CAST(:r AS jsonb))"""),
+                  {"t": dealer.tenant_id, "id": report_id, "ds": [dealer.dealer_id], "f": json.dumps(old),
+                   "r": json.dumps({"figures": old, "datedElsewhere": [{"customerName": "X"}], "statementLines": []})})
+
+    def stored() -> dict:
+        with dealer.engine.begin() as c:
+            return dict(c.execute(text("SELECT report_date, generated_by_name, figures, report FROM auditcore.p2_dms_reports "
+                                       "WHERE tenant_id = :t AND report_id = :id"),
+                                  {"t": dealer.tenant_id, "id": report_id}).mappings().one())
+
+    dry = run_dms_report_rebuild(dealer.engine, f"{dealer.tenant_id}:dms-report-rebuild-test", [])
+    assert (dry["commit"], dry["reports"], dry["failed"]) == (False, 1, 0)
+    [item] = dry["items"]
+    assert item["before"]["deliverySynced"] == 5
+    # GATEPASS synced on the DMS's 3 Nov; the second row is not in Verigence.
+    assert (item["after"]["deliveryDump"], item["after"]["deliverySynced"]) == (2, 1)
+    assert stored()["figures"] == old  # nothing written
+
+    done = run_dms_report_rebuild(dealer.engine, f"{dealer.tenant_id}:dms-report-rebuild-test-commit",
+                                  [str(report_id)])
+    assert (done["commit"], done["failed"]) == (True, 0)
+    now = stored()
+    assert (now["report_date"], now["generated_by_name"]) == (date(2026, 11, 6), "Reviewer One")
+    f = now["figures"]
+    assert (f["deliveryDump"], f["deliverySynced"]) == (2, 1)
+    assert "deliveryDatedElsewhere" not in f and "datedElsewhere" not in now["report"]
+    assert f["deliveryInVerigence"] == f["deliverySynced"] + f["deliveryNotInDms"]
+    assert now["report"]["rebuilt"]["figuresBefore"]["deliverySynced"] == 5
+    # Again: nothing changes but the time it was corrected.
+    again = run_dms_report_rebuild(dealer.engine, f"{dealer.tenant_id}:dms-report-rebuild-test-commit", [])
+    assert again["items"][0]["after"] == {k: f.get(k) for k in again["items"][0]["after"]}
+

@@ -185,15 +185,10 @@ def _name_differs(connection: Connection, tenant_id: str, dealers: list[dict[str
     } for r in rows]
 
 
-def generate_report(connection: Connection, *, tenant_id: str, dealers: list[dict[str, Any]], day: date,
-                    actor_id: str) -> dict[str, Any]:
+def compute_report(connection: Connection, *, tenant_id: str, dealers: list[dict[str, Any]], day: date,
+                   dumps: list[dict[str, Any]]) -> dict[str, Any]:
+    """The report of a day's dumps, as the current counting rules make it (what is stored)."""
     today = _today(connection, tenant_id)
-    dealer_ids = [d["dealerId"] for d in dealers]
-    dumps = _day_dumps(connection, tenant_id, dealer_ids, day)
-    if not dumps:
-        raise HTTPException(status_code=409, detail=f"No DMS dump was uploaded for {day:%d %b %Y}.")
-    for dump in dumps:
-        match_dump(connection, tenant_id=tenant_id, dump_id=dump["dump_id"])
     report = build_outlet_report(connection, tenant_id=tenant_id, dealers=dealers, day=day, today=today)
     report["rows"] = _rows(connection, tenant_id, dealers, dumps)
     report["deliveryScope"] = _delivery_scope_rows(connection, tenant_id, dealers, dumps)
@@ -211,6 +206,18 @@ def generate_report(connection: Connection, *, tenant_id: str, dealers: list[dic
         {**counter(connection, tenant_id, d["dealer_id"], d["dump_kind"], upto=day),
          "dealerName": next((x["dealerName"] for x in dealers if x["dealerId"] == d["dealer_id"]), None)}
         for d in sorted(dumps, key=lambda x: (x["dealer_id"], x["dump_kind"]))]
+    return report
+
+
+def generate_report(connection: Connection, *, tenant_id: str, dealers: list[dict[str, Any]], day: date,
+                    actor_id: str) -> dict[str, Any]:
+    dealer_ids = [d["dealerId"] for d in dealers]
+    dumps = _day_dumps(connection, tenant_id, dealer_ids, day)
+    if not dumps:
+        raise HTTPException(status_code=409, detail=f"No DMS dump was uploaded for {day:%d %b %Y}.")
+    for dump in dumps:
+        match_dump(connection, tenant_id=tenant_id, dump_id=dump["dump_id"])
+    report = compute_report(connection, tenant_id=tenant_id, dealers=dealers, day=day, dumps=dumps)
     report_id = uuid4()
     by_name = _name_of(connection, actor_id)
     connection.execute(
@@ -392,4 +399,9 @@ def export_dms_report(
         headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
-__all__ = ["build_report_excel", "generate_report", "router"]
+__all__ = [
+    "build_report_excel",
+    "compute_report",
+    "generate_report",
+    "router",
+]
