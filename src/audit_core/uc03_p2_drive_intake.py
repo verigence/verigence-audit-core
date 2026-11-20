@@ -136,6 +136,9 @@ _STALE_CLAIM = timedelta(hours=2)
 # A Drive bulk upload that has had no file added for this long, and was never submitted, was
 # left by a run the worker was stopped in (a deploy, 19 Nov 2026: 34 of 45 files taken, never read).
 _ORPHAN_QUIET = timedelta(minutes=15)
+# A file in a photos folder whose customer folder still has no documents this long after it
+# was seen (past its day's run) is read as a document: nothing else would ever read it.
+_LONELY_AFTER = timedelta(hours=12)
 _NAME_NOISE = frozenset({"OTF", "BOOKING", "BKG", "NO", "NUMBER", "DELIVERY", "FILE", "FILES", "CUSTOMER", "MOBILE",
                          "MOB", "PH", "PHONE"})
 _PHOTO_FOLDER = re.compile(r"^\s*(photo|pic)", re.IGNORECASE)
@@ -1182,6 +1185,37 @@ def submit_bulk(connection: Connection, tenant_id: str, bulk_id: Any) -> int | N
     return n
 
 
+def read_lonely_photos(engine: Engine, tenant_id: str, *, older_than: timedelta = _LONELY_AFTER) -> int:
+    """Every file put in Drive is read (product owner 2026-11-20). A file in a customer's
+    photos folder waits for the journey its documents make -- but when the folder has no
+    documents at all, nothing ever makes one (16 Nov: "Ayush Mudgal Booking .pdf" put in
+    Photos_other_docs, waiting for good). Past its day, such a file is read as a document."""
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        rows = connection.execute(
+            text(
+                """
+                UPDATE auditcore.p2_drive_files f
+                   SET lane='DOCUMENT', file_status='NEW', run_id=NULL, updated_at_utc=now(),
+                       detail='In the photos folder of a customer folder with no documents: read as a document'
+                 WHERE f.tenant_id=:t AND f.lane='PHOTO' AND f.file_status='WAITING'
+                   AND f.customer_folder_id IS NOT NULL AND f.journey_id IS NULL
+                   AND lower(f.mime_type) = ANY(:types) AND COALESCE(f.size_bytes, 0) <= :max
+                   AND f.seen_at_utc < :before
+                   AND NOT EXISTS (SELECT 1 FROM auditcore.p2_drive_files d
+                                    WHERE d.tenant_id=f.tenant_id AND d.customer_folder_id=f.customer_folder_id
+                                      AND d.lane='DOCUMENT')
+                RETURNING f.file_name
+                """
+            ),
+            {"t": tenant_id, "types": sorted(DOCUMENT_TYPES), "max": MAX_DOCUMENT_BYTES,
+             "before": datetime.now(UTC) - older_than},
+        ).scalars().all()
+    if rows:
+        logger.warning("p2_drive_lonely_photos_read_as_documents", tenant_id=tenant_id, files=list(rows))
+    return len(rows)
+
+
 def submit_left_behind(engine: Engine, tenant_id: str, *, run_id: Any = None,
                        quiet: timedelta = _ORPHAN_QUIET) -> int:
     """Drive bulk uploads a stopped run took files into but never submitted, submitted now.
@@ -1333,6 +1367,7 @@ def run_drive_intake(engine: Engine, tag: str, tenant_ids: list[str] | None = No
     # A run started again after the worker was stopped (a deploy) first submits what its
     # earlier attempt took: those files are TAKEN, so the claim below no longer sees them.
     submit_left_behind(engine, tenant_id, run_id=run_id)
+    read_lonely_photos(engine, tenant_id)
     files = _claim(engine, tenant_id, run)
     submitter = run["requested_by_actor_id"] if run["run_trigger"] == "PC_SUBMIT" else None
     documents: dict[tuple[str, str], list[dict[str, Any]]] = {}
