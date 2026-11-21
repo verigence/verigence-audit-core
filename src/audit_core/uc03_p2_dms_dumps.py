@@ -622,8 +622,8 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any], taken: frozen
 
     # A delivery row: the chassis first. It is the vehicle itself, printed on the gate pass,
     # invoice, insurance and RTO papers; the booking number comes from one booking form, the
-    # page most easily filed on the wrong Journey (2026-11-21: Aditya's B-13489938 form filed on
-    # ADI-BO-261120-022 too took that Journey from its own chassis T6K67676's row).
+    # page most easily filed on the wrong Journey (2026-11-21: another customer's booking form
+    # filed on ADI-BO-261120-022 took that Journey from the row carrying its own chassis).
     if kind == DELIVERY and (key := chassis_key(row.get("chassis"))) is not None \
             and (jid := one(index.by_chassis.get(key, set()))) is not None:
         return jid, "CHASSIS"

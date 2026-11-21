@@ -140,16 +140,16 @@ def test_a_delivery_row_goes_by_its_chassis_before_a_misfiled_booking_form() -> 
         "a": {"journeyId": "a", "model": "BOLERO NEO", "names": {"Customer A"}, "hasDelivery": True, "outletId": None},
         "b": {"journeyId": "b", "model": "XUV 700", "names": {"Customer B"}, "hasDelivery": True, "outletId": None},
     }
-    for k in m.journey_ref_keys("B-13489938"):  # B's form, misfiled on A
+    for k in m.journey_ref_keys("B-00000002"):  # B's form, misfiled on A
         index.by_ref[k].add("a")
-    index.by_chassis[m.chassis_key("T6K67676")].add("a")
-    index.by_chassis[m.chassis_key("T6K88805")].add("b")
-    row_b = {"booking_number": "B-13489938", "chassis": "T6K88805", "customer_name": "Customer B"}
-    row_a = {"booking_number": "B-13489891", "chassis": "T6K67676", "customer_name": "Customer A"}
+    index.by_chassis[m.chassis_key("T0A00001")].add("a")
+    index.by_chassis[m.chassis_key("T0A00002")].add("b")
+    row_b = {"booking_number": "B-00000002", "chassis": "T0A00002", "customer_name": "Customer B"}
+    row_a = {"booking_number": "B-00000001", "chassis": "T0A00001", "customer_name": "Customer A"}
     assert m.match_row(index, m.DELIVERY, row_b) == ("b", "CHASSIS")
     assert m.match_row(index, m.DELIVERY, row_a, {"b"}) == ("a", "CHASSIS")
     # No chassis on the row: the booking number still finds it.
-    assert m.match_row(index, m.DELIVERY, {"booking_number": "B-13489938"}) == ("a", "BOOKING_NUMBER")
+    assert m.match_row(index, m.DELIVERY, {"booking_number": "B-00000002"}) == ("a", "BOOKING_NUMBER")
 
 
 def test_dump_locations_place_rows_on_outlets() -> None:
