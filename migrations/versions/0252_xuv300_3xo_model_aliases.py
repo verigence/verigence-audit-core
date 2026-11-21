@@ -11,6 +11,14 @@ booking forms say "XUV 300" / "XUV300", 35 say "3XO".
 
 The EV spellings name the EV: the longest alias the words spell wins, so
 "3XO EV" / "XUV 300 EV" never fall into the petrol 3XO.
+
+Customer documents only (new column ``applies_to``: ALL | DOCUMENTS). The
+OEM's own bulletins keep "XUV300" as its own line -- September's and
+October's exchange bulletins print "XUV300 Rs 20,000" beside "XUV 3XO
+(Including REVX) Rs 50,000", the old model's offer -- and an alias must never
+merge two models' offers (2026-10-20). The bulletin and price-list ingests
+read only ALL aliases; the SKU resolver reading booking forms, NDCs and cost
+sheets reads every alias.
 """
 from __future__ import annotations
 
@@ -34,13 +42,18 @@ _ALIASES = {
 
 
 def upgrade() -> None:
+    op.execute(
+        "ALTER TABLE auditcore.oem_model_aliases "
+        "ADD COLUMN applies_to varchar(16) NOT NULL DEFAULT 'ALL' "
+        "CONSTRAINT oem_model_aliases_applies_to_chk CHECK (applies_to IN ('ALL', 'DOCUMENTS'))"
+    )
     op.get_bind().execute(
         text(
             """
-            INSERT INTO auditcore.oem_model_aliases (oem_code, alias_text, canonical_model_name)
-            VALUES ('MAHINDRA', :alias_text, :canonical_model_name)
+            INSERT INTO auditcore.oem_model_aliases (oem_code, alias_text, canonical_model_name, applies_to)
+            VALUES ('MAHINDRA', :alias_text, :canonical_model_name, 'DOCUMENTS')
             ON CONFLICT (oem_code, alias_text) DO UPDATE
-              SET canonical_model_name = EXCLUDED.canonical_model_name
+              SET canonical_model_name = EXCLUDED.canonical_model_name, applies_to = 'DOCUMENTS'
             """
         ),
         [{"alias_text": a, "canonical_model_name": c} for a, c in _ALIASES.items()],
@@ -52,3 +65,4 @@ def downgrade() -> None:
         text("DELETE FROM auditcore.oem_model_aliases WHERE oem_code='MAHINDRA' AND alias_text = ANY(:a)"),
         {"a": list(_ALIASES)},
     )
+    op.execute("ALTER TABLE auditcore.oem_model_aliases DROP COLUMN applies_to")

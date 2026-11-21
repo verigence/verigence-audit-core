@@ -828,7 +828,9 @@ def test_integration_catalogue_search_lists_the_closest_skus_when_the_model_was_
         {"model": "XUV 3XO", "variant": "AX7L PET MT", "fuel": "PETROL", "transmission": "MT", "trim": "AX7L",
          "components": {"EX_SHOWROOM": "1200000"}},
     ])
-    _set_journey_product(c, "XUV300", "W7L EV")
+    # A misread model name ("XUW300"; "XUV300" itself is an alias of the
+    # XUV 3XO for documents since migration 0252).
+    _set_journey_product(c, "XUW300", "W7L EV")
 
     result = mr.sync_model_resolution(
         c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="",
@@ -861,7 +863,9 @@ def test_integration_catalogue_search_suggests_and_the_pc_accepts(mahindra_journ
         {"model": "XUV 3XO EV", "variant": "AX7L", "fuel": "ELECTRIC", "trim": "AX7L",
          "components": {"EX_SHOWROOM": "1700000"}},
     ])
-    _set_journey_product(c, "XUV300", "W7L EV")
+    # A misread model name ("XUW300"; "XUV300" itself is an alias of the
+    # XUV 3XO for documents since migration 0252).
+    _set_journey_product(c, "XUW300", "W7L EV")
     _set_commercial(c, "ex_showroom_price", "1700000")
 
     result = mr.sync_model_resolution(
@@ -893,7 +897,9 @@ def test_rejecting_the_closest_match_leaves_the_pc_to_pick_and_never_resuggests_
         {"model": "XUV 3XO EV", "variant": "AX7L", "fuel": "ELECTRIC", "trim": "AX7L",
          "components": {"EX_SHOWROOM": "1700000"}},
     ])
-    _set_journey_product(c, "XUV300", "W7L EV")
+    # A misread model name ("XUW300"; "XUV300" itself is an alias of the
+    # XUV 3XO for documents since migration 0252).
+    _set_journey_product(c, "XUW300", "W7L EV")
     _set_commercial(c, "ex_showroom_price", "1700000")
     mr.sync_model_resolution(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
     task = _sku_task(c, "SKU_CLOSEST_MATCH_CONFIRM")
