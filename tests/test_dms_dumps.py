@@ -268,14 +268,57 @@ def test_a_booking_row_matches_on_the_name_and_the_booking_date() -> None:
     index = m.JourneyIndex()
     index.journeys = {
         "j1": {"journeyId": "j1", "model": "XEV9S", "names": {"RENUBALA ROUT"}, "hasDelivery": False,
-               "outletId": None, "bookingDate": date(2026, 11, 7)},
+               "outletId": None, "bookingDay": date(2026, 11, 7)},
         "j2": {"journeyId": "j2", "model": "THAR", "names": {"Renubala Rout"}, "hasDelivery": False,
-               "outletId": None, "bookingDate": date(2026, 9, 1)},
+               "outletId": None, "bookingDay": date(2026, 9, 1)},
     }
     row = {"customer_name": "RENUBALA ROUT", "model": "Something else", "event_date": date(2026, 11, 8)}
     assert m.match_row(index, m.BOOKING, row) == ("j1", "NAME_DATE")
     # a month away from both, a different model: no Journey is taken on the name alone
     assert m.match_row(index, m.BOOKING, {**row, "event_date": date(2026, 10, 10)}) == (None, None)
+
+
+def test_the_name_and_a_mobile_or_booking_number_a_digit_or_two_off_find_the_customer() -> None:
+    """2026-11-21, Aditya's Sujit Kumar Bastia: the booking form read 9337354361 for 9337359361,
+    B-1348698 for B-13486428, its date as 2020 and the model XUV-9S for XEV 9S."""
+    from datetime import date
+
+    def journey(jid: str, name: str, mobiles: set[str], refs: set[str]) -> dict:
+        return {"journeyId": jid, "model": "XUV-9S", "names": {name}, "hasDelivery": False, "outletId": None,
+                "bookingDate": None, "bookingDay": date(2026, 11, 20), "mobiles": mobiles, "refs": refs}
+
+    index = m.JourneyIndex()
+    index.journeys = {"j1": journey("j1", "Sujit Kumar Bastia", {"9337354361"}, {"1348698"}),
+                      "j2": journey("j2", "Anita Sahoo", {"9337359361"}, set())}
+    row = {"customer_name": "Sujit Kumar bastia", "mobile": "9337359361", "booking_number": "B-13486428",
+           "dms_booking_number": "OTF27A092698", "model": "XEV 9S", "event_date": date(2026, 11, 7)}
+    # j2 holds the DMS mobile but is another customer: the mobile alone takes it -- so the
+    # misread case is tested with the exact mobile on no Journey.
+    del index.journeys["j2"]
+    assert m.match_row(index, m.BOOKING, row) == ("j1", "NAME_NEAR_ID")
+    # the booking number alone a digit or two off
+    assert m.match_row(index, m.BOOKING, {**row, "mobile": "7000000000"}) == ("j1", "NAME_NEAR_ID")
+    # the same name, a mobile and booking number far off: another customer, not taken
+    assert m.match_row(index, m.BOOKING, {**row, "mobile": "7000000000", "booking_number": "B-13999999",
+                                          "dms_booking_number": None}) == (None, None)
+    # two Journeys of that name, both near: not decided on the name
+    index.journeys["j3"] = journey("j3", "SUJIT KUMAR BASTIA", {"9337359362"}, set())
+    assert m.match_row(index, m.BOOKING, row) == (None, None)
+    assert m.near_mobile("9337359361", {"9337354361"}) and not m.near_mobile("9337359361", {"9437000361"})
+    assert m.near_booking({"13486428"}, {"1348698"}) and not m.near_booking({"21913"}, {"21914"})
+
+
+def test_name_and_date_use_the_upload_day_when_the_form_s_date_is_unreadable() -> None:
+    """The booking date rule (2026-11-07): the booking form's date, else the day the booking
+    documents were uploaded."""
+    from datetime import date
+
+    index = m.JourneyIndex()
+    index.journeys = {"j1": {"journeyId": "j1", "model": "THAR", "names": {"Pankaj Dutta"}, "hasDelivery": False,
+                             "outletId": None, "bookingDate": None, "bookingDay": date(2026, 11, 10),
+                             "mobiles": set(), "refs": set()}}
+    row = {"customer_name": "PANKAJ DUTTA", "model": "XUV 7XO", "event_date": date(2026, 11, 9)}
+    assert m.match_row(index, m.BOOKING, row) == ("j1", "NAME_DATE")
 
 
 def test_a_dump_is_compared_from_the_first_to_its_upload_day() -> None:
