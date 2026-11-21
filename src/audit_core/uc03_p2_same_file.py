@@ -492,8 +492,8 @@ class FileIdentity:
         """Nameless only because its customer's papers are not read: a booking form, PAN,
         Aadhaar or GST certificate on file with nothing read off it. Not a receipt or delivery
         papers on their own -- another customer's file, maybe (2026-11-21: ADI-BO-261120-026,
-        Dr. Rabindra Nath Behera's booking form beside Maddi Narendra Kumar's receipt, was
-        joined into his booking on the receipt alone and its booking form took his)."""
+        one customer's unread booking form beside another customer's receipt, was joined into
+        the receipt's booking on the receipt alone and its booking form replaced the right one)."""
         return self.nameless and bool(self.identity_documents)
 
     @property

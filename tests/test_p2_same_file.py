@@ -1703,10 +1703,10 @@ def test_a_nameless_file_of_another_vehicle_is_left_alone(tenant):
 
 
 def test_a_file_whose_booking_form_is_not_read_is_not_joined_on_a_receipt():
-    """2026-11-21: ADI-BO-261120-026 held Dr. Rabindra Nath Behera's booking form (not read yet)
-    beside Maddi Narendra Kumar's receipt. Called nameless, it was joined into his booking on the
-    receipt alone and its booking form replaced his. A file with a customer's papers on it, read
-    or not, is not nameless; a receipt or delivery papers on their own still join."""
+    """2026-11-21: ADI-BO-261120-026 held customer B's booking form (not read yet) beside
+    customer A's receipt. Called nameless, it was joined into A's booking on the receipt alone
+    and its booking form replaced A's. A file with a customer's papers on it, read or not, is
+    not nameless; a receipt or delivery papers on their own still join."""
     dealer = uuid4()
     booking = _identity(dealer_id=dealer, receipt_keys=frozenset({_RECEIPT_KEY}))
     for kind in ("booking_form", "booking_docket", "pan_card", "aadhaar", "gst_certificate"):
