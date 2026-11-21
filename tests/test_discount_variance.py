@@ -12,7 +12,6 @@ from sqlalchemy import text
 
 from audit_core.db import set_tenant_context
 from audit_core.uc03_discount_variance import (
-    KIT_AS_CASH,
     OVER,
     UNDER,
     UNKNOWN,
@@ -303,19 +302,37 @@ def _kit(entitled="50000", billed=None, eligibility="ELIGIBLE_UNCLAIMED"):
               eligibility=eligibility)
 
 
-def test_an_unused_accessories_kit_given_as_cash_is_listed_apart_not_as_excess():
+def test_an_unused_accessories_kit_given_as_cash_is_the_scheme_availed_not_listed():
     """Scorpio Classic: the consumer scheme gives a Rs 50,000 accessories kit,
-    the NDC gives Rs 50,000 cash. The kit is given as cash -- not excess."""
+    the NDC gives Rs 50,000 cash. Product owner 2026-11-21 (decision 1): as
+    per the consumer scheme, so the scheme availed -- not a breach, not listed."""
     cash = _d("CASH_DISCOUNT", "0", "50000", billed_from="document", eligibility="NOT_ELIGIBLE")
-    rows = discount_variance_rows(_view([cash, _kit()]))
-    assert [(r["status"], r["variance"], r["kit"]) for r in rows] == [(KIT_AS_CASH, "50000", "50000")]
+    assert discount_variance_rows(_view([cash, _kit()])) == []
 
 
 def test_only_what_is_above_the_cash_entitlement_and_the_kit_is_over():
     cash = _d("CASH_DISCOUNT", "10000", "80000", billed_from="document", eligibility="ELIGIBLE")
     rows = discount_variance_rows(_view([cash, _kit("50000")]))
-    assert [(r["status"], r["entitled"], r["variance"]) for r in rows] == [
-        (KIT_AS_CASH, "10000", "50000"), (OVER, "60000", "20000")]
+    assert [(r["status"], r["entitled"], r["variance"]) for r in rows] == [(OVER, "60000", "20000")]
+
+
+def test_the_whole_consumer_package_taken_as_cash_is_the_scheme_availed():
+    """Thar Roxx AX7L DAT 2WD (Shivnath, 2026-11-21): the September scheme gives
+    accessories Rs 50,001 and the 4th-year warranty Rs 19,999, no cash; the NDC
+    charges both and takes "SCHEME Rs 70,000" off. Within the package: availed,
+    with a system remark naming both."""
+    from audit_core import uc03_discount_given as dg
+    from audit_core.uc03_system_remarks import scheme_availed_remarks
+
+    cash = _d("CASH_DISCOUNT", "0", "70000", billed_from="document", eligibility="NOT_ELIGIBLE")
+    ew = _d("EXT_WARRANTY_4TH_YR", "19999", None, billed_from=None, eligibility="ELIGIBLE_UNCLAIMED")
+    discounts = [cash, _kit("50001"), ew]
+    assert discount_variance_rows(_view(discounts)) == []
+    [item] = [i for i in dg.assess(discounts) if i["row"]["key"] == "CASH_DISCOUNT"]
+    assert item["status"] == "WITHIN" and item["entitled"] == Decimal(70000)
+    assert [t["key"] for t in item["schemeAvailed"]["inKind"]] == ["ACCESSORIES_KIT", "EXT_WARRANTY_4TH_YR"]
+    [remark] = scheme_availed_remarks(discounts)
+    assert remark["code"] == "CONSUMER_SCHEME_AVAILED" and "₹50,001" in remark["text"] and "₹19,999" in remark["text"]
 
 
 def test_a_kit_an_accessories_invoice_uses_is_not_given_as_cash():
@@ -445,17 +462,6 @@ def test_a_discount_read_from_an_ndc_that_does_not_add_up_is_listed_apart_not_ex
               sources=[ndc, other])
     [item] = discount_variance_rows(_view([both], policy="ACCOUNT_STATEMENT"), doubt)
     assert item["status"] == OVER
-
-
-def test_a_kit_given_as_cash_shows_the_kit_offer():
-    """2026-11-17: 41 kit-as-cash rows (Scorpio Classic, kit-only offer) showed no offer:
-    the scheme sits on the kit line, not on the cash line."""
-    cash = _d("CASH_DISCOUNT", "0", "50000.00", billed_from="statement", eligibility="ELIGIBLE")
-    kit = {**_d("ACCESSORIES_KIT", "50000", None, billed_from=None, eligibility="ELIGIBLE"),
-           "scheme": {"name": "Mahindra Consumer — SCORPIO CLASSIC", "code": "MAH_CONSUMER_SC"}}
-    [item] = discount_variance_rows(_view([cash, kit], policy="ACCOUNT_STATEMENT"))
-    assert item["status"] == KIT_AS_CASH
-    assert item["offer"]["source"] == "Mahindra Consumer — SCORPIO CLASSIC" and item["offer"]["kit"] == "50000.00"
 
 
 def test_the_rule_does_not_pass_a_discount_it_could_not_judge():
