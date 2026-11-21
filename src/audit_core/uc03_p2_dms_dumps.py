@@ -620,13 +620,17 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any], taken: frozen
     def one(found: set[str]) -> str | None:
         return _one(set(found) - set(taken))
 
+    # A delivery row: the chassis first. It is the vehicle itself, printed on the gate pass,
+    # invoice, insurance and RTO papers; the booking number comes from one booking form, the
+    # page most easily filed on the wrong Journey (2026-11-21: Aditya's B-13489938 form filed on
+    # ADI-BO-261120-022 too took that Journey from its own chassis T6K67676's row).
+    if kind == DELIVERY and (key := chassis_key(row.get("chassis"))) is not None \
+            and (jid := one(index.by_chassis.get(key, set()))) is not None:
+        return jid, "CHASSIS"
     strong = strong_booking_keys(row.get("booking_number"), row.get("dms_booking_number"))
     for key in sorted(booking_keys(row.get("booking_number"), row.get("dms_booking_number")), key=lambda k: k not in strong):
         if (jid := one(index.by_ref.get(key, set()))) is not None and (key in strong or _same_customer(index, jid, row)):
             return jid, "BOOKING_NUMBER"
-    if kind == DELIVERY and (key := chassis_key(row.get("chassis"))) is not None \
-            and (jid := one(index.by_chassis.get(key, set()))) is not None:
-        return jid, "CHASSIS"
     if (key := row.get("mobile")) and (found := set(index.by_mobile.get(key, set())) - set(taken)):
         if (jid := one(found)) is not None:
             return jid, "MOBILE"
