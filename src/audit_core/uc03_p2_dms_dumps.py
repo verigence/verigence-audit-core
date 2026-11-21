@@ -192,6 +192,11 @@ def _columns(headers: list[str], names: dict[str, tuple[str, ...]], rows: list[t
         found = [i for i, h in enumerate(headers) if h in aliases and i not in used]
         if not found:
             continue
+        # Of columns under the same name, the ones that carry values (2026-11-20: Utkal's delivery
+        # sheet heads two columns BOOKING DATE, the first empty; the empty one was read, every
+        # row lost its booking date and bookings of August were marked Inscope).
+        filled = [i for i in found if any(i < len(r) and r[i] not in (None, "") for r in rows)]
+        found = filled or found
         if key == "customer_name":
             found = [i for i in found if not _mostly(rows, i, _is_phone)] or found
         if key == "outlet_label" and len(found) > 1:
@@ -231,7 +236,11 @@ def parse_date(value: Any) -> date | None:
             return datetime.strptime(raw, fmt).date()  # noqa: DTZ007 -- a calendar day
         except ValueError:
             continue
-    return None
+    try:
+        # ISO as the stored raw row keeps a date ("2026-08-11T00:00:00").
+        return datetime.fromisoformat(raw).date()
+    except ValueError:
+        return None
 
 
 def _text(value: Any, limit: int) -> str | None:
@@ -325,6 +334,10 @@ def _rows(kind: str, headers: list[str], body: list[tuple[Any, ...]], sheet: str
             "consultant": _text(cell("consultant"), 200),
             "raw": {h: _jsonable(v) for h, v in zip(headers, r, strict=False) if h and v not in (None, "")},
         }
+        if kind == DELIVERY and row["booking_date"] is None:
+            # The sheet's BOOKING DATE, however its columns were laid out: it decides Inscope /
+            # Outscope (product owner 2026-11-19).
+            row["booking_date"] = parse_date(row["raw"].get("BOOKING DATE"))
         keyed = row["chassis"] if kind == DELIVERY else (row["booking_number"] or row["dms_booking_number"])
         if not keyed and not (row["customer_name"] and (row["mobile"] or row["event_date"])):
             continue  # a blank or total line
