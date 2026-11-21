@@ -873,13 +873,19 @@ def match_lock_key(tenant_id: str, dump_id: Any) -> str:
     return f"dms-match:{tenant_id}:{dump_id}"
 
 
-def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict[str, int]:
-    """Match (again) every row of one dump, store the outcome and mark the Journeys found.
-    A row dated outside dump_window is OUT_OF_PERIOD: kept, not compared, not counted.
-    One match at a time per dump, whoever asks (upload, Match again, Refresh from Verigence,
-    report generation or export, DMS_REMATCH): the others wait for it."""
-    connection.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
-                       {"k": match_lock_key(tenant_id, dump_id)})
+@dataclass
+class DumpPlan:
+    """What matching a dump would store: one update per row, the Journeys synced, the counts."""
+    dump: dict[str, Any]
+    updates: list[dict[str, Any]]
+    synced: list[str]
+    counts: dict[str, int]
+
+
+def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpPlan:
+    """Match every row of one dump with Verigence as it is now, reading only: the outcome each
+    row would get. match_dump stores it; tools/dms_replay.py compares it across code versions
+    on the live dumps before a change is merged (product owner 2026-11-21)."""
     dump = connection.execute(
         text("SELECT dump_kind, dealer_id, period_month, business_date FROM auditcore.p2_dms_dumps "
              "WHERE tenant_id = :t AND dump_id = :id"),
@@ -960,6 +966,18 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
                         "jc": (journey or {}).get("customer"), "na": agrees})
         if jid and outcome != CANCELLED:
             synced.append(jid)
+    return DumpPlan(dict(dump), updates, synced, counts)
+
+
+def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict[str, int]:
+    """Match (again) every row of one dump, store the outcome and mark the Journeys found.
+    A row dated outside dump_window is OUT_OF_PERIOD: kept, not compared, not counted.
+    One match at a time per dump, whoever asks (upload, Match again, Refresh from Verigence,
+    report generation or export, DMS_REMATCH): the others wait for it."""
+    connection.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
+                       {"k": match_lock_key(tenant_id, dump_id)})
+    plan = plan_dump(connection, tenant_id=tenant_id, dump_id=dump_id)
+    kind, updates, synced, counts = plan.dump["dump_kind"], plan.updates, plan.synced, plan.counts
     if updates:
         connection.execute(
             text("""
