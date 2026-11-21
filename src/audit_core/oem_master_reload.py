@@ -270,7 +270,11 @@ SCHEME_RELOAD_PLAN: tuple[tuple[str, str, date, date | None], ...] = (
 # The dates printed above are checked against each document; a file listed
 # here is in force to the date given instead. Product owner, 5 Nov 2026:
 # November has no new consumer, exchange or corporate bulletin -- October's
-# stand for November.
+# stand for November. Superseded for the consumer bulletin on 21 Nov 2026:
+# the "Monthly Consumer Scheme Bulletin Nov'26" (w.e.f. 4 Nov) exists and is
+# loaded by the "-novconsumer" job below, so from 4 Nov November's consumer
+# schemes answer, not October's. Do not re-run "-schemes" without first
+# taking that into account (its October-equals-November check now fails).
 SCHEME_VALID_TO: dict[str, date] = {
     "2026-10/Consumer Scheme Bhubaneswar RO_Oct'26.pdf": date(2026, 11, 30),
     "2026-10/Exchange scheme Oct'26 - B'newar_Raipur_Patna_Guwa.pdf": date(2026, 11, 30),
@@ -1237,6 +1241,122 @@ def load_month_tenant(connection: Connection, *, tenant_id: str, tag: str, store
 
 # ── the deals the reloaded masters price (2026-11-05) ─────────────────────────
 # A deal's standards and entitlements are materialised when its facts move.
+# ── November's consumer bulletin (2026-11-21) ──────────────────────────────────
+# A tag containing "-novconsumer" loads the "Monthly Consumer Scheme Bulletin
+# Nov'26_All Vin, Bhubaneswar RO, w.e.f. 4th Nov'26" through the same ingest
+# the SuperAdmin upload uses, then re-prices every Journey priced from 4 Nov.
+# The 5 Nov plan assumed October's consumer schemes stood for November; the
+# product owner supplied November's bulletin on 21 Nov. A November scheme
+# replaces October's of the same code from 4 Nov; an October scheme November
+# no longer names is withdrawn from 4 Nov (_tombstone_absent_schemes). The
+# exchange and corporate masters are not touched.
+NOV_CONSUMER_FILE = "2026-11/Consumer Scheme Bhubaneswar RO_Nov'26.pdf"
+NOV_CONSUMER_FROM = date(2026, 11, 4)
+NOV_CONSUMER_TO = date(2026, 11, 30)
+NOV_CONSUMER_ROWS = 51
+NOV_CONSUMER_SPOT_CHECKS: tuple[tuple[str, str, date, str, Decimal], ...] = (
+    # changed in November
+    ("SCORPIO CLASSIC", "Classic S BS6.2 - E", date(2026, 11, 10), "ACCESSORIES_KIT", Decimal(65000)),
+    ("NEW THAR 2WD & 4WD", "LXT D AT 4WD 4S HT BS6.2", date(2026, 11, 10), "CASH_DISCOUNT", Decimal(82002)),
+    # new in November
+    ("XUV 3XO", "REVX EDGE PM MT", date(2026, 11, 10), "CASH_DISCOUNT", Decimal(50000)),
+    # "MAXX HD 1.7 LX & CBC" offers the plain LX too (split_variant_cell, 2026-11-21)
+    ("MAXX HD", "MAXX HD 1.7 LX BS6.2", date(2026, 11, 10), "CASH_DISCOUNT", Decimal(22000)),
+    # the day before stays October's
+    ("SCORPIO CLASSIC", "Classic S BS6.2 - E", date(2026, 11, 3), "ACCESSORIES_KIT", Decimal(50000)),
+)
+
+
+def load_november_consumer_tenant(connection: Connection, *, tenant_id: str, tag: str, store: bool) -> dict[str, Any]:
+    """November's consumer bulletin and every check, on one open transaction
+    (the caller commits or rolls back)."""
+    from audit_core.oem_master_parsers import parse_master
+    from audit_core.oem_price_masters import ingest_discount_document
+    from audit_core.uc03_deal_reconciliation import _applicable_benefits
+
+    set_platform_super_admin_context(connection)
+    set_tenant_context(connection, tenant_id)
+    project = connection.execute(text(
+        "SELECT p.oem_id, o.oem_code FROM auditcore.projects p JOIN auditcore.oems o ON o.oem_id = p.oem_id "
+        "WHERE p.tenant_id = :t"), {"t": tenant_id}).mappings().one()
+    actor = f"worker:{tag}"[:160]
+    checks: list[dict[str, Any]] = []
+
+    def check(name: str, ok: bool, expected: Any, actual: Any) -> None:
+        checks.append({"check": name, "ok": bool(ok), "expected": expected, "actual": actual})
+
+    def consumer_rows(on: date) -> set[tuple[str, str, str]]:
+        return {(str(r["scheme_code"]), str(r["model_name"]), str(r["variant_id"]))
+                for r in _standing_rows(connection, tenant_id, on) if str(r["scheme_code"]).startswith("MAH_CONSUMER")}
+
+    eve = NOV_CONSUMER_FROM - timedelta(days=1)
+    eve_before = consumer_rows(eve)
+    path = DATA_DIR / NOV_CONSUMER_FILE
+    content = path.read_bytes()
+    parsed = parse_master("CONSUMER_SCHEME", content, filename=path.name)
+    check(f"{path.name}: the dates the document prints",
+          parsed.effective_from_hint == NOV_CONSUMER_FROM and parsed.effective_to_hint == NOV_CONSUMER_TO,
+          f"{NOV_CONSUMER_FROM} to {NOV_CONSUMER_TO}", f"{parsed.effective_from_hint} to {parsed.effective_to_hint}")
+    check(f"{path.name}: every row reconciles", not parsed.errors, [], parsed.errors[:20])
+    check(f"{path.name}: rows", len(parsed.discount_rows) == NOV_CONSUMER_ROWS, NOV_CONSUMER_ROWS,
+          len(parsed.discount_rows))
+
+    uploads: list[dict[str, Any]] = []
+    # Published on its own date and again on any later date in its validity a
+    # consumer version was loaded on: the later upload on a date wins.
+    for on in [NOV_CONSUMER_FROM, *_shadow_dates(connection, tenant_id, "CONSUMER_SCHEME", NOV_CONSUMER_FROM,
+                                                 NOV_CONSUMER_TO)]:
+        upload_id = connection.execute(text(
+            """
+            INSERT INTO auditcore.oem_master_uploads (
+                tenant_id, oem_code, master_kind, source_filename, source_sha256, effective_from, status,
+                row_counts, preview, uploaded_by_actor_id
+            ) VALUES (:t, :oem, 'CONSUMER_SCHEME', :name, :sha, :eff, 'STAGED', CAST(:rows AS jsonb),
+                      CAST(:preview AS jsonb), :actor)
+            RETURNING upload_id
+            """
+        ), {"t": tenant_id, "oem": project["oem_code"], "name": path.name, "sha": hashlib.sha256(content).hexdigest(),
+            "eff": on, "rows": json.dumps({"discountRows": len(parsed.discount_rows)}),
+            "preview": json.dumps({"reloadTag": tag, "warnings": parsed.warnings[:50]}), "actor": actor}).scalar_one()
+        summary = ingest_discount_document(
+            connection, tenant_id=tenant_id, oem_id=project["oem_id"], oem_code=project["oem_code"],
+            master_kind="CONSUMER_SCHEME", effective_from=on, effective_to=NOV_CONSUMER_TO, parsed=parsed,
+            actor_id=actor)
+        stored = _store_master_file(tenant_id=tenant_id, oem_code=project["oem_code"], kind="CONSUMER_SCHEME", on=on,
+                                    upload_id=upload_id, path=path, content=content) if store else None
+        connection.execute(text(
+            "UPDATE auditcore.oem_master_uploads SET status = 'PUBLISHED', published_at_utc = now(), "
+            "source_object_key = :key, discount_scheme_summary = CAST(:summary AS jsonb) "
+            "WHERE tenant_id = :t AND upload_id = :u"
+        ), {"key": stored, "summary": json.dumps(summary, default=str), "t": tenant_id, "u": upload_id})
+        uploads.append({"file": path.name, "effectiveFrom": on, "effectiveTo": NOV_CONSUMER_TO, "uploadId": upload_id,
+                        "stored": stored is not None, "published": summary.get("published"),
+                        "tombstoned": summary.get("tombstoned"), "unresolved": summary.get("unresolved"),
+                        "unresolvedVariants": (summary.get("unresolvedVariants") or [])[:80],
+                        "warnings": (summary.get("warnings") or [])[:40]})
+
+    check(f"the consumer schemes standing on {eve} unchanged", consumer_rows(eve) == eve_before, len(eve_before),
+          len(consumer_rows(eve)))
+    for model, variant, on, key, amount in NOV_CONSUMER_SPOT_CHECKS:
+        found = find_book_sku(connection, tenant_id=tenant_id, model_text=model, variant_text=variant, effective_on=on)
+        actual: Any = found["reason"]
+        if found["sku"]:
+            sku = connection.execute(text("SELECT model_id, variant_id FROM auditcore.product_skus "
+                                          "WHERE product_sku_id = :s"), {"s": found["sku"]["product_sku_id"]}).one()
+            benefits = _applicable_benefits(connection, tenant_id=tenant_id, model_id=sku[0], variant_id=sku[1],
+                                            effective_on=on, basis="INDIVIDUAL", variant_name=variant)
+            actual = next((Decimal(str(b["amount_value"])) for b in benefits if b["canonical_key"] == key), None)
+        check(f"{model} {variant} {key} on {on}", actual == amount, str(amount), str(actual))
+    per_model: dict[str, int] = {}
+    for row in _standing_rows(connection, tenant_id, date(2026, 11, 10)):
+        if str(row["scheme_code"]).startswith("MAH_CONSUMER") and (row["criteria"] or {}).get("scope") != "UNRESOLVED":
+            per_model[row["model_name"]] = per_model.get(row["model_name"], 0) + 1
+    for row in checks:
+        logger.info("oem_master_reload_check", tenant_id=tenant_id, tag=tag, **{k: str(v) for k, v in row.items()})
+    return {"checks": checks, "passed": all(c["ok"] for c in checks), "uploads": uploads,
+            "consumerRowsPerModelOn2026-11-10": dict(sorted(per_model.items()))}
+
+
 # Masters published for dates already past (the October bulletins, live from
 # 5 Nov) leave every deal of those dates on the masters it last read --
 # September's schemes for October and November deals on 5 Nov. After a
@@ -1244,6 +1364,8 @@ def load_month_tenant(connection: Connection, *, tenant_id: str, tag: str, store
 # earliest date the job published for is re-priced (the deal check itself,
 # ``sync_deal_reconciliation``), one Journey per transaction.
 def _job_starts(tag: str) -> date | None:
+    if "-novconsumer" in tag:
+        return NOV_CONSUMER_FROM
     if "-month" in tag:
         return MONTH_FROM
     if "-schemes" in tag:
@@ -1348,12 +1470,15 @@ def run_master_reload(engine: Engine, tag: str, *, tenant_ids: list[str] | None 
     (``SCHEME_RELOAD_PLAN``), "-grids" only the two dealer discount grids,
     "-octcarry" completes the October book (``complete_october_tenant``),
     "-month" loads the month's book and grid (``load_month_tenant``),
+    "-novconsumer" November's consumer bulletin (``load_november_consumer_tenant``),
     "-reprice" only runs the deal check again (``reprice_deals``), any
     other tag the price books."""
     commit = tag.endswith("-commit")
     if "-reprice" in tag:
         return _run_reprice_only(engine, tag, commit=commit, tenant_ids=tenant_ids)
-    if "-month" in tag:
+    if "-novconsumer" in tag:
+        job = load_november_consumer_tenant
+    elif "-month" in tag:
         job = load_month_tenant
     elif "-octcarry" in tag:
         job = complete_october_tenant
@@ -1402,6 +1527,7 @@ def run_master_reload(engine: Engine, tag: str, *, tenant_ids: list[str] | None 
 
 __all__ = [
     "GRID_PLAN", "RELOAD_PLAN", "SCHEME_RELOAD_PLAN", "complete_october_tenant", "load_month_tenant",
+    "load_november_consumer_tenant",
     "reload_grids_tenant",
     "reload_schemes_tenant", "reload_tenant", "run_master_reload",
 ]
