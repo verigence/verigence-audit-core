@@ -45,6 +45,15 @@ def dealer():
                                    "VALUES (:t, :d, :c, 'Main') RETURNING outlet_id"),
                               {"t": tenant_id, "d": dealer_id, "c": f"DD-OU-{suffix}"}).scalar_one()
 
+        def vin(jid, document, document_type: str) -> None:
+            """A vehicle paper prints the VIN: a delivery in Verigence (2026-11-21)."""
+            c.execute(text("""INSERT INTO auditcore.journey_document_extracted_fields (tenant_id, journey_id,
+                    di_document_id, source_fact_version, field_key, stage_code, source_document_type_key,
+                    extracted_value, effective_value)
+                    VALUES (:t, :j, :d, 1, 'chassis_number', 'DELIVERY', :k, CAST(:v AS jsonb), CAST(:v AS jsonb))"""),
+                      {"t": tenant_id, "j": jid, "d": document, "k": document_type,
+                       "v": json.dumps(f"MA1TEST{str(jid).replace('-', '')[:10].upper()}")})
+
         def journey(name: str, *, delivery_stage: bool, gate_pass: str | None = None, ndc: str | None = None,
                     receipt: date | None = None, delivery_paper: str | None = None) -> None:
             customer = c.execute(text("""INSERT INTO auditcore.customers (tenant_id, dealer_id, outlet_id,
@@ -63,7 +72,8 @@ def dealer():
                 c.execute(text("""INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id,
                         di_document_id, document_type_key, evidence_purpose, process_area, association_status)
                         VALUES (:t, :j, :c, :s, :d, :k, 'JOURNEY_DOCUMENT', 'DELIVERY', 'ACTIVE')"""),
-                          {"t": tenant_id, "j": jid, "c": customer, "s": uuid4(), "d": uuid4(), "k": delivery_paper})
+                          {"t": tenant_id, "j": jid, "c": customer, "s": uuid4(), "d": (paper := uuid4()), "k": delivery_paper})
+                vin(jid, paper, delivery_paper)
             for document_type, value in (("gate_pass", gate_pass), ("customer_ledger", ndc)):
                 if value is None:
                     continue
@@ -77,6 +87,7 @@ def dealer():
                         extracted_value, effective_value)
                         VALUES (:t, :j, :d, 1, 'delivery_date', 'DELIVERY', :k, CAST(:v AS jsonb), CAST(:v AS jsonb))"""),
                           {"t": tenant_id, "j": jid, "d": document, "k": document_type, "v": json.dumps(value)})
+                vin(jid, document, document_type)
             if receipt is not None:
                 document = uuid4()
                 c.execute(text("""INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id,

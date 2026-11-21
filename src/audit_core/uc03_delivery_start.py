@@ -34,17 +34,34 @@ NOT_A_DELIVERY_START: tuple[str, ...] = (
 
 _TYPES = "ARRAY[" + ", ".join(f"'{t}'" for t in NOT_A_DELIVERY_START) + "]::text[]"
 
-# {t} / {j}: the tenant and journey expressions of the surrounding statement.
+# The papers of the vehicle being sold that print its VIN / chassis -- never the exchange
+# vehicle's (its RC, valuation report, scrappage certificate come with the booking).
+VEHICLE_PAPERS: tuple[str, ...] = (
+    "customer_invoice_dms", "customer_invoice_tally", "tax_invoice_dms", "tax_invoice_tally", "customer_ledger",
+    "form_21",
+    "gate_pass", "accessory_invoice_dms", "accessory_invoice_tally", "insurance_cover", "rto_challan",
+    "ew_invoice", "rsa_invoice", "delivery_order_cover",
+)
+_PAPERS = "ARRAY[" + ", ".join(f"'{t}'" for t in VEHICLE_PAPERS) + "]::text[]"
+
+# The delivery rule (product owner, 2026-11-21): a Journey is a delivery in Verigence when a
+# VIN or chassis number of its own vehicle is on it; with none it is a booking only. The
+# Delivery stage row is not one (it opens within minutes of a booking upload), nor is a bank
+# approval letter, an authorization letter or an exchange vehicle's RC filed under the
+# delivery. A delivery a Reviewer completed by hand stays one.
+# {t} / {j}: the tenant and journey expressions of the surrounding statement. No other brace
+# in it: it is embedded in statements that are .format()-ed again.
 DELIVERY_STARTED_SQL = """(
     EXISTS (
-      SELECT 1 FROM auditcore.evidence e
-      WHERE e.tenant_id={t} AND e.journey_id={j}
-        AND e.association_status='ACTIVE'
-        AND upper(COALESCE(e.process_area,''))='DELIVERY'
-        AND e.document_type_key <> ALL(""" + _TYPES + """)
-    ) OR EXISTS (
-      SELECT 1 FROM auditcore.deliveries d
-      WHERE d.tenant_id={t} AND d.journey_id={j} AND d.actual_delivered_at IS NOT NULL
+      SELECT 1 FROM auditcore.journey_document_extracted_fields f
+      JOIN auditcore.evidence e
+        ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id AND e.di_document_id=f.di_document_id
+       AND e.association_status='ACTIVE'
+      WHERE f.tenant_id={t} AND f.journey_id={j}
+        AND f.field_key IN ('vin_number', 'chassis_number')
+        AND COALESCE(e.document_type_key, f.source_document_type_key) = ANY(""" + _PAPERS + """)
+        AND length(regexp_replace(upper(f.effective_value #>> ARRAY[]::text[]), '[^A-Z0-9]', '', 'g')) >= 6
+        AND (f.effective_value #>> ARRAY[]::text[]) ~ '[0-9]'
     ) OR EXISTS (
       SELECT 1 FROM auditcore.p2_journey_runtime r
       WHERE r.tenant_id={t} AND r.journey_id={j} AND r.delivery_completion_state='COMPLETE'

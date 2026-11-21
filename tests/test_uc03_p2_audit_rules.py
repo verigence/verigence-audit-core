@@ -95,7 +95,7 @@ def _deliver(journey, on: date) -> None:
 
 def _start_delivery(journey) -> None:
     """A delivery document on file: the PC's questions are asked from then on (2026-10-28)."""
-    add_evidence(journey, di_document_id=uuid4(), document_type_key="supporting_document", process_area="DELIVERY")
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
 
 
 def _states(journey) -> dict:

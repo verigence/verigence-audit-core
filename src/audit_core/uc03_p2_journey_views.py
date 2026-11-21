@@ -67,6 +67,7 @@ import re
 from datetime import date
 from typing import Any
 
+from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
 from audit_core.uc03_p2_runtime import swept_pending_sql
 
 PC_VIEWS = ("needs_action", "processing", "with_tl", "closed", "all")
@@ -101,6 +102,9 @@ _VEHICLE_SQL = """NULLIF(concat_ws(' · ',
                  NULLIF(jp.colour_name_snapshot,'')
                ), '')"""
 
+# A delivery in Verigence: its own vehicle's VIN / chassis on it (uc03_delivery_start, 2026-11-21).
+_DELIVERED_J = DELIVERY_STARTED_SQL.format(t="j.tenant_id", j="j.journey_id")
+
 _JOURNEY_FROM_SQL = """auditcore.journeys j
         JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
         JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
@@ -130,7 +134,8 @@ def _business_dates_lateral(condition: str) -> str:
                       ORDER BY e.linked_at_utc DESC LIMIT 1),
                      CASE WHEN CAST(dl.actual_delivered_at AS date) >= CAST(:date_floor AS date)
                           THEN CAST(dl.actual_delivered_at AS date) END,
-                     CAST(dst.first_started_at_utc AT TIME ZONE :timezone AS date)) AS delivery_date
+                     CASE WHEN {_DELIVERED_J}
+                          THEN CAST(dst.first_started_at_utc AT TIME ZONE :timezone AS date) END) AS delivery_date
             FROM (SELECT 1) one
             LEFT JOIN auditcore.bookings bk ON bk.tenant_id = j.tenant_id AND bk.journey_id = j.journey_id
             LEFT JOIN auditcore.deliveries dl ON dl.tenant_id = j.tenant_id AND dl.journey_id = j.journey_id

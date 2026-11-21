@@ -1,3 +1,4 @@
+
 """The Executive / Project Manager dashboard (product owner 2026-11-09: "search
 and view the booking and deliveries filtered by PC, dealership, search by
 customer name, mobile number"): every Dealership of the Project is in an
@@ -6,6 +7,7 @@ breakdown has a Dealership-wise strip, and a mobile number is found however it
 is typed."""
 from __future__ import annotations
 
+import json
 from uuid import UUID, uuid4
 
 import pytest
@@ -248,6 +250,22 @@ def _booking_and_delivery_dates(setup, ids):
                  "VALUES (:t, :j, 'DELIVERY', 'DELIVERY_IN_PROGRESS', 'IN_PROGRESS', 'NOT_EVALUATED', "
                  "'2026-10-03T10:00:00+05:30', now(), 1) ON CONFLICT DO NOTHING"),
             {"t": tenant_id, "j": booking_complete})
+        # A delivery in Verigence carries its vehicle's VIN (product owner 2026-11-21): the gate
+        # pass of booking_complete's delivery and of _seed's closed (delivered) journey.
+        for journey_id, vin in ((booking_complete, "MA1TEST0000000001"), (ids[3], "MA1TEST0000000002")):
+            customer = connection.execute(
+                text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+                {"t": tenant_id, "j": journey_id}).scalar_one()
+            document = uuid4()
+            connection.execute(text("""INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id,
+                    di_document_id, document_type_key, evidence_purpose, process_area, association_status)
+                    VALUES (:t, :j, :c, :s, :d, 'gate_pass', 'JOURNEY_DOCUMENT', 'DELIVERY', 'ACTIVE')"""),
+                               {"t": tenant_id, "j": journey_id, "c": customer, "s": uuid4(), "d": document})
+            connection.execute(text("""INSERT INTO auditcore.journey_document_extracted_fields (tenant_id, journey_id,
+                    di_document_id, source_fact_version, field_key, stage_code, source_document_type_key,
+                    extracted_value, effective_value)
+                    VALUES (:t, :j, :d, 1, 'chassis_number', 'DELIVERY', 'gate_pass', CAST(:v AS jsonb), CAST(:v AS jsonb))"""),
+                               {"t": tenant_id, "j": journey_id, "d": document, "v": json.dumps(vin)})
     return booking, booking_complete, delivery
 
 
