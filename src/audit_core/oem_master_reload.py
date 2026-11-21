@@ -1506,7 +1506,8 @@ def run_master_reload(engine: Engine, tag: str, *, tenant_ids: list[str] | None 
                     status = ("DRY_RUN_PASSED" if outcome["passed"] else "DRY_RUN_FAILED") if not commit else "FAILED"
             except Exception as exc:  # logged, rolled back and recorded
                 transaction.rollback()
-                outcome = {"error": f"{exc.__class__.__name__}: {exc}"[:2000]}
+                # An AuditCoreError's str() is its title ("Validation failed"); its detail says why.
+                outcome = {"error": f"{exc.__class__.__name__}: {getattr(exc, 'detail', None) or exc}"[:2000]}
                 status = "DRY_RUN_FAILED" if not commit else "FAILED"
                 logger.warning("oem_master_reload_error", tenant_id=tenant_id, tag=tag, exc_info=True)
             finally:
