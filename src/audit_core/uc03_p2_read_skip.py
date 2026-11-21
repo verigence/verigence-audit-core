@@ -28,6 +28,7 @@ Three reasons a type is named:
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 from uuid import UUID
 
@@ -137,10 +138,27 @@ def read_skip_types(
     return sorted(skip)
 
 
+# Product owner, 21 Nov 2026: "flex for app uploads go ahead". Set to STANDARD, every upload but
+# the Drive intake goes back to the standard tier without a code change (the worker reads it at start).
+_APP_UPLOAD_TIER = os.environ.get("P2_APP_UPLOAD_GEMINI_TIER", "FLEX").strip().upper()
+
+
 def gemini_tier(connection: Connection, *, tenant_id: str, batch_id: UUID | str) -> str | None:
-    """FLEX for a page of the Drive intake (product owner 12 Nov 2026: "used as batch ... lower
-    the cost"): Gemini's Flex tier, half price, answered in minutes (DI #131, migration 0067).
-    None (the standard tier) for every other upload, where a PC is waiting."""
+    """FLEX for every upload: Gemini's Flex tier, half the price of the standard tier for the
+    same model and the same answer, with no promise on speed (DI #131, migration 0067).
+
+    The Drive intake went first (product owner 12 Nov 2026: "used as batch ... lower the cost");
+    from 21 Nov 2026 a PC's upload in the app and a bulk upload go the same way ("flex for app
+    uploads go ahead"). Measured on the Drive pages of 17-21 Nov (588 readings): half answered
+    in 6 seconds, nine in ten in 17, one in a hundred took over a minute; the standard tier's
+    figures for the same days were 5, 9 and 12 seconds. DI asks Flex on a page's first try only
+    and waits six minutes at most; a retry goes to the standard tier, so the 30 minutes a page
+    has to be read in stand.
+
+    None (the standard tier) only when ``P2_APP_UPLOAD_GEMINI_TIER=STANDARD`` and the page is
+    not from the Drive intake."""
+    if _APP_UPLOAD_TIER != "STANDARD":
+        return "FLEX"
     drive = connection.execute(
         text(
             "SELECT 1 FROM auditcore.p2_bulk_files f JOIN auditcore.p2_bulk_uploads u "

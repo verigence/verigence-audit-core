@@ -138,8 +138,10 @@ def _bulk(journey, batch_id, source: str) -> None:
         )
 
 
-def test_drive_pages_are_read_on_the_flex_tier_and_get_an_hour(journey):
-    """"Used as batch ... lower the cost": Gemini's Flex tier, half price, answered in minutes."""
+def test_every_upload_is_read_on_the_flex_tier_and_only_drive_pages_get_an_hour(journey, monkeypatch):
+    """"Used as batch ... lower the cost" (Drive, 12 Nov 2026) and "flex for app uploads go ahead"
+    (21 Nov 2026): Gemini's Flex tier, half price. The time a page has to be read in is by where
+    it came from, not by its tier: 30 minutes, an hour for a Drive page."""
     from datetime import UTC, datetime, timedelta
 
     app_batch, _ = add_batch_pages(journey, [("pan_card", "CLASSIFYING")])
@@ -151,6 +153,10 @@ def test_drive_pages_are_read_on_the_flex_tier_and_get_an_hour(journey):
         set_tenant_context(connection, journey.tenant_id)
         tiers = [rs.gemini_tier(connection, tenant_id=journey.tenant_id, batch_id=b)
                  for b in (app_batch, web_bulk, drive_batch)]
+        # The switch back: every upload but the Drive intake on the standard tier again.
+        monkeypatch.setattr(rs, "_APP_UPLOAD_TIER", "STANDARD")
+        switched_back = [rs.gemini_tier(connection, tenant_id=journey.tenant_id, batch_id=b)
+                         for b in (app_batch, web_bulk, drive_batch)]
         # A bulk upload from the web is a plain bulk upload: "already on the journey" applies.
         assert rs.from_bulk_upload(connection, tenant_id=journey.tenant_id, batch_id=web_bulk)
         connection.execute(text("UPDATE auditcore.p2_document_queue SET read_clock_started_at_utc=:c "
@@ -161,7 +167,8 @@ def test_drive_pages_are_read_on_the_flex_tier_and_get_an_hour(journey):
             text("SELECT batch_id::text, queue_status FROM auditcore.p2_document_queue WHERE tenant_id=:t"),
             {"t": journey.tenant_id},
         ).all())
-    assert tiers == [None, None, "FLEX"]
+    assert tiers == ["FLEX", "FLEX", "FLEX"]
+    assert switched_back == [None, None, "FLEX"]
     # 45 minutes: the app and web pages are failed at 30, the Drive page waits to 60.
     assert (status[str(app_batch)], status[str(web_bulk)], status[str(drive_batch)]) == ("FAILED", "FAILED",
                                                                                            "CLASSIFYING")

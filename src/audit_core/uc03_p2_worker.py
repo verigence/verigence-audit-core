@@ -1678,8 +1678,8 @@ def _ingest_document(engine: Engine, work: WorkItem) -> None:
             connection, tenant_id=work.tenant_id, journey_id=work.journey_id, batch_id=row["batch_id"],
             registry=get_registry(), classify_only=classify_only,
         )
-        # A Drive page is read on Gemini's Flex tier (product owner 12 Nov 2026: "go for flex
-        # for drive"); every other upload stays on the standard tier.
+        # Every upload is read on Gemini's Flex tier, half the standard price (product owner
+        # 12 Nov 2026: "go for flex for drive"; 21 Nov 2026: "flex for app uploads go ahead").
         tier = gemini_tier(connection, tenant_id=work.tenant_id, batch_id=row["batch_id"])
     v2_client = get_di_capture_v2_client()
     content_type = "application/pdf" if str(row["page_object_key"]).endswith(".pdf") else str(row["original_content_type"] or "application/octet-stream")
