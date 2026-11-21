@@ -1,7 +1,8 @@
 name: Figures check (live bookings, read only)
 
 # What a change moves on real bookings before it is merged (product owner
-# 2026-11-17): the base branch's code and this pull request's code each build the
+# 2026-11-17), and on every DMS dump in use (tools/dms_replay.py, 2026-11-21):
+# the base branch's code and this pull request's code each build the
 # Deal, Payments and Audit Summary and run every audit check, read only, on the
 # verified bookings and a fixed sample of delivered bookings of the live Project.
 # The difference is posted on the pull request. It reports; it does not block
@@ -90,11 +91,15 @@ jobs:
         run: python head/tools/figures_check.py pick --tenant "$FIGURES_TENANT" --out /tmp/bookings.json --sample 40
       - name: Capture
         run: python head/tools/figures_check.py capture --tenant "$FIGURES_TENANT" --bookings /tmp/bookings.json --out "/tmp/${{ matrix.side }}.json"
+      # Every DMS dump in use, matched again by this side's code, read only (2026-11-21).
+      - name: Replay the DMS dumps
+        run: python head/tools/dms_replay.py capture --tenant "$FIGURES_TENANT" --out "/tmp/dms-${{ matrix.side }}.json"
       - uses: actions/upload-artifact@v4
         with:
           name: figures-${{ matrix.side }}
           path: |
             /tmp/${{ matrix.side }}.json
+            /tmp/dms-${{ matrix.side }}.json
             /tmp/bookings.json
           retention-days: 7
 
@@ -119,6 +124,9 @@ jobs:
         run: |
           python head/tools/figures_check.py diff /tmp/figures/figures-base/base.json /tmp/figures/figures-head/head.json \
             --bookings /tmp/figures/figures-head/bookings.json --out /tmp/report.md
+          python head/tools/dms_replay.py diff /tmp/figures/figures-base/dms-base.json /tmp/figures/figures-head/dms-head.json \
+            --out /tmp/dms-report.md
+          printf '\n' >> /tmp/report.md && cat /tmp/dms-report.md >> /tmp/report.md
           cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Post on the pull request
         if: ${{ github.event_name == 'pull_request' }}
