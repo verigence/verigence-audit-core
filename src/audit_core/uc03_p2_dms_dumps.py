@@ -474,8 +474,19 @@ def customer_code_key(value: Any) -> str | None:
 
 
 _INDEX_SQL = """
-    WITH j AS (
-        SELECT j.journey_id, j.journey_reference, j.outlet_id,
+    WITH up AS (
+        -- The day the PC uploaded the booking documents: the booking date rule's fallback
+        -- (2026-11-07), as uc03_p2_dms_outlet_report dates bookings.
+        SELECT ub.journey_id, min(CAST(ub.created_at_utc AT TIME ZONE 'Asia/Kolkata' AS date)) AS day
+        FROM auditcore.p2_upload_batches ub
+        JOIN (SELECT DISTINCT q.batch_id FROM auditcore.p2_document_queue q
+              WHERE q.tenant_id = :t AND q.business_stage = 'BOOKING' AND q.queue_status <> 'CANCELLED') qb
+          ON qb.batch_id = ub.batch_id
+        WHERE ub.tenant_id = :t AND ub.batch_status <> 'AWAITING_UPLOAD'
+          AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
+        GROUP BY ub.journey_id
+    ), j AS (
+        SELECT j.journey_id, j.journey_reference, j.outlet_id, up.day AS booking_upload_day,
                COALESCE(NULLIF(c.legal_name, ''),
                         CASE WHEN c.display_name ~* '^[0-9a-f]{8}-[0-9a-f]{4}-' THEN NULL ELSE c.display_name END)
                  AS customer_name,
@@ -490,6 +501,7 @@ _INDEX_SQL = """
         LEFT JOIN auditcore.journey_stage_states ds
           ON ds.tenant_id = j.tenant_id AND ds.journey_id = j.journey_id AND ds.stage_code = 'DELIVERY'
         LEFT JOIN auditcore.vehicle_records vr ON vr.tenant_id = j.tenant_id AND vr.journey_id = j.journey_id
+        LEFT JOIN up ON up.journey_id = j.journey_id
         WHERE j.tenant_id = :t AND j.dealer_id = :d
     )
     SELECT j.*, f.field_key, f.source_document_type_key AS doc, f.effective_value #>> '{}' AS value
@@ -522,15 +534,21 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
                 "journeyId": jid, "reference": r["journey_reference"], "outletId": r["outlet_id"],
                 "customer": r["customer_name"], "names": set(), "model": r["model"],
                 "bookingDate": r["booking_date"],
+                # The booking date rule (2026-11-07): the booking form's, else the day the
+                # booking documents were uploaded -- for telling customers of one name apart.
+                "bookingDay": r["booking_date"] or r["booking_upload_day"],
                 "hasDelivery": bool(r["has_delivery"]),
+                "mobiles": set(), "refs": set(),
             }
             for key in journey_ref_keys(r["booking_reference"]):
                 index.by_ref[key].add(jid)
+                journey["refs"].add(key)
             for value in (r["vin"], r["chassis_number"]):
                 if (key := chassis_key(value)) is not None:
                     index.by_chassis[key].add(jid)
             if (key := mobile_key(r["mobile_number"])) is not None:
                 index.by_mobile[key].add(jid)
+                journey["mobiles"].add(key)
             if r["customer_name"]:
                 journey["names"].add(r["customer_name"])
         field_key, value = r["field_key"], r["value"]
@@ -539,9 +557,11 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
         if field_key == "booking_reference_number":
             for key in journey_ref_keys(value):
                 index.by_ref[key].add(jid)
+                journey["refs"].add(key)
         elif field_key in ("customer_phone", "phone_number"):
             if (key := mobile_key(value)) is not None:
                 index.by_mobile[key].add(jid)
+                journey["mobiles"].add(key)
         elif field_key in ("vin_number", "chassis_number"):
             if (key := chassis_key(value)) is not None:
                 index.by_chassis[key].add(jid)
@@ -557,6 +577,35 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
 
 
 NAME_DATE_DAYS = 3
+
+# A mobile or booking number one or two digits from the customer's (2026-11-21, Aditya's
+# Sujit Kumar Bastia: the booking form read 9337354361 for 9337359361 and B-1348698 for
+# B-13486428, its date as 2020 and the model as XUV-9S for XEV 9S -- every check missed the
+# exact name, and 24 such bookings of that week stood "not in Verigence").
+NEAR_DIGITS = 2
+
+
+def _edits(a: str, b: str) -> int:
+    """Levenshtein distance (insertions, deletions, substitutions)."""
+    previous = list(range(len(b) + 1))
+    for i, x in enumerate(a, 1):
+        current = [i]
+        for j, y in enumerate(b, 1):
+            current.append(min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + (x != y)))
+        previous = current
+    return previous[-1]
+
+
+def near_mobile(a: str | None, journey_mobiles: set[str]) -> bool:
+    return bool(a) and any(sum(x != y for x, y in zip(a, m)) <= NEAR_DIGITS for m in journey_mobiles
+                           if len(m) == len(a))
+
+
+def near_booking(row_keys: set[str], journey_refs: set[str]) -> bool:
+    """A booking number with one or two digits misread, dropped or added: digit keys of six
+    digits and more only (shorter running numbers repeat)."""
+    digits = {k for k in row_keys if k.isdigit() and len(k) >= 6}
+    return any(_edits(k, r) <= NEAR_DIGITS for k in digits for r in journey_refs if r.isdigit() and len(r) >= 6)
 
 
 def _one(found: set[str]) -> str | None:
@@ -594,17 +643,24 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any], taken: frozen
         # mobile; the date, not the model, tells two customers of one name apart).
         day = row.get("event_date")
         if kind == BOOKING and isinstance(day, date):
-            dated = {j for j in named if index.journeys[j].get("bookingDate") is not None
-                     and abs((index.journeys[j]["bookingDate"] - day).days) <= NAME_DATE_DAYS}
+            dated = {j for j in named if index.journeys[j].get("bookingDay") is not None
+                     and abs((index.journeys[j]["bookingDay"] - day).days) <= NAME_DATE_DAYS}
             if (jid := one(dated)) is not None:
                 return jid, "NAME_DATE"
         if (jid := one({j for j in named if same_model(index.journeys[j]["model"], row.get("model"))})) is not None:
             return jid, "NAME_MODEL"
+        # The customer's name and a mobile or booking number one or two digits off: the same
+        # person with a number misread on the papers (2026-11-21). One such Journey only.
+        keys = booking_keys(row.get("booking_number"), row.get("dms_booking_number"))
+        near = {j for j in named if near_mobile(mobile_key(row.get("mobile")), index.journeys[j].get("mobiles", set()))
+                or near_booking(keys, index.journeys[j].get("refs", set()))}
+        if (jid := one(near)) is not None:
+            return jid, "NAME_NEAR_ID"
     return None, None
 
 
 # The order rows claim Journeys in: the surest match first (2026-11-19).
-_BASIS_RANK = {"CHASSIS": 0, "BOOKING_NUMBER": 1, "MOBILE": 2, "NAME_DATE": 3, "NAME_MODEL": 4}
+_BASIS_RANK = {"CHASSIS": 0, "BOOKING_NUMBER": 1, "MOBILE": 2, "NAME_DATE": 3, "NAME_MODEL": 4, "NAME_NEAR_ID": 5}
 
 
 def _line_key(kind: str, row: dict[str, Any]) -> str | None:
