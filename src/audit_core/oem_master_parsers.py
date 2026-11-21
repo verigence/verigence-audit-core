@@ -841,12 +841,44 @@ def is_ev_model_text(text: str | None) -> bool:
 _CONTINUATION_WORDS = frozenset({
     "N", "ADAS", "CHARGER", "KWH", "KW", "BLACK", "EDITION", "CBC", "STEERING", "TIPPER", "HOPPER",
     "TPR", "HPR", "MS", "PS", "REFRESH", "REEFER", "AC", "NEW", "INTERIORS", "MOCHA",
+    # "MAXX HD 1.7 LX CBC BS6.2 - Reefer" / "VAN Negative Temp" (November 2026)
+    "VAN",
 })
+_UNIT_LEADS = frozenset({"CHARGER", "BATTERY"})
 _TRANSMISSIONS = frozenset({"AT", "MT", "AS", "AMT", "DCT", "IVT", "CVT"})
+# One word offered two ways with spaces round the slash ("2WD 6 / 7 STR",
+# "4S CT / HT", "MT / AT"; the November 2026 bulletin). The spaces are taken
+# out so _expand_slash reads one name with two values, never a list of two
+# names ("Z4 G / Z8 G" stays a list: G and Z8 are not such a pair).
+_PAIR_TOKEN = r"(?:\d+|CT|HT|" + "|".join(sorted(_TRANSMISSIONS, key=len, reverse=True)) + r")"
+_SPACED_PAIR = re.compile(r"\b(" + _PAIR_TOKEN + r")\s*/\s*(\d+\s*STR|" + _PAIR_TOKEN + r")\b", re.IGNORECASE)
+
+
+def _close_spaced_pairs(line: str) -> str:
+    def same_kind(left: str, right: str) -> bool:
+        left, right = left.upper(), right.upper()
+        if left.isdigit():
+            return bool(re.fullmatch(r"\d+\s*STR|\d+", right))
+        if left in ("CT", "HT"):
+            return right in ("CT", "HT")
+        return left in _TRANSMISSIONS and right in _TRANSMISSIONS
+
+    def joined(match: re.Match[str]) -> str:
+        left, right = match.group(1), match.group(2)
+        if not same_kind(left, right):
+            return match.group(0)
+        return f"{left}/{re.sub(r'\s+', '', right)}"
+
+    return _SPACED_PAIR.sub(joined, line)
 
 
 def _is_continuation(previous: str, line: str) -> bool:
     if previous.rstrip().endswith(("-", "&", ",", "/", "(")):
+        return True
+    # "... Battery 34.5 Kwh - Charger" / "3.2 Kw - E" (the November 2026
+    # bulletin): a battery or charger is always followed by its rating.
+    words = previous.split()
+    if words and words[-1].upper() in _UNIT_LEADS:
         return True
     if line.lstrip().startswith(("-", "&", ")", "/", ",")):
         return True
@@ -895,8 +927,18 @@ def _expand_repeat(variant: str) -> list[str] | None:
 
 
 def _expand_ampersand(variant: str) -> list[str] | None:
-    """"AT & MT" (two gearboxes) and "6 & 7STR" (two seaters) as two names.
-    Any other "&" ("& Mocha Interiors", "LX & CBC") is part of the name."""
+    """"AT & MT" (two gearboxes), "6 & 7STR" (two seaters) and "LX & CBC"
+    (the variant and its cab-and-chassis body) as two names. Any other "&"
+    ("& Mocha Interiors", "N & Adas") is part of the name.
+
+    "& CBC" (2026-11-21): "MAXX HD 1.7 LX & CBC" and "MAXX CITY 1.3 LX BS6.2
+    & CBC" offer the plain LX as well. Read as one name, only the CBC
+    variant got the offer and 78 plain-LX deals had no consumer offer
+    standard while their NDCs gave exactly the bulletin's amount."""
+    cbc = re.search(r"\s*&\s*CBC\b", variant, re.IGNORECASE)
+    if cbc is not None and variant[: cbc.start()].strip():
+        head, tail = variant[: cbc.start()].rstrip(), variant[cbc.end():]
+        return [f"{head}{tail}", f"{head} CBC{tail}"]
     gear = re.search(r"\b(AT|MT|AS|AMT|DCT|IVT|CVT)\s*&\s*(AT|MT|AS|AMT|DCT|IVT|CVT)\b", variant, re.IGNORECASE)
     if gear is not None:
         head, tail = variant[: gear.start()], variant[gear.end():]
@@ -930,6 +972,7 @@ def split_variant_cell(cell: Any) -> list[str]:
 
     names: list[str] = []
     for line in joined:
+        line = _close_spaced_pairs(line)
         parts = [p.strip() for p in re.split(r"\s+/\s*|\s*/\s+", line) if p.strip()]
         if len(parts) > 1 and all(len(p.split()) == 1 for p in parts[1:]) and len(parts[0].split()) > 1:
             # "... - Tipper / Hopper": the last word has alternatives

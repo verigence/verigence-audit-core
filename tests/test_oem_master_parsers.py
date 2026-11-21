@@ -452,6 +452,16 @@ def test_discount_grid_rejects_an_unreadable_cell_and_a_foreign_workbook() -> No
          ["Supro Maxi Profit Truck VX CBC BS6.2 - Tipper", "Supro Maxi Profit Truck VX CBC BS6.2 - Hopper"]),
         ("MX5 DMT 4WD & Mocha Interiors", ["MX5 DMT 4WD & Mocha Interiors"]),
         ("M2/M4+/M6+(Discontinued Model)", ["M2", "M4+", "M6+"]),
+        # November 2026 bulletin layout (2026-11-21)
+        ("Z8 L D MT 2WD 6 /7 STR BS6.2 - N &\nAdas",
+         ["Z8 L D MT 2WD 6 STR BS6.2 - N & Adas", "Z8 L D MT 2WD 7 STR BS6.2 - N & Adas"]),
+        ("Z8 L G AT 2WD 6 / 7 STR BS6.2", ["Z8 L G AT 2WD 6 STR BS6.2", "Z8 L G AT 2WD 7 STR BS6.2"]),
+        ("LX D AT 4WD 4S CT / HT BS6.2", ["LX D AT 4WD 4S CT BS6.2", "LX D AT 4WD 4S HT BS6.2"]),
+        ("MAXX HD 1.7 LX & CBC", ["MAXX HD 1.7 LX", "MAXX HD 1.7 LX CBC"]),
+        ("MAXX CITY 1.3 LX BS6.2 & CBC", ["MAXX CITY 1.3 LX BS6.2", "MAXX CITY 1.3 LX BS6.2 CBC"]),
+        ("MAXX HD 1.7 LX CBC BS6.2 - Reefer\nVAN Negative Temp", ["MAXX HD 1.7 LX CBC BS6.2 - Reefer VAN Negative Temp"]),
+        ("EC PRO - Battery 34.5 Kwh - Charger\n3.2 Kw - E", ["EC PRO - Battery 34.5 Kwh - Charger 3.2 Kw - E"]),
+        ("V2\nV2 CNG\nV4 CNG", ["V2", "V2 CNG", "V4 CNG"]),
     ],
 )
 def test_variant_cells_are_joined_and_expanded(cell, names) -> None:
