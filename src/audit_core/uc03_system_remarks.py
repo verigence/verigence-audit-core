@@ -77,7 +77,37 @@ def _deal_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -
         remarks.append(_remark("NOT_TAKEN", f"{product} not taken",
                                f"No bill on file charges the {product}{priced}: the customer did not take it, "
                                "so it is not counted as an undercharge.", "Deal"))
+    remarks.extend(scheme_availed_remarks(facts.sheet.get("discounts") or [],
+                                          getattr(facts, "ndc_in_doubt", None)))
     return remarks
+
+
+def scheme_availed_remarks(discounts: list[dict[str, Any]], in_doubt: dict[str, str] | None = None
+                           ) -> list[dict[str, Any]]:
+    """The consumer scheme availed on the deal (product owner 2026-11-21,
+    decision 1: "if it is as per the consumer grid ... it is captured
+    accordingly; we need to capture scheme availed in the system remarks").
+    One remark when the consumer offer given is within the scheme's package
+    (its cash, plus the in-kind accessories / 4th-year warranty taken as cash
+    or taken off on the NDC). A consumer offer above the package is the
+    excess discount check's, not a remark."""
+    from audit_core import uc03_discount_given as dg
+    from audit_core.uc03_p2_audit_rules import _rupees, scheme_availed_text
+
+    out: list[dict[str, Any]] = []
+    for item in dg.assess(discounts, in_doubt):
+        row = item["row"]
+        if row.get("key") != dg.CASH_KEY or item["status"] not in ("WITHIN", dg.UNDER):
+            continue
+        scheme = row.get("scheme") or {}
+        named = f" ({scheme.get('name') or scheme.get('code')})" if scheme.get("name") or scheme.get("code") else ""
+        if item.get("schemeAvailed"):
+            text_ = scheme_availed_text(item) + f"{named}; entitlement {_rupees(item['entitled'])}."
+        else:
+            text_ = (f"{row['label']} {_rupees(item['given'])} given within the consumer scheme's "
+                     f"{_rupees(item['entitled'])}{named}.")
+        out.append(_remark("CONSUMER_SCHEME_AVAILED", "Consumer scheme availed", text_, "Deal"))
+    return out
 
 
 def fastag_not_on_ndc(ndc: dict[str, Decimal] | None, from_invoice: dict[str, Any] | None) -> dict[str, Any] | None:

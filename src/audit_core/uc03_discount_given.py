@@ -274,18 +274,41 @@ def doubtful_reading(row: dict[str, Any], amount: Decimal, in_doubt: dict[str, s
     return in_doubt[str(giving[0].get("documentId"))]
 
 
+# The consumer scheme's benefits given in kind (product owner 2026-11-21).
+IN_KIND_KEYS = (KIT_KEY, "EXT_WARRANTY_4TH_YR", "EXT_WARRANTY_4TH_5TH_YR")
+
+
+def in_kind_available(discounts: list[dict[str, Any]]) -> list[tuple[str, str, Decimal]]:
+    """The consumer scheme's in-kind benefits (accessories kit, 4th-year
+    extended warranty) the deal is entitled to and does not give in kind on a
+    line of its own: (key, label, amount) each.
+
+    Product owner 2026-11-21, decision 1: a consumer offer given in cash (or
+    charged and taken off on the NDC, Shivnath's "SCHEME") that is within the
+    consumer bulletin's package -- its cash plus these benefits -- is the
+    scheme availed: captured as such, with a system remark, never a breach.
+    Replaces 2026-11-06's "accessories kit given as cash, a breach listed
+    apart". A benefit the deal also gives in kind (its own discount line has
+    a figure) is not available a second time."""
+    out: list[tuple[str, str, Decimal]] = []
+    for key in IN_KIND_KEYS:
+        row = next((r for r in discounts if r.get("key") == key), None)
+        if row is None or has_figure(row) or row.get("eligibility") not in ("ELIGIBLE", "ELIGIBLE_UNCLAIMED"):
+            continue
+        if key != KIT_KEY and str((row.get("scheme") or {}).get("category") or "CONSUMER") != "CONSUMER":
+            continue
+        amount = _dec(row.get("entitled"))
+        if not amount and row.get("potential") is not None:
+            amount = _dec(row["potential"])
+        if amount and amount > 0:
+            out.append((key, str(row.get("label") or key), amount))
+    return out
+
+
 def kit_available(discounts: list[dict[str, Any]]) -> Decimal:
-    """The accessories kit the deal is entitled to and no accessories invoice
-    used: the consumer scheme gives it in kind (Scorpio Classic, Thar Roxx),
-    and a dealer who passes it on as cash on the consumer offer has given it
-    as cash (product owner 2026-11-06: a breach, listed apart, not excess)."""
-    kit = next((r for r in discounts if r.get("key") == KIT_KEY), None)
-    if kit is None or has_figure(kit) or kit.get("eligibility") not in ("ELIGIBLE", "ELIGIBLE_UNCLAIMED"):
-        return Decimal(0)
-    amount = _dec(kit.get("entitled"))
-    if not amount and kit.get("potential") is not None:
-        amount = _dec(kit["potential"])
-    return amount if amount and amount > 0 else Decimal(0)
+    """The consumer scheme's in-kind benefits not given in kind, in total
+    (``in_kind_available``)."""
+    return sum((amount for _, _, amount in in_kind_available(discounts)), Decimal(0))
 
 
 def assess(discounts: list[dict[str, Any]], in_doubt: dict[str, str] | None = None) -> list[dict[str, Any]]:
@@ -296,8 +319,11 @@ def assess(discounts: list[dict[str, Any]], in_doubt: dict[str, str] | None = No
     * READING_IN_DOUBT: above the entitlement, but read from an NDC / cost sheet
       that does not add up (``in_doubt``, uc03_statement_totals.charges_in_doubt):
       listed apart with why, never counted as excess (2026-11-17);
-    * KIT_AS_CASH: the part of the consumer offer the unused accessories kit
-      covers -- reported with the kit amount, never as excess;
+    * the consumer offer within the consumer scheme's package (its cash plus
+      the accessories kit / 4th-year warranty not given in kind): the scheme
+      availed, judged with that package as its entitlement and carried as
+      ``schemeAvailed`` (product owner 2026-11-21, decision 1; until then the
+      kit part was a KIT_AS_CASH breach, no longer emitted);
     * OVER_UNLESS_INHOUSE: a dealer discount above the grid tier it was
       judged at but within a higher tier of its grid line -- over only if
       the insurance / EW were not in-house, never counted as excess
@@ -312,7 +338,7 @@ def assess(discounts: list[dict[str, Any]], in_doubt: dict[str, str] | None = No
     Each item: row, given, column, status, entitled (with the kit where it
     counted), variance (the excess, the kit part, or the shortfall), kit, reason
     (and ifInhouse: the higher tier's allowance, on OVER_UNLESS_INHOUSE)."""
-    kit_left = kit_available(discounts)
+    in_kind_left = list(in_kind_available(discounts))
     out: list[dict[str, Any]] = []
     for row in discounts:
         if not has_figure(row):
@@ -338,15 +364,19 @@ def assess(discounts: list[dict[str, Any]], in_doubt: dict[str, str] | None = No
         other = disagreeing_figures(row, amount) if column == "billed" and extra > LINE_TOLERANCE else None
         if other is not None:
             base = {**base, "ledger": other}
-        if row.get("key") == CASH_KEY and extra > LINE_TOLERANCE and kit_left > 0:
-            kit_used = min(extra, kit_left)
-            kit_left -= kit_used
-            out.append({**base, "status": KIT_AS_CASH, "entitled": entitled_amount, "variance": kit_used,
-                        "kit": kit_used, "reason": "accessories kit given as cash"})
-            entitled_amount += kit_used
-            extra -= kit_used
-            if extra <= LINE_TOLERANCE:
-                continue
+        if row.get("key") == CASH_KEY and in_kind_left:
+            # The scheme's package: its cash plus the in-kind benefits not given
+            # in kind. Used only as far as the amount given needs it.
+            taken: list[dict[str, Any]] = []
+            while extra > LINE_TOLERANCE and in_kind_left:
+                key, label, amount = in_kind_left.pop(0)
+                used = min(extra, amount)
+                taken.append({"key": key, "label": label, "amount": used})
+                entitled_amount += used
+                extra -= used
+            if taken:
+                base = {**base, "schemeAvailed": {"cash": entitled_amount - sum(t["amount"] for t in taken),
+                                                  "inKind": taken}}
         covering = higher_tier_covering(row, amount) if extra > LINE_TOLERANCE else None
         if covering is not None:
             tier, allowance = covering
@@ -383,6 +413,7 @@ __all__ = [
     "given_document",
     "has_figure",
     "higher_tier_covering",
+    "in_kind_available",
     "is_over",
     "kit_available",
     "standards_known",

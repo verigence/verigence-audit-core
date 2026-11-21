@@ -694,34 +694,31 @@ def excess_discount(facts: _Facts) -> RuleOutcome:
 
 
 def kit_given_as_cash(facts: _Facts) -> RuleOutcome:
-    """The consumer scheme gives an accessories kit (Scorpio Classic, Thar
-    Roxx), no accessories invoice uses it, and the consumer offer was given in
-    cash above its cash entitlement: the kit was given as cash. Product owner
-    2026-11-06: a breach listed apart, never counted as excess discount (the
-    EXCESS_DISCOUNT check counts the kit with the entitlement)."""
+    """Retired as a breach (product owner 2026-11-21, decision 1): a consumer
+    offer given in cash within the consumer scheme's package -- its cash plus
+    the accessories kit / 4th-year warranty it gives in kind -- is the scheme
+    availed, captured as such (uc03_discount_given.assess, ``schemeAvailed``)
+    and noted in the journey's system remarks. Anything above the package is
+    the EXCESS_DISCOUNT check's. The check stays so the tasks it raised before
+    close on re-evaluation."""
     from audit_core import uc03_discount_given as dg
 
     code = "KIT_GIVEN_AS_CASH"
-    if not dg.kit_available(facts.sheet["discounts"]):
-        return RuleOutcome(code, "PASS", "No unused accessories kit on this deal.")
-    if not dg.standards_known(facts.sheet):
-        return RuleOutcome(code, "SKIPPED", _NO_STANDARD)
-    assessed = dg.assess(facts.sheet["discounts"], getattr(facts, "ndc_in_doubt", None))
-    kits = [i for i in assessed if i["status"] == dg.KIT_AS_CASH]
-    if not kits and any(i["status"] == dg.READING_IN_DOUBT and i["row"].get("key") == dg.CASH_KEY for i in assessed):
-        return RuleOutcome(code, "SKIPPED", "Not judged yet: the consumer offer is read from an NDC that does not "
-                                            "add up; judged once its reading is corrected.")
-    if not kits:
-        return RuleOutcome(code, "PASS", "The accessories kit was not given as cash.")
-    lines = [{"key": i["row"]["key"], "label": i["row"]["label"], "given": str(i["given"]),
-              "entitled": str(i["entitled"]), "kit": str(i["kit"])} for i in kits]
-    total = sum((i["kit"] for i in kits), Decimal(0))
-    return RuleOutcome(code, "FAIL", "; ".join(
-        f"{line['label']}: {_rupees(line['given'])} given in cash against a cash entitlement of "
-        f"{_rupees(line['entitled'])}; {_rupees(line['kit'])} of it is the accessories kit the scheme gives "
-        "in kind, not invoiced as accessories" for line in lines) + ".", {
-        "findingTitle": "Accessories kit given as cash", "discounts": lines, "kitAsCash": str(total),
-    })
+    availed = [i for i in dg.assess(facts.sheet["discounts"], getattr(facts, "ndc_in_doubt", None))
+               if i.get("schemeAvailed")]
+    if not availed:
+        return RuleOutcome(code, "PASS", "No consumer-scheme benefit given in kind was taken as cash.")
+    return RuleOutcome(code, "PASS", "; ".join(scheme_availed_text(i) for i in availed) + ".")
+
+
+def scheme_availed_text(item: dict[str, Any]) -> str:
+    """"Consumer offer / scheme discount Rs 70,000 given: the consumer scheme
+    availed -- cash Rs 0, Accessories kit Rs 50,001 and Free extended warranty
+    (4th year) Rs 19,999 taken as cash" (decision 1, 2026-11-21)."""
+    availed = item["schemeAvailed"]
+    in_kind = " and ".join(f"{t['label']} {_rupees(t['amount'])}" for t in availed["inKind"])
+    return (f"{item['row']['label']} {_rupees(item['given'])} given: the consumer scheme availed -- cash "
+            f"{_rupees(availed['cash'])}, {in_kind} taken as cash instead of in kind")
 
 
 def cash_above_limit(facts: _Facts) -> RuleOutcome:

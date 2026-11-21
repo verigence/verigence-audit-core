@@ -188,10 +188,11 @@ def _application(journey, key: str, entitled: str | None, eligibility: str) -> N
                   "VALUES (:t, :j, :k, :e, :r, 'EVIDENCE')", k=key, e=entitled, r=eligibility)
 
 
-def test_an_unused_accessories_kit_given_as_cash_is_its_own_finding_not_excess_discount(journey):
-    """Product owner 2026-11-06: the consumer scheme gives a Rs 50,000
-    accessories kit (no accessories invoice uses it) and the consumer offer
-    was given as Rs 50,000 cash: KIT_GIVEN_AS_CASH, never EXCESS_DISCOUNT."""
+def test_an_unused_accessories_kit_given_as_cash_is_the_scheme_availed(journey):
+    """Product owner 2026-11-21 (decision 1, replacing 2026-11-06's breach): the
+    consumer scheme gives a Rs 50,000 accessories kit (no accessories invoice
+    uses it) and the consumer offer was given as Rs 50,000 cash: as per the
+    consumer scheme -- no finding, the scheme availed is a system remark."""
     _line(journey, "ex_showroom_price", "1000000", "1000000")
     _source(journey, "COMMERCIAL", "ex_showroom_price", "tax_invoice_tally", "1000000")
     _application(journey, "CASH_DISCOUNT", None, "NOT_ELIGIBLE")
@@ -201,9 +202,8 @@ def test_an_unused_accessories_kit_given_as_cash_is_its_own_finding_not_excess_d
     result = _run(journey, "BOOKING")
     assert result["EXCESS_DISCOUNT"].outcome == "PASS"
     kit = result["KIT_GIVEN_AS_CASH"]
-    assert kit.outcome == "FAIL" and kit.details["kitAsCash"] == "50000.00"
-    assert "₹50,000 of it is the accessories kit" in kit.reason
-    assert _finding(journey, "KIT_GIVEN_AS_CASH")[:3] == ("OPEN", "MEDIUM", "Accessories kit given as cash")
+    assert kit.outcome == "PASS" and "the consumer scheme availed" in kit.reason
+    assert _finding(journey, "KIT_GIVEN_AS_CASH")[0] is None
     assert _finding(journey, "EXCESS_DISCOUNT")[0] is None
 
     # Cash above the kit too: the rest is an excess discount, with the kit counted.
@@ -214,7 +214,7 @@ def test_an_unused_accessories_kit_given_as_cash_is_its_own_finding_not_excess_d
     assert excess.outcome == "FAIL"
     assert excess.details["discounts"] == [{"key": "CASH_DISCOUNT", "label": "Consumer offer / scheme discount",
                                             "entitled": "50000.00", "given": "70000.00", "extra": "20000.00"}]
-    assert result["KIT_GIVEN_AS_CASH"].outcome == "FAIL"
+    assert result["KIT_GIVEN_AS_CASH"].outcome == "PASS"
 
 
 def test_a_discount_with_no_master_behind_it_raises_no_excess_discount(journey):
