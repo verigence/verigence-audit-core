@@ -1,7 +1,7 @@
 """DMS dumps: dates taken from the DMS on a sure match, and model differences listed.
 
-Revision ID: 0251_dms_strong_match_sync
-Revises: 0250_dms_delivery_booking_date
+Revision ID: 0252_dms_strong_match_sync
+Revises: 0251_veero_g1_model_alias
 
 Product owner 2026-11-21: when a DMS row matches a Journey on the OTF / booking number (booking
 dump) or the chassis (delivery dump), the DMS date is the Journey's date -- corrected on the
@@ -19,8 +19,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0251_dms_strong_match_sync"
-down_revision = "0250_dms_delivery_booking_date"
+revision = "0252_dms_strong_match_sync"
+down_revision = "0251_veero_g1_model_alias"
 branch_labels = None
 depends_on = None
 
