@@ -9,6 +9,7 @@ from p2_support import add_batch_pages, create_p2_journey, database_engine
 from sqlalchemy import text
 
 from audit_core.db import set_tenant_context
+from audit_core.uc03_p2_document_alerts import publish_document_alerts
 from audit_core.uc03_p2_notifications import messages_for, seen_at, upload_status
 
 
@@ -44,9 +45,10 @@ def _messages(journey, actor=None):
 
 
 def _alert(journey, title, *, audience=None, hours_ago=0, expired=False):
+    # Any Project alert that is not about one's own pages: those have their own rule (below).
     payload = {"audienceActorIds": audience} if audience else {}
     _sql(journey, "INSERT INTO auditcore.p2_tenant_alerts (tenant_id, alert_kind, alert_status, title, body, payload, "
-                  "published_at_utc, expires_at_utc) VALUES (:t, 'MY_DOCUMENTS_ATTENTION', 'PUBLISHED', :title, 'b', "
+                  "published_at_utc, expires_at_utc) VALUES (:t, 'SAME_FILE_UPLOADED', 'PUBLISHED', :title, 'b', "
                   "CAST(:p AS jsonb), now() - make_interval(hours => :h), "
                   "CASE WHEN :x THEN now() - interval '1 minute' ELSE now() + interval '1 day' END)",
          title=title, p=json.dumps(payload), h=hours_ago, x=expired)
@@ -127,3 +129,69 @@ def test_messages_stay_after_they_expire_and_are_unread_until_the_bell_is_opened
     assert not any(m.unread for m in _messages(journey))
     _alert(journey, "New since")
     assert [m.title for m in _messages(journey) if m.unread] == ["New since"]
+
+
+# --- one's own stuck or failed pages: one message per booking, named, only while it stands -----
+# Product owner 2026-11-18: "notification tab is quite vague... it doesnt tell which customer/journey
+# is the reported issue.. can you provide it clickable so that it can directly open up that task or
+# journey 360".
+
+def _publish(journey):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return publish_document_alerts(connection, tenant_id=journey.tenant_id)
+
+
+def _name(journey, name):
+    _sql(journey, "UPDATE auditcore.customers SET legal_name=:n WHERE tenant_id=:t AND customer_id=:c",
+         n=name, c=journey.customer_id)
+
+
+def test_a_failed_page_is_told_by_customer_and_opens_its_booking(journey):
+    _name(journey, "Sanjay Kumar Sahoo")
+    add_batch_pages(journey, [("booking_form", "READY"), (None, "FAILED"), (None, "FAILED")])
+    _publish(journey)
+    [message] = _messages(journey)
+    assert message.title == "Sanjay Kumar Sahoo: 2 pages failed or refused"
+    assert message.journeyId == str(journey.journey_id)
+    assert message.journeyReference.startswith("P2-J-")
+    assert message.kind == "MY_DOCUMENTS_ATTENTION" and message.unread
+    assert _messages(journey, actor="someone-else") == []
+
+
+def test_a_booking_whose_name_was_not_read_is_told_by_its_reference():
+    from audit_core.uc03_p2_document_alerts import _customer, _named, booking_messages
+
+    assert _customer("Name not read") is None
+    assert _named("Name not read", "UTK-SA-261111-001") == "UTK-SA-261111-001"
+    assert _named("Sanjay Kumar Sahoo", "UTK-SA-261111-001") == "Sanjay Kumar Sahoo (UTK-SA-261111-001)"
+    # An alert written before 18 Nov has no customer name: its bookings are still told one by one.
+    [message] = booking_messages({"journeys": [{"journeyId": "j1", "reference": "UTK-SA-261111-001",
+                                                "stuck": 1, "failed": 0}]})
+    assert message["title"] == "UTK-SA-261111-001: 1 page still being read after 6 hours"
+    assert message["journeyId"] == "j1"
+
+
+def test_a_settled_page_leaves_the_bell(journey):
+    """18 Nov: UTK-SA-261103-024's pages were sent again within a minute, yet two messages about
+    them stayed in the PC's bell beside the one that still stood."""
+    add_batch_pages(journey, [(None, "FAILED")])
+    _publish(journey)
+    assert len(_messages(journey)) == 1
+    _sql(journey, "UPDATE auditcore.p2_document_queue SET queue_status='CANCELLED', last_error='SUPERSEDED_PAGE' "
+                  "WHERE tenant_id=:t AND journey_id=:j")
+    assert _publish(journey)["withdrawn"] == 1
+    assert _messages(journey) == []
+
+
+def test_a_booking_is_new_again_only_when_more_of_its_pages_go_wrong(journey):
+    me = str(journey.actor_id)
+    add_batch_pages(journey, [(None, "FAILED")])
+    _publish(journey)
+    _sql(journey, "INSERT INTO auditcore.p2_notification_seen (tenant_id, actor_id) VALUES (:t, :a)", a=me)
+    assert _publish(journey) == {"published": 0, "updated": 0, "withdrawn": 0}
+    assert [m.unread for m in _messages(journey)] == [False]
+    add_batch_pages(journey, [(None, "FAILED")])
+    assert _publish(journey)["updated"] == 1
+    [message] = _messages(journey)
+    assert message.unread and message.title.endswith("2 pages failed or refused")
