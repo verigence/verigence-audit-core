@@ -21,11 +21,25 @@ service asks the database anything on its own clock. Nothing is switched off:
 
 ``VERIGENCE_SLEEP_WINDOW_IST`` sets the window ("00:30-08:00"); "off" means
 never sleep.
+
+The shutdown switch (product owner 2026-11-21: "lets have a tab in the
+verigence to have a full shutdown of DB"). The hours above were a setting of
+each service. They are now one piece of state held by Verigence Security, which
+a Super Admin or Executive changes from the System shutdown tab: the daily
+hours, a "Shut down now" (shut to the next daily opening) and a "Start now".
+Every service asks Security for it once a minute (audit_core.system_switch; an
+answer from memory there, no database) and hands the answer to ``follow``.
+From then on "the window" in this module is that state: a shutdown by hand at
+six in the evening is rested through exactly as the night is, with work in
+hand finished first, and a Start at three at night ends the rest within the
+minute. Until the first answer, and with ``follow`` never called (tests), the
+window is the setting above.
 """
 from __future__ import annotations
 
 import os
 import threading
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from datetime import time as clock_time
 from zoneinfo import ZoneInfo
@@ -62,25 +76,126 @@ WINDOW: Window | None = parse_window(os.environ.get("VERIGENCE_SLEEP_WINDOW_IST"
 _working = threading.Event()
 
 
+SHUT = "SHUT"
+OPEN = "OPEN"
+
+
+@dataclass(frozen=True)
+class Followed:
+    """Security's shutdown switch as last heard: the daily hours (None: no daily
+    shutdown) and a Shut down or Start by hand, in force from ``since`` until
+    ``until``."""
+
+    hours: Window | None
+    manual: str | None = None
+    since: datetime | None = None
+    until: datetime | None = None
+
+
+_followed: Followed | None = None
+_followed_lock = threading.Lock()
+
+
+def _when(value: object) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value)).astimezone(UTC) if value else None
+    except ValueError:
+        return None
+
+
+def follow(status: object) -> bool:
+    """Take Security's answer (GET /security/v1/system/status) as the state to go
+    by. False, and nothing changes, for an answer that is not one: a service
+    must not start or stop sleeping on a page that happened to say 200."""
+    global _followed
+    if not isinstance(status, dict) or "resting" not in status:
+        return False
+    hours: Window | None = None
+    start_text, end_text = status.get("hoursFromIst"), status.get("hoursToIst")
+    if start_text or end_text:
+        try:
+            start, end = clock_time.fromisoformat(str(start_text)), clock_time.fromisoformat(str(end_text))
+        except ValueError:
+            return False
+        if start == end:
+            return False
+        hours = (start, end)
+    manual = status.get("manual")
+    until = _when(status.get("manualUntilUtc"))
+    if manual not in {SHUT, OPEN} or until is None:
+        manual, until = None, None
+    since = _when(status.get("manualSinceUtc")) if manual else None
+    with _followed_lock:
+        _followed = Followed(hours=hours, manual=manual, since=since, until=until)
+    return True
+
+
+def unfollow() -> None:
+    """Back to the setting alone (tests; a service told not to follow the switch)."""
+    global _followed
+    with _followed_lock:
+        _followed = None
+
+
+def followed() -> Followed | None:
+    with _followed_lock:
+        return _followed
+
+
 def _now(now: datetime | None) -> datetime:
     return (now or datetime.now(UTC)).astimezone(IST)
 
 
-def in_window(now: datetime | None = None) -> bool:
-    """Whether the clock is inside the sleep window."""
-    if WINDOW is None:
+def _hours() -> Window | None:
+    state = followed()
+    return state.hours if state is not None else WINDOW
+
+
+def _manual(now: datetime | None) -> Followed | None:
+    """The Shut down or Start by hand in force at this moment, if any."""
+    state = followed()
+    if state is None or state.manual is None or state.until is None:
+        return None
+    return state if _now(now) < state.until else None
+
+
+def _in_hours(now: datetime | None) -> bool:
+    hours = _hours()
+    if hours is None:
         return False
-    start, end = WINDOW
+    start, end = hours
     local = _now(now).time()
     return start <= local < end if start < end else (local >= start or local < end)
 
 
+def _next_opening(moment: datetime) -> datetime | None:
+    """The next daily opening time after ``moment``."""
+    hours = _hours()
+    if hours is None:
+        return None
+    local = moment.astimezone(IST)
+    wake = local.replace(hour=hours[1].hour, minute=hours[1].minute, second=0, microsecond=0)
+    if wake <= local:
+        wake += timedelta(days=1)
+    return wake
+
+
+def in_window(now: datetime | None = None) -> bool:
+    """Whether Verigence is shut at this moment: a Shut down or Start by hand
+    while it lasts, else the daily hours."""
+    manual = _manual(now)
+    return manual.manual == SHUT if manual is not None else _in_hours(now)
+
+
 def window_started_at(now: datetime | None = None) -> datetime | None:
-    """When the window the clock is in began; None outside it."""
+    """When the shutdown the clock is in began; None outside one."""
     if not in_window(now):
         return None
+    manual = _manual(now)
+    if manual is not None:
+        return (manual.since or _now(now)).astimezone(UTC)
     local = _now(now)
-    start = WINDOW[0]  # type: ignore[index]  # in_window() is False without a window
+    start = _hours()[0]  # type: ignore[index]  # in_window() is False without hours
     began = local.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
     if began > local:
         began -= timedelta(days=1)
@@ -88,15 +203,16 @@ def window_started_at(now: datetime | None = None) -> datetime | None:
 
 
 def seconds_until_wake(now: datetime | None = None) -> float:
-    """Seconds left of the window; 0 outside it."""
+    """Seconds left of the shutdown; 0 outside one."""
     if not in_window(now):
         return 0.0
     local = _now(now)
-    end = WINDOW[1]  # type: ignore[index]
-    wake = local.replace(hour=end.hour, minute=end.minute, second=0, microsecond=0)
-    if wake <= local:
-        wake += timedelta(days=1)
-    return (wake - local).total_seconds()
+    manual = _manual(now)
+    wake = manual.until if manual is not None else _next_opening(local)  # type: ignore[union-attr]
+    if manual is not None and wake is not None and _in_hours(wake):
+        # A shutdown by hand that runs out inside the daily hours goes on to that day's opening.
+        wake = _next_opening(wake)
+    return max(0.0, (wake - local).total_seconds()) if wake is not None else 0.0
 
 
 def keep_awake(working: bool) -> None:

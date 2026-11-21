@@ -50,7 +50,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PdfReadError
 from sqlalchemy import Connection, Engine, text
 
-from audit_core import job_reads, job_schedule, sleep_window
+from audit_core import job_reads, job_schedule, sleep_window, system_switch
 from audit_core import uc03_p2_runtime as _runtime
 from audit_core.config import SettingsError, load_settings
 from audit_core.db import set_platform_super_admin_context, set_tenant_context
@@ -5778,6 +5778,8 @@ def main() -> None:
     threading.Thread(target=_sweep_cost_sheet_statements_every, args=(engine,), name="cost-sheet-statements",
                      daemon=True).start()
     threading.Thread(target=_drive_every, args=(engine,), name="drive-intake", daemon=True).start()
+    # Whether Verigence is shut is Security's to say (the System shutdown tab), once a minute.
+    system_switch.start(_stopping)
     logger.info(
         "p2_worker_started",
         worker_id=_WORKER_ID,

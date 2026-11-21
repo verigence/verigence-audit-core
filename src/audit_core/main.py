@@ -6,7 +6,7 @@ import anyio.to_thread
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from audit_core import mahindra_masters, role_mappings
+from audit_core import mahindra_masters, role_mappings, system_switch
 from audit_core.activity_settings import admin_router as activity_settings_admin_router
 from audit_core.config import load_settings
 from audit_core.contract_guards import install_contract_guards
@@ -264,6 +264,8 @@ async def _lifespan(_: FastAPI):
     # again, not this default.
     anyio.to_thread.current_default_thread_limiter().total_tokens = 100
     warm_runtime_dependencies()
+    # Whether Verigence is shut is Security's to say (the System shutdown tab), once a minute.
+    system_switch.start()
     sweep_interval = float(
         os.environ.get(
             "STALE_WORKER_TASK_SWEEP_INTERVAL_SECONDS",
