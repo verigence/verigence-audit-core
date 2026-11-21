@@ -757,6 +757,8 @@ def _oem_code_for_tenant(connection: Connection, *, tenant_id: str) -> str | Non
 
 
 def _oem_model_aliases(connection: Connection, *, oem_code: str) -> list[tuple[str, str]]:
+    """Every alias, the DOCUMENTS ones included ("XUV 300" -> XUV3XO, 0252):
+    this reads dealers' papers, not the OEM's masters (``_alias_map``)."""
     rows = connection.execute(
         text(
             "SELECT alias_text, canonical_model_name FROM auditcore.oem_model_aliases "
@@ -1856,6 +1858,59 @@ def _why_not_named(ev: dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
+def _nameplate(model_name: Any) -> str:
+    """A model's nameplate for the contradiction test: generation words and
+    the EV suffix left out ("NEW SCORPIO N" ~ "SCORPIO N", "XUV3XO EV" ~
+    "XUV3XO"), so only a genuinely different vehicle counts as one."""
+    from audit_core.uc03_sku_words import generation_key
+
+    key = generation_key(str(model_name or ""))
+    return key[:-2] if key.endswith("EV") and len(key) > 4 else key
+
+
+def _booking_names_other_model(ev: dict[str, Any], state: dict[str, Any], inv: dict[str, Any]) -> str | None:
+    """Product owner 2026-11-21: an automatic SKU the booking form contradicts
+    does not stay. When the booking form's words name a model -- by the
+    price list's name or an alias ("XUV 300" -> XUV 3XO) -- but not one SKU
+    of it, and that model is not the pinned SKU's, the pin is cleared and the
+    PC gets the closest-SKU question (MODEL_NOT_IDENTIFIED, with the closest
+    SKU of the named model suggested). SHI-YK-261113-009: the form reads
+    "XUV 300 / W6 (AXS) Petrol MT" at Rs 9,99,901 and the pin was XUV 7XO AX5
+    PET MT 7 STR (Rs 17.88L), kept as AUTO_UNCONFIRMED under review 471 B2.
+
+    Narrow on purpose -- every other case keeps review 471 B2 (never
+    cleared): only an automatic, TENTATIVE pin; no vehicle invoice naming
+    anything (the invoice is the source of truth); one booking form decides
+    (forms disagreeing is their own PC task); and the form names a model
+    (a form naming nothing, or no form, contradicts nothing). Returns why, or
+    None."""
+    if is_human_decision(state) or state.get("product_sku_id") is None:
+        return None
+    if inv.get("named") or inv.get("fallback") or inv.get("disagree") or ev.get("bookingDisagree"):
+        return None
+    # A vehicle invoice naming any model (even no one SKU of it) is the
+    # source of truth: the booking form alone never clears against it
+    # (UTK-SB-261111-004: form "XUV700", invoice "XEV 9S", pin XEV 9S).
+    if any(r.identified or r.model_rows or r.candidates for _, r in ev.get("invoices") or []):
+        return None
+    booking, res = ev.get("booking"), ev.get("bookingResult")
+    if booking is None or res is None or res.identified or res.status in {"NO_MODEL", "NO_TEXT"}:
+        return None
+    named = {_nameplate(r.get("model_name")) for r in (res.model_rows or res.candidates or []) if r.get("model_name")}
+    pinned = _nameplate(state.get("model_name"))
+    # One name inside the other is the same vehicle line, not a contradiction
+    # (ADI-RD-261022-001: form "Bolero / NEO-N11" read as BOLERO, pin the
+    # September combined model "THE BOSS- BOLERO+NEO" N11). Conservative: THAR
+    # against THAR ROXX is not cleared either.
+    if not named or not pinned or any(pinned in n or n in pinned for n in named):
+        return None
+    read = " / ".join(v for v in (booking.get("model"), booking.get("variant")) if v) or "-"
+    models = ", ".join(sorted({str(r.get("model_name")) for r in (res.model_rows or res.candidates or [])
+                               if r.get("model_name")}))
+    return (f"the booking form reads '{read}', which names {models}, not the {state.get('model_name')} "
+            f"that was pinned automatically")
+
+
 def _decide(ev: dict[str, Any], state: dict[str, Any], *, recheck_legacy: bool) -> dict[str, Any]:
     """The ladder's decision for one Journey, without writing anything (the
     dry run shows exactly this). Actions:
@@ -1870,6 +1925,10 @@ def _decide(ev: dict[str, Any], state: dict[str, Any], *, recheck_legacy: bool) 
     UNCONFIRMED -- an automatic SKU the documents do not name: it is KEPT
       (never cleared: review 471 B2), marked AUTO_UNCONFIRMED, and the PC
       gets "SKU not clearly identified from the documents";
+    CONTRADICTED -- an automatic SKU of another model than the one the
+      booking form names (``_booking_names_other_model``, 2026-11-21): the
+      pin is cleared and the PC gets MODEL_NOT_IDENTIFIED with the closest
+      SKU of the named model;
     NOT_IDENTIFIED -- no SKU and none named: MODEL_NOT_IDENTIFIED;
     SKIP -- nothing to resolve."""
     has_sku = state.get("product_sku_id") is not None
@@ -1899,6 +1958,9 @@ def _decide(ev: dict[str, Any], state: dict[str, Any], *, recheck_legacy: bool) 
             return {**plan, "action": "KEEP", "keepReason": "a vehicle invoice's words name it", "named": True}
         if legacy and not recheck_legacy:
             return {**plan, "action": "KEEP", "keepReason": "pinned before the 2026-10-20 rules (reresolve re-checks it)"}
+        contradiction = _booking_names_other_model(ev, state, inv)
+        if contradiction is not None:
+            return {**plan, "action": "CONTRADICTED", "why": contradiction}
         return {**plan, "action": "UNCONFIRMED", "why": _why_not_named(ev)}
     if inv.get("fallback"):
         return {**plan, "action": "INVOICE_WORDS_PIN", "fallback": inv["fallback"]}
@@ -1922,6 +1984,8 @@ def _proposal(ev: dict[str, Any], state: dict[str, Any], plan: dict[str, Any]) -
         reading, row, basis, check = fb["reading"], fb["result"].row, BASIS_AUTO_PRICE_MISMATCH, fb["check"]
     elif action == "UNCONFIRMED":
         basis = BASIS_AUTO_UNCONFIRMED
+    elif action == "CONTRADICTED":
+        basis = None
     tasks: list[str] = []
     inv = plan.get("invoice") or {}
     if inv.get("disagree"):
@@ -1942,7 +2006,7 @@ def _proposal(ev: dict[str, Any], state: dict[str, Any], plan: dict[str, Any]) -
         tasks.append("SKU_PRICE_MISMATCH (booking)")
     if action == "UNCONFIRMED" and not _other_pc_question(ev, plan):
         tasks.append("SKU_NOT_CONFIRMED")
-    if action == "NOT_IDENTIFIED":
+    if action in {"NOT_IDENTIFIED", "CONTRADICTED"}:
         tasks.append("MODEL_NOT_IDENTIFIED")
     master = _to_decimal((row or {}).get("master_ex_showroom"))
     offered = (reading or {}).get("exShowroom")
@@ -1953,7 +2017,8 @@ def _proposal(ev: dict[str, Any], state: dict[str, Any], plan: dict[str, Any]) -
         "action": action,
         "oldSku": state.get("sku_code"), "oldBasis": state.get("match_basis"),
         "proposedSku": new_sku, "proposedBasis": basis if new_sku else None,
-        "changes": bool(row is not None and str(row["product_sku_id"]) != str(state.get("product_sku_id"))),
+        "changes": bool((row is not None and str(row["product_sku_id"]) != str(state.get("product_sku_id")))
+                        or action == "CONTRADICTED"),
         "document": (reading or {}).get("documentType"), "documentId": (reading or {}).get("documentId"),
         "words": " / ".join(v for v in ((reading or {}).get("model"), (reading or {}).get("variant")) if v) or None,
         "masterExShowroom": str(master) if master is not None else None,
@@ -2398,6 +2463,54 @@ def _apply_invoice_words_only(
     return {"resolved": True, "changed": False, "source": "INVOICE", "skuCode": row["sku_code"],
             "matchStage": "INVOICE_WORDS", "basis": BASIS_AUTO_PRICE_MISMATCH, "priceCheck": check,
             "crossChecked": True, "mismatchFlagged": True}
+
+
+def _clear_automatic_pin(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, state: dict[str, Any], ev: dict[str, Any],
+    why: str, correlation_id: str,
+) -> bool:
+    """Take an automatic (TENTATIVE) SKU off the Journey (CONTRADICTED,
+    2026-11-21): the Journey then reads like any Journey with no SKU -- no
+    SKU, no selection, the booking form's own words as its vehicle text --
+    and the evidence keeps what was cleared and why. Never touches a SKU a
+    PC or Team Lead set. Returns whether it was written."""
+    booking = ev.get("booking") or {}
+    written = connection.execute(
+        text(
+            """
+            UPDATE auditcore.journey_products
+            SET product_sku_id = NULL, model_code_snapshot = NULL, variant_code_snapshot = NULL,
+                model_name_snapshot = :model, variant_name_snapshot = :variant,
+                selection_status = NULL, selection_method = NULL, match_basis = NULL,
+                match_evidence = CAST(:evidence AS jsonb), updated_at_utc = now()
+            WHERE tenant_id = :t AND journey_id = :j AND product_sku_id IS NOT NULL
+              AND selection_status IS DISTINCT FROM 'CONFIRMED'
+            RETURNING journey_id
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "model": booking.get("model"), "variant": booking.get("variant"),
+         "evidence": json.dumps({"source": "RECHECK", "cleared": state.get("sku_code"),
+                                 "clearedBasis": state.get("match_basis"), "why": why,
+                                 "decidedAtUtc": datetime.now(UTC).isoformat()}, default=str)},
+    ).first() is not None
+    if written:
+        # The old SKU's questions go (its "not confirmed" and price checks);
+        # the closest-SKU suggestion is the PC's question now, so the "SKU
+        # resolved" closing (_close_sku_tasks) is not used here.
+        from audit_core.uc03_sku_tasks import (
+            resolve_not_confirmed_task,
+            resolve_price_mismatch_tasks,
+        )
+
+        reason = "The automatic SKU was cleared: the booking form names another model"
+        resolve_not_confirmed_task(connection, tenant_id=tenant_id, journey_id=journey_id, reason=reason)
+        resolve_price_mismatch_tasks(connection, tenant_id=tenant_id, journey_id=journey_id, source="BOOKING",
+                                     keep=set(), reason=reason)
+        _note_change(connection, tenant_id=tenant_id, journey_id=journey_id, state=state, new_sku=None,
+                     basis="CLEARED", why=f"Cleared: {why}", correlation_id=correlation_id)
+        _note_sku_fact_change(connection, tenant_id=tenant_id, journey_id=journey_id,
+                              reason="sku_cleared_automatically")
+    return written
 
 
 def _apply_unconfirmed(
@@ -3191,6 +3304,14 @@ def _sync_model_resolution_unguarded(
                              named=bool(plan.get("named")), booking_not_naming=True, **common)
         if action == "UNCONFIRMED":
             return _apply_unconfirmed(connection, ev=ev, state=state, plan=plan, info=info, **common)
+        if action == "CONTRADICTED":
+            _clear_automatic_pin(connection, tenant_id=tenant_id, journey_id=journey_id, state=state, ev=ev,
+                                 why=plan["why"], correlation_id=correlation_id)
+            result = _raise_not_identified(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                           correlation_id=correlation_id, ev=ev, info=info)
+            _run_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                     correlation_id=correlation_id, raise_findings=raise_findings)
+            return {**result, "cleared": state.get("sku_code"), "why": plan["why"]}
         if action == "INVOICE_WORDS_PIN":
             return _apply_invoice_words_only(connection, ev=ev, fallback=plan["fallback"], info=info, **common)
         return _raise_not_identified(connection, tenant_id=tenant_id, journey_id=journey_id,

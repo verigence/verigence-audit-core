@@ -744,3 +744,99 @@ def test_marking_an_invoice_cancelled_voids_that_document_and_resolves_again(jou
     # The remaining invoice names LX at its price: it sets the SKU.
     assert _vehicle(c)["product_sku_id"] == lx
     assert _sku_task(c, "SKU_INVOICES_DISAGREE")["task_status"] == "VERIFIED_COMPLETE"
+
+
+# ── 2026-11-21: an automatic SKU the booking form contradicts is cleared ─────
+_THAR_AND_3XO = [
+    {"model": "THAR", "variant": "LX", "components": {"EX_SHOWROOM": "1400000"}},
+    {"model": "XUV 3XO", "variant": "AX5 PM MT", "fuel": "PETROL", "transmission": "MT", "trim": "AX5",
+     "components": {"EX_SHOWROOM": "999901"}},
+]
+
+
+def test_an_automatic_pin_of_another_model_than_the_booking_form_names_is_cleared(journey):
+    """SHI-YK-261113-009: the form reads "XUV 300 / W6 (AXS) Petrol MT" (the XUV
+    3XO, no SKU of it named) and the automatic pin was another model: it is
+    cleared, its "not confirmed" question closed, and the PC asked which SKU
+    with the 3XO's closest SKU -- never kept as AUTO_UNCONFIRMED."""
+    c = journey
+    lx, _ax5 = _seed_price_list(c, _THAR_AND_3XO)
+    doc = _booking_form(c, {"vehicle_model": "THAR", "vehicle_variant": "LX", "ex_showroom_price": "1400000"})
+    _sync(c)
+    assert _vehicle(c)["product_sku_id"] == lx
+    _correct_field(c, doc, "vehicle_model", "XUV 3XO")
+    _correct_field(c, doc, "vehicle_variant", "W6 (AXS) Petrol MT")
+    _correct_field(c, doc, "ex_showroom_price", "999901")
+
+    proposal = _recheck(c, commit=False)["proposal"]
+    assert (proposal["action"], proposal["changes"], proposal["proposedSku"]) == ("CONTRADICTED", True, None)
+    assert proposal["tasks"] == ["MODEL_NOT_IDENTIFIED"] and proposal["group"] == "CHANGE"
+
+    _sync(c)
+    v = _vehicle(c)
+    assert v["product_sku_id"] is None and v["match_basis"] is None and v["selection_status"] is None
+    assert (v["model_name_snapshot"], v["variant_name_snapshot"]) == ("XUV 3XO", "W6 (AXS) Petrol MT")
+    assert v["match_evidence"]["cleared"] and "THAR" in v["match_evidence"]["why"]
+    assert "SKU_NOT_CONFIRMED" not in _open_tasks(c)
+    activity = c.execute(text("SELECT details FROM auditcore.p2_activity_events WHERE tenant_id=:t AND journey_id=:j "
+                              "AND event_type='SKU_RESOLUTION_CHANGED' ORDER BY created_at_utc"),
+                         {"t": c.tenant_id, "j": c.journey_id}).scalars().all()
+    assert activity[-1]["to"] is None and activity[-1]["toBasis"] == "CLEARED"
+
+
+def test_the_same_model_with_a_word_no_sku_carries_still_keeps_the_pin(journey):
+    """The narrow rule: the form names the pinned SKU's own model (only a
+    trim no SKU carries) -- review 471 B2 stands, the pin is kept."""
+    c = journey
+    lx, _ = _seed_price_list(c, _THAR_AND_3XO)
+    doc = _booking_form(c, {"vehicle_model": "THAR", "vehicle_variant": "LX", "ex_showroom_price": "1400000"})
+    _sync(c)
+    _correct_field(c, doc, "vehicle_variant", "AX7")
+    _sync(c)
+    v = _vehicle(c)
+    assert v["product_sku_id"] == lx and v["match_basis"] == "AUTO_UNCONFIRMED"
+
+
+def test_a_pc_set_sku_is_never_cleared_by_a_contradicting_form(journey):
+    c = journey
+    lx, _ = _seed_price_list(c, _THAR_AND_3XO)
+    doc = _booking_form(c, {"vehicle_model": "THAR", "vehicle_variant": "LX", "ex_showroom_price": "1400000"})
+    _sync(c)
+    c.execute(text("UPDATE auditcore.journey_products SET selection_status='CONFIRMED', match_basis='PC_CONFIRMED' "
+                   "WHERE tenant_id=:t AND journey_id=:j"), {"t": c.tenant_id, "j": c.journey_id})
+    _correct_field(c, doc, "vehicle_model", "XUV 3XO")
+    _correct_field(c, doc, "vehicle_variant", "W6")
+    _sync(c)
+    assert _vehicle(c)["product_sku_id"] == lx
+
+
+def test_a_vehicle_invoice_naming_a_model_stops_the_form_from_clearing(journey):
+    """The invoice is the source of truth: a form naming another model never
+    clears a pin while a vehicle invoice names a model."""
+    c = journey
+    lx, _ = _seed_price_list(c, _THAR_AND_3XO)
+    doc = _booking_form(c, {"vehicle_model": "THAR", "vehicle_variant": "LX", "ex_showroom_price": "1400000"})
+    _sync(c)
+    _set_invoice_field(c, "model_name_raw", "THAR")
+    _correct_field(c, doc, "vehicle_model", "XUV 3XO")
+    _correct_field(c, doc, "vehicle_variant", "W6")
+    assert _recheck(c, commit=False)["proposal"]["action"] != "CONTRADICTED"
+    _sync(c)
+    assert _vehicle(c)["product_sku_id"] == lx
+
+
+def test_one_model_name_inside_the_other_is_not_a_contradiction():
+    """ "BOLERO" read off a form against the September "THE BOSS- BOLERO+NEO"
+    pin, "XUV 3XO" against "XUV3XO EV": the same vehicle line."""
+    from audit_core.uc03_sku_words import WordResult
+
+    state = {"product_sku_id": "x", "selection_status": "TENTATIVE", "match_basis": "AUTO_MATCHED",
+             "model_name": "THE BOSS- BOLERO+NEO"}
+    res = WordResult(status="UNRECOGNISED_WORD", model_rows=[{"model_name": "BOLERO"}])
+    ev = {"booking": {"model": "Bolero", "variant": "NEO-N11"}, "bookingResult": res, "invoices": []}
+    assert mr._booking_names_other_model(ev, state, {}) is None
+    state["model_name"] = "XUV3XO EV"
+    ev["bookingResult"] = WordResult(status="UNRECOGNISED_WORD", model_rows=[{"model_name": "XUV3XO"}])
+    assert mr._booking_names_other_model(ev, state, {}) is None
+    state["model_name"] = "XUV 7XO"
+    assert "XUV3XO" in mr._booking_names_other_model(ev, state, {})
