@@ -31,6 +31,8 @@ from typing import Any
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
+
 GATE_PASS, NDC, RECEIPT = "GATE_PASS", "NDC", "RECEIPT"
 SOURCE_LABELS = {GATE_PASS: "Gate pass", NDC: "NDC delivery date", RECEIPT: "Latest payment receipt"}
 
@@ -109,11 +111,7 @@ _SQL = """
            (SELECT jp.model_name_snapshot FROM auditcore.journey_products jp
             WHERE jp.tenant_id = :t AND jp.journey_id = s.journey_id LIMIT 1) AS model,
            cl.deal_type, dy.gate_pass, dy.ndc, r.day AS receipt,
-           (EXISTS (SELECT 1 FROM auditcore.deliveries dl
-                    WHERE dl.tenant_id = :t AND dl.journey_id = s.journey_id AND dl.actual_delivered_at IS NOT NULL)
-            OR EXISTS (SELECT 1 FROM auditcore.journey_stage_states ds
-                       WHERE ds.tenant_id = :t AND ds.journey_id = s.journey_id AND ds.stage_code = 'DELIVERY'
-                         AND ds.first_started_at_utc IS NOT NULL)) AS has_delivery
+           """ + DELIVERY_STARTED_SQL.format(t=":t", j="s.journey_id") + """ AS has_delivery
     FROM scope s
     LEFT JOIN days dy ON dy.journey_id = s.journey_id
     LEFT JOIN receipts r ON r.journey_id = s.journey_id

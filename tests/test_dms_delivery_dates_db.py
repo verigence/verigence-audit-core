@@ -46,7 +46,7 @@ def dealer():
                               {"t": tenant_id, "d": dealer_id, "c": f"DD-OU-{suffix}"}).scalar_one()
 
         def journey(name: str, *, delivery_stage: bool, gate_pass: str | None = None, ndc: str | None = None,
-                    receipt: date | None = None) -> None:
+                    receipt: date | None = None, delivery_paper: str | None = None) -> None:
             customer = c.execute(text("""INSERT INTO auditcore.customers (tenant_id, dealer_id, outlet_id,
                     customer_type_code, display_name, legal_name) VALUES (:t, :d, :o, 'INDIVIDUAL', :n, :n)
                     RETURNING customer_id"""), {"t": tenant_id, "d": dealer_id, "o": outlet_id, "n": name}).scalar_one()
@@ -59,6 +59,11 @@ def dealer():
                 c.execute(text("INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code, "
                                "business_status, first_started_at_utc) VALUES (:t, :j, 'DELIVERY', 'IN_PROGRESS', now())"),
                           {"t": tenant_id, "j": jid})
+            if delivery_paper is not None:  # a delivery document with no delivery date on it
+                c.execute(text("""INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id,
+                        di_document_id, document_type_key, evidence_purpose, process_area, association_status)
+                        VALUES (:t, :j, :c, :s, :d, :k, 'JOURNEY_DOCUMENT', 'DELIVERY', 'ACTIVE')"""),
+                          {"t": tenant_id, "j": jid, "c": customer, "s": uuid4(), "d": uuid4(), "k": delivery_paper})
             for document_type, value in (("gate_pass", gate_pass), ("customer_ledger", ndc)):
                 if value is None:
                     continue
@@ -88,7 +93,10 @@ def dealer():
 
         journey("GATEPASS", delivery_stage=True, gate_pass="2026-11-03", receipt=date(2026, 10, 25))
         journey("NDCONLY", delivery_stage=True, ndc="2026-11-04", receipt=date(2026, 10, 30))
-        journey("RECEIPTONLY", delivery_stage=True, receipt=date(2026, 11, 2))
+        journey("RECEIPTONLY", delivery_stage=True, receipt=date(2026, 11, 2), delivery_paper="insurance_cover")
+        # 2026-11-21: the Delivery stage row opens on its own minutes after a booking upload; with
+        # no delivery document on file the car is not delivered in Verigence (uc03_delivery_start).
+        journey("STAGEONLY", delivery_stage=True, receipt=date(2026, 11, 2))
         journey("BOOKINGONLY", delivery_stage=False, receipt=date(2026, 11, 2))
         journey("LATERGP", delivery_stage=True, gate_pass="2026-11-08")
         journey("OCTOBER", delivery_stage=True, gate_pass="2026-10-28")
@@ -120,6 +128,7 @@ def test_delivery_day_is_gate_pass_then_ndc_then_latest_receipt(dealer):
     assert (by_name["GATEPASS"].source, by_name["GATEPASS"].days) == (dd.GATE_PASS, [date(2026, 11, 3)])
     assert (by_name["NDCONLY"].source, by_name["NDCONLY"].days) == (dd.NDC, [date(2026, 11, 4)])
     assert (by_name["RECEIPTONLY"].source, by_name["RECEIPTONLY"].days) == (dd.RECEIPT, [date(2026, 11, 2)])
+    assert by_name["STAGEONLY"] is None
     assert by_name["BOOKINGONLY"] is None  # receipts, but no delivery files: not a delivery
     # a gate pass dated after today is a misreading: the receipt decides
     assert (by_name["MISREAD"].source, by_name["MISREAD"].days) == (dd.RECEIPT, [date(2026, 11, 1)])

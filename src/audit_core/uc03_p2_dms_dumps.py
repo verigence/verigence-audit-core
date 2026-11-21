@@ -72,6 +72,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
 from audit_core.uc03_p2_access import authorize_p2_any
 from audit_core.uc03_p2_names import same_person
 
@@ -491,15 +492,16 @@ _INDEX_SQL = """
                         CASE WHEN c.display_name ~* '^[0-9a-f]{8}-[0-9a-f]{4}-' THEN NULL ELSE c.display_name END)
                  AS customer_name,
                c.mobile_number, b.booking_reference, b.booking_date, jp.model_name_snapshot AS model,
-               (dl.actual_delivered_at IS NOT NULL OR ds.first_started_at_utc IS NOT NULL) AS has_delivery,
+               -- Delivered in Verigence: a delivery document on file, or the car delivered --
+               -- the one rule (uc03_delivery_start, 2026-10-28). The Delivery stage row opens
+               -- on its own within minutes of a booking upload, so it is not one (2026-11-21:
+               -- 125 journeys with no delivery paper read as delivered against the DMS).
+               """ + DELIVERY_STARTED_SQL.format(t="j.tenant_id", j="j.journey_id") + """ AS has_delivery,
                vr.vin, vr.chassis_number
         FROM auditcore.journeys j
         LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
         LEFT JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
         LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
-        LEFT JOIN auditcore.deliveries dl ON dl.tenant_id = j.tenant_id AND dl.journey_id = j.journey_id
-        LEFT JOIN auditcore.journey_stage_states ds
-          ON ds.tenant_id = j.tenant_id AND ds.journey_id = j.journey_id AND ds.stage_code = 'DELIVERY'
         LEFT JOIN auditcore.vehicle_records vr ON vr.tenant_id = j.tenant_id AND vr.journey_id = j.journey_id
         LEFT JOIN up ON up.journey_id = j.journey_id
         WHERE j.tenant_id = :t AND j.dealer_id = :d
