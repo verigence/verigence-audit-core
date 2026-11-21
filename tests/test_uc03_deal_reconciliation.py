@@ -117,13 +117,22 @@ def journey():
                         now(), now(), 1)"""),
             {"t": tenant_id, "j": journey_id},
         )
+        gate_pass = uuid4()
         # Delivery has started: the deal is compared with the standard only
         # from then on (product owner 2026-10-28).
         c.execute(
             text("""INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id, di_document_id,
                 document_type_key, evidence_purpose, process_area, association_status)
                 VALUES (:t, :j, :c, :s, :d, 'gate_pass', 'JOURNEY_DOCUMENT', 'DELIVERY', 'ACTIVE')"""),
-            {"t": tenant_id, "j": journey_id, "c": customer_id, "s": uuid4(), "d": uuid4()},
+            {"t": tenant_id, "j": journey_id, "c": customer_id, "s": uuid4(), "d": gate_pass},
+        )
+        # ...and the gate pass prints the vehicle's VIN: a delivery in Verigence (2026-11-21).
+        c.execute(
+            text("""INSERT INTO auditcore.journey_document_extracted_fields (tenant_id, journey_id, di_document_id,
+                source_fact_version, field_key, stage_code, source_document_type_key, extracted_value, effective_value)
+                VALUES (:t, :j, :d, 1, 'chassis_number', 'DELIVERY', 'gate_pass', '"MA1TEST0RECON0001"',
+                        '"MA1TEST0RECON0001"')"""),
+            {"t": tenant_id, "j": journey_id, "d": gate_pass},
         )
     engine.dispose()
     engine = create_engine(database_url)

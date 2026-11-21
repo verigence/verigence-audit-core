@@ -231,7 +231,10 @@ def test_todays_register_is_not_yet_due(setup):
     today = datetime.now(IST).date()
     _gate_schedule(s, today - timedelta(days=30))
     gp = _build(s, tl, "DAY", today)["totals"]["gatePass"]
-    if today.isoweekday() == 7:
+    # A Sunday has its own register from 15 Nov 2026 (task_manager.sunday_is_off).
+    from audit_core.task_manager import sunday_is_off
+
+    if sunday_is_off(today):
         assert gp["due"] == 0
     else:
         assert (gp["due"], gp["notYetDue"], gp["missing"]) == (1, 1, 0)

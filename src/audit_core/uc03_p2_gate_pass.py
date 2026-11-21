@@ -1182,8 +1182,10 @@ def gate_pass_summary(
     if start > end or (end - start).days >= MAX_SUMMARY_DAYS:
         raise HTTPException(status_code=422, detail=f"Choose a range of 1 to {MAX_SUMMARY_DAYS} days.")
     outlets = scope_outlets(connection, tenant_id, principal.subject)
+    # A Sunday from 15 Nov 2026 has its own register; an earlier one went with Monday's
+    # (sunday_is_off). Leaving out every Sunday dropped those registers from the totals.
     days = [start + timedelta(days=i) for i in range((end - start).days + 1)
-            if (start + timedelta(days=i)).isoweekday() != 7]
+            if not sunday_is_off(start + timedelta(days=i))]
     ids = [str(o["outlet_id"]) for o in outlets]
     empty = {"asPerRegister": 0, "updatedInTool": 0, "notNotifiedToPc": 0, "pendingDueToPc": 0,
              "stockTransfers": 0, "gatePassDays": 0, "gatePassesFinished": 0, "gatePassesMissing": 0}

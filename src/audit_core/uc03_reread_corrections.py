@@ -62,7 +62,8 @@ def corrections_of(connection: Connection, *, tenant_id: str, journey_id: UUID, 
                 FROM auditcore.journey_field_change_log c
                 WHERE c.tenant_id = f.tenant_id AND c.journey_id = f.journey_id
                   AND c.di_document_id = f.di_document_id AND c.field_key = f.field_key
-                  AND c.change_reason = 'CORRECTION'
+                  -- a date taken from the DMS dump is kept like a person's (2026-11-21)
+                  AND c.change_reason IN ('CORRECTION', 'DMS_SYNC')
                 ORDER BY c.changed_at_utc DESC LIMIT 1
             ) l ON true
             WHERE f.tenant_id = :t AND f.journey_id = :j AND f.di_document_id = CAST(:d AS uuid)

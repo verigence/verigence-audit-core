@@ -89,6 +89,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
 from audit_core.uc03_p2_dms_dumps import (
     _READ,
     _UPDATE,
@@ -743,6 +744,9 @@ _ROWS_SQL = f"""
 _DATE = "'^\\d{4}-\\d{2}-\\d{2}$'"
 # The Journeys Verigence shows as charged, with the day they belong to and whether any
 # current dump of the type carries the vehicle (a cancelled registration apart).
+# Delivered in Verigence: the one rule (uc03_delivery_start), not the Delivery stage row.
+_DELIVERED = DELIVERY_STARTED_SQL.format(t="j.tenant_id", j="j.journey_id")
+
 _SOLD_SQL = f"""
     SELECT CAST(k.journey_id AS text) AS journey_id, CAST(j.dealer_id AS text) AS dealer_id, d.dealer_name,
            CAST(j.outlet_id AS text) AS outlet_id, o.outlet_name, j.journey_reference,
@@ -764,6 +768,7 @@ _SOLD_SQL = f"""
               FROM auditcore.journey_stage_states ds
               LEFT JOIN auditcore.deliveries dl ON dl.tenant_id = ds.tenant_id AND dl.journey_id = ds.journey_id
              WHERE ds.tenant_id = j.tenant_id AND ds.journey_id = j.journey_id AND ds.stage_code = 'DELIVERY'
+               AND {_DELIVERED}
            ) AS delivery_started,
            EXISTS (SELECT 1 FROM auditcore.p2_scheme_dump_rows r
                    JOIN auditcore.p2_scheme_dumps u

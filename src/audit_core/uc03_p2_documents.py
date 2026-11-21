@@ -975,35 +975,26 @@ def patch_p2_document_field(
     )
 
 
-@router.post("/documents/{document_id}/field-corrections")
-def correct_p2_document_field(
+def apply_p2_field_correction(
+    connection: Connection,
+    *,
     tenant_id: str,
     journey_id: UUID,
     document_id: UUID,
-    command: P2FieldCorrectionCommand,
-    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
-    authorization_client: Annotated[
-        SecurityAuthorizationClient, Depends(get_security_authorization_client)
-    ],
-    connection: Annotated[Connection, Depends(get_connection)],
+    field_key: str,
+    canonical_field_id: str,
+    source_fact_version: int,
+    new_value: Any,
+    actor_id: str,
+    actor_role_code: str,
+    remarks: str | None,
+    change_reason: str = "CORRECTION",
 ) -> dict[str, Any]:
-    access = authorize_p2_any(
-        connection,
-        tenant_id=tenant_id,
-        journey_id=journey_id,
-        human_principal=human_principal,
-        authorization_client=authorization_client,
-        permission_keys=_FIELD_UPDATE_PERMISSIONS,
-    )
-    if future_date_verdict(command.fieldKey, command.newValue):
-        # The same rule the review check applies to a reading: a date of something
-        # that has already happened cannot be after today (2026-11-06: a gate pass
-        # corrected to 2027-10-27 instead of 2026-10-27).
-        raise HTTPException(
-            status_code=422,
-            detail=(f"{command.newValue} is after today ({programme_today().isoformat()}). "
-                    "This date records something that has already happened; check the day and the year."),
-        )
+    """Write one field's corrected value: on the row it was read from and every other stage's
+    copy, logged in the journey's change log. A person's correction (the endpoint below) and
+    the DMS dumps' dates (uc03_p2_dms_dumps, change_reason DMS_SYNC, product owner 2026-11-21)
+    go through here alike. Returns the field as it stood ("confidence", "previous", "documentType").
+    The caller notes the facts changed."""
     context = _document_context(
         connection,
         tenant_id=tenant_id,
@@ -1034,9 +1025,9 @@ def correct_p2_document_field(
             "tenant_id": tenant_id,
             "journey_id": journey_id,
             "document_id": document_id,
-            "canonical_field_id": command.canonicalFieldId,
-            "source_fact_version": command.sourceFactVersion,
-            "field_key": command.fieldKey,
+            "canonical_field_id": canonical_field_id,
+            "source_fact_version": source_fact_version,
+            "field_key": field_key,
         },
     ).mappings().all()
     field = copies[0] if copies else None
@@ -1045,8 +1036,8 @@ def correct_p2_document_field(
             connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id))
     if _pending_for(
         _pending_corrections(connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id),
-        field_key=command.fieldKey, canonical_field_id=command.canonicalFieldId,
-        source_fact_version=command.sourceFactVersion,
+        field_key=field_key, canonical_field_id=canonical_field_id,
+        source_fact_version=source_fact_version,
     ):
         raise HTTPException(status_code=409, detail=_PENDING_CORRECTION_DETAIL)
 
@@ -1083,7 +1074,6 @@ def correct_p2_document_field(
     # the PC's own task kept coming back because the value had not changed.
     # The Team Lead and the Reviewer are informed instead: the journey's
     # activity records who changed what, from which value, at what confidence.
-    reviewer = (access.operating_role or "").upper() == "REVIEWER"
     # The correction goes onto the row the value was read from, under that row's own stage --
     # not the page's stage as the document screen has it. Where the two differed, the
     # correction was stored as a second row and the value as read stayed "not reviewed", so
@@ -1100,13 +1090,13 @@ def correct_p2_document_field(
             field["source_document_type_key"]
             or context["document_type_key"]
         ),
-        field_key=command.fieldKey,
-        canonical_field_id=command.canonicalFieldId,
-        source_fact_version=command.sourceFactVersion,
+        field_key=field_key,
+        canonical_field_id=canonical_field_id,
+        source_fact_version=source_fact_version,
         confidence_score=confidence,
         original_value=machine_value,
-        new_value=command.newValue,
-        actor_id=human_principal.subject,
+        new_value=new_value,
+        actor_id=actor_id,
     )
     # A value already stored under two stages is corrected under both: one value on the page,
     # one answer, whichever copy a reader takes.
@@ -1119,17 +1109,17 @@ def correct_p2_document_field(
             tenant_id=tenant_id,
             journey_id=journey_id,
             stage_code=str(copy["stage_code"]),
-            actor_id=human_principal.subject,
+            actor_id=actor_id,
             fields=[ReviewedDiField(
                 document_id=document_id,
                 evidence_id=copy["evidence_id"],
-                source_canonical_field_id=command.canonicalFieldId,
+                source_canonical_field_id=canonical_field_id,
                 source_document_type_key=copy["source_document_type_key"] or context["document_type_key"],
-                field_key=command.fieldKey,
-                source_fact_version=command.sourceFactVersion,
+                field_key=field_key,
+                source_fact_version=source_fact_version,
                 extracted_value=copy["extracted_value"],
-                modified_value=command.newValue,
-                effective_value=command.newValue,
+                modified_value=new_value,
+                effective_value=new_value,
                 is_modified=True,
                 confidence_score=copy_confidence,
                 confidence_scale="PERCENT" if copy_confidence is not None else None,
@@ -1153,19 +1143,60 @@ def correct_p2_document_field(
             or str(context["stage_code"])
         ),
         document_id=document_id,
-        field_key=command.fieldKey,
-        canonical_field_id=command.canonicalFieldId,
-        source_fact_version=command.sourceFactVersion,
+        field_key=field_key,
+        canonical_field_id=canonical_field_id,
+        source_fact_version=source_fact_version,
         previous_value=json.dumps(current_effective),
-        new_value=json.dumps(command.newValue),
+        new_value=json.dumps(new_value),
         confidence_score=confidence,
-        change_reason="CORRECTION",
+        change_reason=change_reason,
+        actor_id=actor_id,
+        actor_role_code=actor_role_code,
+        remarks=remarks,
+    )
+    return {"confidence": confidence, "previous": current_effective,
+            "documentType": field["source_document_type_key"] or context["document_type_key"]}
+
+
+@router.post("/documents/{document_id}/field-corrections")
+def correct_p2_document_field(
+    tenant_id: str,
+    journey_id: UUID,
+    document_id: UUID,
+    command: P2FieldCorrectionCommand,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    access = authorize_p2_any(
+        connection,
+        tenant_id=tenant_id,
+        journey_id=journey_id,
+        human_principal=human_principal,
+        authorization_client=authorization_client,
+        permission_keys=_FIELD_UPDATE_PERMISSIONS,
+    )
+    if future_date_verdict(command.fieldKey, command.newValue):
+        # The same rule the review check applies to a reading: a date of something
+        # that has already happened cannot be after today (2026-11-06: a gate pass
+        # corrected to 2027-10-27 instead of 2026-10-27).
+        raise HTTPException(
+            status_code=422,
+            detail=(f"{command.newValue} is after today ({programme_today().isoformat()}). "
+                    "This date records something that has already happened; check the day and the year."),
+        )
+    reviewer = (access.operating_role or "").upper() == "REVIEWER"
+    applied = apply_p2_field_correction(
+        connection, tenant_id=tenant_id, journey_id=journey_id, document_id=document_id,
+        field_key=command.fieldKey, canonical_field_id=command.canonicalFieldId,
+        source_fact_version=command.sourceFactVersion, new_value=command.newValue,
         actor_id=human_principal.subject,
-        actor_role_code=(
-            access.operating_role or access.functional_role or "USER"
-        ),
+        actor_role_code=access.operating_role or access.functional_role or "USER",
         remarks=(command.remarks or "").strip() or None,
     )
+    confidence, current_effective = applied["confidence"], applied["previous"]
     if reviewer:
         # One information task for the Team Lead listing every value the
         # Reviewer corrected on this journey (product owner 2026-11-04).
@@ -1180,7 +1211,7 @@ def correct_p2_document_field(
             subject_type="DOCUMENT", subject_id=str(document_id),
             details={"fieldKey": command.fieldKey, "previousValue": current_effective,
                      "newValue": command.newValue, "confidence": confidence,
-                     "documentTypeKey": field["source_document_type_key"] or context["document_type_key"],
+                     "documentTypeKey": applied["documentType"],
                      "actorId": human_principal.subject,
                      "actorRole": access.operating_role or access.functional_role or "USER",
                      "remarks": (command.remarks or "").strip() or None,

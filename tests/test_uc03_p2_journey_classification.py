@@ -221,7 +221,7 @@ def test_team_lead_is_asked_in_delivery_and_their_answer_wins(engine) -> None:
     # Not asked before delivery has started.
     _run(journey, rule.sync_classification)
     assert _task(journey) is None
-    add_evidence(journey, di_document_id=uuid4(), document_type_key="supporting_document", process_area="DELIVERY")
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
     _run(journey, rule.sync_classification)
     task = _task(journey)
     assert task is not None and task["assigned_role_code"] == "TL"
@@ -247,7 +247,7 @@ def test_team_lead_is_asked_in_delivery_and_their_answer_wins(engine) -> None:
 
 def test_one_deal_type_for_several_journeys_in_one_go(engine) -> None:
     journey = create_p2_journey(engine, prefix="clsmany")
-    add_evidence(journey, di_document_id=uuid4(), document_type_key="supporting_document", process_area="DELIVERY")
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
     _run(journey, rule.sync_classification)
     assert _task(journey)["task_status"] not in ("VERIFIED_COMPLETE", "CANCELLED")
     outside = uuid4()  # not a Journey of this Project: refused, nothing changed

@@ -1,6 +1,8 @@
 """When a delivery has started (product owner 2026-10-28): a UPI screenshot, an
 extra receipt, a cost sheet or a GST certificate uploaded with the booking
-papers does not start it; a delivery record an upload opened is not a start."""
+papers does not start it; a delivery record an upload opened is not a start.
+2026-11-21: a delivery in Verigence is a journey with its own vehicle's VIN or
+chassis number on it; without one it is a booking only."""
 from __future__ import annotations
 
 import pytest
@@ -66,6 +68,33 @@ def test_a_delivery_document_starts_it(journey):
     assert _started(journey) and starts_delivery("customer_invoice_dms")
 
 
-def test_a_delivered_car_has_started_its_delivery(journey):
+def test_a_delivery_date_on_its_own_is_not_a_delivery(journey):
+    """2026-11-21: four journeys of Aditya held a delivery date and no document at all."""
     _delivery_record(journey, delivered=True)
+    assert not _started(journey)
+
+
+# ── the delivery rule (product owner 2026-11-21): its own vehicle's VIN / chassis on it ──
+def test_papers_filed_under_the_delivery_without_a_vin_are_a_booking_only(journey):
+    """A bank approval letter, an authorization letter, the exchange vehicle's RC or
+    scrappage certificate, filed under the delivery, came with the booking."""
+    for kind in ("bank_approval_letter", "authorization_letter", "scrappage_certificate_of_deposit",
+                 "supporting_document"):
+        add_ready_document(journey, kind, process_area="DELIVERY")
+    add_ready_document(journey, "vehicle_rc", process_area="DELIVERY", chassis_number="MA1OLDCAR0000001")
+    assert not _started(journey)
+
+
+def test_a_vehicle_paper_that_prints_no_vin_yet_is_not_a_delivery(journey):
+    from uuid import uuid4
+
+    from p2_support import add_evidence
+
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY",
+                 chassis=None)
+    assert not _started(journey)
+
+
+def test_its_vin_on_any_vehicle_paper_is_a_delivery(journey):
+    add_ready_document(journey, "insurance_cover", process_area="BOOKING", chassis_number="MA1NA2XZXT6K00001")
     assert _started(journey)

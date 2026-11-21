@@ -54,6 +54,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
 from audit_core.uc03_p2_access import authorize_p2
 
 logger = structlog.get_logger(__name__)
@@ -720,7 +721,7 @@ def journey_facts(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                                      WHERE c.tenant_id=:t AND c.journey_id=:j) THEN 'Closed by Reviewer'
                         WHEN bool_or(st.stage_code='DELIVERY' AND st.business_completed_at_utc IS NOT NULL)
                           THEN 'Delivery complete'
-                        WHEN bool_or(st.stage_code='DELIVERY' AND st.first_started_at_utc IS NOT NULL)
+                        WHEN """ + DELIVERY_STARTED_SQL.format(t=":t", j=":j") + """
                           THEN 'Delivery in progress'
                         WHEN bool_or(st.stage_code='BOOKING' AND st.business_completed_at_utc IS NOT NULL)
                           THEN 'Booking complete'
