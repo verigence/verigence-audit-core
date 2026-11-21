@@ -356,6 +356,15 @@ _IDENTITY_SQL = f"""
                AND {_ON_ACTIVE_DOCUMENT}) AS invoice_numbers,
            (SELECT jc.vin_used FROM auditcore.journey_classifications jc
              WHERE jc.tenant_id = j.tenant_id AND jc.journey_id = j.journey_id) AS vin,
+           -- 2026-11-21: the papers that name a customer, on file whether read or not.
+           (SELECT array_agg(DISTINCT t.kind) FROM (
+               SELECT e.document_type_key AS kind FROM auditcore.evidence e
+                WHERE e.tenant_id = j.tenant_id AND e.journey_id = j.journey_id AND e.association_status = 'ACTIVE'
+               UNION ALL
+               SELECT q.classified_document_type FROM auditcore.p2_document_queue q
+                WHERE q.tenant_id = j.tenant_id AND q.journey_id = j.journey_id AND q.queue_status <> 'CANCELLED'
+             ) t WHERE t.kind IN ('booking_form', 'booking_docket', 'pan_card', 'aadhaar', 'customer_kyc',
+                                  'gst_certificate')) AS identity_documents,
            {_CLOSED_SQL} AS is_closed
     FROM auditcore.journeys j
     JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
@@ -468,12 +477,24 @@ class FileIdentity:
     # no customer on it to its booking (part_of_sale_fields).
     receipt_keys: frozenset[str] = frozenset()
     chassis: frozenset[str] = frozenset()
+    # 2026-11-21: the kinds of paper naming a customer it holds (booking form / docket, PAN,
+    # Aadhaar, KYC, GST certificate), read or not.
+    identity_documents: frozenset[str] = frozenset()
 
     @property
     def nameless(self) -> bool:
         """No customer on the file: no PAN, Aadhaar, mobile or GSTIN read -- a receipt or the
         delivery papers uploaded on their own."""
         return not (self.pans or self.aadhaars or self.pan or self.aadhaar or self.mobile or self.gstin)
+
+    @property
+    def unread_customer(self) -> bool:
+        """Nameless only because its customer's papers are not read: a booking form, PAN,
+        Aadhaar or GST certificate on file with nothing read off it. Not a receipt or delivery
+        papers on their own -- another customer's file, maybe (2026-11-21: ADI-BO-261120-026,
+        one customer's unread booking form beside another customer's receipt, was joined into
+        the receipt's booking on the receipt alone and its booking form replaced the right one)."""
+        return self.nameless and bool(self.identity_documents)
 
     @property
     def model_key(self) -> str:
@@ -579,6 +600,7 @@ def _identities(connection: Connection, *, tenant_id: str, journey_ids: Iterable
             aadhaars=frozenset(a for a in (_valid_aadhaar(v) for v in row["aadhaar_values"] or []) if a),
             receipt_keys=_receipt_keys(row["receipt_rows"]),
             chassis=_chassis(row["chassis_values"], row["vin"]),
+            identity_documents=frozenset(str(k) for k in row["identity_documents"] or [] if k),
         )
     return out
 
@@ -897,6 +919,8 @@ def part_of_sale_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[
     if not (new.dealer_id and new.dealer_id == existing.dealer_id):
         return None
     if new.nameless == existing.nameless:
+        return None
+    if new.unread_customer or existing.unread_customer:
         return None
     if new.chassis and existing.chassis and not new.chassis & existing.chassis:
         return None
