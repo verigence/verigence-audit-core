@@ -44,6 +44,21 @@ def _at(day: date, hh: int = 11, mm: int = 0) -> datetime:
 
 
 @pytest.fixture
+def on_a_monday(monkeypatch):
+    """The duties module's clock on MON, 11:00 IST, for tests that go through the routes or
+    take today's list: on a Sunday the standard duties are not due (CI on Sunday 22 Nov 2026)."""
+    fixed = _at(MON)
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+
+    monkeypatch.setattr(dd, "datetime", _Clock)
+    return fixed
+
+
+@pytest.fixture
 def project():
     engine = database_engine()
     journey = create_p2_journey(engine, prefix="dd")
@@ -584,6 +599,8 @@ def test_the_pc_confirms_a_day_with_no_deliveries(project):
     assert (done["status"], done["doneSource"]) == ("DONE", "PC")
 
 
+@pytest.mark.skipif(datetime.now(IST).isoweekday() == 7,
+                    reason="reads today's uploads on the real clock; the standard duties are Monday to Saturday")
 def test_uploads_are_read_against_the_files_received(project):
     p = project
     with _Db(p) as c:
@@ -782,7 +799,7 @@ def test_day_close_states_of_the_pcs(project):
 # --------------------------------------------------------------------------- HTTP
 
 
-def test_http_routes_and_role_gates(project):
+def test_http_routes_and_role_gates(project, on_a_monday):
     p = project
     acting = {"subject": p.people["EXECUTIVE"]}
     app.dependency_overrides[get_human_principal] = lambda: HumanPrincipal(subject=acting["subject"])
