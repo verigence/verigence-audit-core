@@ -280,10 +280,15 @@ def _project_oem(connection: Connection, tenant_id: str) -> dict[str, Any]:
 
 
 def _alias_map(connection: Connection, oem_code: str) -> dict[str, str]:
+    """The aliases for the OEM's own masters (price lists, bulletins, grids):
+    ``applies_to = 'ALL'`` only. A DOCUMENTS alias ("XUV 300" -> XUV3XO,
+    migration 0252) is how dealers' papers name a model; in a bulletin the
+    same words are a model of their own (the exchange bulletin's "XUV300"
+    line), and an alias must never merge two models' offers."""
     rows = connection.execute(
         text(
             "SELECT alias_text, canonical_model_name FROM auditcore.oem_model_aliases "
-            "WHERE oem_code = :oem_code"
+            "WHERE oem_code = :oem_code AND applies_to = 'ALL'"
         ),
         {"oem_code": oem_code},
     ).mappings().all()

@@ -757,6 +757,8 @@ def _oem_code_for_tenant(connection: Connection, *, tenant_id: str) -> str | Non
 
 
 def _oem_model_aliases(connection: Connection, *, oem_code: str) -> list[tuple[str, str]]:
+    """Every alias, the DOCUMENTS ones included ("XUV 300" -> XUV3XO, 0252):
+    this reads dealers' papers, not the OEM's masters (``_alias_map``)."""
     rows = connection.execute(
         text(
             "SELECT alias_text, canonical_model_name FROM auditcore.oem_model_aliases "
