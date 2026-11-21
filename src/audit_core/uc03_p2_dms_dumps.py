@@ -929,6 +929,127 @@ def match_lock_key(tenant_id: str, dump_id: Any) -> str:
     return f"dms-match:{tenant_id}:{dump_id}"
 
 
+# --------------------------------------------------------------------------- sure matches
+
+# Product owner 2026-11-21: "if OTF matches then ... if verigence has some discrepancy ... if it
+# is for date can you update those date fields as per the DMS provided record ... and close the
+# corresponding manual tasks ... dont update mobile number ... if you find a difference in the
+# model ... make a list of the cases and provide it to the person who uploaded". The name is left
+# as it is (he chose to ignore name differences); a hand correction gives way to the DMS date,
+# the earlier value kept in the change log; the delivery dump does the same on the chassis.
+DATE_FIELDS = {BOOKING: ("booking_date", ("booking_form", "booking_docket")),
+               DELIVERY: ("delivery_date", ("gate_pass", "customer_ledger"))}
+
+
+def sure_match(kind: str, row: dict[str, Any], basis: str | None, journey: dict[str, Any] | None) -> bool:
+    """A match that names one booking on its own: the booking dump's B-number / OTF with its series
+    as the Journey's booking form reads it, the delivery dump's chassis. Not the OTF's running
+    number alone, not a mobile, not a name."""
+    if journey is None:
+        return False
+    if kind == DELIVERY:
+        return basis == "CHASSIS"
+    return basis == "BOOKING_NUMBER" and bool(
+        strong_booking_keys(row.get("booking_number"), row.get("dms_booking_number")) & set(journey.get("refs") or ()))
+
+
+_DATE_COPIES_SQL = """
+    SELECT DISTINCT ON (f.journey_id, f.di_document_id)
+           CAST(f.journey_id AS text) AS journey_id, CAST(f.di_document_id AS text) AS document_id,
+           COALESCE(e.document_type_key, f.source_document_type_key) AS doc,
+           f.source_canonical_field_id, f.source_fact_version, f.effective_value #>> '{}' AS value
+    FROM auditcore.journey_document_extracted_fields f
+    JOIN auditcore.evidence e
+      ON e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+     AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE'
+    WHERE f.tenant_id = :t AND CAST(f.journey_id AS text) = ANY(:js) AND f.field_key = :fk
+      AND COALESCE(e.document_type_key, f.source_document_type_key) = ANY(:docs)
+      AND f.source_canonical_field_id IS NOT NULL AND f.source_fact_version IS NOT NULL
+    ORDER BY f.journey_id, f.di_document_id, f.source_fact_version DESC NULLS LAST, f.updated_at_utc DESC
+"""
+
+
+def _sure_match_sync(connection: Connection, tenant_id: str, kind: str,
+                     sure: list[tuple[dict[str, Any], str, dict[str, Any]]],
+                     updates: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """On each sure match: the model compared (listed when it differs) and the date the DMS gives
+    set against the papers' -- the corrections to make. Reads only."""
+    from audit_core.uc03_p2_dates import parse_extracted_date, programme_today
+
+    if not sure:
+        return []
+    field_key, documents = DATE_FIELDS[kind]
+    copies: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in connection.execute(text(_DATE_COPIES_SQL), {
+            "t": tenant_id, "js": sorted({jid for _, jid, _ in sure}), "fk": field_key, "docs": list(documents)}
+            ).mappings():
+        copies[r["journey_id"]].append(dict(r))
+    fixes: list[dict[str, Any]] = []
+    for row, jid, journey in sure:
+        u = updates[row["row_no"]]
+        u["jm"] = journey.get("model")
+        u["md"] = not same_model(row.get("model"), journey.get("model"))
+        day = row.get("event_date")
+        if not isinstance(day, date) or day > programme_today():
+            continue
+        own = copies.get(jid, [])
+        # The delivery date: the gate pass's; the NDC's only when no gate pass is on file.
+        if kind == DELIVERY and any(c["doc"] == "gate_pass" for c in own):
+            own = [c for c in own if c["doc"] == "gate_pass"]
+        if not own:
+            u["ds"] = {"status": "NO_DOCUMENT", "field": field_key, "dms": day.isoformat()}
+            continue
+        wrong = [c for c in own if parse_extracted_date(c["value"]) != day]
+        if not wrong:
+            continue
+        u["ds"] = {"status": "TO_APPLY", "field": field_key, "dms": day.isoformat(),
+                   "was": sorted({str(c["value"]) for c in wrong})}
+        fixes += [{"journeyId": jid, "documentId": c["document_id"], "documentType": c["doc"],
+                   "canonicalFieldId": c["source_canonical_field_id"], "sourceFactVersion": c["source_fact_version"],
+                   "fieldKey": field_key, "was": c["value"], "dms": day.isoformat(), "rowNo": row["row_no"]}
+                  for c in wrong]
+    return fixes
+
+
+def apply_date_fixes(connection: Connection, *, tenant_id: str, plan: DumpPlan) -> int:
+    """The planned DMS dates written through the field correction path (logged DMS_SYNC, the
+    uploader named), the Journeys' facts noted as changed so their checks and tasks settle.
+    Each row's date_sync says what happened."""
+    from fastapi import HTTPException
+
+    from audit_core.uc03_p2_documents import apply_p2_field_correction
+    from audit_core.uc03_p2_runtime import note_facts_changed
+
+    dump, rows = plan.dump, {u["n"]: u for u in plan.updates}
+    word = "booking" if dump["dump_kind"] == BOOKING else "delivery"
+    remarks = (f"As per the DMS {word} dump of {dump['business_date']:%d %b %Y} ({dump['file_name']}), "
+               f"uploaded by {dump['uploaded_by_name'] or dump['uploaded_by']}")
+    applied, changed = 0, set()
+    for fix in plan.date_fixes:
+        u = rows[fix["rowNo"]]
+        try:
+            with connection.begin_nested():
+                apply_p2_field_correction(
+                    connection, tenant_id=tenant_id, journey_id=UUID(fix["journeyId"]),
+                    document_id=UUID(fix["documentId"]), field_key=fix["fieldKey"],
+                    canonical_field_id=fix["canonicalFieldId"], source_fact_version=int(fix["sourceFactVersion"]),
+                    new_value=fix["dms"], actor_id=str(dump["uploaded_by"]), actor_role_code="DMS_SYNC",
+                    remarks=f"{remarks}, row {fix['rowNo']}", change_reason="DMS_SYNC")
+        except HTTPException as error:
+            u["ds"] = {**(u["ds"] or {}), "status": "NOT_APPLIED", "reason": str(error.detail)[:300]}
+            continue
+        except Exception as error:  # noqa: BLE001 -- one Journey's date must not fail the upload
+            logger.warning("dms_date_sync_failed", journey_id=fix["journeyId"], error=str(error)[:300])
+            u["ds"] = {**(u["ds"] or {}), "status": "NOT_APPLIED", "reason": type(error).__name__}
+            continue
+        applied += 1
+        changed.add(fix["journeyId"])
+        u["ds"] = {**(u["ds"] or {}), "status": "APPLIED"}
+    for jid in sorted(changed):
+        note_facts_changed(connection, tenant_id=tenant_id, journey_id=UUID(jid), reason="DMS_DATE_SYNC")
+    return applied
+
+
 @dataclass
 class DumpPlan:
     """What matching a dump would store: one update per row, the Journeys synced, the counts."""
@@ -936,6 +1057,8 @@ class DumpPlan:
     updates: list[dict[str, Any]]
     synced: list[str]
     counts: dict[str, int]
+    # The dates the DMS gives that the Journeys' papers do not (sure matches only).
+    date_fixes: list[dict[str, Any]] = field(default_factory=list)
 
 
 def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpPlan:
@@ -943,8 +1066,8 @@ def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpP
     row would get. match_dump stores it; tools/dms_replay.py compares it across code versions
     on the live dumps before a change is merged (product owner 2026-11-21)."""
     dump = connection.execute(
-        text("SELECT dump_kind, dealer_id, period_month, business_date FROM auditcore.p2_dms_dumps "
-             "WHERE tenant_id = :t AND dump_id = :id"),
+        text("SELECT dump_kind, dealer_id, period_month, business_date, file_name, uploaded_by, uploaded_by_name "
+             "FROM auditcore.p2_dms_dumps WHERE tenant_id = :t AND dump_id = :id"),
         {"t": tenant_id, "id": str(dump_id)},
     ).mappings().one()
     # Matching is Python work between statements of one transaction: past the pool's 60 s
@@ -983,6 +1106,7 @@ def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpP
     rows = sorted(rows, key=lambda r: order.get(r["row_no"], -1))
     taken: set[str] = set()
     seen_lines: dict[str, int] = {}
+    sure: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
     for row in rows:
         if (model := row_out_of_scope(dict(row))) is not None:
             updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": None, "b": model,
@@ -1022,7 +1146,14 @@ def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpP
                         "jc": (journey or {}).get("customer"), "na": agrees})
         if jid and outcome != CANCELLED:
             synced.append(jid)
-    return DumpPlan(dict(dump), updates, synced, counts)
+            if sure_match(kind, dict(row), basis, journey):
+                sure.append((dict(row), jid, journey))
+    for u in updates:
+        u.setdefault("jm", None)
+        u.setdefault("md", None)
+        u.setdefault("ds", None)
+    date_fixes = _sure_match_sync(connection, tenant_id, kind, sure, {u["n"]: u for u in updates})
+    return DumpPlan(dict(dump), updates, synced, counts, date_fixes)
 
 
 def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict[str, int]:
@@ -1034,12 +1165,16 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
                        {"k": match_lock_key(tenant_id, dump_id)})
     plan = plan_dump(connection, tenant_id=tenant_id, dump_id=dump_id)
     kind, updates, synced, counts = plan.dump["dump_kind"], plan.updates, plan.synced, plan.counts
+    apply_date_fixes(connection, tenant_id=tenant_id, plan=plan)
+    for u in updates:
+        u["ds"] = json.dumps(u["ds"]) if u["ds"] is not None else None
     if updates:
         connection.execute(
             text("""
                 UPDATE auditcore.p2_dms_dump_rows SET journey_id = CAST(:j AS uuid), match_basis = :b, outcome = :o,
                        outlet_id = CAST(:ol AS uuid), deal_type = :dt, deal_type_basis = :dtb,
-                       journey_customer = :jc, name_agrees = :na
+                       journey_customer = :jc, name_agrees = :na,
+                       journey_model = :jm, model_differs = :md, date_sync = CAST(:ds AS jsonb)
                 WHERE tenant_id = :t AND dump_id = :id AND row_no = :n
             """),
             updates,
@@ -1083,6 +1218,9 @@ def _dump_json(r: Any) -> dict[str, Any]:
         "notInTool": r["not_in_tool_count"], "missing": r["missing_count"], "cancelled": r["cancelled_count"],
         "uploadedBy": r["uploaded_by_name"] or r["uploaded_by"], "uploadedAtUtc": r["uploaded_at_utc"].isoformat(),
         "matchedAtUtc": r["matched_at_utc"].isoformat() if r["matched_at_utc"] else None,
+        # Sure matches whose model differs, and dates taken from the DMS (2026-11-21).
+        "modelDiffers": int(r.get("model_differs_count") or 0),
+        "datesFromDms": int(r.get("dates_from_dms_count") or 0),
     }
 
 
@@ -1178,6 +1316,8 @@ def upload_dms_dump(
                        if d["dealerId"] == str(dealerId))
     publish_dump_alert(connection, tenant_id=tenant_id, dealer_id=str(dealerId), dealer_name=dealer_name,
                        kind=parsed.kind, business_date=business_date)
+    publish_model_alert(connection, tenant_id=tenant_id, dump_id=dump_id, uploader=principal.subject,
+                        dealer_name=dealer_name, kind=parsed.kind, business_date=business_date)
     logger.info("dms_dump_uploaded", tenant_id=tenant_id, dump_id=str(dump_id), kind=parsed.kind,
                 rows=len(parsed.rows), **{k.lower(): v for k, v in counts.items()})
     return _read_dump(connection, tenant_id, dump_id)
@@ -1186,7 +1326,12 @@ def upload_dms_dump(
 def _read_dump(connection: Connection, tenant_id: str, dump_id: UUID) -> dict[str, Any]:
     row = connection.execute(
         text("""
-            SELECT u.*, d.dealer_name FROM auditcore.p2_dms_dumps u
+            SELECT u.*, d.dealer_name, (SELECT count(*) FROM auditcore.p2_dms_dump_rows x
+                      WHERE x.tenant_id = u.tenant_id AND x.dump_id = u.dump_id AND x.model_differs) AS model_differs_count,
+                   (SELECT count(*) FROM auditcore.p2_dms_dump_rows x
+                      WHERE x.tenant_id = u.tenant_id AND x.dump_id = u.dump_id
+                        AND x.date_sync->>'status' = 'APPLIED') AS dates_from_dms_count
+            FROM auditcore.p2_dms_dumps u
             JOIN auditcore.dealers d ON d.tenant_id = u.tenant_id AND d.dealer_id = u.dealer_id
             WHERE u.tenant_id = :t AND u.dump_id = :id
         """),
@@ -1213,7 +1358,12 @@ def list_dms_dumps(
     dealer_ids = [d["dealerId"] for d in _dealers(connection, tenant_id, principal.subject, "ADMIN" in held)]
     rows = connection.execute(
         text("""
-            SELECT u.*, d.dealer_name FROM auditcore.p2_dms_dumps u
+            SELECT u.*, d.dealer_name, (SELECT count(*) FROM auditcore.p2_dms_dump_rows x
+                      WHERE x.tenant_id = u.tenant_id AND x.dump_id = u.dump_id AND x.model_differs) AS model_differs_count,
+                   (SELECT count(*) FROM auditcore.p2_dms_dump_rows x
+                      WHERE x.tenant_id = u.tenant_id AND x.dump_id = u.dump_id
+                        AND x.date_sync->>'status' = 'APPLIED') AS dates_from_dms_count
+            FROM auditcore.p2_dms_dumps u
             JOIN auditcore.dealers d ON d.tenant_id = u.tenant_id AND d.dealer_id = u.dealer_id
             WHERE u.tenant_id = :t AND u.business_date >= :f AND u.business_date < :l
               AND CAST(u.dealer_id AS text) = ANY(:ds)
@@ -1254,6 +1404,8 @@ def _row_json(r: Any) -> dict[str, Any]:
         "journeyId": str(r["journey_id"]) if r["journey_id"] else None, "journeyReference": r["journey_reference"],
         "dumpDate": r["business_date"].isoformat(),
         "dealType": r.get("deal_type"), "dealTypeBasis": r.get("deal_type_basis"),
+        "journeyModel": r.get("journey_model"), "modelDiffers": r.get("model_differs"),
+        "dateSync": r.get("date_sync"),
     }
 
 
@@ -1352,7 +1504,12 @@ def build_report(connection: Connection, *, tenant_id: str, dealer_ids: list[str
 
     dumps = connection.execute(
         text("""
-            SELECT u.*, d.dealer_name FROM auditcore.p2_dms_dumps u
+            SELECT u.*, d.dealer_name, (SELECT count(*) FROM auditcore.p2_dms_dump_rows x
+                      WHERE x.tenant_id = u.tenant_id AND x.dump_id = u.dump_id AND x.model_differs) AS model_differs_count,
+                   (SELECT count(*) FROM auditcore.p2_dms_dump_rows x
+                      WHERE x.tenant_id = u.tenant_id AND x.dump_id = u.dump_id
+                        AND x.date_sync->>'status' = 'APPLIED') AS dates_from_dms_count
+            FROM auditcore.p2_dms_dumps u
             JOIN auditcore.dealers d ON d.tenant_id = u.tenant_id AND d.dealer_id = u.dealer_id
             WHERE u.tenant_id = :t AND u.business_date >= :f AND u.business_date < :l
               AND CAST(u.dealer_id AS text) = ANY(:ds) AND (CAST(:id AS uuid) IS NULL OR u.dump_id = CAST(:id AS uuid))
@@ -1456,6 +1613,93 @@ def export_dms_dump_report(
                         day=day)
     name = f"DMS-Dump-Variance_{day:%Y-%m-%d}.xlsx" if day else f"DMS-Dump-Variance_{first:%Y-%m}.xlsx"
     return StreamingResponse(io.BytesIO(data), media_type=(
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
+# --------------------------------------------------------------------------- model differences
+
+MODEL_ALERT_KIND = "DMS_MODEL_DIFFERS"
+_MODEL_COLUMNS = [("Dealership", "dealerName"), ("DMS location", "outletLabel"), ("DMS date", "eventDate"),
+                  ("Row", "rowNo"), ("Customer", "customerName"), ("Booking no.", "bookingNumber"), ("OTF", "otf"),
+                  ("Chassis", "chassis"), ("Model as per DMS", "model"), ("Variant as per DMS", "variant"),
+                  ("Model in Verigence", "journeyModel"), ("Journey", "journeyReference"), ("Matched on", "matchBasis"),
+                  ("Consultant (DMS)", "consultant")]
+
+
+def model_differences(connection: Connection, tenant_id: str, dump_id: UUID) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        text(_ROW_SQL + " AND r.dump_id = :id AND r.model_differs ORDER BY r.event_date NULLS LAST, r.row_no"),
+        {"t": tenant_id, "id": str(dump_id)},
+    ).mappings().all()
+    items = [_row_json(r) for r in rows]
+    for item in items:
+        item["journeyModel"] = item["journeyModel"] or "Not identified"
+        item["matchBasis"] = {"BOOKING_NUMBER": "Booking no. / OTF", "CHASSIS": "Chassis"}.get(
+            item["matchBasis"], item["matchBasis"])
+    return items
+
+
+def publish_model_alert(connection: Connection, *, tenant_id: str, dump_id: UUID, uploader: str,
+                        dealer_name: str, kind: str, business_date: date) -> None:
+    """The person who uploaded the dump is told how many sure matches name a different model,
+    with the list to download (product owner 2026-11-21)."""
+    count = connection.execute(
+        text("SELECT count(*) FROM auditcore.p2_dms_dump_rows WHERE tenant_id = :t AND dump_id = :id "
+             "AND model_differs"), {"t": tenant_id, "id": str(dump_id)}).scalar_one()
+    if not count:
+        return
+    word = "booking" if kind == BOOKING else "delivery"
+    payload = {"audienceActorIds": [uploader], "dumpId": str(dump_id), "dumpKind": kind,
+               "dealerName": dealer_name, "count": int(count),
+               "link": f"/p2/data-uploads?dumpId={dump_id}",
+               "download": f"/dms-dumps/{dump_id}/model-differences/file"}
+    connection.execute(
+        text("""
+            INSERT INTO auditcore.p2_tenant_alerts (tenant_id, alert_kind, alert_status, title, body, payload,
+              published_at_utc, expires_at_utc)
+            VALUES (:t, :k, 'PUBLISHED', :title, :body, CAST(:p AS jsonb), now(), now() + interval '24 hours')
+        """),
+        {"t": tenant_id, "k": MODEL_ALERT_KIND,
+         "title": f"Model differs on {count} {word}{'s' if count != 1 else ''}",
+         "body": (f"{dealer_name}'s DMS {word} dump of {business_date:%d %b}: {count} matched on the "
+                  f"{'booking number / OTF' if kind == BOOKING else 'chassis'} name a different model in Verigence. "
+                  "Download the list from Data uploads."),
+         "p": json.dumps(payload)},
+    )
+
+
+@router.get("/dms-dumps/{dump_id}/model-differences/file")
+def export_model_differences(
+    tenant_id: str,
+    dump_id: UUID,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> StreamingResponse:
+    """Excel: the sure matches of one upload whose model differs between the DMS and Verigence."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    _access(connection, tenant_id, principal, client, _READ, READ_ROLES)
+    dump = _read_dump(connection, tenant_id, dump_id)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Model differs"
+    sheet.append([c for c, _ in _MODEL_COLUMNS])
+    bold, head = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="161616")
+    for cell in sheet[1]:
+        cell.font, cell.fill = bold, head
+    sheet.freeze_panes = "A2"
+    for item in model_differences(connection, tenant_id, dump_id):
+        sheet.append([item.get(key) for _, key in _MODEL_COLUMNS])
+    for column in sheet.columns:
+        width = max((len(str(c.value)) for c in column if c.value is not None), default=8)
+        sheet.column_dimensions[column[0].column_letter].width = min(max(width + 2, 10), 40)
+    out = io.BytesIO()
+    workbook.save(out)
+    name = f"Model-differs_{dump['dealerName']}_{dump['kind'].title()}_{dump['businessDate']}.xlsx".replace(" ", "-")
+    return StreamingResponse(io.BytesIO(out.getvalue()), media_type=(
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
