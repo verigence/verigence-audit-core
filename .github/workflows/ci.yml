@@ -257,6 +257,16 @@ jobs:
     uses: ./.github/workflows/p2-worker-dev-deploy.yml
     secrets: inherit
 
+  live-data-checks:
+    name: Live data checks after the deploy
+    needs: deploy-p2-worker-dev
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/dev' &&
+      needs.deploy-p2-worker-dev.result == 'success'
+    uses: ./.github/workflows/live-data-checks.yml
+    secrets: inherit
+
   diagnose-security-create:
     name: Diagnose live Security tenant create
     needs: deploy-dev
