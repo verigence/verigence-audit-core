@@ -17,14 +17,16 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, Engine, text
 
+from audit_core import activity_at_night
 from audit_core.activity_settings import reading_window, reading_window_minutes
 from audit_core.authorization import AuthorizationError
 from audit_core.db import set_tenant_context
 from audit_core.dependencies import (
     HumanAdminRequest,
     get_connection,
+    get_engine,
     get_human_principal,
     require_super_admin_request,
 )
@@ -363,25 +365,42 @@ def di_dashboard(tenant_id: str, principal: Principal, client: Client, connectio
 
 @router.post("/activity", status_code=202)
 def activity(tenant_id: str, command: ActivityCommand, principal: Principal, client: Client,
-             connection: Db) -> dict[str, Any]:
-    """The browser's tally of time on Verigence for today (one small upsert)."""
-    caller = _project_caller(connection, tenant_id=tenant_id, principal=principal, client=client,
-                             require_role=False)
-    if caller.role is None:
-        return {"recorded": False, "readingWindowMinutes": reading_window_minutes(connection, tenant_id)}
-    recorded = _run(lambda: record_activity(connection, tenant_id=tenant_id, caller=caller,
-                                            payload=command.model_dump()))
-    # The app picks up a changed reading window from its next send (product owner 2026-11-09).
-    return {"recorded": recorded, "readingWindowMinutes": reading_window_minutes(connection, tenant_id)}
+             engine: Annotated[Engine, Depends(get_engine)]) -> dict[str, Any]:
+    """The browser's tally of time on Verigence for today (one small upsert).
+
+    Asleep at night, a send from a tab nobody is using is left for the next one that is written
+    (audit_core.activity_at_night): no connection is taken, so the database can stop. Hence the
+    engine here and not a connection, which is checked the moment it is handed out."""
+    if activity_at_night.left_for_later(command.lastActiveAt):
+        return {"recorded": False}
+    with engine.begin() as connection:
+        caller = _project_caller(connection, tenant_id=tenant_id, principal=principal, client=client,
+                                 require_role=False)
+        if caller.role is None:
+            return {"recorded": False, "readingWindowMinutes": reading_window_minutes(connection, tenant_id)}
+        recorded = _run(lambda: record_activity(connection, tenant_id=tenant_id, caller=caller,
+                                                payload=command.model_dump()))
+        # The app picks up a changed reading window from its next send (product owner 2026-11-09).
+        return {"recorded": recorded, "readingWindowMinutes": reading_window_minutes(connection, tenant_id)}
 
 
 @router.get("/activity/settings")
-def activity_settings(tenant_id: str, principal: Principal, client: Client, connection: Db) -> dict[str, Any]:
+def activity_settings(tenant_id: str, principal: Principal, client: Client,
+                      engine: Annotated[Engine, Depends(get_engine)]) -> dict[str, Any]:
     """The reading window the app classifies each minute with (activity_settings): a minute is
-    active when a click, tap or key was in it or in this many minutes before it."""
-    _project_caller(connection, tenant_id=tenant_id, principal=principal, client=client, require_role=False)
-    window = reading_window(connection, tenant_id)
-    return {"readingWindowMinutes": window["minutes"], "scope": window["scope"]}
+    active when a click, tap or key was in it or in this many minutes before it.
+
+    The app asks again with every renewed sign-in, an open tab all night long; asleep, it is told
+    what it was told last, with no database (audit_core.activity_at_night)."""
+    told = activity_at_night.window_told(tenant_id, principal.subject)
+    if told is not None:
+        return told
+    with engine.begin() as connection:
+        _project_caller(connection, tenant_id=tenant_id, principal=principal, client=client, require_role=False)
+        window = reading_window(connection, tenant_id)
+    answer = {"readingWindowMinutes": window["minutes"], "scope": window["scope"]}
+    activity_at_night.remember_window(tenant_id, principal.subject, answer)
+    return answer
 
 
 # --------------------------------------------------------------------------- superadmin routes

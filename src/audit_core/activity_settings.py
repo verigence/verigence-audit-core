@@ -34,8 +34,9 @@ from typing import Annotated, Any
 import structlog
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
-from sqlalchemy import Connection, text
+from sqlalchemy import Connection, event, text
 
+from audit_core import activity_at_night
 from audit_core.db import set_platform_super_admin_context
 from audit_core.dependencies import (
     HumanAdminRequest,
@@ -257,6 +258,11 @@ def set_reading_window(connection: Connection, *, tenant_id: str | None, minutes
     )
     logger.info("activity_reading_window_changed", scope=tenant_id or "ALL", minutes=minutes,
                 previous_minutes=previous, actor_id=actor_id)
+    # Open tabs are told the window from memory at night (audit_core.activity_at_night): not any
+    # more. Now, and again once this is committed -- a tab that asks in between is told the old
+    # value and would otherwise keep it until morning.
+    activity_at_night.forget_windows()
+    event.listen(connection, "commit", lambda _connection: activity_at_night.forget_windows(), once=True)
 
 
 def set_engagement_settings(connection: Connection, *, tenant_id: str | None, values: dict[str, int | None],
