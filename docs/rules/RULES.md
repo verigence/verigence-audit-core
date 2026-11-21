@@ -65,6 +65,12 @@ rule once, with what it replaced and where it is read, is what stops that.
 | A consumer offer given in cash, or charged and taken off on the NDC, that is as per the consumer bulletin is the scheme availed: its entitlement is the scheme's cash plus the in-kind accessories kit / 4th-year EW the deal does not also give in kind, and Journey 360's System remarks say "Consumer scheme availed" with the breakdown. Only what is above that package is excess discount. Scheme and dealer grid stay judged line by line, never clubbed. | 21 Nov 2026 | 6 Nov: "accessories kit given as cash" was a breach listed apart (KIT_GIVEN_AS_CASH finding); the EW was not counted at all (SHI-SS-261030-008: kit 50,001 + EW 19,999 = NDC "SCHEME 70,000" flagged) | `uc03_discount_given.assess` (`schemeAvailed`), EXCESS_DISCOUNT, KIT_GIVEN_AS_CASH (now PASS, closes its tasks), Excess discount screen, Insights discount report, System remarks (`CONSUMER_SCHEME_AVAILED`) | `DISCOUNT_VARIANCE_RECOMPUTE` |
 | Consumer-scheme cash amounts like 7,001 / 80,001 are the bulletin's own: cash is the total offer less the EW price (7,001 + 17,999 + kit 50,000 = 75,000). Not a misread; never "corrected". | 17 Nov 2026 (checked) | 15 Nov recheck wrongly called them master errors | scheme master import (cash + other = total check) | — |
 
+## Vehicle (SKU)
+
+| Rule | Since | Replaces | Read by | Job for bookings before |
+|---|---|---|---|---|
+| A SKU Verigence pinned on its own (never one a PC or reviewer set) is cleared when the Booking Form names a different model and no vehicle invoice names any model: the vehicle goes back to the Booking Form's words and the PC gets "Vehicle model not identified" with the closest match. Not cleared when one model name contains the other (BOLERO vs THE BOSS- BOLERO+NEO, THAR vs THAR ROXX, XUV3XO vs XUV3XO EV), when the Booking Form names the same model with a word no SKU carries, or when a vehicle invoice names a model (the invoice is the source of truth). | 21 Nov 2026 | review 471 B2: an automatic SKU the papers do not confirm is kept (AUTO_UNCONFIRMED), never cleared (SHI-YK-261113-009 kept XUV 7XO while its Booking Form reads XUV 300) | `uc03_model_resolution._booking_names_other_model`, `_decide` (`CONTRADICTED`), `_clear_automatic_pin` | `SKU_RUN` reresolve (dry run, then commit) |
+
 ## Insurance (in-house or the customer's own)
 
 | Rule | Since | Replaces | Read by | Job for bookings before |
