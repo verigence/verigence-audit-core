@@ -869,9 +869,17 @@ class DeliveryScope:
         return decided["deal_type"], basis or None
 
 
+def match_lock_key(tenant_id: str, dump_id: Any) -> str:
+    return f"dms-match:{tenant_id}:{dump_id}"
+
+
 def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict[str, int]:
     """Match (again) every row of one dump, store the outcome and mark the Journeys found.
-    A row dated outside dump_window is OUT_OF_PERIOD: kept, not compared, not counted."""
+    A row dated outside dump_window is OUT_OF_PERIOD: kept, not compared, not counted.
+    One match at a time per dump, whoever asks (upload, Match again, Refresh from Verigence,
+    report generation or export, DMS_REMATCH): the others wait for it."""
+    connection.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
+                       {"k": match_lock_key(tenant_id, dump_id)})
     dump = connection.execute(
         text("SELECT dump_kind, dealer_id, period_month, business_date FROM auditcore.p2_dms_dumps "
              "WHERE tenant_id = :t AND dump_id = :id"),

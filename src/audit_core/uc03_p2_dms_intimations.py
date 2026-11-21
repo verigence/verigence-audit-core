@@ -148,13 +148,14 @@ def rematch_on_demand(connection: Connection, tenant_id: str, dump_id: Any) -> N
     (product owner 2026-11-21: the list was what the last match saw, so a Journey uploaded since
     still showed its booking "Not marked"; on demand, not on every opening, to keep the load down).
 
-    One match at a time per dump: a request waits for one already running and skips its own
-    when that one began after this request did (it has seen everything this one would)."""
-    from audit_core.uc03_p2_dms_dumps import match_dump
+    One match at a time per dump (match_dump's lock, whoever asks): a request waits for one
+    already running and skips its own when that one began after this request did."""
+    from audit_core.uc03_p2_dms_dumps import match_dump, match_lock_key
 
     asked = connection.execute(text("SELECT clock_timestamp()")).scalar_one()
+    # The lock match_dump takes (re-entrant within this transaction).
     connection.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
-                       {"k": f"dms-match:{tenant_id}:{dump_id}"})
+                       {"k": match_lock_key(tenant_id, dump_id)})
     matched = connection.execute(
         text("SELECT matched_at_utc FROM auditcore.p2_dms_dumps WHERE tenant_id = :t AND dump_id = :d"),
         {"t": tenant_id, "d": str(dump_id)},
