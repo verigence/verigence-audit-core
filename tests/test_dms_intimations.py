@@ -115,6 +115,36 @@ def _dump(s, kind: str, rows: list[dict], back: int = 0) -> str:
     return dump_id
 
 
+def test_refresh_from_verigence_matches_the_dump_on_demand(setup) -> None:
+    """A Journey uploaded after the dump was matched: the list shows its booking open until someone
+    asks to refresh from Verigence, which matches the dump first (product owner 2026-11-21)."""
+    s = setup
+    _dump(s, m.BOOKING, [{"booking_number": "B-20261121", "name": "Late Upload", "mobile": "9000000021"}])
+    params = {"kind": "BOOKING"}
+    before = s.client.get(f"{s.base}/dms-intimations", params={**params, "view": "month"}).json()
+    assert [i["state"] for i in before["items"]] == ["OPEN"]
+    add_extracted_field(s.journey, di_document_id=uuid4(), field_key="booking_reference_number", value="B-20261121")
+    # Opening, searching and switching views read the last match.
+    stale = s.client.get(f"{s.base}/dms-intimations", params={**params, "view": "month"}).json()
+    assert [i["state"] for i in stale["items"]] == ["OPEN"]
+    opened = s.client.get(f"{s.base}/dms-intimations", params={**params, "view": "month", "refresh": "true"}).json()
+    assert [i["state"] for i in opened["items"]] == ["IN_VERIGENCE"]
+    assert opened["items"][0]["journeyId"] == str(s.journey.journey_id)
+    assert opened["dump"]["matchedAtUtc"] > before["dump"]["matchedAtUtc"]
+
+    # The full sequence on (product owner 2026-11-21): the Reviewer generates the report; the PC's
+    # screen notes it, a refresh keeps the note (the dump is the same); the next dump clears it.
+    s.acting["subject"] = s.reviewer
+    made = s.client.post(f"{s.base}/dms-reports", json={})
+    assert made.status_code == 201, made.text
+    s.acting["subject"] = s.journey.actor_id
+    after = s.client.get(f"{s.base}/dms-intimations", params={**params, "view": "month", "refresh": "true"}).json()
+    assert after["report"]["reportId"] == made.json()["reportId"]
+    assert [i["state"] for i in after["items"]] == ["IN_VERIGENCE"]
+    _dump(s, m.BOOKING, [{"booking_number": "B-20261121", "name": "Late Upload", "mobile": "9000000021"}])
+    assert s.client.get(f"{s.base}/dms-intimations", params=params).json()["report"] is None
+
+
 @pytest.mark.skipif(_today().day < 3, reason="needs two dump days in the month")
 def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(setup) -> None:
     s = setup

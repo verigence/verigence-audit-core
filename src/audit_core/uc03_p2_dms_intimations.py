@@ -33,6 +33,9 @@ The mark      a row in Verigence needs none (the PC has its papers). Any other r
 The alert     an upload alerts the PCs of the dealership's outlets on every screen.
 The counter   on demand, for whoever generates the report: per PC of the dealership, how
               many rows they have marked, and the rows still open.
+Freshness     the list is what the dump's last match saw (matchedAtUtc). "Refresh from Verigence"
+              (refresh=true) matches it again with Verigence as it is now, on demand only (product
+              owner 2026-11-21: not on every opening, which would load the system needlessly).
 The report    once the DMS report has been generated from the dump the PC sees, the screen
               says so (2026-11-20: "once the report is generated, then we should put a note on
               the intimation screen and pop that Report has been already generated. If you want
@@ -125,7 +128,8 @@ def dump_pair(connection: Connection, tenant_id: str, dealer_id: str, kind: str,
     (an earlier day, the same month)."""
     rows = connection.execute(
         text("""
-            SELECT DISTINCT ON (u.business_date) u.dump_id, u.business_date, u.period_month, u.uploaded_at_utc
+            SELECT DISTINCT ON (u.business_date) u.dump_id, u.business_date, u.period_month, u.uploaded_at_utc,
+                   u.matched_at_utc
             FROM auditcore.p2_dms_dumps u
             WHERE u.tenant_id = :t AND u.dealer_id = CAST(:d AS uuid) AND u.dump_kind = :k AND u.status = 'ACTIVE'
               AND (CAST(:upto AS date) IS NULL OR u.business_date <= CAST(:upto AS date))
@@ -137,6 +141,28 @@ def dump_pair(connection: Connection, tenant_id: str, dealer_id: str, kind: str,
     latest = dict(rows[0]) if rows else None
     previous = (dict(rows[1]) if len(rows) > 1 and rows[1]["period_month"] == rows[0]["period_month"] else None)
     return latest, previous
+
+
+def rematch_on_demand(connection: Connection, tenant_id: str, dump_id: Any) -> None:
+    """The dump matched again with Verigence as it is now, on the screen's "Refresh from Verigence"
+    (product owner 2026-11-21: the list was what the last match saw, so a Journey uploaded since
+    still showed its booking "Not marked"; on demand, not on every opening, to keep the load down).
+
+    One match at a time per dump (match_dump's lock, whoever asks): a request waits for one
+    already running and skips its own when that one began after this request did."""
+    from audit_core.uc03_p2_dms_dumps import match_dump, match_lock_key
+
+    asked = connection.execute(text("SELECT clock_timestamp()")).scalar_one()
+    # The lock match_dump takes (re-entrant within this transaction).
+    connection.execute(text("SELECT pg_advisory_xact_lock(hashtextextended(:k, 0))"),
+                       {"k": match_lock_key(tenant_id, dump_id)})
+    matched = connection.execute(
+        text("SELECT matched_at_utc FROM auditcore.p2_dms_dumps WHERE tenant_id = :t AND dump_id = :d"),
+        {"t": tenant_id, "d": str(dump_id)},
+    ).scalar_one_or_none()
+    if matched is not None and matched >= asked:
+        return
+    match_dump(connection, tenant_id=tenant_id, dump_id=dump_id)
 
 
 def report_of_dump(connection: Connection, tenant_id: str, dealer_id: str, dump: dict[str, Any]
@@ -348,6 +374,7 @@ def list_intimations(
     dealerId: UUID | None = None,
     view: str = "new",
     q: str | None = None,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     from audit_core.uc03_p2_dms_outlet_report import outlet_map
 
@@ -374,6 +401,9 @@ def list_intimations(
     if latest is None:
         return {"kind": kind, "dealerId": did, "dealerName": name, "items": [], "counts": dict.fromkeys(VIEWS, 0),
                 "dump": None}
+    if refresh:
+        rematch_on_demand(connection, tenant_id, latest["dump_id"])
+        latest, previous = dump_pair(connection, tenant_id, did, kind)
     rows = _in_scope(dump_rows(connection, tenant_id, latest["dump_id"]), outlets, anchors)
     openable = ({str(o["outlet_id"]) for o in _pc_outlets(connection, tenant_id, principal.subject)} if is_pc
                 else None)
@@ -401,7 +431,8 @@ def list_intimations(
     return {
         "kind": kind, "dealerId": did, "dealerName": name, "view": view, "q": q or None,
         "dump": {"dumpId": str(latest["dump_id"]), "dumpDate": latest["business_date"].isoformat(),
-                 "previousDumpDate": since.isoformat() if since else None},
+                 "previousDumpDate": since.isoformat() if since else None,
+                 "matchedAtUtc": latest["matched_at_utc"].isoformat() if latest.get("matched_at_utc") else None},
         "report": report_of_dump(connection, tenant_id, did, latest),
         "counts": {k: len(v) for k, v in groups.items()},
         "newStates": {s: states.get(s, 0) for s in (IN_VERIGENCE, INTIMATED, OPEN)},
