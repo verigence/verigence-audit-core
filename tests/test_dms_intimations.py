@@ -443,3 +443,40 @@ def test_a_surname_alone_is_not_the_customer() -> None:
     assert not same_person("Deepak Ranjan Pradhan", "M/S. Pradhan Enterprises")
     assert same_person("A. Sahoo", "Anita Sahoo")
     assert same_person("Gk and son automobile pvt ltd", "G K & SONS AUTOMOBILES PRIVATE LIMITED")
+
+
+def test_the_dms_replay_reads_only_and_names_rows_without_personal_details(setup, tmp_path, monkeypatch) -> None:
+    """tools/dms_replay.py (product owner 2026-11-21): what a change moves on the live dumps,
+    read only; the report names the dump, row and Journey reference, never the customer."""
+    import importlib.util
+    import json as _json
+    import os
+
+    s = setup
+    _dump(s, m.BOOKING, [{"booking_number": "B-55500011", "name": "Replay Person", "mobile": "9000000055"}])
+    spec = importlib.util.spec_from_file_location(
+        "dms_replay", os.path.join(os.path.dirname(__file__), "..", "tools", "dms_replay.py"))
+    replay = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(replay)
+    monkeypatch.setenv("FIGURES_DATABASE_URL", str(s.journey.engine.url.render_as_string(hide_password=False)))
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        stored_before = connection.execute(text(
+            "SELECT count(*) FROM auditcore.p2_dms_dump_rows WHERE tenant_id = :t AND journey_id IS NOT NULL"),
+            {"t": s.journey.tenant_id}).scalar_one()
+    base, head = tmp_path / "base.json", tmp_path / "head.json"
+    assert replay.main(["capture", "--tenant", s.journey.tenant_id, "--out", str(base)]) == 0
+    # The Journey's booking number now read: the head side would match the row; nothing is stored.
+    add_extracted_field(s.journey, di_document_id=uuid4(), field_key="booking_reference_number", value="B-55500011")
+    assert replay.main(["capture", "--tenant", s.journey.tenant_id, "--out", str(head)]) == 0
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        assert connection.execute(text(
+            "SELECT count(*) FROM auditcore.p2_dms_dump_rows WHERE tenant_id = :t AND journey_id IS NOT NULL"),
+            {"t": s.journey.tenant_id}).scalar_one() == stored_before
+    assert _json.loads(base.read_text())["mode"] == "replayed"
+    report = tmp_path / "report.md"
+    replay.main(["diff", str(base), str(head), "--out", str(report)])
+    text_ = report.read_text()
+    assert "1 row(s) come out differently" in text_ and "MATCHED · BOOKING_NUMBER" in text_
+    assert "Replay Person" not in text_ and "9000000055" not in text_
