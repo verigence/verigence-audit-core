@@ -272,6 +272,18 @@ def timeline(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     }
 
 
+# The most documents a booking may hold and still be closed as "document upload failed"
+# (product owner 2026-11-22: "block Document upload failed once more than 10 documents are uploaded").
+UPLOAD_FAILED_MAX_DOCUMENTS = 10
+
+
+def documents_on_file(connection: Connection, *, tenant_id: str, journey_id: UUID) -> int:
+    """The documents on file on a journey: its ACTIVE evidence."""
+    return int(connection.execute(text(
+        "SELECT COUNT(*) FROM auditcore.evidence WHERE tenant_id=:t AND journey_id=:j AND association_status='ACTIVE'"),
+        {"t": tenant_id, "j": journey_id}).scalar_one())
+
+
 def cancel_stuck_journey(
     connection: Connection, *, tenant_id: str, journey_id: UUID, actor_id: str, actor_role: str | None,
     reason: str | None = None, correlation_id: str | None = None,
@@ -282,8 +294,13 @@ def cancel_stuck_journey(
     audit record), its open tasks and queued work are cancelled, and the
     Team Lead gets a notice. Allowed only while the booking is not complete
     and something really failed: a page or upload whose retries are spent.
-    Returns CANCELLED, COMPLETED (booking already complete), ALREADY_CLOSED
-    or NOT_STUCK.
+    Returns CANCELLED, COMPLETED (booking already complete), ALREADY_CLOSED,
+    NOT_STUCK or TOO_MANY_DOCUMENTS.
+
+    Never once more than UPLOAD_FAILED_MAX_DOCUMENTS documents are on file (product
+    owner 2026-11-22): journeys holding complete delivery files -- the only record of
+    their vehicle -- were closed this way by their PCs and then counted as cancelled.
+    A failed page there is retried or removed, not a reason to close the booking.
     """
     from audit_core.uc03_p2_runtime import record_activity, swept_pending_sql
     from audit_core.uc03_p2_task_producer import raise_or_refresh
@@ -319,6 +336,8 @@ def cancel_stuck_journey(
     ).mappings().one()
     if not (failed["pages"] or failed["uploads"]):
         return "NOT_STUCK"
+    if documents_on_file(connection, tenant_id=tenant_id, journey_id=journey_id) > UPLOAD_FAILED_MAX_DOCUMENTS:
+        return "TOO_MANY_DOCUMENTS"
     remarks = " ".join((reason or "").split()) or None
     version = int(state["version_no"]) + 1 if state else 1
     if state:

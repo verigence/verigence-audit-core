@@ -512,6 +512,13 @@ def cancel_p2_journey(
     if outcome == "NOT_STUCK":
         raise HTTPException(status_code=409, detail="Nothing has failed on this booking: only a booking whose "
                                                     "document upload failed after the retries can be deleted.")
+    if outcome == "TOO_MANY_DOCUMENTS":
+        from audit_core.uc03_p2_workflow import UPLOAD_FAILED_MAX_DOCUMENTS
+
+        raise HTTPException(status_code=409, detail=(
+            f"This booking holds more than {UPLOAD_FAILED_MAX_DOCUMENTS} documents, so it cannot be deleted as a failed "
+            "upload. Retry or remove the page that failed; to remove the booking itself, ask the Team Lead or "
+            "Reviewer."))
     note_facts_changed(connection, tenant_id=tenant_id, journey_id=journey_id, reason="JOURNEY_CANCELLED")
     return {"journeyId": str(journey_id), "status": "BOOKING_CANCELLED"}
 
