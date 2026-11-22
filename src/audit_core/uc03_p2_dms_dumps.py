@@ -506,6 +506,12 @@ _INDEX_SQL = """
     LEFT JOIN auditcore.journey_document_extracted_fields f
       ON f.tenant_id = :t AND f.journey_id = j.journey_id
      AND jsonb_typeof(f.effective_value) IN ('string', 'number')
+     -- Only the papers on file now (2026-11-22): a booking form held as another customer's
+     -- (FOREIGN), replaced (SUPERSEDED) or removed still kept its values here, and a Journey
+     -- went on "carrying" that customer's OTF and mobile -- the DMS gave it their row.
+     AND EXISTS (SELECT 1 FROM auditcore.evidence e
+                 WHERE e.tenant_id = f.tenant_id AND e.journey_id = f.journey_id
+                   AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE')
      AND (
           (f.field_key = 'booking_reference_number' AND f.source_document_type_key = 'booking_form')
        OR (f.field_key IN ('customer_phone', 'phone_number')
