@@ -43,6 +43,14 @@ def _parse(tag: str) -> tuple[str, bool]:
     return tenant_id.strip(), label.strip().endswith("-commit")
 
 
+def report_dealers(covered: list[dict[str, Any]], dealer_ids: list[Any] | None) -> list[dict[str, Any]]:
+    """The dealerships a stored report was made for, among those its author covers now. A report
+    generated for one dealership stays one (2026-11-22: two Aditya-only reports of 21 Nov came
+    back covering all three dealerships). An old report with no dealerships stored takes all."""
+    wanted = {str(d) for d in dealer_ids or []}
+    return [d for d in covered if str(d["dealerId"]) in wanted] if wanted else covered
+
+
 def run_dms_report_rebuild(engine: Engine, tag: str, reports: list[str]) -> dict[str, Any]:
     from audit_core.uc03_p2_dms_dumps import _dealers
     from audit_core.uc03_p2_dms_reports import _day_dumps, compute_report
@@ -63,7 +71,9 @@ def run_dms_report_rebuild(engine: Engine, tag: str, reports: list[str]) -> dict
                 transaction = connection.begin()
                 set_tenant_context(connection, tenant_id)
                 by = str(row["generated_by"] or "")
-                dealers = _dealers(connection, tenant_id, by, False) or _dealers(connection, tenant_id, by, True)
+                dealers = report_dealers(
+                    _dealers(connection, tenant_id, by, False) or _dealers(connection, tenant_id, by, True),
+                    row["dealer_ids"])
                 dumps = _day_dumps(connection, tenant_id, [d["dealerId"] for d in dealers], row["report_date"])
                 if not dumps:
                     raise ValueError(f"no current dump for {row['report_date']}")
@@ -98,4 +108,4 @@ def run_dms_report_rebuild(engine: Engine, tag: str, reports: list[str]) -> dict
     return {"commit": commit, "reports": len(stored), "failed": failed, "items": out}
 
 
-__all__ = ["JOB", "run_dms_report_rebuild"]
+__all__ = ["JOB", "report_dealers", "run_dms_report_rebuild"]

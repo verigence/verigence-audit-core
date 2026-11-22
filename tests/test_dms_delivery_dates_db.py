@@ -52,7 +52,7 @@ def dealer():
                     extracted_value, effective_value)
                     VALUES (:t, :j, :d, 1, 'chassis_number', 'DELIVERY', :k, CAST(:v AS jsonb), CAST(:v AS jsonb))"""),
                       {"t": tenant_id, "j": jid, "d": document, "k": document_type,
-                       "v": json.dumps(f"MA1TEST{str(jid).replace('-', '')[:10].upper()}")})
+                       "v": json.dumps(f"TST{str(jid).replace('-', '')[:10].upper()}")})
 
         def journey(name: str, *, delivery_stage: bool, gate_pass: str | None = None, ndc: str | None = None,
                     receipt: date | None = None, delivery_paper: str | None = None) -> None:
@@ -296,3 +296,15 @@ def test_a_generated_report_is_corrected_in_place(dealer):
     again = run_dms_report_rebuild(dealer.engine, f"{dealer.tenant_id}:dms-report-rebuild-test-commit", [])
     assert again["items"][0]["after"] == {k: f.get(k) for k in again["items"][0]["after"]}
 
+
+
+def test_a_rebuilt_report_keeps_the_dealerships_it_was_made_for():
+    """2026-11-22: a report generated for one dealership came back covering every dealership its
+    author covers."""
+    from audit_core.uc03_dms_report_rebuild import report_dealers
+
+    covered = [{"dealerId": "a", "dealerName": "A"}, {"dealerId": "b", "dealerName": "B"},
+               {"dealerId": "c", "dealerName": "C"}]
+    assert [d["dealerId"] for d in report_dealers(covered, ["b"])] == ["b"]
+    assert [d["dealerId"] for d in report_dealers(covered, ["a", "c"])] == ["a", "c"]
+    assert report_dealers(covered, []) == covered and report_dealers(covered, None) == covered

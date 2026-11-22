@@ -229,14 +229,16 @@ def add_evidence(
 ) -> UUID:
     """``chassis``: the VIN a vehicle paper filed under the delivery prints (a gate pass, an
     invoice, the insurance cover...), as real ones do -- a delivery in Verigence is a journey
-    with its vehicle's VIN on it (uc03_delivery_start, 2026-11-21). None for a paper without one."""
+    with its vehicle's VIN on it (uc03_delivery_start, 2026-11-21). None for a paper without one.
+    The automatic one is a 13-character chassis, never a 17-character Mahindra VIN: a VIN's
+    year and month letters would let the Deal Type rule decide on its own, at random."""
     from audit_core.uc03_delivery_start import VEHICLE_PAPERS
 
     evidence_id = _insert_evidence(journey, di_document_id=di_document_id, document_type_key=document_type_key,
                                    process_area=process_area, status=status)
     if (chassis == "auto" and process_area.upper() == "DELIVERY" and document_type_key in VEHICLE_PAPERS
             and status == "ACTIVE"):
-        chassis = f"MA1TEST{str(journey.journey_id).replace('-', '')[:10].upper()}"
+        chassis = f"TST{str(journey.journey_id).replace('-', '')[:10].upper()}"
     if chassis and chassis != "auto":
         add_extracted_field(journey, di_document_id=di_document_id, field_key="chassis_number", value=chassis,
                             document_type=document_type_key)
