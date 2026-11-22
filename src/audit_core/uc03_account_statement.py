@@ -356,6 +356,21 @@ def _figure(text_: str) -> Decimal:
     return Decimal(text_.replace(",", ""))
 
 
+_NOT_A_NOTE = frozenset({"FREE", "FOC", "SCHEME"})
+_NOTE_NUMBER_BELOW = Decimal(100)
+
+
+def _is_note(working: str) -> bool:
+    """What follows the item is a note, not a sum to check: words, and only
+    small numbers -- a charger's kW, years of cover, a count ("7.2 CHARGER",
+    "(2YR)", "4 YRS", "3 PARTY", "(01) PMT"). An amount of 100 or more, or a
+    word that says it was given (FREE, FOC, SCHEME), keeps it a working."""
+    words = re.findall(r"[A-Z]{2,}", working)
+    numbers = re.findall(r"\d[\d,]*(?:\.\d+)?", working)
+    return (bool(words) and not any(w in _NOT_A_NOTE for w in words)
+            and all(_figure(n) < _NOTE_NUMBER_BELOW for n in numbers))
+
+
 def read_working(working: str, amount: Decimal) -> tuple[Decimal, Decimal] | None:
     """What a line's handwritten working gives -- (the value billed, the free
     part) -- when it agrees with the amount printed on the line; None when it
@@ -605,6 +620,13 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
                 out.received.append((row, amount))
             continue
         working = _WORKING.fullmatch(label)
+        if working is not None and _is_note(working["working"]):
+            # Words after the figure make it a note on the row, not a working
+            # (ADI-RD-261112-021, 2026-11-22: "ACCESSORIES 7.2 Charger" Rs
+            # 60,000 -- the charger's 7.2 kW -- was left out as a working that
+            # does not add up, and the Deal kept the booking form's Rs 25,000).
+            # The row is read below as the charge it starts with.
+            working = None
         item = next((k for k, pattern in _WORKING_ITEMS if working and pattern.fullmatch(working["item"])), None)
         if working is not None and item is not None:
             read = read_working(working["working"], amount)
