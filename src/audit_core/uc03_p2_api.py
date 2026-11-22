@@ -316,12 +316,22 @@ def _assign_readable_reference(
                 text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
                 {"key": f"journey-reference|{tenant_id}|{prefix}"},
             )
+            # The next number after every one issued -- the deleted journeys' too (2026-11-22): a
+            # copy deleted as the same file uploaded again gave its number back, and the next
+            # booking of that outlet and PC that day took it, so one reference named two journeys
+            # in the Deleted list. p2_journey_deletions keeps every deleted journey's reference.
             number = connection.execute(
                 text(
                     """
-                    SELECT COALESCE(MAX(substring(journey_reference FROM '[0-9]+$')::int), 0) + 1
-                    FROM auditcore.journeys
-                    WHERE tenant_id=:tenant_id AND journey_reference ~ ('^' || :prefix || '[0-9]+$')
+                    SELECT COALESCE(MAX(n), 0) + 1 FROM (
+                        SELECT substring(journey_reference FROM '[0-9]+$')::int AS n
+                        FROM auditcore.journeys
+                        WHERE tenant_id=:tenant_id AND journey_reference ~ ('^' || :prefix || '[0-9]+$')
+                        UNION ALL
+                        SELECT substring(journey_reference FROM '[0-9]+$')::int
+                        FROM auditcore.p2_journey_deletions
+                        WHERE tenant_id=:tenant_id AND journey_reference ~ ('^' || :prefix || '[0-9]+$')
+                    ) issued
                     """
                 ),
                 {"tenant_id": tenant_id, "prefix": prefix},
