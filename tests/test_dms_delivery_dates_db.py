@@ -52,7 +52,7 @@ def dealer():
                     extracted_value, effective_value)
                     VALUES (:t, :j, :d, 1, 'chassis_number', 'DELIVERY', :k, CAST(:v AS jsonb), CAST(:v AS jsonb))"""),
                       {"t": tenant_id, "j": jid, "d": document, "k": document_type,
-                       "v": json.dumps(f"MA1TEST{str(jid).replace('-', '')[:10].upper()}")})
+                       "v": json.dumps(f"TST{str(jid).replace('-', '')[:10].upper()}")})
 
         def journey(name: str, *, delivery_stage: bool, gate_pass: str | None = None, ndc: str | None = None,
                     receipt: date | None = None, delivery_paper: str | None = None) -> None:
