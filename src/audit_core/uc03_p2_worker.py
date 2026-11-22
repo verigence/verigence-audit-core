@@ -4446,6 +4446,54 @@ def run_data_archive(engine: Engine, tenant_id: str, now: datetime | None = None
         return None
 
 
+# Every document that failed on our side is sent again, once (product owner 22 Nov 2026,
+# uc03_p2_failed_resend): each morning at the Jobs page time, 8:15 am IST -- after the
+# night's sleep, before the day's uploads. Off with P2_FAILED_RESEND_UTC=off.
+_FAILED_RESEND_UTC = job_schedule.time_utc("FAILED_RESEND")
+_last_failed_resend: dict[str, str] = {}
+
+
+def _failed_resend_due(tenant_id: str, now: datetime | None = None) -> str | None:
+    """The UTC date whose morning run this worker still owes, once its time has passed."""
+    if _FAILED_RESEND_UTC.strip().lower() in {"", "off", "none"}:
+        return None
+    now = now or datetime.now(UTC)
+    hour, _, minute = _FAILED_RESEND_UTC.partition(":")
+    due_at = now.replace(hour=int(hour), minute=int(minute or 0), second=0, microsecond=0)
+    if now < due_at:
+        return None
+    today = now.date().isoformat()
+    return None if _last_failed_resend.get(tenant_id) == today else today
+
+
+def run_failed_resend_daily(engine: Engine, tenant_id: str, now: datetime | None = None) -> bool | None:
+    """Ask for the morning's run once per Project and day. The run itself is a one-off job
+    (p2_worker_jobs, kind FAILED_RESEND): it has its own thread and time limit, and what it
+    found and sent stays on its row. The day is marked in p2_scheduled_runs (P2_FAILED_RESEND),
+    which is what the Jobs page shows as the last run. True when this call asked for it."""
+    from audit_core.uc03_p2_failed_resend import RUN_NAME, request_daily
+
+    due = _failed_resend_due(tenant_id, now)
+    if due is None:
+        return None
+    try:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            claimed = claim_scheduled_run(connection, tenant_id=tenant_id, run_name=RUN_NAME, run_key=due,
+                                          claimed_by=_WORKER_ID)
+            if claimed:
+                # with the claim: both or neither, so a day is never marked and not asked for
+                set_platform_super_admin_context(connection)
+                request_daily(connection, tenant_id=tenant_id, day=due)
+        _last_failed_resend[tenant_id] = due
+        if claimed:
+            logger.info("p2_failed_resend_requested", tenant_id=tenant_id, day=due)
+        return claimed
+    except Exception:
+        logger.warning("p2_failed_resend_request_failed", tenant_id=tenant_id, day=due, exc_info=True)
+        return None
+
+
 # The verified bookings compared again (product owner 17 Nov 2026, uc03_verified_bookings):
 # each night at the Jobs page time (9:40 pm IST), and once per Project after each deploy.
 _VERIFIED_CHECK_UTC = job_schedule.time_utc("VERIFIED_CHECK")
@@ -4592,6 +4640,7 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
     run_dayend_sweep(engine, tenant_id)
     run_data_archive(engine, tenant_id)
     run_verified_checks(engine, tenant_id)
+    run_failed_resend_daily(engine, tenant_id)
     if now - _last_task_manager_at.get(tenant_id, 0.0) >= _TASK_MANAGER_SECONDS:
         _last_task_manager_at[tenant_id] = now
         run_task_manager(engine, tenant_id)
@@ -5359,6 +5408,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # file (2026-11-02): see uc03_p2_our_side_reupload. A dry run lists them.
         from audit_core.uc03_p2_our_side_reupload import run_our_side_reupload
         return run_our_side_reupload, (engine, tag, reports)
+    if kind == "FAILED_RESEND":
+        # Every document that failed on our side is sent again, once: each morning
+        # and when asked for (2026-11-22): see uc03_p2_failed_resend. A dry run lists them.
+        from audit_core.uc03_p2_failed_resend import run_failed_resend
+        return run_failed_resend, (engine, tag, reports)
     if kind == "DUPLICATE_MERGE":
         # The documents only a duplicate copy holds go to the booking kept
         # (2026-11-02), before the copy is purged: see uc03_duplicate_merge.
@@ -5620,6 +5674,14 @@ def dry_run_missing(connection: Connection, job: dict[str, Any]) -> str | None:
     """Why this commit job may not run (no recent dry run of it), or None."""
     tenant_id, sep, label = str(job.get("tag") or "").partition(":")
     if not sep or not label.strip().lower().endswith("-commit"):
+        return None
+    # The morning's own run of FAILED_RESEND (product owner 22 Nov 2026: "one job at
+    # 8:15 am which handles all the failed transactions") sends with no dry run before
+    # it: what it may send is fixed, and each document only once. A run a person asks
+    # for still needs its dry run.
+    from audit_core import uc03_p2_failed_resend as failed_resend
+
+    if job.get("job_kind") == failed_resend.JOB and failed_resend.is_daily_tag(job.get("tag")):
         return None
     found = connection.execute(
         text(

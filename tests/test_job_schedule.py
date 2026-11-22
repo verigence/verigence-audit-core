@@ -67,7 +67,11 @@ def client(table):
 def test_every_daily_job_starts_before_ten_at_night_and_outside_the_sleep(monkeypatch):
     monkeypatch.setattr(sleep_window, "WINDOW", NIGHT)
     for job in job_schedule.DAILY_JOBS.values():
-        assert "21:00" <= job.default_ist < "22:00", job.key
+        if job.key == "FAILED_RESEND":
+            # the morning's job (22 Nov 2026): after the night's sleep, before the day's uploads
+            assert job.default_ist == "08:15"
+        else:
+            assert "21:00" <= job.default_ist < "22:00", job.key
         assert not job_schedule.in_sleep_window(job.default_ist)
     assert job_schedule.in_sleep_window("02:00") and not job_schedule.in_sleep_window("00:29")
     # The clean-up runs first in the worker's pass, then the review, as when both were at 02:00.
@@ -150,7 +154,9 @@ def test_the_page_lists_every_job_and_a_super_admin_changes_a_time(client, monke
         assert {k: j["timeIst"] for k, j in daily.items()} == {
             "DAYEND_CLEANUP": "21:30", "NIGHTLY_REVIEW": "21:30", "DATA_ARCHIVE": "21:50",
             # the verified bookings compared each night (2026-11-17)
-            "VERIFIED_CHECK": "21:40"}
+            "VERIFIED_CHECK": "21:40",
+            # the documents that failed on our side sent again each morning (2026-11-22)
+            "FAILED_RESEND": "08:15"}
         assert all(j["editable"] and j["enabled"] and not j["insideSleepWindow"] for j in daily.values())
         assert daily["NIGHTLY_REVIEW"]["lastRunAtUtc"] and daily["NIGHTLY_REVIEW"]["projectsRunLast"] >= 1
         assert daily["DATA_ARCHIVE"]["changedBy"] is None

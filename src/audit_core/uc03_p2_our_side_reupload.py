@@ -55,15 +55,22 @@ logger = structlog.get_logger(__name__)
 
 _JOB = "OUR_SIDE_REUPLOAD"
 _PER_RUN = int(os.environ.get("AUDIT_CORE_OUR_SIDE_REUPLOAD_PER_RUN", "8"))
-# Pages and documents that failed on our side, not the page's.
-OUR_SIDE_CODES = ("NOT_READ_IN_30_MIN", "GROUPING_FAILED")
+# Pages and documents that failed on our side, not the page's. An AI answer our
+# reader refused after its retries is one of them (product owner 22 Nov 2026:
+# "pls send 48 AI refused pages from storage"): a fresh read may be answered well.
+OUR_SIDE_CODES = ("NOT_READ_IN_30_MIN", "GROUPING_FAILED", "DOCUMENT_AI_RESPONSE_INVALID")
 # So did a page a system error stopped after its retries (22 Nov 2026: 15 pages of
 # 3 files from 17 Nov waited for the PC with "A system problem stopped this page").
 # Such a page's code is the error's own name -- "DiClientError (at ...)",
 # "OperationalError: ...", "ReadTimeout (at ...)" -- never one of the worded codes (NOT_READ_IN_30_MIN,
 # DI_QUALITY_*, DOCUMENT_AI_*, DUPLICATE_PAGE ...), which are all capitals.
 OUR_SIDE_ERROR = r"^[A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*(Error|Exception|Timeout)\M"
-_OUR_SIDE_SQL = "(q.last_error = ANY(:codes) OR q.last_error ~ :system_error)"
+# A document a person made -- typed, sent again or put together by the PC -- is not
+# a reason to upload the whole file again: read as a fresh upload it loses what the
+# person said of it (22 Nov 2026, live: pages a PC had sent again as good scans were
+# refused for scan quality once more). uc03_p2_failed_resend sends it again as it was.
+_OUR_SIDE_SQL = ("((q.last_error = ANY(:codes) OR q.last_error ~ :system_error) "
+                 "AND NOT (q.unit_kind='GROUP' AND COALESCE(q.group_source, '')='PC'))")
 # A person closed the task: nothing is sent again (2026-10-27).
 _PERSON_CLOSED = ("CLOSED_BY_PC", "EXCEPTION_ACCEPTED")
 _SENT_AGAIN_REASON = ("Sent again by Verigence from the stored file on {day} (it failed on our side, "
@@ -271,8 +278,10 @@ def _send(engine: Engine, tenant_id: str, row: dict[str, Any], *, tag: str, now:
     return batch_id
 
 
-def run_our_side_reupload(engine: Engine, tag: str, references: list[str] | None = None) -> dict[str, Any]:
+def run_our_side_reupload(engine: Engine, tag: str, references: list[str] | None = None,
+                          per_run: int | None = None) -> dict[str, Any]:
     tenant_id, commit = parse_tag(tag)
+    per_run = _PER_RUN if per_run is None else per_run
     now = datetime.now(UTC)
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
@@ -298,8 +307,8 @@ def run_our_side_reupload(engine: Engine, tag: str, references: list[str] | None
             if outcome is None:
                 if not commit:
                     outcome = "WOULD_SEND"
-                elif totals["sent"] >= _PER_RUN:
-                    outcome, why = "NEXT_RUN", f"more than {_PER_RUN} in one run"
+                elif totals["sent"] >= per_run:
+                    outcome, why = "NEXT_RUN", f"more than {per_run} in one run"
                 else:
                     item["newBatchId"] = str(_send(engine, tenant_id, row, tag=tag, now=now))
                     outcome = "SENT"
@@ -311,5 +320,5 @@ def run_our_side_reupload(engine: Engine, tag: str, references: list[str] | None
                 "NEXT_RUN": "left_for_next_run", "FAILED": "failed"}[outcome]] += 1
         items.append(item)
         logger.info("our_side_reupload_item", tag=tag, tenant_id=tenant_id, commit=commit, **item)
-    logger.info("our_side_reupload_finished", tag=tag, tenant_id=tenant_id, commit=commit, per_run=_PER_RUN, **totals)
-    return {"commit": commit, "perRun": _PER_RUN, **totals, "items": items}
+    logger.info("our_side_reupload_finished", tag=tag, tenant_id=tenant_id, commit=commit, per_run=per_run, **totals)
+    return {"commit": commit, "perRun": per_run, **totals, "items": items}
