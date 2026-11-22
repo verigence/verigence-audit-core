@@ -231,3 +231,35 @@ def test_the_customer_name_follows_the_kyc_on_file(uc03_create_booking_setup):  
     assert _customer(setup, created["customerId"])["legal_name"] == "SARBESWAR PRADHAN"
     listed = client.get(url, params={"state": "open"}).json()["items"]
     assert next(i for i in listed if i["journey_id"] == created["journeyId"])["customer_name"] == "SARBESWAR PRADHAN"
+
+
+def test_a_deleted_journeys_reference_is_never_given_again(uc03_create_booking_setup):  # noqa: F811
+    """2026-11-22: a copy deleted as the same file uploaded again gave its number back, and the
+    next booking of the outlet, PC and day took it -- one reference named two journeys."""
+    setup = uc03_create_booking_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    url = f"/p2/v1/tenants/{setup['tenant_id']}/journeys"
+
+    def start(key: str) -> str:
+        response = client.post(url, headers={"Idempotency-Key": key},
+                               json={"outletId": str(setup["outlet_id"]), "createdByName": "Asha Rao"})
+        assert response.status_code == 201, response.text
+        return response.json()["journeyId"]
+
+    first = start("p2-ref-reuse-001")
+    second = start("p2-ref-reuse-002")
+    gone = _reference(setup, second)
+    assert gone.endswith("-002"), gone
+    # The second is deleted: its row leaves the journeys, its record stays.
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        connection.execute(text("""
+            INSERT INTO auditcore.p2_journey_deletions (tenant_id, journey_id, journey_reference, reason,
+              deleted_by_actor_id, deleted_by_role, deletion_status)
+            VALUES (:t, :j, :r, 'Same file uploaded again (test)', 'SYSTEM', 'SYSTEM', 'COMPLETED')
+        """), {"t": setup["tenant_id"], "j": second, "r": gone})
+        connection.execute(text("UPDATE auditcore.journeys SET journey_reference = :r WHERE journey_id = :j"),
+                           {"r": f"VJ-DELETED-{second[:8]}", "j": second})
+    third = start("p2-ref-reuse-003")
+    assert _reference(setup, first).endswith("-001")
+    assert _reference(setup, third) == gone[:-3] + "003"  # never -002 again
