@@ -176,6 +176,13 @@ def test_a_reviewed_booking_is_left_alone(journey):
     assert (item["outcome"], item["why"]) == ("SKIPPED", "the booking's documents are marked reviewed")
 
 
+def test_a_pc_made_document_refused_for_several_documents_on_its_page_is_not_sent_again(journey):
+    _pc_made_document_we_did_not_read(journey, template=_a_document_type(), code="PAGE_HAS_SEVERAL_DOCUMENTS",
+                                      reason=worker.SEVERAL_DOCUMENTS_REASON)
+    done = _run(journey, "morning-commit")
+    assert (done["documents"]["documents"], done["files"]["files"]) == (0, 0)
+
+
 def test_at_most_so_many_in_one_run(journey, monkeypatch):
     _pc_made_document_we_did_not_read(journey, quality_confirmed=True)
     monkeypatch.setattr(job, "_DOCUMENTS", 0)
@@ -206,7 +213,9 @@ def test_a_page_never_read_has_its_file_uploaded_again(journey, code, reason):
     assert _run(journey, "next-morning-commit")["files"]["files"] == 0      # once
 
 
-@pytest.mark.parametrize("code", ["DI_QUALITY_IMAGE_BLUR_SCORE", "DOCUMENT_AI_CONTENT_BLOCKED", "DUPLICATE_PAGE"])
+@pytest.mark.parametrize("code", ["DI_QUALITY_IMAGE_BLUR_SCORE", "DOCUMENT_AI_CONTENT_BLOCKED", "DUPLICATE_PAGE",
+                                  # more than one document on the page (22 Nov 2026)
+                                  "PAGE_HAS_SEVERAL_DOCUMENTS"])
 def test_a_page_refused_for_what_it_is_stays_with_the_pc(journey, code):
     batch_id, ids = _file(journey)
     _fail_and_sweep(journey, batch_id, ids[1], code, "Refused.")
