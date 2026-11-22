@@ -203,6 +203,24 @@ def compute_report(connection: Connection, *, tenant_id: str, dealers: list[dict
         {k: row.get(k) for k in ("dealerName", "outletName", "eventDate", "customerName", "mobile", "chassis",
                                  "model", "journeyReference", "datedBy")}
         for row in _not_in_dump(connection, tenant_id, [d["dump_id"] for d in dumps if d["dump_kind"] == DELIVERY])]
+    # Verigence can't have additional bookings (product owner 2026-11-22): each one no DMS row
+    # found, with the reason it was not matched and the nearest DMS row.
+    from collections import Counter
+
+    from audit_core.uc03_p2_dms_booking_crosscheck import REASONS, bookings_not_in_dump
+
+    names = {x["dealerId"]: x["dealerName"] for x in dealers}
+    report["notInDmsBookings"] = [
+        {**row, "dealerName": names.get(str(d["dealer_id"]))}
+        for d in dumps if d["dump_kind"] == BOOKING
+        for row in bookings_not_in_dump(connection, tenant_id=tenant_id, dump=d, today=today)]
+    reasons = Counter(row["reasonCode"] for row in report["notInDmsBookings"])
+    report["figures"]["bookingNotInDmsChecked"] = len(report["notInDmsBookings"])
+    if reasons:
+        report["statementLines"].append(
+            f"* In Verigence, not in the DMS booking dump: {len(report['notInDmsBookings'])} booking(s), cross-checked "
+            "-- " + "; ".join(f"{REASONS[code].lower()} {n}" for code, n in reasons.most_common())
+            + " (sheet \"Bookings not in DMS - why\")")
     report["intimations"] = [
         {**counter(connection, tenant_id, d["dealer_id"], d["dump_kind"], upto=day),
          "dealerName": next((x["dealerName"] for x in dealers if x["dealerId"] == d["dealer_id"]), None)}

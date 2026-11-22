@@ -535,6 +535,7 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
                 # the first money receipt's -- either may match the DMS's date, within
                 # BOOKING_MATCH_DAYS. Never the upload day.
                 "bookingDays": {d for d in (r["booking_date"], r["first_receipt"]) if d is not None},
+                "firstReceipt": r["first_receipt"],
                 "hasDelivery": bool(r["has_delivery"]),
                 "mobiles": set(), "refs": set(),
             }

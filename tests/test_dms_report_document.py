@@ -74,7 +74,8 @@ def test_the_excel_holds_every_fact_styled():
     book = load_workbook(io.BytesIO(build_report_xlsx(_report())))
     assert book.sheetnames == ["Summary", "By DMS location", "Statement", "Bookings not in Verigence",
                                "Deliveries not in Verigence", "Delivery not uploaded", "Matched, name differs",
-                               "In Verigence, not in dump", "Delivery dump scope", "PC intimations",
+                               "Bookings not in DMS - why", "In Verigence, not in dump", "Delivery dump scope",
+                               "PC intimations",
                                "How it is counted"]
     grouping = book["By DMS location"]
     labels = [grouping.cell(row=r, column=1).value for r in range(1, grouping.max_row + 1)]

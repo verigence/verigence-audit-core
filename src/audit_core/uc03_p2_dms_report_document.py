@@ -78,6 +78,13 @@ NAME_DIFFERS_COLUMNS = (("Dealer", "dealerName"), ("Dump", "kind"), ("DMS locati
 NOT_IN_DUMP_COLUMNS = (("Dealer", "dealerName"), ("Outlet", "outletName"), ("Delivery date", "eventDate"),
                        ("Dated by", "datedBy"), ("Customer", "customerName"), ("Mobile", "mobile"),
                        ("Chassis", "chassis"), ("Model", "model"), ("Journey", "journeyReference"))
+CROSS_CHECK_COLUMNS = (("Dealer", "dealerName"), ("Outlet", "outletName"), ("Booking date", "bookingDate"),
+                       ("Dated by", "datedBy"), ("Customer", "customerName"), ("Mobile", "mobile"),
+                       ("OTF read", "otf"), ("Model", "model"), ("Journey", "journeyReference"),
+                       ("Why not matched", "reason"), ("Nearest DMS row", "dmsRow"),
+                       ("DMS customer", "dmsCustomer"), ("DMS OTF", "dmsOtf"), ("DMS mobile", "dmsMobile"),
+                       ("DMS model", "dmsModel"), ("DMS date", "dmsDate"), ("DMS row matched to", "dmsMatchedTo"),
+                       ("Detail", "detail"))
 SCOPE_COLUMNS = (("Dealer", "dealerName"), ("DMS location", "location"), ("Delivery date", "eventDate"),
                  ("Customer", "customerName"), ("Chassis", "chassis"), ("Model", "model"),
                  ("Booking no.", "bookingNumber"), ("In Verigence", "inVerigence"), ("Journey", "journeyReference"),
@@ -121,6 +128,9 @@ def exception_lists(report: dict[str, Any]) -> list[tuple[str, tuple[tuple[str, 
          "The booking is in Verigence; its delivery papers (with the vehicle's VIN) are not uploaded."),
         ("Matched, name differs", NAME_DIFFERS_COLUMNS, report.get("nameDiffers") or [],
          "Found by chassis, booking number or mobile, but the customer's name differs: review."),
+        ("Bookings not in DMS - why", CROSS_CHECK_COLUMNS, report.get("notInDmsBookings") or [],
+         ("Booked in Verigence in the period (booking form, else first receipt), not in the DMS booking dump: "
+          "Verigence can't have additional bookings -- each is cross-checked, with the nearest DMS row.")),
         ("In Verigence, not in dump", NOT_IN_DUMP_COLUMNS, report.get("notInDump") or [],
          "Delivered in Verigence in the period; not in the DMS delivery dump."),
     ]
@@ -157,7 +167,7 @@ def location_rows(dealer: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _cell(row: dict[str, Any], key: str) -> Any:
     value = row.get(key)
-    if key == "eventDate" and value:
+    if key in ("eventDate", "bookingDate", "dmsDate") and value:
         return _day(value) or value
     if key == "kind" and value:
         return str(value).title()
@@ -466,7 +476,7 @@ def build_report_xlsx(report: dict[str, Any]) -> bytes:
 
     styles = {"Bookings not in Verigence": "TableStyleMedium2", "Deliveries not in Verigence": "TableStyleMedium3",
               "Delivery not uploaded": "TableStyleMedium5", "Matched, name differs": "TableStyleMedium4",
-              "In Verigence, not in dump": "TableStyleMedium6"}
+              "In Verigence, not in dump": "TableStyleMedium6", "Bookings not in DMS - why": "TableStyleMedium7"}
     for title, columns, rows, about in exception_lists(report):
         table_sheet(title, columns, rows, about, styles.get(title, "TableStyleMedium2"))
     table_sheet("Delivery dump scope", SCOPE_COLUMNS, report.get("deliveryScope") or [],
@@ -757,6 +767,12 @@ def build_report_pdf(report: dict[str, Any]) -> bytes:
                                   ("DMS customer", "dmsCustomer", 0.18), ("Verigence customer", "journeyCustomer", 0.18),
                                   ("Journey", "journeyReference", 0.12), ("Matched on", "matchedOn", 0.1),
                                   ("Chassis", "chassis", 0.08), ("OTF / booking no.", "otf", 0.12)),
+        "Bookings not in DMS - why": (("Dealer", "dealerName", 0.08), ("Outlet", "outletName", 0.08),
+                                      ("Date", "bookingDate", 0.05), ("Customer", "customerName", 0.13),
+                                      ("OTF read", "otf", 0.08), ("Model", "model", 0.08),
+                                      ("Journey", "journeyReference", 0.1), ("Why not matched", "reason", 0.12),
+                                      ("Nearest DMS row", "dmsCustomer", 0.12), ("DMS OTF", "dmsOtf", 0.08),
+                                      ("Matched to", "dmsMatchedTo", 0.08)),
         "In Verigence, not in dump": (("Dealer", "dealerName", 0.11), ("Outlet", "outletName", 0.12),
                                       ("Delivery date", "eventDate", 0.07), ("Dated by", "datedBy", 0.09),
                                       ("Customer", "customerName", 0.2), ("Chassis", "chassis", 0.09),
@@ -765,7 +781,7 @@ def build_report_pdf(report: dict[str, Any]) -> bytes:
     }
     accents = {"Bookings not in Verigence": BLUE_60, "Deliveries not in Verigence": RED_60,
                "Delivery not uploaded": "8E6A00", "Matched, name differs": "6929C4",
-               "In Verigence, not in dump": TEAL_60}
+               "In Verigence, not in dump": TEAL_60, "Bookings not in DMS - why": "6929C4"}
     for title_, _columns, rows, about in exception_lists(report):
         story.append(PageBreak())
         story.append(Paragraph(f"{escape(title_)} <font color='#{GRAY_50}'>({len(rows):,})</font>", h1))
