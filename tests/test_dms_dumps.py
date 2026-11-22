@@ -358,3 +358,20 @@ def test_a_dump_is_compared_from_the_first_to_its_upload_day() -> None:
     assert m.dump_window(date(2026, 11, 1), date(2026, 11, 18)) == (date(2026, 11, 1), date(2026, 11, 18))
     # uploaded on 1 Dec with November's rows: the whole of November
     assert m.dump_window(date(2026, 11, 1), date(2026, 12, 1)) == (date(2026, 11, 1), date(2026, 11, 30))
+
+
+def test_a_dump_is_compared_up_to_the_last_day_its_rows_reach(journey) -> None:
+    """2026-11-22: a dump uploaded on the 21st whose rows stop at the 19th holds nothing of the
+    20th -- the bookings of the 20th are not compared with it."""
+    from datetime import timedelta
+
+    dump_id = _store(journey, m.BOOKING, [{"booking_number": "B-1", "customer_name": "A", "days_back": 3},
+                                         {"booking_number": "B-2", "customer_name": "B", "days_back": 5}])
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        dump = dict(connection.execute(text(
+            "SELECT dump_id, business_date, period_month FROM auditcore.p2_dms_dumps WHERE dump_id = :i"),
+            {"i": dump_id}).mappings().one())
+        window_end = m.dump_window(dump["period_month"], dump["business_date"])[1]
+        assert m.compared_until(connection, journey.tenant_id, dump) == min(
+            window_end, dump["business_date"] - timedelta(days=3))

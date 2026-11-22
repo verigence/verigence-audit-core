@@ -195,3 +195,19 @@ def test_a_held_or_replaced_form_gives_its_numbers_to_no_match(setup) -> None:  
     dump_id = _dump(s, dumps.BOOKING, [{"booking_number": "B-55500077", "otf": "OTF27A055555",
                                        "name": "Someone Else", "mobile": "9000011122", "model": "XEV 9S"}])
     assert _row(s, dump_id)["match_basis"] is None
+
+
+def test_a_booking_cancelled_in_verigence_takes_no_dms_row(setup) -> None:  # noqa: F811
+    """2026-11-22: a journey the PC closed as "document upload failed" (a fresh one started for
+    the same sale) is no booking: no DMS row goes to it."""
+    s = setup
+    _document(s, "booking_form", booking_reference_number="B-66600011", customer_phone="+919000044455")
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("""
+            INSERT INTO auditcore.journey_stage_states (tenant_id, journey_id, stage_code, business_status)
+            VALUES (:t, :j, 'BOOKING', 'BOOKING_CANCELLED')
+            ON CONFLICT (tenant_id, journey_id, stage_code) DO UPDATE SET business_status = 'BOOKING_CANCELLED'
+        """), {"t": s.journey.tenant_id, "j": s.journey.journey_id})
+        index = dumps.build_index(connection, tenant_id=s.journey.tenant_id, dealer_id=s.journey.dealer_id)
+    assert str(s.journey.journey_id) not in index.journeys

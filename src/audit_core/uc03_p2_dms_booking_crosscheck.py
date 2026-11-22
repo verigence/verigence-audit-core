@@ -21,6 +21,12 @@ DMS row:
   OTF_NOT_READ             no OTF / booking number read on the Journey, and nothing else agrees
   NOT_IN_DMS               no DMS row has its OTF, mobile or name: not entered in the DMS for
                            these days, or entered under another name and number
+  DUPLICATE_JOURNEY        another Verigence Journey carries the same OTF, or the same customer
+                           with the same mobile or model (2026-11-22): one sale on two Journeys,
+                           or one Journey holding another's OTF -- the DMS row can go to only one
+
+Not looked for (2026-11-22): a booking dated after the last day the dump's rows reach (the DMS
+could not have it yet), and a Journey the DMS delivery dump found (retailed: it is in the DMS).
 """
 from __future__ import annotations
 
@@ -33,7 +39,9 @@ from audit_core.uc03_p2_dms_dumps import (
     BOOKING,
     booking_keys,
     build_index,
+    compared_until,
     dms_dates,
+    dms_delivery_bookings,
     dump_window,
     mobile_key,
     near_booking,
@@ -54,7 +62,13 @@ REASONS: dict[str, str] = {
     "MOBILE_MISREAD": "Mobile read wrong (1-2 digits off)",
     "OTF_NOT_READ": "No OTF read, nothing else agrees",
     "NOT_IN_DMS": "Not in the DMS booking dump",
+    "DUPLICATE_JOURNEY": "Duplicate journey in Verigence",
 }
+# Reasons a duplicate Journey replaces: the DMS row's own verdict (cancelled, OTF one digit off)
+# stands.
+_DUPLICATE_KEEPS = frozenset({"OTF_CANCELLED", "OTF_MISREAD"})
+# The same customer's two Journeys count as one sale only within these days of each other.
+DUPLICATE_DAYS = 31
 
 _ROWS_SQL = """
     SELECT r.row_no, r.outcome, CAST(r.journey_id AS text) AS journey_id, r.customer_name, r.mobile,
@@ -71,6 +85,30 @@ def _day(journey: dict[str, Any], today: date) -> date | None:
     for day in (journey.get("bookingDate"), journey.get("firstReceipt")):
         if day is not None and day <= today:
             return day
+    return None
+
+
+def duplicate_of(journey: dict[str, Any], journeys: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """Another Journey of the dealership holding the same sale: the same OTF / booking number,
+    or the same customer (by name) with the same mobile or the same model. A customer buying two
+    different models (a fleet buyer) is two sales, not a duplicate."""
+    mine, refs, mobiles = journey["journeyId"], journey.get("refs") or set(), journey.get("mobiles") or set()
+    names, model = journey.get("names") or set(), journey.get("model")
+    for jid, other in sorted(journeys.items(), key=lambda kv: str(kv[1].get("reference") or "")):
+        if jid == mine or out_of_scope_model(other.get("model")):
+            continue
+        if refs & (other.get("refs") or set()):
+            return other
+        same_customer = any(same_person(a, b) for a in names for b in other.get("names") or set())
+        if not same_customer:
+            continue
+        models_agree = not model or not other.get("model") or same_model(model, other.get("model"))
+        # A common name on an unrelated booking months apart is not the same sale.
+        days, other_days = journey.get("bookingDays") or set(), other.get("bookingDays") or set()
+        near = not days or not other_days or any(abs((a - b).days) <= DUPLICATE_DAYS
+                                                 for a in days for b in other_days)
+        if models_agree and near and (mobiles & (other.get("mobiles") or set()) or (model and other.get("model"))):
+            return other
     return None
 
 
@@ -139,25 +177,33 @@ def bookings_not_in_dump(connection: Connection, *, tenant_id: str, dump: dict[s
     each with the reason and the nearest DMS row. ``dump``: dump_id, dealer_id, period_month,
     business_date."""
     month = dump.get("period_month") or dump["business_date"].replace(day=1)
-    first, last = dump_window(month, dump["business_date"])
-    last = min(last, today)
+    first, _ = dump_window(month, dump["business_date"])
+    # Up to the last day the dump's rows reach, not its upload day (2026-11-22).
+    last = min(compared_until(connection, tenant_id, {**dump, "period_month": month}), today)
     rows = [dict(r) for r in connection.execute(text(_ROWS_SQL), {"t": tenant_id, "id": str(dump["dump_id"])})
             .mappings()]
     found = {r["journey_id"] for r in rows if r.get("journey_id")}
     # A booking the DMS dates outside these days (in another dump) is not looked for in this one.
     dated = dms_dates(connection, tenant_id, str(dump["dealer_id"]), dump["business_date"])[BOOKING]
+    # Retailed: the DMS delivery dump found it -- in the DMS (2026-11-22).
+    retailed = dms_delivery_bookings(connection, tenant_id, str(dump["dealer_id"]), dump["business_date"])
     outlets = {str(r[0]): r[1] for r in connection.execute(
         text("SELECT outlet_id, outlet_name FROM auditcore.dealer_outlets WHERE tenant_id = :t AND dealer_id = :d"),
         {"t": tenant_id, "d": str(dump["dealer_id"])})}
     index = build_index(connection, tenant_id=tenant_id, dealer_id=dump["dealer_id"])
     out = []
     for jid, journey in index.journeys.items():
-        if jid in found or jid in dated or out_of_scope_model(journey.get("model")):
+        if jid in found or jid in dated or jid in retailed or out_of_scope_model(journey.get("model")):
             continue
         day = _day(journey, today)
         if day is None or not first <= day <= last:
             continue
         code, why, near = diagnose(journey, rows)
+        if code not in _DUPLICATE_KEEPS and (twin := duplicate_of(journey, index.journeys)) is not None:
+            code, why = "DUPLICATE_JOURNEY", (
+                f"Also on {twin.get('reference')} ({twin.get('customer') or 'name not read'}"
+                f"{', ' + str(twin['model']) if twin.get('model') else ''}): one sale on two journeys, or one "
+                "journey holding the other's OTF -- the DMS row can go to only one. Keep one, remove the other.")
         out.append({
             "journeyId": jid, "journeyReference": journey.get("reference"),
             "outletName": outlets.get(str(journey.get("outletId") or "")), "bookingDate": day.isoformat(),
@@ -176,4 +222,47 @@ def bookings_not_in_dump(connection: Connection, *, tenant_id: str, dump: dict[s
     return sorted(out, key=lambda r: (r["reasonCode"], r["bookingDate"], r["journeyReference"] or ""))
 
 
-__all__ = ["REASONS", "bookings_not_in_dump", "diagnose"]
+def store_not_in_dms(connection: Connection, *, tenant_id: str, report_id: str, report_date: date,
+                     report: dict[str, Any]) -> int:
+    """The report's "In Verigence, not in DMS" bookings onto their Journeys
+    (p2_journey_not_in_dms), for the list's "Not in DMS" switch (product owner 2026-11-22).
+    Per dealership with a booking dump in the report, and only when no newer report covers it:
+    its Journeys listed now are switched on with their reason, the others switched off."""
+    stored = 0
+    listed: dict[str, list[dict[str, Any]]] = {}
+    for row in report.get("notInDmsBookings") or []:
+        if row.get("dealerId") and row.get("journeyId"):
+            listed.setdefault(str(row["dealerId"]), []).append(row)
+    for dealer in report.get("dealers") or []:
+        did = str(dealer.get("dealerId") or "")
+        if not did or not dealer.get("bookingDumpDate"):
+            continue
+        newest = connection.execute(text("""
+            SELECT max(report_date) FROM auditcore.p2_dms_reports
+            WHERE tenant_id = :t AND CAST(:d AS text) = ANY(CAST(dealer_ids AS text[]))
+        """), {"t": tenant_id, "d": did}).scalar()
+        if newest is not None and newest > report_date:
+            continue  # a newer report of the dealership decides
+        connection.execute(text("""
+            UPDATE auditcore.p2_journey_not_in_dms SET active = false, updated_at_utc = now()
+            WHERE tenant_id = :t AND dealer_id = CAST(:d AS uuid) AND active
+        """), {"t": tenant_id, "d": did})
+        for row in listed.get(did, []):
+            connection.execute(text("""
+                INSERT INTO auditcore.p2_journey_not_in_dms (tenant_id, journey_id, dealer_id, report_id,
+                  report_date, dump_date, booking_date, reason_code, reason, detail, active)
+                VALUES (:t, CAST(:j AS uuid), CAST(:d AS uuid), CAST(:r AS uuid), :rd, :dd, :bd, :c, :why, :detail, true)
+                ON CONFLICT (tenant_id, journey_id) DO UPDATE SET
+                  dealer_id = EXCLUDED.dealer_id, report_id = EXCLUDED.report_id,
+                  report_date = EXCLUDED.report_date, dump_date = EXCLUDED.dump_date,
+                  booking_date = EXCLUDED.booking_date, reason_code = EXCLUDED.reason_code,
+                  reason = EXCLUDED.reason, detail = EXCLUDED.detail, active = true, updated_at_utc = now()
+            """), {"t": tenant_id, "j": str(row["journeyId"]), "d": did, "r": report_id, "rd": report_date,
+                   "dd": row.get("dumpDate"), "bd": row.get("bookingDate"), "c": row["reasonCode"],
+                   "why": row.get("reason") or REASONS.get(row["reasonCode"], row["reasonCode"]),
+                   "detail": row.get("detail")})
+            stored += 1
+    return stored
+
+
+__all__ = ["REASONS", "bookings_not_in_dump", "diagnose", "duplicate_of", "store_not_in_dms"]
