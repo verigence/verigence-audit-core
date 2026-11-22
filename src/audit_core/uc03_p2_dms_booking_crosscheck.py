@@ -95,7 +95,7 @@ def duplicate_of(journey: dict[str, Any], journeys: dict[str, dict[str, Any]]) -
     mine, refs, mobiles = journey["journeyId"], journey.get("refs") or set(), journey.get("mobiles") or set()
     names, model = journey.get("names") or set(), journey.get("model")
     for jid, other in sorted(journeys.items(), key=lambda kv: str(kv[1].get("reference") or "")):
-        if jid == mine or out_of_scope_model(other.get("model")):
+        if jid == mine or other.get("cancelled") or out_of_scope_model(other.get("model")):
             continue
         if refs & (other.get("refs") or set()):
             return other
@@ -193,7 +193,8 @@ def bookings_not_in_dump(connection: Connection, *, tenant_id: str, dump: dict[s
     index = build_index(connection, tenant_id=tenant_id, dealer_id=dump["dealer_id"])
     out = []
     for jid, journey in index.journeys.items():
-        if jid in found or jid in dated or jid in retailed or out_of_scope_model(journey.get("model")):
+        if (jid in found or jid in dated or jid in retailed or journey.get("cancelled")
+                or out_of_scope_model(journey.get("model"))):
             continue
         day = _day(journey, today)
         if day is None or not first <= day <= last:

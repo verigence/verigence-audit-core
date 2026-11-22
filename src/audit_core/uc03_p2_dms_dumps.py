@@ -492,7 +492,15 @@ _INDEX_SQL = """
                -- on its own within minutes of a booking upload, so it is not one (2026-11-21:
                -- 125 journeys with no delivery paper read as delivered against the DMS).
                """ + DELIVERY_STARTED_SQL.format(t="j.tenant_id", j="j.journey_id") + """ AS has_delivery,
-               vr.vin, vr.chassis_number
+               vr.vin, vr.chassis_number,
+               -- Cancelled in Verigence, or closed as a duplicate (2026-11-22): no booking to
+               -- match by OTF, mobile or name (a PC closed a journey as "document upload failed"
+               -- and started a fresh one for the same sale). Its chassis still finds it: the
+               -- chassis is the vehicle, and journeys closed that way held complete deliveries.
+               EXISTS (SELECT 1 FROM auditcore.journey_stage_states cs
+                       WHERE cs.tenant_id = j.tenant_id AND cs.journey_id = j.journey_id
+                         AND cs.stage_code = 'BOOKING'
+                         AND cs.business_status IN ('BOOKING_CANCELLED', 'DUPLICATE_BOOKING')) AS cancelled
         FROM auditcore.journeys j
         LEFT JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
         LEFT JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
@@ -500,14 +508,6 @@ _INDEX_SQL = """
         LEFT JOIN auditcore.vehicle_records vr ON vr.tenant_id = j.tenant_id AND vr.journey_id = j.journey_id
         LEFT JOIN rc ON rc.journey_id = j.journey_id
         WHERE j.tenant_id = :t AND j.dealer_id = :d
-          -- A booking cancelled in Verigence (or closed as a duplicate) is no booking to match
-          -- (2026-11-22: a PC closed a journey as "document upload failed" and started a fresh
-          -- one; the two copies of one sale left its DMS row unmatched and the closed one
-          -- counted "in Verigence, not in the DMS").
-          AND NOT EXISTS (SELECT 1 FROM auditcore.journey_stage_states cs
-                          WHERE cs.tenant_id = j.tenant_id AND cs.journey_id = j.journey_id
-                            AND cs.stage_code = 'BOOKING'
-                            AND cs.business_status IN ('BOOKING_CANCELLED', 'DUPLICATE_BOOKING'))
     )
     SELECT j.*, f.field_key, f.source_document_type_key AS doc, f.effective_value #>> '{}' AS value
     FROM j
@@ -551,6 +551,7 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
                 "bookingDays": {d for d in (r["booking_date"], r["first_receipt"]) if d is not None},
                 "firstReceipt": r["first_receipt"],
                 "hasDelivery": bool(r["has_delivery"]),
+                "cancelled": bool(r["cancelled"]),
                 "mobiles": set(), "refs": set(),
             }
             for key in journey_ref_keys(r["booking_reference"]):
@@ -643,20 +644,23 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any], taken: frozen
     of the same dump -- a Journey is one vehicle, one row (2026-11-19)."""
 
     def one(found: set[str]) -> str | None:
-        return _one(set(found) - set(taken))
+        return _one(set(found) - set(taken) - cancelled)
+
+    # Journeys cancelled in Verigence take no match but by their chassis (2026-11-22).
+    cancelled = {jid for jid, j in index.journeys.items() if j.get("cancelled")}
 
     # A delivery row: the chassis first. It is the vehicle itself, printed on the gate pass,
     # invoice, insurance and RTO papers; the booking number comes from one booking form, the
     # page most easily filed on the wrong Journey (2026-11-21: another customer's booking form
     # filed on ADI-BO-261120-022 took that Journey from the row carrying its own chassis).
     if kind == DELIVERY and (key := chassis_key(row.get("chassis"))) is not None \
-            and (jid := one(index.by_chassis.get(key, set()))) is not None:
+            and (jid := _one(set(index.by_chassis.get(key, set())) - set(taken))) is not None:
         return jid, "CHASSIS"
     strong = strong_booking_keys(row.get("booking_number"), row.get("dms_booking_number"))
     for key in sorted(booking_keys(row.get("booking_number"), row.get("dms_booking_number")), key=lambda k: k not in strong):
         if (jid := one(index.by_ref.get(key, set()))) is not None and (key in strong or _same_customer(index, jid, row)):
             return jid, "BOOKING_NUMBER"
-    if (key := row.get("mobile")) and (found := set(index.by_mobile.get(key, set())) - set(taken)):
+    if (key := row.get("mobile")) and (found := set(index.by_mobile.get(key, set())) - set(taken) - cancelled):
         if (jid := one(found)) is not None:
             return jid, "MOBILE"
         # one customer, two bookings: the one of the same model
@@ -673,7 +677,7 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any], taken: frozen
     name = row.get("customer_name")
     if name:
         named = {jid for jid, j in index.journeys.items()
-                 if jid not in taken and any(same_person(name, n) for n in j["names"])}
+                 if jid not in taken and jid not in cancelled and any(same_person(name, n) for n in j["names"])}
         # A booking row: the customer's name and the booking date the DMS prints, within
         # NAME_DATE_DAYS of the Journey's (2026-11-18: papers often carry no OTF or a misread
         # mobile; the date, not the model, tells two customers of one name apart).
