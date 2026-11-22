@@ -361,6 +361,7 @@ _CLAIM_SQL = text(
     ),
     ready AS (
         SELECT work_id, journey_id, queued_at_utc, (work_type = ANY(:page_types)) AS page_work,
+               (work_type = ANY(:poll_types)) AS poll_work,
                row_number() OVER (PARTITION BY journey_id ORDER BY queued_at_utc, work_id) AS journey_rank,
                -- Among a Journey's own work its checks come last (2026-10-31):
                -- they read what the recompute, the reconcile and task
@@ -403,12 +404,19 @@ _CLAIM_SQL = text(
     first_page_work AS (
         SELECT journey_id, MIN(journey_rank) AS journey_rank FROM ready WHERE page_work GROUP BY journey_id
     ),
+    -- Journeys with reading waiting: a page to split, send or group, or the look
+    -- at Document Intelligence for what it has read.
+    reading_waits AS (
+        SELECT DISTINCT journey_id FROM ready WHERE page_work OR poll_work
+    ),
     eligible AS (
-        SELECT r.work_id, r.page_work, r.queued_at_utc
+        SELECT r.work_id, r.queued_at_utc,
+               CASE WHEN r.page_work THEN 0 WHEN w.journey_id IS NOT NULL THEN 1 ELSE 2 END AS claim_class
         FROM ready r
         LEFT JOIN inflight i ON i.journey_id=r.journey_id
         LEFT JOIN next_journey_work n ON n.journey_id=r.journey_id
         LEFT JOIN first_page_work p ON p.journey_id=r.journey_id
+        LEFT JOIN reading_waits w ON w.journey_id=r.journey_id
         WHERE CASE
           WHEN r.page_work THEN
             COALESCE(i.running_journey_work, 0) = 0
@@ -421,7 +429,19 @@ _CLAIM_SQL = text(
         -- rule were never sent to Document Intelligence -- they waited behind
         -- control checks and recomputes. A page's work is claimed before any
         -- evaluation work, oldest first within each class.
-        ORDER BY (NOT r.page_work), r.queued_at_utc, r.work_id
+        --
+        -- All of the reading (22 Nov 2026), not only the sending. A page is read
+        -- when its result is fetched too, and that look (JOURNEY_RECONCILE) stood
+        -- in the checks' line: on 12 Nov a rules re-run asked for some 33,000
+        -- checks at 3:10 pm and for 95 minutes no page's result was fetched --
+        -- 136 pages Document Intelligence had been sent were failed "Not read
+        -- within 30 minutes" (the same after the re-runs of 14, 16 and 21 Nov).
+        -- So after the pages comes everything a waiting page or a waiting look
+        -- needs: the look itself, and the Journey item that is before it in its
+        -- own Journey's line (that item runs alone, so the page or the look
+        -- waits for it -- it must not wait in the long line in its turn). Checks
+        -- of Journeys with nothing to read keep their order behind these.
+        ORDER BY claim_class, r.queued_at_utc, r.work_id
         LIMIT :limit
     )
     SELECT w.tenant_id, w.work_id, w.journey_id, w.work_type, w.work_key,
@@ -430,7 +450,7 @@ _CLAIM_SQL = text(
     FROM auditcore.p2_work_queue w
     JOIN eligible e ON e.work_id=w.work_id
     WHERE w.tenant_id=:tenant_id
-    ORDER BY (NOT e.page_work), w.queued_at_utc, w.work_id
+    ORDER BY e.claim_class, w.queued_at_utc, w.work_id
     FOR UPDATE OF w SKIP LOCKED
     """
 )
@@ -443,7 +463,8 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
         rows = connection.execute(
             _CLAIM_SQL,
             {"tenant_id": tenant_id, "limit": limit, "per_journey": _PER_JOURNEY_CONCURRENCY,
-             "page_types": list(PAGE_WORK_TYPES), "same_file_delete": SAME_FILE_DELETE_WORK_TYPE,
+             "page_types": list(PAGE_WORK_TYPES), "poll_types": sorted(_POLL_WORK_TYPES),
+             "same_file_delete": SAME_FILE_DELETE_WORK_TYPE,
              "deletion_hold_minutes": DELETION_HOLD_MINUTES},
         ).mappings().all()
         for row in rows:
