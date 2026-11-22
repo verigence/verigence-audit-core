@@ -211,7 +211,7 @@ def compute_report(connection: Connection, *, tenant_id: str, dealers: list[dict
 
     names = {x["dealerId"]: x["dealerName"] for x in dealers}
     report["notInDmsBookings"] = [
-        {**row, "dealerName": names.get(str(d["dealer_id"]))}
+        {**row, "dealerId": str(d["dealer_id"]), "dealerName": names.get(str(d["dealer_id"]))}
         for d in dumps if d["dump_kind"] == BOOKING
         for row in bookings_not_in_dump(connection, tenant_id=tenant_id, dump=d, today=today)]
     reasons = Counter(row["reasonCode"] for row in report["notInDmsBookings"])
@@ -249,6 +249,9 @@ def generate_report(connection: Connection, *, tenant_id: str, dealers: list[dic
          "ds": sorted({d["dealer_id"] for d in dumps}), "by": actor_id, "byn": by_name,
          "f": json.dumps(report["figures"]), "r": json.dumps(report, default=str)},
     )
+    from audit_core.uc03_p2_dms_booking_crosscheck import store_not_in_dms
+
+    store_not_in_dms(connection, tenant_id=tenant_id, report_id=str(report_id), report_date=day, report=report)
     return {"reportId": str(report_id), "date": day.isoformat(), "generatedBy": by_name or actor_id,
             "figures": report["figures"], "statementLines": report["statementLines"]}
 

@@ -345,6 +345,38 @@ def test_a_booking_is_dated_by_its_form_else_its_first_receipt_never_the_upload_
     assert figures["bookingDateNotRead"] == 3
 
 
+def test_after_the_dumps_last_day_and_retailed_bookings_are_not_extra(dealer):
+    """2026-11-22: bookings dated after the last day their dump's rows reached, and bookings in
+    the DMS delivery dump, were counted "In Verigence, not in DMS". Neither is an extra booking."""
+    from datetime import timedelta
+
+    today = date.today()  # noqa: DTZ011 -- the database dates receipts against CURRENT_DATE
+    ids: dict[str, str] = {}
+    with dealer.engine.begin() as c:
+        for name, form in (("ONFILE", today - timedelta(days=3)), ("LATE", today - timedelta(days=1)),
+                           ("RETAILED", today - timedelta(days=4)), ("OLDRETAIL", today - timedelta(days=5))):
+            customer = c.execute(text("""INSERT INTO auditcore.customers (tenant_id, dealer_id, outlet_id,
+                    customer_type_code, display_name, legal_name) VALUES (:t, :d, :o, 'INDIVIDUAL', :n, :n)
+                    RETURNING customer_id"""), {"t": dealer.tenant_id, "d": dealer.dealer_id,
+                                                "o": dealer.outlet_id, "n": name}).scalar_one()
+            ids[name] = str(c.execute(text("""INSERT INTO auditcore.journeys (tenant_id, dealer_id, outlet_id,
+                    customer_id, journey_reference) VALUES (:t, :d, :o, :c, :r) RETURNING journey_id"""),
+                    {"t": dealer.tenant_id, "d": dealer.dealer_id, "o": dealer.outlet_id, "c": customer,
+                     "r": f"AD-{uuid4().hex[:6]}-{name}"}).scalar_one())
+            c.execute(text("INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date) VALUES (:t, :j, :b)"),
+                      {"t": dealer.tenant_id, "j": ids[name], "b": form})
+        figures = verigence_figures(
+            c, dealer.tenant_id, [{"outlet_id": dealer.outlet_id}], today - timedelta(days=10),
+            today - timedelta(days=2), today, today, booking_dump_journeys=set(),
+            # the delivery dump: RETAILED with no booking date printed, OLDRETAIL booked months ago
+            delivery_bookings={ids["RETAILED"]: None, ids["OLDRETAIL"]: today - timedelta(days=90)},
+            not_compared_to=today)[dealer.outlet_id]
+    assert figures["bookingNotInDms"] == 1  # ONFILE only
+    assert figures["bookingInDmsElsewhere"] == 1  # RETAILED, on its own date
+    assert figures["bookingAfterDump"] == 1  # LATE: after the dump's last day
+    assert figures["bookingInVerigence"] == 2  # OLDRETAIL is a booking of months ago, per the DMS
+
+
 def test_a_rebuilt_report_keeps_the_dealerships_it_was_made_for():
     """2026-11-22: a report generated for one dealership came back covering every dealership its
     author covers."""

@@ -322,3 +322,47 @@ def test_the_queue_totals_count_the_tasks_the_list_lists(uc03_create_booking_set
             overdue = sum(1 for r in listed if r["due_at_utc"] is not None
                           and r["due_at_utc"] < connection.execute(text("SELECT now()")).scalar_one())
             assert totals["overdue_total"] == overdue, role
+
+
+def test_the_not_in_dms_switch_lists_the_latest_reports_extra_bookings(uc03_create_booking_setup):  # noqa: F811
+    """Product owner 2026-11-22: "can we add a new filter or simply a switch not in dms". The
+    latest DMS report of a dealership decides; an older report rebuilt later changes nothing."""
+    from audit_core.uc03_p2_dms_booking_crosscheck import store_not_in_dms
+
+    setup = uc03_create_booking_setup
+    client, base, journeys = _seed(setup)
+    tenant = setup["tenant_id"]
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, tenant)
+        dealer = str(connection.execute(text("SELECT dealer_id FROM auditcore.journeys WHERE journey_id = :j"),
+                                        {"j": journeys[1]}).scalar_one())
+
+        def report(day: date, *listed: str) -> dict:
+            report_id = str(uuid4())
+            connection.execute(text("""
+                INSERT INTO auditcore.p2_dms_reports (tenant_id, report_id, report_date, period_month, dealer_ids,
+                  generated_by, figures, report) VALUES (:t, :id, :d, :m, ARRAY[CAST(:dl AS varchar)], 'rv', '{}', '{}')
+            """), {"t": tenant, "id": report_id, "d": day, "m": day.replace(day=1), "dl": dealer})
+            body = {"dealers": [{"dealerId": dealer, "bookingDumpDate": day.isoformat()}],
+                    "notInDmsBookings": [{"journeyId": j, "dealerId": dealer, "reasonCode": "NOT_IN_DMS",
+                                          "reason": "Not in the DMS booking dump", "detail": "No DMS row agrees.",
+                                          "bookingDate": "2026-11-05", "dumpDate": day.isoformat()}
+                                         for j in listed]}
+            return {"id": report_id, "day": day, "body": body}
+
+        old = report(date(2026, 11, 19), journeys[1], journeys[2])
+        store_not_in_dms(connection, tenant_id=tenant, report_id=old["id"], report_date=old["day"], report=old["body"])
+        new = report(date(2026, 11, 21), journeys[1])
+        store_not_in_dms(connection, tenant_id=tenant, report_id=new["id"], report_date=new["day"], report=new["body"])
+        # The older report rebuilt afterwards: the newer one still decides.
+        assert store_not_in_dms(connection, tenant_id=tenant, report_id=old["id"], report_date=old["day"],
+                                report=old["body"]) == 0
+
+    listed = client.get(f"{base}/journeys", params={"view": "all", "not_in_dms": "true"}).json()["items"]
+    assert [i["journey_id"] for i in listed] == [journeys[1]]
+    assert listed[0]["not_in_dms_reason"] == "Not in the DMS booking dump"
+    assert listed[0]["not_in_dms_report_date"] == "2026-11-21"
+    counts = client.get(f"{base}/journeys:counts", params={"not_in_dms": "true"}).json()["counts"]
+    assert counts["all"] == 1
+    everyone = client.get(f"{base}/journeys", params={"view": "all"}).json()["items"]
+    assert len(everyone) == 5 and sum(1 for i in everyone if i["not_in_dms_reason"]) == 1

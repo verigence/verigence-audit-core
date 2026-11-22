@@ -52,6 +52,7 @@ def report_dealers(covered: list[dict[str, Any]], dealer_ids: list[Any] | None) 
 
 
 def run_dms_report_rebuild(engine: Engine, tag: str, reports: list[str]) -> dict[str, Any]:
+    from audit_core.uc03_p2_dms_booking_crosscheck import store_not_in_dms
     from audit_core.uc03_p2_dms_dumps import _dealers
     from audit_core.uc03_p2_dms_reports import _day_dumps, compute_report
 
@@ -88,6 +89,8 @@ def run_dms_report_rebuild(engine: Engine, tag: str, reports: list[str]) -> dict
                     {"t": tenant_id, "id": str(row["report_id"]), "f": json.dumps(report["figures"]),
                      "r": json.dumps(report, default=str)},
                 )
+                store_not_in_dms(connection, tenant_id=tenant_id, report_id=str(row["report_id"]),
+                                 report_date=row["report_date"], report=report)
                 if commit:
                     transaction.commit()
                 else:

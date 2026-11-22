@@ -196,6 +196,11 @@ _SCOPE_WHERE_SQL = f"""j.tenant_id = :tenant_id
                             FROM auditcore.p2_observation_severity os
                             WHERE os.tenant_id = j.tenant_id AND os.journey_id = j.journey_id), 'NONE')
                   = CAST(:severity AS varchar))
+          -- Not in DMS (2026-11-22): the latest DMS report of the dealership lists the booking as
+          -- in Verigence but not in the DMS (p2_journey_not_in_dms, uc03_p2_dms_booking_crosscheck).
+          AND (NOT CAST(:not_in_dms AS boolean)
+               OR EXISTS (SELECT 1 FROM auditcore.p2_journey_not_in_dms nd
+                          WHERE nd.tenant_id = j.tenant_id AND nd.journey_id = j.journey_id AND nd.active))
           AND (
             :search = ''
             OR c.display_name ILIKE '%' || :search || '%'
@@ -489,6 +494,7 @@ def scope_params(
     date_from: date | None = None,
     date_to: date | None = None,
     severity: str | None = None,
+    not_in_dms: bool = False,
 ) -> dict[str, Any]:
     """The search and filter parameters SCOPED_SQL / SUGGEST_SQL read, from the request's own.
     ``date_from`` / ``date_to`` (both, from not after to): the business-date range, in place of
@@ -505,6 +511,7 @@ def scope_params(
         "pc_actor_id": (pc_actor_id or "").strip() or None,
         "kind": journey_kind(kind),
         "severity": severity_filter(severity),
+        "not_in_dms": bool(not_in_dms),
     }
 
 

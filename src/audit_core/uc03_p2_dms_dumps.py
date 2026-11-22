@@ -500,6 +500,14 @@ _INDEX_SQL = """
         LEFT JOIN auditcore.vehicle_records vr ON vr.tenant_id = j.tenant_id AND vr.journey_id = j.journey_id
         LEFT JOIN rc ON rc.journey_id = j.journey_id
         WHERE j.tenant_id = :t AND j.dealer_id = :d
+          -- A booking cancelled in Verigence (or closed as a duplicate) is no booking to match
+          -- (2026-11-22: a PC closed a journey as "document upload failed" and started a fresh
+          -- one; the two copies of one sale left its DMS row unmatched and the closed one
+          -- counted "in Verigence, not in the DMS").
+          AND NOT EXISTS (SELECT 1 FROM auditcore.journey_stage_states cs
+                          WHERE cs.tenant_id = j.tenant_id AND cs.journey_id = j.journey_id
+                            AND cs.stage_code = 'BOOKING'
+                            AND cs.business_status IN ('BOOKING_CANCELLED', 'DUPLICATE_BOOKING'))
     )
     SELECT j.*, f.field_key, f.source_document_type_key AS doc, f.effective_value #>> '{}' AS value
     FROM j
@@ -617,6 +625,18 @@ def _one(found: set[str]) -> str | None:
     return next(iter(found)) if len(found) == 1 else None
 
 
+def _earliest_alike(index: JourneyIndex, found: set[str]) -> str | None:
+    """The earliest (by reference) of two or more Journeys of one customer -- every pair agrees
+    on the name -- or None when they are not alike."""
+    if len(found) < 2:
+        return None
+    journeys = [index.journeys[j] for j in found]
+    first = journeys[0]["names"]
+    if not first or not all(any(same_person(a, b) for a in first for b in j["names"]) for j in journeys[1:]):
+        return None
+    return min(found, key=lambda j: (str(index.journeys[j].get("reference") or ""), j))
+
+
 def match_row(index: JourneyIndex, kind: str, row: dict[str, Any], taken: frozenset[str] | set[str] = frozenset()
               ) -> tuple[str | None, str | None]:
     """(journey id, basis) or (None, None). ``taken``: Journeys already claimed by another row
@@ -642,6 +662,13 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any], taken: frozen
         # one customer, two bookings: the one of the same model
         same_model_ = {j for j in found if same_model(index.journeys[j]["model"], row.get("model"))}
         if (jid := one(same_model_)) is not None:
+            return jid, "MOBILE"
+        # Several Journeys alike -- the same mobile, model and customer (2026-11-22): a fleet
+        # buyer's identical vehicles (two MAXX HD booked the same day: the DMS has two rows) or
+        # one booking uploaded twice. Each row takes the earliest still free, so two rows take
+        # the two Journeys, and a second copy is left over for the cross-check to name as a
+        # duplicate. Until then every such row stood "not in Verigence" and every Journey extra.
+        if (jid := _earliest_alike(index, same_model_)) is not None:
             return jid, "MOBILE"
     name = row.get("customer_name")
     if name:
@@ -822,6 +849,43 @@ def dump_window(period_month: date, business_date: date) -> tuple[date, date]:
     the start of the month"): the 1st of its month to its upload day, within the month."""
     month_end = _next_month(period_month) - timedelta(days=1)
     return period_month, min(business_date, month_end)
+
+
+def compared_until(connection: Connection, tenant_id: str, dump: dict[str, Any]) -> date:
+    """The last day a dump is compared for: its window's last day (dump_window), but no later
+    than the latest date the dump's own rows carry (2026-11-22). A dump uploaded on the 21st
+    whose rows stop at the 19th holds nothing of the 20th yet; bookings dated after its last row
+    were wrongly counted "In Verigence, not in DMS"."""
+    window_end = dump_window(dump["period_month"], dump["business_date"])[1]
+    last = connection.execute(text("""
+        SELECT max(event_date) FROM auditcore.p2_dms_dump_rows
+        WHERE tenant_id = :t AND dump_id = CAST(:id AS uuid) AND event_date <= :end
+          AND outcome NOT IN ('EXCLUDED', 'DUPLICATE')
+    """), {"t": tenant_id, "id": str(dump["dump_id"]), "end": window_end}).scalar()
+    return min(window_end, last) if last is not None else window_end
+
+
+def dms_delivery_bookings(connection: Connection, tenant_id: str, dealer_id: str, upto: date
+                          ) -> dict[str, date | None]:
+    """Journey -> the booking date the DMS delivery dump prints for it (None when it prints
+    none), for each Journey any of the dealership's delivery dumps up to ``upto`` found. Such a
+    Journey is in the DMS (2026-11-22): retailed, it is not an extra booking of Verigence's,
+    and the DMS's booking date decides its month (several such Journeys were booked in the DMS
+    months earlier). A year before 2000 is a typo
+    in the dump (0026-09-10), not a date."""
+    out: dict[str, date | None] = {}
+    for r in connection.execute(text("""
+        SELECT CAST(r.journey_id AS text) AS journey_id, r.booking_date
+        FROM auditcore.p2_dms_dump_rows r
+        JOIN auditcore.p2_dms_dumps u ON u.tenant_id = r.tenant_id AND u.dump_id = r.dump_id
+        WHERE r.tenant_id = :t AND CAST(u.dealer_id AS text) = :d AND u.status = 'ACTIVE'
+          AND u.dump_kind = 'DELIVERY' AND u.business_date <= :upto AND r.journey_id IS NOT NULL
+          AND r.outcome NOT IN ('OUT_OF_PERIOD', 'EXCLUDED', 'DUPLICATE')
+        ORDER BY u.business_date, u.uploaded_at_utc, r.row_no
+    """), {"t": tenant_id, "d": str(dealer_id), "upto": upto}).mappings():
+        day = r["booking_date"]
+        out[r["journey_id"]] = day if day is not None and day.year >= 2000 else out.get(r["journey_id"])
+    return out
 
 
 def dms_dates(connection: Connection, tenant_id: str, dealer_id: str, upto: date) -> dict[str, dict[str, date]]:
@@ -1788,8 +1852,10 @@ __all__ = [
     "booking_keys",
     "build_index",
     "chassis_key",
+    "compared_until",
     "detect_kind",
     "dms_dates",
+    "dms_delivery_bookings",
     "dump_calendar",
     "journey_ref_keys",
     "match_dump",

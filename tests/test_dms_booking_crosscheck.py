@@ -48,3 +48,45 @@ def test_nothing_agrees():
     assert diagnose(_journey(refs={"55555"}), [_row(1)]) == (
         "NOT_IN_DMS", diagnose(_journey(refs={"55555"}), [_row(1)])[1], None)
     assert diagnose(_journey(), [_row(1)])[0] == "OTF_NOT_READ"
+
+
+def test_a_duplicate_journey_is_the_same_otf_or_the_same_customer_and_sale():
+    """2026-11-22: two journeys of one sale (or one holding the other's OTF) leave the DMS row to
+    neither; a fleet buyer's second model, or a namesake months apart, is not a duplicate."""
+    from audit_core.uc03_p2_dms_booking_crosscheck import duplicate_of
+
+    day = {date(2026, 11, 6)}
+    me = _journey(journeyId="a", reference="J-A", refs={"77700012"}, model="SCORPIO N", bookingDays=day)
+    others = {"a": me,
+              "b": _journey(journeyId="b", reference="J-B", names={"Other Person"}, refs={"77700012"},
+                            model="SCORPIO N")}
+    assert duplicate_of(me, others)["reference"] == "J-B"  # the same OTF
+    me = _journey(journeyId="a", reference="J-A", model="MAXX HD", bookingDays=day)
+    twin = _journey(journeyId="c", reference="J-C", model="MAXX HD", bookingDays={date(2026, 11, 7)})
+    assert duplicate_of(me, {"a": me, "c": twin})["reference"] == "J-C"  # same customer and model
+    fleet = _journey(journeyId="d", reference="J-D", model="BOLERO NEO", bookingDays=day)
+    assert duplicate_of(me, {"a": me, "d": fleet}) is None  # a second model: another sale
+    namesake = _journey(journeyId="e", reference="J-E", model="MAXX HD", bookingDays={date(2026, 6, 1)})
+    assert duplicate_of(me, {"a": me, "e": namesake}) is None  # months apart
+    unread = _journey(journeyId="f", reference="J-F", model=None, mobiles={"9000000001"}, bookingDays=day)
+    me = _journey(journeyId="a", reference="J-A", model="MAXX HD", mobiles={"9000000001"}, bookingDays=day)
+    assert duplicate_of(me, {"a": me, "f": unread})["reference"] == "J-F"  # model unread: the mobile decides
+
+
+def test_alike_journeys_take_alike_rows_one_each():
+    """2026-11-22: one customer's two identical MAXX HD (two DMS rows, two Journeys) were left
+    unmatched on both sides; one booking uploaded twice left its DMS row unmatched."""
+    from audit_core.uc03_p2_dms_dumps import BOOKING, JourneyIndex, match_row
+
+    index = JourneyIndex()
+    for jid, ref in (("j1", "J-1"), ("j2", "J-2")):
+        index.journeys[jid] = {"journeyId": jid, "reference": ref, "names": {"CUSTOMER K"}, "model": "MAXX HD",
+                               "mobiles": {"9000012345"}, "refs": set(), "bookingDays": set()}
+        index.by_mobile["9000012345"].add(jid)
+    row = {"customer_name": "CUSTOMER K", "mobile": "9000012345", "model": "MAXX HD",
+           "event_date": date(2026, 11, 6)}
+    assert match_row(index, BOOKING, row) == ("j1", "MOBILE")
+    assert match_row(index, BOOKING, row, {"j1"}) == ("j2", "MOBILE")
+    # Another customer on the same mobile: not alike, no guess.
+    index.journeys["j2"]["names"] = {"Someone Else"}
+    assert match_row(index, BOOKING, {**row, "customer_name": "Third Name"}) == (None, None)
