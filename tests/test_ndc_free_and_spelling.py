@@ -82,10 +82,53 @@ def test_accessories_written_free_are_billed_at_their_value_and_the_free_part_is
     assert not read.unmapped
 
 
-def test_accessories_written_free_with_no_figure_are_charged_as_written():
+def test_accessories_written_free_with_no_figure_are_free_up_to_the_kit():
+    # as the Offer Letter's "ACCESSORIES Free": the Deal takes the kit free, the rest to pay
     read = _read(("ACCESSORIES FREE SALE", 5140))
-    assert read.components == {"accessories_cost": Decimal(5140)} and not read.discounts
-    assert read.free_rows[0]["free"] is None
+    assert read.components == {"accessories_cost": Decimal(5140)}
+    assert read.discounts == {"ACCESSORIES_KIT": Decimal(5140)}
+    assert read.free_rows[0]["free"] is None and read.free_rows[0]["asValue"]
+
+
+def test_the_offer_letters_accessories_free_is_a_free_row_too():
+    read = _read(("ACCESSORIES Free", 5112))  # ADI-RD-261104-012
+    assert read.free_rows == [{"key": "accessories_cost", "label": "ACCESSORIES FREE", "amount": Decimal(5112),
+                               "free": None, "side": "DR", "asValue": True}]
+    assert free_row_text(read.free_rows[0]).startswith("Accessories Rs 5,112 written FREE on the NDC")
+
+
+def _deal_rows(bought, free, entitled):
+    accessories = {"key": "accessories_cost", "current": str(bought), "flags": []}
+    kit = {"key": "ACCESSORIES_KIT", "current": str(free), "billed": str(free), "entitled":
+           None if entitled is None else str(entitled), "flags": ["OVER_ENTITLEMENT"], "variance": None}
+    return accessories, kit
+
+
+def test_accessories_free_with_no_amount_are_free_up_to_the_kit_and_the_rest_is_to_pay():
+    # ADI-RD-261104-012: "ACCESSORIES Free" Rs 5,112, the consumer scheme's kit Rs 5,000
+    from audit_core.uc03_p2_journey360 import split_free_accessories
+
+    accessories, kit = _deal_rows(5112, 5112, 5000)
+    split_free_accessories([accessories], [kit], as_value=True)
+    assert (kit["current"], kit["billed"], kit["variance"], kit["flags"]) == ("5000", "5000", "0", [])
+    assert accessories["freeSplit"] == {"bought": "5112", "free": "5000", "toPay": "112", "overFree": "0"}
+    assert accessories["ndcNote"] == "Accessories Rs 5,112: Rs 5,000 free, Rs 112 to be paid by the customer."
+
+
+def test_a_free_amount_written_is_never_capped_and_its_split_is_said():
+    from audit_core.uc03_p2_journey360 import split_free_accessories
+
+    accessories, kit = _deal_rows(3000, 5000, 5000)
+    split_free_accessories([accessories], [kit], as_value=False)
+    assert kit["current"] == "5000"
+    assert accessories["ndcNote"] == ("Accessories Rs 3,000: Rs 5,000 given free against Rs 3,000 of accessories: "
+                                      "Rs 2,000 more.")
+    accessories, kit = _deal_rows(3000, 3000, 5000)
+    split_free_accessories([accessories], [kit], as_value=True)
+    assert accessories["ndcNote"] == "Accessories Rs 3,000: All free; Rs 2,000 of the scheme's Rs 5,000 kit not used."
+    accessories, kit = _deal_rows(5140, 5000, None)
+    split_free_accessories([accessories], [kit], as_value=False)
+    assert accessories["ndcNote"] == "Accessories Rs 5,140: Rs 5,000 free, Rs 140 to be paid by the customer."
 
 
 def test_rsa_written_free_is_charged_beside_the_other_rsa_row():
@@ -98,7 +141,7 @@ def test_a_product_written_free_as_a_minus_is_only_a_note():
     read = read_statement([{"particulars_raw": "Extended Warranty Free", "debit_amount": -60000}])
     assert not read.components and not read.discounts and not read.unmapped
     assert read.free_rows == [{"key": "extended_warranty_amount", "label": "EXTENDED WARRANTY FREE",
-                               "amount": Decimal(60000), "free": Decimal(60000), "side": "CR"}]
+                               "amount": Decimal(60000), "free": Decimal(60000), "side": "CR", "asValue": False}]
 
 
 @pytest.mark.parametrize(("label", "amount"), [
