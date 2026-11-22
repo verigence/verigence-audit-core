@@ -219,7 +219,11 @@ def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(set
     assert {r["customerName"]: r["intimation"] for r in kept["rows"]} == {
         "Asha Das": "Intimated to PC - pending with PC", "Bina Rout": "Not intimated to PC - pending with dealership"}
     book = load_workbook(io.BytesIO(s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}/file").content))
-    assert book.sheetnames[:2] == ["Outlet report", "Statement"]
+    assert book.sheetnames[:3] == ["Summary", "By DMS location", "Statement"]
+    # ...and the same report as a PDF (2026-11-22).
+    pdf = s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}/file", params={"format": "pdf"})
+    assert pdf.status_code == 200 and pdf.headers["content-type"] == "application/pdf"
+    assert pdf.content.startswith(b"%PDF") and ".pdf" in pdf.headers["content-disposition"]
     # The PC's screen now says the report has been generated from this dump (2026-11-20);
     # marks can still change.
     s.acting["subject"] = s.journey.actor_id

@@ -640,6 +640,33 @@ def get_outlet_report(
 
 
 # (header, key, group) -- the Excel's columns, in the layout of the dealers' own daily sheet
+# How the DMS report is counted: on its "How it is counted" sheet and in the PDF.
+COUNTING_NOTES: tuple[str, ...] = (
+    ("The DMS is the source of truth for dates. A booking or delivery the DMS has is counted on the DMS's date, "
+     "whatever date Verigence reads from the papers. Only a booking or delivery the DMS does not have is counted "
+     "on Verigence's own date."),
+    ("Month to date. DMS figures come from each dealership's dump uploaded on the report's date; Verigence and "
+     "gate register figures are counted up to the last day that dump covers, so both sides are the same days."),
+    ("'Of which dated by upload day': bookings the DMS does not have and with no booking form date read, so "
+     "Verigence dates them by the day the booking documents were uploaded."),
+    ("A dump row is placed by its location name: Utkal's ANANDAPUR is reported by the DMS under KEONJHAR; Aditya's outlets "
+     "other than JAJPUR are all under CUTTACK. Where several outlets share a DMS location, each outlet shows its Verigence "
+     "figures and the location's row compares the DMS with their total."),
+    ("In Verigence: bookings and deliveries the DMS dates in the period, and those the DMS does not have that "
+     "Verigence dates in the period (booking form date, else the upload day; gate pass, else NDC, else receipt)."),
+    ("Intimated to PC: a dump row Verigence does not hold that the PC marked as intimated to them (Booking / Delivery "
+     "Intimation tab) -- pending with the PC. Not intimated to PC: no PC marked it -- pending with the dealership. "
+     "A row in Verigence needs no mark."),
+    "Gate register: the PC's daily register, its count of deliveries; registers missed are listed on the Statement sheet.",
+    ("Synced = a DMS row found in Verigence. Not in Verigence = no journey at all. Delivery not uploaded = journey "
+     "found, delivery file not uploaded. In Verigence, not in DMS = in Verigence for these days, not in the dump."),
+    ("The figures add up: As per DMS = synced + delivery not uploaded + not in Verigence; In Verigence = synced + "
+     "not in DMS + not compared. One journey is matched to one DMS row only; a line repeating an earlier line's "
+     "chassis / OTF is a duplicate and is left out."),
+    "Cancelled bookings in the DMS are left out of 'As per DMS'.",
+)
+
+
 EXCEL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("As per DMS", "bookingDms", "Booking"),
     ("In Verigence", "bookingInVerigence", "Booking"),
@@ -757,30 +784,7 @@ def build_outlet_report_excel(report: dict[str, Any]) -> bytes:
                 st.cell(row=st.max_row, column=1).font = Font(bold=True)
         st.column_dimensions["A"].width = 160
     notes = wb.create_sheet("How it is counted")
-    for line in (
-        ("The DMS is the source of truth for dates. A booking or delivery the DMS has is counted on the DMS's date, "
-         "whatever date Verigence reads from the papers. Only a booking or delivery the DMS does not have is counted "
-         "on Verigence's own date."),
-        ("Month to date. DMS figures come from each dealership's dump uploaded on the report's date; Verigence and "
-         "gate register figures are counted up to the last day that dump covers, so both sides are the same days."),
-        ("'Of which dated by upload day': bookings the DMS does not have and with no booking form date read, so "
-         "Verigence dates them by the day the booking documents were uploaded."),
-        ("A dump row is placed by its location name: Utkal's ANANDAPUR is reported by the DMS under KEONJHAR; Aditya's outlets "
-         "other than JAJPUR are all under CUTTACK. Where several outlets share a DMS location, each outlet shows its Verigence "
-         "figures and the location's row compares the DMS with their total."),
-        ("In Verigence: bookings and deliveries the DMS dates in the period, and those the DMS does not have that "
-         "Verigence dates in the period (booking form date, else the upload day; gate pass, else NDC, else receipt)."),
-        ("Intimated to PC: a dump row Verigence does not hold that the PC marked as intimated to them (Booking / Delivery "
-         "Intimation tab) -- pending with the PC. Not intimated to PC: no PC marked it -- pending with the dealership. "
-         "A row in Verigence needs no mark."),
-        "Gate register: the PC's daily register, its count of deliveries; registers missed are listed on the Statement sheet.",
-        ("Synced = a DMS row found in Verigence. Not in Verigence = no journey at all. Delivery not uploaded = journey "
-         "found, delivery file not uploaded. In Verigence, not in DMS = in Verigence for these days, not in the dump."),
-        ("The figures add up: As per DMS = synced + delivery not uploaded + not in Verigence; In Verigence = synced + "
-         "not in DMS + not compared. One journey is matched to one DMS row only; a line repeating an earlier line's "
-         "chassis / OTF is a duplicate and is left out."),
-        "Cancelled bookings in the DMS are left out of 'As per DMS'.",
-    ):
+    for line in COUNTING_NOTES:
         notes.append([line])
     notes.column_dimensions["A"].width = 160
     out = io.BytesIO()

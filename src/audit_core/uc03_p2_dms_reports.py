@@ -29,10 +29,10 @@ import io
 import json
 from datetime import date
 from datetime import date as _Date
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import Connection, text
@@ -391,13 +391,23 @@ def export_dms_report(
     principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
     client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
     connection: Annotated[Connection, Depends(get_connection)],
+    format: Annotated[Literal["xlsx", "pdf"], Query()] = "xlsx",
 ) -> StreamingResponse:
+    """The report as one styled document (2026-11-22): Excel by default, ``?format=pdf`` for the PDF."""
+    from audit_core.uc03_p2_dms_report_document import (
+        build_report_pdf,
+        build_report_xlsx,
+        file_name,
+    )
+
     dealer_ids = {d["dealerId"] for d in _reviewer(connection, tenant_id, principal, client)}
     report = _report(connection, tenant_id, report_id, dealer_ids)
-    name = f"DMS-Report_{report['date']}.xlsx"
-    return StreamingResponse(io.BytesIO(build_report_excel(report)), media_type=(
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-        headers={"Content-Disposition": f'attachment; filename="{name}"'})
+    if format == "pdf":
+        body, media = build_report_pdf(report), "application/pdf"
+    else:
+        body, media = build_report_xlsx(report), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    return StreamingResponse(io.BytesIO(body), media_type=media,
+                             headers={"Content-Disposition": f'attachment; filename="{file_name(report, format)}"'})
 
 
 __all__ = [
