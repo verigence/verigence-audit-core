@@ -57,6 +57,13 @@ _JOB = "OUR_SIDE_REUPLOAD"
 _PER_RUN = int(os.environ.get("AUDIT_CORE_OUR_SIDE_REUPLOAD_PER_RUN", "8"))
 # Pages and documents that failed on our side, not the page's.
 OUR_SIDE_CODES = ("NOT_READ_IN_30_MIN", "GROUPING_FAILED")
+# So did a page a system error stopped after its retries (22 Nov 2026: 15 pages of
+# 3 files from 17 Nov waited for the PC with "A system problem stopped this page").
+# Such a page's code is the error's own name -- "DiClientError (at ...)",
+# "OperationalError: ...", "ReadTimeout (at ...)" -- never one of the worded codes (NOT_READ_IN_30_MIN,
+# DI_QUALITY_*, DOCUMENT_AI_*, DUPLICATE_PAGE ...), which are all capitals.
+OUR_SIDE_ERROR = r"^[A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*(Error|Exception|Timeout)\M"
+_OUR_SIDE_SQL = "(q.last_error = ANY(:codes) OR q.last_error ~ :system_error)"
 # A person closed the task: nothing is sent again (2026-10-27).
 _PERSON_CLOSED = ("CLOSED_BY_PC", "EXCEPTION_ACCEPTED")
 _SENT_AGAIN_REASON = ("Sent again by Verigence from the stored file on {day} (it failed on our side, "
@@ -93,12 +100,12 @@ def candidates(connection: Connection, tenant_id: str, references: list[str] | N
                    (b.batch_status='FAILED' AND COALESCE(b.page_count, 0)=0) AS never_split,
                    (SELECT COUNT(*) FROM auditcore.p2_document_queue q
                      WHERE q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id
-                       AND q.last_error = ANY(:codes)
+                       AND {_OUR_SIDE_SQL}
                        AND (q.queue_status IN ('FAILED','DEAD_LETTER') OR {swept_pending_sql("q")})) AS units_failed,
                    (SELECT COALESCE(SUM(COALESCE(cardinality(q.page_numbers), 1)), 0)
                       FROM auditcore.p2_document_queue q
                      WHERE q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id AND q.unit_kind='PAGE'
-                       AND q.last_error = ANY(:codes)
+                       AND {_OUR_SIDE_SQL}
                        AND (q.queue_status IN ('FAILED','DEAD_LETTER') OR {swept_pending_sql("q")})) AS pages_failed,
                    EXISTS (SELECT 1 FROM auditcore.p2_stage_document_reviews rv
                            WHERE rv.tenant_id=b.tenant_id AND rv.journey_id=b.journey_id) AS reviewed,
@@ -129,13 +136,14 @@ def candidates(connection: Connection, tenant_id: str, references: list[str] | N
                  AND b.failure_reason IN (:not_uploaded, :not_split))
                 OR EXISTS (SELECT 1 FROM auditcore.p2_document_queue q
                            WHERE q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id
-                             AND q.last_error = ANY(:codes)
+                             AND {_OUR_SIDE_SQL}
                              AND (q.queue_status IN ('FAILED','DEAD_LETTER') OR {swept_pending_sql("q")}))
               )
             ORDER BY b.created_at_utc, b.batch_id
             """
         ),
-        {"t": tenant_id, "codes": list(OUR_SIDE_CODES), "person_closed": list(_PERSON_CLOSED),
+        {"t": tenant_id, "codes": list(OUR_SIDE_CODES), "system_error": OUR_SIDE_ERROR,
+         "person_closed": list(_PERSON_CLOSED),
          "refs": list(references or []), "not_uploaded": FILE_NOT_UPLOADED_IN_TIME_REASON,
          "not_split": FILE_NOT_SPLIT_IN_TIME_REASON},
     ).mappings().all()

@@ -252,3 +252,57 @@ def test_the_customer_s_name_in_the_key_is_the_kyc_name_else_the_entered_one_nev
                      "UPDATE auditcore.journeys SET customer_id=(SELECT customer_id FROM placeholder) "
                      "WHERE tenant_id=:t AND journey_id=:j")
     assert labels()[2] is None
+
+
+# ── 22 Nov 2026: "are they being reloaded or they silently got missed out" ────────────────
+def _swept_file(journey, name: str, code: str, reason: str):
+    payload = sw._pdf(210, 310)
+    batch_id = sw._upload(journey, journey.storage, name, payload)
+    sw._split(journey, batch_id)
+    ids = sw._sql(journey, "SELECT queue_id FROM auditcore.p2_document_queue WHERE batch_id=:b ORDER BY page_number",
+                  b=batch_id)
+    sw._sql(journey, "UPDATE auditcore.p2_document_queue SET queue_status='READY' WHERE queue_id=:q",
+            q=ids[0]["queue_id"])
+    sw._fail(journey, ids[1]["queue_id"], code=code, reason=reason)
+    with journey.engine.begin() as connection:
+        sw.set_tenant_context(connection, journey.tenant_id)
+        worker._refresh_batch_status(connection, journey.tenant_id, batch_id)
+    sw._sync(journey)
+    assert sw._sweep(journey)["pages"] == 1
+    return batch_id
+
+
+@pytest.mark.parametrize("code", [
+    "DiClientError (at audit_core/di_client.py:212)",
+    "DiCaptureV2Error (at audit_core/di_capture_v2.py:95)",
+    "OperationalError: (psycopg.errors.QueryCanceled) canceling statement due to statement timeout",
+    "ReadTimeout (at _transports/default.py:101)",
+])
+def test_a_page_a_system_error_stopped_is_our_side_too(journey, code):
+    """17 Nov, live: 15 pages of 3 files ended "A system problem stopped this page -- tried 3
+    times", were swept, and waited for the PC. The job did not look at them."""
+    _swept_file(journey, "Delivery file.pdf", code, "A system problem stopped this page — tried 3 times.")
+    [item] = _run(journey, "ours-2026-11-22")["items"]
+    assert (item["outcome"], item["file"], item["pagesFailed"]) == ("WOULD_SEND", "Delivery file.pdf", 1)
+
+
+@pytest.mark.parametrize("code", [
+    "DI_QUALITY_IMAGE_BLUR_SCORE", "DOCUMENT_AI_RESPONSE_INVALID", "DOCUMENT_AI_CONTENT_BLOCKED", "DUPLICATE_PAGE",
+    "FACTS_COPY_FAILED: InternalError",
+])
+def test_a_page_refused_for_what_it_is_stays_with_the_pc(journey, code):
+    _swept_file(journey, "Booking file.pdf", code, "Refused.")
+    assert _run(journey, "ours-2026-11-22")["files"] == 0
+
+
+def test_the_pages_of_a_file_are_found_by_index(journey):
+    """The job's first query read the whole of p2_document_queue once per file and count, and
+    on 22 Nov ran past the 10-second limit: the job failed before it listed anything."""
+    batch_id = _swept_file(journey, "Booking file.pdf", "NOT_READ_IN_30_MIN", NOT_READ)
+    with journey.engine.begin() as connection:
+        sw.set_tenant_context(connection, journey.tenant_id)
+        connection.exec_driver_sql("SET LOCAL enable_seqscan = off")
+        plan = "\n".join(r[0] for r in connection.exec_driver_sql(
+            "EXPLAIN SELECT count(*) FROM auditcore.p2_document_queue q WHERE q.tenant_id=%s AND q.batch_id=%s "
+            "AND q.last_error = 'NOT_READ_IN_30_MIN'", (journey.tenant_id, batch_id)))
+    assert "ix_p2_document_queue_batch" in plan, plan
