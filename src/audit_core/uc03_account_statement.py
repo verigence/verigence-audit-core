@@ -1510,7 +1510,11 @@ def combine_copies(copies: list[Copy]) -> Combined:
         return out
     ordered = _newest_first(copies)
     full = [c for c in ordered if c.full]
-    primary = next((c for c in full if not c.pre_gst), full[0] if full else ordered[0])
+    # The NDC stands whenever one is on file: a full NDC, else an NDC page,
+    # never the DMS printout while there is one (2026-11-22: the printout,
+    # newest and full, stood as the NDC on 17 Aditya bookings).
+    primary = next((c for c in full if not c.pre_gst),
+                   next((c for c in ordered if not c.pre_gst), full[0] if full else ordered[0]))
     out.primary = primary.document
     # A copy pricing another vehicle (a customer ledger of two vehicles,
     # ADI-RD-261113-019: Rs 19,39,939 against the deal's 9,62,500) is no copy
@@ -1531,14 +1535,24 @@ def combine_copies(copies: list[Copy]) -> Combined:
         # its figures is taken or listed as a difference while an NDC stands.
         return key in copy.figures and not (copy.pre_gst and not primary.pre_gst)
 
-    keys = [k for k in keys if any(counts(c, k) for c in ordered)]
+    def fills(copy: Copy, key: tuple[str, str]) -> bool:
+        # The DMS printout fills a charge no NDC copy gives (product owner
+        # 2026-11-22: "printout should fill such gap" -- ADI-RD-261112-018's
+        # TCS, ADI-BM-261120-037's ex-showroom). Never a discount or a
+        # statement figure: its scheme and corporate figures are before GST.
+        return (copy.pre_gst and not primary.pre_gst and key[0] == "COMMERCIAL" and key in copy.figures
+                and not any(key in c.figures for c in ordered if not c.pre_gst))
+
+    keys = [k for k in keys if any(counts(c, k) or fills(c, k) for c in ordered)]
     for key in keys:
         if key in primary.figures:
             chosen: Copy | None = primary
         elif any(counts(c, key) for c in other_full):
             chosen = None  # the latest full copy no longer prints it
-        else:
+        elif any(counts(c, key) for c in pages):
             chosen = next(c for c in pages if counts(c, key))
+        else:
+            chosen = next(c for c in ordered if fills(c, key))
         taken = chosen.figures[key] if chosen is not None else None
         if chosen is not None and taken is not None:
             out.figures[key] = taken
@@ -1568,6 +1582,7 @@ def _statement_figures(read: StatementRead) -> dict[tuple[str, str], Decimal]:
 
 
 _DMS_SCHEME = re.compile(r"(SCHEME|OTHER|TOTAL) DISCOUNT|AUTO CARD( / LOYALTY CARD)?|ROUND OFF")
+_DMS_POSTING = re.compile(r".*\b(BANK FINANCE DO \(BDO\)|MONEY RECEIPT \((BANK|CASH)\)|JOURNAL_NONGST|JOURNAL, NONGST).*")
 
 
 def _pre_gst(rows: list[dict[str, Any]], read: StatementRead) -> bool:
@@ -1576,6 +1591,12 @@ def _pre_gst(rows: list[dict[str, Any]], read: StatementRead) -> bool:
     paise, a price no NDC writes, and it carries the DMS's own labels. Its
     scheme and corporate figures are before GST (product owner 2026-11-14,
     "excess discount report is so vague and wrong": 8 rows of the recheck)."""
+    # Also the same printout with its postings (product owner 2026-11-22,
+    # 105 Aditya copies): "Bank Finance DO (BDO), ...", "Money Receipt (Bank),
+    # ...", "Journal_NonGST, ..." -- rows no NDC form carries, whatever its
+    # ex-showroom (often whole rupees: ADI-RD-261101-051 Rs 10,30,000).
+    if any(_DMS_POSTING.fullmatch(_label(row.get("particulars_raw"))) for row in rows):
+        return True
     price = read.components.get("ex_showroom_price")
     if price is None or price == price.to_integral_value():
         return False
@@ -1613,7 +1634,11 @@ def combine_statements(
     out.receipts = primary.receipts or next((r.receipts for r in in_use if r.receipts), Decimal(0))
     out.received = primary.received or next((r.received for r in in_use if r.received), [])
     out.refunds = primary.refunds or next((r.refunds for r in in_use if r.refunds), Decimal(0))
-    for read in in_use:
+    # A DMS printout filling a charge gap is not the NDC: its rows are not
+    # the NDC's rows (left out, FREE, misspelt, to verify) while an NDC stands.
+    printouts = {id(c.document) for c in copies if c.pre_gst}
+    stands = id(combined.primary) not in printouts
+    for read in [reads[id(d)] for d in combined.used if not (stands and id(d) in printouts)]:
         out.unmapped.extend(read.unmapped)
         out.conflicts.extend(read.conflicts)
         # Rows written FREE and rows read once corrected, once across copies.
