@@ -197,11 +197,13 @@ def test_a_held_or_replaced_form_gives_its_numbers_to_no_match(setup) -> None:  
     assert _row(s, dump_id)["match_basis"] is None
 
 
-def test_a_booking_cancelled_in_verigence_takes_no_dms_row(setup) -> None:  # noqa: F811
+def test_a_booking_cancelled_in_verigence_takes_no_booking_row_but_its_chassis_still_finds_it(setup) -> None:  # noqa: F811
     """2026-11-22: a journey the PC closed as "document upload failed" (a fresh one started for
-    the same sale) is no booking: no DMS row goes to it."""
+    the same sale) is no booking: no booking row goes to it by OTF or mobile. Journeys closed that
+    way also held complete deliveries: the chassis, the vehicle itself, still finds them."""
     s = setup
     _document(s, "booking_form", booking_reference_number="B-66600011", customer_phone="+919000044455")
+    _document(s, "customer_invoice_dms", "DELIVERY", vin_number="MA1TESTCANCEL0001")
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
         connection.execute(text("""
@@ -210,4 +212,8 @@ def test_a_booking_cancelled_in_verigence_takes_no_dms_row(setup) -> None:  # no
             ON CONFLICT (tenant_id, journey_id, stage_code) DO UPDATE SET business_status = 'BOOKING_CANCELLED'
         """), {"t": s.journey.tenant_id, "j": s.journey.journey_id})
         index = dumps.build_index(connection, tenant_id=s.journey.tenant_id, dealer_id=s.journey.dealer_id)
-    assert str(s.journey.journey_id) not in index.journeys
+    mine = str(s.journey.journey_id)
+    assert index.journeys[mine]["cancelled"]
+    booking = {"booking_number": "B-66600011", "mobile": "9000044455", "customer_name": "Someone"}
+    assert dumps.match_row(index, dumps.BOOKING, booking) == (None, None)
+    assert dumps.match_row(index, dumps.DELIVERY, {"chassis": "MA1TESTCANCEL0001"}) == (mine, "CHASSIS")
