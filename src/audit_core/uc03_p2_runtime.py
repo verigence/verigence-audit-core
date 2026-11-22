@@ -243,14 +243,27 @@ def enqueue_work(
                               THEN 0
                             ELSE auditcore.p2_work_queue.attempt_count
                           END,
+                          -- Asked for later never puts off what was asked for sooner
+                          -- (22 Nov 2026). While the item runs, this column holds when it
+                          -- was asked for again -- now() for "at once" -- and the worker
+                          -- runs it again then (_complete). It used to be left alone, so a
+                          -- follow-up "in ten minutes" asked from inside the running
+                          -- recompute ran it again straight away, every 7 seconds for as
+                          -- long as a page of the Journey was waiting to be read. An item
+                          -- waiting and due now stays due now: the same follow-up used to
+                          -- put a recompute that was due off by ten minutes.
                           next_attempt_at_utc=CASE
                             WHEN auditcore.p2_work_queue.work_status IN ('CLAIMED','PROCESSING')
-                              THEN auditcore.p2_work_queue.next_attempt_at_utc
+                              THEN LEAST(COALESCE(auditcore.p2_work_queue.next_attempt_at_utc,
+                                                  EXCLUDED.next_attempt_at_utc, now()),
+                                         COALESCE(EXCLUDED.next_attempt_at_utc, now()))
                             WHEN auditcore.p2_work_queue.work_status IN ('PENDING','RETRY_WAIT')
-                              AND auditcore.p2_work_queue.next_attempt_at_utc IS NOT NULL
                               AND EXCLUDED.next_attempt_at_utc IS NOT NULL
-                              THEN LEAST(auditcore.p2_work_queue.next_attempt_at_utc,
-                                         EXCLUDED.next_attempt_at_utc)
+                              THEN CASE
+                                WHEN auditcore.p2_work_queue.next_attempt_at_utc IS NULL THEN NULL
+                                ELSE LEAST(auditcore.p2_work_queue.next_attempt_at_utc,
+                                           EXCLUDED.next_attempt_at_utc)
+                              END
                             ELSE EXCLUDED.next_attempt_at_utc
                           END,
                           last_error=CASE
