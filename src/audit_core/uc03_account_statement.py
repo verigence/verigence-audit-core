@@ -356,6 +356,8 @@ def _figure(text_: str) -> Decimal:
     return Decimal(text_.replace(",", ""))
 
 
+THIRD_PARTY_ACCESSORIES_KEY = "non_genuine_accessories_amount"
+_THIRD_PARTY = re.compile(r"\b(3 ?(RD)? ?PARTY|THIRD ?PARTY|NON[- ]?GENUINE)\b")
 _NOT_A_NOTE = frozenset({"FREE", "FOC", "SCHEME"})
 _NOTE_NUMBER_BELOW = Decimal(100)
 
@@ -503,6 +505,12 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
     def give(kind: str, key: str, amount: Decimal, row: str = "") -> None:
         if key == "fastag_amount" and _fastag_over_limit(out, label, amount):
             key, row = "other_charges", "FASTAG_ROW_OVER_LIMIT"
+        if kind == "COMMERCIAL" and key == "accessories_cost" and _THIRD_PARTY.search(label):
+            # Third-party accessories are their own line under accessories
+            # (product owner 2026-11-22: "where ever we have 3rd party it has
+            # to be as additional line item in accessories"; UTK-SR-261102-002
+            # "Accessories 3 party" Rs 5,000), and a system remark says so.
+            key = THIRD_PARTY_ACCESSORIES_KEY
         found.setdefault((kind, key, row), []).append(amount)
 
     def leave(label: str, side: tuple[str, Decimal], why: str) -> None:

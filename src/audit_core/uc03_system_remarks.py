@@ -79,7 +79,26 @@ def _deal_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                                "so it is not counted as an undercharge.", "Deal"))
     remarks.extend(scheme_availed_remarks(facts.sheet.get("discounts") or [],
                                           getattr(facts, "ndc_in_doubt", None)))
+    third_party = third_party_accessories_remark(ndc_charges(connection, tenant_id=tenant_id,
+                                                             journey_id=journey_id)[0])
+    if third_party is not None:
+        remarks.append(third_party)
     return remarks
+
+
+def third_party_accessories_remark(ndc: dict[str, Decimal] | None) -> dict[str, Any] | None:
+    """Third-party accessories on the NDC (product owner 2026-11-22: "where
+    ever we have 3rd party it has to be as additional line item in
+    accessories ... and it should be added in the system remarks")."""
+    from audit_core.uc03_account_statement import THIRD_PARTY_ACCESSORIES_KEY
+    from audit_core.uc03_p2_audit_rules import _rupees
+
+    amount = (ndc or {}).get(THIRD_PARTY_ACCESSORIES_KEY)
+    if not amount:
+        return None
+    return _remark("THIRD_PARTY_ACCESSORIES", "Third-party accessories",
+                   f"The NDC charges {_rupees(amount)} for third-party (non-genuine) accessories: shown as its own "
+                   "line under accessories on the Deal.", "Deal")
 
 
 def scheme_availed_remarks(discounts: list[dict[str, Any]], in_doubt: dict[str, str] | None = None

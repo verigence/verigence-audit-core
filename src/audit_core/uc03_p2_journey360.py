@@ -106,7 +106,7 @@ _COMPONENT_LABELS = {
     "accessories_cost": "Accessories kit",
     "essential_kit_amount": "Essential kit",
     "genuine_accessories_amount": "Genuine accessories",
-    "non_genuine_accessories_amount": "Non-genuine accessories",
+    "non_genuine_accessories_amount": "Third-party (non-genuine) accessories",
     "additional_warranty_amount": "Extended warranty",
     "extended_warranty_amount": "Extended warranty",
     "rsa_amount": "Road-side assistance",
