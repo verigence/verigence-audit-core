@@ -1970,6 +1970,18 @@ _NOT_SCANNED_REASON = "File couldn't be scanned — please reload it."
 _SETUP_REASON = SETUP_PAGE_TEXT
 _CONFIG_REASON = ("Document Intelligence is not set up to read this page on our side. Ask your Team Lead to "
                   "raise it with support, then retry the page from the card once it is fixed.")
+# A page that carries more than one document (22 Nov 2026). Document Intelligence refuses
+# it under its own code and never tries it again: what is on the page does not change.
+# Live that day 27 pages PCs had typed as a receipt or an accessory invoice were answered
+# by the AI with two or more documents; they were refused three attempts at a time as "AI
+# reading failed. Please upload this page again", and the same page uploaded again got the
+# same answer. Product owner, 17 Nov: a page with two receipts is not accepted and not
+# split; 22 Nov: "the PC would be told the page carries more than one document and to
+# upload each one as its own page, there would be no retries, and the morning job would
+# skip them" (uc03_p2_failed_resend sends only failures on our side: this is not one).
+SEVERAL_DOCUMENTS_CODE = "PAGE_HAS_SEVERAL_DOCUMENTS"
+SEVERAL_DOCUMENTS_REASON = ("This page carries more than one document (for example two receipts on one page). "
+                            "Upload each document as its own page; uploading the same page again will not help.")
 NOT_READ_IN_TIME_CODE = "NOT_READ_IN_30_MIN"
 NOT_READ_IN_TIME_REASON = "Not read within 30 minutes. Please upload this page again."
 
@@ -2161,6 +2173,8 @@ def _di_failure_reason(di_item: dict[str, Any] | None) -> str:
         return f"{_NOT_SCANNED_REASON[:-1]}{' (' + detail + ')' if detail else ''}."
     if code == "DOCUMENT_AI_CONTENT_BLOCKED":
         return "AI declined to read this page's content — check the page and upload it again."
+    if code == SEVERAL_DOCUMENTS_CODE:
+        return SEVERAL_DOCUMENTS_REASON
     return "Document Intelligence could not read this page. Retry or re-upload it." + (f" ({detail})" if detail else "")
 
 

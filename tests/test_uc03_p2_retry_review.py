@@ -238,11 +238,34 @@ def test_di_retrying_a_page_is_waited_for_and_its_final_failure_says_how_often_i
     ({"state": "CLASSIFIED", "processingStatus": "FAILED", "processingFailureCode": "DOCUMENT_AI_CONTENT_BLOCKED",
       "failureKind": "DOCUMENT", "scanPassed": True},
      "AI declined to read this page's content — check the page and upload it again."),
+    # 22 Nov 2026: the AI read two receipts on a page sent as one document. The PC was told
+    # "AI reading failed. Please upload this page again", and the same page failed the same way.
+    ({"state": "CLASSIFIED", "processingStatus": "FAILED", "processingFailureCode": "PAGE_HAS_SEVERAL_DOCUMENTS",
+      "failureKind": "DOCUMENT", "scanPassed": True, "attemptsMade": 1,
+      "failureDetail": "More than one document was read on a page sent as one document."},
+     ("This page carries more than one document (for example two receipts on one page). "
+      "Upload each document as its own page; uploading the same page again will not help.")),
 ])
 def test_a_refusal_fails_at_once(item, reason):
     outcome = worker.classify_page_outcome(di_item=item, extracted_count=0, submitted_at=None, facts_copy=None,
                                            now=datetime.now(UTC))
     assert (outcome.status, outcome.reason) == ("FAILED", reason)
+
+
+def test_a_page_with_several_documents_keeps_its_own_code_and_the_morning_job_does_not_send_it():
+    """Its code is the page's, not ours: the 8:15 am job (uc03_p2_failed_resend) sends again only
+    what failed on our side, so this page stays with the PC, who is told what to do."""
+    import re
+
+    from audit_core import uc03_p2_our_side_reupload as ours
+
+    outcome = worker.classify_page_outcome(
+        di_item={"state": "CLASSIFIED", "processingStatus": "FAILED", "failureKind": "DOCUMENT", "scanPassed": True,
+                 "processingFailureCode": "PAGE_HAS_SEVERAL_DOCUMENTS"},
+        extracted_count=0, submitted_at=None, facts_copy=None, now=datetime.now(UTC))
+    assert (outcome.status, outcome.last_error) == ("FAILED", worker.SEVERAL_DOCUMENTS_CODE)
+    assert outcome.last_error not in ours.OUR_SIDE_CODES
+    assert not re.search(ours.OUR_SIDE_ERROR.replace(r"\M", r"\b"), outcome.last_error)
 
 
 @pytest.mark.parametrize(("attempts", "tried"), [
