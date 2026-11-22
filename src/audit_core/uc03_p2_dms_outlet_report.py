@@ -32,9 +32,10 @@ Verigence      per outlet, from the 1st up to the last day the dealership's dump
                found is counted on the DMS's date; only a Journey no dump found is
                counted on the date below:
                bookings       Journeys whose booking date (the booking form's, else the
-                              day the PC uploaded the booking documents -- the booking
-                              date rule of 2026-11-07) falls in the period; of those,
-                              the ones dated by the upload day are shown apart
+                              first money receipt's -- never the upload day, 2026-11-22,
+                              uc03_booking_day) falls in the period; those dated by the
+                              receipt are shown apart, and those with neither date read
+                              as "booking date not read" (not counted)
                deliveries     delivery Journeys whose delivery day falls in the period
                               (uc03_p2_delivery_dates, 2026-11-17): the gate pass's date,
                               else the NDC's printed delivery date, else the latest payment
@@ -73,6 +74,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.uc03_booking_day import FIRST_RECEIPT_SQL
 from audit_core.uc03_p2_dms_dumps import (
     _READ,
     _UPDATE,
@@ -104,7 +106,7 @@ DMS_KEYS = ("bookingDms", "bookingSynced", "bookingNotInVerigence", "bookingCanc
             "deliveryNotUploaded", "deliveryNotInVerigence",
             "dumpInscope", "dumpOutscope", "dumpOtherDealType", "dumpDealTypePending",
             "deliveryIntimated", "deliveryNotIntimated")
-VERIGENCE_KEYS = ("bookingInVerigence", "bookingDatedByUpload", "bookingNotInDms", "bookingNotCompared",
+VERIGENCE_KEYS = ("bookingInVerigence", "bookingDatedByReceipt", "bookingDateNotRead", "bookingNotInDms", "bookingNotCompared",
                   "deliveryInVerigence", "deliveryDatedWithoutGatePass", "deliveryNotInDms", "deliveryNotCompared", "inscope", "outscope", "otherDealType",
                   "dealTypePending", "gateRegister", "registersMissed", "countsPending")
 
@@ -232,22 +234,18 @@ def dms_figures(rows: list[dict[str, Any]], outlets: list[dict[str, Any]],
 
 
 _BOOKINGS_SQL = """
-    WITH up AS (
-        SELECT ub.journey_id, min(CAST(ub.created_at_utc AT TIME ZONE 'Asia/Kolkata' AS date)) AS day
-        FROM auditcore.p2_upload_batches ub
-        JOIN (SELECT DISTINCT q.batch_id FROM auditcore.p2_document_queue q
-              WHERE q.tenant_id = :t AND q.business_stage = 'BOOKING' AND q.queue_status <> 'CANCELLED') qb
-          ON qb.batch_id = ub.batch_id
-        WHERE ub.tenant_id = :t AND ub.batch_status <> 'AWAITING_UPLOAD'
-          AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
-        GROUP BY ub.journey_id
-    )
+    WITH rc AS (""" + FIRST_RECEIPT_SQL + """)
+    -- The booking date (2026-11-22, uc03_booking_day): the booking form's, else the first money
+    -- receipt's -- never the upload day. With neither, the Journey is listed as "booking date
+    -- not read" for the days it was uploaded in, not counted as a booking of any day.
     SELECT CAST(j.journey_id AS text) AS journey_id, CAST(j.outlet_id AS text) AS outlet_id,
-           COALESCE(CASE WHEN b.booking_date <= CAST(:today AS date) THEN b.booking_date END, up.day) AS day,
-           (b.booking_date IS NULL OR b.booking_date > CAST(:today AS date)) AS by_upload
+           COALESCE(CASE WHEN b.booking_date <= CAST(:today AS date) THEN b.booking_date END,
+                    CASE WHEN rc.first_receipt <= CAST(:today AS date) THEN rc.first_receipt END) AS day,
+           (b.booking_date IS NULL OR b.booking_date > CAST(:today AS date)) AS no_form_date,
+           CAST(j.created_at_utc AT TIME ZONE 'Asia/Kolkata' AS date) AS created_day
     FROM auditcore.journeys j
     LEFT JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
-    LEFT JOIN up ON up.journey_id = j.journey_id
+    LEFT JOIN rc ON rc.journey_id = j.journey_id
     WHERE j.tenant_id = :t AND CAST(j.outlet_id AS text) = ANY(:ids)
 """
 
@@ -286,14 +284,20 @@ def verigence_figures(connection: Connection, tenant_id: str, outlets: list[dict
     for r in connection.execute(text(_BOOKINGS_SQL), {"t": tenant_id, "ids": ids, "today": today}).mappings():
         dms_day = dms_booking.get(r["journey_id"])
         day = dms_day or r["day"]  # the DMS's date first (2026-11-19)
-        if day is None or not first <= day <= booking_to:
+        if day is None:
+            # No booking form date and no money receipt date read, and no dump found it: not a
+            # booking of any day -- listed apart for the days it was uploaded in (2026-11-22).
+            created = r["created_day"]
+            if created is not None and first <= created <= booking_to:
+                out[r["outlet_id"]]["bookingDateNotRead"] += 1
+            continue
+        if not first <= day <= booking_to:
             continue
         booked.add(r["journey_id"])
         figures = out[r["outlet_id"]]
         figures["bookingInVerigence"] += 1
-        # Not in a dump and no booking form date read: dated by the day the booking documents
-        # were uploaded.
-        figures["bookingDatedByUpload"] += dms_day is None and bool(r["by_upload"])
+        # Not in a dump and no booking form date read: dated by the first money receipt.
+        figures["bookingDatedByReceipt"] += dms_day is None and bool(r["no_form_date"])
         if booking_dump_journeys is not None and r["journey_id"] not in booking_dump_journeys:
             figures["bookingNotInDms"] += 1
     # The delivery day (product owner 2026-11-17): the gate pass's, else the NDC's printed
@@ -647,13 +651,15 @@ COUNTING_NOTES: tuple[str, ...] = (
      "on Verigence's own date."),
     ("Month to date. DMS figures come from each dealership's dump uploaded on the report's date; Verigence and "
      "gate register figures are counted up to the last day that dump covers, so both sides are the same days."),
-    ("'Of which dated by upload day': bookings the DMS does not have and with no booking form date read, so "
-     "Verigence dates them by the day the booking documents were uploaded."),
+    ("A booking's date in Verigence is its booking form date, else its first money receipt date -- never the day "
+     "the PC uploaded the papers. 'Of which dated by the first money receipt': bookings the DMS does not have and "
+     "with no booking form date read. 'Booking date not read': uploaded in these days with neither date read; "
+     "not counted as a booking of any day until the booking form or a receipt is read."),
     ("A dump row is placed by its location name: Utkal's ANANDAPUR is reported by the DMS under KEONJHAR; Aditya's outlets "
      "other than JAJPUR are all under CUTTACK. Where several outlets share a DMS location, each outlet shows its Verigence "
      "figures and the location's row compares the DMS with their total."),
     ("In Verigence: bookings and deliveries the DMS dates in the period, and those the DMS does not have that "
-     "Verigence dates in the period (booking form date, else the upload day; gate pass, else NDC, else receipt)."),
+     "Verigence dates in the period (booking form date, else the first money receipt; gate pass, else NDC, else receipt)."),
     ("Intimated to PC: a dump row Verigence does not hold that the PC marked as intimated to them (Booking / Delivery "
      "Intimation tab) -- pending with the PC. Not intimated to PC: no PC marked it -- pending with the dealership. "
      "A row in Verigence needs no mark."),
@@ -670,7 +676,9 @@ COUNTING_NOTES: tuple[str, ...] = (
 EXCEL_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("As per DMS", "bookingDms", "Booking"),
     ("In Verigence", "bookingInVerigence", "Booking"),
-    ("of which dated by upload day (not in DMS, no booking form date)", "bookingDatedByUpload", "Booking"),
+    ("of which dated by the first money receipt (not in DMS, no booking form date)", "bookingDatedByReceipt",
+     "Booking"),
+    ("Booking date not read (no booking form or receipt date; not counted)", "bookingDateNotRead", "Booking"),
     ("Synced with DMS", "bookingSynced", "Booking"),
     ("Not in Verigence", "bookingNotInVerigence", "Booking"),
     ("In Verigence, not in DMS", "bookingNotInDms", "Booking"),

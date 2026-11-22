@@ -289,9 +289,9 @@ def test_a_booking_row_matches_on_the_name_and_the_booking_date() -> None:
     index = m.JourneyIndex()
     index.journeys = {
         "j1": {"journeyId": "j1", "model": "XEV9S", "names": {"RENUBALA ROUT"}, "hasDelivery": False,
-               "outletId": None, "bookingDay": date(2026, 11, 7)},
+               "outletId": None, "bookingDays": {date(2026, 11, 7)}},
         "j2": {"journeyId": "j2", "model": "THAR", "names": {"Renubala Rout"}, "hasDelivery": False,
-               "outletId": None, "bookingDay": date(2026, 9, 1)},
+               "outletId": None, "bookingDays": {date(2026, 9, 1)}},
     }
     row = {"customer_name": "RENUBALA ROUT", "model": "Something else", "event_date": date(2026, 11, 8)}
     assert m.match_row(index, m.BOOKING, row) == ("j1", "NAME_DATE")
@@ -306,7 +306,7 @@ def test_the_name_and_a_mobile_or_booking_number_a_digit_or_two_off_find_the_cus
 
     def journey(jid: str, name: str, mobiles: set[str], refs: set[str]) -> dict:
         return {"journeyId": jid, "model": "XUV-9S", "names": {name}, "hasDelivery": False, "outletId": None,
-                "bookingDate": None, "bookingDay": date(2026, 11, 20), "mobiles": mobiles, "refs": refs}
+                "bookingDate": None, "bookingDays": {date(2026, 11, 20)}, "mobiles": mobiles, "refs": refs}
 
     index = m.JourneyIndex()
     index.journeys = {"j1": journey("j1", "Sujit Kumar Bastia", {"9337354361"}, {"1348698"}),
@@ -329,17 +329,25 @@ def test_the_name_and_a_mobile_or_booking_number_a_digit_or_two_off_find_the_cus
     assert m.near_booking({"13486428"}, {"1348698"}) and not m.near_booking({"21913"}, {"21914"})
 
 
-def test_name_and_date_use_the_upload_day_when_the_form_s_date_is_unreadable() -> None:
-    """The booking date rule (2026-11-07): the booking form's date, else the day the booking
-    documents were uploaded."""
+def test_name_and_date_use_the_booking_form_or_the_first_receipt_within_two_days() -> None:
+    """The booking date (product owner 2026-11-22): the booking form's date or the first money
+    receipt's, within two days of the DMS's -- never the upload day (the index carries none)."""
     from datetime import date
 
     index = m.JourneyIndex()
     index.journeys = {"j1": {"journeyId": "j1", "model": "THAR", "names": {"Pankaj Dutta"}, "hasDelivery": False,
-                             "outletId": None, "bookingDate": None, "bookingDay": date(2026, 11, 10),
-                             "mobiles": set(), "refs": set()}}
-    row = {"customer_name": "PANKAJ DUTTA", "model": "XUV 7XO", "event_date": date(2026, 11, 9)}
-    assert m.match_row(index, m.BOOKING, row) == ("j1", "NAME_DATE")
+                             "outletId": None, "bookingDate": None,
+                             # no booking form date read; the first money receipt of the 10th
+                             "bookingDays": {date(2026, 11, 10)}, "mobiles": set(), "refs": set()}}
+    row = {"customer_name": "PANKAJ DUTTA", "model": "XUV 7XO", "event_date": date(2026, 11, 8)}
+    assert m.match_row(index, m.BOOKING, row) == ("j1", "NAME_DATE")              # two days off
+    assert m.match_row(index, m.BOOKING, {**row, "event_date": date(2026, 11, 7)}) == (None, None)  # three
+    # the booking form's date or the receipt's: either within two days
+    index.journeys["j1"]["bookingDays"] = {date(2026, 11, 1), date(2026, 11, 10)}
+    assert m.match_row(index, m.BOOKING, {**row, "event_date": date(2026, 11, 2)}) == ("j1", "NAME_DATE")
+    # nothing read: no date to match on
+    index.journeys["j1"]["bookingDays"] = set()
+    assert m.match_row(index, m.BOOKING, row) == (None, None)
 
 
 def test_a_dump_is_compared_from_the_first_to_its_upload_day() -> None:
