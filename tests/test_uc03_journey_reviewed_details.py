@@ -433,3 +433,33 @@ def test_the_booking_form_outranks_the_docket_for_the_model() -> None:
     _, resolved = annotate_and_resolve_reviewed_fields(rows)
 
     assert resolved["model"]["value"] == "From the form"
+
+
+def test_a_voided_superseded_or_foreign_booking_form_never_sets_the_vehicle() -> None:
+    """SHI-YK-261113-009 / UTK-JI-261026-009 (2026-11-22): the vehicle text
+    came off a voided form and another customer's forms once the Journey had
+    no SKU. Only this booking's own (ACTIVE) papers set it; the others stay
+    visible."""
+    active = _row(field_key="vehicle_variant", value="Z8L DPL AT 2WD", document_type="booking_form", stage="BOOKING")
+    rows = [active]
+    for status, value in (("VOIDED", "AX5 Petrol MT"), ("FOREIGN", "AX7L DSL MT 7 STR"),
+                          ("SUPERSEDED", "D AT 2WD Z8L 7S")):
+        row = _row(field_key="vehicle_variant", value=value, document_type="booking_form", stage="DELIVERY")
+        row["associationStatus"] = status
+        rows.append(row)
+
+    annotated, resolved = annotate_and_resolve_reviewed_fields(rows)
+
+    assert resolved["variant"]["value"] == "Z8L DPL AT 2WD"
+    assert len(annotated) == 4
+
+
+def test_a_foreign_form_alone_leaves_the_vehicle_unset_but_not_other_fields() -> None:
+    foreign_model = _row(field_key="vehicle_model", value="XUV7XO", document_type="booking_form", stage="BOOKING")
+    foreign_model["associationStatus"] = "FOREIGN"
+    pan = _row(field_key="pan_name", value="Legal Customer", document_type="pan_card", stage="BOOKING")
+
+    _, resolved = annotate_and_resolve_reviewed_fields([foreign_model, pan])
+
+    assert "model" not in resolved
+    assert resolved["customer_name"]["value"] == "Legal Customer"
