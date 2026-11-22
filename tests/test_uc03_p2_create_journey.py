@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import re
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi.testclient import TestClient
 from p2_support import P2Journey, add_page, add_ready_document
@@ -145,6 +145,31 @@ def test_a_pc_can_delete_a_booking_a_failed_upload_left_stuck(uc03_create_bookin
     assert "Scanner output was corrupt" in notice["description"]
     assert stage["business_status"] == "BOOKING_CANCELLED" and stage["close_reason_code"] == "DOCUMENT_UPLOAD_FAILED"
     assert client.post(cancel, json={}).status_code == 409  # already closed
+
+
+def test_a_booking_with_more_than_ten_documents_is_not_deleted_as_a_failed_upload(uc03_create_booking_setup):  # noqa: F811
+    """Product owner 2026-11-22: "block Document upload failed once more than 10 documents are
+    uploaded" -- complete delivery files were closed this way by their PCs."""
+    from p2_support import add_evidence
+
+    setup = uc03_create_booking_setup
+    client = TestClient(app, raise_server_exceptions=False)
+    url = f"/p2/v1/tenants/{setup['tenant_id']}/journeys"
+    created = client.post(url, headers={"Idempotency-Key": "p2-new-journey-011"},
+                          json={"outletId": str(setup["outlet_id"])}).json()
+    journey = _journey(setup, created["journeyId"], created["customerId"])
+    cancel = f"{url}/{created['journeyId']}:cancel"
+    add_page(journey, status="FAILED")
+    for n in range(11):
+        add_evidence(journey, di_document_id=uuid4(), document_type_key="dealer_receipt", chassis=None)
+    refused = client.post(cancel, json={"reason": "upload failed"})
+    assert refused.status_code == 409 and "more than 10 documents" in refused.text
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        status = connection.execute(text(
+            "SELECT business_status FROM auditcore.journey_stage_states WHERE tenant_id=:t AND journey_id=:j "
+            "AND stage_code='BOOKING'"), {"t": setup["tenant_id"], "j": created["journeyId"]}).scalar()
+    assert status != "BOOKING_CANCELLED"
 
 
 def test_reference_letters_for_the_outlet_and_the_pc():
