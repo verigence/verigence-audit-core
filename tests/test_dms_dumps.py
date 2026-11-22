@@ -170,7 +170,7 @@ from uuid import uuid4
 import pytest
 from conftest import delete_tenant_data
 from p2_support import (
-    add_extracted_field,
+    add_read_value,
     create_p2_journey,
     database_engine,
 )
@@ -212,9 +212,10 @@ def _store(journey, kind: str, rows: list[dict]) -> str:
 
 
 def test_a_dump_is_matched_marked_reported_and_shown_on_the_calendar(journey) -> None:
-    add_extracted_field(journey, di_document_id=uuid4(), field_key="booking_reference_number", value="B-13455387")
-    add_extracted_field(journey, di_document_id=uuid4(), field_key="vin_number", value="MA1NS2NP1T2K61232",
-                        document_type="customer_invoice_dms")
+    add_read_value(journey, field_key="booking_reference_number", value="B-13455387")
+    # The chassis known from a paper that is not a delivery paper (the RC): found by the delivery
+    # dump, but no delivery file on the journey (an invoice printing it would be one).
+    add_read_value(journey, field_key="vin_number", value="MA1NS2NP1T2K61232", document_type="vehicle_rc")
     booking = _store(journey, m.BOOKING, [
         {"booking_number": "B-13455387", "dms_booking_number": "OTF27A090950", "customer_name": "P2 Customer"},
         {"booking_number": "B-99999999", "dms_booking_number": "OTF27A000001", "customer_name": "Someone Else"},

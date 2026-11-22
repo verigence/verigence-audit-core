@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from openpyxl import load_workbook
 from p2_support import (
     AllowAllAuthorization,
-    add_extracted_field,
+    add_read_value,
     create_p2_journey,
     database_engine,
 )
@@ -123,7 +123,7 @@ def test_refresh_from_verigence_matches_the_dump_on_demand(setup) -> None:
     params = {"kind": "BOOKING"}
     before = s.client.get(f"{s.base}/dms-intimations", params={**params, "view": "month"}).json()
     assert [i["state"] for i in before["items"]] == ["OPEN"]
-    add_extracted_field(s.journey, di_document_id=uuid4(), field_key="booking_reference_number", value="B-20261121")
+    add_read_value(s.journey, field_key="booking_reference_number", value="B-20261121")
     # Opening, searching and switching views read the last match.
     stale = s.client.get(f"{s.base}/dms-intimations", params={**params, "view": "month"}).json()
     assert [i["state"] for i in stale["items"]] == ["OPEN"]
@@ -148,7 +148,7 @@ def test_refresh_from_verigence_matches_the_dump_on_demand(setup) -> None:
 @pytest.mark.skipif(_today().day < 3, reason="needs two dump days in the month")
 def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(setup) -> None:
     s = setup
-    add_extracted_field(s.journey, di_document_id=uuid4(), field_key="booking_reference_number", value="B-13455387")
+    add_read_value(s.journey, field_key="booking_reference_number", value="B-13455387")
     # Yesterday's dump: our booking and one not in Verigence.
     _dump(s, m.BOOKING, [{"booking_number": "B-13455387", "otf": "OTF27A090950", "name": "P2 Customer", "back": 2},
                          {"otf": "OTF27A000001", "name": "Asha Das", "mobile": "9000000001", "back": 2}], back=1)
@@ -389,7 +389,7 @@ def test_an_otf_running_number_alone_needs_the_same_customer(setup) -> None:
     """A booking form prints only the OTF's running number (21913); another customer's OTF of
     another series (OTF27F021913, Sahoo Agency) is not that booking (product owner 2026-11-19)."""
     s = setup
-    add_extracted_field(s.journey, di_document_id=uuid4(), field_key="booking_reference_number", value="21913")
+    add_read_value(s.journey, field_key="booking_reference_number", value="21913")
     dump_id = _dump(s, m.BOOKING, [
         {"otf": "OTF27F021913", "name": "Sahoo Agency", "mobile": "9000000201"},
         {"otf": "OTF27A021913", "name": "P2 Customer", "mobile": "9000000202"},
@@ -406,7 +406,7 @@ def test_an_otf_running_number_alone_needs_the_same_customer(setup) -> None:
 def test_a_match_whose_customer_differs_is_listed_for_review(setup) -> None:
     """The booking number agrees, the customer does not (2026-11-19): matched, and listed."""
     s = setup
-    add_extracted_field(s.journey, di_document_id=uuid4(), field_key="booking_reference_number", value="B-13455387")
+    add_read_value(s.journey, field_key="booking_reference_number", value="B-13455387")
     _dump(s, m.BOOKING, [{"booking_number": "B-13455387", "name": "Somebody Else Entirely", "mobile": "9000000301"},
                          {"booking_number": "B-99999999", "name": "Not Here", "mobile": "9000000302"}])
     s.acting["subject"] = s.reviewer
@@ -425,7 +425,7 @@ def test_one_journey_takes_one_dump_row_and_a_repeated_line_is_a_duplicate(setup
     """Seven OTFs of one mobile all matched one Journey, and one chassis sat on three delivery
     lines (2026-11-19): a Journey now goes to its best row only, a repeated line is DUPLICATE."""
     s = setup
-    add_extracted_field(s.journey, di_document_id=uuid4(), field_key="booking_reference_number", value="B-13455387")
+    add_read_value(s.journey, field_key="booking_reference_number", value="B-13455387")
     dump_id = _dump(s, m.BOOKING, [
         {"booking_number": "B-55555555", "name": "P2 Customer", "mobile": "9000000401"},
         {"booking_number": "B-13455387", "name": "P2 Customer", "mobile": "9000000402"},
@@ -471,7 +471,7 @@ def test_the_dms_replay_reads_only_and_names_rows_without_personal_details(setup
     base, head = tmp_path / "base.json", tmp_path / "head.json"
     assert replay.main(["capture", "--tenant", s.journey.tenant_id, "--out", str(base)]) == 0
     # The Journey's booking number now read: the head side would match the row; nothing is stored.
-    add_extracted_field(s.journey, di_document_id=uuid4(), field_key="booking_reference_number", value="B-55500011")
+    add_read_value(s.journey, field_key="booking_reference_number", value="B-55500011")
     assert replay.main(["capture", "--tenant", s.journey.tenant_id, "--out", str(head)]) == 0
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)

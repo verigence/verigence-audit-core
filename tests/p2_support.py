@@ -245,6 +245,21 @@ def add_evidence(
     return evidence_id
 
 
+def add_read_value(journey: P2Journey, *, field_key: str, value: Any, document_type: str = "booking_form",
+                   process_area: str = "BOOKING") -> UUID:
+    """A value read from a document on file: the ACTIVE evidence and its extracted field. Values
+    of a document held, replaced or removed count nowhere (2026-11-22), so a fixture's value
+    needs its document."""
+    from uuid import uuid4 as _uuid4
+
+    document = _uuid4()
+    add_evidence(journey, di_document_id=document, document_type_key=document_type, process_area=process_area,
+                 chassis=None)
+    add_extracted_field(journey, di_document_id=document, field_key=field_key, value=value,
+                        document_type=document_type)
+    return document
+
+
 def _insert_evidence(journey: P2Journey, *, di_document_id: UUID, document_type_key: str, process_area: str,
                      status: str) -> UUID:
     with journey.engine.begin() as connection:

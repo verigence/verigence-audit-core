@@ -171,3 +171,27 @@ def test_a_different_model_is_listed_for_the_uploader_with_the_excel(setup) -> N
     header = [c.value for c in sheet[1]]
     line = dict(zip(header, [c.value for c in sheet[2]], strict=True))
     assert line["Model as per DMS"] == "XEV 9S" and line["Booking no."] == "B-77700013"
+
+
+def test_a_held_or_replaced_form_gives_its_numbers_to_no_match(setup) -> None:  # noqa: F811
+    """2026-11-22: another customer's booking form, held as FOREIGN on a Journey, still gave the
+    Journey that customer's OTF and mobile -- the DMS dump gave it their row by booking number.
+    Only the papers on file now count."""
+    s = setup
+    held = _document(s, "booking_form", booking_reference_number="B-55500077", customer_phone="+919000011122")
+    replaced = _document(s, "booking_form", booking_reference_number="B-55500088", customer_phone="+919000033344")
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        for document, status in ((held, "FOREIGN"), (replaced, "SUPERSEDED")):
+            connection.execute(text(
+                "UPDATE auditcore.evidence SET association_status = :s "
+                "WHERE tenant_id = :t AND di_document_id = CAST(:d AS uuid)"),
+                {"s": status, "t": s.journey.tenant_id, "d": document})
+        index = dumps.build_index(connection, tenant_id=s.journey.tenant_id, dealer_id=s.journey.dealer_id)
+    refs = index.journeys.get(str(s.journey.journey_id), {}).get("refs") or set()
+    mobiles = index.journeys.get(str(s.journey.journey_id), {}).get("mobiles") or set()
+    assert not any("55500077" in r or "55500088" in r for r in refs)
+    assert not any("9000011122" in m or "9000033344" in m for m in mobiles)
+    dump_id = _dump(s, dumps.BOOKING, [{"booking_number": "B-55500077", "otf": "OTF27A055555",
+                                       "name": "Someone Else", "mobile": "9000011122", "model": "XEV 9S"}])
+    assert _row(s, dump_id)["match_basis"] is None
