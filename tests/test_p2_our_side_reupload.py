@@ -277,6 +277,9 @@ def _swept_file(journey, name: str, code: str, reason: str):
     "DiCaptureV2Error (at audit_core/di_capture_v2.py:95)",
     "OperationalError: (psycopg.errors.QueryCanceled) canceling statement due to statement timeout",
     "ReadTimeout (at _transports/default.py:101)",
+    # an AI answer our reader refused, too (product owner, later on 22 Nov:
+    # "pls send 48 AI refused pages from storage")
+    "DOCUMENT_AI_RESPONSE_INVALID",
 ])
 def test_a_page_a_system_error_stopped_is_our_side_too(journey, code):
     """17 Nov, live: 15 pages of 3 files ended "A system problem stopped this page -- tried 3
@@ -287,7 +290,7 @@ def test_a_page_a_system_error_stopped_is_our_side_too(journey, code):
 
 
 @pytest.mark.parametrize("code", [
-    "DI_QUALITY_IMAGE_BLUR_SCORE", "DOCUMENT_AI_RESPONSE_INVALID", "DOCUMENT_AI_CONTENT_BLOCKED", "DUPLICATE_PAGE",
+    "DI_QUALITY_IMAGE_BLUR_SCORE", "DOCUMENT_AI_CONTENT_BLOCKED", "DUPLICATE_PAGE",
     "FACTS_COPY_FAILED: InternalError",
 ])
 def test_a_page_refused_for_what_it_is_stays_with_the_pc(journey, code):

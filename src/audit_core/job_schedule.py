@@ -7,9 +7,10 @@ Superadmin and allow him to change the time" and "lets move all jobs before
 A daily job runs once a day at its time (India time) for every live Project.
 Its time is, in this order: the one a SuperAdmin set (platform_ops.job_schedules),
 else the worker's environment variable where one existed before, else the
-default below. The defaults are all before 10:00 pm: with the Drive run at
+default below. The night's jobs are all before 10:00 pm: with the Drive run at
 9:00 pm the night's work is through by midnight and the system sleeps
-(audit_core.sleep_window).
+(audit_core.sleep_window). One job is the morning's (22 Nov 2026): the failed
+documents are sent again at 8:15 am, after the sleep and before the day's uploads.
 
 The worker and the API each hold the times in memory and read the table again
 once a minute while awake (platform_health._tick), so a change made on the page
@@ -80,6 +81,18 @@ DAILY_JOBS: dict[str, DailyJob] = {
             default_ist="21:40",
             run_name="P2_VERIFIED_CHECK",
             env_utc="P2_VERIFIED_CHECK_UTC",
+            can_be_off=True,
+        ),
+        DailyJob(
+            key="FAILED_RESEND",
+            name="Failed documents sent again",
+            what=("Sends again, from storage, every document that failed for a reason on our side and "
+                  "still waits for the PC: not read in time, pages not put together, a system error, an "
+                  "AI answer our reader refused, a file never split. Each one once: if it fails again it "
+                  "stays with the PC. Pages refused for scan quality are not sent."),
+            default_ist="08:15",
+            run_name="P2_FAILED_RESEND",
+            env_utc="P2_FAILED_RESEND_UTC",
             can_be_off=True,
         ),
         DailyJob(
@@ -176,6 +189,7 @@ def apply(times_ist: dict[str, str]) -> None:
         worker._NIGHTLY_REVIEW_UTC = time_utc("NIGHTLY_REVIEW")
         worker._DATA_ARCHIVE_UTC = time_utc("DATA_ARCHIVE")
         worker._VERIFIED_CHECK_UTC = time_utc("VERIFIED_CHECK")
+        worker._FAILED_RESEND_UTC = time_utc("FAILED_RESEND")
 
 
 def stored_times(connection: Connection) -> dict[str, dict[str, Any]]:
