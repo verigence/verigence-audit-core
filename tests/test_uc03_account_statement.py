@@ -211,7 +211,8 @@ def test_a_note_written_on_a_charge_row_keeps_the_rows_charge(label: str, key: s
 
 
 @pytest.mark.parametrize("label", [
-    "LESS: EXCHANGED VEHICLE (Welcome Bonus)", "IF ANY OTHERS MOTO", "EXTENDED WARRANTY FREE",
+    # "EXTENDED WARRANTY FREE" is read since 2026-11-22 (tests/test_ndc_free_and_spelling.py)
+    "LESS: EXCHANGED VEHICLE (Welcome Bonus)", "IF ANY OTHERS MOTO",
 ])
 def test_a_row_whose_writing_names_no_charge_it_bills_is_left_unmapped(label: str) -> None:
     read = read_statement([{"particulars_raw": "Ex Showroom", "debit_amount": 1000000},
@@ -279,7 +280,8 @@ def test_accessories_terms_that_add_up_to_the_amount_are_the_accessories(label: 
 
 
 @pytest.mark.parametrize(("label", "amount"), [
-    ("ACCESSORIES 5000(Free)", 5153),         # the free part only: what was billed is not written
+    # "ACCESSORIES 5000(Free)" against 5,153 is read since 2026-11-22: the amount
+    # is what is left to pay, 5,000 free (tests/test_ndc_free_and_spelling.py)
     ("ACCESSORIES Scheme 5000 true", 112),    # no working that gives 112
     ("ACCESSORIES 6691 - 5000 Free", 1690),   # one rupee off
     ("ACCESSORIES 5255 - 5000 = 250", 255),   # its own result disagrees

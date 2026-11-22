@@ -796,6 +796,8 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
             row = conclude_charge(line, on_file=on_file, discounts=discount_amounts,
                                   statement_only=summary.get("billedSource") == "ACCOUNT_STATEMENT")
             row["category"] = group.get("label")
+            if line.get("ndcNote"):
+                row["note"] = line["ndcNote"]  # written FREE on the NDC (2026-11-22)
             if line.get("addOn"):
                 row["addOn"] = line["addOn"]
             if line["key"] in _VAS:

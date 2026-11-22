@@ -58,6 +58,8 @@ REVIEWER_CORRECTIONS_TASK = "REVIEWER_CORRECTIONS_INFO"
 KEY_FIGURES_TASK = "DOCUMENT_KEY_FIGURES_NOT_READ"
 # An NDC / cost sheet whose rows do not add up (2026-11-05): the PC closes it when the dealer's sum is wrong.
 ADDS_UP_TASK = "STATEMENT_ROWS_DO_NOT_ADD_UP"
+# NDC rows the Deal does not take (2026-11-22): the PC closes it saying what a row read right is.
+ROWS_NOT_IN_DEAL_TASK = "STATEMENT_ROWS_NOT_IN_DEAL"
 # The registration taken as lower by the scrappage concession (2026-11-09): for information.
 SCRAPPAGE_REGISTRATION_TASK = "SCRAPPAGE_REGISTRATION_CONCESSION"
 # Corrections made before a page was read again that the new reading does not
@@ -67,7 +69,7 @@ CORRECTIONS_RECHECK_TASK = "CORRECTIONS_RECHECK"
 BH_QUESTION_TASK = "REGISTRATION_BH_CONFIRM"
 CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK, COST_SHEET_DIFFERENCE_TASK, COPIES_DIFFERENCE_TASK,
                               FASTAG_VERIFY_TASK, DEAL_LINE_VERIFY_TASK,
-                              REVIEWER_CORRECTIONS_TASK, KEY_FIGURES_TASK, ADDS_UP_TASK,
+                              REVIEWER_CORRECTIONS_TASK, KEY_FIGURES_TASK, ADDS_UP_TASK, ROWS_NOT_IN_DEAL_TASK,
                               SCRAPPAGE_REGISTRATION_TASK, CORRECTIONS_RECHECK_TASK, BH_QUESTION_TASK})
 # "Upload the ..." tasks (a conditional document, or the booking docket) close
 # by hand too (product owner 2026-11-02): a single page uploaded for them is

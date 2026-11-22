@@ -337,6 +337,14 @@ def _run_audit_core_rules_for_stage(
     _record("STATEMENT_ROWS_ADD_UP", "ERROR" if totals.get("error") else (
         "SKIPPED" if not totals.get("judged") else "FAIL" if totals.get("copies") else "PASS"), totals)
 
+    # NDC rows the Deal does not take, told to the PC (product owner
+    # 2026-11-22): one task per booking. Never raises.
+    from audit_core.uc03_statement_rows_left_out import sync_rows_left_out
+
+    left_out = sync_rows_left_out(connection, tenant_id=tenant_id, journey_id=journey_id)
+    _record("STATEMENT_ROWS_IN_DEAL", "ERROR" if left_out.get("error") else (
+        "SKIPPED" if left_out.get("skipped") else "FAIL" if left_out.get("rows") else "PASS"), left_out)
+
     # The deal-audit checks (price, discounts, settlement, financier, trade-in,
     # third-party payer, cash limit): journey-wide ones run with
     # BOOKING, delivery-dependent ones with DELIVERY.
