@@ -808,7 +808,8 @@ def audit_summary(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                     products[-1].update(taken=False, reason="Not taken.")
             else:
                 charges.append(row)
-    benefits = [conclude_benefit(d, unknown_results=ENTITLEMENT_UNKNOWN_RESULTS) for d in deal.get("discounts") or []]
+    benefits = [conclude_benefit(d, unknown_results=ENTITLEMENT_UNKNOWN_RESULTS) | (
+        {"note": d["ndcNote"]} if d.get("ndcNote") else {}) for d in deal.get("discounts") or []]
 
     # ── how the deal was paid ──
     # Every counted receipt is checked against the bank statement, the loan's

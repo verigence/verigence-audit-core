@@ -1902,13 +1902,16 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
         # visible in deal and audit summary corresponding item").
         from audit_core.uc03_account_statement import ndc_free_rows
 
+        free_rows = ndc_free_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
         free_notes: dict[str, list[str]] = {}
-        for free in ndc_free_rows(connection, tenant_id=tenant_id, journey_id=journey_id):
+        for free in free_rows:
             free_notes.setdefault(str(free["key"]), []).append(free["text"])
         for group in groups:
             for component in group["components"]:
                 if component["key"] in free_notes:
                     component["ndcNote"] = " ".join(free_notes[component["key"]])
+        split_free_accessories(all_rows, discount_rows,
+                               as_value=any(f["key"] == "accessories_cost" and f.get("asValue") for f in free_rows))
     for group in groups:
         group["totals"] = {
             c: _column_total([r for r in group["components"] if not r.get("partOf") and not r.get("notTaken")], c)
@@ -3024,6 +3027,61 @@ def _component_current(row: dict[str, Any], situation: _DealSituation) -> None:
     row["awaiting"] = situation.awaited(document) + (
         " (on file, figure not read)" if situation.document_on_file[document] else "")
     row["flags"] = [*row["flags"], "AWAITING_DOCUMENT"]
+
+
+_FREE_KIT_KEY = "ACCESSORIES_KIT"
+
+
+def split_free_accessories(component_rows: list[dict[str, Any]], discount_rows: list[dict[str, Any]], *,
+                           as_value: bool) -> None:
+    """The accessories bought, the part given free and the part the customer
+    pays, said on the accessories line (product owner 2026-11-22: "there are
+    accessories worth 5000 free, and then person buy accessories worth Rs 5112
+    ... 5000 to be adjusted and shown 112 as the amount to be paid.. and same
+    goes with where ever the free amount exceeds the invoice amount or less").
+
+    * The NDC writes the accessories FREE with no free amount ("ACCESSORIES
+      Free" Rs 5,112, ADI-RD-261104-012): the free part is the consumer
+      scheme's kit, never more -- the free accessories line gives the kit's
+      Rs 5,000, and Rs 112 is to be paid.
+    * Free less than the accessories: what is free and what is to be paid.
+    * Free equal: all free; with the kit larger, the part of it not used.
+    * Free more than the accessories: said so (the free accessories line
+      stays as the NDC gives it; above its entitlement it is the excess
+      discount check's)."""
+    kit = next((r for r in discount_rows if r["key"] == _FREE_KIT_KEY), None)
+    accessories = next((r for r in component_rows if r["key"] == "accessories_cost"
+                        and not r.get("excluded") and not r.get("partOf")), None)
+    if kit is None or accessories is None:
+        return
+    free, bought, entitled = _dec(kit.get("current")), _dec(accessories.get("current")), _dec(kit.get("entitled"))
+    if free is None or free <= 0 or bought is None or bought <= 0:
+        return
+    if as_value and entitled is not None and entitled > 0 and free > entitled:
+        kit["billedPrinted"] = kit.get("billedPrinted") or _money(free)
+        free = entitled
+        kit["billed"] = kit["current"] = _money(free)
+        kit["variance"] = _minus(kit["current"], kit["entitled"])
+        kit["flags"] = _measured_flags("DISCOUNT", [f for f in kit["flags"] if f not in _STANDARD_FLAGS],
+                                       kit["current"], kit["entitled"])
+        kit["ndcNote"] = (f"The NDC writes the accessories ({_rupees(bought)}) FREE with no free amount: free up "
+                          f"to the consumer scheme's kit, {_rupees(free)}.")
+    if free < bought:
+        split = f"{_rupees(free)} free, {_rupees(bought - free)} to be paid by the customer."
+    elif free == bought:
+        split = "All free" + (f"; {_rupees(entitled - free)} of the scheme's {_rupees(entitled)} kit not used."
+                              if entitled is not None and entitled > free else ".")
+    else:
+        split = f"{_rupees(free)} given free against {_rupees(bought)} of accessories: {_rupees(free - bought)} more."
+    note = f"Accessories {_rupees(bought)}: {split}"
+    accessories["freeSplit"] = {"bought": _money(bought), "free": _money(min(free, bought)),
+                                "toPay": _money(max(bought - free, Decimal(0))),
+                                "overFree": _money(max(free - bought, Decimal(0)))}
+    accessories["ndcNote"] = " ".join(n for n in (note, accessories.get("ndcNote")) if n)
+
+
+def _rupees(value: Decimal) -> str:
+    return f"Rs {value:,.2f}".rstrip("0").rstrip(".")
 
 
 def _settle_discount(row: dict[str, Any], situation: _DealSituation, *, mr_key: str) -> None:

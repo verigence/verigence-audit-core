@@ -431,7 +431,10 @@ def free_row(label: str, side: tuple[str, Decimal]) -> dict[str, Any] | None:
             return None
         return {"key": key, "label": label, "amount": amount, "free": None, "charged": amount, "benefit": None}
     if not figures:
-        return {"key": key, "label": label, "amount": amount, "free": None, "charged": amount, "benefit": None}
+        # No free amount written ("ACCESSORIES FREE SALE" 5,140): free as the
+        # Offer Letter's "ACCESSORIES Free", the Deal taking it up to the kit.
+        return {"key": key, "label": label, "amount": amount, "free": None, "charged": amount, "benefit": amount,
+                "asValue": True}
     if len(figures) != 1:
         return None
     free = figures[0]
@@ -680,7 +683,8 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
         read = free_row(label, side)
         if read is None:
             return False
-        out.free_rows.append({k: read[k] for k in ("key", "label", "amount", "free")} | {"side": side[0]})
+        out.free_rows.append({k: read[k] for k in ("key", "label", "amount", "free")}
+                             | {"side": side[0], "asValue": bool(read.get("asValue"))})
         if read["charged"] is not None:
             give("COMMERCIAL", read["key"], read["charged"], "FREE")
         if read["benefit"]:
@@ -743,8 +747,12 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
         if _ACCESSORIES_FREE.fullmatch(label):
             # Accessories given free: billed at their value, the same value the
             # free-accessories benefit (the Offer Letter's "ACCESSORIES Free").
+            # No free amount is written: the Deal takes it free up to the
+            # consumer scheme's kit (product owner 2026-11-22).
             give("COMMERCIAL", "accessories_cost", amount)
             give("DISCOUNT", FREE_ACCESSORIES_KEY, amount)
+            out.free_rows.append({"key": "accessories_cost", "label": label, "amount": amount, "free": None,
+                                  "side": side[0], "asValue": True})
             continue
         charge = next((k for k, pattern in _CHARGES if pattern.fullmatch(label)), None)
         if charge == "other_charges" and _ADDED_KIT.search(label):
@@ -2587,6 +2595,9 @@ def free_row_text(row: dict[str, Any]) -> str:
     if row.get("side") != "DR":
         return (f"{item} written FREE on the NDC ({written}, {_rupee_text(amount)}): given free, "
                 "neither charged nor counted as a benefit.")
+    if row.get("asValue"):
+        return (f"{item} {_rupee_text(amount)} written FREE on the NDC ({written}) with no free amount: free up to "
+                "the consumer scheme's accessories kit, the rest to be paid by the customer.")
     if row["key"] == "accessories_cost" and free is not None:
         free = Decimal(str(free))
         if free == amount:
