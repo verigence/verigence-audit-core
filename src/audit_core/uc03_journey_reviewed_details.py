@@ -248,7 +248,8 @@ def load_reviewed_field_details(
                 r.source_fact_version AS "sourceFactVersion",
                 r.reviewed_by_actor_id AS "reviewedByActorId",
                 r.reviewed_at_utc AS "reviewedAtUtc",
-                COALESCE(e.identity_check_status, 'PASSED') AS "identityCheckStatus"
+                COALESCE(e.identity_check_status, 'PASSED') AS "identityCheckStatus",
+                COALESCE(e.association_status, 'ACTIVE') AS "associationStatus"
             FROM ranked r
             LEFT JOIN auditcore.document_capture_v2_documents d
               ON d.tenant_id=r.tenant_id
@@ -447,6 +448,15 @@ def annotate_and_resolve_reviewed_fields(
         # was booked. It stays in `annotated` (nothing is hidden from Journey
         # Details); it simply cannot win the model, variant or colour.
         if semantic in _PRODUCT_SEMANTIC_KEYS and not _names_the_booked_vehicle(item, semantic):
+            continue
+        # The vehicle is read only off the papers that belong to this booking,
+        # as the SKU resolver reads it (uc03_model_resolution: ACTIVE evidence
+        # only). A voided, superseded or another customer's (FOREIGN) booking
+        # form used to win the vehicle text once a Journey had no SKU
+        # (2026-11-22: SHI-YK-261113-009 showed the voided form's "AX5 Petrol
+        # MT", UTK-JI-261026-009 another customer's "XUV7XO", right after their
+        # wrong automatic SKUs were cleared).
+        if semantic in _PRODUCT_SEMANTIC_KEYS and str(item.get("associationStatus") or "ACTIVE").upper() != "ACTIVE":
             continue
         candidates_by_semantic[semantic].append(item)
 

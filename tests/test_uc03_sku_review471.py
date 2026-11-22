@@ -840,3 +840,50 @@ def test_one_model_name_inside_the_other_is_not_a_contradiction():
     assert mr._booking_names_other_model(ev, state, {}) is None
     state["model_name"] = "XUV 7XO"
     assert "XUV3XO" in mr._booking_names_other_model(ev, state, {})
+
+
+def test_a_cleared_pin_brings_back_the_model_question_the_system_had_closed(journey):
+    """SHI-YK-261113-009 (2026-11-22): MODEL_NOT_IDENTIFIED was raised, then
+    closed (FIXED) when an automatic SKU was pinned; when that SKU was cleared
+    the closed finding stayed closed and the PC got no shortlist. It is
+    raised again with the closest-SKU question."""
+    c = journey
+    lx, _ax5 = _seed_price_list(c, _THAR_AND_3XO)
+    doc = _booking_form(c, {"vehicle_model": "XUV 3XO", "vehicle_variant": "W6 (AXS) Petrol MT",
+                            "ex_showroom_price": "999901"})
+    _sync(c)
+    assert (_vehicle(c) or {}).get("product_sku_id") is None
+    _correct_field(c, doc, "vehicle_model", "THAR")
+    _correct_field(c, doc, "vehicle_variant", "LX")
+    _correct_field(c, doc, "ex_showroom_price", "1400000")
+    _sync(c)
+    assert _vehicle(c)["product_sku_id"] == lx
+    findings = lambda: c.execute(text(
+        "SELECT finding_status, disposition FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j "
+        "AND rule_key='MODEL_NOT_IDENTIFIED:BOOKING' ORDER BY created_at_utc"),
+        {"t": c.tenant_id, "j": c.journey_id}).all()
+    assert [tuple(r) for r in findings()] == [("RESOLVED", "FIXED")]
+
+    _correct_field(c, doc, "vehicle_model", "XUV 3XO")
+    _correct_field(c, doc, "vehicle_variant", "W6 (AXS) Petrol MT")
+    _correct_field(c, doc, "ex_showroom_price", "999901")
+    _sync(c)
+
+    assert _vehicle(c)["product_sku_id"] is None
+    assert [tuple(r) for r in findings()] == [("OPEN", None)]
+    assert "SKU_CLOSEST_MATCH_CONFIRM" in _open_tasks(c)
+
+
+def test_a_model_question_a_team_lead_judged_is_never_raised_again(journey):
+    c = journey
+    _seed_price_list(c, _THAR_AND_3XO)
+    _booking_form(c, {"vehicle_model": "XUV 3XO", "vehicle_variant": "W6 (AXS) Petrol MT",
+                      "ex_showroom_price": "999901"})
+    _sync(c)
+    c.execute(text("UPDATE auditcore.audit_findings SET finding_status='RESOLVED', disposition='FALSE_POSITIVE' "
+                   "WHERE tenant_id=:t AND journey_id=:j AND rule_key='MODEL_NOT_IDENTIFIED:BOOKING'"),
+              {"t": c.tenant_id, "j": c.journey_id})
+    _sync(c)
+    assert c.execute(text("SELECT finding_status FROM auditcore.audit_findings WHERE tenant_id=:t AND journey_id=:j "
+                          "AND rule_key='MODEL_NOT_IDENTIFIED:BOOKING'"),
+                     {"t": c.tenant_id, "j": c.journey_id}).scalar_one() == "RESOLVED"

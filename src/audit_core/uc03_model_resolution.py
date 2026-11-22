@@ -1154,6 +1154,69 @@ def _resolve_open_flag(
     return len(open_ids)
 
 
+def _reopen_fixed_flag(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, title: str, description: str,
+    safe_payload: dict[str, Any], correlation_id: str,
+) -> bool:
+    """The MODEL_NOT_IDENTIFIED finding the system closed as FIXED when a SKU
+    was pinned is the PC's question again once the Journey has no SKU (an
+    automatic SKU cleared, 2026-11-21). ``_machine_flag`` returns the latest
+    finding whatever its status, so a closed one used to stay closed and the
+    PC got no shortlist (SHI-YK-261113-009, 2026-11-22). A verdict (a
+    confirmed breach or false positive) is never reopened. Returns whether
+    it was reopened."""
+    row = connection.execute(
+        text(
+            """
+            SELECT f.audit_finding_id, f.finding_status, f.disposition
+            FROM auditcore.audit_findings f
+            WHERE f.tenant_id=:t AND f.journey_id=:j AND f.stage_code=:stage AND f.rule_key=:rule
+              AND f.finding_status <> 'VOIDED'
+            ORDER BY f.created_at_utc DESC, f.audit_finding_id DESC
+            LIMIT 1
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "stage": _STAGE, "rule": _RULE_KEY},
+    ).mappings().one_or_none()
+    if row is None or row["finding_status"] != "RESOLVED" or row["disposition"] != "FIXED":
+        return False
+    has_sku = connection.execute(
+        text("SELECT EXISTS (SELECT 1 FROM auditcore.journey_products WHERE tenant_id=:t AND journey_id=:j "
+             "AND product_sku_id IS NOT NULL)"),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one()
+    if has_sku:
+        return False
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.audit_findings
+            SET finding_status='OPEN', disposition=NULL, resolved_at_utc=NULL, resolved_by_actor_id=NULL,
+                title=:title, description=:description, updated_at_utc=now()
+            WHERE tenant_id=:t AND audit_finding_id=:fid AND finding_status='RESOLVED'
+            """
+        ),
+        {"t": tenant_id, "fid": row["audit_finding_id"], "title": title, "description": description},
+    )
+    connection.execute(
+        text(
+            """
+            INSERT INTO auditcore.audit_finding_events (
+                tenant_id, audit_finding_id, journey_id, stage_code,
+                event_type, actor_id, actor_role_snapshot, safe_payload, correlation_id
+            ) VALUES (
+                :t, :fid, :j, :stage, 'RAISED', NULL, 'SYSTEM', CAST(:payload AS jsonb), :correlation_id
+            )
+            """
+        ),
+        {"t": tenant_id, "fid": row["audit_finding_id"], "j": journey_id, "stage": _STAGE,
+         "payload": json.dumps({**safe_payload, "note": "Raised again: the Journey has no SKU any more."},
+                               default=str),
+         "correlation_id": correlation_id},
+    )
+    return True
+
+
 def _refresh_open_flag(
     connection: Connection,
     *,
@@ -2678,6 +2741,8 @@ def _raise_not_identified(
     task_payload_extra = _candidate_task_payload(
         report, matched, multiple=multiple, stage=stage, source=source, other_lists=other_lists,
     )
+    _reopen_fixed_flag(connection, tenant_id=tenant_id, journey_id=journey_id, title=title,
+                       description=description, safe_payload=safe_payload, correlation_id=correlation_id)
     finding_id = _machine_flag(
         connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=_STAGE, rule_key=_RULE_KEY,
         finding_type=_FINDING_TYPE, severity="MEDIUM", title=title, description=description,
