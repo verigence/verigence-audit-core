@@ -83,7 +83,16 @@ def _deal_remarks(connection: Connection, *, tenant_id: str, journey_id: UUID) -
                                                              journey_id=journey_id)[0])
     if third_party is not None:
         remarks.append(third_party)
+    from audit_core.uc03_account_statement import ndc_free_rows
+
+    remarks.extend(free_on_ndc_remarks(ndc_free_rows(connection, tenant_id=tenant_id, journey_id=journey_id)))
     return remarks
+
+
+def free_on_ndc_remarks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each row written FREE on the NDC (product owner 2026-11-22: "where ever
+    free word is coming, pls raise it in system remark")."""
+    return [_remark("FREE_ON_NDC", "Written FREE on the NDC", row["text"], "Deal") for row in rows]
 
 
 def third_party_accessories_remark(ndc: dict[str, Decimal] | None) -> dict[str, Any] | None:

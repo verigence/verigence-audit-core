@@ -28,8 +28,7 @@ def test_words_and_small_numbers_after_the_item_are_a_note(label, amount, key):
 
 
 @pytest.mark.parametrize(("label", "amount"), [
-    ("ACCESSORIES 5000/ FOC", 4918),
-    ("ACCESSORIES SCHEME 5000 FREE ACCESSORIES", 1520),
+    # (FOC / FREE rows are read since 2026-11-22: tests/test_ndc_free_and_spelling.py)
     ("ACCESSORIES 1 DEC 5000", 1025),
 ])
 def test_an_amount_or_a_given_word_keeps_it_a_working_left_for_a_person(label, amount):

@@ -83,6 +83,7 @@ def test_run_all_rules_for_a_fresh_booking_journey_returns_all_expected_rule_cod
         "WRONG_DOCUMENT", "DUPLICATE_RECEIPT", "DUPLICATE_BOOKING", "MODEL_NOT_IDENTIFIED",
         "DEAL_RECONCILIATION_REFRESH", "MANUAL_VERIFICATION", "PAYMENT_BANK_UNMATCHED", "DOCUMENT_KEY_FIGURES",
         "STATEMENT_ROWS_ADD_UP",
+        "STATEMENT_ROWS_IN_DEAL",
         "AUTOMATED_SYNC_FAILURE",
         # The deal-audit checks that run with the Booking stage.
         "DEAL_UNDERCHARGED", "EXCESS_DISCOUNT", "KIT_GIVEN_AS_CASH",
@@ -141,6 +142,7 @@ def test_run_all_rules_for_delivery_stage_only_runs_delivery_scoped_rules(
         "MODEL_NOT_IDENTIFIED", "INVOICE_SKU_MISMATCH",
         "MANUAL_VERIFICATION", "PAYMENT_BANK_UNMATCHED", "AUTOMATED_SYNC_FAILURE", "DOCUMENT_KEY_FIGURES",
         "STATEMENT_ROWS_ADD_UP",
+        "STATEMENT_ROWS_IN_DEAL",
         # The deal-audit checks that need a delivery.
         "DELIVERED_ON_SHORT_PAYMENT", "RECEIPTS_EQUAL_INVOICES",
         "PAYMENT_AFTER_DELIVERY_WITHIN_GRACE", "PAYMENT_AFTER_DELIVERY_BEYOND_GRACE",

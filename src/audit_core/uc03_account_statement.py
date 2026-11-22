@@ -287,14 +287,14 @@ _SUMMARY = re.compile(
     # (with the form's numbering or a note after them: "BALANCE PAYMENT (11-24)",
     # "1ST EMI DP", "FINANCE FEES D.P.", 2026-11-05)
     r"VEHICLE PRICE|SCHEME|BALANCE PAYMENT( .*)?|SUB ?TOTAL.*|DOWN ?PAYMENT.*|1ST EMI( .*)?|FINANCE FEES( .*)?|"
-    r"MISC PAYMENT|FINAL PAYMENT"
+    r"MISC PAYMENT|FINAL PAYMENT( \([\d+ ]+\))?"  # "FINAL PAYMENT (20+21+22+23)", Shivnath 2026-11-22
 )
 # The old vehicle's value (product owner 2026-10-29): Aditya's form deducts
 # "LESS: EXCHANGED VEHICLE" in section A, before the net receivable. It is the
 # customer paying with the old vehicle -- not a discount and not the exchange
 # bonus (that is "EXCHANGE CLAIM") -- and, being already netted off the net
 # receivable, not one of the statement's received lines either.
-_OLD_VEHICLE = re.compile(r"EXCHANGED? VEHICLE( VALUE| AMT| AMOUNT)?")
+_OLD_VEHICLE = re.compile(r"EXCHANGED? VEHICLE( VALUE| AMT| AMOUNT)?\.?")  # "EXCHANGE VEHICLE AMT." (2026-11-22)
 # Utkal's "Exchange Value", in the payment column and counted in its Total
 # Receipt (2026-11-05: UTK-BP-261104-002 Rs 6,70,000, left unread), is the
 # old vehicle taken in kind, as the Shivnath form's "Trade in value".
@@ -371,6 +371,138 @@ def _is_note(working: str) -> bool:
     numbers = re.findall(r"\d[\d,]*(?:\.\d+)?", working)
     return (bool(words) and not any(w in _NOT_A_NOTE for w in words)
             and all(_figure(n) < _NOTE_NUMBER_BELOW for n in numbers))
+
+
+# ── rows written FREE (product owner 2026-11-22) ─────────────────────────────
+# "where ever free word is coming, pls raise it in system remark and also make
+# it visible in deal and audit summary corresponding item". Live, 60 such rows
+# were left out of the Deal ("ACCESSORIES FREE 5K" 140, "ACCESSORIES 5000
+# (FREE)" 5,153, "RSA Free" 5,000, "EXTENDED WARRANTY FREE", "FAST TAG FREE").
+#   * Accessories charged (a debit), as the working "5140-5000 FREE" already
+#     reads: the amount printed is what is left to pay and the figure written
+#     FREE is the free-accessories benefit, so the accessories are billed at
+#     the two together. The free figure equal to the amount is the Offer
+#     Letter's "ACCESSORIES Free" (billed at its value, the same value free).
+#     No figure written: the accessories as charged, FREE noted.
+#   * Extended warranty, RSA, FASTag charged: the line as charged, FREE noted
+#     (no benefit is assumed), beside any other row of the same charge
+#     ("RSA Free" 5,000 and "RSA" 140 are RSA Rs 5,140).
+#   * Written FREE on the credit side or as a minus (Shivnath's "Extended
+#     Warranty Free" -60,000, left out of its own "On Road Price"): a note,
+#     neither charged nor a benefit.
+# Several figures that do not make a working, or a row PENDING / DUE /
+# APPROVAL, stay for a person.
+_FREE_WORD = re.compile(r"\b(FREE|FOC|F\.O\.C)\b")
+_FREE_ITEMS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("accessories_cost", re.compile(r"ACCESSOR(IES|Y)\b")),
+    ("extended_warranty_amount", re.compile(r"(EXT(ENDED|\.)? ?WARR?[AE]NTY|EW|4TH (YEAR |YR )?WARRANTY)\b")),
+    ("rsa_amount", re.compile(r"(RSA|ROAD ?SIDE( ASSISTANCE)?)\b")),
+    ("fastag_amount", re.compile(r"FAST ?T?AG\b")),
+)
+_FREE_AMOUNT_RATIO = 20
+_FREE_UNSETTLED = re.compile(r"\b(PENDING|DUE|APPROVAL|ADJUST)\b")
+_FREE_FIGURE = re.compile(r"(?<![\d.])(\d{1,3}(?:[,.]\d{3})+|\d+)(\s?K\b)?")
+
+
+def _free_figures(label: str) -> list[Decimal]:
+    """The figures written on a FREE row, as rupees: "5K" is 5,000, "40.000"
+    and "50,000" are thousands."""
+    figures: list[Decimal] = []
+    for number, thousand in _FREE_FIGURE.findall(label):
+        value = Decimal(re.sub(r"[,.]", "", number))
+        figures.append(value * 1000 if thousand else value)
+    return [f for f in dict.fromkeys(figures) if f >= _NOTE_NUMBER_BELOW]
+
+
+def free_row(label: str, side: tuple[str, Decimal]) -> dict[str, Any] | None:
+    """How a row written FREE is read, or None when it is not one this reads
+    (not FREE, no item named, unsettled, or figures that make no sense)."""
+    if not _FREE_WORD.search(label) or _FREE_UNSETTLED.search(label):
+        return None
+    key = next((k for k, pattern in _FREE_ITEMS if pattern.match(label)), None)
+    if key is None:
+        return None
+    direction, amount = side
+    figures = _free_figures(label)
+    if direction != "DR":
+        return {"key": key, "label": label, "amount": amount, "free": amount, "charged": None, "benefit": None}
+    if key != "accessories_cost":
+        if figures and figures != [amount]:
+            return None
+        return {"key": key, "label": label, "amount": amount, "free": None, "charged": amount, "benefit": None}
+    if not figures:
+        return {"key": key, "label": label, "amount": amount, "free": None, "charged": amount, "benefit": None}
+    if len(figures) != 1:
+        return None
+    free = figures[0]
+    if amount > free * _FREE_AMOUNT_RATIO:
+        return None  # another figure read on the row (ADI-RD-261113-046: "5000 FREE" against Rs 1,56,540)
+    value = amount if free == amount else amount + free
+    return {"key": key, "label": label, "amount": amount, "free": free, "charged": value, "benefit": free}
+
+
+# ── misspelt words (product owner 2026-11-22) ────────────────────────────────
+# "whereever it is misspelled ... build a logic in the code to handle that and
+# apply to the corresponding line item". A row no label reads is read again
+# with each misspelt word put right: a word not in the statement's own
+# vocabulary, one letter off a known word of five or six letters, two off a
+# longer one, and nearer one known word than any other ("ACCESORIES",
+# "EXCHANNGGE", "SCHME", "FITNERS", "PERMITT"). The row still has to read as a
+# line of its own once corrected; else it is left, as before.
+_VOCABULARY = frozenset((
+    "ACCESSORIES", "ACCESSORY", "ADDITIONAL", "ASSISTANCE", "BONUS", "BOOKING", "CERTIFICATE", "CHARGES",
+    "CHOICE", "CLAIM", "COATING", "CONSUMER", "CORPORATE", "DEPOSITED", "DISCOUNT", "EXCHANGE", "EXCHANGED",
+    "EXTENDED", "FASTAG", "FINANCE", "FINANCER", "FITNESS", "GENUINE", "HANDLING", "INSURANCE", "LOYALTY",
+    "NUMBER", "OFFER", "OTHERS", "PACKAGE", "PERMIT", "PREMIUM", "PRIVILEGE", "RECEIPT", "REGISTRATION",
+    "SCHEME", "SCRAPPAGE", "SERVICE", "SHIELD", "SUPPORT", "TEMPORARY", "VEHICLE", "WARRANTY",
+))
+# Words written right that look like one of those, never "corrected": seen on
+# five or more live statements (2026-11-22), or a word of its own ("BONDS" is
+# the scrappage certificate, not the bonus; "CHARGER" is not "CHARGES").
+_KNOWN_WORDS = _VOCABULARY | frozenset((
+    "ACCOUNT", "ADJUSTMENT", "ALLOWED", "AMOUNT", "ASSISTANT", "BALANCE", "BILLING", "BONDS", "BRANCH",
+    "CHARGER", "CHEQUE", "COMMERCIAL", "COMPANY", "CONTRIBUTION", "CUSTOMER", "DEALER", "DELIVERY",
+    "DETAILS", "DOWNPAYMENT", "EXPENSES", "EXTRA", "FINAL", "FINANCIAL", "FITTED", "GENERAL", "GOVERNER",
+    "HOUSE", "INVOICE", "JOURNAL", "LABOUR", "LIMITED", "LOCAL", "MACHINE", "MONEY", "MONTH", "MOTORS",
+    "NONGST", "NORMAL", "ONLINE", "ONROAD", "OTHER", "PARTS", "PARTY", "PAYABLE", "PAYMENT", "PENDING",
+    "PERSONAL", "PHONE", "POLICY", "PRICE", "PRIVATE", "PROMOTION", "PROVISION", "PURCHASE", "RECEIPTS",
+    "RECEIVED", "REFUND", "ROUND", "ROUNDING", "SALES", "SERIES", "SERVICES", "SHIFTING", "SHOWROOM",
+    "SPARE", "SPECIAL", "SPEED", "STATE", "TOTAL", "TRANSFER", "VALUE", "WELCOME", "WORKSHOP",
+))
+
+
+def _edits(a: str, b: str) -> int:
+    """Optimal string alignment distance (a swap of two letters is one)."""
+    rows = [list(range(len(b) + 1))]
+    for i, ca in enumerate(a, 1):
+        row = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            row[j] = min(rows[-1][j] + 1, row[j - 1] + 1, rows[-1][j - 1] + (ca != cb))
+            if i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb:
+                row[j] = min(row[j], rows[-2][j - 2] + 1)
+        rows.append(row)
+    return rows[-1][-1]
+
+
+def spelled_right(label: str) -> str:
+    """The label with each misspelt word put right, as above (unchanged when
+    there is none)."""
+    def fix(match: re.Match[str]) -> str:
+        word = match.group(0)
+        if len(word) < 5 or word in _KNOWN_WORDS:
+            return word
+        limit = 1 if len(word) <= 6 else 2
+        near = sorted((_edits(word, known), known) for known in _VOCABULARY
+                      if abs(len(known) - len(word)) <= limit)
+        if not near or near[0][0] > limit:
+            return word
+        tied = [known for distance, known in near if distance == near[0][0]]
+        # A word and its own -D form tied ("EXCHANNGER": EXCHANGE, EXCHANGED):
+        # the word itself; any other tie is too close to call.
+        if len(tied) > 1 and not all(t.startswith(min(tied, key=len)) for t in tied):
+            return word
+        return min(tied, key=len)
+    return re.sub(r"[A-Z]+", fix, label)
 
 
 def read_working(working: str, amount: Decimal) -> tuple[Decimal, Decimal] | None:
@@ -459,6 +591,12 @@ class StatementRead:
     conflicts: list[dict[str, Any]] = field(default_factory=list)
     # rows to be checked by hand (FASTAG_VERIFY_TASK): {"label", "amount", "why"}
     verify: list[dict[str, Any]] = field(default_factory=list)
+    # rows written FREE (product owner 2026-11-22): {"key", "label", "amount",
+    # "free", "side"} -- shown on the Deal and audit summary line and in the
+    # system remarks
+    free_rows: list[dict[str, Any]] = field(default_factory=list)
+    # rows read only once their misspelt words were corrected: {"label", "as"}
+    spelled: list[dict[str, str]] = field(default_factory=list)
 
 
 # A FASTag costs at most Rs 600 (product owner 2026-11-18: "Fasttag cost wont be
@@ -511,11 +649,43 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             # to be as additional line item in accessories"; UTK-SR-261102-002
             # "Accessories 3 party" Rs 5,000), and a system remark says so.
             key = THIRD_PARTY_ACCESSORIES_KEY
+        if line.get("_spelled_from") and not row:
+            # A row read once corrected is a row of its own: beside another of
+            # the same charge it adds up (SHI-SS-261027-023: "ACCESSORIES"
+            # 5,000 and "Accesories" 8,380, two accessory bills on the ledger).
+            row = "SPELLED"
         found.setdefault((kind, key, row), []).append(amount)
+        if line.get("_spelled_from") and not any(s["as"] == label for s in out.spelled):
+            out.spelled.append({"label": str(line["_spelled_from"]), "as": label})
 
     def leave(label: str, side: tuple[str, Decimal], why: str) -> None:
         out.unmapped.append({"label": label, "amount": side[1], "why": why})
         out.left_out.append(side)
+
+    def read_again_spelled(row: dict[str, Any], label: str) -> bool:
+        """Queue the row again with its misspelt words put right, once."""
+        if row.get("_spelled_from"):
+            return False
+        corrected = spelled_right(label)
+        if corrected == label:
+            return False
+        queue.append({**row, "particulars_raw": corrected, "_spelled_from": label})
+        return True
+
+    def take_free(row: dict[str, Any], label: str, side: tuple[str, Decimal]) -> bool:
+        """Read a row written FREE (above); False when it is not one."""
+        debit = _amount(row.get("debit_amount"))
+        if debit is not None and debit < 0:
+            side = ("CR", side[1])  # written as a minus: given, not charged
+        read = free_row(label, side)
+        if read is None:
+            return False
+        out.free_rows.append({k: read[k] for k in ("key", "label", "amount", "free")} | {"side": side[0]})
+        if read["charged"] is not None:
+            give("COMMERCIAL", read["key"], read["charged"], "FREE")
+        if read["benefit"]:
+            give("DISCOUNT", FREE_ACCESSORIES_KEY, read["benefit"])
+        return True
 
     # The Offer Letter / Payment Details form plans the payment ("BOOKING
     # AMOUNT", "FINANCE AMOUNT", "DOWNPAYMENT") and then lists the money
@@ -529,7 +699,10 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
         any(_RECEIPT_ROW.fullmatch(label) for label in labels) and any(_PLAN_ROW.fullmatch(label) for label in labels))
     listed_receipts = [side[1] for row in lines if _RECEIPT_ROW.fullmatch(_label(row.get("particulars_raw")))
                        and (side := _side_amount(row)) is not None]
-    for row in lines:
+    queue = list(lines)
+    line: dict[str, Any] = {}
+    for row in queue:
+        line = row
         label = _label(row.get("particulars_raw"))
         side = _side_amount(row)
         if plans_its_receipts and _PLANNED_BOOKING.fullmatch(label):
@@ -639,6 +812,8 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
         if working is not None and item is not None:
             read = read_working(working["working"], amount)
             if read is None or (read[1] and item != "accessories_cost"):
+                if take_free(row, label, side):
+                    continue
                 leave(label, side, "the working written beside it does not agree with the amount")
                 continue
             value, free = read
@@ -680,7 +855,11 @@ def read_statement(lines: list[dict[str, Any]]) -> StatementRead:
             give("COMMERCIAL", "other_charges", amount,
                  "COMBINED" if _COMBINED_CHARGES.fullmatch(label) else "SCRAPPAGE_COD")
             continue
-        leave(label, side, "label not in the mapping")
+        if take_free(row, label, side):
+            continue
+        if read_again_spelled(row, label):
+            continue
+        leave(row.get("_spelled_from") or label, side, "label not in the mapping")
     totals: dict[tuple[str, str], Decimal] = {}
     in_conflict: set[tuple[str, str]] = set()
     for (kind, key, _), amounts in sorted(found.items()):
@@ -1429,6 +1608,10 @@ def combine_statements(
     for read in in_use:
         out.unmapped.extend(read.unmapped)
         out.conflicts.extend(read.conflicts)
+        # Rows written FREE and rows read once corrected, once across copies.
+        out.free_rows.extend(f for f in read.free_rows
+                             if (f["label"], f["amount"]) not in {(g["label"], g["amount"]) for g in out.free_rows})
+        out.spelled.extend(x for x in read.spelled if x not in out.spelled)
         # Rows to check by hand (a FASTag row above Rs 600), once across copies.
         out.verify.extend(v for v in read.verify
                           if (v["label"], v["amount"]) not in {(w["label"], w["amount"]) for w in out.verify})
@@ -2384,6 +2567,45 @@ def ndc_charges(connection: Connection, *, tenant_id: str, journey_id: UUID
     return (dict(sheet.components) if sheet is not None else None), postings
 
 
+_FREE_LINE_LABELS = {
+    "accessories_cost": "Accessories", "extended_warranty_amount": "Extended warranty",
+    "rsa_amount": "RSA", "fastag_amount": "FASTag",
+}
+
+
+def _rupee_text(amount: Decimal) -> str:
+    whole = f"{amount:,.2f}".rstrip("0").rstrip(".")
+    return f"Rs {whole}"
+
+
+def free_row_text(row: dict[str, Any]) -> str:
+    """One sentence for a row written FREE, the same on the Deal, the audit
+    summary and the system remarks."""
+    item = _FREE_LINE_LABELS.get(str(row["key"]), str(row["key"]))
+    amount, free = Decimal(str(row["amount"])), row.get("free")
+    written = f"\"{row['label']}\""
+    if row.get("side") != "DR":
+        return (f"{item} written FREE on the NDC ({written}, {_rupee_text(amount)}): given free, "
+                "neither charged nor counted as a benefit.")
+    if row["key"] == "accessories_cost" and free is not None:
+        free = Decimal(str(free))
+        if free == amount:
+            return f"{item} {_rupee_text(free)} given free on the NDC ({written}): billed at its value, the same value free."
+        return (f"{item} {_rupee_text(free)} given free on the NDC ({written}): {_rupee_text(amount)} left to pay, "
+                f"billed at {_rupee_text(amount + free)}.")
+    return f"{item} written FREE on the NDC ({written}) and charged {_rupee_text(amount)}: no free amount is counted."
+
+
+def ndc_free_rows(connection: Connection, *, tenant_id: str, journey_id: UUID) -> list[dict[str, Any]]:
+    """The rows written FREE on the NDC the Deal reads (product owner
+    2026-11-22), each with its sentence."""
+    documents = load_ledger_documents(connection, tenant_id=tenant_id, journey_id=journey_id)
+    forms = [(d, rows) for d in documents
+             if (rows := line_rows((d.get("fields") or {}).get("line_items"))) and statement_kind(rows) == KIND_FORM]
+    statement = combine_statements(forms)[0] if forms else None
+    return [{**row, "text": free_row_text(row)} for row in (statement.free_rows if statement else [])]
+
+
 __all__ = [
     "COPIES_DIFFERENCE_TASK",
     "COST_SHEET_DIFFERENCE_TASK",
@@ -2416,10 +2638,12 @@ __all__ = [
     "combined_tally_rows",
     "cost_sheet_differences",
     "cost_sheet_discount",
+    "free_row_text",
     "ledger_postings",
     "line_rows",
     "load_ledger_documents",
     "ndc_charges",
+    "ndc_free_rows",
     "read_cost_sheet",
     "read_erp_settlement",
     "read_statement",

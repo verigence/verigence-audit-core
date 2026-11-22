@@ -1897,6 +1897,18 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
     not_taken = [r for r in counted_rows if r.get("notTaken")]
     counted_rows = [r for r in counted_rows if not r.get("notTaken")]
     standard_discounts = [r for r in discount_rows if r["inStandard"]]
+    if statement_policy:
+        # Rows written FREE on the NDC (product owner 2026-11-22: "make it
+        # visible in deal and audit summary corresponding item").
+        from audit_core.uc03_account_statement import ndc_free_rows
+
+        free_notes: dict[str, list[str]] = {}
+        for free in ndc_free_rows(connection, tenant_id=tenant_id, journey_id=journey_id):
+            free_notes.setdefault(str(free["key"]), []).append(free["text"])
+        for group in groups:
+            for component in group["components"]:
+                if component["key"] in free_notes:
+                    component["ndcNote"] = " ".join(free_notes[component["key"]])
     for group in groups:
         group["totals"] = {
             c: _column_total([r for r in group["components"] if not r.get("partOf") and not r.get("notTaken")], c)
