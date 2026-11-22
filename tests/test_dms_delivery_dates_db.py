@@ -296,3 +296,15 @@ def test_a_generated_report_is_corrected_in_place(dealer):
     again = run_dms_report_rebuild(dealer.engine, f"{dealer.tenant_id}:dms-report-rebuild-test-commit", [])
     assert again["items"][0]["after"] == {k: f.get(k) for k in again["items"][0]["after"]}
 
+
+
+def test_a_rebuilt_report_keeps_the_dealerships_it_was_made_for():
+    """2026-11-22: a report generated for one dealership came back covering every dealership its
+    author covers."""
+    from audit_core.uc03_dms_report_rebuild import report_dealers
+
+    covered = [{"dealerId": "a", "dealerName": "A"}, {"dealerId": "b", "dealerName": "B"},
+               {"dealerId": "c", "dealerName": "C"}]
+    assert [d["dealerId"] for d in report_dealers(covered, ["b"])] == ["b"]
+    assert [d["dealerId"] for d in report_dealers(covered, ["a", "c"])] == ["a", "c"]
+    assert report_dealers(covered, []) == covered and report_dealers(covered, None) == covered
