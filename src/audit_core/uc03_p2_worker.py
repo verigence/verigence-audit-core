@@ -333,8 +333,16 @@ def _active_tenants(engine: Engine) -> list[str]:
 # them at once updated the same Deal, stage-flag, payment and product rows in a
 # different order and Postgres killed one (881 deadlocks; the killed step was
 # skipped and the item still reported success). A Journey item starts only
-# when nothing else of its Journey is running and it is the oldest waiting;
-# page work queued after it waits for it.
+# when nothing else of its Journey is running and no page asked for before it
+# is still waiting; a page asked for after it waits for it.
+#
+# "It" is the Journey item that is actually next (22 Nov 2026), not the oldest
+# one waiting. The oldest can be a check, and a check lets the recompute go
+# first: pages asked for after that check waited for it while the recompute,
+# asked for again each time it ran, went ahead of it -- for an hour, until the
+# time limit failed pages that had never been sent to be read (109 pages in 20
+# Journeys on 21 Nov). An item asked for again joins the back of the line
+# (_complete), so a page already waiting now always gets its turn before it.
 PAGE_WORK_TYPES = ("SPLIT_BATCH", "DOCUMENT_INGEST", "PAGE_REREAD", "BATCH_GROUP", "DI_DOCUMENT_WITHDRAW")
 # How long a deletion that has started holds its Journey's work back. A
 # deletion takes seconds; one left STARTED by a crash stops holding it then.
@@ -370,10 +378,12 @@ _CLAIM_SQL = text(
         FROM auditcore.p2_work_queue
         WHERE tenant_id=:tenant_id
           AND (
-            work_status IN ('PENDING','RETRY_WAIT')
+            (work_status IN ('PENDING','RETRY_WAIT')
+             AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= now()))
+            -- an item whose worker died is taken again whatever was asked for it
+            -- meanwhile (a running item's next_attempt_at_utc is "asked again, not before")
             OR (work_status IN ('CLAIMED','PROCESSING') AND lease_expires_at_utc <= now())
           )
-          AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc <= now())
           -- A Journey being deleted gets no new work (2026-10-31): a check
           -- still writing its findings while the delete removed its rows
           -- deadlocked with it (the delete takes the audit tables' trigger
@@ -386,20 +396,26 @@ _CLAIM_SQL = text(
                   AND d.deletion_status='STARTED'
                   AND d.requested_at_utc > now() - (:deletion_hold_minutes * interval '1 minute')))
     ),
-    first_journey_work AS (
-        SELECT journey_id, MIN(journey_rank) AS journey_rank FROM ready WHERE NOT page_work GROUP BY journey_id
+    -- The Journey item that runs next, and the oldest page waiting.
+    next_journey_work AS (
+        SELECT journey_id, journey_rank FROM ready WHERE NOT page_work AND journey_work_rank = 1
+    ),
+    first_page_work AS (
+        SELECT journey_id, MIN(journey_rank) AS journey_rank FROM ready WHERE page_work GROUP BY journey_id
     ),
     eligible AS (
         SELECT r.work_id, r.page_work, r.queued_at_utc
         FROM ready r
         LEFT JOIN inflight i ON i.journey_id=r.journey_id
-        LEFT JOIN first_journey_work f ON f.journey_id=r.journey_id
+        LEFT JOIN next_journey_work n ON n.journey_id=r.journey_id
+        LEFT JOIN first_page_work p ON p.journey_id=r.journey_id
         WHERE CASE
           WHEN r.page_work THEN
             COALESCE(i.running_journey_work, 0) = 0
-            AND r.journey_rank + COALESCE(i.running, 0) <= :per_journey
-            AND r.journey_rank < COALESCE(f.journey_rank, 2147483647)
-          ELSE COALESCE(i.running, 0) = 0 AND f.journey_rank = 1 AND r.journey_work_rank = 1
+            AND r.journey_work_rank + COALESCE(i.running, 0) <= :per_journey
+            AND r.journey_rank < COALESCE(n.journey_rank, 2147483647)
+          ELSE COALESCE(i.running, 0) = 0 AND r.journey_work_rank = 1
+               AND r.journey_rank < COALESCE(p.journey_rank, 2147483647)
         END
         -- Reading first (2026-10-29): 383 of 554 pages failed by the 30-minute
         -- rule were never sent to Document Intelligence -- they waited behind
@@ -470,6 +486,8 @@ def _claim_for_tenant(engine: Engine, tenant_id: str, limit: int) -> list[WorkIt
                     SET work_status='CLAIMED',
                         attempt_count=:attempts,
                         claim_count=claim_count+1,
+                        -- while it runs this holds when it was asked for again (enqueue_work)
+                        next_attempt_at_utc=NULL,
                         lease_token=:token,
                         lease_expires_at_utc=now() + (:lease_seconds * interval '1 second'),
                         updated_at_utc=now()
@@ -564,7 +582,14 @@ def _complete(engine: Engine, work: WorkItem) -> None:
                     attempt_count=CASE WHEN CAST(:status AS varchar)='COMPLETED' THEN 0 ELSE attempt_count END,
                     -- asked for again while it ran: it joins the back of the line (2026-10-28)
                     queued_at_utc=CASE WHEN CAST(:status AS varchar)='PENDING' THEN now() ELSE queued_at_utc END,
-                    next_attempt_at_utc=NULL,
+                    -- ... and runs when it was asked for, not at once (22 Nov 2026): a
+                    -- follow-up "in ten minutes" asked from inside the running recompute
+                    -- ran it again straight away, every 7 seconds for an hour.
+                    next_attempt_at_utc=CASE
+                      WHEN CAST(:status AS varchar)='PENDING' AND next_attempt_at_utc > now()
+                        THEN next_attempt_at_utc
+                      ELSE NULL
+                    END,
                     lease_token=NULL,
                     lease_expires_at_utc=NULL,
                     last_error=NULL,
@@ -598,8 +623,11 @@ def _reschedule(engine: Engine, work: WorkItem, exc: RescheduleWork) -> None:
                 """
                 UPDATE auditcore.p2_work_queue
                 SET work_status='PENDING',
+                    -- asked for again while it ran: at the sooner of that time and its own wait
                     next_attempt_at_utc=CASE
-                      WHEN :immediate THEN NULL
+                      WHEN :immediate THEN NULLIF(GREATEST(now(), LEAST(
+                             COALESCE(next_attempt_at_utc, now()),
+                             now() + (:delay_seconds * interval '1 second'))), now())
                       ELSE now() + (:delay_seconds * interval '1 second')
                     END,
                     -- the step ran and only has to wait: earlier failures no
