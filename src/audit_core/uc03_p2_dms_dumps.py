@@ -39,8 +39,9 @@ A dump row is matched to a Journey of the same dealership, in this order:
                   invoice, insurance cover or RTO challan (CHASSIS_DOCUMENT_TYPES)
   MOBILE          the customer's mobile (last 10 digits) on the booking form, a receipt
                   or the KYC
-  NAME_DATE       (booking) the same customer name, the Journey booked within 3 days of the
-                  DMS booking date, only when one Journey has it (2026-11-18)
+  NAME_DATE       (booking) the same customer name, the Journey's booking form date or first
+                  money receipt date within 2 days of the DMS booking date, only when one
+                  Journey has it (2026-11-18; 2026-11-22)
   NAME_MODEL      the same customer name and model (same_model: spacing aside, one name
                   within the other), only when one Journey has it
 Outcome per row: MATCHED; for a delivery row, NOT_IN_TOOL when its Journey is found but
@@ -72,6 +73,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.uc03_booking_day import BOOKING_MATCH_DAYS, FIRST_RECEIPT_SQL
 from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
 from audit_core.uc03_p2_access import authorize_p2_any
 from audit_core.uc03_p2_names import same_person
@@ -475,19 +477,12 @@ def customer_code_key(value: Any) -> str | None:
 
 
 _INDEX_SQL = """
-    WITH up AS (
-        -- The day the PC uploaded the booking documents: the booking date rule's fallback
-        -- (2026-11-07), as uc03_p2_dms_outlet_report dates bookings.
-        SELECT ub.journey_id, min(CAST(ub.created_at_utc AT TIME ZONE 'Asia/Kolkata' AS date)) AS day
-        FROM auditcore.p2_upload_batches ub
-        JOIN (SELECT DISTINCT q.batch_id FROM auditcore.p2_document_queue q
-              WHERE q.tenant_id = :t AND q.business_stage = 'BOOKING' AND q.queue_status <> 'CANCELLED') qb
-          ON qb.batch_id = ub.batch_id
-        WHERE ub.tenant_id = :t AND ub.batch_status <> 'AWAITING_UPLOAD'
-          AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
-        GROUP BY ub.journey_id
+    WITH rc AS (
+        -- The first money receipt's date: the booking date when the booking form gives none
+        -- (2026-11-22, uc03_booking_day; never the upload day).
+        """ + FIRST_RECEIPT_SQL + """
     ), j AS (
-        SELECT j.journey_id, j.journey_reference, j.outlet_id, up.day AS booking_upload_day,
+        SELECT j.journey_id, j.journey_reference, j.outlet_id, rc.first_receipt,
                COALESCE(NULLIF(c.legal_name, ''),
                         CASE WHEN c.display_name ~* '^[0-9a-f]{8}-[0-9a-f]{4}-' THEN NULL ELSE c.display_name END)
                  AS customer_name,
@@ -503,7 +498,7 @@ _INDEX_SQL = """
         LEFT JOIN auditcore.bookings b ON b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id
         LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
         LEFT JOIN auditcore.vehicle_records vr ON vr.tenant_id = j.tenant_id AND vr.journey_id = j.journey_id
-        LEFT JOIN up ON up.journey_id = j.journey_id
+        LEFT JOIN rc ON rc.journey_id = j.journey_id
         WHERE j.tenant_id = :t AND j.dealer_id = :d
     )
     SELECT j.*, f.field_key, f.source_document_type_key AS doc, f.effective_value #>> '{}' AS value
@@ -536,9 +531,11 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
                 "journeyId": jid, "reference": r["journey_reference"], "outletId": r["outlet_id"],
                 "customer": r["customer_name"], "names": set(), "model": r["model"],
                 "bookingDate": r["booking_date"],
-                # The booking date rule (2026-11-07): the booking form's, else the day the
-                # booking documents were uploaded -- for telling customers of one name apart.
-                "bookingDay": r["booking_date"] or r["booking_upload_day"],
+                # The booking's days (2026-11-22, uc03_booking_day): the booking form's date and
+                # the first money receipt's -- either may match the DMS's date, within
+                # BOOKING_MATCH_DAYS. Never the upload day.
+                "bookingDays": {d for d in (r["booking_date"], r["first_receipt"]) if d is not None},
+                "firstReceipt": r["first_receipt"],
                 "hasDelivery": bool(r["has_delivery"]),
                 "mobiles": set(), "refs": set(),
             }
@@ -578,7 +575,7 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
     return index
 
 
-NAME_DATE_DAYS = 3
+NAME_DATE_DAYS = BOOKING_MATCH_DAYS  # 2: the booking form or first receipt date (2026-11-22)
 
 # A mobile or booking number one or two digits from the customer's (2026-11-21, Aditya's
 # Sujit Kumar Bastia: the booking form read 9337354361 for 9337359361 and B-1348698 for
@@ -649,8 +646,8 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any], taken: frozen
         # mobile; the date, not the model, tells two customers of one name apart).
         day = row.get("event_date")
         if kind == BOOKING and isinstance(day, date):
-            dated = {j for j in named if index.journeys[j].get("bookingDay") is not None
-                     and abs((index.journeys[j]["bookingDay"] - day).days) <= NAME_DATE_DAYS}
+            dated = {j for j in named
+                     if any(abs((d - day).days) <= NAME_DATE_DAYS for d in index.journeys[j].get("bookingDays") or ())}
             if (jid := one(dated)) is not None:
                 return jid, "NAME_DATE"
         if (jid := one({j for j in named if same_model(index.journeys[j]["model"], row.get("model"))})) is not None:

@@ -298,6 +298,53 @@ def test_a_generated_report_is_corrected_in_place(dealer):
 
 
 
+def test_a_booking_is_dated_by_its_form_else_its_first_receipt_never_the_upload_day(dealer):
+    """Product owner 2026-11-22: "we have to go with the booking form date, and not the PC
+    upload date". No booking form date: the first money receipt's; neither: listed as booking
+    date not read, not counted as a booking of any day."""
+    from datetime import timedelta
+
+    today = date.today()  # noqa: DTZ011 -- the database dates receipts against CURRENT_DATE
+    with dealer.engine.begin() as c:
+        def journey(name: str, *, form: date | None, receipts: tuple[date, ...]) -> str:
+            customer = c.execute(text("""INSERT INTO auditcore.customers (tenant_id, dealer_id, outlet_id,
+                    customer_type_code, display_name, legal_name) VALUES (:t, :d, :o, 'INDIVIDUAL', :n, :n)
+                    RETURNING customer_id"""), {"t": dealer.tenant_id, "d": dealer.dealer_id,
+                                                "o": dealer.outlet_id, "n": name}).scalar_one()
+            jid = c.execute(text("""INSERT INTO auditcore.journeys (tenant_id, dealer_id, outlet_id, customer_id,
+                    journey_reference) VALUES (:t, :d, :o, :c, :r) RETURNING journey_id"""),
+                            {"t": dealer.tenant_id, "d": dealer.dealer_id, "o": dealer.outlet_id, "c": customer,
+                             "r": f"BD-{uuid4().hex[:6]}-{name}"}).scalar_one()
+            booking = c.execute(text("INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date) "
+                                     "VALUES (:t, :j, :b) RETURNING booking_id"),
+                                {"t": dealer.tenant_id, "j": jid, "b": form}).scalar_one()
+            for n, day in enumerate(receipts):
+                document = uuid4()
+                c.execute(text("""INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id,
+                        di_document_id, document_type_key, evidence_purpose, process_area, association_status)
+                        VALUES (:t, :j, :c, :s, :d, 'dealer_receipt', 'JOURNEY_DOCUMENT', 'BOOKING', 'ACTIVE')"""),
+                          {"t": dealer.tenant_id, "j": jid, "c": customer, "s": uuid4(), "d": document})
+                c.execute(text("""INSERT INTO auditcore.payments (tenant_id, journey_id, amount, booking_id,
+                        payment_stage, status_source, source_di_document_id, receipt_number, receipt_date,
+                        payment_mode_code) VALUES (:t, :j, 21000, :b, 'BOOKING', 'EVIDENCE', :d, :n, :rd, 'NEFT')"""),
+                          {"t": dealer.tenant_id, "j": jid, "b": booking, "d": document, "n": f"R-{name}-{n}",
+                           "rd": day})
+            return str(jid)
+
+        journey("FORM", form=today - timedelta(days=3), receipts=(today - timedelta(days=30),))
+        journey("RECEIPT", form=None, receipts=(today - timedelta(days=2), today - timedelta(days=1)))
+        journey("NEITHER", form=None, receipts=())
+        journey("LASTMONTH", form=None, receipts=(today - timedelta(days=40),))
+        figures = verigence_figures(c, dealer.tenant_id, [{"outlet_id": dealer.outlet_id}],
+                                    today - timedelta(days=10), today, today, today)[dealer.outlet_id]
+    # FORM on its form date; RECEIPT on its first receipt; LASTMONTH's first receipt is out of
+    # the days; NEITHER, and the fixture's undated LATERGP / OCTOBER (uploaded today), are not
+    # bookings of any day -- never dated by their upload.
+    assert figures["bookingInVerigence"] == 2
+    assert figures["bookingDatedByReceipt"] == 1
+    assert figures["bookingDateNotRead"] == 3
+
+
 def test_a_rebuilt_report_keeps_the_dealerships_it_was_made_for():
     """2026-11-22: a report generated for one dealership came back covering every dealership its
     author covers."""
