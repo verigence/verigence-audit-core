@@ -160,17 +160,22 @@ def test_same_vehicle_is_stricter_than_a_word_in_common() -> None:
     assert not same_vehicle("XEV 9S", "XUV 3XO")
 
 
-def test_journey_360_shows_the_dms_enquiry_number_when_the_papers_have_none(setup) -> None:  # noqa: F811
+def test_journey_360_shows_the_dms_enquiry_number_and_the_dms_pin(setup) -> None:  # noqa: F811
     from audit_core.uc03_p2_journey360 import vehicle
 
     s = setup
     _document(s, "booking_form", booking_reference_number="B-77700051", customer_phone="9000000105")
+    aadhaar = _document(s, "aadhaar", stage="BOOKING", address_pincode="759120")
     _dump(s, dumps.BOOKING, [{**_BOOKING_ROW, "booking_number": "B-77700051", "otf": "OTF27A000051",
-                              "mobile": "9000000105", "raw": {"ENQUIRY NUMBER": "EN-0038000051"}}])
+                              "mobile": "9000000105", "raw": {"ENQUIRY NUMBER": "EN-0038000051",
+                                                              "CUSTOMER MAILINGPOSTALCODE": "751024"}}])
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
         booking = vehicle(connection, tenant_id=s.journey.tenant_id, journey_id=s.journey.journey_id)["booking"]
     assert (booking["enquiryNumber"], booking["enquiryNumberFromDms"]) == ("EN-0038000051", True)
+    # The DMS PIN beside the KYC's, which stands.
+    assert booking["dmsPin"] == "751024"
+    assert _value(s, aadhaar, "address_pincode") == "759120"
 
 
 def test_the_vin_written_is_the_dms_vin_or_the_paper_s_with_the_dms_last_characters() -> None:
