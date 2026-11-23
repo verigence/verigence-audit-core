@@ -194,3 +194,12 @@ def test_the_vin_written_is_the_dms_vin_or_the_paper_s_with_the_dms_last_charact
     # Another vehicle's chassis (an exchange car's RC): left as it is.
     assert vin_target("MA3ZZZZZZZ0738728", "T2J84218") is None
     assert vin_target("MA1AAAAAAAB12345X", "MA1ZZZZZZZB123456") is None
+
+
+def test_the_invoice_number_written_corrects_a_misreading_only() -> None:
+    from audit_core.uc03_p2_dms_field_sync import invoice_target
+
+    assert invoice_target("INV21A000351", "INV27A000351") == "INV27A000351"
+    assert invoice_target("INV270000221", "INV27Q000221") == "INV27Q000221"
+    assert invoice_target("INV27A0003832", "INV27A003832") == "INV27A003832"  # a character too many
+    assert invoice_target("INV27A003342", "INV27A003576") is None  # another invoice

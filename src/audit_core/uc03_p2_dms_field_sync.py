@@ -191,8 +191,25 @@ def _invoice(row: dict[str, Any]) -> str | None:
     return value if value and len(_alnum(value)) >= 5 else None
 
 
+def _edits(a: str, b: str) -> int:
+    """Characters to change, add or drop to make one into the other (Levenshtein)."""
+    row = list(range(len(b) + 1))
+    for i, x in enumerate(a, start=1):
+        prev, row[0] = row[0], i
+        for j, y in enumerate(b, start=1):
+            prev, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev + (x != y))
+    return row[-1]
+
+
 def _invoice_agrees(read: str, dms: str) -> bool:
     return _alnum(read) == _alnum(dms)
+
+
+def invoice_target(read: str, dms: str) -> str | None:
+    """The DMS invoice number, only over a misreading of it (at most two characters changed,
+    added or dropped: INV27A... read INV21A..., INV270... for INV27O...). A number differing
+    more is another invoice and is left."""
+    return dms if 0 < _edits(_alnum(read), _alnum(dms)) <= VIN_MISREAD_CHARACTERS else None
 
 
 RULES: dict[str, tuple[FieldRule, ...]] = {
@@ -209,7 +226,8 @@ RULES: dict[str, tuple[FieldRule, ...]] = {
     # dump we dont need sales consultant name ... we need to verify DMS invoice number and
     # chasis/VIN number").
     DELIVERY: (
-        FieldRule("invoice_number", ("customer_invoice_dms",), _invoice, _invoice_agrees),
+        FieldRule("invoice_number", ("customer_invoice_dms",), _invoice, _invoice_agrees,
+                  target=lambda read, dms: invoice_target(read, dms["value"])),
         FieldRule("vin_number", CHASSIS_DOCS, _chassis, _chassis_agrees,
                   target=lambda read, dms: vin_target(read, dms["value"])),
         FieldRule("chassis_number", CHASSIS_DOCS, _chassis, _chassis_agrees,
@@ -318,5 +336,5 @@ def apply_field_fixes(connection: Connection, *, tenant_id: str, dump: dict[str,
     return applied
 
 
-__all__ = ["CHASSIS_DOCS", "RULES", "VIN_MISREAD_CHARACTERS", "apply_field_fixes", "otf_target", "plan_field_fixes", "same_vehicle",
+__all__ = ["CHASSIS_DOCS", "RULES", "VIN_MISREAD_CHARACTERS", "apply_field_fixes", "invoice_target", "otf_target", "plan_field_fixes", "same_vehicle",
            "trusted", "vin_target"]
