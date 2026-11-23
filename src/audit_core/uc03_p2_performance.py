@@ -66,7 +66,6 @@ from audit_core.uc03_p2_dashboard import WIDGETS as DASHBOARD_WIDGETS
 from audit_core.uc03_p2_dashboard import build as build_dashboard
 from audit_core.uc03_p2_project_tracker import (
     _ADMIN_ROLES,
-    _CLOSING_EVENTS,
     _FALLBACK_TIMEZONE,
     _MEMBER_ROLES,
     _REPORT_ROLES,
@@ -75,6 +74,7 @@ from audit_core.uc03_p2_project_tracker import (
     _zone,
     period_bounds,
 )
+from audit_core.uc03_p2_tasks_closed import tasks_closed_rows
 
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-performance"])
 
@@ -227,16 +227,7 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
           AND q.last_error LIKE 'DI\\_QUALITY\\_%' AND q.queue_status IN ('FAILED', 'DEAD_LETTER', 'CANCELLED')
         GROUP BY 1, 2, 3
     """), params).mappings().all(), "pagesRejected")
-    put(connection.execute(text("""
-        SELECT te.actor_id AS actor, (te.created_at_utc AT TIME ZONE :tz)::date AS day,
-               COALESCE(tk.outlet_id, j.outlet_id) AS outlet, count(DISTINCT te.task_id) AS n
-        FROM auditcore.p2_task_events te
-        JOIN auditcore.p2_tasks tk ON tk.tenant_id = te.tenant_id AND tk.task_id = te.task_id
-        LEFT JOIN auditcore.journeys j ON j.tenant_id = tk.tenant_id AND j.journey_id = tk.journey_id
-        WHERE te.tenant_id = :t AND te.created_at_utc >= :s AND te.created_at_utc < :e
-          AND te.actor_id IS NOT NULL AND upper(te.actor_id) <> 'SYSTEM' AND te.event_type = ANY(:closing)
-        GROUP BY 1, 2, 3
-    """), {**params, "closing": sorted(_CLOSING_EVENTS)}).mappings().all(), "tasksClosed")
+    put(tasks_closed_rows(connection, tenant_id=tenant_id, start=start, end=end, tz=tz), "tasksClosed")
     put(connection.execute(text("""
         SELECT actor, day, outlet, count(*) AS n FROM (
           SELECT reviewed_by_actor_id AS actor, (reviewed_at_utc AT TIME ZONE :tz)::date AS day, outlet_id AS outlet
@@ -416,17 +407,23 @@ def _sections(part: Any, data: dict[str, Any], *, rows: list[dict[str, Any]], ou
         no_issues = {"duplicates": dict.fromkeys(("direct", "bulk", "drive"), 0),
                      "errors": dict.fromkeys(("direct", "bulk", "drive"), 0)}
 
-        def by_channel(source: dict[str, Any], problems: dict[str, Any]) -> dict[str, Any]:
+        def by_channel(source: dict[str, Any], problems: dict[str, Any], journeys: dict[str, Any]) -> dict[str, Any]:
             return {**{c: [source.get(c, {}).get(d, 0) for d in iso] for c in ("direct", "bulk", "drive")},
-                    "duplicates": dict(problems["duplicates"]), "errors": dict(problems["errors"])}
+                    "duplicates": dict(problems["duplicates"]), "errors": dict(problems["errors"]),
+                    # Journeys by channel, new and updated, per day (product owner 2026-11-23).
+                    "journeys": {c: {k: [journeys.get(c, {}).get(k, {}).get(d, 0) for d in iso]
+                                     for k in ("new", "updated")} for c in ("direct", "bulk", "drive")}}
 
+        j_outlet, j_person = ch.get("journeysByOutlet", {}), ch.get("journeysByPerson", {})
         out["uploads"] = {
             "outlets": [] if own else [
                 {**place(o), **by_channel(ch["byOutlet"].get(str(o["outlet_id"]), {}),
-                                          issues["byOutlet"].get(str(o["outlet_id"]), no_issues))}
+                                          issues["byOutlet"].get(str(o["outlet_id"]), no_issues),
+                                          j_outlet.get(str(o["outlet_id"]), {}))}
                 for o in outlets],
             "people": [{"actorId": a, "name": names[a], "role": people[a]["role"],
-                        **by_channel(ch["byPerson"].get(a, {}), issues["byPerson"].get(a, no_issues))}
+                        **by_channel(ch["byPerson"].get(a, {}), issues["byPerson"].get(a, no_issues),
+                                     j_person.get(a, {}))}
                        for a in visible if people[a]["role"] == "PC"],
         }
 
@@ -862,6 +859,33 @@ def get_performance(
         days = min(MAX_DAYS, (day - first).days + 1)
     return build_performance(connection, tenant_id=tenant_id, actor_id=human_principal.subject, day=day,
                              days=days, admin=admin, own=not team, section=section, month=month)
+
+
+@router.get("/reports/pc-day")
+def get_pc_day(
+    tenant_id: str,
+    human_principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    authorization_client: Annotated[
+        SecurityAuthorizationClient, Depends(get_security_authorization_client)
+    ],
+    connection: Annotated[Connection, Depends(get_connection)],
+    day: Annotated[date | None, Query(alias="date")] = None,
+) -> dict[str, Any]:
+    """Every PC's day in one window (uc03_p2_pc_day): a Team Lead, PM, Executive or Project
+    administrator, for the PCs of their outlets. Time on Verigence for an Executive or
+    administrator only."""
+    from audit_core.uc03_p2_pc_day import build_pc_day
+
+    access = authorize_p2(
+        connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,
+        authorization_client=authorization_client, permission_key=_READ_PERMISSION,
+    )
+    admin = (access.functional_role or "").upper() in _ADMIN_ROLES
+    if not admin and not _holds(connection, tenant_id, human_principal.subject, _REPORT_ROLES):
+        raise AuthorizationError(error_code="VAC-AUTH-002", status_code=403, title="Permission denied")
+    executive = admin or "EXECUTIVE" in _caller_roles(connection, tenant_id, human_principal.subject)
+    return build_pc_day(connection, tenant_id=tenant_id, actor_id=human_principal.subject, day=day, admin=admin,
+                        show_activity=executive)
 
 
 # --------------------------------------------------------------------------- SuperAdmin settings

@@ -508,4 +508,14 @@ def admin_di_dashboard(tenant_id: str, admin: Admin, connection: Db, start: From
     return _di_dashboard(connection, tenant_id=tenant_id, caller=caller, start=start, end=end)
 
 
+@admin_router.get("/pc-day")
+def admin_pc_day(tenant_id: str, admin: Admin, connection: Db, day: Day = None) -> dict[str, Any]:
+    """Every PC's day in one window, for the Superadmin (uc03_p2_pc_day), time on Verigence included."""
+    from audit_core.uc03_p2_pc_day import build_pc_day
+
+    caller = _admin_caller(connection, tenant_id=tenant_id, admin=admin)
+    return _run(lambda: build_pc_day(connection, tenant_id=tenant_id, actor_id=caller.actor_id, day=day, admin=True,
+                                     show_activity=True))
+
+
 __all__ = ["admin_router", "router"]

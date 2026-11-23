@@ -595,3 +595,79 @@ def test_new_bookings_new_deliveries_and_journeys_updated(setup):
     assert (flow["bookings"], flow["deliveries"], flow["updated"]) == (1, 1, 2)
     mine = next(p for p in report["uploads"]["people"] if p["actorId"] == me)
     assert mine["duplicates"]["direct"] == 1
+
+
+def test_new_journeys_and_updates_by_channel_and_every_pcs_day(setup):
+    """Product owner 2026-11-23: the channel table shows new Journeys and updates to existing
+    Journeys; the engagement report and the PCs' day window read the same rules, so they tally
+    with the Project Tracker. (The figures are compared before and after: the set-up has its own.)"""
+    from audit_core.engagement_reports import build_engagement
+    from audit_core.uc03_p2_pc_day import build_pc_day
+
+    s = setup
+    outlet = str(s.journey.outlet_id)
+    me = s.journey.actor_id
+    today = datetime.now(IST).date()
+    earlier = datetime.now(UTC) - timedelta(days=3)
+    tl = f"tl-{uuid4().hex[:6]}"
+    tt._role(s, tl, "TL")
+
+    def figures() -> dict:
+        report = _build(s, tl, section="uploads")
+        mine = next((p for p in report["uploads"]["people"] if p["actorId"] == me), None)
+        with s.journey.engine.begin() as connection:
+            set_tenant_context(connection, s.journey.tenant_id)
+            engagement = build_engagement(connection, tenant_id=s.journey.tenant_id, start_day=today, end_day=today)
+            lead = build_pc_day(connection, tenant_id=s.journey.tenant_id, actor_id=tl, day=today, admin=False,
+                                show_activity=False, use_cache=False)
+            superadmin = build_pc_day(connection, tenant_id=s.journey.tenant_id, actor_id="admin", day=today,
+                                      admin=True, show_activity=True, use_cache=False)
+        t = next((p for p in engagement["people"] if p["actorId"] == me), {"totals": {}})["totals"]
+        row = next(r for r in lead["people"] if r["actorId"] == me)
+        out = {f"{c}.{k}": sum(mine["journeys"][c][k]) if mine else 0
+               for c in ("direct", "bulk", "drive") for k in ("new", "updated")}
+        out.update({f"files.{c}": sum(mine[c]) if mine else 0 for c in ("direct", "bulk", "drive")})
+        out.update({f"eng.{k}": t.get(k, 0) for k in ("newBookings", "newDeliveries", "journeysUpdated",
+                                                      "filesUploaded")})
+        out.update({f"day.{k}": v for k, v in row["journeys"].items()})
+        out.update({f"dayfiles.{k}": v for k, v in row["files"].items()})
+        out["row"], out["lead"], out["admin_row"] = row, lead, next(r for r in superadmin["people"] if r["actorId"] == me)
+        return out
+
+    before = figures()
+    direct_new = tt._journey(s, outlet, me)                  # a new booking, two files on its own
+    _uploads(s, me, direct_new, 2)
+    bulk_new = tt._journey(s, outlet, me)                    # a new booking from a folder upload
+    batch, _ = add_batch_pages(SimpleNamespace(**{**s.journey.__dict__, "journey_id": bulk_new}),
+                               [("booking_form", "READY")])
+    tt._bulk_source(s, batch, "WEB")
+    topped = tt._journey(s, outlet, me)                      # booked earlier, a Drive file today: an update
+    tt._exec(s, "UPDATE auditcore.journeys SET created_at_utc=:at WHERE tenant_id=:t AND journey_id=:j",
+             at=earlier, j=topped)
+    _uploads(s, me, topped, 1, at=earlier)
+    batch, _ = add_batch_pages(SimpleNamespace(**{**s.journey.__dict__, "journey_id": topped}),
+                               [("pan", "READY")])
+    tt._bulk_source(s, batch, "DRIVE")
+    after = figures()
+
+    def grew(key: str) -> int:
+        return after[key] - before[key]
+
+    # The Tracker's section covers the 14 days to today: the Journey booked three days ago is a new
+    # booking there (direct), and today's Drive file an update. Each Journey once a day, under the
+    # channel of its first file; files stay files.
+    assert (grew("direct.new"), grew("direct.updated")) == (2, 0)
+    assert (grew("bulk.new"), grew("bulk.updated")) == (1, 0)
+    assert (grew("drive.new"), grew("drive.updated")) == (0, 1)
+    assert (grew("files.direct"), grew("files.bulk"), grew("files.drive")) == (3, 1, 1)
+    # The day itself in the engagement report and the PCs' day window: the same Journeys and files.
+    assert (grew("eng.newBookings"), grew("eng.newDeliveries"), grew("eng.journeysUpdated")) == (2, 0, 1)
+    assert grew("eng.filesUploaded") == 4
+    assert (grew("day.bookings"), grew("day.deliveries"), grew("day.updated")) == (2, 0, 1)
+    assert (grew("dayfiles.direct"), grew("dayfiles.bulk"), grew("dayfiles.drive"), grew("dayfiles.total")) == (2, 1, 1, 4)
+    assert (after["day.bookings"], after["day.updated"]) == (after["eng.newBookings"], after["eng.journeysUpdated"])
+    row = after["row"]
+    assert row["seen"] and row["didWork"] and any(o["outletId"] == outlet for o in row["outlets"])
+    # Time on Verigence: Executive and Superadmin only.
+    assert "activity" not in row and after["lead"]["showsActivity"] is False
+    assert "activity" in after["admin_row"] and after["admin_row"]["journeys"] == row["journeys"]

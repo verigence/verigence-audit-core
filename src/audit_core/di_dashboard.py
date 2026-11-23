@@ -169,6 +169,9 @@ def build_di_dashboard(connection: Connection, *, tenant_id: str, start_day: dat
     for unit in units:
         units_by_file[unit["batch_id"]].append(dict(unit))
 
+    # Files per PC, next to the documents DI read from them (product owner 2026-11-23: the DI
+    # numbers "don't tally" -- a file is what the PC uploaded, a document what DI read in it).
+    files_by_pc: dict[str, int] = defaultdict(int)
     for f in files:
         d = days[f["day"].isoformat()]
         if f["batch_status"] == "CANCELLED" and not (f["page_count"] or 0) and f["sha256"]:
@@ -178,6 +181,7 @@ def build_di_dashboard(connection: Connection, *, tenant_id: str, start_day: dat
             d["notUploadedFiles"] += 1
             continue
         d["files"] += 1
+        files_by_pc[str(f["uploaded_by_actor_id"] or "")] += 1
         d["pages"] += int(f["page_count"] or 0)
         if f["size_bytes"]:
             d["_bytes"].append(float(f["size_bytes"]))
@@ -288,7 +292,7 @@ def build_di_dashboard(connection: Connection, *, tenant_id: str, start_day: dat
     for actor, v in by_pc.items():
         if not actor:
             continue
-        pcs.append({"actorId": actor, "name": names.get(actor), **v,
+        pcs.append({"actorId": actor, "name": names.get(actor), "files": files_by_pc.get(actor, 0), **v,
                     "badScanPct": round(100 * v["badScans"] / v["documents"], 1) if v["documents"] else None,
                     "readFirstPct": round(100 * v["readFirst"] / v["documents"], 1) if v["documents"] else None})
     pcs.sort(key=lambda p: (-(p["badScanPct"] or 0), -p["documents"]))

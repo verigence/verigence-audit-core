@@ -97,6 +97,10 @@ def _empty() -> dict[str, Any]:
         "hourlyActiveMinutes": [0] * 24,
         "journeysStarted": 0, "filesUploaded": 0, "pagesUploaded": 0, "badScans": 0, "notReadInTime": 0,
         "journeyTasksWorked": 0, "taskActions": 0,
+        # The Project Tracker's rules (product owner 2026-11-23, "doesn't tally"): Journeys as new
+        # bookings, new deliveries or updated (uc03_p2_upload_kind), and the tasks the person
+        # closed (uc03_p2_tasks_closed), next to the files and the tasks worked.
+        "newBookings": 0, "newDeliveries": 0, "journeysUpdated": 0, "tasksClosed": 0,
         "tasksAssigned": 0, "tasksCompleted": 0, "tasksCompletedOnTime": 0, "sendBacksReceived": 0,
         "reviewsDone": 0,
         # Days with minute detail only (2026-11-16): active minutes there, how many were followed by
@@ -245,6 +249,15 @@ def build_engagement(connection: Connection, *, tenant_id: str, start_day: date,
         c["journeyTasksWorked"] += int(row["tasks"])
         c["taskActions"] += int(row["actions"])
 
+    from audit_core.uc03_p2_tasks_closed import tasks_closed_rows
+    from audit_core.uc03_p2_upload_kind import BOOKING, DELIVERY, upload_days
+
+    kind_key = {BOOKING: "newBookings", DELIVERY: "newDeliveries"}
+    for row in upload_days(connection, tenant_id=tenant_id, start=start, end=end, tz="Asia/Kolkata"):
+        if row["person"]:
+            cell(row["person"], row["day"])[kind_key.get(row["kind"], "journeysUpdated")] += 1
+    for row in tasks_closed_rows(connection, tenant_id=tenant_id, start=start, end=end, tz="Asia/Kolkata"):
+        cell(row["actor"], row["day"])["tasksClosed"] += int(row["n"])
     minute_rows: dict[tuple[str, date], list[dict[str, Any]]] = defaultdict(list)
     for row in connection.execute(text("""
         SELECT actor_id, activity_date, client_kind, active_seconds, idle_seconds, background_seconds,
@@ -285,7 +298,7 @@ def build_engagement(connection: Connection, *, tenant_id: str, start_day: date,
             if last is not None:
                 c["_lastClock"].append(_clock(last))
             did_work = (c["activeMinutes"] or c["filesUploaded"] or c["journeyTasksWorked"]
-                        or c["tasksCompleted"] or c["journeysStarted"] or c["reviewsDone"])
+                        or c["tasksCompleted"] or c["journeysStarted"] or c["reviewsDone"] or c["tasksClosed"])
             c["daysActive"] = 1 if did_work else 0
 
     span = [start_day + timedelta(days=i) for i in range((end_day - start_day).days + 1)]
@@ -368,6 +381,10 @@ def build_engagement(connection: Connection, *, tenant_id: str, start_day: date,
             engagement_rule_note(settings),
             (f"A session is a stretch of use with no break of {SESSION_GAP_MINUTES} minutes or more. Sessions are "
              "counted from 27 Oct 2026; days before show time but no sessions."),
+            ("New bookings, new deliveries and Journeys updated follow the Project Tracker's rule: a Journey "
+             "counts once a day for the person who uploaded, as a new booking, its first delivery files, or an "
+             "update. Files are every file uploaded. Tasks worked: Journey tasks acted on in any way plus Task "
+             "Manager tasks done; tasks closed: the tasks the person closed, as on the Project Tracker."),
             ("Efficacy figures are plain ratios: files and tasks per active hour, tasks closed on time, the share "
              "of uploaded pages refused as bad scans, days active out of working days (Monday to Saturday)."),
             ("Time measures interaction, not work: read it next to the output. Minutes since the last send are "
