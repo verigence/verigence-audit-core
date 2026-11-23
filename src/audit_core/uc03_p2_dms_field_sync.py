@@ -164,14 +164,24 @@ def _chassis_agrees(read: str, dms: str) -> bool:
     return r == d if len(d) >= 17 else r.endswith(d)
 
 
+# A chassis read differing from the DMS's in more characters than this is another vehicle's
+# (the exchange car's RC, another car's accessory invoice), not a misreading of this one's.
+VIN_MISREAD_CHARACTERS = 2
+
+
+def _misread(read: str, dms: str) -> bool:
+    return len(read) == len(dms) and 0 < sum(a != b for a, b in zip(read, dms, strict=True)) <= VIN_MISREAD_CHARACTERS
+
+
 def vin_target(read: str, dms: str) -> str | None:
-    """The VIN to write: the DMS's when it gives the full VIN; when it gives only the last
-    characters, the paper's VIN with those characters replaced -- only on a full 17-character
-    VIN read, else nothing."""
+    """The VIN to write, only over a misreading of this vehicle's (at most two characters
+    different): the DMS's full VIN; where the DMS gives only the last characters, the paper's
+    17-character VIN with those characters replaced. A paper whose chassis differs more is
+    another vehicle's (live, 23 Nov 2026: the exchange car's RC read as the chassis) and is left."""
     r, d = _alnum(read), _alnum(dms)
     if len(d) >= 17:
-        return d
-    if len(r) == 17 and 6 <= len(d) < 17:
+        return d if _misread(r, d) else None
+    if len(r) == 17 and 6 <= len(d) < 17 and _misread(r[-len(d):], d):
         return r[:17 - len(d)] + d
     return None
 
@@ -308,5 +318,5 @@ def apply_field_fixes(connection: Connection, *, tenant_id: str, dump: dict[str,
     return applied
 
 
-__all__ = ["CHASSIS_DOCS", "RULES", "apply_field_fixes", "otf_target", "plan_field_fixes", "same_vehicle",
+__all__ = ["CHASSIS_DOCS", "RULES", "VIN_MISREAD_CHARACTERS", "apply_field_fixes", "otf_target", "plan_field_fixes", "same_vehicle",
            "trusted", "vin_target"]

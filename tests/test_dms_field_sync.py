@@ -124,13 +124,16 @@ def test_a_trusted_delivery_match_corrects_the_dms_invoice_number_and_the_vin(se
     invoice = _document(s, "customer_invoice_dms", stage="DELIVERY", invoice_number="INV-2600l234",
                         vin_number="MA1XXAAAAT2K5563B")
     gate = _document(s, "gate_pass", stage="DELIVERY", vin_number="MA1XXAAAAT2K5563B")
-    # The sheet prints the chassis's last 8 characters, the paper read one of them wrong.
+    # The sheet prints the chassis's last 8 characters, the paper read one of them wrong; the
+    # exchange car's RC prints another vehicle's chassis and is left.
+    rc = _document(s, "vehicle_rc", stage="DELIVERY", chassis_number="MA3ZZZZZZZ0738728")
     row = {"booking_number": "B-77700031", "name": "P2 Customer", "model": "THAR ROXX", "chassis": "T2K55631",
            "consultant": "TEST KUMAR TESTER", "invoice": "INV-26001234"}
     _dump(s, dumps.DELIVERY, [row])
     assert _value(s, invoice, "invoice_number") == "INV-26001234"
     assert _value(s, invoice, "vin_number") == "MA1XXAAAAT2K55631"
     assert _value(s, gate, "vin_number") == _value(s, invoice, "vin_number")
+    assert _value(s, rc, "chassis_number") == "MA3ZZZZZZZ0738728"
     assert _value(s, docket, "sales_person") == "Someone Wrong"  # the delivery dump's consultant is not taken
     assert _synced(s) == ["invoice_number", "vin_number", "vin_number"]
 
@@ -184,6 +187,10 @@ def test_the_vin_written_is_the_dms_vin_or_the_paper_s_with_the_dms_last_charact
 
     assert CHASSIS_DOCS == CHASSIS_DOCUMENT_TYPES
     assert vin_target("MA1AAAAAAAAB12345X", "B1234567") is None  # 18 read: not a VIN
-    assert vin_target("MA1AAAAAAAB12345X", "B1234567") == "MA1AAAAAAB1234567"
-    assert vin_target("MA1AAAAAAAB12345X", "MA1ZZZZZZZB123456") == "MA1ZZZZZZZB123456"
+    assert vin_target("MA1AAAAAAB123456X", "B1234567") == "MA1AAAAAAB1234567"  # one character misread
+    assert vin_target("MA1AAAAAAZ123456X", "B1234567") == "MA1AAAAAAB1234567"  # two
+    assert vin_target("MA1AAAAAAAB12345X", "MA1AAAAAAAB123456") == "MA1AAAAAAAB123456"
     assert vin_target("B12345X", "B1234567") is None
+    # Another vehicle's chassis (an exchange car's RC): left as it is.
+    assert vin_target("MA3ZZZZZZZ0738728", "T2J84218") is None
+    assert vin_target("MA1AAAAAAAB12345X", "MA1ZZZZZZZB123456") is None
