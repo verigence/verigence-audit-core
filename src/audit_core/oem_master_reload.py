@@ -1357,6 +1357,183 @@ def load_november_consumer_tenant(connection: Connection, *, tenant_id: str, tag
             "consumerRowsPerModelOn2026-11-10": dict(sorted(per_model.items()))}
 
 
+# 23 Nov 2026 (product owner: "fix what can be fixed" from the bulletins).
+# September's and October's consumer bulletins were loaded before the reader
+# split a cell like "MAXX HD 1.7 LX & CBC" into its two variants (21 Nov, with
+# November's load): they stand for the CBC variant only, and the plain LX --
+# which the bulletin names and the price list carries -- has no offer, so
+# its discount reads "scheme to be mapped". The two files are read again with
+# today's reader and published again on their dates: only what the bulletin
+# prints and the price list carries is applied, nothing else changes.
+# October stands until the day before November's bulletin (w.e.f. 4 Nov):
+# a row October prints and November does not must not answer in November.
+CONSUMER_REREAD_PLAN: tuple[tuple[str, date, date, date], ...] = (
+    # file, in force from, the last day the document prints, in force to
+    ("2026-09/Consumer Scheme Bhubaneswar RO_Sep'26.pdf", date(2026, 9, 3), date(2026, 9, 30), date(2026, 9, 30)),
+    ("2026-10/Consumer Scheme Bhubaneswar RO_Oct'26.pdf", date(2026, 10, 3), date(2026, 10, 31),
+     NOV_CONSUMER_FROM - timedelta(days=1)),
+)
+# What a deal reads on these dates is compared before and after.
+CONSUMER_REREAD_DATES = (date(2026, 9, 15), date(2026, 10, 15), date(2026, 11, 2))
+# November's consumer schemes are not touched.
+CONSUMER_REREAD_UNCHANGED = (NOV_CONSUMER_FROM, date(2026, 11, 10))
+# Each figure is the bulletin's own row for that variant.
+CONSUMER_REREAD_SPOT_CHECKS: tuple[tuple[str, str, date, str, Decimal], ...] = (
+    ("MAXX HD", "MAXX HD 1.7 LX BS6.2", date(2026, 9, 15), "CASH_DISCOUNT", Decimal(25000)),
+    ("MAXX HD", "MAXX HD 1.7 LX BS6.2", date(2026, 10, 15), "CASH_DISCOUNT", Decimal(22000)),
+    ("MAXX HD", "MAXX HD 1.7 LX BS6.2", date(2026, 10, 15), "ACCESSORIES_KIT", Decimal(5000)),
+    ("MAXX HD", "MAXX HD 1.7 LX CBC BS6.2", date(2026, 10, 15), "CASH_DISCOUNT", Decimal(22000)),
+    ("MAXX CITY", "MAXX CITY 1.3 LX BS6.2", date(2026, 9, 15), "CASH_DISCOUNT", Decimal(25000)),
+    ("MAXX CITY", "MAXX CITY 1.3 LX BS6.2", date(2026, 10, 15), "CASH_DISCOUNT", Decimal(23000)),
+    ("MAXX CITY", "MAXX CITY 1.5 LX BS6.2", date(2026, 10, 15), "CASH_DISCOUNT", Decimal(8000)),
+    ("MAXX HD", "MAXX HD 1.7 LX BS6.2", date(2026, 11, 2), "CASH_DISCOUNT", Decimal(22000)),
+    # unchanged rows still answer
+    ("XUV 3XO", "AX5 PM MT", date(2026, 9, 15), "CASH_DISCOUNT", Decimal(30000)),
+    ("MAXX HD", "MAXX HD 1.7 LX BS6.2", date(2026, 11, 10), "CASH_DISCOUNT", Decimal(22000)),
+)
+
+
+def _consumer_offers(connection: Connection, tenant_id: str, on: date) -> dict[tuple[str, str], dict[str, str]]:
+    """What each variant is offered by the consumer schemes standing on the
+    date: (model, variant) -> benefit -> amount. Rows of variants the price
+    list does not carry are left out (they apply to nothing)."""
+    rows = connection.execute(text(
+        """
+        WITH started AS (
+            SELECT DISTINCT ON (v.discount_scheme_id) v.discount_scheme_id, v.discount_scheme_version_id, v.effective_to
+            FROM auditcore.discount_scheme_versions v
+            JOIN auditcore.discount_schemes ds
+              ON ds.tenant_id = v.tenant_id AND ds.discount_scheme_id = v.discount_scheme_id
+            WHERE v.tenant_id = :t AND v.lifecycle_status = 'PUBLISHED' AND v.effective_from <= :on
+              AND ds.scheme_category = 'CONSUMER'
+            ORDER BY v.discount_scheme_id, v.effective_from DESC, v.created_at_utc DESC
+        )
+        SELECT pm.model_name, COALESCE(pv.variant_name, '(every variant)') AS variant_name, b.benefit_key, b.amount_value
+        FROM started s
+        JOIN auditcore.discount_scheme_eligibility e
+          ON e.tenant_id = :t AND e.discount_scheme_version_id = s.discount_scheme_version_id
+        JOIN auditcore.discount_scheme_benefits b
+          ON b.tenant_id = :t AND b.discount_scheme_version_id = s.discount_scheme_version_id
+        JOIN auditcore.product_models pm ON pm.model_id = e.model_id
+        LEFT JOIN auditcore.product_variants pv ON pv.variant_id = e.variant_id
+        WHERE (s.effective_to IS NULL OR s.effective_to >= :on)
+          AND COALESCE(e.criteria->>'scope', '') <> 'UNRESOLVED'
+        """
+    ), {"t": tenant_id, "on": on}).mappings().all()
+    offers: dict[tuple[str, str], dict[str, str]] = {}
+    for row in rows:
+        offers.setdefault((str(row["model_name"]), str(row["variant_name"])), {})[str(row["benefit_key"])] = str(
+            Decimal(str(row["amount_value"])).quantize(Decimal(1)))
+    return offers
+
+
+def _offer_changes(before: dict[tuple[str, str], dict[str, str]],
+                   after: dict[tuple[str, str], dict[str, str]]) -> dict[str, list[str]]:
+    def line(key: tuple[str, str], offer: dict[str, str]) -> str:
+        return f"{key[0]} / {key[1]}: " + ", ".join(f"{k} {v}" for k, v in sorted(offer.items()))
+
+    return {
+        "gained": sorted(line(k, after[k]) for k in after.keys() - before.keys()),
+        "lost": sorted(line(k, before[k]) for k in before.keys() - after.keys()),
+        "changed": sorted(f"{line(k, before[k])} -> {line(k, after[k])}"
+                          for k in before.keys() & after.keys() if before[k] != after[k]),
+    }
+
+
+def reread_consumer_bulletins_tenant(connection: Connection, *, tenant_id: str, tag: str,
+                                     store: bool) -> dict[str, Any]:
+    """September's and October's consumer bulletins read again, and every
+    check, on one open transaction (the caller commits or rolls back).
+
+    The result lists, for a date in each bulletin's month, every variant
+    that gains an offer, loses one or changes: a dry run is read against the
+    bulletins before the commit. A variant losing its offer, or one whose
+    figure changes, fails the run: the first load is not known to have
+    applied anything the bulletin does not print."""
+    from audit_core.oem_master_parsers import parse_master
+    from audit_core.oem_price_masters import ingest_discount_document
+    from audit_core.uc03_deal_reconciliation import _applicable_benefits
+
+    set_platform_super_admin_context(connection)
+    set_tenant_context(connection, tenant_id)
+    project = connection.execute(text(
+        "SELECT p.oem_id, o.oem_code FROM auditcore.projects p JOIN auditcore.oems o ON o.oem_id = p.oem_id "
+        "WHERE p.tenant_id = :t"), {"t": tenant_id}).mappings().one()
+    actor = f"worker:{tag}"[:160]
+    checks: list[dict[str, Any]] = []
+
+    def check(name: str, ok: bool, expected: Any, actual: Any) -> None:
+        checks.append({"check": name, "ok": bool(ok), "expected": expected, "actual": actual})
+
+    before = {on: _consumer_offers(connection, tenant_id, on)
+              for on in (*CONSUMER_REREAD_DATES, *CONSUMER_REREAD_UNCHANGED)}
+    uploads: list[dict[str, Any]] = []
+    for relative, start, printed_to, until in CONSUMER_REREAD_PLAN:
+        path = DATA_DIR / relative
+        content = path.read_bytes()
+        parsed = parse_master("CONSUMER_SCHEME", content, filename=path.name)
+        check(f"{path.name}: the dates the document prints",
+              parsed.effective_from_hint == start and parsed.effective_to_hint == printed_to,
+              f"{start} to {printed_to}", f"{parsed.effective_from_hint} to {parsed.effective_to_hint}")
+        check(f"{path.name}: every row reconciles", not parsed.errors, [], parsed.errors[:20])
+        # On its own date and again on any later date in its validity a
+        # consumer version was loaded on: the later upload on a date wins.
+        for on in [start, *_shadow_dates(connection, tenant_id, "CONSUMER_SCHEME", start, until)]:
+            upload_id = connection.execute(text(
+                """
+                INSERT INTO auditcore.oem_master_uploads (
+                    tenant_id, oem_code, master_kind, source_filename, source_sha256, effective_from, status,
+                    row_counts, preview, uploaded_by_actor_id
+                ) VALUES (:t, :oem, 'CONSUMER_SCHEME', :name, :sha, :eff, 'STAGED', CAST(:rows AS jsonb),
+                          CAST(:preview AS jsonb), :actor)
+                RETURNING upload_id
+                """
+            ), {"t": tenant_id, "oem": project["oem_code"], "name": path.name,
+                "sha": hashlib.sha256(content).hexdigest(), "eff": on,
+                "rows": json.dumps({"discountRows": len(parsed.discount_rows)}),
+                "preview": json.dumps({"reloadTag": tag, "warnings": parsed.warnings[:50]}),
+                "actor": actor}).scalar_one()
+            summary = ingest_discount_document(
+                connection, tenant_id=tenant_id, oem_id=project["oem_id"], oem_code=project["oem_code"],
+                master_kind="CONSUMER_SCHEME", effective_from=on, effective_to=until, parsed=parsed, actor_id=actor)
+            stored = _store_master_file(tenant_id=tenant_id, oem_code=project["oem_code"], kind="CONSUMER_SCHEME",
+                                        on=on, upload_id=upload_id, path=path, content=content) if store else None
+            connection.execute(text(
+                "UPDATE auditcore.oem_master_uploads SET status = 'PUBLISHED', published_at_utc = now(), "
+                "source_object_key = :key, discount_scheme_summary = CAST(:summary AS jsonb) "
+                "WHERE tenant_id = :t AND upload_id = :u"
+            ), {"key": stored, "summary": json.dumps(summary, default=str), "t": tenant_id, "u": upload_id})
+            uploads.append({"file": path.name, "effectiveFrom": on, "effectiveTo": until, "uploadId": upload_id,
+                            "stored": stored is not None, "published": summary.get("published"),
+                            "tombstoned": summary.get("tombstoned"),
+                            "unresolvedVariants": (summary.get("unresolvedVariants") or [])[:80]})
+
+    changes: dict[str, dict[str, list[str]]] = {}
+    for on in CONSUMER_REREAD_DATES:
+        changes[str(on)] = _offer_changes(before[on], _consumer_offers(connection, tenant_id, on))
+        check(f"no variant loses its consumer offer on {on}", not changes[str(on)]["lost"], [],
+              changes[str(on)]["lost"][:40])
+        check(f"no consumer offer changes its figure on {on}", not changes[str(on)]["changed"], [],
+              changes[str(on)]["changed"][:40])
+    for on in CONSUMER_REREAD_UNCHANGED:
+        moved = _offer_changes(before[on], _consumer_offers(connection, tenant_id, on))
+        check(f"November's consumer offers unchanged on {on}", not any(moved.values()), {},
+              {k: v[:20] for k, v in moved.items() if v})
+    for model, variant, on, key, amount in CONSUMER_REREAD_SPOT_CHECKS:
+        found = find_book_sku(connection, tenant_id=tenant_id, model_text=model, variant_text=variant, effective_on=on)
+        actual: Any = found["reason"]
+        if found["sku"]:
+            sku = connection.execute(text("SELECT model_id, variant_id FROM auditcore.product_skus "
+                                          "WHERE product_sku_id = :s"), {"s": found["sku"]["product_sku_id"]}).one()
+            benefits = _applicable_benefits(connection, tenant_id=tenant_id, model_id=sku[0], variant_id=sku[1],
+                                            effective_on=on, basis="INDIVIDUAL", variant_name=variant)
+            actual = next((Decimal(str(b["amount_value"])) for b in benefits if b["canonical_key"] == key), None)
+        check(f"{model} {variant} {key} on {on}", actual == amount, str(amount), str(actual))
+    for row in checks:
+        logger.info("oem_master_reload_check", tenant_id=tenant_id, tag=tag, **{k: str(v) for k, v in row.items()})
+    return {"checks": checks, "passed": all(c["ok"] for c in checks), "uploads": uploads, "offerChanges": changes}
+
+
 # Masters published for dates already past (the October bulletins, live from
 # 5 Nov) leave every deal of those dates on the masters it last read --
 # September's schemes for October and November deals on 5 Nov. After a
@@ -1364,6 +1541,8 @@ def load_november_consumer_tenant(connection: Connection, *, tenant_id: str, tag
 # earliest date the job published for is re-priced (the deal check itself,
 # ``sync_deal_reconciliation``), one Journey per transaction.
 def _job_starts(tag: str) -> date | None:
+    if "-consumerreread" in tag:
+        return min(start for _, start, _, _ in CONSUMER_REREAD_PLAN)
     if "-novconsumer" in tag:
         return NOV_CONSUMER_FROM
     if "-month" in tag:
@@ -1471,12 +1650,16 @@ def run_master_reload(engine: Engine, tag: str, *, tenant_ids: list[str] | None 
     "-octcarry" completes the October book (``complete_october_tenant``),
     "-month" loads the month's book and grid (``load_month_tenant``),
     "-novconsumer" November's consumer bulletin (``load_november_consumer_tenant``),
+    "-consumerreread" September's and October's consumer bulletins read again
+    (``reread_consumer_bulletins_tenant``),
     "-reprice" only runs the deal check again (``reprice_deals``), any
     other tag the price books."""
     commit = tag.endswith("-commit")
     if "-reprice" in tag:
         return _run_reprice_only(engine, tag, commit=commit, tenant_ids=tenant_ids)
-    if "-novconsumer" in tag:
+    if "-consumerreread" in tag:
+        job = reread_consumer_bulletins_tenant
+    elif "-novconsumer" in tag:
         job = load_november_consumer_tenant
     elif "-month" in tag:
         job = load_month_tenant
@@ -1527,8 +1710,15 @@ def run_master_reload(engine: Engine, tag: str, *, tenant_ids: list[str] | None 
 
 
 __all__ = [
-    "GRID_PLAN", "RELOAD_PLAN", "SCHEME_RELOAD_PLAN", "complete_october_tenant", "load_month_tenant",
+    "GRID_PLAN",
+    "RELOAD_PLAN",
+    "SCHEME_RELOAD_PLAN",
+    "complete_october_tenant",
+    "load_month_tenant",
     "load_november_consumer_tenant",
     "reload_grids_tenant",
-    "reload_schemes_tenant", "reload_tenant", "run_master_reload",
+    "reload_schemes_tenant",
+    "reload_tenant",
+    "reread_consumer_bulletins_tenant",
+    "run_master_reload",
 ]
