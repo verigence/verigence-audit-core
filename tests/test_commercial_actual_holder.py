@@ -82,8 +82,8 @@ def test_a_withdrawn_holder_blocks_no_new_writer(journey):
 
 
 def test_with_no_source_left_the_actual_is_cleared(journey):
-    sheet, ndc = _setup(journey)
-    _sql(journey, "UPDATE auditcore.evidence SET association_status='VOIDED' WHERE tenant_id=:t", )
+    _setup(journey)
+    _sql(journey, "UPDATE auditcore.evidence SET association_status='VOIDED' WHERE tenant_id=:t")
     assert _run(journey, reconcile_commercial_actuals) == 1
     line = _line(journey)
     assert line["actual_amount"] is None and line["source_reference"] is None
