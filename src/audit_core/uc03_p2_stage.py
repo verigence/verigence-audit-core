@@ -391,6 +391,16 @@ def statement_out_of_balance(values: dict[str, Any]) -> tuple[float, float, floa
     credits = [n for n in (_number(i.get("credit_amount")) for i in items) if n is not None]
     if not debits or not credits:
         return None
+    # The DMS printout prints every credit with a minus sign ("Money Receipt (Bank) ...
+    # -50,000", "Other Discount -5,000") and its balance as minus the excess: that is its
+    # convention, not a misreading (2026-11-23, ADI-RD-261101-051: debits Rs 11,86,208,
+    # credits Rs -11,92,789, balance Rs -6,581 -- it adds up). 39 of 63 printouts flagged
+    # "do not add up" added up once read that way; the rest stay flagged. An NDC form's
+    # negative total stays a misreading.
+    from audit_core.uc03_account_statement import is_dms_printout
+
+    if is_dms_printout(values.get("line_items")):
+        credits = [abs(n) for n in credits]
     total_debit, total_credit = sum(debits), sum(credits)
     read_balance = _number(values.get("balance_amount"))
     if total_debit < 0 or total_credit < 0:
