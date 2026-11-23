@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import json
+from datetime import date
 from uuid import uuid4
 
 from openpyxl import load_workbook
@@ -217,3 +218,23 @@ def test_a_booking_cancelled_in_verigence_takes_no_booking_row_but_its_chassis_s
     booking = {"booking_number": "B-66600011", "mobile": "9000044455", "customer_name": "Someone"}
     assert dumps.match_row(index, dumps.BOOKING, booking) == (None, None)
     assert dumps.match_row(index, dumps.DELIVERY, {"chassis": "MA1TESTCANCEL0001"}) == (mine, "CHASSIS")
+
+
+def test_an_older_dump_does_not_write_over_the_date_a_newer_dump_gives(setup) -> None:  # noqa: F811
+    """Two delivery dumps a day apart gave one Journey different delivery dates, and every
+    re-match wrote one and then the other, asking for the Journey's checks each time. The newer
+    dump's date stands: matching the older one again leaves it."""
+    s = setup
+    today = _today()
+    gate = _document(s, "gate_pass", stage="DELIVERY", delivery_date="2025-11-06", vin_number="MA1XX2T2K55618")
+    older = _dump(s, dumps.DELIVERY, [{"chassis": "T2K55618", "name": "X", "model": "XUV 3XO", "back": 3}], back=2)
+    assert _value(s, gate, "delivery_date") == date.fromordinal(today.toordinal() - 3).isoformat()
+    _dump(s, dumps.DELIVERY, [{"chassis": "T2K55618", "name": "X", "model": "XUV 3XO"}], back=1)
+    newer_date = date.fromordinal(today.toordinal() - 1).isoformat()
+    assert _value(s, gate, "delivery_date") == newer_date
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        dumps.match_dump(connection, tenant_id=s.journey.tenant_id, dump_id=older)
+    assert _value(s, gate, "delivery_date") == newer_date
+    assert _row(s, older)["date_sync"]["status"] == "NEWER_DUMP"
+    assert [e["new_value"] for e in _log(s) if e["field_key"] == "delivery_date"][-1] == newer_date

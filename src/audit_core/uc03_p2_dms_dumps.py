@@ -1074,16 +1074,44 @@ _DATE_COPIES_SQL = """
 """
 
 
+# The Journeys a newer dump of the same kind also gives a date for, on a sure match: that dump's
+# date stands, and an older dump's is not written over it. Two dumps a day apart once gave the
+# same Journeys different delivery dates, and every re-match wrote one date and then the other --
+# each time asking for the Journeys' checks again, which the second write then ran into.
+_NEWER_DUMP_DATE_SQL = """
+    SELECT DISTINCT CAST(r.journey_id AS text) AS journey_id
+    FROM auditcore.p2_dms_dump_rows r
+    JOIN auditcore.p2_dms_dumps u ON u.tenant_id = r.tenant_id AND u.dump_id = r.dump_id
+    WHERE r.tenant_id = :t AND u.status = 'ACTIVE' AND u.dump_kind = :k AND u.dump_id <> CAST(:id AS uuid)
+      AND (u.business_date > :bd OR (u.business_date = :bd AND u.uploaded_at_utc > :ua))
+      AND r.outcome = 'MATCHED' AND r.match_basis = :basis AND r.event_date IS NOT NULL
+      AND CAST(r.journey_id AS text) = ANY(:js)
+"""
+
+
+def _dated_by_newer_dump(connection: Connection, tenant_id: str, dump: dict[str, Any],
+                         journeys: list[str]) -> set[str]:
+    if not journeys or not dump.get("dump_id") or not dump.get("business_date"):
+        return set()
+    basis = "CHASSIS" if dump["dump_kind"] == DELIVERY else "BOOKING_NUMBER"
+    return {r[0] for r in connection.execute(text(_NEWER_DUMP_DATE_SQL), {
+        "t": tenant_id, "k": dump["dump_kind"], "id": str(dump["dump_id"]), "bd": dump["business_date"],
+        "ua": dump.get("uploaded_at_utc"), "basis": basis, "js": journeys})}
+
+
 def _sure_match_sync(connection: Connection, tenant_id: str, kind: str,
                      sure: list[tuple[dict[str, Any], str, dict[str, Any]]],
-                     updates: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+                     updates: dict[int, dict[str, Any]],
+                     dump: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """On each sure match: the model compared (listed when it differs) and the date the DMS gives
-    set against the papers' -- the corrections to make. Reads only."""
+    set against the papers' -- the corrections to make. Reads only. A date a newer dump of the
+    same kind also gives for the Journey is left to that dump."""
     from audit_core.uc03_p2_dates import parse_extracted_date, programme_today
 
     if not sure:
         return []
     field_key, documents = DATE_FIELDS[kind]
+    newer = _dated_by_newer_dump(connection, tenant_id, dump or {}, sorted({jid for _, jid, _ in sure}))
     copies: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in connection.execute(text(_DATE_COPIES_SQL), {
             "t": tenant_id, "js": sorted({jid for _, jid, _ in sure}), "fk": field_key, "docs": list(documents)}
@@ -1096,6 +1124,9 @@ def _sure_match_sync(connection: Connection, tenant_id: str, kind: str,
         u["md"] = not same_model(row.get("model"), journey.get("model"))
         day = row.get("event_date")
         if not isinstance(day, date) or day > programme_today():
+            continue
+        if jid in newer:
+            u["ds"] = {"status": "NEWER_DUMP", "field": field_key, "dms": day.isoformat()}
             continue
         own = copies.get(jid, [])
         # The delivery date: the gate pass's; the NDC's only when no gate pass is on file.
@@ -1171,8 +1202,8 @@ def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpP
     row would get. match_dump stores it; tools/dms_replay.py compares it across code versions
     on the live dumps before a change is merged (product owner 2026-11-21)."""
     dump = connection.execute(
-        text("SELECT dump_kind, dealer_id, period_month, business_date, file_name, uploaded_by, uploaded_by_name "
-             "FROM auditcore.p2_dms_dumps WHERE tenant_id = :t AND dump_id = :id"),
+        text("SELECT dump_id, dump_kind, dealer_id, period_month, business_date, file_name, uploaded_by, "
+             "uploaded_by_name, uploaded_at_utc FROM auditcore.p2_dms_dumps WHERE tenant_id = :t AND dump_id = :id"),
         {"t": tenant_id, "id": str(dump_id)},
     ).mappings().one()
     # Matching is Python work between statements of one transaction: past the pool's 60 s
@@ -1257,7 +1288,7 @@ def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpP
         u.setdefault("jm", None)
         u.setdefault("md", None)
         u.setdefault("ds", None)
-    date_fixes = _sure_match_sync(connection, tenant_id, kind, sure, {u["n"]: u for u in updates})
+    date_fixes = _sure_match_sync(connection, tenant_id, kind, sure, {u["n"]: u for u in updates}, dict(dump))
     return DumpPlan(dict(dump), updates, synced, counts, date_fixes)
 
 
