@@ -1,8 +1,8 @@
 """DMS dumps correct what the Journey's papers were read as (product owner 2026-11-23).
 
 "when we have delivery and booking information from DMS can we check and correct the wrong
-information captured in the Journey": the sales consultant, the OTF number, the enquiry number
-and the PIN code from the booking dump; the DMS invoice number and the chassis / VIN from the
+information captured in the Journey": the sales consultant, the OTF number and the enquiry number
+from the booking dump (not the PIN: the DMS's is the mailing address's, not the KYC's); the DMS invoice number and the chassis / VIN from the
 delivery dump. The DMS model and variant are not used ("ignore DMS Model"): the DMS names
 them as codes the price list does not use. The dates have their own path (uc03_p2_dms_dumps,
 _sure_match_sync) and are left as they are.
@@ -109,15 +109,6 @@ def _consultant(row: dict[str, Any]) -> str | None:
     return _text(row.get("consultant"))
 
 
-def _pin(row: dict[str, Any]) -> str | None:
-    digits = re.sub(r"\D", "", str(_raw(row, "CUSTOMER MAILINGPOSTALCODE") or ""))
-    return digits if re.fullmatch(r"[1-9]\d{5}", digits) else None
-
-
-def _pin_agrees(read: str, dms: str) -> bool:
-    return re.sub(r"\D", "", read) == dms
-
-
 def _enquiry(row: dict[str, Any]) -> str | None:
     value = _text(_raw(row, "ENQUIRY NUMBER", "ENQUIRY NO"))
     return value if enquiry_key(value) else None
@@ -200,9 +191,9 @@ RULES: dict[str, tuple[FieldRule, ...]] = {
         FieldRule("booking_reference_number", BOOKING_DOCS, _otf, _otf_agrees_read,
                   target=lambda read, dms: otf_target(read, dms["row"])),
         FieldRule("enquiry_number", BOOKING_DOCS, _enquiry, _enquiry_agrees),
-        # The PIN is read from the address KYC (product owner 2026-11-23).
-        FieldRule("address_pincode", ("aadhaar",), _pin, _pin_agrees),
-        FieldRule("pin_code", ("customer_kyc",), _pin, _pin_agrees),
+        # Not the PIN: the DMS's is the customer's mailing PIN, the KYC's the address on the
+        # document -- on the live dumps most differences were two addresses (another district
+        # or state), not a misreading, and writing the DMS's over the KYC would make it wrong.
     ),
     # The sales consultant is the booking dump's alone (product owner 2026-11-23: "from delivery
     # dump we dont need sales consultant name ... we need to verify DMS invoice number and

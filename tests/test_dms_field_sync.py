@@ -68,23 +68,22 @@ _BOOKING_ROW = {"booking_number": "B-77700021", "otf": "OTF27A019876", "name": "
                 "raw": {"ENQUIRY NUMBER": "EN-0038000002", "CUSTOMER MAILINGPOSTALCODE": "759124"}}
 
 
-def test_a_trusted_booking_match_corrects_the_consultant_otf_enquiry_and_pin(setup) -> None:  # noqa: F811
+def test_a_trusted_booking_match_corrects_the_consultant_otf_and_enquiry_not_the_pin(setup) -> None:  # noqa: F811
     s = setup
     docket, aadhaar = _booking_papers(s)
     dump_id = _dump(s, dumps.BOOKING, [_BOOKING_ROW])
     assert _value(s, docket, "booking_reference_number") == "OTF27A019876"  # the full OTF, same kind
     assert _value(s, docket, "sales_person") == "TEST KUMAR TESTER"
     assert _value(s, docket, "enquiry_number") == "EN-0038000002"
-    assert _value(s, aadhaar, "address_pincode") == "759124"
-    assert _synced(s) == ["address_pincode", "booking_reference_number", "enquiry_number", "sales_person"]
+    assert _value(s, aadhaar, "address_pincode") == "759120"  # the KYC's address stands
+    assert _synced(s) == ["booking_reference_number", "enquiry_number", "sales_person"]
     assert {f["field"]: f["status"] for f in _fields(s, dump_id)} == {
-        "address_pincode": "APPLIED", "booking_reference_number": "APPLIED", "enquiry_number": "APPLIED",
-        "sales_person": "APPLIED"}
+        "booking_reference_number": "APPLIED", "enquiry_number": "APPLIED", "sales_person": "APPLIED"}
     # Matched again: nothing more to correct.
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
         dumps.match_dump(connection, tenant_id=s.journey.tenant_id, dump_id=dump_id)
-    assert len(_synced(s)) == 4
+    assert len(_synced(s)) == 3
 
 
 def test_a_different_name_corrects_nothing(setup) -> None:  # noqa: F811
