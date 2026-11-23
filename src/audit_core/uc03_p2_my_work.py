@@ -9,8 +9,10 @@ all the assigned outlets and then weekly / monthly view, with a range of dates")
 PC
     journeysTotal       every Journey they ever opened at the outlet
     journeysUploaded    Journeys they uploaded a file to in the period
-    bookingsUploaded    of those, Journeys uploaded to while still at booking
-    deliveriesUpdated   of those, Journeys with a delivery page in those uploads
+    bookingsUploaded    of those, new Journeys (their first upload, no delivery page that day)
+    deliveriesUpdated   of those, new deliveries (the Journey's first delivery page came that day)
+    journeysUpdated     of those, Journeys documents were added to (neither of the above that day;
+                        product owner 2026-11-23, uc03_p2_upload_kind)
     duplicatesDeleted   Journeys they uploaded in the period that the system deleted as the
                         same file uploaded again (product owner 2026-11-12; from that day)
     journeysCompleted   their Journeys whose delivery file closed in the period, by the
@@ -195,33 +197,17 @@ def gate_register(connection: Connection, tenant_id: str, outlets: list[dict[str
 
 def _uploads(connection: Connection, *, tenant_id: str, actor_id: str, tz: str, start: date,
              end: date) -> list[dict[str, Any]]:
-    """Journeys the caller uploaded to in the period, per outlet and IST day, and whether any page of those
-    uploads was a delivery page (p2_document_queue.business_stage = 'DELIVERY'). The page's own stage
-    is used, not the Journey's stage trail: on live data most Journeys never recorded a stage change,
-    which counted 1 delivery where the PC had uploaded 73 (checked 2026-11-02). A Journey uploaded to
-    with no delivery page counts as a booking upload."""
-    return [dict(r) for r in connection.execute(
-        text(
-            """
-            WITH b AS (
-                SELECT (CAST(:a AS date))::timestamp AT TIME ZONE :tz AS s,
-                       (CAST(:b AS date) + 1)::timestamp AT TIME ZONE :tz AS e
-            )
-            SELECT ub.journey_id, j.outlet_id, CAST(ub.created_at_utc AT TIME ZONE :tz AS date) AS day,
-                   COALESCE(bool_or(q.business_stage = 'DELIVERY'), false) AS delivery
-            FROM auditcore.p2_upload_batches ub
-            CROSS JOIN b
-            JOIN auditcore.journeys j ON j.tenant_id=ub.tenant_id AND j.journey_id=ub.journey_id
-            LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id=ub.tenant_id AND q.batch_id=ub.batch_id
-            WHERE ub.tenant_id=:t AND ub.uploaded_by_actor_id=:me
-              AND ub.created_at_utc >= b.s AND ub.created_at_utc < b.e
-              AND ub.batch_status <> 'AWAITING_UPLOAD'
-              AND NOT (ub.batch_status='CANCELLED' AND ub.page_count=0)
-            GROUP BY ub.journey_id, j.outlet_id, CAST(ub.created_at_utc AT TIME ZONE :tz AS date)
-            """
-        ),
-        {"t": tenant_id, "me": actor_id, "tz": tz, "a": start, "b": end},
-    ).mappings().all()]
+    """Journeys the caller uploaded to in the period, per outlet and day, with what that day counts
+    as: a new booking, a new delivery or the Journey updated (product owner 2026-11-23,
+    uc03_p2_upload_kind -- the one rule every tracker reads)."""
+    from zoneinfo import ZoneInfo
+
+    from audit_core.uc03_p2_upload_kind import upload_days
+
+    zone = ZoneInfo(tz)
+    s = datetime.combine(start, datetime.min.time(), zone)
+    e = datetime.combine(end + timedelta(days=1), datetime.min.time(), zone)
+    return upload_days(connection, tenant_id=tenant_id, start=s, end=e, tz=tz, actor_id=actor_id)
 
 
 def _journeys_total(connection: Connection, *, tenant_id: str, actor_id: str) -> dict[str, int]:
@@ -402,12 +388,14 @@ def buckets(start: date, end: date, by: str = "day") -> list[tuple[date, date, s
     return out
 
 
-_PC_KEYS = ("journeysTotal", "journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "duplicatesDeleted",
+_PC_KEYS = ("journeysTotal", "journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "journeysUpdated",
+            "duplicatesDeleted",
             "journeysCompleted",
             "gateRegisterDays", "gateRegisterUploaded", "gateRegisterMissed", "registerTotal", "registerIntimated",
             "uploadedInTool", "pendingDeliveryFiles", "notIntimated", "tasksWorked", "tasksClosed", "tasksPending")
 # The figures of one row (a day, week or month) of one outlet.
-_PC_ROW_KEYS = ("journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "duplicatesDeleted", "journeysCompleted",
+_PC_ROW_KEYS = ("journeysUploaded", "bookingsUploaded", "deliveriesUpdated", "journeysUpdated", "duplicatesDeleted",
+                "journeysCompleted",
                 "gateRegisterDays", "gateRegisterUploaded", "registerTotal", "registerIntimated",
                 "uploadedInTool", "pendingDeliveryFiles", "tasksWorked", "tasksClosed")
 _REVIEWER_KEYS = ("journeysWorked", "reviewsClosed", "corrections", "tasksWorked", "tasksClosed", "tasksPending")
@@ -415,11 +403,13 @@ _REVIEWER_ROW_KEYS = ("journeysWorked", "reviewsClosed", "corrections", "tasksWo
 
 
 def _uploaded(uploads: list[dict[str, Any]]) -> dict[str, int]:
-    """Journeys uploaded to, of them bookings (no delivery page) and deliveries (a delivery page)."""
-    journeys = {str(u["journey_id"]) for u in uploads}
-    delivered = {str(u["journey_id"]) for u in uploads if u["delivery"]}
-    return {"journeysUploaded": len(journeys), "bookingsUploaded": len(journeys - delivered),
-            "deliveriesUpdated": len(delivered)}
+    """Journeys uploaded to; of them new bookings, new deliveries (bookingsUploaded and
+    deliveriesUpdated keep their names for the screens) and Journeys updated (documents added)."""
+    def of(kind: str) -> int:
+        return len({str(u["journey_id"]) for u in uploads if u["kind"] == kind})
+
+    return {"journeysUploaded": len({str(u["journey_id"]) for u in uploads}), "bookingsUploaded": of("booking"),
+            "deliveriesUpdated": of("delivery"), "journeysUpdated": of("updated")}
 
 
 def _tasks(worked: list[dict[str, Any]]) -> dict[str, int]:

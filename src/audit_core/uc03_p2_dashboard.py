@@ -247,6 +247,7 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
         counts = backlog["byPerson"].get(actor_id, {})
         bookings = [flow.get(d, {}).get("bookings", 0) for d in iso]
         deliveries = [flow.get(d, {}).get("deliveries", 0) for d in iso]
+        updated = [flow.get(d, {}).get("updated", 0) for d in iso]
         q = part("quality")["byPerson"].get(actor_id, {})
         pages = total(mine, "pagesUploaded")
         out["title"] = "My dashboard"
@@ -254,8 +255,9 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
             quality = quality_block(q, pages, _n(counts, "pagesToReupload"))
             tiles = []
             if measure("journeysUploaded"):
-                tiles += [kpi("bookings", "Bookings uploaded", sum(bookings), f"{bookings[-1]} on {_short(last)}"),
-                          kpi("deliveries", "Deliveries uploaded", sum(deliveries), f"{deliveries[-1]} on {_short(last)}")]
+                tiles += [kpi("bookings", "New bookings", sum(bookings), f"{bookings[-1]} on {_short(last)}"),
+                          kpi("deliveries", "New deliveries", sum(deliveries), f"{deliveries[-1]} on {_short(last)}"),
+                          kpi("updated", "Journeys updated", sum(updated), f"{updated[-1]} on {_short(last)}")]
             if measure("journeysClosed"):
                 tiles.append(kpi("filesClosed", "Delivery files closed", int(total(mine, "journeysClosed")),
                                  f"{int(total(mine, 'journeysClosed', [last]))} on {_short(last)}"))
@@ -271,7 +273,8 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
             out["pending"] = pending_block("Waiting for me now", counts, _PC_KINDS, {"tasksOpen": "Open tasks"})
         if shown("trend"):
             out["trend"] = {"title": "My work", "series": [
-                {"name": "Bookings uploaded", "data": bookings}, {"name": "Deliveries uploaded", "data": deliveries},
+                {"name": "New bookings", "data": bookings}, {"name": "New deliveries", "data": deliveries},
+                {"name": "Journeys updated", "data": updated},
                 {"name": "Delivery files closed", "data": series(mine, "journeysClosed")}]}
         if shown("tasks"):
             raised = part("tasks")["raisedByPerson"].get(actor_id, {})
@@ -413,9 +416,11 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
         tiles = []
         if measure("journeysUploaded"):
             tiles += [
-                kpi("bookings", "Bookings uploaded", flow_total("bookings"), f"{flow_total('bookings', [last])} on {_short(last)}"),
-                kpi("deliveries", "Deliveries uploaded", flow_total("deliveries"),
+                kpi("bookings", "New bookings", flow_total("bookings"), f"{flow_total('bookings', [last])} on {_short(last)}"),
+                kpi("deliveries", "New deliveries", flow_total("deliveries"),
                     f"{flow_total('onRegister')} on the gate registers"),
+                kpi("updated", "Journeys updated", flow_total("updated"),
+                    f"{flow_total('updated', [last])} on {_short(last)}"),
             ]
         if measure("journeysClosed"):
             tiles.append(kpi("filesClosed", "Delivery files closed", unit_total("deliveryFilesClosed"),
@@ -546,8 +551,9 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
 
     if shown("trend"):
         out["trend"] = {"title": "Bookings and deliveries", "series": [
-            {"name": "Bookings uploaded", "data": [flow_total("bookings", [d]) for d in iso]},
-            {"name": "Deliveries uploaded", "data": [flow_total("deliveries", [d]) for d in iso]},
+            {"name": "New bookings", "data": [flow_total("bookings", [d]) for d in iso]},
+            {"name": "New deliveries", "data": [flow_total("deliveries", [d]) for d in iso]},
+            {"name": "Journeys updated", "data": [flow_total("updated", [d]) for d in iso]},
             {"name": "Deliveries on gate register", "kind": "line", "data": [flow_total("onRegister", [d]) for d in iso]}]}
 
     if shown("tasks"):
@@ -568,6 +574,7 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
                 rows.append({"id": a, "name": name_of(a), "sub": where_text(a), "spark": series(v, "journeysUploaded"), "values": {
                     "bookings": sum(person_flow.get(a, {}).get(d, {}).get("bookings", 0) for d in iso),
                     "deliveries": sum(person_flow.get(a, {}).get(d, {}).get("deliveries", 0) for d in iso),
+                    "updated": sum(person_flow.get(a, {}).get(d, {}).get("updated", 0) for d in iso),
                     "filesClosed": int(total(v, "journeysClosed")), "tasksClosed": int(total(v, "tasksClosed")),
                     "notUploaded": _n(c, "deliveriesNotUploaded"), "filesOpen": _n(c, "deliveryFilesOpen"),
                     "overdue": _n(c, "tasksOverdue"), "dutiesMissed": len(missed_dates(a)),
@@ -575,8 +582,9 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
                     "inTime": _pct(int(e.get("tasksInTime", 0)), due), "hours": active_hours(a)}})
             cards.append({"key": "pcs", "title": "PCs", "sort": "deliveries", "spark": "Journeys uploaded, day by day",
                           "columns": columns(
-                              ("bookings", "Bookings uploaded", "bar", "journeysUploaded"),
-                              ("deliveries", "Deliveries uploaded", "bar", "journeysUploaded"),
+                              ("bookings", "New bookings", "bar", "journeysUploaded"),
+                              ("deliveries", "New deliveries", "bar", "journeysUploaded"),
+                              ("updated", "Journeys updated", "num", "journeysUploaded"),
                               ("filesClosed", "Delivery files closed", "num", "journeysClosed"),
                               ("tasksClosed", "Tasks closed", "num", "tasksClosed"),
                               ("notUploaded", "Deliveries not uploaded", "alert", None),
@@ -625,24 +633,26 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
             c = _add_counts([backlog["byOutlet"].get(o, {}) for o in ids])
             return {"id": unit_id, "name": name, "sub": sub, "spark": [flow_total("deliveries", [d], ids) for d in iso], "values": {
                 "bookings": flow_total("bookings", only=ids), "deliveries": flow_total("deliveries", only=ids),
+                "updated": flow_total("updated", only=ids),
                 "onRegister": flow_total("onRegister", only=ids), "notNotified": flow_total("notNotified", only=ids),
                 "notUploaded": _n(c, "deliveriesNotUploaded"), "filesOpen": _n(c, "deliveryFilesOpen"),
                 "overdue": _n(c, "tasksOverdue"), "payments": _n(c, "paymentsNotReconciled"),
                 "awaitingReview": _n(c, "awaitingReview"), "registersMissed": flow_total("registerMissing", only=ids)}}
 
         unit_columns = columns(
-            ("bookings", "Bookings uploaded", "bar", "journeysUploaded"), ("deliveries", "Deliveries uploaded", "bar", "journeysUploaded"),
+            ("bookings", "New bookings", "bar", "journeysUploaded"), ("deliveries", "New deliveries", "bar", "journeysUploaded"),
+            ("updated", "Journeys updated", "num", "journeysUploaded"),
             ("onRegister", "On gate register", "num", None), ("notNotified", "Not intimated to PC", "warn", None),
             ("notUploaded", "Deliveries not uploaded", "alert", None), ("filesOpen", "Files not closed", "warn", None),
             ("overdue", "Overdue tasks", "alert", None), ("payments", "Payments not reconciled", "warn", None),
             ("awaitingReview", "Awaiting Reviewer", "num", None), ("registersMissed", "Registers missed", "alert", None))
         if outlets:
-            cards.append({"key": "outlets", "title": "Outlets", "sort": "deliveries", "spark": "Deliveries uploaded, day by day",
+            cards.append({"key": "outlets", "title": "Outlets", "sort": "deliveries", "spark": "New deliveries, day by day",
                           "columns": unit_columns, "rows": [
                               unit_row(str(o["outlet_id"]), o["outlet_name"], o["dealer_name"], [str(o["outlet_id"])])
                               for o in outlets]})
         if len(dealer_outlets) > 1:
-            cards.append({"key": "dealers", "title": "Dealerships", "sort": "deliveries", "spark": "Deliveries uploaded, day by day",
+            cards.append({"key": "dealers", "title": "Dealerships", "sort": "deliveries", "spark": "New deliveries, day by day",
                           "columns": unit_columns, "rows": [
                               unit_row(d, dealer_name[d], _plural(len(ids), "outlet"), ids) for d, ids in dealer_outlets.items()]})
         out["scorecards"] = cards

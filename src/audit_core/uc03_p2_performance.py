@@ -130,6 +130,8 @@ DUTIES_ITEM, PEERS_ITEM = "duties", "peerComparison"
 # The sections of the screen (product owner 13 Nov 2026: pending work, PC efficiency, day to day
 # and week to week, delinquencies, bookings and deliveries).
 SECTIONS: tuple[dict[str, str], ...] = (
+    # Each PC against what the DMS says they received, month wise (product owner 2026-11-23).
+    {"key": "dms", "label": "Against the DMS (month wise)"},
     {"key": "pending", "label": "Backlog"},
     {"key": "flow", "label": "Bookings and deliveries"},
     {"key": "uploads", "label": "Uploads (direct, bulk, Drive)"},
@@ -353,7 +355,8 @@ def _cached(connection: Connection, *, tenant_id: str, first: date, last: date, 
 
 
 def _sections(part: Any, data: dict[str, Any], *, rows: list[dict[str, Any]], outlets: list[dict[str, Any]],
-              own: bool, hidden: set[str], iso: list[str], people: dict[str, Any], only: str | None) -> dict[str, Any]:
+              own: bool, hidden: set[str], iso: list[str], people: dict[str, Any], only: str | None,
+              dms_reader: Any = None) -> dict[str, Any]:
     """What a lead manages by, for the people and outlets the caller reads, leaving out what a
     SuperAdmin has switched off for their role. ``only``: one section (the tab that is open), so
     nothing else is read or sent."""
@@ -381,6 +384,22 @@ def _sections(part: Any, data: dict[str, Any], *, rows: list[dict[str, Any]], ou
                                        for o in outlets],
             "people": [{"actorId": a, "name": names[a], "role": people[a]["role"],
                         "counts": backlog["byPerson"].get(a, {})} for a in visible],
+        }
+
+    if wanted("dms") and dms_reader is not None:
+        # Every PC of the view against the DMS month (uc03_p2_dms_pc_backlog): the dealerships of
+        # the outlets read, and of the PCs shown (a PC's own view has no outlets).
+        pcs = [a for a in visible if people[a]["role"] == "PC"]
+        dealer_ids = sorted({str(o["dealer_id"]) for o in outlets}
+                            | {str(d) for a in pcs for d in people[a].get("dealers") or ()})
+        pc_outlets = sorted({str(o) for a in pcs for o in people[a].get("outlets") or ()})
+        backlog_dms = dms_reader(dealer_ids, pc_outlets)
+        out["dms"] = {
+            "month": backlog_dms["month"], "months": backlog_dms["months"],
+            "dealers": backlog_dms["dealers"],
+            "people": [{"actorId": a, "name": names[a], **backlog_dms["byPerson"][a]}
+                       for a in pcs if a in backlog_dms["byPerson"]],
+            "notMapped": [{"actorId": a, "name": names[a]} for a in pcs if a not in backlog_dms["byPerson"]],
         }
 
     if wanted("flow") and not own:
@@ -545,6 +564,33 @@ def _part(connection: Connection, name: str, *, tenant_id: str, first: date, las
     return data
 
 
+def _dms_backlog(connection: Connection, tenant_id: str, dealer_ids: list[str], outlet_ids: list[str],
+                 month: str | None) -> dict[str, Any]:
+    """The PCs against the DMS for the month asked, else the latest month with a dump; kept two
+    minutes like the other parts. ``outlet_ids``: the PCs' outlets, whose dealerships are read too."""
+    from audit_core.uc03_p2_dms_pc_backlog import months, pc_backlog
+
+    if outlet_ids:
+        dealer_ids = sorted(set(dealer_ids) | {str(r[0]) for r in connection.execute(
+            text("SELECT DISTINCT dealer_id FROM auditcore.dealer_outlets WHERE tenant_id = :t AND CAST(outlet_id AS text) = ANY(:ids)"),
+            {"t": tenant_id, "ids": outlet_ids})})
+
+    available = months(connection, tenant_id, dealer_ids)
+    picked = month if month in available else (available[0] if available else None)
+    if picked is None:
+        return {"month": None, "months": [], "dealers": [], "byPerson": {}}
+    key = (tenant_id, f"dms:{picked}", ",".join(dealer_ids))
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and _time.monotonic() - hit[0] < _CACHE_SECONDS:
+            return hit[1]
+    data = {**pc_backlog(connection, tenant_id=tenant_id, dealer_ids=dealer_ids,
+                         month=date.fromisoformat(f"{picked}-01")), "months": available}
+    with _cache_lock:
+        _cache[key] = (_time.monotonic(), data)
+    return data
+
+
 def standing(value: float, median: float | None, *, lower_is_better: bool = False) -> str | None:
     """above / with / below the peers' median (within a tenth is "with"); None with no peers to
     compare with. For a measure where lower is better, fewer is "above"."""
@@ -559,9 +605,10 @@ def standing(value: float, median: float | None, *, lower_is_better: bool = Fals
 def build_performance(
     connection: Connection, *, tenant_id: str, actor_id: str, day: date, days: int = DEFAULT_DAYS,
     admin: bool = False, own: bool = False, now: datetime | None = None, use_cache: bool = True,
-    section: str | None = None,
+    section: str | None = None, month: str | None = None,
 ) -> dict[str, Any]:
-    """``section``: the tab that is open -- only its part is read and sent. None: everything."""
+    """``section``: the tab that is open -- only its part is read and sent. None: everything.
+    ``month``: the DMS month of the "dms" section (YYYY-MM), else the latest with a dump."""
     now = now or datetime.now(UTC)
     tz = connection.execute(
         text("SELECT timezone_name FROM auditcore.projects WHERE tenant_id = :t"), {"t": tenant_id},
@@ -756,7 +803,9 @@ def build_performance(
         "people": rows,
         **_sections(lambda name: _part(connection, name, tenant_id=tenant_id, first=first, last=day, tz=tz, now=now,
                                         use_cache=use_cache),
-                    data, rows=rows, outlets=outlets, own=own, hidden=hidden, iso=iso, people=people, only=section),
+                    data, rows=rows, outlets=outlets, own=own, hidden=hidden, iso=iso, people=people, only=section,
+                    dms_reader=lambda dealer_ids, outlet_ids: _dms_backlog(connection, tenant_id, dealer_ids,
+                                                                              outlet_ids, month)),
         "unitMeasures": [{k: v for k, v in m.items() if k != "setting"} for m in unit_measures],
         "outlets": outlet_units,
         "dealers": sorted(dealer_units, key=lambda d: (d["dealerName"] or "").lower()),
@@ -790,7 +839,8 @@ def get_performance(
     day: Annotated[date | None, Query(alias="date")] = None,
     days: Annotated[int, Query(ge=MIN_DAYS, le=MAX_DAYS)] = DEFAULT_DAYS,
     first: Annotated[date | None, Query(alias="from")] = None,
-    section: Annotated[str | None, Query(pattern=r"^(dashboard|pending|flow|uploads|quality|tasks|trend|efficiency|duties)$")] = None,
+    section: Annotated[str | None, Query(pattern=r"^(dashboard|dms|pending|flow|uploads|quality|tasks|trend|efficiency|duties)$")] = None,
+    month: Annotated[str | None, Query(pattern=r"^\d{4}-\d{2}$")] = None,
 ) -> dict[str, Any]:
     access = authorize_p2(
         connection, tenant_id=tenant_id, journey_id=None, human_principal=human_principal,
@@ -811,7 +861,7 @@ def get_performance(
             raise HTTPException(status_code=422, detail="'from' is after 'date'.")
         days = min(MAX_DAYS, (day - first).days + 1)
     return build_performance(connection, tenant_id=tenant_id, actor_id=human_principal.subject, day=day,
-                             days=days, admin=admin, own=not team, section=section)
+                             days=days, admin=admin, own=not team, section=section, month=month)
 
 
 # --------------------------------------------------------------------------- SuperAdmin settings

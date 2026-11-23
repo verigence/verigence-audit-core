@@ -14,9 +14,8 @@ pending     as of now, by age (today, 1-3 days, 4-7 days, older), per outlet and
             awaitingDecision    Journeys a Reviewer closed that the TL / PM has not decided
 efficiency  per PC over the window: delivery files started and closed, the days from the first
             delivery upload to closing, tasks closed with a due time and of those in time
-flow        per outlet and day: bookings and deliveries uploaded (a Journey uploaded to that day
-            counts as a delivery when a delivery page is among that day's uploads, else a booking),
-            and the gate register: deliveries on the register, in the tool, not notified to the PC
+flow        per outlet and day: new bookings, new deliveries and Journeys updated (one rule,
+            uc03_p2_upload_kind, product owner 2026-11-23), and the gate register: deliveries on the register, in the tool, not notified to the PC
 """
 from __future__ import annotations
 
@@ -290,33 +289,22 @@ def flow(connection: Connection, *, tenant_id: str, first: date, last: date, sta
     flow: dict[str, dict[str, dict[str, int]]] = defaultdict(dict)
 
     def cell_of(outlet: Any, day: str) -> dict[str, int]:
-        return flow[str(outlet)].setdefault(day, {"bookings": 0, "deliveries": 0, "onRegister": 0, "inTool": 0,
-                                                    "notNotified": 0, "notUploaded": 0, "registerMissing": 0})
+        return flow[str(outlet)].setdefault(day, {"bookings": 0, "deliveries": 0, "updated": 0, "onRegister": 0,
+                                                    "inTool": 0, "notNotified": 0, "notUploaded": 0, "registerMissing": 0})
+
+    # New bookings, new deliveries and Journeys updated (product owner 2026-11-23): one rule for
+    # every view, uc03_p2_upload_kind.
+    from audit_core.uc03_p2_upload_kind import upload_days
 
     by_person: dict[str, dict[str, dict[str, int]]] = defaultdict(dict)
-    for r in connection.execute(text("""
-        SELECT j.outlet_id AS outlet, x.person, x.day, count(*) FILTER (WHERE x.delivery) AS deliveries,
-               count(*) FILTER (WHERE NOT x.delivery) AS bookings
-        FROM (
-          SELECT ub.journey_id, ub.uploaded_by_actor_id AS person, (ub.created_at_utc AT TIME ZONE :tz)::date AS day,
-                 COALESCE(bool_or(q.business_stage = 'DELIVERY'), false) AS delivery
-          FROM auditcore.p2_upload_batches ub
-          LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id = ub.tenant_id AND q.batch_id = ub.batch_id
-          WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
-            AND ub.batch_status <> 'AWAITING_UPLOAD'
-            AND NOT (ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0)
-          GROUP BY 1, 2, 3
-        ) x
-        JOIN auditcore.journeys j ON j.tenant_id = :t AND j.journey_id = x.journey_id
-        GROUP BY 1, 2, 3
-    """), {"t": tenant_id, "s": start, "e": end, "tz": tz}).mappings():
-        c = cell_of(r["outlet"], r["day"].isoformat())
-        c["bookings"] += int(r["bookings"])
-        c["deliveries"] += int(r["deliveries"])
+    key_of = {"booking": "bookings", "delivery": "deliveries", "updated": "updated"}
+    for r in upload_days(connection, tenant_id=tenant_id, start=start, end=end, tz=tz):
+        key = key_of[r["kind"]]
+        day = r["day"].isoformat()
+        cell_of(r["outlet_id"], day)[key] += 1
         if r["person"]:
-            mine = by_person[str(r["person"])].setdefault(r["day"].isoformat(), {"bookings": 0, "deliveries": 0})
-            mine["bookings"] += int(r["bookings"])
-            mine["deliveries"] += int(r["deliveries"])
+            mine = by_person[r["person"]].setdefault(day, {"bookings": 0, "deliveries": 0, "updated": 0})
+            mine[key] += 1
     outlets, starts = _register_outlets(connection, tenant_id)
     if outlets and starts is not None and max(first, starts) <= min(last, today):
         for oid, days in gate_register(connection, tenant_id, outlets, max(first, starts), min(last, today),
@@ -408,7 +396,8 @@ def channel_issues(connection: Connection, *, tenant_id: str, start: datetime, e
     files with errors of the window (product owner 14 Nov 2026: "for each PC I don't see the count of
     file upload channel wise and corresponding duplicacy and errors").
 
-    duplicates  files found to be a copy: a bulk / Drive file set aside as an exact duplicate, and a
+    duplicates  files found to be a copy: a bulk / Drive file set aside as an exact duplicate, a
+                file dropped on arrival as the same file already on the Journey, and a
                 journey deleted as the same file uploaded again (by the channel it came in on: a bulk
                 or Drive file was read on it, else direct)
     errors      files with a page that failed or was not read in time, or rejected on image quality,
@@ -468,6 +457,20 @@ def channel_issues(connection: Connection, *, tenant_id: str, start: datetime, e
     """), params).mappings():
         add(r["person"], r["outlet"], "duplicates", r["channel"], int(r["duplicates"]))
         add(r["person"], r["outlet"], "errors", r["channel"], int(r["errors"]))
+    # The same file sent again to a Journey and dropped on arrival (cancelled, no pages, its
+    # fingerprint kept: uc03_p2_worker). Not a file, so it was counted nowhere (2026-11-23: a PC
+    # sent one image twice and the duplicates read 0). By the channel the copy came in on.
+    for r in connection.execute(text(f"""
+        SELECT ub.uploaded_by_actor_id AS person, j.outlet_id AS outlet,
+               COALESCE(c.channel, 'direct') AS channel, count(*) AS n
+        FROM auditcore.p2_upload_batches ub
+        JOIN auditcore.journeys j ON j.tenant_id = ub.tenant_id AND j.journey_id = ub.journey_id
+        LEFT JOIN ({_BATCH_CHANNEL_SQL}) c ON c.batch_id = ub.batch_id
+        WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
+          AND ub.batch_status = 'CANCELLED' AND COALESCE(ub.page_count, 0) = 0 AND ub.sha256 IS NOT NULL
+        GROUP BY 1, 2, 3
+    """), params).mappings():
+        add(r["person"], r["outlet"], "duplicates", r["channel"], int(r["n"]))
     # Journeys deleted as the same file uploaded again, by the channel they came in on.
     for r in connection.execute(text("""
         SELECT d.pc_actor_id AS person, d.outlet_id AS outlet,
