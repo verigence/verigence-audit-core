@@ -128,6 +128,10 @@ def _all_refs(result) -> list[str]:
     return sorted(j["journeyReference"] for g in result["outlets"] for j in g["journeys"])
 
 
+def _added_refs(result) -> list[str]:
+    return [r for r in _all_refs(result) if not r.startswith("P2-J-")]
+
+
 def test_search_finds_a_journey_by_its_number_and_narrows_the_picker(board):
     # Product owner 2026-11-04: search on the Reviewer's board. On the server,
     # so a board cut off at its row limit cannot hide a match.
@@ -156,6 +160,9 @@ def test_a_search_across_both_states_marks_each_row(board):
         )
     assert "B-10" not in _all_refs(_list(board, q="-10"))  # open only
     both = _list(board, q="-10", state="all")
-    assert _all_refs(both) == ["A-10", "B-10"]
-    closed = {j["journeyReference"]: j["closed"] for g in both["outlets"] for j in g["journeys"]}
+    # The fixture's own journey has a random reference ("P2-J-" and hex), which can
+    # itself contain "-10"; only the rows this test added are compared.
+    assert _added_refs(both) == ["A-10", "B-10"]
+    closed = {j["journeyReference"]: j["closed"] for g in both["outlets"] for j in g["journeys"]
+              if not j["journeyReference"].startswith("P2-J-")}
     assert closed == {"A-10": False, "B-10": True}
