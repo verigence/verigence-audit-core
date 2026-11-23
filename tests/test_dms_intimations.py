@@ -219,7 +219,7 @@ def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(set
     assert {r["customerName"]: r["intimation"] for r in kept["rows"]} == {
         "Asha Das": "Intimated to PC - pending with PC", "Bina Rout": "Not intimated to PC - pending with dealership"}
     book = load_workbook(io.BytesIO(s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}/file").content))
-    assert book.sheetnames[:3] == ["Summary", "By DMS location", "Statement"]
+    assert book.sheetnames[:3] == ["Summary", "By DMS location", "Bookings in Verigence not DMS"]
     # ...and the same report as a PDF (2026-11-22).
     pdf = s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}/file", params={"format": "pdf"})
     assert pdf.status_code == 200 and pdf.headers["content-type"] == "application/pdf"
@@ -232,7 +232,8 @@ def test_pcs_mark_rows_the_marks_carry_and_the_reviewer_generates_the_report(set
     assert note["generatedBy"]
     assert s.client.post(f"{s.base}/dms-intimations/withdraw", json=asha).status_code == 200
     s.acting["subject"] = s.reviewer
-    assert "Bookings not in Verigence" in book.sheetnames and "PC intimations" in book.sheetnames
+    # the four groups (2026-11-23): Asha intimated, Bina left over
+    assert "Bookings intimated to PC" in book.sheetnames and "Bookings left over" in book.sheetnames
     # A day with no dump: nothing to generate.
     assert s.client.post(f"{s.base}/dms-reports",
                          json={"date": _today().replace(day=1).isoformat()}).status_code == 409
@@ -296,7 +297,7 @@ def test_delivery_dump_rows_are_marked_inscope_or_outscope(setup) -> None:
     kept = s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}").json()
     assert {r["customerName"]: r["dealType"] for r in kept["deliveryScope"]}["No Chassis"] == "Pending"
     book = load_workbook(io.BytesIO(s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}/file").content))
-    assert "Delivery dump scope" in book.sheetnames
+    assert "Deliveries left over" in book.sheetnames  # the scope stays in the stored report, not the document
 
 
 def test_an_uploaded_delivery_sheet_s_booking_date_decides_the_deal_type(setup) -> None:
@@ -418,7 +419,7 @@ def test_a_match_whose_customer_differs_is_listed_for_review(setup) -> None:
     assert row["dmsCustomer"] == "Somebody Else Entirely" and row["matchedOn"] == "Booking number / OTF"
     assert any(line.startswith("* Matched, but the customer name differs: 1") for line in kept["statementLines"])
     book = load_workbook(io.BytesIO(s.client.get(f"{s.base}/dms-reports/{made.json()['reportId']}/file").content))
-    assert "Matched, name differs" in book.sheetnames
+    assert book.sheetnames[0] == "Summary"  # kept in the stored report; the document lists the four groups
 
 
 def test_one_journey_takes_one_dump_row_and_a_repeated_line_is_a_duplicate(setup) -> None:
