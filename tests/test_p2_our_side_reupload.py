@@ -308,4 +308,11 @@ def test_the_pages_of_a_file_are_found_by_index(journey):
         plan = "\n".join(r[0] for r in connection.exec_driver_sql(
             "EXPLAIN SELECT count(*) FROM auditcore.p2_document_queue q WHERE q.tenant_id=%s AND q.batch_id=%s "
             "AND q.last_error = 'NOT_READ_IN_30_MIN'", (journey.tenant_id, batch_id)))
-    assert "ix_p2_document_queue_batch" in plan, plan
+        definition = connection.exec_driver_sql(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'auditcore' "
+            "AND indexname = 'ix_p2_document_queue_batch'").scalar_one()
+    # The index the query needs is there, on (tenant_id, batch_id), and the query does not
+    # read the whole table. Which index the planner picks on a near-empty test table is a
+    # tie it may break either way, so the test does not name one.
+    assert "(tenant_id, batch_id)" in definition, definition
+    assert "Seq Scan" not in plan, plan
