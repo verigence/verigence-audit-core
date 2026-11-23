@@ -485,3 +485,56 @@ def test_the_dms_replay_reads_only_and_names_rows_without_personal_details(setup
     text_ = report.read_text()
     assert "1 row(s) come out differently" in text_ and "MATCHED · BOOKING_NUMBER" in text_
     assert "Replay Person" not in text_ and "9000000055" not in text_
+
+
+def test_each_pc_against_the_dms_month_shared_locations_count_for_every_pc(setup) -> None:
+    """Product owner 2026-11-23: each PC's backlog against the DMS month, bookings and deliveries;
+    a location with several PCs shows the same count for every PC tagged to it."""
+    from audit_core.uc03_p2_dms_pc_backlog import months, pc_backlog
+
+    s = setup
+    second = f"intim-pc-{uuid4().hex[:6]}"
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        for pc in (s.journey.actor_id, second):
+            connection.execute(text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, "
+                                    "business_role_code, dealer_id, outlet_id) VALUES (:t, :a, 'PC', :d, :o)"),
+                               {"t": s.journey.tenant_id, "a": pc, "d": s.journey.dealer_id, "o": s.journey.outlet_id})
+        connection.execute(text("UPDATE auditcore.dealer_outlets SET outlet_name='Test Motors - KESORA' "
+                                "WHERE tenant_id=:t AND outlet_id=:o"), {"t": s.journey.tenant_id, "o": s.journey.outlet_id})
+        outlet_name = "KESORA"
+    add_read_value(s.journey, field_key="booking_reference_number", value="B-20261123")
+    booking = _dump(s, m.BOOKING, [{"booking_number": "B-20261123", "name": "P2 Customer"},
+                                   {"otf": "OTF27A000009", "name": "Not Uploaded", "mobile": "9000000009"}])
+    delivery = _dump(s, m.DELIVERY, [{"chassis": "MA1XX2XX3XX456789", "name": "Someone Else", "mobile": "9000000010"}])
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_dms_dump_rows SET outlet_label=:l WHERE tenant_id=:t "
+                                "AND dump_id IN (:b, :d)"),
+                           {"l": outlet_name, "t": s.journey.tenant_id, "b": booking, "d": delivery})
+        month = connection.execute(text("SELECT period_month FROM auditcore.p2_dms_dumps WHERE tenant_id=:t "
+                                        "AND dump_id=:d"), {"t": s.journey.tenant_id, "d": booking}).scalar_one()
+        dealer = str(s.journey.dealer_id)
+        assert months(connection, s.journey.tenant_id, [dealer]) == [month.strftime("%Y-%m")]
+        result = pc_backlog(connection, tenant_id=s.journey.tenant_id, dealer_ids=[dealer], month=month)
+    mine, theirs = result["byPerson"][s.journey.actor_id], result["byPerson"][second]
+    assert mine == theirs  # one location, two PCs: the same figures for both
+    assert (mine["bookingDms"], mine["bookingSynced"], mine["bookingPending"], mine["bookingNotIntimated"]) == (2, 1, 1, 1)
+    assert (mine["deliveryDms"], mine["deliverySynced"], mine["deliveryPending"]) == (1, 0, 1)
+    # The same figures on the Project Tracker's "Against the DMS" tab of a Team Lead.
+    from audit_core import uc03_p2_performance as perf
+
+    tl = f"intim-tl-{uuid4().hex[:6]}"
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, "
+                                "business_role_code, dealer_id) VALUES (:t, :a, 'TL', :d)"),
+                           {"t": s.journey.tenant_id, "a": tl, "d": s.journey.dealer_id})
+        view = perf.build_performance(connection, tenant_id=s.journey.tenant_id, actor_id=tl, day=_today(),
+                                      use_cache=False, section="dms")
+        own = perf.build_performance(connection, tenant_id=s.journey.tenant_id, actor_id=second, day=_today(),
+                                     own=True, use_cache=False, section="dms")
+    rows = {p["actorId"]: p for p in view["dms"]["people"]}
+    assert rows[second]["bookingPending"] == 1 and rows[s.journey.actor_id]["deliveryPending"] == 1
+    assert view["dms"]["month"] == month.strftime("%Y-%m")
+    assert [p["actorId"] for p in own["dms"]["people"]] == [second] and own["dms"]["people"][0]["bookingDms"] == 2

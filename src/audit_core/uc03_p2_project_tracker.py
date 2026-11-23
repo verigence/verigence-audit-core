@@ -33,7 +33,8 @@ consolidated view)
 Files uploaded (p2_upload_batches created in the period; a duplicate cancelled on
 arrival is not an upload), under the PC who uploaded
     files, pages, documents (the units the pages became), journeys uploaded to, of which
-    deliveries (a delivery page among those uploads) and bookings (none); newJourneys:
+    bookings (new Journeys), deliveries (new deliveries) and updated (documents added),
+    uc03_p2_upload_kind (product owner 2026-11-23); newJourneys:
     Journeys started in the period, under the PC who started them; duplicatesDeleted: the
     Journeys the PC uploaded in the period that were deleted as the same file uploaded
     again (from 12 Nov 2026, product owner)
@@ -174,7 +175,7 @@ def _blank() -> dict[str, Any]:
                      "onRegister": 0, "intimated": 0, "notNotified": 0, "uploadedInTool": 0, "pendingWithPc": 0,
                      "stockTransfers": 0},
         "uploads": {"files": 0, "pages": 0, "documents": 0, "journeys": set(), "deliveries": set(),
-                    "newJourneys": 0, "duplicatesDeleted": 0},
+                    "bookings": set(), "updated": set(), "newJourneys": 0, "duplicatesDeleted": 0},
         "closed": {"deliveryFiles": 0, "reviewer": 0},
         "channels": {"directFiles": 0, "directPages": 0, "bulkFiles": 0, "bulkPages": 0, "driveFiles": 0,
                      "drivePages": 0},
@@ -197,11 +198,10 @@ def _blank() -> dict[str, Any]:
 
 
 def _finish(figures: dict[str, Any]) -> dict[str, Any]:
-    """Sets become counts; bookings are the Journeys uploaded to with no delivery page."""
+    """Sets become counts (bookings, deliveries and updated: uc03_p2_upload_kind)."""
     uploads = figures["uploads"]
-    journeys, deliveries = uploads.pop("journeys"), uploads.pop("deliveries")
-    uploads["journeys"], uploads["deliveries"] = len(journeys), len(deliveries)
-    uploads["bookings"] = len(journeys - deliveries)
+    for key in ("journeys", "deliveries", "bookings", "updated"):
+        uploads[key] = len(uploads[key])
     figures["failures"]["files"] = len(figures["failures"]["files"])
     tasks = figures["tasks"]
     tasks["worked"] = {key: len(value) for key, value in tasks["worked"].items()}
@@ -389,13 +389,13 @@ def _add_gate_pass(connection: Connection, tree: _Tree, *, tenant_id: str, outle
                 _bump(nodes, "gatePass", key, int(value or 0))
 
 
-def _add_uploads(connection: Connection, tree: _Tree, *, tenant_id: str, start: datetime, end: datetime) -> None:
+def _add_uploads(connection: Connection, tree: _Tree, *, tenant_id: str, start: datetime, end: datetime,
+                 tz: str) -> None:
     rows = connection.execute(
         text("""
             SELECT ub.batch_id, ub.journey_id, j.outlet_id, ub.uploaded_by_actor_id AS actor_id,
                    COALESCE(ub.page_count, 0) AS pages,
                    COUNT(q.queue_id) FILTER (WHERE q.queue_status NOT IN ('MERGED', 'CANCELLED')) AS documents,
-                   COALESCE(bool_or(q.business_stage = 'DELIVERY'), false) AS delivery,
                    -- How the file came in (product owner 2026-11-13): a file of a bulk upload
                    -- from Google Drive, of a bulk (folder) upload, or uploaded on its own.
                    (SELECT CASE WHEN count(*) = 0 THEN NULL WHEN bool_or(bu.source = 'DRIVE') THEN 'drive' ELSE 'bulk' END
@@ -423,9 +423,16 @@ def _add_uploads(connection: Connection, tree: _Tree, *, tenant_id: str, start: 
         channel = r["channel"] or "direct"
         _bump(nodes, "channels", f"{channel}Files")
         _bump(nodes, "channels", f"{channel}Pages", int(r["pages"]))
-        _member(nodes, "uploads", "journeys", str(r["journey_id"]))
-        if r["delivery"]:
-            _member(nodes, "uploads", "deliveries", str(r["journey_id"]))
+    # New bookings, new deliveries and Journeys updated (product owner 2026-11-23): the one rule.
+    from audit_core.uc03_p2_upload_kind import upload_days
+
+    key_of = {"booking": "bookings", "delivery": "deliveries", "updated": "updated"}
+    for r in upload_days(connection, tenant_id=tenant_id, start=start, end=end, tz=tz):
+        if not tree.has_outlet(r["outlet_id"]):
+            continue
+        nodes = tree.nodes(r["outlet_id"], r["person"])
+        _member(nodes, "uploads", "journeys", r["journey_id"])
+        _member(nodes, "uploads", key_of[r["kind"]], r["journey_id"])
     for r in connection.execute(
         text("""
             SELECT j.outlet_id, j.created_by_actor_id FROM auditcore.journeys j
@@ -835,7 +842,8 @@ def build_project_tracker(
 
     _add_gate_pass(connection, tree, tenant_id=tenant_id, outlets=outlets, pcs=pcs, first=first, last=last,
                    today=today, now=now)
-    _add_uploads(connection, tree, tenant_id=tenant_id, start=start, end=end)
+    _add_uploads(connection, tree, tenant_id=tenant_id, start=start, end=end,
+                 tz=str(_zone(timezone_name)))
     _add_closed(connection, tree, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end, wide=wide)
     _add_drive(connection, tree, tenant_id=tenant_id, start=start, end=end)
     _add_reviews(connection, tree, tenant_id=tenant_id, actor_id=actor_id, start=start, end=end, now=now, wide=wide)
@@ -866,8 +874,9 @@ def build_project_tracker(
              "intimated to them (figures only: the Team Lead's task for them is suspended); 'in tool' are the "
              "delivery files whose vehicle gate pass is dated that day."),
             ("Files uploaded: uploads made in the period under the PC who uploaded them (a duplicate dropped "
-             "on arrival is not counted). A Journey counts as a delivery when a delivery page is among those "
-             "uploads, otherwise as a booking; a Journey uploaded to by two PCs counts once on the outlet. "
+             "on arrival is not counted). Bookings are new Journeys, deliveries new deliveries (the Journey's "
+             "first delivery page), and documents added to a Journey on any other day count as Journeys "
+             "updated; a Journey uploaded to by two PCs counts once on the outlet. "
              "Duplicates deleted: Journeys the PC uploaded in the period that the system deleted as the same "
              "file uploaded again (counted from 12 Nov 2026)."),
             ("Google Drive: the files put in the Project's Drive in the period (by when Verigence first saw "

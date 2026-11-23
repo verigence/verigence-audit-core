@@ -172,7 +172,7 @@ def test_a_super_admin_chooses_what_each_role_sees(setup):
         for_tl, for_pm = _build(s, tl), _build(s, pm)
         assert "activeMinutes" not in [m["key"] for m in for_tl["measures"]]
         assert "efficiency" not in for_tl and "pending" not in for_tl
-        assert [x["key"] for x in for_tl["sections"]] == ["flow", "uploads", "quality", "tasks", "trend", "duties"]
+        assert [x["key"] for x in for_tl["sections"]] == ["dms", "flow", "uploads", "quality", "tasks", "trend", "duties"]
         assert "activeMinutes" in [m["key"] for m in for_pm["measures"]]
         assert "efficiency" in for_pm and "pending" in for_pm
         mine = next(p for p in for_tl["people"] if p["actorId"] == s.journey.actor_id)
@@ -255,7 +255,7 @@ def test_pending_work_efficiency_delinquencies_and_bookings_deliveries(setup):
     tl = f"tl-{uuid4().hex[:6]}"
     tt._role(s, tl, "TL")
     report = _build(s, tl)
-    assert [x["key"] for x in report["sections"]] == ["pending", "flow", "uploads", "quality", "tasks", "trend",
+    assert [x["key"] for x in report["sections"]] == ["dms", "pending", "flow", "uploads", "quality", "tasks", "trend",
                                                       "efficiency", "duties"]
 
     pending = next(p for p in report["pending"]["people"] if p["actorId"] == me)["counts"]
@@ -531,3 +531,67 @@ def test_tasks_in_time_count_every_task_due_and_its_owner(setup):
     rev_card = next(c for c in board["efficiency"]["cards"] if c["key"] == "reviewers")
     rows = {r["id"]: r["values"] for r in rev_card["rows"]}
     assert rows[reviewer]["inTime"] == 0 and rows[crm]["inTime"] == 0     # the CRM is read as a Reviewer
+
+
+def test_new_bookings_new_deliveries_and_journeys_updated(setup):
+    """Product owner 2026-11-23: a booking is a new Journey, a delivery a new delivery; documents
+    added to a Journey on any other day count as Journeys updated -- in every view."""
+    from audit_core.uc03_p2_my_work import build_pc_work
+    from audit_core.uc03_p2_upload_kind import upload_days
+
+    s = setup
+    outlet = str(s.journey.outlet_id)
+    me = s.journey.actor_id
+    now = datetime.now(UTC)
+    today = datetime.now(IST).date()
+    earlier = now - timedelta(days=3)
+
+    def delivery_page(journey, at):
+        batch, _rows = add_batch_pages(SimpleNamespace(**{**s.journey.__dict__, "journey_id": journey}),
+                                       [("gate_pass", "READY")])
+        tt._exec(s, "UPDATE auditcore.p2_document_queue SET business_stage='DELIVERY' WHERE tenant_id=:t AND batch_id=:b",
+                 b=batch)
+        tt._exec(s, "UPDATE auditcore.p2_upload_batches SET created_at_utc=:at WHERE tenant_id=:t AND batch_id=:b",
+                 at=at, b=batch)
+
+    new = tt._journey(s, outlet, me)                         # booked today: a new booking
+    _uploads(s, me, new, 2)
+    topped = tt._journey(s, outlet, me)                      # booked three days ago, a page added today
+    tt._exec(s, "UPDATE auditcore.journeys SET created_at_utc=:at WHERE tenant_id=:t AND journey_id=:j",
+             at=earlier, j=topped)
+    _uploads(s, me, topped, 1, at=earlier)
+    _uploads(s, me, topped, 3)
+    delivered = tt._journey(s, outlet, me)                   # booked earlier, delivery file today
+    tt._exec(s, "UPDATE auditcore.journeys SET created_at_utc=:at WHERE tenant_id=:t AND journey_id=:j",
+             at=earlier, j=delivered)
+    _uploads(s, me, delivered, 1, at=earlier)
+    delivery_page(delivered, now)
+    again = tt._journey(s, outlet, me)                       # delivered three days ago, another delivery page today
+    tt._exec(s, "UPDATE auditcore.journeys SET created_at_utc=:at WHERE tenant_id=:t AND journey_id=:j",
+             at=earlier, j=again)
+    delivery_page(again, earlier)
+    delivery_page(again, now)
+    # The same file sent again and dropped on arrival: no upload, but a duplicate.
+    batch, _rows = add_batch_pages(SimpleNamespace(**{**s.journey.__dict__, "journey_id": topped}), [("pan", "READY")])
+    tt._exec(s, "UPDATE auditcore.p2_upload_batches SET batch_status='CANCELLED', page_count=0, sha256='abc' "
+                "WHERE tenant_id=:t AND batch_id=:b", b=batch)
+
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        start = datetime.combine(today, datetime.min.time(), IST)
+        days = upload_days(connection, tenant_id=s.journey.tenant_id, start=start, end=start + timedelta(days=1),
+                           tz="Asia/Kolkata", actor_id=me)
+        kinds = {d["journey_id"]: d["kind"] for d in days}
+        work = build_pc_work(connection, tenant_id=s.journey.tenant_id, actor_id=me, start=today, end=today, now=now)
+    assert kinds[new] == "booking" and kinds[topped] == "updated"
+    assert kinds[delivered] == "delivery" and kinds[again] == "updated"
+    assert work["totals"]["bookingsUploaded"] == 1 and work["totals"]["deliveriesUpdated"] == 1
+    assert work["totals"]["journeysUpdated"] == 2
+
+    tl = f"tl-{uuid4().hex[:6]}"
+    tt._role(s, tl, "TL")
+    report = _build(s, tl)
+    flow = next(o for o in report["flow"]["outlets"] if o["outletId"] == outlet)["days"][today.isoformat()]
+    assert (flow["bookings"], flow["deliveries"], flow["updated"]) == (1, 1, 2)
+    mine = next(p for p in report["uploads"]["people"] if p["actorId"] == me)
+    assert mine["duplicates"]["direct"] == 1
