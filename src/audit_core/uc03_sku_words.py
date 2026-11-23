@@ -431,6 +431,33 @@ def _conflicts(doc: dict[str, str | None], row: dict[str, str | None]) -> bool:
     return any(doc[k] and row[k] and doc[k] != row[k] for k in _ATTRIBUTE_KEYS)
 
 
+# A battery size printed bare: "59", "39.4", or with the option letter a
+# dealer glues to it, "39.4(O)" (read as "39.4O").
+_BARE_BATTERY = re.compile(r"^(\d+(?:\.\d+)?)([OSLT]?)$")
+
+
+def _battery_words(trim: frozenset[str], vocabulary_trim: set[str]) -> set[str]:
+    """A bare number reads as the list's battery word when the model's list
+    has that battery: "59" -> B59, "39.4" -> B39.4.
+
+    Live, ADI-BM-261114-007 (23 Nov 2026): the booking form prints "XUV400 EL
+    39.4(O) ZJ" and the list prices "EL PRO FC - Battery 34.5 Kwh" and
+    "... Battery 39.4 Kwh". Only a whole number was read as a battery, so
+    "39.4(O)" told nothing, both rows fitted and the deal was never checked
+    against the price and discount masters. A number the model's list has no
+    battery for stays the word it is ("1.7" on a Maxx HD is its engine)."""
+    out: set[str] = set()
+    for word in trim:
+        bare = _BARE_BATTERY.match(word)
+        if bare and f"B{bare.group(1)}" in vocabulary_trim:
+            out.add(f"B{bare.group(1)}")
+            if bare.group(2):
+                out.add(bare.group(2))  # the glued option letter stays a word of its own
+        else:
+            out.add(word)
+    return out
+
+
 def _match_one_model(doc: Reading, sigs: list[RowWords]) -> tuple[list[RowWords], list[str]]:
     """The rows of one model whose distinguishing words are exactly the
     document's, in both directions:
@@ -447,8 +474,7 @@ def _match_one_model(doc: Reading, sigs: list[RowWords]) -> tuple[list[RowWords]
     Returns (rows, unknown trim-like words)."""
     vocabulary = set().union(*(s.words for s in sigs)) if sigs else set()
     vocabulary_trim = {w for w in vocabulary if ":" not in w}
-    # A bare battery number reads as the list's battery word ("59" -> B59).
-    trim = {f"B{w}" if w.isdigit() and f"B{w}" in vocabulary_trim else w for w in doc.trim}
+    trim = _battery_words(doc.trim, vocabulary_trim)
     # "N10 (O)" is the list's "N10 OPT"; "EDGE OPT" is the list's "EDGE(O)".
     for word in list(trim):
         if word not in vocabulary_trim and word.endswith("O") and word[:-1] in vocabulary_trim \
