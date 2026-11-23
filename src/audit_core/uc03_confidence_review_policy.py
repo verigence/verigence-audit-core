@@ -45,6 +45,7 @@ from audit_core.security_authorization import (
 from audit_core.security_integration import SecurityOAuthClient, SecurityTokenError
 from audit_core.uc03_booking_rule_trigger import schedule_booking_checkpoint_rules
 from audit_core.uc03_document_registry import is_reconciliation_trigger_document_type
+from audit_core.uc03_enquiry_number import filed_as
 from audit_core.uc03_post_extraction_materialization import (
     materialize_machine_booking_values,
 )
@@ -350,7 +351,8 @@ def _machine_upsert_fact(
             "fact_version": int(fact.version_no),
             "document_type_key": document_type_key,
             "canonical": canonical,
-            "field_key": str(fact.field_key),
+            # An enquiry number is never kept as the booking number (2026-11-23).
+            "field_key": filed_as(str(fact.field_key), fact.value),
             "value": payload,
             "confidence": fact.confidence_score,
             "confidence_scale": "PERCENT" if fact.confidence_score is not None else None,

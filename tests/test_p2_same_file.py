@@ -1808,3 +1808,14 @@ def test_when_the_pans_differ_the_copys_pan_is_carried_not_lost(tenant, monkeypa
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
     assert _alerts(new)[0]["payload"]["carryDocuments"] == ["pan_card"]
     assert _delete(new) == "DELETED" and len(_batches_copied(old)) == 1
+
+
+
+def test_an_enquiry_number_is_no_booking_reference():
+    """2026-11-23: "enquiry number cant be booking number" -- two journeys sharing only an
+    enquiry number read as the booking number are not one booking by it."""
+    from audit_core.uc03_p2_same_file import normalize_booking_reference
+
+    assert normalize_booking_reference("ENQ-38100019") is None
+    assert normalize_booking_reference("0038100003") is None
+    assert normalize_booking_reference("B-13100014") is not None

@@ -7,6 +7,8 @@ from uuid import UUID
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_enquiry_number import filed_as
+
 StageCode = Literal["BOOKING", "DELIVERY"]
 ConfidenceScale = Literal["UNIT_INTERVAL", "PERCENT"]
 
@@ -107,7 +109,10 @@ def _row(
             if field.source_canonical_field_id
             else None
         ),
-        "field_key": field.field_key.strip(),
+        # An enquiry number read where the booking number should be is kept as the enquiry
+        # number (2026-11-23, uc03_enquiry_number): "enquiry number cant be booking number".
+        "field_key": filed_as(field.field_key.strip(), field.effective_value
+                              if field.effective_value_is_set else field.extracted_value),
         "extracted_value": _json_payload(
             field.extracted_value,
             is_set=field.extracted_value is not None,

@@ -90,3 +90,22 @@ def test_alike_journeys_take_alike_rows_one_each():
     # Another customer on the same mobile: not alike, no guess.
     index.journeys["j2"]["names"] = {"Someone Else"}
     assert match_row(index, BOOKING, {**row, "customer_name": "Third Name"}) == (None, None)
+
+
+
+def test_the_dms_enquiry_number_matches_after_the_booking_number():
+    """2026-11-23: the booking form's enquiry number, never a booking number, matches the dump's
+    ENQUIRY NUMBER column -- and a booking number still wins over it."""
+    from audit_core.uc03_p2_dms_dumps import BOOKING, JourneyIndex, match_row
+
+    index = JourneyIndex()
+    index.journeys["j1"] = {"journeyId": "j1", "reference": "J-1", "names": {"CUSTOMER E"}, "model": "MAXX HD",
+                            "mobiles": set(), "refs": set(), "bookingDays": set()}
+    index.by_enquiry["38100003"].add("j1")
+    row = {"customer_name": "CUSTOMER E", "booking_number": "B-13100009", "model": "MAXX HD",
+           "raw": {"ENQUIRY NUMBER": "EN-0038100003"}}
+    assert match_row(index, BOOKING, row) == ("j1", "ENQUIRY_NUMBER")
+    index.journeys["j2"] = {"journeyId": "j2", "reference": "J-2", "names": {"CUSTOMER F"}, "model": "MAXX HD",
+                            "mobiles": set(), "refs": {"13100009"}, "bookingDays": set()}
+    index.by_ref["13100009"].add("j2")
+    assert match_row(index, BOOKING, row) == ("j2", "BOOKING_NUMBER")

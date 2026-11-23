@@ -75,6 +75,7 @@ from audit_core.security_authorization import (
 )
 from audit_core.uc03_booking_day import BOOKING_MATCH_DAYS, FIRST_RECEIPT_SQL
 from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
+from audit_core.uc03_enquiry_number import enquiry_key, is_enquiry_number
 from audit_core.uc03_p2_access import authorize_p2_any
 from audit_core.uc03_p2_names import same_person
 
@@ -354,6 +355,19 @@ def _alnum(value: Any) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
 
 
+def dms_enquiry_number(row: dict[str, Any]) -> Any:
+    """The ENQUIRY NUMBER a dump row prints (the booking dump has the column)."""
+    raw = row.get("raw") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    if not isinstance(raw, dict):
+        return None
+    return raw.get("ENQUIRY NUMBER") or raw.get("ENQUIRY NO")
+
+
 def booking_keys(booking_number: Any, dms_booking_number: Any) -> set[str]:
     """The keys a dump row's booking is known by: the B-number's digits, the OTF
     without "OTF", and the OTF's numeric tail (also without leading zeros)."""
@@ -435,6 +449,7 @@ def same_model(a: Any, b: Any) -> bool:
 @dataclass
 class JourneyIndex:
     by_ref: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
+    by_enquiry: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     by_chassis: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     by_mobile: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     # The DMS customer id the dealer's invoices print (R270905009) and the vehicle's
@@ -522,6 +537,8 @@ _INDEX_SQL = """
                    AND e.di_document_id = f.di_document_id AND e.association_status = 'ACTIVE')
      AND (
           (f.field_key = 'booking_reference_number' AND f.source_document_type_key = 'booking_form')
+       -- the enquiry number, read off the booking form or docket (2026-11-23)
+       OR (f.field_key = 'enquiry_number' AND f.source_document_type_key IN ('booking_form', 'booking_docket'))
        OR (f.field_key IN ('customer_phone', 'phone_number')
            AND f.source_document_type_key IN ('booking_form', 'dealer_receipt', 'customer_kyc'))
        OR (f.field_key IN ('vin_number', 'chassis_number') AND f.source_document_type_key = ANY(:chassis_types))
@@ -554,7 +571,8 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
                 "cancelled": bool(r["cancelled"]),
                 "mobiles": set(), "refs": set(),
             }
-            for key in journey_ref_keys(r["booking_reference"]):
+            # An enquiry number kept as the booking reference is no booking number (2026-11-23).
+            for key in ([] if is_enquiry_number(r["booking_reference"]) else journey_ref_keys(r["booking_reference"])):
                 index.by_ref[key].add(jid)
                 journey["refs"].add(key)
             for value in (r["vin"], r["chassis_number"]):
@@ -568,10 +586,13 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
         field_key, value = r["field_key"], r["value"]
         if not field_key or not value:
             continue
-        if field_key == "booking_reference_number":
+        if field_key == "booking_reference_number" and not is_enquiry_number(value):
             for key in journey_ref_keys(value):
                 index.by_ref[key].add(jid)
                 journey["refs"].add(key)
+        elif field_key in ("booking_reference_number", "enquiry_number"):
+            if (key := enquiry_key(value)) is not None:
+                index.by_enquiry[key].add(jid)
         elif field_key in ("customer_phone", "phone_number"):
             if (key := mobile_key(value)) is not None:
                 index.by_mobile[key].add(jid)
@@ -660,6 +681,12 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any], taken: frozen
     for key in sorted(booking_keys(row.get("booking_number"), row.get("dms_booking_number")), key=lambda k: k not in strong):
         if (jid := one(index.by_ref.get(key, set()))) is not None and (key in strong or _same_customer(index, jid, row)):
             return jid, "BOOKING_NUMBER"
+    # The enquiry number, after the booking number (2026-11-23): booking forms carry it, and it
+    # was read where the booking number should be on many journeys; the DMS prints it in its
+    # own column.
+    if (key := enquiry_key(dms_enquiry_number(row))) is not None \
+            and (jid := one(index.by_enquiry.get(key, set()))) is not None:
+        return jid, "ENQUIRY_NUMBER"
     if (key := row.get("mobile")) and (found := set(index.by_mobile.get(key, set())) - set(taken) - cancelled):
         if (jid := one(found)) is not None:
             return jid, "MOBILE"
@@ -700,7 +727,8 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any], taken: frozen
 
 
 # The order rows claim Journeys in: the surest match first (2026-11-19).
-_BASIS_RANK = {"CHASSIS": 0, "BOOKING_NUMBER": 1, "MOBILE": 2, "NAME_DATE": 3, "NAME_MODEL": 4, "NAME_NEAR_ID": 5}
+_BASIS_RANK = {"CHASSIS": 0, "BOOKING_NUMBER": 1, "ENQUIRY_NUMBER": 2, "MOBILE": 3, "NAME_DATE": 4, "NAME_MODEL": 5,
+               "NAME_NEAR_ID": 6}
 
 
 def _line_key(kind: str, row: dict[str, Any]) -> str | None:
