@@ -1169,8 +1169,8 @@ def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
     net = received - refunded
     gap = net - billed
     refund_text = f" less {_rupees(refunded)} refunded" if refunded else ""
-    how = ("the net value printed on the account statement, " + _rupees(printed) + ", less the discounts it "
-           "prints, " + _rupees(given) + ":" if less_discounts else "the net value printed on the account statement")
+    how = ("the net value printed on the account statement (" + _rupees(printed) + ") less the discounts it "
+           "prints (" + _rupees(given) + ")" if less_discounts else "the net value printed on the account statement")
     details = {"statementTotal": str(billed), "statementNetPrinted": str(printed),
                "statementDiscounts": str(given) if less_discounts else None,
                "statementReceivedLines": str(read.receipts),
