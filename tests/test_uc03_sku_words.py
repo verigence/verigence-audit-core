@@ -68,7 +68,9 @@ NEO = [
     _row("BOLERO NEO", "N10 BS6.2 - R - Refresh (Commercial)", code="NEO::N10R::COM"),
     _row("BOLERO NEO", "N10 OPT BS6.2 - Refresh (Private)", code="NEO::N10OPT::PRI"),
 ]
-ROWS = MAXX_HD + MAXX_CITY + XUV3XO + XUV7XO + SCORPIO + BE6 + NEO
+XUV400 = [_row("XUV400", f"EL PRO FC - Battery {kwh} Kwh - Charger 7.2 Kw - E", fuel="ELECTRIC", transmission="AT")
+          for kwh in ("34.5", "39.4")]
+ROWS = MAXX_HD + MAXX_CITY + XUV3XO + XUV7XO + SCORPIO + BE6 + NEO + XUV400
 
 
 def _id(model, variant=None, **kwargs):
@@ -96,6 +98,11 @@ def _id(model, variant=None, **kwargs):
     ("SCORPIO N", "Z8L DIESEL AT 4WD 7 STR", "Z8 L D AT 4WD 7 STR BS6.2 - N - ADAS"),
     ("BE 6", "TWO B59 R19 C11", "BE 6 Two B59 R19 C11"),
     ("BE6 SPORTEQ", "THREE+ B79 R19 C11", "BE 6 SPORTEQ THREE+ B79 R19 C11"),  # "BE 6" vs "BE6"; THREE+ != THREE
+    # A battery size printed bare, with the "(O)" a dealer glues to it (ADI-BM-261114-007's booking form).
+    ("XUV400", "EL 39.4(O) ZJ", "EL PRO FC - Battery 39.4 Kwh - Charger 7.2 Kw - E"),
+    ("XUV400 EL 34.5(O)", None, "EL PRO FC - Battery 34.5 Kwh - Charger 7.2 Kw - E"),
+    ("XUV 400", "EL PRO 39.4", "EL PRO FC - Battery 39.4 Kwh - Charger 7.2 Kw - E"),
+    ("XUV400", "EL PRO 39.4 KWH", "EL PRO FC - Battery 39.4 Kwh - Charger 7.2 Kw - E"),
 ])
 def test_the_words_name_exactly_one_row(model, variant, expected):
     result = _id(model, variant)
@@ -114,6 +121,9 @@ def test_the_words_name_exactly_one_row(model, variant, expected):
     ("BOLERO NEO", "N10 R", "REGISTRATION_UNKNOWN"),
     ("XUV 3XO", "AX9 PETROL MT", "UNRECOGNISED_WORD"),  # a trim the list does not have
     ("XUV300", "W7L EV", "NO_MODEL"),
+    ("XUV400", "EL PRO", "AMBIGUOUS"),  # the battery is not stated: 34.5 or 39.4
+    ("XUV-400-EL-PRO-AT-EV", None, "AMBIGUOUS"),  # the NDC's wording names no battery either
+    ("XUV400", "EL 40.5(O)", "AMBIGUOUS"),  # a battery the list does not have picks nothing
 ])
 def test_anything_but_one_row_is_a_task(model, variant, status):
     result = _id(model, variant)
