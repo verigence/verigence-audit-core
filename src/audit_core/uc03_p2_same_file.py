@@ -165,7 +165,7 @@ import os
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
 
@@ -365,6 +365,16 @@ _IDENTITY_SQL = f"""
                 WHERE q.tenant_id = j.tenant_id AND q.journey_id = j.journey_id AND q.queue_status <> 'CANCELLED'
              ) t WHERE t.kind IN ('booking_form', 'booking_docket', 'pan_card', 'aadhaar', 'customer_kyc',
                                   'gst_certificate')) AS identity_documents,
+           -- 2026-11-23: its booking date -- the booking form's, and the first receipt's.
+           (SELECT b.booking_date FROM auditcore.bookings b
+             WHERE b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id LIMIT 1) AS form_date,
+           (SELECT min(COALESCE(p.receipt_date, p.payment_reference_date)) FROM auditcore.payments p
+             WHERE p.tenant_id = j.tenant_id AND p.journey_id = j.journey_id AND p.status_source = 'EVIDENCE'
+               AND p.amount > 0
+               AND EXISTS (SELECT 1 FROM auditcore.evidence e
+                           WHERE e.tenant_id = p.tenant_id AND e.journey_id = p.journey_id
+                             AND e.di_document_id = p.source_di_document_id
+                             AND e.association_status = 'ACTIVE')) AS first_receipt,
            {_CLOSED_SQL} AS is_closed
     FROM auditcore.journeys j
     JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
@@ -480,6 +490,8 @@ class FileIdentity:
     # 2026-11-21: the kinds of paper naming a customer it holds (booking form / docket, PAN,
     # Aadhaar, KYC, GST certificate), read or not.
     identity_documents: frozenset[str] = frozenset()
+    # 2026-11-23: its booking date -- the booking form's and the first receipt's (either).
+    booking_days: frozenset[date] = frozenset()
 
     @property
     def nameless(self) -> bool:
@@ -601,6 +613,7 @@ def _identities(connection: Connection, *, tenant_id: str, journey_ids: Iterable
             receipt_keys=_receipt_keys(row["receipt_rows"]),
             chassis=_chassis(row["chassis_values"], row["vin"]),
             identity_documents=frozenset(str(k) for k in row["identity_documents"] or [] if k),
+            booking_days=frozenset(d for d in (row["form_date"], row["first_receipt"]) if d is not None),
         )
     return out
 
@@ -994,13 +1007,18 @@ def one_booking_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[s
 
 def same_otf_mobile_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
     """One sale (product owner 2026-11-23): one dealership, the same booking reference number
-    (OTF) and the same mobile -- whatever the model text or the PAN says. "Different PAN is a
-    wrong document upload": a delivery file carrying another person's PAN, or a booking form
-    reading only "Maxx", kept a booking and its delivery file as two journeys. Never when the
-    VINs are read on both and differ (two vehicles). The fields that matched; None otherwise."""
+    (OTF), the same mobile, and the same model or the same booking date ("just add one point
+    same model or same booking date") -- whatever the PAN says. "Different PAN is a wrong
+    document upload": a delivery file carrying another person's PAN, or a booking form reading
+    only "Maxx", kept a booking and its delivery file as two journeys. Never when the VINs are
+    read on both and differ (two vehicles). The fields that matched; None otherwise."""
     if not (new.dealer_id and new.dealer_id == existing.dealer_id):
         return None
     if not (new.mobile and new.mobile == existing.mobile and booking_reference_shared(new, existing)):
+        return None
+    models_agree = same_model(new, existing)
+    same_day = sorted(new.booking_days & existing.booking_days)
+    if not (models_agree or same_day):
         return None
     if new.vin and existing.vin and new.vin != existing.vin:
         return None
@@ -1019,9 +1037,12 @@ def same_otf_mobile_fields(new: FileIdentity, existing: FileIdentity) -> list[di
                        "newValue": ", ".join(sorted(_masked(p) or "" for p in _all_pans(new))),
                        "existingValue": ", ".join(sorted(_masked(p) or "" for p in _all_pans(existing))),
                        "exact": False})
+    if same_day:
+        fields.append({"field": "booking_date", "label": "Booking date", "newValue": same_day[0].isoformat(),
+                       "existingValue": same_day[0].isoformat(), "exact": True})
     fields += [
         {"field": "model", "label": "Model", "newValue": new.model_name, "existingValue": existing.model_name,
-         "exact": same_model(new, existing)},
+         "exact": models_agree},
         {"field": "outlet", "label": "Outlet", "newValue": _place(new.dealer_name, new.outlet_name),
          "existingValue": _place(existing.dealer_name, existing.outlet_name), "exact": same_outlet(new, existing)},
     ]

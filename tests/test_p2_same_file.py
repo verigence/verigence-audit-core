@@ -1723,20 +1723,38 @@ def test_a_file_whose_booking_form_is_not_read_is_not_joined_on_a_receipt():
 
 
 
-# ── 2026-11-23: the same OTF and the same mobile are one sale ─────────────────────────────────
-@pytest.mark.parametrize("differs", [
-    {"pan": "ABCPE9999F"},  # "different PAN is a wrong document upload"
-    {"model": "MAXX"},  # a booking form reading only the nameplate
-    {"model": None},  # a delivery file with no model read
-])
-def test_the_same_otf_and_mobile_are_one_sale_whatever_the_pan_or_model(tenant, differs):
-    """Product owner 2026-11-23: same OTF + same mobile is one booking; a delivery file with
-    another person's PAN, or a booking form reading only "Maxx", kept a booking and its delivery
-    file as two journeys."""
-    _, new = _pair(tenant, **differs)
+# ── 2026-11-23: the same OTF and the same mobile, with the same model or booking date ─────────
+def _booked(journey: P2Journey, day: str) -> None:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date) VALUES (:t, :j, :d) "
+                                "ON CONFLICT (tenant_id, journey_id) DO UPDATE SET booking_date = EXCLUDED.booking_date"),
+                           {"t": journey.tenant_id, "j": journey.journey_id, "d": day})
+
+
+def test_the_same_otf_mobile_and_model_are_one_sale_whatever_the_pan(tenant):
+    """Product owner 2026-11-23: "different PAN is a wrong document upload"."""
+    _, new = _pair(tenant, pan="ABCPE9999F")
     assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
     _quiet(new)
     assert _delete(new) == "DELETED" and not _exists(new)
+
+
+@pytest.mark.parametrize("differs", [{"model": "MAXX"}, {"model": None}])
+def test_the_same_otf_mobile_and_booking_date_are_one_sale_whatever_the_model(tenant, differs):
+    """A booking form reading only the nameplate, or a delivery file with no model read: the same
+    booking date stands in for the model ("same model or same booking date")."""
+    old, new = _pair(tenant, pan="ABCPE9999F", **differs)
+    _booked(old, "2026-11-14")
+    _booked(new, "2026-11-14")
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+
+
+def test_the_same_otf_and_mobile_without_the_same_model_or_date_are_kept_apart(tenant):
+    old, new = _pair(tenant, pan="ABCPE9999F", model="MAXX")
+    _booked(old, "2026-11-04")
+    _booked(new, "2026-11-14")
+    assert _detect(new).get("raised", 0) == 0 and _exists(new)
 
 
 @pytest.mark.parametrize("differs", [{"mobile": "9000000001", "pan": "ABCPE9999F"},
