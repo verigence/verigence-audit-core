@@ -506,3 +506,56 @@ def test_a_reprice_tag_runs_only_the_deal_check_again_and_once(tenant, monkeypat
     assert _versions(engine, tenant_id) == 0  # no master was loaded
     assert run_master_reload(engine, f"{tag}-commit", tenant_ids=[tenant_id])[0]["status"] == "ALREADY_DONE"
     assert len(calls) == 1
+
+
+def test_september_and_october_consumer_bulletins_are_read_again_without_touching_november(tenant) -> None:
+    """Product owner, 23 Nov 2026 ("fix what can be fixed" from the bulletins).
+    September and October were loaded before a cell like "MAXX HD 1.7 LX &
+    CBC" was read as its two variants: the plain LX the bulletin names had
+    no offer. Read again, it gains the bulletin's figure on a date of each
+    month; nothing loses an offer or changes, and November's stand as loaded."""
+    engine, tenant_id = tenant
+    tag = _month_history(engine, tenant_id)
+    for suffix in ("-schemes-commit", "-month-commit", "-novconsumer-commit"):
+        (result,) = run_master_reload(engine, f"{tag}{suffix}", tenant_ids=[tenant_id])
+        assert result["status"] == "COMMITTED", [c for c in result.get("checks", []) if not c["ok"]] or result
+
+    # As the first load left it: the plain LX is not on September's and October's rows.
+    with engine.begin() as conn:
+        conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        removed = conn.execute(text(
+            """
+            DELETE FROM auditcore.discount_scheme_eligibility e
+            USING auditcore.discount_scheme_versions v, auditcore.product_variants pv
+            WHERE e.tenant_id = :t AND v.discount_scheme_version_id = e.discount_scheme_version_id
+              AND v.effective_from < DATE '2026-11-04' AND pv.variant_id = e.variant_id
+              AND pv.variant_name = 'MAXX HD 1.7 LX BS6.2'
+            """), {"t": tenant_id}).rowcount
+    assert removed >= 2
+
+    (dry,) = run_master_reload(engine, f"{tag}-consumerreread", tenant_ids=[tenant_id])
+    assert dry["status"] == "DRY_RUN_PASSED", [c for c in dry.get("checks", []) if not c["ok"]] or dry.get("error")
+    for on, cash in (("2026-09-15", 25000), ("2026-10-15", 22000), ("2026-11-02", 22000)):
+        changes = dry["offerChanges"][on]
+        assert changes["gained"] == [
+            f"MAXX HD / MAXX HD 1.7 LX BS6.2: ACCESSORIES_KIT 5000, CASH_DISCOUNT {cash}"], (on, changes)
+        assert changes["lost"] == [] and changes["changed"] == []
+    # each bulletin on its own date (and on any later date a version was loaded on); October to 3 Nov
+    assert {(u["effectiveFrom"], u["effectiveTo"]) for u in dry["uploads"]
+            if u["effectiveFrom"] in (date(2026, 9, 3), date(2026, 10, 3))} == {
+        (date(2026, 9, 3), date(2026, 9, 30)), (date(2026, 10, 3), date(2026, 11, 3))}
+
+    (done,) = run_master_reload(engine, f"{tag}-consumerreread-commit", tenant_ids=[tenant_id])
+    assert done["status"] == "COMMITTED", [c for c in done.get("checks", []) if not c["ok"]] or done.get("error")
+    assert done["reprice"]["from"] == "2026-09-03" and done["reprice"]["failed"] == []
+    with engine.begin() as conn:
+        conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
+        october = oem_master_reload._consumer_offers(conn, tenant_id, date(2026, 10, 15))
+        november = oem_master_reload._consumer_offers(conn, tenant_id, date(2026, 11, 10))
+    assert october[("MAXX HD", "MAXX HD 1.7 LX BS6.2")] == {"ACCESSORIES_KIT": "5000", "CASH_DISCOUNT": "22000"}
+    assert october[("MAXX HD", "MAXX HD 1.7 LX CBC BS6.2")] == {"ACCESSORIES_KIT": "5000", "CASH_DISCOUNT": "22000"}
+    assert november[("MAXX HD", "MAXX HD 1.7 LX BS6.2")] == {"ACCESSORIES_KIT": "5000", "CASH_DISCOUNT": "22000"}
+    # read a second time, nothing more to gain
+    (again,) = run_master_reload(engine, f"{tag}-b-consumerreread", tenant_ids=[tenant_id])
+    assert again["status"] == "DRY_RUN_PASSED", [c for c in again.get("checks", []) if not c["ok"]]
+    assert all(not any(v.values()) for v in again["offerChanges"].values())
