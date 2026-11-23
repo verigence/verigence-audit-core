@@ -182,6 +182,16 @@ def test_the_report_carries_category_pc_outlet_customer_and_model(journey):
     # For the screen's filters (2026-11-06): the dealership, the outlet and the dates.
     assert {"dealer", "dealerId", "outletId", "bookingDate", "deliveryDate"} <= set(item)
     assert item["dealerId"] and item["outletId"]
+    # 23 Nov 2026 ("give filters to have inscope"): the Journey's Deal Type, None while not decided.
+    assert item["dealType"] is None
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("INSERT INTO auditcore.journey_classifications (tenant_id, journey_id, customer_type, deal_type) "
+                 "VALUES (:t, :j, 'INDIVIDUAL', 'INSCOPE') ON CONFLICT (tenant_id, journey_id) DO UPDATE SET deal_type = 'INSCOPE'"),
+            {"t": journey.tenant_id, "j": journey.journey_id},
+        )
+        assert discount_variance_report(connection, tenant_id=journey.tenant_id)["items"][0]["dealType"] == "Inscope"
 
 
 def test_the_report_can_list_only_the_over_grants(journey):

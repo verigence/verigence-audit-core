@@ -45,6 +45,7 @@ from audit_core.security_authorization import (
 )
 from audit_core.uc03_p2_access import authorize_p2
 from audit_core.uc03_p2_journey360 import _dec
+from audit_core.uc03_p2_journey_classification import LABELS as _DEAL_TYPE_LABELS
 
 router = APIRouter(prefix="/p2/v1/tenants/{tenant_id}", tags=["uc03-phase2-discount-variance"])
 
@@ -157,6 +158,9 @@ _REPORT_SQL = """
            COALESCE(bk.booking_confirm_date, bk.booking_confirmed_at_utc::date) AS booking_date,
            dl.actual_delivered_at::date AS delivery_date,
            jp.model_name_snapshot AS model, jp.variant_name_snapshot AS variant,
+           -- 23 Nov 2026 (product owner: "give filters to have inscope"): the
+           -- Journey's own Deal Type, as its classification decided it.
+           jc.deal_type,
            e.item->>'key' AS discount_key, e.item->>'label' AS discount_label,
            e.item->>'status' AS status, (e.item->>'entitled')::numeric AS entitled,
            (e.item->>'invoice')::numeric AS invoice, (e.item->>'variance')::numeric AS variance,
@@ -172,6 +176,7 @@ _REPORT_SQL = """
       ON o.tenant_id = j.tenant_id AND o.dealer_id = j.dealer_id AND o.outlet_id = j.outlet_id
     LEFT JOIN auditcore.journey_products jp ON jp.tenant_id = j.tenant_id AND jp.journey_id = j.journey_id
     LEFT JOIN auditcore.dealers d ON d.tenant_id = j.tenant_id AND d.dealer_id = j.dealer_id
+    LEFT JOIN auditcore.journey_classifications jc ON jc.tenant_id = j.tenant_id AND jc.journey_id = j.journey_id
     LEFT JOIN auditcore.journey_stage_states bk
       ON bk.tenant_id = j.tenant_id AND bk.journey_id = j.journey_id AND bk.stage_code = 'BOOKING'
     LEFT JOIN auditcore.deliveries dl ON dl.tenant_id = j.tenant_id AND dl.journey_id = j.journey_id
@@ -215,6 +220,8 @@ def discount_variance_report(
         "bookingDate": None if r["booking_date"] is None else r["booking_date"].isoformat(),
         "deliveryDate": None if r["delivery_date"] is None else r["delivery_date"].isoformat(),
         "model": r["model"], "variant": r["variant"],
+        # Inscope / Outscope / MR / Lease / Bulk; None while the Deal Type is not decided.
+        "dealType": _DEAL_TYPE_LABELS.get(str(r["deal_type"] or "")),
         "discountKey": r["discount_key"], "discount": r["discount_label"], "status": r["status"],
         "entitled": None if r["entitled"] is None else str(r["entitled"]),
         "invoice": None if r["invoice"] is None else str(r["invoice"]),
