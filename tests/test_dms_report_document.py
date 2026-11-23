@@ -1,5 +1,6 @@
-"""The DMS report as one styled document, Excel and PDF (product owner 2026-11-22): the facts in
-one report, deliveries grouped as the DMS groups outlets, against the gate register."""
+"""The DMS report as one styled document, Excel and PDF: four groups for bookings and deliveries
+alike, and the gate register (product owner 2026-11-23, "keep it simple"), grouped as the DMS
+groups outlets."""
 from __future__ import annotations
 
 import io
@@ -21,7 +22,8 @@ def _figures(**kw: int) -> dict[str, int]:
     base = {k: 0 for k in ("bookingDms", "bookingSynced", "bookingNotInVerigence", "bookingInVerigence",
                            "bookingNotInDms", "deliveryDump", "deliverySynced", "deliveryNotUploaded",
                            "deliveryNotInVerigence", "deliveryInVerigence", "deliveryNotInDms", "deliveryGap",
-                           "gateRegister", "registersMissed", "countsPending", "dumpInscope", "dumpOutscope")}
+                           "gateRegister", "registersMissed", "countsPending", "dumpInscope", "dumpOutscope",
+                           "bookingIntimated", "bookingNotIntimated", "deliveryIntimated", "deliveryNotIntimated")}
     return {**base, **kw}
 
 
@@ -48,9 +50,16 @@ def _report() -> dict:
         }],
         "statementLines": ["Dealer One", "* Onsite - gate register missing: none"],
         "rows": [{**row, "kind": "BOOKING", "inVerigence": "Not in Verigence"},
-                 {**row, "kind": "DELIVERY", "inVerigence": "Not in Verigence"},
-                 {**row, "kind": "DELIVERY", "inVerigence": NOT_UPLOADED, "journeyReference": "J-1"}],
-        "nameDiffers": [], "notInDump": [], "deliveryScope": [row], "intimations": [],
+                 {**row, "kind": "DELIVERY", "inVerigence": "Not in Verigence", "intimated": True,
+                  "markedBy": "PC Two"},
+                 {**row, "kind": "DELIVERY", "inVerigence": NOT_UPLOADED, "journeyReference": "J-1",
+                  "intimation": "Intimated to PC - pending with PC"}],
+        "nameDiffers": [], "deliveryScope": [row], "intimations": [],
+        "notInDump": [{"dealerName": "Dealer One", "outletName": "Town A", "eventDate": "2026-11-19",
+                       "customerName": "Customer V", "chassis": "T0A00009", "journeyReference": "J-9",
+                       "pcName": "PC One"}],
+        "notInDmsBookings": [{"dealerName": "Dealer One", "outletName": "Town A", "bookingDate": "2026-11-18",
+                              "customerName": "Customer W", "journeyReference": "J-8", "pcName": "PC One"}],
     }
 
 
@@ -63,27 +72,37 @@ def test_deliveries_are_grouped_as_the_dms_groups_outlets():
     assert rows[3]["figures"]["gateRegister"] == 1
 
 
-def test_the_exceptions_split_not_in_verigence_from_delivery_not_uploaded():
+def test_the_lists_are_the_four_groups():
     lists = {title: rows for title, _, rows, _ in exception_lists(_report())}
-    assert len(lists["Bookings not in Verigence"]) == 1
-    assert len(lists["Deliveries not in Verigence"]) == 1
-    assert [r["journeyReference"] for r in lists["Delivery not uploaded"]] == ["J-1"]
+    assert list(lists) == ["Bookings in Verigence, not in DMS", "Deliveries in Verigence, not in DMS",
+                           "Bookings intimated, not in Verigence", "Deliveries intimated, not in Verigence",
+                           "Bookings left over", "Deliveries left over"]
+    assert [r["pcName"] for r in lists["Deliveries in Verigence, not in DMS"]] == ["PC One"]
+    assert [r["pcName"] for r in lists["Bookings in Verigence, not in DMS"]] == ["PC One"]
+    # intimated: the mark, or (a report stored before 2026-11-23) its wording
+    assert len(lists["Deliveries intimated, not in Verigence"]) == 2
+    assert len(lists["Bookings left over"]) == 1 and lists["Deliveries left over"] == []
 
 
-def test_the_excel_holds_every_fact_styled():
+def test_the_excel_holds_the_groups_styled():
     book = load_workbook(io.BytesIO(build_report_xlsx(_report())))
-    assert book.sheetnames == ["Summary", "By DMS location", "Statement", "Bookings not in Verigence",
-                               "Deliveries not in Verigence", "Delivery not uploaded", "Matched, name differs",
-                               "Bookings not in DMS - why", "In Verigence, not in dump", "Delivery dump scope",
-                               "PC intimations",
-                               "How it is counted"]
+    assert book.sheetnames == ["Summary", "By DMS location", "Bookings in Verigence not DMS",
+                               "Deliveries in Verigence not DMS", "Bookings intimated to PC",
+                               "Deliveries intimated to PC", "Bookings left over", "Deliveries left over"]
     grouping = book["By DMS location"]
     labels = [grouping.cell(row=r, column=1).value for r in range(1, grouping.max_row + 1)]
+    heads = [grouping.cell(row=labels.index("Dealership / DMS location / outlet") + 1, column=c).value
+             for c in range(1, 11)]
+    assert heads[1:] == ["In Verigence and DMS", "In Verigence, not in DMS",
+                         "In DMS, intimated to PC, not in Verigence", "In DMS, not intimated, not in Verigence",
+                         "As per gate register", "In Verigence and DMS", "In Verigence, not in DMS",
+                         "In DMS, intimated to PC, not in Verigence", "In DMS, not intimated, not in Verigence"]
     outlet = labels.index("Satellite B") + 1
     assert grouping.row_dimensions[outlet].outline_level == 1  # folds under its DMS location
-    assert grouping.cell(row=outlet, column=5).value is None   # the DMS's figures are the location's
-    assert grouping.cell(row=outlet, column=2).value == 2      # its own gate register
-    assert book["Bookings not in Verigence"].tables          # a filterable Excel table
+    assert grouping.cell(row=outlet, column=7).value is None   # the DMS's figures are the location's
+    assert grouping.cell(row=outlet, column=6).value == 2      # its own gate register
+    sheet = book["Deliveries in Verigence not DMS"]
+    assert sheet.tables and "PC" in [c.value for c in sheet[5]]
     assert book["Summary"]["A1"].value == "DMS Reconciliation Report"
 
 
@@ -91,6 +110,7 @@ def test_the_pdf_reads_as_one_report():
     pdf = PdfReader(io.BytesIO(build_report_pdf(_report())))
     text = " ".join(page.extract_text() for page in pdf.pages)
     assert len(pdf.pages) >= 4
-    for words in ("DMS Reconciliation Report", "Deliveries by DMS location", "Satellite B", "Statement",
-                  "Bookings not in Verigence", "Delivery not uploaded", f"Page 1 of {len(pdf.pages)}"):
+    for words in ("DMS Reconciliation Report", "By DMS location", "Satellite B", "As per gate register",
+                  "Bookings left over", "Deliveries in Verigence, not in DMS", "PC One",
+                  f"Page 1 of {len(pdf.pages)}"):
         assert words in text

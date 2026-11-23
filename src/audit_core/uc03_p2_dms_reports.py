@@ -118,6 +118,7 @@ def _rows(connection: Connection, tenant_id: str, dealers: list[dict[str, Any]],
                                 else "Not in Verigence"),
                 "journeyReference": r["journey_reference"],
                 "dealType": _SCOPE.get(r.get("deal_type") or "", "Pending" if kind == DELIVERY else None),
+                "intimated": state == INTIMATED,
                 "intimation": ("Intimated to PC - pending with PC" if state == INTIMATED
                                else "Not intimated to PC - pending with dealership"),
                 "markedBy": (mark["claimed_by_name"] or mark["claimed_by"]) if mark else None,
@@ -221,11 +222,28 @@ def compute_report(connection: Connection, *, tenant_id: str, dealers: list[dict
             f"* In Verigence, not in the DMS booking dump: {len(report['notInDmsBookings'])} booking(s), cross-checked "
             "-- " + "; ".join(f"{REASONS[code].lower()} {n}" for code, n in reasons.most_common())
             + " (sheet \"Bookings not in DMS - why\")")
+    # The PC of each Verigence booking / delivery the DMS does not carry, to confirm it (2026-11-23).
+    pcs = _pc_names(connection, tenant_id, [r.get("journeyReference") for r in
+                                            report["notInDump"] + report["notInDmsBookings"]])
+    for row in report["notInDump"] + report["notInDmsBookings"]:
+        row["pcName"] = pcs.get(row.get("journeyReference") or "")
     report["intimations"] = [
         {**counter(connection, tenant_id, d["dealer_id"], d["dump_kind"], upto=day),
          "dealerName": next((x["dealerName"] for x in dealers if x["dealerId"] == d["dealer_id"]), None)}
         for d in sorted(dumps, key=lambda x: (x["dealer_id"], x["dump_kind"]))]
     return report
+
+
+def _pc_names(connection: Connection, tenant_id: str, references: list[Any]) -> dict[str, str]:
+    """The PC who uploaded each Journey (its creator), by Journey reference."""
+    wanted = sorted({str(r) for r in references if r})
+    if not wanted:
+        return {}
+    return {str(r[0]): r[1] for r in connection.execute(
+        text("SELECT journey_reference, created_by_display_name FROM auditcore.journeys "
+             "WHERE tenant_id = :t AND journey_reference = ANY(:refs)"),
+        {"t": tenant_id, "refs": wanted},
+    ).all() if r[1]}
 
 
 def generate_report(connection: Connection, *, tenant_id: str, dealers: list[dict[str, Any]], day: date,

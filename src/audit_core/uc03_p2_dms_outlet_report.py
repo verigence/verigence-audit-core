@@ -222,7 +222,8 @@ def dms_figures(rows: list[dict[str, Any]], outlets: list[dict[str, Any]],
                 figures["bookingIntimated" if r.get("intimated") else "bookingNotIntimated"] += 1
         else:
             figures["deliveryDump"] += 1
-            if outcome == MATCHED or (delivered is not None and r.get("journey_id") in delivered):
+            synced = outcome == MATCHED or (delivered is not None and r.get("journey_id") in delivered)
+            if synced:
                 figures["deliverySynced"] += 1
             elif outcome == NOT_IN_TOOL:
                 figures["deliveryNotUploaded"] += 1
@@ -232,7 +233,9 @@ def dms_figures(rows: list[dict[str, Any]], outlets: list[dict[str, Any]],
             scope = str(r.get("deal_type") or "")
             figures["dumpInscope" if scope == "INSCOPE" else "dumpOutscope" if scope == "OUTSCOPE"
                     else "dumpOtherDealType" if scope in ("MR", "LEASE", "BULK") else "dumpDealTypePending"] += 1
-            if outcome != MATCHED:
+            # Intimated / not intimated split what is not synced, so the groups add up to the dump
+            # (2026-11-23: a row synced by a delivery file uploaded after the match was counted twice).
+            if not synced:
                 figures["deliveryIntimated" if r.get("intimated") else "deliveryNotIntimated"] += 1
     return dict(located), dict(unmapped)
 
