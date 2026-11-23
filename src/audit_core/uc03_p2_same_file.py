@@ -185,6 +185,7 @@ from audit_core.uc03_duplicate_booking_detection import (
     _valid_gstin,
     _valid_pan,
 )
+from audit_core.uc03_enquiry_number import is_enquiry_number
 from audit_core.uc03_p2_names import (
     _is_company,
     is_firm_name,
@@ -648,6 +649,8 @@ def normalize_booking_reference(value: Any) -> str | None:
     and "BK/1/23" remain two numbers. None for a placeholder ("NA", "-",
     "0000"), for a value with no digit other than 0, or with fewer than three
     letters and digits -- too little to tell two bookings apart."""
+    if is_enquiry_number(value):  # an enquiry number is no booking number (2026-11-23)
+        return None
     if value is None:
         return None
     raw = str(value).upper()
