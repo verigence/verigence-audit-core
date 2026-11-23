@@ -86,6 +86,14 @@ def _rematch_one(engine: Engine, tenant_id: str, commit: bool, dump: dict[str, A
                      "WHERE tenant_id = :t AND dump_id = :id ORDER BY row_no"),
                 {"t": tenant_id, "id": str(dump["dump_id"])}).mappings()
                 if was.get(r["row_no"]) == "MISSING" and r["outcome"] != "MISSING"]
+            # The papers' values the DMS corrects, per field (uc03_p2_dms_field_sync): what a dry
+            # run would write, or what a commit wrote.
+            fields = {f"{r['field']} {r['status']}": r["n"] for r in connection.execute(
+                text("SELECT f ->> 'field' AS field, f ->> 'status' AS status, count(*) AS n "
+                     "FROM auditcore.p2_dms_dump_rows r, jsonb_array_elements(r.date_sync -> 'fields') f "
+                     "WHERE r.tenant_id = :t AND r.dump_id = :id AND jsonb_typeof(r.date_sync -> 'fields') = 'array' "
+                     "GROUP BY 1, 2"),
+                {"t": tenant_id, "id": str(dump["dump_id"])}).mappings()}
             if commit:
                 transaction.commit()
             else:
@@ -94,7 +102,7 @@ def _rematch_one(engine: Engine, tenant_id: str, commit: bool, dump: dict[str, A
                 "day": dump["business_date"].isoformat(),
                 "before": {"matched": dump["matched_count"], "notInTool": dump["not_in_tool_count"],
                            "missing": dump["missing_count"], "cancelled": dump["cancelled_count"]},
-                "after": counts, "newlyFound": len(found), "found": found[:40]}
+                "after": counts, "newlyFound": len(found), "found": found[:40], "fieldFixes": fields}
     except Exception as error:
         logger.warning("dms_rematch_failed", dump_id=str(dump["dump_id"]), exc_info=True)
         return f"{type(error).__name__}: {str(error)[:400]}"

@@ -150,7 +150,9 @@ NOTE_COLUMNS = ("Booking Date Source", "Insurance Policy No", "Insurance Add-ons
                 # whether the dealer's DMS booking / delivery dump has the journey (product owner 2026-11-13)
                 "DMS Booking Synced", "DMS Delivery Synced",
                 # the dealership bank statements' verdict (product owner 2026-11-14)
-                "Bank Verification", "Bank Verified On")
+                "Bank Verification", "Bank Verified On",
+                # the enquiry number, the booking's or the DMS's (product owner 2026-11-23)
+                "Enquiry No")
 # The accessories lines of the Deal (the standard kit and what is billed on it).
 _ACCESSORY_KEYS = frozenset({"accessories_cost", "essential_kit_amount", "genuine_accessories_amount",
                              "non_genuine_accessories_amount"})
@@ -266,6 +268,8 @@ def column_notes() -> list[tuple[str, str]]:
                                "uploaded bank statements; Partly verified / Not verified otherwise; blank when no "
                                "statement has covered its receipts. Cash receipts do not hold it back")),
         ("Bank Verified On", "The day (IST) the journey first became Bank verified"),
+        ("Enquiry No", ("Booking form / docket (enquiry number); else the enquiry number the DMS booking dump "
+                        "gives for the same booking (matched on its booking or enquiry number)")),
     ]
     return notes
 
@@ -493,6 +497,7 @@ def identity_row(base: dict[str, Any], *, deal: dict[str, Any], vehicle: dict[st
         "Dealership": base.get("dealer_name"),
         "Location": location or None,
         "Booking No": booking.get("bookingReference") or base.get("booking_reference") or base.get("journey_reference"),
+        "Enquiry No": booking.get("enquiryNumber"),
         # The journey's booking date, the same one the date filter used: never
         # a raw reading the rule passed over as a misread.
         "Booking Date": _date_text(base.get("booking_date")),
