@@ -101,7 +101,9 @@ def _seed(s, actor, role, points):
     """Accesses an hour apart (the API counts accesses less than 10 minutes apart once)."""
     with s.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
-        start = datetime.now(IST) - timedelta(hours=len(points) + 1)
+        # Inside the watch window (WATCH_FROM..WATCH_UNTIL), whatever today is: the window ended
+        # on 22 Nov and the tests seeding "now" began failing the next day.
+        start = datetime(2026, 11, 20, 8, 0, tzinfo=IST)
         for i, point in enumerate(points):
             command = watch.AccessLocationCommand.model_validate(
                 point if isinstance(point, dict) else _located(point))
@@ -109,8 +111,10 @@ def _seed(s, actor, role, points):
                                 command=command, now=start + timedelta(hours=i))
 
 
-def test_a_pc_sign_in_is_classified_against_their_tagged_outlet(setup):
+def test_a_pc_sign_in_is_classified_against_their_tagged_outlet(setup, monkeypatch):
     s = setup
+    # The API records with the database clock; keep the window open for this test, whatever today is.
+    monkeypatch.setattr(watch, "watch_open", lambda now: True)
     r = s.client.post(s.base, json=_located(NEARBY))
     assert r.status_code == 200, r.text
     assert r.json()["recorded"] is True and r.json()["atTaggedOutlet"] is True
