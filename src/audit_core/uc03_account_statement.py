@@ -1603,6 +1603,12 @@ def _pre_gst(rows: list[dict[str, Any]], read: StatementRead) -> bool:
     return any(_DMS_SCHEME.fullmatch(_label(row.get("particulars_raw"))) for row in rows)
 
 
+def is_dms_printout(line_items: Any) -> bool:
+    """Whether a statement's lines are the dealer's DMS printout (_pre_gst), not an NDC form."""
+    rows = line_rows(line_items)
+    return bool(rows) and _pre_gst(rows, read_statement(rows))
+
+
 def combine_statements(
     forms: list[tuple[dict[str, Any], list[dict[str, Any]]]],
 ) -> tuple[StatementRead | None, Combined]:

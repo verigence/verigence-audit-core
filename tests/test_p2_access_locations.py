@@ -5,7 +5,7 @@ Real Postgres (runtime role, so row security and the append-only grant are exerc
 Security and Google are doubles."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -101,9 +101,7 @@ def _seed(s, actor, role, points):
     """Accesses an hour apart (the API counts accesses less than 10 minutes apart once)."""
     with s.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
-        # Inside the watch window (WATCH_FROM..WATCH_UNTIL), whatever today is: the window ended
-        # on 22 Nov and the tests seeding "now" began failing the next day.
-        start = datetime(2026, 11, 20, 8, 0, tzinfo=IST)
+        start = datetime.now(IST) - timedelta(hours=len(points) + 1)
         for i, point in enumerate(points):
             command = watch.AccessLocationCommand.model_validate(
                 point if isinstance(point, dict) else _located(point))
@@ -111,10 +109,16 @@ def _seed(s, actor, role, points):
                                 command=command, now=start + timedelta(hours=i))
 
 
-def test_a_pc_sign_in_is_classified_against_their_tagged_outlet(setup, monkeypatch):
+@pytest.fixture
+def watch_running(monkeypatch):
+    """The watch ended on 22 Nov 2026; tests that record at the real time keep it open
+    through tomorrow (they failed from 23 Nov on every pull request)."""
+    tomorrow = datetime.now(UTC).astimezone(IST).date() + timedelta(days=1)
+    monkeypatch.setattr(watch, "WATCH_UNTIL", max(watch.WATCH_UNTIL, tomorrow))
+
+
+def test_a_pc_sign_in_is_classified_against_their_tagged_outlet(setup, watch_running):
     s = setup
-    # The API records with the database clock; keep the window open for this test, whatever today is.
-    monkeypatch.setattr(watch, "watch_open", lambda now: True)
     r = s.client.post(s.base, json=_located(NEARBY))
     assert r.status_code == 200, r.text
     assert r.json()["recorded"] is True and r.json()["atTaggedOutlet"] is True
@@ -145,7 +149,7 @@ def test_recording_stops_after_22_november(setup):
     assert result.recorded is False and result.reason == "WATCH_ENDED"
 
 
-def test_executive_sees_counts_per_place_with_the_top_3_addressed_once(setup):
+def test_executive_sees_counts_per_place_with_the_top_3_addressed_once(setup, watch_running):
     s = setup
     pc = s.journey.actor_id
     _seed(s, pc, "PC", [NEARBY, NEARBY, HOME, HOME_NEXT_DOOR, HOME, MARKET, MARKET, CAFE, TEMPLE,
@@ -156,7 +160,7 @@ def test_executive_sees_counts_per_place_with_the_top_3_addressed_once(setup):
     r = s.client.get(s.base)
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["watchUntil"] == "2026-11-22" and body["radiusM"] == 500
+    assert body["watchUntil"] == watch.WATCH_UNTIL.isoformat() and body["radiusM"] == 500
     me = next(p for p in body["people"] if p["actorId"] == pc)
     assert me["accesses"] == 11 and me["atTaggedOutlet"] == 2 and me["taggedOutlets"] == ["Utkal Mahindra – CDA"]
     assert me["elsewhere"] == 7 and me["unclear"] == 1 and me["noLocation"] == 1
