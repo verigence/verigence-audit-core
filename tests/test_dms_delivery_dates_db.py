@@ -249,6 +249,33 @@ def test_dms_rematch_job_dry_run_then_commit(dealer):
     assert done["commit"] is True and done["failed"] == 0
 
 
+def test_dms_rematch_tries_a_failed_dump_again_and_keeps_the_error(dealer, monkeypatch):
+    """A dump that fails is tried once more after the others; one that fails again is counted
+    and its error kept in the job's result (the worker's log lines can be dropped)."""
+    from audit_core import uc03_p2_dms_dumps as dumps
+    from audit_core.uc03_dms_rematch import run_dms_rematch
+
+    real, calls = dumps.match_dump, []
+
+    def flaky(connection, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("lock wait")
+        return real(connection, **kwargs)
+
+    monkeypatch.setattr(dumps, "match_dump", flaky)
+    once = run_dms_rematch(dealer.engine, f"{dealer.tenant_id}:dms-rematch-test", [])
+    assert (once["failed"], once["retried"], once["errors"], len(once["items"])) == (0, 1, [], 1)
+
+    def broken(connection, **kwargs):
+        raise RuntimeError("still locked")
+
+    monkeypatch.setattr(dumps, "match_dump", broken)
+    twice = run_dms_rematch(dealer.engine, f"{dealer.tenant_id}:dms-rematch-test", [])
+    assert (twice["failed"], twice["retried"], len(twice["items"])) == (1, 1, 0)
+    assert twice["errors"][0]["error"] == "RuntimeError: still locked"
+
+
 def test_a_generated_report_is_corrected_in_place(dealer):
     """DMS_REPORT_REBUILD (product owner, 20 Nov 2026: "correct the already generated report"):
     the stored report keeps its id, date and author; its figures are counted again; a dry run
