@@ -2,8 +2,8 @@
 
 "when we have delivery and booking information from DMS can we check and correct the wrong
 information captured in the Journey": the sales consultant, the OTF number, the enquiry number
-and the PIN code from the booking dump; the DMS invoice number and the sales consultant from
-the delivery dump. The DMS model and variant are not used ("ignore DMS Model"): the DMS names
+and the PIN code from the booking dump; the DMS invoice number and the chassis / VIN from the
+delivery dump. The DMS model and variant are not used ("ignore DMS Model"): the DMS names
 them as codes the price list does not use. The dates have their own path (uc03_p2_dms_dumps,
 _sure_match_sync) and are left as they are.
 
@@ -152,6 +152,39 @@ def _otf_agrees_read(read: str, dms: str) -> bool:  # decided by otf_target alon
     return False
 
 
+# The papers that print the chassis / VIN: uc03_p2_dms_dumps.CHASSIS_DOCUMENT_TYPES (that module
+# imports this one; a test keeps the two the same).
+CHASSIS_DOCS = (
+    "customer_invoice_dms", "customer_invoice_tally", "customer_ledger", "form_21", "vehicle_rc", "gate_pass",
+    "tax_invoice_tally", "accessory_invoice_dms", "accessory_invoice_tally", "insurance_cover", "rto_challan",
+    "ew_invoice", "rsa_invoice", "delivery_order_cover",
+)
+
+
+def _chassis(row: dict[str, Any]) -> str | None:
+    value = _alnum(row.get("chassis"))
+    return value if len(value) >= 6 else None
+
+
+def _chassis_agrees(read: str, dms: str) -> bool:
+    """The DMS's chassis is the full VIN (17 characters) or its last characters (Aditya's sheet
+    prints the last 8): the paper agrees when it ends with them."""
+    r, d = _alnum(read), _alnum(dms)
+    return r == d if len(d) >= 17 else r.endswith(d)
+
+
+def vin_target(read: str, dms: str) -> str | None:
+    """The VIN to write: the DMS's when it gives the full VIN; when it gives only the last
+    characters, the paper's VIN with those characters replaced -- only on a full 17-character
+    VIN read, else nothing."""
+    r, d = _alnum(read), _alnum(dms)
+    if len(d) >= 17:
+        return d
+    if len(r) == 17 and 6 <= len(d) < 17:
+        return r[:17 - len(d)] + d
+    return None
+
+
 def _invoice(row: dict[str, Any]) -> str | None:
     value = _text(row.get("invoice_number"))
     return value if value and len(_alnum(value)) >= 5 else None
@@ -171,9 +204,15 @@ RULES: dict[str, tuple[FieldRule, ...]] = {
         FieldRule("address_pincode", ("aadhaar",), _pin, _pin_agrees),
         FieldRule("pin_code", ("customer_kyc",), _pin, _pin_agrees),
     ),
+    # The sales consultant is the booking dump's alone (product owner 2026-11-23: "from delivery
+    # dump we dont need sales consultant name ... we need to verify DMS invoice number and
+    # chasis/VIN number").
     DELIVERY: (
         FieldRule("invoice_number", ("customer_invoice_dms",), _invoice, _invoice_agrees),
-        FieldRule("sales_person", BOOKING_DOCS, _consultant, lambda r, d: same_person(r, d)),
+        FieldRule("vin_number", CHASSIS_DOCS, _chassis, _chassis_agrees,
+                  target=lambda read, dms: vin_target(read, dms["value"])),
+        FieldRule("chassis_number", CHASSIS_DOCS, _chassis, _chassis_agrees,
+                  target=lambda read, dms: vin_target(read, dms["value"])),
     ),
 }
 
@@ -278,4 +317,5 @@ def apply_field_fixes(connection: Connection, *, tenant_id: str, dump: dict[str,
     return applied
 
 
-__all__ = ["RULES", "apply_field_fixes", "otf_target", "plan_field_fixes", "same_vehicle", "trusted"]
+__all__ = ["CHASSIS_DOCS", "RULES", "apply_field_fixes", "otf_target", "plan_field_fixes", "same_vehicle",
+           "trusted", "vin_target"]

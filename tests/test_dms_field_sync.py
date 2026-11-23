@@ -113,7 +113,7 @@ def test_the_same_consultant_spelt_otherwise_is_left(setup) -> None:  # noqa: F8
     assert _synced(s) == []
 
 
-def test_a_trusted_delivery_match_corrects_the_dms_invoice_number_and_consultant(setup) -> None:  # noqa: F811
+def test_a_trusted_delivery_match_corrects_the_dms_invoice_number_and_the_vin(setup) -> None:  # noqa: F811
     s = setup
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
@@ -123,13 +123,17 @@ def test_a_trusted_delivery_match_corrects_the_dms_invoice_number_and_consultant
                            {"t": s.journey.tenant_id, "j": s.journey.journey_id})
     docket = _document(s, "booking_form", booking_reference_number="B-77700031", sales_person="Someone Wrong")
     invoice = _document(s, "customer_invoice_dms", stage="DELIVERY", invoice_number="INV-2600l234",
-                        vin_number="MA1XX2T2K55631")
+                        vin_number="MA1XXAAAAT2K5563B")
+    gate = _document(s, "gate_pass", stage="DELIVERY", vin_number="MA1XXAAAAT2K5563B")
+    # The sheet prints the chassis's last 8 characters, the paper read one of them wrong.
     row = {"booking_number": "B-77700031", "name": "P2 Customer", "model": "THAR ROXX", "chassis": "T2K55631",
            "consultant": "TEST KUMAR TESTER", "invoice": "INV-26001234"}
     _dump(s, dumps.DELIVERY, [row])
     assert _value(s, invoice, "invoice_number") == "INV-26001234"
-    assert _value(s, docket, "sales_person") == "TEST KUMAR TESTER"
-    assert _synced(s) == ["invoice_number", "sales_person"]
+    assert _value(s, invoice, "vin_number") == "MA1XXAAAAT2K55631"
+    assert _value(s, gate, "vin_number") == _value(s, invoice, "vin_number")
+    assert _value(s, docket, "sales_person") == "Someone Wrong"  # the delivery dump's consultant is not taken
+    assert _synced(s) == ["invoice_number", "vin_number", "vin_number"]
 
 
 def test_a_delivery_row_without_the_otf_corrects_nothing(setup) -> None:  # noqa: F811
@@ -168,3 +172,14 @@ def test_journey_360_shows_the_dms_enquiry_number_when_the_papers_have_none(setu
         set_tenant_context(connection, s.journey.tenant_id)
         booking = vehicle(connection, tenant_id=s.journey.tenant_id, journey_id=s.journey.journey_id)["booking"]
     assert (booking["enquiryNumber"], booking["enquiryNumberFromDms"]) == ("EN-0038000051", True)
+
+
+def test_the_vin_written_is_the_dms_vin_or_the_paper_s_with_the_dms_last_characters() -> None:
+    from audit_core.uc03_p2_dms_dumps import CHASSIS_DOCUMENT_TYPES
+    from audit_core.uc03_p2_dms_field_sync import CHASSIS_DOCS, vin_target
+
+    assert CHASSIS_DOCS == CHASSIS_DOCUMENT_TYPES
+    assert vin_target("MA1AAAAAAAAB12345X", "B1234567") is None  # 18 read: not a VIN
+    assert vin_target("MA1AAAAAAAB12345X", "B1234567") == "MA1AAAAAAB1234567"
+    assert vin_target("MA1AAAAAAAB12345X", "MA1ZZZZZZZB123456") == "MA1ZZZZZZZB123456"
+    assert vin_target("B12345X", "B1234567") is None
