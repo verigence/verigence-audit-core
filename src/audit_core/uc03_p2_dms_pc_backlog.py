@@ -20,6 +20,12 @@ carries both.
 
 Rows naming no DMS location are not put on anybody: they are returned per dealership, so the
 totals still agree with the dumps.
+
+"Backlog till" (product owner 2026-11-23: "since DMS dump is upto a certain date, you need to
+provide that date as well"): the last day each dump holds -- the latest date its own rows carry,
+within the 1st to its upload day (uc03_p2_dms_dumps.compared_until, as the DMS report compares
+it). A dump uploaded on the 23rd whose booking rows stop at the 21st is a backlog till the 21st.
+A PC on locations of two dealerships is shown till the earlier of their dates.
 """
 from __future__ import annotations
 
@@ -72,7 +78,7 @@ def _latest_of_month(connection: Connection, tenant_id: str, dealer_ids: list[st
     rows = connection.execute(
         text("""
             SELECT DISTINCT ON (dealer_id, dump_kind) CAST(dealer_id AS text) AS dealer_id, dump_kind, dump_id,
-                   business_date
+                   business_date, period_month
             FROM auditcore.p2_dms_dumps
             WHERE tenant_id = :t AND status = 'ACTIVE' AND period_month = :m AND CAST(dealer_id AS text) = ANY(:ds)
             ORDER BY dealer_id, dump_kind, business_date DESC, uploaded_at_utc DESC
@@ -86,7 +92,7 @@ def pc_backlog(connection: Connection, *, tenant_id: str, dealer_ids: list[str],
                ) -> dict[str, Any]:
     """``byPerson``: PC -> figures (each location they are tagged to, in full); ``dealers``: per
     dealership the dumps used and the rows naming no DMS location."""
-    from audit_core.uc03_p2_dms_dumps import BOOKING, DELIVERY
+    from audit_core.uc03_p2_dms_dumps import BOOKING, DELIVERY, compared_until
     from audit_core.uc03_p2_dms_intimations import live_marks, row_key
     from audit_core.uc03_p2_dms_outlet_report import (
         _pcs_by_outlet,
@@ -131,6 +137,11 @@ def pc_backlog(connection: Connection, *, tenant_id: str, dealer_ids: list[str],
         {"t": tenant_id, "ds": dealer_ids})}
     by_person: dict[str, dict[str, int]] = defaultdict(lambda: dict.fromkeys(FIGURES, 0))
     locations_of: dict[str, list[str]] = defaultdict(list)
+    till_of: dict[str, dict[str, Any]] = defaultdict(lambda: {"bookingsTill": None, "deliveriesTill": None})
+
+    def earlier(a: Any, b: Any) -> Any:
+        return b if a is None else a if b is None else min(a, b)
+
     dealers_out = []
     for did in dealer_ids:
         rows = rows_by_dealer.get(did, [])
@@ -144,18 +155,26 @@ def pc_backlog(connection: Connection, *, tenant_id: str, dealer_ids: list[str],
             anchor = str(o["dms_outlet_id"])
             members[anchor if anchor in by_id else str(o["outlet_id"])].append(str(o["outlet_id"]))
         pcs = _pcs_by_outlet(connection, tenant_id, [str(o["outlet_id"]) for o in outlets])
+        booking, delivery = dumps.get((did, BOOKING)), dumps.get((did, DELIVERY))
+        bookings_till = compared_until(connection, tenant_id, booking) if booking else None
+        deliveries_till = compared_until(connection, tenant_id, delivery) if delivery else None
         for anchor, ids in members.items():
             figures = _from_dms(located.get(anchor, {}))
             tagged = set().union(*(pcs.get(i, set()) for i in ids)) if ids else set()
             for pc in tagged:
                 _add(by_person[pc], figures)
+                till_of[pc]["bookingsTill"] = earlier(till_of[pc]["bookingsTill"], bookings_till)
+                till_of[pc]["deliveriesTill"] = earlier(till_of[pc]["deliveriesTill"], deliveries_till)
                 locations_of[pc].append(short_name(by_id[anchor]["outlet_name"]))
-        booking, delivery = dumps.get((did, BOOKING)), dumps.get((did, DELIVERY))
         dealers_out.append({
             "dealerId": did, "dealerName": dealer_names.get(did),
             "bookingDumpDate": booking["business_date"].isoformat() if booking else None,
             "deliveryDumpDate": delivery["business_date"].isoformat() if delivery else None,
+            "bookingsTill": bookings_till.isoformat() if bookings_till else None,
+            "deliveriesTill": deliveries_till.isoformat() if deliveries_till else None,
             "unmapped": [{"label": label, **_from_dms(f)} for label, f in sorted(unmapped.items())],
         })
     return {"month": month.strftime("%Y-%m"), "dealers": dealers_out,
-            "byPerson": {pc: {**f, "locations": sorted(set(locations_of[pc]))} for pc, f in by_person.items()}}
+            "byPerson": {pc: {**f, "locations": sorted(set(locations_of[pc])),
+                              **{k: v.isoformat() if v else None for k, v in till_of[pc].items()}}
+                         for pc, f in by_person.items()}}

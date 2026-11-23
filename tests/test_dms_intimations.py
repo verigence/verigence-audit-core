@@ -504,8 +504,11 @@ def test_each_pc_against_the_dms_month_shared_locations_count_for_every_pc(setup
                                 "WHERE tenant_id=:t AND outlet_id=:o"), {"t": s.journey.tenant_id, "o": s.journey.outlet_id})
         outlet_name = "KESORA"
     add_read_value(s.journey, field_key="booking_reference_number", value="B-20261123")
-    booking = _dump(s, m.BOOKING, [{"booking_number": "B-20261123", "name": "P2 Customer"},
-                                   {"otf": "OTF27A000009", "name": "Not Uploaded", "mobile": "9000000009"}])
+    # The booking rows stop a day before the upload (as live dumps do): the backlog is till then.
+    back = 1 if _today().day > 1 else 0
+    booking = _dump(s, m.BOOKING, [{"booking_number": "B-20261123", "name": "P2 Customer", "back": back},
+                                   {"otf": "OTF27A000009", "name": "Not Uploaded", "mobile": "9000000009",
+                                    "back": back}])
     delivery = _dump(s, m.DELIVERY, [{"chassis": "MA1XX2XX3XX456789", "name": "Someone Else", "mobile": "9000000010"}])
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
@@ -519,6 +522,13 @@ def test_each_pc_against_the_dms_month_shared_locations_count_for_every_pc(setup
         result = pc_backlog(connection, tenant_id=s.journey.tenant_id, dealer_ids=[dealer], month=month)
     mine, theirs = result["byPerson"][s.journey.actor_id], result["byPerson"][second]
     assert mine == theirs  # one location, two PCs: the same figures for both
+    # Backlog till the last day each dump holds (2026-11-23), not its upload day.
+    from datetime import timedelta
+
+    assert mine["bookingsTill"] == (_today() - timedelta(days=back)).isoformat()
+    assert mine["deliveriesTill"] == _today().isoformat()
+    assert result["dealers"][0]["bookingsTill"] == mine["bookingsTill"]
+    assert result["dealers"][0]["bookingDumpDate"] == _today().isoformat()
     assert (mine["bookingDms"], mine["bookingSynced"], mine["bookingPending"], mine["bookingNotIntimated"]) == (2, 1, 1, 1)
     assert (mine["deliveryDms"], mine["deliverySynced"], mine["deliveryPending"]) == (1, 0, 1)
     # The same figures on the Project Tracker's "Against the DMS" tab of a Team Lead.
