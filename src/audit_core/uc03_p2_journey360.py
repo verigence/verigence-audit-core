@@ -4257,8 +4257,26 @@ def vehicle(connection: Connection, *, tenant_id: str, journey_id: UUID,
         params,
     ).mappings().first()
     b = dict(booking_row) if booking_row else {}
+    # The enquiry number (product owner 2026-11-23): the booking form / docket's, else the one the
+    # newest DMS booking dump gives for this booking, matched on its booking or enquiry number.
+    dms_enquiry = None if form.get("enquiry_number") else connection.execute(
+        text(
+            """
+            SELECT r.raw::jsonb ->> 'ENQUIRY NUMBER'
+            FROM auditcore.p2_dms_dump_rows r
+            JOIN auditcore.p2_dms_dumps u ON u.tenant_id = r.tenant_id AND u.dump_id = r.dump_id
+            WHERE r.tenant_id = :t AND r.journey_id = :j AND r.dump_kind = 'BOOKING' AND r.outcome = 'MATCHED'
+              AND r.match_basis IN ('BOOKING_NUMBER', 'ENQUIRY_NUMBER') AND u.status = 'ACTIVE'
+              AND COALESCE(r.raw::jsonb ->> 'ENQUIRY NUMBER', '') <> ''
+            ORDER BY u.business_date DESC, u.uploaded_at_utc DESC LIMIT 1
+            """
+        ),
+        params,
+    ).scalar()
     booking = {
         "bookingReference": form.get("booking_reference_number") or b.get("booking_reference"),
+        "enquiryNumber": form.get("enquiry_number") or dms_enquiry,
+        "enquiryNumberFromDms": bool(dms_enquiry),
         "bookingDate": form.get("booking_date") or (b["booking_confirmation_date"].isoformat() if b.get("booking_confirmation_date") else None),
         "salesConsultant": form.get("sales_person") or b.get("sales_staff_name"),
         "dealerBranch": form.get("dealer_branch") or b.get("outlet_address") or b.get("outlet_name"),

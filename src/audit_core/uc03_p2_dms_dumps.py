@@ -77,6 +77,8 @@ from audit_core.uc03_booking_day import BOOKING_MATCH_DAYS, FIRST_RECEIPT_SQL
 from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
 from audit_core.uc03_enquiry_number import enquiry_key, is_enquiry_number
 from audit_core.uc03_p2_access import authorize_p2_any
+from audit_core.uc03_p2_dms_field_sync import apply_field_fixes, plan_field_fixes
+from audit_core.uc03_p2_dms_field_sync import trusted as trusted_for_fields
 from audit_core.uc03_p2_names import same_person
 
 logger = structlog.get_logger(__name__)
@@ -1195,6 +1197,8 @@ class DumpPlan:
     counts: dict[str, int]
     # The dates the DMS gives that the Journeys' papers do not (sure matches only).
     date_fixes: list[dict[str, Any]] = field(default_factory=list)
+    # The other values the DMS corrects (uc03_p2_dms_field_sync, trusted matches only).
+    field_fixes: list[dict[str, Any]] = field(default_factory=list)
 
 
 def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpPlan:
@@ -1243,6 +1247,7 @@ def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpP
     taken: set[str] = set()
     seen_lines: dict[str, int] = {}
     sure: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+    trusted_rows: list[tuple[dict[str, Any], str]] = []
     for row in rows:
         if (model := row_out_of_scope(dict(row))) is not None:
             updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": None, "b": model,
@@ -1284,12 +1289,18 @@ def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpP
             synced.append(jid)
             if sure_match(kind, dict(row), basis, journey):
                 sure.append((dict(row), jid, journey))
+            if trusted_for_fields(kind, dict(row), journey):
+                trusted_rows.append((dict(row), jid))
     for u in updates:
         u.setdefault("jm", None)
         u.setdefault("md", None)
         u.setdefault("ds", None)
-    date_fixes = _sure_match_sync(connection, tenant_id, kind, sure, {u["n"]: u for u in updates}, dict(dump))
-    return DumpPlan(dict(dump), updates, synced, counts, date_fixes)
+    by_row = {u["n"]: u for u in updates}
+    date_fixes = _sure_match_sync(connection, tenant_id, kind, sure, by_row, dict(dump))
+    # The other fields the DMS corrects, on a match the product owner trusts (2026-11-23).
+    newer = _dated_by_newer_dump(connection, tenant_id, dict(dump), sorted({jid for _, jid in trusted_rows}))
+    field_fixes = plan_field_fixes(connection, tenant_id, kind, trusted_rows, by_row, newer)
+    return DumpPlan(dict(dump), updates, synced, counts, date_fixes, field_fixes)
 
 
 def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict[str, int]:
@@ -1302,6 +1313,8 @@ def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict
     plan = plan_dump(connection, tenant_id=tenant_id, dump_id=dump_id)
     kind, updates, synced, counts = plan.dump["dump_kind"], plan.updates, plan.synced, plan.counts
     apply_date_fixes(connection, tenant_id=tenant_id, plan=plan)
+    apply_field_fixes(connection, tenant_id=tenant_id, dump=plan.dump, fixes=plan.field_fixes,
+                      updates={u["n"]: u for u in updates})
     for u in updates:
         u["ds"] = json.dumps(u["ds"]) if u["ds"] is not None else None
     if updates:
