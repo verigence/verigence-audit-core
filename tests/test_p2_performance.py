@@ -671,3 +671,46 @@ def test_new_journeys_and_updates_by_channel_and_every_pcs_day(setup):
     # Time on Verigence: Executive and Superadmin only.
     assert "activity" not in row and after["lead"]["showsActivity"] is False
     assert "activity" in after["admin_row"] and after["admin_row"]["journeys"] == row["journeys"]
+
+
+def test_duty_days_missed_come_from_the_daily_duties(setup):
+    """Product owner 2026-11-23: "duty days missed are not being populated" -- since 19 Nov the PCs'
+    duties are the daily duties, not the Task Manager's recurring tasks; the Tracker reads them, with
+    the Daily duties board's rule, for every PC mapped to the outlet."""
+    s = setup
+    me = s.journey.actor_id
+    today = datetime.now(IST).date()
+    old_day, late_day = today - timedelta(days=6), today - timedelta(days=2)
+    duty = str(tt._exec(s, """
+        INSERT INTO auditcore.p2_duties (tenant_id, title, mandatory, effective_from)
+        VALUES (:t, 'Cash ledger', false, :d) RETURNING duty_id
+    """, d=old_day).scalar_one())
+
+    def item(day, *, carry: int, done_on=None):
+        tt._exec(s, """
+            INSERT INTO auditcore.p2_duty_items (tenant_id, duty_id, dealer_id, outlet_id, duty_date, for_date, title,
+              mandatory, close_mode, carry_days, status, done_on)
+            VALUES (:t, :duty, :dealer, :o, :day, :day, 'Cash ledger', false, 'TICK', :carry, :st, :done)
+        """, duty=duty, dealer=s.journey.dealer_id, o=s.journey.outlet_id, day=day, carry=carry,
+                 st="DONE" if done_on else "PENDING", done=done_on)
+
+    item(old_day, carry=1)                         # never done, carry days over: missed
+    item(late_day, carry=5, done_on=today)         # done two days late
+    item(today, carry=5, done_on=today)            # done the same day
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        data = perf._aggregate(connection, tenant_id=s.journey.tenant_id, first=old_day, last=today,
+                               tz="Asia/Kolkata", now=datetime.now(UTC))
+    mine = data["duties"][me][duty]
+    assert mine[old_day.isoformat()]["notDone"] == 1
+    assert mine[late_day.isoformat()]["late"] == 1
+    assert mine[today.isoformat()]["onTime"] == 1
+    assert data["outlet_duties"][str(s.journey.outlet_id)][duty][old_day.isoformat()]["notDone"] == 1
+    assert any(x["scheduleId"] == duty and x["title"] == "Cash ledger" for x in data["schedules"])
+
+    tl = f"tl-{uuid4().hex[:6]}"
+    tt._role(s, tl, "TL")
+    report = _build(s, tl, section="dashboard")
+    pcs = next(c for c in report["dashboard"]["scorecards"] if c["key"] == "pcs")
+    row = next(r for r in pcs["rows"] if r["id"] == me)
+    assert row["values"]["dutiesMissed"] == 1
