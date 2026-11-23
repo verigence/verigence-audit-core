@@ -165,7 +165,7 @@ import os
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 from uuid import UUID
 
@@ -365,6 +365,16 @@ _IDENTITY_SQL = f"""
                 WHERE q.tenant_id = j.tenant_id AND q.journey_id = j.journey_id AND q.queue_status <> 'CANCELLED'
              ) t WHERE t.kind IN ('booking_form', 'booking_docket', 'pan_card', 'aadhaar', 'customer_kyc',
                                   'gst_certificate')) AS identity_documents,
+           -- 2026-11-23: its booking date -- the booking form's, and the first receipt's.
+           (SELECT b.booking_date FROM auditcore.bookings b
+             WHERE b.tenant_id = j.tenant_id AND b.journey_id = j.journey_id LIMIT 1) AS form_date,
+           (SELECT min(COALESCE(p.receipt_date, p.payment_reference_date)) FROM auditcore.payments p
+             WHERE p.tenant_id = j.tenant_id AND p.journey_id = j.journey_id AND p.status_source = 'EVIDENCE'
+               AND p.amount > 0
+               AND EXISTS (SELECT 1 FROM auditcore.evidence e
+                           WHERE e.tenant_id = p.tenant_id AND e.journey_id = p.journey_id
+                             AND e.di_document_id = p.source_di_document_id
+                             AND e.association_status = 'ACTIVE')) AS first_receipt,
            {_CLOSED_SQL} AS is_closed
     FROM auditcore.journeys j
     JOIN auditcore.customers c ON c.tenant_id = j.tenant_id AND c.customer_id = j.customer_id
@@ -480,6 +490,8 @@ class FileIdentity:
     # 2026-11-21: the kinds of paper naming a customer it holds (booking form / docket, PAN,
     # Aadhaar, KYC, GST certificate), read or not.
     identity_documents: frozenset[str] = frozenset()
+    # 2026-11-23: its booking date -- the booking form's and the first receipt's (either).
+    booking_days: frozenset[date] = frozenset()
 
     @property
     def nameless(self) -> bool:
@@ -601,6 +613,7 @@ def _identities(connection: Connection, *, tenant_id: str, journey_ids: Iterable
             receipt_keys=_receipt_keys(row["receipt_rows"]),
             chassis=_chassis(row["chassis_values"], row["vin"]),
             identity_documents=frozenset(str(k) for k in row["identity_documents"] or [] if k),
+            booking_days=frozenset(d for d in (row["form_date"], row["first_receipt"]) if d is not None),
         )
     return out
 
@@ -992,13 +1005,58 @@ def one_booking_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[s
     return fields
 
 
+def same_otf_mobile_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
+    """One sale (product owner 2026-11-23): one dealership, the same booking reference number
+    (OTF), the same mobile, and the same model or the same booking date ("just add one point
+    same model or same booking date") -- whatever the PAN says. "Different PAN is a wrong
+    document upload": a delivery file carrying another person's PAN, or a booking form reading
+    only "Maxx", kept a booking and its delivery file as two journeys. Never when the VINs are
+    read on both and differ (two vehicles). The fields that matched; None otherwise."""
+    if not (new.dealer_id and new.dealer_id == existing.dealer_id):
+        return None
+    if not (new.mobile and new.mobile == existing.mobile and booking_reference_shared(new, existing)):
+        return None
+    models_agree = same_model(new, existing)
+    same_day = sorted(new.booking_days & existing.booking_days)
+    if not (models_agree or same_day):
+        return None
+    if new.vin and existing.vin and new.vin != existing.vin:
+        return None
+    shown_new = new.booking_ref_display or ", ".join(sorted(new.booking_refs))
+    shown_old = existing.booking_ref_display or ", ".join(sorted(existing.booking_refs))
+    fields: list[dict[str, Any]] = [
+        {"field": "booking_reference", "label": "OTF", "newValue": shown_new, "existingValue": shown_old,
+         "exact": True},
+        {"field": "mobile", "label": "Mobile", "newValue": _masked(new.mobile),
+         "existingValue": _masked(existing.mobile), "exact": True},
+    ]
+    if two_people(new, existing):
+        # Shown as not matching: one of the two PANs is a wrong upload; both are kept on the
+        # journey and the customer-identity check asks the PC which (WRONG_DOCUMENT_REVIEW).
+        fields.append({"field": "pan", "label": "PAN (one is a wrong upload)",
+                       "newValue": ", ".join(sorted(_masked(p) or "" for p in _all_pans(new))),
+                       "existingValue": ", ".join(sorted(_masked(p) or "" for p in _all_pans(existing))),
+                       "exact": False})
+    if same_day:
+        fields.append({"field": "booking_date", "label": "Booking date", "newValue": same_day[0].isoformat(),
+                       "existingValue": same_day[0].isoformat(), "exact": True})
+    fields += [
+        {"field": "model", "label": "Model", "newValue": new.model_name, "existingValue": existing.model_name,
+         "exact": models_agree},
+        {"field": "outlet", "label": "Outlet", "newValue": _place(new.dealer_name, new.outlet_name),
+         "existingValue": _place(existing.dealer_name, existing.outlet_name), "exact": same_outlet(new, existing)},
+    ]
+    return fields
+
+
 def same_file_fields(new: FileIdentity, existing: FileIdentity) -> list[dict[str, Any]] | None:
     """One booking uploaded twice: the one rule (one_booking_fields, 2026-11-14). The earlier
     conditions (matched_fields: the name and booking reference number; same_sale_fields: the
     receipt) no longer decide it -- requiring them is what kept letting duplicates through.
     The same receipt number still finds one sale whose model was written differently on the
     booking form and on the invoice (same_sale_fields, 2026-11-12): more duplicates, not fewer."""
-    return one_booking_fields(new, existing) or same_sale_fields(new, existing) or part_of_sale_fields(new, existing)
+    return (one_booking_fields(new, existing) or same_otf_mobile_fields(new, existing)
+            or same_sale_fields(new, existing) or part_of_sale_fields(new, existing))
 
 
 def page_counts(connection: Connection, *, tenant_id: str, journey_ids: Iterable[UUID]) -> dict[UUID, int]:
@@ -1275,6 +1333,10 @@ _RECEIPT_KINDS = frozenset({"dealer_receipt", "payment_receipt"})
 # A page not typed yet is carried: nothing says the earlier journey has it.
 _UNTYPED_KINDS = frozenset({"document", "unknown", "other", "unclassified"})
 _GONE_UNITS = ("CANCELLED", "MERGED")
+# The customer's identity papers: carried even when the kept journey holds the kind, if the two
+# journeys' PANs differ (2026-11-23) -- one of them is a wrong upload, and deleting the copy must
+# not lose the right one.
+_IDENTITY_KINDS = frozenset({"pan_card", "aadhaar", "customer_kyc"})
 
 
 @dataclass(frozen=True)
@@ -1354,9 +1416,13 @@ def carry_plan(connection: Connection, *, tenant_id: str, new: FileIdentity, exi
              "AND association_status='ACTIVE' AND document_type_key IS NOT NULL"),
         {"t": tenant_id, "j": existing.journey_id},
     ).scalars().all()}
+    pans_differ = two_people(new, existing)
     carried: dict[str, dict[str, Any]] = {}
     for key, unit in units.items():
         kind = str(unit["document_type_key"])
+        if pans_differ and kind in _IDENTITY_KINDS:
+            carried[key] = unit
+            continue
         if kind in _RECEIPT_KINDS:
             numbers = _document_numbers(connection.execute(
                 text("SELECT f.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields f "
@@ -1860,8 +1926,8 @@ def run_same_file_delete(
         raise UploadInProgress(wait + 30)
     existing_ref = (dict(alert["payload"] or {}).get("existingJourney") or {}).get("reference")
     existing_id = UUID(str(alert["related_journey_id"])) if alert["related_journey_id"] else None
-    reason = (f"Duplicate booking: the same model and the same PAN, Aadhaar, mobile or GSTIN as "
-              f"{existing_ref or 'another journey'}, which has more pages and is kept")
+    reason = (f"Duplicate booking of {existing_ref or 'another journey'} (the same OTF and mobile, or the same "
+              f"model and the same PAN, Aadhaar, mobile or GSTIN), which has more pages and is kept")
 
     def publish(outcome: str, kept_reason: str | None = None) -> Callable[[Connection], None]:
         return lambda connection: publish_alert(connection, tenant_id=tenant_id, journey_id=journey_id,

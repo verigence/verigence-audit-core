@@ -358,7 +358,7 @@ def test_same_file_with_an_individual_pan_is_deleted_and_alerted(tenant):
         ).mappings().one()
     assert record["deleted_by_actor_id"] == "SYSTEM" and record["deleted_by_role"] == "SYSTEM"
     assert record["deletion_status"] == "COMPLETED"
-    assert record["reason"].startswith("Duplicate booking: the same model") and "OLD-" in record["reason"]
+    assert record["reason"].startswith("Duplicate booking of OLD-")
     # What the Deleted tab shows (2026-11-02): PAN and mobile in full, the booking number, the copy kept.
     assert record["deletion_kind"] == "SAME_FILE"
     assert record["customer_pan"] == INDIVIDUAL_PAN and record["customer_mobile"] == "9876543210"
@@ -368,8 +368,10 @@ def test_same_file_with_an_individual_pan_is_deleted_and_alerted(tenant):
 
 
 @pytest.mark.parametrize("differs", [
-    # Two people (a PAN read on both and different), another model, or no model to compare.
-    {"pan": "ABCPE9999F"}, {"model": "SCORPIO N"}, {"model": None},
+    # Two people (a PAN read on both and different), another model, or no model to compare --
+    # each with another OTF: the same OTF and mobile are one sale whatever else differs (2026-11-23).
+    {"pan": "ABCPE9999F", "booking_ref": "BK/0099"}, {"model": "SCORPIO N", "booking_ref": "BK/0099"},
+    {"model": None, "booking_ref": "BK/0099"},
 ])
 def test_one_value_different_is_not_the_same_file(tenant, differs):
     _, new = _pair(tenant, **differs)
@@ -1539,7 +1541,8 @@ def test_a_firms_pan_beside_the_proprietors_is_still_one_customer(tenant):
 
 
 def test_no_pan_in_common_is_still_two_people(tenant):
-    _, new = _pair(tenant, pan="ABCPE9999F")
+    # Another OTF too: the same OTF and mobile are one sale whatever the PANs (2026-11-23).
+    _, new = _pair(tenant, pan="ABCPE9999F", booking_ref="BK/0099")
     _kyc(new, pan="ABCPE8888F")
     assert _detect(new).get("raised", 0) == 0
 
@@ -1717,3 +1720,75 @@ def test_a_file_whose_booking_form_is_not_read_is_not_joined_on_a_receipt():
     papers = _nameless(dealer_id=dealer, receipt_keys=frozenset({_RECEIPT_KEY}),
                        identity_documents=frozenset())
     assert part_of_sale_fields(papers, booking) is not None
+
+
+
+# ── 2026-11-23: the same OTF and the same mobile, with the same model or booking date ─────────
+def _booked(journey: P2Journey, day: str) -> None:
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date) VALUES (:t, :j, :d) "
+                                "ON CONFLICT (tenant_id, journey_id) DO UPDATE SET booking_date = EXCLUDED.booking_date"),
+                           {"t": journey.tenant_id, "j": journey.journey_id, "d": day})
+
+
+def test_the_same_otf_mobile_and_model_are_one_sale_whatever_the_pan(tenant):
+    """Product owner 2026-11-23: "different PAN is a wrong document upload"."""
+    _, new = _pair(tenant, pan="ABCPE9999F")
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    _quiet(new)
+    assert _delete(new) == "DELETED" and not _exists(new)
+
+
+@pytest.mark.parametrize("differs", [{"model": "MAXX"}, {"model": None}])
+def test_the_same_otf_mobile_and_booking_date_are_one_sale_whatever_the_model(tenant, differs):
+    """A booking form reading only the nameplate, or a delivery file with no model read: the same
+    booking date stands in for the model ("same model or same booking date")."""
+    old, new = _pair(tenant, pan="ABCPE9999F", **differs)
+    _booked(old, "2026-11-14")
+    _booked(new, "2026-11-14")
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+
+
+def test_the_same_otf_and_mobile_without_the_same_model_or_date_are_kept_apart(tenant):
+    old, new = _pair(tenant, pan="ABCPE9999F", model="MAXX")
+    _booked(old, "2026-11-04")
+    _booked(new, "2026-11-14")
+    assert _detect(new).get("raised", 0) == 0 and _exists(new)
+
+
+@pytest.mark.parametrize("differs", [{"mobile": "9000000001", "pan": "ABCPE9999F"},
+                                     {"booking_ref": "BK/0099", "pan": "ABCPE9999F"}])
+def test_the_same_otf_or_mobile_alone_does_not_join_two_peoples_files(tenant, differs):
+    _, new = _pair(tenant, **differs)
+    assert _detect(new).get("raised", 0) == 0 and _exists(new)
+
+
+def test_same_otf_and_mobile_but_two_vehicles_is_not_one_sale():
+    from audit_core.uc03_p2_same_file import same_otf_mobile_fields
+
+    dealer = uuid4()
+    left = _identity(pan="ABCPE9999F", vin="MA1AAAAAAAAA11111", dealer_id=dealer)
+    right = _identity(vin="MA1BBBBBBBBB22222", dealer_id=dealer)
+    assert same_otf_mobile_fields(left, right) is None
+    assert same_otf_mobile_fields(_identity(dealer_id=dealer), _identity(dealer_id=uuid4())) is None
+    fields = same_otf_mobile_fields(_identity(pan="ABCPE9999F", dealer_id=dealer), _identity(dealer_id=dealer))
+    assert [f["field"] for f in fields][:3] == ["booking_reference", "mobile", "pan"]
+    assert next(f for f in fields if f["field"] == "pan")["exact"] is False
+
+
+def test_when_the_pans_differ_the_copys_pan_is_carried_not_lost(tenant, monkeypatch):
+    """2026-11-23: one of the two PANs is a wrong upload. The kept journey holds a PAN already,
+    but the copy's is carried too -- deleting the copy must not lose the right one; the
+    customer-identity check then asks the PC which is wrong."""
+    from audit_core import uc03_p2_storage
+
+    old, new = _pair(tenant, pan="ABCPE9999F")
+    _same_pages(old, new)
+    _page(old, sha=uuid4().hex, kind="pan_card")
+    _page(new, sha=uuid4().hex, kind="pan_card")  # another person's PAN
+    _quiet(new)
+    monkeypatch.setattr(uc03_p2_storage, "get_p2_document_storage", lambda: CopyStorage())
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    assert _alerts(new)[0]["payload"]["carryDocuments"] == ["pan_card"]
+    assert _delete(new) == "DELETED" and len(_batches_copied(old)) == 1
