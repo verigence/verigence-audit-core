@@ -164,14 +164,24 @@ def _chassis_agrees(read: str, dms: str) -> bool:
     return r == d if len(d) >= 17 else r.endswith(d)
 
 
+# A chassis read differing from the DMS's in more characters than this is another vehicle's
+# (the exchange car's RC, another car's accessory invoice), not a misreading of this one's.
+VIN_MISREAD_CHARACTERS = 2
+
+
+def _misread(read: str, dms: str) -> bool:
+    return len(read) == len(dms) and 0 < sum(a != b for a, b in zip(read, dms, strict=True)) <= VIN_MISREAD_CHARACTERS
+
+
 def vin_target(read: str, dms: str) -> str | None:
-    """The VIN to write: the DMS's when it gives the full VIN; when it gives only the last
-    characters, the paper's VIN with those characters replaced -- only on a full 17-character
-    VIN read, else nothing."""
+    """The VIN to write, only over a misreading of this vehicle's (at most two characters
+    different): the DMS's full VIN; where the DMS gives only the last characters, the paper's
+    17-character VIN with those characters replaced. A paper whose chassis differs more is
+    another vehicle's (live, 23 Nov 2026: the exchange car's RC read as the chassis) and is left."""
     r, d = _alnum(read), _alnum(dms)
     if len(d) >= 17:
-        return d
-    if len(r) == 17 and 6 <= len(d) < 17:
+        return d if _misread(r, d) else None
+    if len(r) == 17 and 6 <= len(d) < 17 and _misread(r[-len(d):], d):
         return r[:17 - len(d)] + d
     return None
 
@@ -181,8 +191,25 @@ def _invoice(row: dict[str, Any]) -> str | None:
     return value if value and len(_alnum(value)) >= 5 else None
 
 
+def _edits(a: str, b: str) -> int:
+    """Characters to change, add or drop to make one into the other (Levenshtein)."""
+    row = list(range(len(b) + 1))
+    for i, x in enumerate(a, start=1):
+        prev, row[0] = row[0], i
+        for j, y in enumerate(b, start=1):
+            prev, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev + (x != y))
+    return row[-1]
+
+
 def _invoice_agrees(read: str, dms: str) -> bool:
     return _alnum(read) == _alnum(dms)
+
+
+def invoice_target(read: str, dms: str) -> str | None:
+    """The DMS invoice number, only over a misreading of it (at most two characters changed,
+    added or dropped: INV27A... read INV21A..., INV270... for INV27O...). A number differing
+    more is another invoice and is left."""
+    return dms if 0 < _edits(_alnum(read), _alnum(dms)) <= VIN_MISREAD_CHARACTERS else None
 
 
 RULES: dict[str, tuple[FieldRule, ...]] = {
@@ -199,7 +226,8 @@ RULES: dict[str, tuple[FieldRule, ...]] = {
     # dump we dont need sales consultant name ... we need to verify DMS invoice number and
     # chasis/VIN number").
     DELIVERY: (
-        FieldRule("invoice_number", ("customer_invoice_dms",), _invoice, _invoice_agrees),
+        FieldRule("invoice_number", ("customer_invoice_dms",), _invoice, _invoice_agrees,
+                  target=lambda read, dms: invoice_target(read, dms["value"])),
         FieldRule("vin_number", CHASSIS_DOCS, _chassis, _chassis_agrees,
                   target=lambda read, dms: vin_target(read, dms["value"])),
         FieldRule("chassis_number", CHASSIS_DOCS, _chassis, _chassis_agrees,
@@ -308,5 +336,5 @@ def apply_field_fixes(connection: Connection, *, tenant_id: str, dump: dict[str,
     return applied
 
 
-__all__ = ["CHASSIS_DOCS", "RULES", "apply_field_fixes", "otf_target", "plan_field_fixes", "same_vehicle",
+__all__ = ["CHASSIS_DOCS", "RULES", "VIN_MISREAD_CHARACTERS", "apply_field_fixes", "invoice_target", "otf_target", "plan_field_fixes", "same_vehicle",
            "trusted", "vin_target"]
