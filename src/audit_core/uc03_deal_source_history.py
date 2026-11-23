@@ -393,6 +393,111 @@ def source_rank(priority: tuple[str, ...], document_type: str | None) -> int:
     return len(priority) + 1
 
 
+def holder_stands(
+    connection: Connection, *, tenant_id: str, journey_id: UUID, component_key: str, source_reference: Any,
+) -> bool:
+    """Whether the document holding a canonical commercial_lines actual still gives it: its
+    document is on file (ACTIVE evidence) and, when its figure was recorded per source, that
+    record is not withdrawn. A holder with no per-source record stands (nothing says otherwise).
+
+    2026-11-23 (product owner, ADI-RD-261101-051): a cost sheet voided or superseded kept its
+    ex-showroom Rs 10,30,100 as the Journey's actual on 274 bookings, and the NDC's
+    Rs 10,30,000 could never replace it -- the old holder still ranked ahead."""
+    holder_type = _reference_type(source_reference)
+    document = _as_uuid(str(source_reference or "").partition(":")[2] or None)
+    if holder_type is None or document is None:
+        return True
+    row = connection.execute(
+        text(
+            f"""
+            SELECT
+              EXISTS (SELECT 1 FROM auditcore.evidence e
+                      WHERE e.tenant_id = :t AND e.journey_id = :j AND e.di_document_id = :d
+                        AND e.association_status <> 'ACTIVE')
+              AND NOT EXISTS (SELECT 1 FROM auditcore.evidence e
+                      WHERE e.tenant_id = :t AND e.journey_id = :j AND e.di_document_id = :d
+                        AND e.association_status = 'ACTIVE') AS off_file,
+              count(s.*) AS recorded,
+              count(s.*) FILTER (WHERE s.withdrawn_at_utc IS NULL) AS standing
+            FROM (SELECT 1) one
+            LEFT JOIN auditcore.commercial_line_source_values s
+              ON s.tenant_id = :t AND s.journey_id = :j AND s.line_kind = 'COMMERCIAL'
+             AND s.component_key = :k AND s.source_document_id = :d AND {NORMALISED_TYPE_SQL} = :type
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "d": document, "k": component_key, "type": holder_type},
+    ).mappings().one()
+    if row["off_file"]:
+        return False
+    return not (row["recorded"] and not row["standing"])
+
+
+def reconcile_commercial_actuals(connection: Connection, *, tenant_id: str, journey_id: UUID) -> int:
+    """Hand every canonical commercial_lines actual whose document no longer gives it to the
+    strongest source still on file (the component's source priority, as upsert_commercial_actual
+    ranks it), or clear it when no source gives the line any more -- as a re-read statement's
+    lines are cleared (_stale_statement_rows). Run on every recompute; idempotent. Returns the
+    number of lines changed."""
+    from audit_core.uc03_attribute_mapping import spec_for_field
+
+    held = connection.execute(
+        text(
+            """
+            SELECT component_key, source_reference, actual_amount FROM auditcore.commercial_lines
+            WHERE tenant_id = :t AND journey_id = :j AND actual_amount IS NOT NULL
+              AND source_reference LIKE '%:%'
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).mappings().all()
+    stale = [r for r in held if not holder_stands(
+        connection, tenant_id=tenant_id, journey_id=journey_id, component_key=str(r["component_key"]),
+        source_reference=r["source_reference"])]
+    if not stale:
+        return 0
+    sources = [r for r in active_source_rows(connection, tenant_id=tenant_id, journey_id=journey_id)
+               if r["line_kind"] == "COMMERCIAL" and r["amount"] is not None
+               and not invoice_withheld(connection, tenant_id=tenant_id, document_type=r["source_document_type"])]
+    changed = 0
+    for line in stale:
+        key = str(line["component_key"])
+        spec = spec_for_field(key)
+        candidates = [r for r in sources if r["component_key"] == key]
+        if spec is not None:
+            candidates = [r for r in candidates if source_rank(spec.source_priority, r["source_document_type"])
+                          <= len(spec.source_priority)]
+        best = min(candidates, key=lambda r: source_rank(spec.source_priority if spec else (), r["source_document_type"]),
+                   default=None)
+        if best is None:
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.commercial_lines
+                    SET actual_amount = NULL, actual_source_kind = NULL, source_evidence_id = NULL,
+                        source_reference = NULL, updated_at_utc = now()
+                    WHERE tenant_id = :t AND journey_id = :j AND component_key = :k
+                    """
+                ),
+                {"t": tenant_id, "j": journey_id, "k": key},
+            )
+        else:
+            connection.execute(
+                text(
+                    """
+                    UPDATE auditcore.commercial_lines
+                    SET actual_amount = :amount, actual_source_kind = 'EVIDENCE', source_evidence_id = :evidence,
+                        source_reference = :reference, updated_at_utc = now()
+                    WHERE tenant_id = :t AND journey_id = :j AND component_key = :k
+                    """
+                ),
+                {"t": tenant_id, "j": journey_id, "k": key, "amount": best["amount"],
+                 "evidence": best["source_evidence_id"],
+                 "reference": f"{best['source_document_type']}:{best['source_document_id']}"},
+            )
+        changed += 1
+    return changed
+
+
 def upsert_commercial_actual(
     connection: Connection,
     *,
@@ -450,6 +555,11 @@ def upsert_commercial_actual(
     ).mappings().one_or_none()
     if existing is not None:
         existing_type = _reference_type(existing["source_reference"])
+        # A holder whose document no longer gives the figure blocks nothing (2026-11-23).
+        if existing_type is not None and not holder_stands(
+                connection, tenant_id=tenant_id, journey_id=journey_id, component_key=component_key,
+                source_reference=existing["source_reference"]):
+            existing_type = None
         if existing_type is not None:
             existing_rank = source_rank(priority, existing_type)
             new_rank = source_rank(priority, document_type)
@@ -493,8 +603,10 @@ __all__ = [
     "ACTIVE_SOURCE_CONDITION",
     "NORMALISED_TYPE_SQL",
     "active_source_rows",
+    "holder_stands",
     "load_source_breakdown",
     "normalise_document_type",
+    "reconcile_commercial_actuals",
     "record_source_value",
     "source_rank",
     "upsert_commercial_actual",

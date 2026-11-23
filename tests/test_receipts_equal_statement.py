@@ -184,3 +184,26 @@ def test_a_statement_with_the_net_value_only_in_its_field_is_compared(journey) -
     result = _check(journey)
     assert result.outcome == "PASS", result.reason
     assert D(result.details["statementTotal"]) == D(3235940)
+
+
+def test_a_net_value_printed_before_the_discounts_is_compared_less_them(journey) -> None:
+    """ADI-RD-261101-051 (2026-11-23): the NDC prints its charges' sum as the net value and
+    the cash discount among the credits; the customer owes the net value less it."""
+    _statement(journey, [*CHARGES, {"particulars_raw": "Net value", "debit_amount": 1150000}])
+    _delivered(journey, 30)
+    add_receipt_payment(journey, amount="1145000", receipt_number="R-1", receipt_date="2026-09-01")
+    result = _check(journey)
+    assert result.outcome == "PASS", result.reason
+    assert D(result.details["statementTotal"]) == D(1145000) and D(result.details["statementNetPrinted"]) == D(1150000)
+    assert "less the discounts it prints" in result.reason
+    add_receipt_payment(journey, amount="6581", receipt_number="R-2", receipt_date="2026-09-02")
+    result = _check(journey)
+    assert result.outcome == "FAIL" and D(result.details["difference"]) == D(6581)
+
+
+def test_a_net_value_already_net_of_the_discounts_stands_as_printed(journey) -> None:
+    _statement(journey, [*CHARGES, {"particulars_raw": "Net value", "debit_amount": 1145000}])
+    _delivered(journey, 30)
+    add_receipt_payment(journey, amount="1145000", receipt_number="R-1", receipt_date="2026-09-01")
+    result = _check(journey)
+    assert result.outcome == "PASS" and result.details["statementDiscounts"] is None

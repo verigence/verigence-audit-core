@@ -3564,6 +3564,22 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     # (2026-11-12): typed so before the delivery is built from it.
     _count_delivery_receipt_as_gate_pass(connection, tenant_id=tenant_id, journey_id=journey_id)
     _materialize_journey(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # A Journey actual held by a document that no longer gives it (voided, superseded, or its
+    # figure withdrawn) passes to the strongest source still on file (2026-11-23).
+    from audit_core.uc03_deal_source_history import reconcile_commercial_actuals
+
+    try:
+        with connection.begin_nested():
+            reconciled = reconcile_commercial_actuals(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if reconciled:
+            logger.info("p2_commercial_actuals_reconciled", tenant_id=tenant_id, journey_id=str(journey_id),
+                        lines=reconciled)
+    except Exception as exc:
+        from audit_core.uc03_db_transient import raise_if_worker_transient
+
+        raise_if_worker_transient(exc)
+        logger.warning("p2_commercial_actuals_reconcile_failed", tenant_id=tenant_id, journey_id=str(journey_id),
+                       exc_info=True)
     # The booking date follows the receipts still on file: a receipt deleted,
     # re-read or replaced since the last pass no longer sets it (2026-10-20).
     from audit_core.uc03_booking_confirmation_rules import (
