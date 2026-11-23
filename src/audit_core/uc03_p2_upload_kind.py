@@ -20,6 +20,10 @@ who uploaded:
 A Journey's first day is the earlier of the day it was created and its first upload, so a
 Journey opened before uploads were recorded is not read as new. An upload is a file that
 came in: one still awaiting its bytes, or cancelled on arrival as the same file again, is not.
+
+Each Journey-day also carries the channel its first file came in on (direct, bulk upload or
+Google Drive), so the Tracker's channel table counts each Journey once a day, as new or as an
+update (product owner 2026-11-23: "new journey and updates to existing journey").
 """
 from __future__ import annotations
 
@@ -37,12 +41,15 @@ _UPLOADED = """ub.batch_status <> 'AWAITING_UPLOAD'
 
 _SQL = f"""
     WITH up AS (
-        SELECT DISTINCT ub.journey_id, ub.uploaded_by_actor_id AS person,
-               CAST(ub.created_at_utc AT TIME ZONE :tz AS date) AS day
+        SELECT ub.journey_id, ub.uploaded_by_actor_id AS person,
+               CAST(ub.created_at_utc AT TIME ZONE :tz AS date) AS day,
+               count(*) AS files,
+               (array_agg(ub.batch_id ORDER BY ub.created_at_utc, ub.batch_id))[1] AS first_batch
         FROM auditcore.p2_upload_batches ub
         WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
           AND (CAST(:me AS text) IS NULL OR CAST(ub.uploaded_by_actor_id AS text) = CAST(:me AS text))
           AND {_UPLOADED}
+        GROUP BY 1, 2, 3
     ),
     -- Each of those Journeys' first upload day and first delivery-page day, ever (not only in
     -- the window: a Journey booked last month and added to today is updated, not new).
@@ -61,17 +68,28 @@ _SQL = f"""
            CAST(up.person AS text) AS person, up.day,
            CASE WHEN up.day = f.first_delivery THEN 'delivery'
                 WHEN up.day = LEAST(f.first_upload, CAST(j.created_at_utc AT TIME ZONE :tz AS date)) THEN 'booking'
-                ELSE 'updated' END AS kind
+                ELSE 'updated' END AS kind,
+           up.files, COALESCE(c.channel, 'direct') AS channel
     FROM up
     JOIN firsts f ON f.journey_id = up.journey_id
     JOIN auditcore.journeys j ON j.tenant_id = :t AND j.journey_id = up.journey_id
+    -- The channel of the day's first file to the Journey: a bulk or Drive file read on it, else
+    -- direct (by the bulk files' index on the upload, 0258).
+    LEFT JOIN LATERAL (
+        SELECT CASE WHEN bool_or(bu.source = 'DRIVE') THEN 'drive' ELSE 'bulk' END AS channel
+        FROM auditcore.p2_bulk_files bf
+        JOIN auditcore.p2_bulk_uploads bu ON bu.tenant_id = bf.tenant_id AND bu.bulk_id = bf.bulk_id
+        WHERE bf.tenant_id = :t AND bf.batch_id = up.first_batch
+        HAVING count(*) > 0
+    ) c ON true
 """
 
 
 def upload_days(connection: Connection, *, tenant_id: str, start: datetime, end: datetime, tz: str,
                 actor_id: str | None = None) -> list[dict[str, Any]]:
     """Each Journey, person and day uploaded to in [start, end), with what that day counts as
-    (``kind``: booking, delivery or updated). ``actor_id``: only that person's uploads."""
+    (``kind``: booking, delivery or updated), the ``files`` that came in and the ``channel``
+    (direct, bulk, drive) of the first of them. ``actor_id``: only that person's uploads."""
     return [dict(r) for r in connection.execute(
         text(_SQL), {"t": tenant_id, "s": start, "e": end, "tz": tz, "me": actor_id},
     ).mappings()]

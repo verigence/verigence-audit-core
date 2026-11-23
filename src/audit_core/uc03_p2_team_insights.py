@@ -377,7 +377,26 @@ def channels(connection: Connection, *, tenant_id: str, start: datetime, end: da
             if key:
                 cell = owner[str(key)][r["channel"]]
                 cell[day] = cell.get(day, 0) + int(r["n"])
-    return {"byPerson": by_person, "byOutlet": by_outlet}
+    # The same uploads as Journeys (product owner 2026-11-23: "change this to new journey and
+    # updates to existing journey"): each Journey once a day, under the channel its first file
+    # came in on; new = a new booking or a Journey's first delivery files, update = anything else
+    # added to a Journey (the one rule of uc03_p2_upload_kind, so the totals are the New bookings,
+    # New deliveries and Journeys updated of the tracker).
+    from audit_core.uc03_p2_upload_kind import UPDATED, upload_days
+
+    journeys_by_person: dict[str, dict[str, dict[str, dict[str, int]]]] = defaultdict(
+        lambda: defaultdict(lambda: {"new": {}, "updated": {}}))
+    journeys_by_outlet: dict[str, dict[str, dict[str, dict[str, int]]]] = defaultdict(
+        lambda: defaultdict(lambda: {"new": {}, "updated": {}}))
+    for r in upload_days(connection, tenant_id=tenant_id, start=start, end=end, tz=tz):
+        day = r["day"].isoformat()
+        kind = "updated" if r["kind"] == UPDATED else "new"
+        for owner, key in ((journeys_by_person, r["person"]), (journeys_by_outlet, r["outlet_id"])):
+            if key:
+                cell = owner[str(key)][r["channel"] if r["channel"] in CHANNELS else "direct"][kind]
+                cell[day] = cell.get(day, 0) + 1
+    return {"byPerson": by_person, "byOutlet": by_outlet,
+            "journeysByPerson": journeys_by_person, "journeysByOutlet": journeys_by_outlet}
 
 
 
