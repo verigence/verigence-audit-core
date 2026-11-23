@@ -548,10 +548,16 @@ def test_september_and_october_consumer_bulletins_are_read_again_without_touchin
         assert changes["gained"] == [
             f"MAXX HD / MAXX HD 1.7 LX BS6.2: ACCESSORIES_KIT 5000, CASH_DISCOUNT {cash}"], (on, changes)
         assert changes["lost"] == [] and changes["changed"] == []
-    # each bulletin on its own date (and on any later date a version was loaded on); October to 3 Nov
+    # September's bulletin stands for 1-2 October (product owner, 23 Nov 2026): nothing answered there before.
+    october_first = dry["offerChanges"]["2026-10-01"]
+    assert "MAXX CITY / MAXX CITY 1.3 LX BS6.2: ACCESSORIES_KIT 5000, CASH_DISCOUNT 25000" in october_first["gained"]
+    assert october_first["lost"] == [] and october_first["changed"] == []
+    assert not any(dry["offerChanges"]["2026-11-10"].values())  # November read again: the same offers
+    # each bulletin on its own date (and on any later date a version was loaded on), to the eve of the next
     assert {(u["effectiveFrom"], u["effectiveTo"]) for u in dry["uploads"]
-            if u["effectiveFrom"] in (date(2026, 9, 3), date(2026, 10, 3))} == {
-        (date(2026, 9, 3), date(2026, 9, 30)), (date(2026, 10, 3), date(2026, 11, 3))}
+            if u["effectiveFrom"] in (date(2026, 9, 3), date(2026, 10, 3), date(2026, 11, 4))} == {
+        (date(2026, 9, 3), date(2026, 10, 2)), (date(2026, 10, 3), date(2026, 11, 3)),
+        (date(2026, 11, 4), date(2026, 11, 30))}
 
     (done,) = run_master_reload(engine, f"{tag}-consumerreread-commit", tenant_ids=[tenant_id])
     assert done["status"] == "COMMITTED", [c for c in done.get("checks", []) if not c["ok"]] or done.get("error")
@@ -560,10 +566,46 @@ def test_september_and_october_consumer_bulletins_are_read_again_without_touchin
         conn.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": tenant_id})
         october = oem_master_reload._consumer_offers(conn, tenant_id, date(2026, 10, 15))
         november = oem_master_reload._consumer_offers(conn, tenant_id, date(2026, 11, 10))
+        second_october = oem_master_reload._consumer_offers(conn, tenant_id, date(2026, 10, 2))
     assert october[("MAXX HD", "MAXX HD 1.7 LX BS6.2")] == {"ACCESSORIES_KIT": "5000", "CASH_DISCOUNT": "22000"}
     assert october[("MAXX HD", "MAXX HD 1.7 LX CBC BS6.2")] == {"ACCESSORIES_KIT": "5000", "CASH_DISCOUNT": "22000"}
     assert november[("MAXX HD", "MAXX HD 1.7 LX BS6.2")] == {"ACCESSORIES_KIT": "5000", "CASH_DISCOUNT": "22000"}
+    assert second_october[("MAXX HD", "MAXX HD 1.7 LX BS6.2")] == {"ACCESSORIES_KIT": "5000", "CASH_DISCOUNT": "25000"}
+    # the wording rules of 23 Nov: a Veero trim names every body; November prints "V4/V6 LNT"
+    assert october[("VEERO", "1.6XXL HD V2 - LNT")] == {"ACCESSORIES_KIT": "5000", "CASH_DISCOUNT": "45000"}
+    assert november[("VEERO", "1.6XXL SD V6 - LNT")] == {"ACCESSORIES_KIT": "5000", "CASH_DISCOUNT": "30000"}
+    assert ("VEERO", "1.6XXL SD V6") not in november
     # read a second time, nothing more to gain
     (again,) = run_master_reload(engine, f"{tag}-b-consumerreread", tenant_ids=[tenant_id])
     assert again["status"] == "DRY_RUN_PASSED", [c for c in again.get("checks", []) if not c["ok"]]
     assert all(not any(v.values()) for v in again["offerChanges"].values())
+
+
+def test_a_veero_trim_names_every_body_and_maxx_hd_2_0_sx_is_the_sxi_ac() -> None:
+    """Product owner, 23 Nov 2026, on the consumer bulletins' wording. Used
+    only when the name matches no price-list name; a wording the rules do not
+    cover ("V2 CNG", "MAXX HD 1.7 VXi" beside the list's "VXi AC") names
+    nothing."""
+    from uuid import UUID
+
+    from audit_core.oem_price_masters import _match_variants
+
+    names = ["1.6XXL HD V2 - LNT", "1.5XXL SD V2", "1.6XXL SD V4", "1.6XXL SD V4 - LNT", "1.6XXL SD V6 - LNT",
+             "MAXX HD 2.0L SXi AC - BS6.2", "MAXX HD 2.0L SXi CBC AC - BS6.2", "MAXX HD 2.0L VXi AC - BS6.2",
+             "MAXX HD 1.7 VXi AC - BS6.2"]
+    pool = [(name, UUID(int=i)) for i, name in enumerate(names)]
+
+    def named(text_: str) -> list[str]:
+        ((_, ids),) = _match_variants([text_], pool)
+        return sorted(names[i.int] for i in ids)
+
+    assert named("V2") == ["1.5XXL SD V2", "1.6XXL HD V2 - LNT"]
+    assert named("V4") == ["1.6XXL SD V4", "1.6XXL SD V4 - LNT"]
+    assert named("V4 LNT") == ["1.6XXL SD V4 - LNT"]
+    assert named("V6 LNT") == ["1.6XXL SD V6 - LNT"]
+    assert named("V2 CNG") == []
+    assert named("MAXX HD 2.0 SX") == ["MAXX HD 2.0L SXi AC - BS6.2"]
+    assert named("MAXX HD 2.0 SX CBC") == ["MAXX HD 2.0L SXi CBC AC - BS6.2"]
+    assert named("MAXX HD 2.0L Vxi AC") == ["MAXX HD 2.0L VXi AC - BS6.2"]  # word for word, as before
+    assert named("MAXX HD 2.0L Mxi") == []
+    assert named("MAXX HD 1.7 VXi BS6.2") == []  # not the VXi AC
