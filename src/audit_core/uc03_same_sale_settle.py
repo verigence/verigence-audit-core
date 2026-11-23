@@ -84,8 +84,16 @@ def run_same_sale_settle(engine: Engine, tag: str, reports: list[str]) -> dict[s
     transaction = connection.begin()
     try:
         set_tenant_context(connection, tenant_id)
-        rows = connection.execute(text(_CANDIDATES_SQL), {"t": tenant_id}).mappings().all()
-        rows = [r for r in rows if not wanted or r["journey_reference"] in wanted]
+        if wanted:
+            # The journeys named, looked up directly (2026-11-23): the Project-wide candidate
+            # search no longer fits in the statement timeout, even to pick a few out of it.
+            rows = connection.execute(
+                text("SELECT journey_id, journey_reference, created_at_utc FROM auditcore.journeys "
+                     "WHERE tenant_id = :t AND journey_reference = ANY(:refs) ORDER BY created_at_utc"),
+                {"t": tenant_id, "refs": sorted(wanted)},
+            ).mappings().all()
+        else:
+            rows = connection.execute(text(_CANDIDATES_SQL), {"t": tenant_id}).mappings().all()
         failed = 0
         for row in rows:
             try:

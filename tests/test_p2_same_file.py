@@ -1408,6 +1408,22 @@ def test_the_settle_job_deletes_a_pair_with_the_same_otf(tenant):
     assert done["toDelete"] == 1 and len(_queued(booking)) == 1
 
 
+def test_the_settle_job_checks_only_the_journeys_named(tenant):
+    """2026-11-23: given references, the job looks those journeys up directly (the Project-wide
+    candidate search timed out) -- and still settles their pairs."""
+    from audit_core.uc03_same_sale_settle import run_same_sale_settle
+
+    now = datetime.now(UTC)
+    booking = _journey(tenant, ref="NAMED-BOOKING", created=now - timedelta(days=10))
+    delivery = _journey(tenant, ref="NAMED-DELIVERY", created=now - timedelta(days=8))
+    _file(booking, mobile="+91 93386 96711", booking_ref="OTF NO-19669")
+    _file(delivery, mobile="+91 93386 96711", booking_ref="019669")
+    other = _journey(tenant, ref="NOT-NAMED", created=now - timedelta(days=9))
+    _file(other, mobile="+91 93386 96711", booking_ref="019669")
+    dry = run_same_sale_settle(tenant.engine, f"{tenant.tenant_id}:named", ["NAMED-BOOKING", "NAMED-DELIVERY"])
+    assert dry["journeys"] == 2 and dry["commit"] is False
+
+
 # ── exactly the same documents are deleted whatever else is said (2026-11-12) ──
 def test_exactly_the_same_documents_of_a_company_are_deleted(tenant):
     now = datetime.now(UTC)
