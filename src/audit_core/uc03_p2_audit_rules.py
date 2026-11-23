@@ -1133,6 +1133,19 @@ def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
     billed = statement_total(document["fields"], read)
     if billed is None:
         return RuleOutcome(code, "SKIPPED", "The account statement shows no net value or final price.")
+    # The NDC prints its discounts among the credits, beside the money received, and its
+    # net value as the charges alone (2026-11-23, ADI-RD-261101-051: charges Rs 11,86,208 =
+    # the printed net value; "CASH DISCOUNT Rs 3,000" in the credits; Total Receipts
+    # Rs 11,92,789; balance Rs 6,581). A discount is not money received: the customer owes
+    # the net value less the discounts printed. Only when the printed net value is the
+    # charges' sum and not already net of the discounts; otherwise as printed.
+    printed = billed
+    given = sum(read.discounts.values(), Decimal(0))
+    charges = sum(read.components.values(), Decimal(0))
+    less_discounts = (given > 0 and abs(printed - charges) <= _INVOICE_TOLERANCE
+                      and abs(printed - (charges - given)) > _INVOICE_TOLERANCE)
+    if less_discounts:
+        billed = printed - given
     delivered = facts.delivery_date
     if delivered is None:
         return RuleOutcome(code, "SKIPPED", _NO_DELIVERY_DATE)
@@ -1156,8 +1169,11 @@ def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
     net = received - refunded
     gap = net - billed
     refund_text = f" less {_rupees(refunded)} refunded" if refunded else ""
-    how = "the net value printed on the account statement"
-    details = {"statementTotal": str(billed), "statementReceivedLines": str(read.receipts),
+    how = ("the net value printed on the account statement, " + _rupees(printed) + ", less the discounts it "
+           "prints, " + _rupees(given) + ":" if less_discounts else "the net value printed on the account statement")
+    details = {"statementTotal": str(billed), "statementNetPrinted": str(printed),
+               "statementDiscounts": str(given) if less_discounts else None,
+               "statementReceivedLines": str(read.receipts),
                "received": str(received), "refunded": str(refunded), "difference": str(gap),
                "receipts": str(money.get("receipts")), "loan": str(money.get("loan")),
                "loanSource": money.get("loanSource"), "oldVehicle": money.get("oldVehicle"),
