@@ -1538,9 +1538,36 @@ def _match_variants(
     # list's only by the emission norm, the "- E" / release markers, "(O)"
     # for OPT or "& Mocha Interiors" is the same variant.
     return [
-        (raw, list(by_key.get(variant_key(raw)) or by_loose.get(variant_loose_key(raw)) or []))
+        (raw, list(by_key.get(variant_key(raw)) or by_loose.get(variant_loose_key(raw))
+                   or _named_by_product_owner_rule(raw, variants)))
         for raw in variant_texts
     ]
+
+
+# Product owner, 23 Nov 2026, on the consumer bulletins' wording -- used only
+# when a named variant matches no price-list name word for word or loosely:
+#   * "MAXX HD 2.0 SX & CBC" is the price list's "MAXX HD 2.0L SXi AC" and
+#     "MAXX HD 2.0L SXi CBC AC" ("yes");
+#   * a Veero row names a trim, not a body: "V2" is every Veero V2 the price
+#     list carries (XL / XXL, SD / HD / CBC, LNT or not), "V4 LNT" only the
+#     LNT ones ("I guess so" -- his reading, to be reversed here if the OEM
+#     says otherwise). "V2 CNG" names no variant the price list carries.
+_SAME_VARIANT_BY_RULE = {
+    "MAXX HD 2 0 SX": "MAXX HD 2 0L SXI AC",
+    "MAXX HD 2 0 SX CBC": "MAXX HD 2 0L SXI CBC AC",
+}
+_TRIM_ONLY_VARIANT = re.compile(r"^V[0-9](?: LNT)?$")
+
+
+def _named_by_product_owner_rule(raw: str, variants: list[tuple[str, UUID]]) -> list[UUID]:
+    key = variant_loose_key(raw)
+    same = _SAME_VARIANT_BY_RULE.get(key)
+    if same:
+        return [variant_id for name, variant_id in variants if variant_loose_key(name) == same]
+    if _TRIM_ONLY_VARIANT.match(key):
+        wanted = set(key.split())
+        return [variant_id for name, variant_id in variants if wanted <= set(variant_key(name).split())]
+    return []
 
 
 def _condition_code(qualifiers: dict[str, Any], config: dict[str, Any]) -> str:

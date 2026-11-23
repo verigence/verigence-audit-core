@@ -1368,17 +1368,22 @@ def load_november_consumer_tenant(connection: Connection, *, tenant_id: str, tag
 # October stands until the day before November's bulletin (w.e.f. 4 Nov):
 # a row October prints and November does not must not answer in November.
 CONSUMER_REREAD_PLAN: tuple[tuple[str, date, date, date], ...] = (
-    # file, in force from, the last day the document prints, in force to
-    ("2026-09/Consumer Scheme Bhubaneswar RO_Sep'26.pdf", date(2026, 9, 3), date(2026, 9, 30), date(2026, 9, 30)),
+    # file, in force from, the last day the document prints, in force to.
+    # Product owner, 23 Nov 2026: a month's bulletin stands until the next
+    # one starts ("yes" to September's standing for 1-2 October, as October's
+    # already stood to 3 Nov). November's is read again too, so the wording
+    # rules of the same day (``_named_by_product_owner_rule``) reach it.
+    ("2026-09/Consumer Scheme Bhubaneswar RO_Sep'26.pdf", date(2026, 9, 3), date(2026, 9, 30), date(2026, 10, 2)),
     ("2026-10/Consumer Scheme Bhubaneswar RO_Oct'26.pdf", date(2026, 10, 3), date(2026, 10, 31),
      NOV_CONSUMER_FROM - timedelta(days=1)),
+    (NOV_CONSUMER_FILE, NOV_CONSUMER_FROM, NOV_CONSUMER_TO, NOV_CONSUMER_TO),
 )
-# What a deal reads on these dates is compared before and after.
-CONSUMER_REREAD_DATES = (date(2026, 9, 15), date(2026, 10, 15), date(2026, 11, 2))
-# November's consumer schemes are not touched.
-CONSUMER_REREAD_UNCHANGED = (NOV_CONSUMER_FROM, date(2026, 11, 10))
-# Each figure is the bulletin's own row for that variant.
-CONSUMER_REREAD_SPOT_CHECKS: tuple[tuple[str, str, date, str, Decimal], ...] = (
+# What a deal reads on these dates is compared before and after: a variant
+# may gain an offer, none may lose one or change its figure.
+CONSUMER_REREAD_DATES = (date(2026, 9, 15), date(2026, 10, 1), date(2026, 10, 15), date(2026, 11, 2),
+                         date(2026, 11, 10))
+# Each figure is the bulletin's own row for that variant; None: no offer.
+CONSUMER_REREAD_SPOT_CHECKS: tuple[tuple[str, str, date, str, Decimal | None], ...] = (
     ("MAXX HD", "MAXX HD 1.7 LX BS6.2", date(2026, 9, 15), "CASH_DISCOUNT", Decimal(25000)),
     ("MAXX HD", "MAXX HD 1.7 LX BS6.2", date(2026, 10, 15), "CASH_DISCOUNT", Decimal(22000)),
     ("MAXX HD", "MAXX HD 1.7 LX BS6.2", date(2026, 10, 15), "ACCESSORIES_KIT", Decimal(5000)),
@@ -1387,6 +1392,21 @@ CONSUMER_REREAD_SPOT_CHECKS: tuple[tuple[str, str, date, str, Decimal], ...] = (
     ("MAXX CITY", "MAXX CITY 1.3 LX BS6.2", date(2026, 10, 15), "CASH_DISCOUNT", Decimal(23000)),
     ("MAXX CITY", "MAXX CITY 1.5 LX BS6.2", date(2026, 10, 15), "CASH_DISCOUNT", Decimal(8000)),
     ("MAXX HD", "MAXX HD 1.7 LX BS6.2", date(2026, 11, 2), "CASH_DISCOUNT", Decimal(22000)),
+    # September's stands for 1-2 October
+    ("MAXX CITY", "MAXX CITY 1.3 LX BS6.2", date(2026, 10, 1), "CASH_DISCOUNT", Decimal(25000)),
+    ("MAXX HD", "MAXX HD 1.7 LX BS6.2", date(2026, 10, 2), "CASH_DISCOUNT", Decimal(25000)),
+    ("MAXX HD", "MAXX HD 1.7 LX BS6.2", date(2026, 10, 3), "CASH_DISCOUNT", Decimal(22000)),
+    # "MAXX HD 2.0 SX & CBC": September only (October and November print no 2.0 row)
+    ("MAXX HD", "MAXX HD 2.0L SXi AC - BS6.2", date(2026, 9, 15), "CASH_DISCOUNT", Decimal(3000)),
+    ("MAXX HD", "MAXX HD 2.0L SXi CBC AC - BS6.2", date(2026, 9, 15), "ACCESSORIES_KIT", Decimal(5000)),
+    ("MAXX HD", "MAXX HD 2.0L SXi AC - BS6.2", date(2026, 10, 15), "CASH_DISCOUNT", None),
+    # Veero: "V2" / "V4/V6" every body, LNT or not; November prints "V4/V6 LNT"
+    ("VEERO", "1.6XXL HD V2 - LNT", date(2026, 10, 15), "CASH_DISCOUNT", Decimal(45000)),
+    ("VEERO", "1.6XXL SD V6 - LNT", date(2026, 10, 15), "CASH_DISCOUNT", Decimal(30000)),
+    ("VEERO", "1.5XXL SD V2", date(2026, 10, 15), "ACCESSORIES_KIT", Decimal(5000)),
+    ("VEERO", "1.6XXL SD V6 - LNT", date(2026, 11, 10), "CASH_DISCOUNT", Decimal(30000)),
+    ("VEERO", "1.6XXL SD V6", date(2026, 11, 10), "CASH_DISCOUNT", None),
+    ("VEERO", "1.6XXL SD V2 - LNT", date(2026, 11, 10), "CASH_DISCOUNT", Decimal(45000)),
     # unchanged rows still answer
     ("XUV 3XO", "AX5 PM MT", date(2026, 9, 15), "CASH_DISCOUNT", Decimal(30000)),
     ("MAXX HD", "MAXX HD 1.7 LX BS6.2", date(2026, 11, 10), "CASH_DISCOUNT", Decimal(22000)),
@@ -1442,8 +1462,9 @@ def _offer_changes(before: dict[tuple[str, str], dict[str, str]],
 
 def reread_consumer_bulletins_tenant(connection: Connection, *, tenant_id: str, tag: str,
                                      store: bool) -> dict[str, Any]:
-    """September's and October's consumer bulletins read again, and every
-    check, on one open transaction (the caller commits or rolls back).
+    """The three consumer bulletins read again, each in force until the next
+    one starts, and every check, on one open transaction (the caller commits
+    or rolls back).
 
     The result lists, for a date in each bulletin's month, every variant
     that gains an offer, loses one or changes: a dry run is read against the
@@ -1465,8 +1486,7 @@ def reread_consumer_bulletins_tenant(connection: Connection, *, tenant_id: str, 
     def check(name: str, ok: bool, expected: Any, actual: Any) -> None:
         checks.append({"check": name, "ok": bool(ok), "expected": expected, "actual": actual})
 
-    before = {on: _consumer_offers(connection, tenant_id, on)
-              for on in (*CONSUMER_REREAD_DATES, *CONSUMER_REREAD_UNCHANGED)}
+    before = {on: _consumer_offers(connection, tenant_id, on) for on in CONSUMER_REREAD_DATES}
     uploads: list[dict[str, Any]] = []
     for relative, start, printed_to, until in CONSUMER_REREAD_PLAN:
         path = DATA_DIR / relative
@@ -1515,10 +1535,6 @@ def reread_consumer_bulletins_tenant(connection: Connection, *, tenant_id: str, 
               changes[str(on)]["lost"][:40])
         check(f"no consumer offer changes its figure on {on}", not changes[str(on)]["changed"], [],
               changes[str(on)]["changed"][:40])
-    for on in CONSUMER_REREAD_UNCHANGED:
-        moved = _offer_changes(before[on], _consumer_offers(connection, tenant_id, on))
-        check(f"November's consumer offers unchanged on {on}", not any(moved.values()), {},
-              {k: v[:20] for k, v in moved.items() if v})
     for model, variant, on, key, amount in CONSUMER_REREAD_SPOT_CHECKS:
         found = find_book_sku(connection, tenant_id=tenant_id, model_text=model, variant_text=variant, effective_on=on)
         actual: Any = found["reason"]
