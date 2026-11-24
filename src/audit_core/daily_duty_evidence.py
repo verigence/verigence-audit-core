@@ -4,16 +4,18 @@
 me if any PC updates cash registers, bank statement, and or uploaded pics in the non extracted
 folder". One row a PC, for the TL's outlets (PM, Executive, SuperAdmin: all), over up to 31 days:
 
-    Gate register   the outlets' "Gate out register" duty for the day: done (on the day or late)
-                    or not done
-    Cash register   the outlets' "Cash ledger" duty: the amount and number of transactions the PC
-                    entered, "not received" (from the dealership), or nothing
+    Gate register   the outlet's gate out register of the day (uc03_p2_gate_pass), by the date the
+                    register is for: uploaded by the next day, uploaded late, counts not entered,
+                    or not uploaded; any range, whether or not the daily duties were on
+    Cash register   the outlets' "Cash ledger" duty, by the day the ledger is for: the amount and
+                    number of transactions the PC entered, "not received" (from the dealership),
+                    or nothing; counted from the day the duty started
     Bank statement  statements the PC uploaded that day (p2_bank_statements)
     Photos          photos the PC added that day (delivery_vehicle_photos), by where they came from:
                     the "photo" folder of a customer's Drive folder (kept, not read), the app's
                     camera, and pages the system could not read and kept as photos
 
-A duty of today is pending until the day is over; a past day's duty not done is not done. Read-only.
+A register or ledger whose day to be entered is not over yet is pending. Read-only.
 """
 from __future__ import annotations
 
@@ -41,6 +43,9 @@ GATE, CASH = "GATE_REGISTER", "CASH_LEDGER"
 # Photos from a customer's Drive folder carry the Drive file in their upload id (uc03_p2_drive_intake);
 # pages the system could not read are kept as photos under their own source (uc03_p2_vehicle_photos).
 DRIVE_PREFIX, UNREAD_SOURCE = "drive-", "P2_UNRECOGNISED"
+# Sunday has its own gate register from this day (product owner 2026-11-16); before it, Monday's
+# register covered Sunday.
+SUNDAY_REGISTER_FROM = date(2026, 11, 16)
 
 
 def _number(value: Any) -> float | None:
@@ -71,39 +76,74 @@ def evidence_view(connection: Connection, *, tenant_id: str, caller: Caller, sta
         for pc in o["pcs"]:
             person = pcs.setdefault(pc["actorId"], {"actorId": pc["actorId"], "name": pc["name"], "outlets": []})
             person["outlets"].append(o)
-    base = {"from": start.isoformat(), "to": end.isoformat(), "today": today.isoformat(),
-            "days": [d.isoformat() for d in days], "pcs": []}
+    base: dict[str, Any] = {"from": start.isoformat(), "to": end.isoformat(), "today": today.isoformat(),
+                            "days": [d.isoformat() for d in days], "cashFrom": None, "pcs": []}
     if not pcs:
         return base
     outlet_ids = sorted({o["outlet_id"] for o in outlets})
     actors = sorted(pcs)
 
-    # The gate register and cash ledger duties of the outlets, by outlet and day.
+    # Gate register: the registers themselves (uc03_p2_gate_pass), by the date each register is
+    # for, so any range is counted whether or not the daily duties were on (product owner
+    # 2026-11-24: "this data is not in sync with date range"). Every day has its own register,
+    # Sunday included (rule of 2026-11-16; before it Monday's register covered Sunday). A day's
+    # register is uploaded the next day, so yesterday's is still pending; uploaded later than the
+    # next day is late.
+    duty: dict[tuple[str, str, date], dict[str, Any]] = {}
+    registers = {
+        (str(r["outlet"]), r["day"]): r for r in connection.execute(text("""
+            SELECT CAST(outlet_id AS text) AS outlet, business_date AS day, completed_at_utc,
+                   (created_at_utc AT TIME ZONE 'Asia/Kolkata')::date AS uploaded_on, pc_name
+            FROM auditcore.p2_gate_passes
+            WHERE tenant_id = :t AND status = 'ACTIVE' AND outlet_id = ANY(CAST(:o AS uuid[]))
+              AND business_date BETWEEN :a AND :b
+        """), {"t": tenant_id, "o": outlet_ids, "a": start, "b": end}).mappings()
+    }
+    for outlet in outlet_ids:
+        for d in days:
+            row = registers.get((outlet, d))
+            if row is None:
+                if d.isoweekday() == 7 and d < SUNDAY_REGISTER_FROM:
+                    continue  # Monday's register covered Sunday then
+                state = "PENDING" if d >= today - timedelta(days=1) else "NOT_DONE"
+            elif row["completed_at_utc"] is None:
+                state = "NO_COUNTS"
+            else:
+                state = "DONE" if row["uploaded_on"] <= d + timedelta(days=1) else "LATE"
+            duty[(GATE, outlet, d)] = {"state": state, "amount": None, "transactions": None,
+                                       "by": row["pc_name"] if row is not None else None}
+
+    # Cash register: only the daily duty records it (from the day the duty started), by the day
+    # the ledger is for. Before that day nothing was asked, so those days are not counted.
+    cash_start = connection.execute(text("""
+        SELECT min(i.for_date) FROM auditcore.p2_duty_items i
+        JOIN auditcore.p2_duties d ON d.tenant_id = i.tenant_id AND d.duty_id = i.duty_id
+        WHERE i.tenant_id = :t AND d.standard_code = :c AND i.status <> 'CANCELLED'
+    """), {"t": tenant_id, "c": CASH}).scalar()
     duty_rows = connection.execute(text("""
-        SELECT d.standard_code AS code, i.item_id, CAST(i.outlet_id AS text) AS outlet, i.duty_date, i.status,
+        SELECT i.item_id, CAST(i.outlet_id AS text) AS outlet, i.for_date, i.duty_date, i.status,
                i.done_on, i.input_values, i.done_by_name
         FROM auditcore.p2_duty_items i
         JOIN auditcore.p2_duties d ON d.tenant_id = i.tenant_id AND d.duty_id = i.duty_id
-        WHERE i.tenant_id = :t AND d.standard_code = ANY(:codes) AND i.status <> 'CANCELLED'
-          AND i.outlet_id = ANY(CAST(:o AS uuid[])) AND i.duty_date BETWEEN :a AND :b
-    """), {"t": tenant_id, "codes": [GATE, CASH], "o": outlet_ids, "a": start, "b": end}).mappings().all()
-    not_received = {(str(r["item_id"]), r["on_date"]) for r in connection.execute(text("""
-        SELECT item_id, on_date FROM auditcore.p2_duty_reasons
+        WHERE i.tenant_id = :t AND d.standard_code = :c AND i.status <> 'CANCELLED'
+          AND i.outlet_id = ANY(CAST(:o AS uuid[])) AND i.for_date BETWEEN :a AND :b
+    """), {"t": tenant_id, "c": CASH, "o": outlet_ids, "a": start, "b": end}).mappings().all()
+    not_received = {str(item) for item in connection.execute(text("""
+        SELECT DISTINCT item_id FROM auditcore.p2_duty_reasons
         WHERE tenant_id = :t AND category = :c AND item_id = ANY(CAST(:ids AS uuid[]))
-    """), {"t": tenant_id, "c": NOT_RECEIVED, "ids": [str(r["item_id"]) for r in duty_rows]}).mappings()
+    """), {"t": tenant_id, "c": NOT_RECEIVED, "ids": [str(r["item_id"]) for r in duty_rows]}).scalars()
     } if duty_rows else set()
-    duty: dict[tuple[str, str, date], dict[str, Any]] = {}
     for r in duty_rows:
         if r["status"] == "DONE":
             state = "DONE" if r["done_on"] is not None and r["done_on"] <= r["duty_date"] else "LATE"
-        elif any((str(r["item_id"]), d) in not_received for d in days if d >= r["duty_date"]):
+        elif str(r["item_id"]) in not_received:
             state = "NOT_RECEIVED"
         elif r["duty_date"] >= today:
             state = "PENDING"
         else:
             state = "NOT_DONE"
         values = dict(r["input_values"] or {}) if r["status"] == "DONE" else {}
-        duty[(r["code"], r["outlet"], r["duty_date"])] = {
+        duty[(CASH, r["outlet"], r["for_date"])] = {
             "state": state, "amount": _number(values.get("amount")),
             "transactions": _number(values.get("transactions")), "by": r["done_by_name"]}
 
@@ -157,17 +197,23 @@ def evidence_view(connection: Connection, *, tenant_id: str, caller: Caller, sta
             for k, v in day_photos.items():
                 summary["photos"][k] += v
             day_rows.append({"date": d.isoformat(), **cells, "statements": n_statements, "photos": day_photos})
+        for key in ("gate", "cash"):
+            counted = {d for d in days for o in mine
+                       if (GATE if key == "gate" else CASH, o["outlet_id"], d) in duty
+                       and duty[(GATE if key == "gate" else CASH, o["outlet_id"], d)]["state"] != "PENDING"}
+            summary[key]["days"] = len(counted)
         rows.append({"actorId": person["actorId"], "name": person["name"],
                      "outlets": [f"{o['dealer_name']} - {o['outlet_name']}" for o in mine],
                      "summary": summary, "days": day_rows})
-    return {**base, "pcs": rows}
+    return {**base, "cashFrom": cash_start.isoformat() if cash_start else None, "pcs": rows}
 
 
-_KEY = {"DONE": "done", "LATE": "late", "NOT_RECEIVED": "notReceived", "PENDING": "pending", "NOT_DONE": "notDone"}
+_KEY = {"DONE": "done", "LATE": "late", "NO_COUNTS": "noCounts", "NOT_RECEIVED": "notReceived", "PENDING": "pending",
+        "NOT_DONE": "notDone"}
 
 
 def _blank_duty() -> dict[str, Any]:
-    return {"done": 0, "late": 0, "notReceived": 0, "pending": 0, "notDone": 0}
+    return {"done": 0, "late": 0, "noCounts": 0, "notReceived": 0, "pending": 0, "notDone": 0}
 
 
 def _utc_window(start: date, end: date) -> dict[str, datetime]:
