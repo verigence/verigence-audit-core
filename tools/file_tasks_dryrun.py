@@ -27,3 +27,4 @@ with engine.connect() as c:
         if c.execute(text("SELECT to_regclass('auditcore.alembic_version')")).scalar() else \
         c.execute(text("SELECT version_num FROM public.alembic_version")).scalar()
     print("live migration head:", head)
+# rerun after #958 deploy
