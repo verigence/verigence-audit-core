@@ -163,6 +163,8 @@ def test_a_different_model_is_listed_for_the_uploader_with_the_excel(setup) -> N
             {"t": s.journey.tenant_id, "k": dumps.MODEL_ALERT_KIND}).mappings().one()
     assert alert["title"] == "Model differs on 1 booking"
     assert alert["payload"]["audienceActorIds"] == [s.reviewer]
+    # Data uploads opens the dump on its "Model differs" rows (a delivery dump: under Delivery dumps).
+    assert alert["payload"]["link"] == f"/p2/data-uploads?dumpId={dump_id}&view=model"
     s.acting["subject"] = s.reviewer
     listed = s.client.get(f"{s.base}/dms-dumps").json()["items"]
     assert next(d for d in listed if d["dumpId"] == dump_id)["modelDiffers"] == 1

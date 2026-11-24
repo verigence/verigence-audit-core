@@ -1801,7 +1801,10 @@ def publish_model_alert(connection: Connection, *, tenant_id: str, dump_id: UUID
     word = "booking" if kind == BOOKING else "delivery"
     payload = {"audienceActorIds": [uploader], "dumpId": str(dump_id), "dumpKind": kind,
                "dealerName": dealer_name, "count": int(count),
-               "link": f"/p2/data-uploads?dumpId={dump_id}",
+               # Data uploads opens the dump under its own section, on its "Model differs" rows
+               # (product owner 2026-11-24).
+               "link": (f"/p2/data-uploads?{'' if kind == BOOKING else 'type=delivery&'}"
+                        f"dumpId={dump_id}&view=model"),
                "download": f"/dms-dumps/{dump_id}/model-differences/file"}
     connection.execute(
         text("""
