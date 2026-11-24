@@ -140,6 +140,40 @@ def main() -> None:
                       f"ref={f['placed_reference']} batch={f['batch_status']}/{f['page_count']} "
                       f"bulk={f['bulk_status']} detail={f['detail']!r} bulk_detail={f['bulk_detail']!r} "
                       f"fail={f['failure_reason']!r}")
+            # Files placed on another journey than the one they were read on: who the day's
+            # upload is counted under (uc03_p2_upload_kind), on the read journey and the target.
+            from audit_core.uc03_p2_upload_kind import upload_days
+            joined = [f for f in files if f["outcome"] == "ADDED_TO_BOOKING"]
+            print(f"\n--- Files added to an existing journey ({len(joined)})")
+            for f in joined:
+                for label, jid in (("read", f["bulk_journey"]), ("target", f["placed_journey_id"])):
+                    if not jid:
+                        print(f"  {f['file_name']!r} {label}: none")
+                        continue
+                    j = c.execute(text(
+                        "SELECT j.journey_reference, j.created_at_utc, j.created_by_actor_id, pn.display_name "
+                        "FROM auditcore.journeys j LEFT JOIN auditcore.people_names pn ON pn.actor_id=j.created_by_actor_id "
+                        "WHERE j.tenant_id=:t AND j.journey_id=:j"), {"t": tid, "j": jid}).mappings().one_or_none()
+                    print(f"  {f['file_name']!r} {label} journey {jid}: "
+                          f"{dict(j) if j else 'GONE (deleted)'}")
+                    for b in c.execute(text(
+                        "SELECT ub.batch_id, ub.created_at_utc, ub.batch_status, ub.page_count, ub.original_filename, "
+                        "ub.uploaded_by_actor_id, pn.display_name, ub.correlation_id FROM auditcore.p2_upload_batches ub "
+                        "LEFT JOIN auditcore.people_names pn ON pn.actor_id=ub.uploaded_by_actor_id "
+                        "WHERE ub.tenant_id=:t AND ub.journey_id=:j AND ub.created_at_utc >= :s ORDER BY ub.created_at_utc"),
+                        {"t": tid, "j": jid, "s": start}).mappings():
+                        print("      batch", {k: str(v) for k, v in b.items()})
+            for actor in actors + sorted({str(r[0]) for r in c.execute(text(
+                    "SELECT DISTINCT j.created_by_actor_id FROM auditcore.journeys j WHERE j.tenant_id=:t "
+                    "AND j.journey_id = ANY(CAST(:ids AS uuid[]))"),
+                    {"t": tid, "ids": [str(f["placed_journey_id"]) for f in joined if f["placed_journey_id"]]})
+                    if r[0] and str(r[0]) not in actors}):
+                days = upload_days(c, tenant_id=tid, start=start, end=end, tz="Asia/Kolkata", actor_id=actor)
+                print(f"\n--- upload_days (PCs' day / Tracker rule) for {actor}: {len(days)} journey-days")
+                for d in sorted(days, key=lambda d: (d["day"], d["kind"])):
+                    ref = c.execute(text("SELECT journey_reference FROM auditcore.journeys WHERE tenant_id=:t "
+                                         "AND journey_id=CAST(:j AS uuid)"), {"t": tid, "j": d["journey_id"]}).scalar()
+                    print(f"    {d['day']} {d['kind']:8} {d['channel']:6} files={d['files']} {ref}")
             outlets = sorted({str(f["outlet_id"]) for f in files if f["outlet_id"]} | {
                 str(r[0]) for r in c.execute(text(
                     "SELECT outlet_id FROM auditcore.business_assignments WHERE tenant_id=:t "
