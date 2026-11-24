@@ -1,0 +1,82 @@
+name: Drive files diagnose (read only)
+
+# Where did a PC's Google Drive files go (product owner 2026-11-24: Aditya, Cuttack, 15 files
+# on 23 Nov, 13 in the results, none in failures). Compares what Google Drive holds in the PC's
+# outlet folders with what Verigence recorded and what each file became. Read only: the database
+# session is READ ONLY and only Drive reads are made (tools/drive_files_diagnose.py).
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: Part of the PC's name
+        required: true
+      since:
+        description: First day (IST), YYYY-MM-DD
+        required: true
+      until:
+        description: Day after the last (IST), YYYY-MM-DD
+        required: true
+  push:
+    branches: ['claude/drive-files-diagnose']
+    paths:
+      - '.github/workflows/drive-files-diagnose.yml'
+      - 'tools/drive_files_diagnose.py'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      PC_NAME: ${{ inputs.name || 'aditya' }}
+      SINCE: ${{ inputs.since || '2026-11-22' }}
+      UNTIL: ${{ inputs.until || '2026-11-25' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          npm install --global @railway/cli@5.70.0
+      - name: Reach the live database and the Drive client
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${RAILWAY_API_TOKEN:-}"
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/vars.json
+          python - <<'PY'
+          import json
+          from urllib.parse import urlparse
+          v = json.load(open('/tmp/vars.json'))
+          url = ''
+          for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
+              value = v.get(key) or ''
+              for prefix in ('postgresql+asyncpg://', 'postgresql://', 'postgres://'):
+                  if value.startswith(prefix):
+                      value = 'postgresql+psycopg://' + value[len(prefix):]
+              host = (urlparse(value).hostname or '').lower()
+              if value and host and not host.endswith('.railway.internal'):
+                  url = value
+                  break
+          assert url, 'no public database URL'
+          import os
+          env = open(os.environ['GITHUB_ENV'], 'a')
+          print(f"::add-mask::{url}")
+          env.write(f"DATABASE_URL={url}\n")
+          for key in ('AUDIT_CORE_GOOGLE_DRIVE_CLIENT_ID', 'AUDIT_CORE_GOOGLE_DRIVE_CLIENT_SECRET'):
+              if v.get(key):
+                  print(f"::add-mask::{v[key]}")
+                  env.write(f"{key}={v[key]}\n")
+          PY
+      - name: Diagnose
+        run: python tools/drive_files_diagnose.py --name "$PC_NAME" --since "$SINCE" --until "$UNTIL"
