@@ -62,7 +62,7 @@ jobs:
               base = """FROM auditcore.p2_dms_dump_rows r
                   JOIN auditcore.p2_dms_dumps u ON u.tenant_id=r.tenant_id AND u.dump_id=r.dump_id
                   LEFT JOIN auditcore.dealers d ON d.tenant_id=r.tenant_id AND d.dealer_id=r.dealer_id
-                  LEFT JOIN auditcore.outlets o ON o.tenant_id=r.tenant_id AND o.outlet_id=r.outlet_id
+                  LEFT JOIN auditcore.dealer_outlets o ON o.tenant_id=r.tenant_id AND o.outlet_id=r.outlet_id
                   WHERE r.tenant_id=%s AND u.status='ACTIVE'"""
               for r in c.execute(f"""SELECT d.dealer_name, u.file_name, r.dump_kind, u.uploaded_by_name,
                     to_char(u.uploaded_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI'),
