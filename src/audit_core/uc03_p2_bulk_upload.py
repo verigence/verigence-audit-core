@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import UTC, datetime
 from typing import Annotated, Any
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -87,7 +88,7 @@ _WAITING_UNITS = (
     "CLASSIFYING", "EXTRACTING", "SYNCING_TO_AUDIT_CORE", "RETRY_WAIT",
 )
 _IN_FLIGHT_BATCHES = ("AWAITING_UPLOAD", "UPLOADED", "SPLITTING")
-_SETTLED_OUTCOMES = ("EXACT_DUPLICATE", "NEW_BOOKING", "ADDED_TO_BOOKING", "KEPT_FOR_REVIEW", "FAILED")
+_SETTLED_OUTCOMES = ("EXACT_DUPLICATE", "NEW_BOOKING", "ADDED_TO_BOOKING", "KEPT_FOR_REVIEW", "FAILED", "REPLACED")
 
 
 # --------------------------------------------------------------------------- storage names
@@ -111,6 +112,95 @@ def numbered(name: str, n: int) -> str:
     if not dot or not stem:
         return f"{name} ({n})"
     return f"{stem} ({n}).{ext}"
+
+
+_NUMBERED = re.compile(r" \(\d+\)(\.[^.]*)?$")
+
+
+def unnumbered(name: str) -> str:
+    """The name before ``numbered``: ``scan (2).pdf`` -> ``scan.pdf`` (the SQL in migration
+    0260 is the same pattern)."""
+    return _NUMBERED.sub(lambda m: m.group(1) or "", str(name or ""))
+
+
+def _same_file_earlier(
+    earlier: list[dict[str, Any]], claimed: set[str], name: str, size: int, content_type: str,
+) -> dict[str, Any] | None:
+    """A file of the drop, from before this request, that this one is: the same name (as the
+    PC gave it, or numbered by an earlier retry) and the same size. One already in storage is
+    preferred; a file still pending is the one to put again. 24 Nov 2026: a retry used to add a
+    "(2)" copy and leave the first record waiting, which then failed at submit."""
+    matches = [f for f in earlier
+               if str(f["file_id"]) not in claimed and f["outcome"] == "PENDING"
+               and int(f["size_bytes"] or 0) == int(size) and str(f["content_type"]) == content_type
+               and unnumbered(str(f["original_filename"])) == unnumbered(name)]
+    matches.sort(key=lambda f: f["upload_status"] != "UPLOADED")
+    return matches[0] if matches else None
+
+
+def _take_files_already_in_storage(connection: Connection, tenant_id: str, bulk_id: UUID) -> int:
+    """At submit, a file whose "uploaded" call never arrived (the browser put it in storage, then
+    lost the connection) is in storage all the same: it is taken, not failed."""
+    from audit_core.uc03_p2_storage import get_p2_document_storage
+
+    waiting = connection.execute(
+        text("SELECT file_id, object_key, size_bytes FROM auditcore.p2_bulk_files WHERE tenant_id=:t AND bulk_id=:b "
+             "AND upload_status='AWAITING_UPLOAD' AND outcome='PENDING'"), {"t": tenant_id, "b": bulk_id},
+    ).mappings().all()
+    if not waiting:
+        return 0
+    try:
+        storage = get_p2_document_storage()
+    except RuntimeError:
+        return 0
+    taken = 0
+    for row in waiting:
+        try:
+            head = storage.head_object(str(row["object_key"]))
+        except Exception:  # noqa: BLE001 - any failure to find it means it is not in storage
+            logger.info("p2_bulk_file_not_in_storage_at_submit", tenant_id=tenant_id, file_id=str(row["file_id"]))
+            continue
+        connection.execute(
+            text("UPDATE auditcore.p2_bulk_files SET upload_status='UPLOADED', size_bytes=:s, updated_at_utc=now() "
+                 "WHERE tenant_id=:t AND file_id=:f"),
+            {"s": int(head.get("contentLength") or row["size_bytes"] or 0), "t": tenant_id, "f": row["file_id"]},
+        )
+        taken += 1
+    return taken
+
+
+def _close_files_not_uploaded(connection: Connection, tenant_id: str, bulk_id: UUID) -> None:
+    """At submit, a file still not in storage is REPLACED when the drop holds it again, uploaded
+    (the same name, numbered or not, and the same size) -- nothing is missing, so the PC is not
+    told it failed. Only a file the drop does not hold in any form is FAILED."""
+    connection.execute(
+        text(
+            r"""
+            UPDATE auditcore.p2_bulk_files f
+               SET outcome='REPLACED', detail='Uploaded again as ' || m.again, updated_at_utc=now()
+              FROM (
+                SELECT DISTINCT ON (w.file_id) w.file_id, g.original_filename AS again
+                  FROM auditcore.p2_bulk_files w
+                  JOIN auditcore.p2_bulk_files g
+                    ON g.tenant_id=w.tenant_id AND g.bulk_id=w.bulk_id AND g.file_id <> w.file_id
+                   AND g.upload_status='UPLOADED' AND g.size_bytes=w.size_bytes
+                   AND regexp_replace(g.original_filename, ' \(\d+\)(\.[^.]*)?$', '\1')
+                     = regexp_replace(w.original_filename, ' \(\d+\)(\.[^.]*)?$', '\1')
+                 WHERE w.tenant_id=:t AND w.bulk_id=:b AND w.upload_status='AWAITING_UPLOAD'
+                   AND w.outcome='PENDING'
+                 ORDER BY w.file_id, g.created_at_utc
+              ) m
+             WHERE f.tenant_id=:t AND f.file_id=m.file_id
+            """
+        ),
+        {"t": tenant_id, "b": bulk_id},
+    )
+    connection.execute(
+        text("UPDATE auditcore.p2_bulk_files SET outcome='FAILED', detail='Not uploaded before submit', "
+             "updated_at_utc=now() WHERE tenant_id=:t AND bulk_id=:b AND upload_status='AWAITING_UPLOAD' "
+             "AND outcome='PENDING'"),
+        {"t": tenant_id, "b": bulk_id},
+    )
 
 
 def group_key(filename: str, file_id: str) -> str:
@@ -182,8 +272,9 @@ def _files(connection: Connection, tenant_id: str, bulk_ids: list[Any]) -> dict[
     if not bulk_ids:
         return out
     for row in connection.execute(
+        # A file REPLACED by its own later upload is not the PC's to see: nothing is missing.
         text("SELECT * FROM auditcore.p2_bulk_files WHERE tenant_id=:t AND bulk_id = ANY(CAST(:ids AS uuid[])) "
-             "ORDER BY created_at_utc, original_filename"),
+             "AND outcome <> 'REPLACED' ORDER BY created_at_utc, original_filename"),
         {"t": tenant_id, "ids": [str(b) for b in bulk_ids]},
     ).mappings():
         out[str(row["bulk_id"])].append(dict(row))
@@ -249,6 +340,13 @@ def add_bulk_files(
         storage = get_p2_document_storage()
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail="Document storage is not configured.") from exc
+    # The drop's files from before this request: a file picked again (a retry, or the page
+    # reloaded and the files picked again) is the same file, not a "(2)" copy of it.
+    earlier = [dict(r) for r in connection.execute(
+        text("SELECT * FROM auditcore.p2_bulk_files WHERE tenant_id=:t AND bulk_id=:b ORDER BY created_at_utc"),
+        {"t": tenant_id, "b": bulk_id},
+    ).mappings().all()]
+    claimed: set[str] = set()
     out = []
     for item in command.files:
         content_type = item.contentType.lower().strip()
@@ -257,6 +355,16 @@ def add_bulk_files(
         if item.sizeBytes > _MAX_BYTES:
             raise HTTPException(status_code=413, detail=f"{item.filename}: larger than 50 MB.")
         name = plain_name(item.filename)
+        same = _same_file_earlier(earlier, claimed, name, item.sizeBytes, content_type)
+        if same is not None:
+            claimed.add(str(same["file_id"]))
+            uploaded = same["upload_status"] == "UPLOADED"
+            out.append({"fileId": str(same["file_id"]), "filename": same["original_filename"],
+                        "objectKey": same["object_key"], "contentType": content_type,
+                        "alreadyUploaded": uploaded,
+                        "uploadUrl": None if uploaded else storage.presign_put(
+                            str(same["object_key"]), content_type=content_type, expires_seconds=3600)})
+            continue
         key, n = f"{bulk['folder']}/{name}", 1
         while connection.execute(
             text("SELECT 1 FROM auditcore.p2_bulk_files WHERE tenant_id=:t AND object_key=:k"),
@@ -271,7 +379,7 @@ def add_bulk_files(
              "size": item.sizeBytes, "k": key},
         ).mappings().one()
         out.append({"fileId": str(row["file_id"]), "filename": name if n == 1 else numbered(name, n),
-                    "objectKey": key, "contentType": content_type,
+                    "objectKey": key, "contentType": content_type, "alreadyUploaded": False,
                     "uploadUrl": storage.presign_put(key, content_type=content_type, expires_seconds=3600)})
     return {"bulkId": str(bulk_id), "files": out}
 
@@ -328,13 +436,10 @@ def submit_bulk_upload(
         text("SELECT count(*) FROM auditcore.p2_bulk_files WHERE tenant_id=:t AND bulk_id=:b "
              "AND upload_status='UPLOADED'"), {"t": tenant_id, "b": bulk_id},
     ).scalar_one()
+    uploaded += _take_files_already_in_storage(connection, tenant_id, bulk_id)
     if not uploaded:
         raise HTTPException(status_code=409, detail="No file has finished uploading yet.")
-    connection.execute(
-        text("UPDATE auditcore.p2_bulk_files SET outcome='FAILED', detail='Not uploaded before submit', "
-             "updated_at_utc=now() WHERE tenant_id=:t AND bulk_id=:b AND upload_status='AWAITING_UPLOAD'"),
-        {"t": tenant_id, "b": bulk_id},
-    )
+    _close_files_not_uploaded(connection, tenant_id, bulk_id)
     row = connection.execute(
         text("UPDATE auditcore.p2_bulk_uploads SET status='SUBMITTED', file_count=:n, submitted_at_utc=now(), "
              "updated_at_utc=now() WHERE tenant_id=:t AND bulk_id=:b RETURNING *"),
@@ -554,7 +659,8 @@ def _finish_if_settled(engine: Engine, tenant_id: str, bulk_id: UUID) -> bool:
             text("UPDATE auditcore.p2_bulk_uploads SET summary=CAST(:s AS jsonb), updated_at_utc=now(), "
                  "status = CASE WHEN :done THEN 'DONE' ELSE 'PROCESSING' END, "
                  "finished_at_utc = CASE WHEN :done THEN now() END WHERE tenant_id=:t AND bulk_id=:b"),
-            {"s": json.dumps(counts), "done": done, "t": tenant_id, "b": bulk_id},
+            {"s": json.dumps({k: n for k, n in counts.items() if k != "REPLACED"}), "done": done,
+             "t": tenant_id, "b": bulk_id},
         )
     return done
 
