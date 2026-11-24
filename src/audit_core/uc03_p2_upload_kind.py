@@ -47,7 +47,7 @@ _SQL = f"""
     WITH up AS (
         SELECT ub.journey_id, ub.uploaded_by_actor_id AS person,
                CAST(ub.created_at_utc AT TIME ZONE :tz AS date) AS day,
-               count(*) AS files,
+               count(*) AS files, max(ub.created_at_utc) AS last_at,
                (array_agg(ub.batch_id ORDER BY ub.created_at_utc, ub.batch_id))[1] AS first_batch
         FROM auditcore.p2_upload_batches ub
         WHERE ub.tenant_id = :t AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
@@ -73,7 +73,8 @@ _SQL = f"""
            CASE WHEN up.day = f.first_delivery THEN 'delivery'
                 WHEN up.day = LEAST(f.first_upload, CAST(j.created_at_utc AT TIME ZONE :tz AS date)) THEN 'booking'
                 ELSE 'updated' END AS kind,
-           up.files, COALESCE(c.channel, 'direct') AS channel
+           up.files, COALESCE(c.channel, 'direct') AS channel, up.last_at,
+           up.day = LEAST(f.first_upload, CAST(j.created_at_utc AT TIME ZONE :tz AS date)) AS new_journey
     FROM up
     JOIN firsts f ON f.journey_id = up.journey_id
     JOIN auditcore.journeys j ON j.tenant_id = :t AND j.journey_id = up.journey_id
@@ -102,8 +103,10 @@ _SQL = f"""
 def upload_days(connection: Connection, *, tenant_id: str, start: datetime, end: datetime, tz: str,
                 actor_id: str | None = None) -> list[dict[str, Any]]:
     """Each Journey, person and day uploaded to in [start, end), with what that day counts as
-    (``kind``: booking, delivery or updated), the ``files`` that came in and the ``channel``
-    (direct, bulk, drive) of the first of them. ``actor_id``: only that person's uploads."""
+    (``kind``: booking, delivery or updated), the ``files`` that came in, the ``channel``
+    (direct, bulk, drive) of the first of them and when the last came in (``last_at``), and
+    whether the Journey is new that day (``new_journey``: also true for a Journey booked and
+    delivered the same day, which counts as a delivery). ``actor_id``: only that person's uploads."""
     return [dict(r) for r in connection.execute(
         text(_SQL), {"t": tenant_id, "s": start, "e": end, "tz": tz, "me": actor_id},
     ).mappings()]

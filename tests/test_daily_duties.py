@@ -609,8 +609,10 @@ def test_uploads_are_read_against_the_files_received(project):
                            spec={"enabled": True, "workingWeekdays": [1, 2, 3, 4, 5, 6, 7]}, now=datetime.now(UTC))
         view = dd.my_day(c, tenant_id=p.tenant, caller=_caller(p, "PC"))
     uploads = _one(view, "Upload bookings and deliveries")
-    assert uploads["progress"] == {"state": "PENDING", "note": "Enter the files received first", "done": None,
-                                   "total": None}
+    # Without the files received there is nothing to judge by: the PC confirms, and the note says
+    # what was uploaded on the day (product owner 2026-11-24: never a bare 0 when files are uploaded).
+    assert uploads["progress"]["state"] == "NOTHING"
+    assert uploads["progress"]["note"].startswith("Uploaded on ") and "new bookings" in uploads["progress"]["note"]
     received = _one(view, "Booking and delivery files received")
     with _Db(p) as c:
         view = dd.tick(c, tenant_id=p.tenant, caller=_caller(p, "PC"), item_id=UUID(received["itemId"]),
@@ -631,6 +633,48 @@ def test_uploads_are_read_against_the_files_received(project):
         view = dd.my_day(c, tenant_id=p.tenant, caller=_caller(p, "PC"))
     done = _one(view, "Upload bookings and deliveries")
     assert done["status"] == "ON_TRACK" and done["progress"]["note"] == "Bookings 1 of 1, deliveries 1 of 1 uploaded"
+
+    # Nobody opens a list again: the worker's check ticks it once its day is over, on the day of
+    # the uploads (on time), not on the day of the check.
+    tomorrow = datetime.combine(dd.ist_today() + timedelta(days=1), datetime.min.time(), tzinfo=IST) + timedelta(hours=10)
+    with _Db(p) as c:
+        assert dd.sync_open_items(c, tenant_id=p.tenant, now=tomorrow.astimezone(UTC)) >= 1
+        row = c.execute(text("""
+            SELECT i.status, i.done_on, i.duty_date, i.done_source FROM auditcore.p2_duty_items i
+            WHERE i.tenant_id = :t AND i.title = 'Upload bookings and deliveries' AND i.for_date = :d
+        """), {"t": p.tenant, "d": dd.ist_today()}).mappings().first()
+    assert (row["status"], row["done_source"]) == ("DONE", "SYSTEM") and row["done_on"] == row["duty_date"]
+
+
+def test_an_upload_the_next_day_counts_for_the_day_the_files_were_received(project):
+    """Product owner 2026-11-24: files received one day and uploaded the next counted for neither."""
+    from audit_core.daily_duty_checkers import check_uploads
+
+    p = project
+    today = dd.ist_today()
+    with _Db(p) as c:
+        dd.add_standard_duties(c, tenant_id=p.tenant, caller=_caller(p, "EXECUTIVE"), now=datetime.now(UTC))
+        dd.update_settings(c, tenant_id=p.tenant, caller=_caller(p, "EXECUTIVE"),
+                           spec={"enabled": True, "workingWeekdays": [1, 2, 3, 4, 5, 6, 7]}, now=datetime.now(UTC))
+        dd.my_day(c, tenant_id=p.tenant, caller=_caller(p, "PC"))
+        # Yesterday the PC received one booking file and entered it; nothing was uploaded that day.
+        duty = c.execute(text("SELECT duty_id FROM auditcore.p2_duties WHERE tenant_id = :t AND standard_code = 'INTIMATION'"),
+                         {"t": p.tenant}).scalar_one()
+        c.execute(text("""
+            INSERT INTO auditcore.p2_duty_items (tenant_id, duty_id, dealer_id, outlet_id, duty_date, for_date, title,
+              mandatory, close_mode, carry_days, status, input_values, done_at_utc, done_on)
+            VALUES (:t, :duty, :dealer, :o, :d, :d, 'Booking and delivery files received', false, 'TICK', 5, 'DONE',
+              CAST('{"bookingFiles": 1, "deliveryFiles": 0}' AS jsonb), now(), :d)
+        """), {"t": p.tenant, "duty": duty, "dealer": p.journey.dealer_id, "o": p.journey.outlet_id,
+               "d": today - timedelta(days=1)})
+    add_batch_pages(p.journey, [("booking_form", "READY")])  # uploaded today: the new Journey
+    yesterday = {"item_id": "y", "outlet_id": str(p.journey.outlet_id), "for_date": today - timedelta(days=1)}
+    same_day = {"item_id": "t", "outlet_id": str(p.journey.outlet_id), "for_date": today}
+    with _Db(p) as c:
+        answers = check_uploads(c, p.tenant, [yesterday, same_day], today)
+    assert answers["y"]["state"] == "DONE" and answers["y"]["note"] == "Bookings 1 of 1, deliveries 0 of 0 uploaded"
+    # Today had no files received entered: it says what came in, and the booking is not counted twice.
+    assert answers["t"]["state"] == "NOTHING" and answers["t"]["note"].endswith("1 new bookings, 0 new deliveries, 0 Journeys updated")
 
 
 def test_the_bank_statement_ticks_itself_for_the_outlet_or_its_dealership(project):

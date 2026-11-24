@@ -4589,6 +4589,23 @@ def run_verified_checks(engine: Engine, tenant_id: str, now: datetime | None = N
     return result
 
 
+def run_duty_sync(engine: Engine, tenant_id: str, now: datetime | None = None) -> int | None:
+    """The PCs' system-checked daily duties, ticked as their work lands in Verigence
+    (daily_duties.sync_open_items), every few minutes with the Task Manager's pass."""
+    from audit_core.daily_duties import sync_open_items
+
+    try:
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            ticked = sync_open_items(connection, tenant_id=tenant_id, now=now)
+        if ticked:
+            logger.info("p2_duty_sync", tenant_id=tenant_id, ticked=ticked)
+        return ticked
+    except Exception:
+        logger.warning("p2_duty_sync_failed", tenant_id=tenant_id, exc_info=True)
+        return None
+
+
 def run_task_manager(engine: Engine, tenant_id: str, now: datetime | None = None) -> dict[str, int] | None:
     """The Task Manager's pass for one Project (docs/TASK_MANAGER_DESIGN_v1.0.md):
     raise today's recurring occurrences (each claimed once in
@@ -4685,6 +4702,7 @@ def _maybe_sweep(engine: Engine, tenant_id: str) -> None:
         _last_task_manager_at[tenant_id] = now
         run_task_manager(engine, tenant_id)
         run_closure_auto_accept(engine, tenant_id)
+        run_duty_sync(engine, tenant_id)
     due = _nightly_review_due(tenant_id)
     if due is None:
         return

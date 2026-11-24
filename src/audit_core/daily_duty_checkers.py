@@ -205,66 +205,89 @@ def check_vehicle_photos(connection: Connection, tenant_id: str, items: list[dic
 
 def check_uploads(connection: Connection, tenant_id: str, items: list[dict[str, Any]],
                   today: date) -> dict[str, dict[str, Any]]:
-    """Every booking and delivery file received on the day is uploaded: the Journeys
-    uploaded to at the outlet that day (My Tracker's rule, uc03_p2_my_work._uploads: a
-    Journey with a delivery page among the day's uploads is a delivery, else a booking;
-    direct, bulk and Drive uploads alike) against the counts the PC entered in the
-    "files received" duty of the same outlet and day."""
+    """Every booking and delivery file received is uploaded (product owner 2026-11-24: the duty
+    showed 0 when files had been uploaded, and "is not making much difference").
+
+    The uploads are the Project Tracker's (uc03_p2_upload_kind.upload_days): a new Journey is a
+    booking file, a Journey's first delivery files a delivery file, anything else added to a
+    Journey an update -- direct, bulk and Drive alike, at the outlet of the Journey. They are set
+    against the counts the PC entered in the "files received" duty, oldest day first: a file
+    received on one day and uploaded the next counts for the day it was received, never twice.
+    A day is done once its files received are all matched, at the time of the upload that
+    matched the last of them. Without counts there is nothing to judge by: the PC confirms with
+    a tick, and the note says what was uploaded on the day, never a bare 0."""
+    from audit_core.uc03_p2_upload_kind import DELIVERY, UPDATED, upload_days
+
     outlets, first, last = _span(items)
+    start = first - timedelta(days=7)  # files received a few days earlier can still be waiting
     received: dict[tuple[str, date], dict[str, Any]] = {}
     for r in connection.execute(
         text("""
-            SELECT i.outlet_id::text AS outlet_id, i.for_date, i.status, i.input_values
+            SELECT i.outlet_id::text AS outlet_id, i.for_date, i.status, i.input_values, i.done_at_utc
             FROM auditcore.p2_duty_items i
             JOIN auditcore.p2_duties d ON d.tenant_id = i.tenant_id AND d.duty_id = i.duty_id
-            WHERE i.tenant_id = :t AND d.standard_code = 'INTIMATION' AND i.status <> 'CANCELLED'
+            WHERE i.tenant_id = :t AND d.standard_code = 'INTIMATION' AND i.status = 'DONE'
               AND i.outlet_id = ANY(CAST(:o AS uuid[])) AND i.for_date BETWEEN :a AND :b
         """),
-        {"t": tenant_id, "o": outlets, "a": first, "b": last},
+        {"t": tenant_id, "o": outlets, "a": start, "b": last},
     ).mappings().all():
-        received[(r["outlet_id"], r["for_date"])] = dict(r)
-    uploaded: dict[tuple[str, date], dict[str, Any]] = {}
-    for r in connection.execute(
-        text("""
-            SELECT j.outlet_id::text AS outlet_id, CAST(ub.created_at_utc AT TIME ZONE :tz AS date) AS day,
-                   ub.journey_id, COALESCE(bool_or(q.business_stage = 'DELIVERY'), false) AS delivery,
-                   max(ub.created_at_utc) AS last_at
-            FROM auditcore.p2_upload_batches ub
-            JOIN auditcore.journeys j ON j.tenant_id = ub.tenant_id AND j.journey_id = ub.journey_id
-            LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id = ub.tenant_id AND q.batch_id = ub.batch_id
-            WHERE ub.tenant_id = :t AND j.outlet_id = ANY(CAST(:o AS uuid[]))
-              AND ub.created_at_utc >= :s AND ub.created_at_utc < :e
-              AND ub.batch_status <> 'AWAITING_UPLOAD'
-              AND NOT (ub.batch_status = 'CANCELLED' AND ub.page_count = 0)
-            GROUP BY 1, 2, 3
-        """),
-        {"t": tenant_id, "tz": _TZ, "o": outlets, "s": _ist_start(first), "e": _ist_start(last + timedelta(days=1))},
-    ).mappings().all():
-        slot = uploaded.setdefault((r["outlet_id"], r["day"]), {"bookings": 0, "deliveries": 0, "last_at": None})
-        slot["deliveries" if r["delivery"] else "bookings"] += 1
-        if slot["last_at"] is None or r["last_at"] > slot["last_at"]:
-            slot["last_at"] = r["last_at"]
+        counts = dict(r["input_values"] or {})
+        if {"bookingFiles", "deliveryFiles"} <= counts.keys():
+            received[(r["outlet_id"], r["for_date"])] = {
+                "bookings": int(counts["bookingFiles"] or 0), "deliveries": int(counts["deliveryFiles"] or 0),
+                "entered_at": r["done_at_utc"]}
+    wanted = set(outlets)
+    uploads: dict[str, list[dict[str, Any]]] = {}
+    day_sum: dict[tuple[str, date], dict[str, int]] = {}
+    for r in upload_days(connection, tenant_id=tenant_id, start=_ist_start(start),
+                         end=_ist_start(max(today, last) + timedelta(days=1)), tz=_TZ):
+        if r["outlet_id"] not in wanted:
+            continue
+        uploads.setdefault(r["outlet_id"], []).append(r)
+        cell = day_sum.setdefault((r["outlet_id"], r["day"]), {"bookings": 0, "deliveries": 0, "updated": 0})
+        cell["deliveries" if r["kind"] == DELIVERY else "updated" if r["kind"] == UPDATED else "bookings"] += 1
+
+    # Oldest first: each outlet's files received, matched by its uploads in the order they came in.
+    matched: dict[tuple[str, date], dict[str, Any]] = {}
+    for outlet in outlets:
+        queue = []
+        for (o, day), want in sorted(received.items(), key=lambda kv: kv[0][1]):
+            if o != outlet:
+                continue
+            entry = {"day": day, "bookings": want["bookings"], "deliveries": want["deliveries"],
+                     "left_b": want["bookings"], "left_d": want["deliveries"],
+                     "at": want["entered_at"] if not (want["bookings"] or want["deliveries"]) else None}
+            queue.append(entry)
+            matched[(outlet, day)] = entry
+        for up in sorted(uploads.get(outlet, []), key=lambda u: (u["last_at"], u["journey_id"])):
+            for side, counts in (("left_b", bool(up["new_journey"])), ("left_d", up["kind"] == DELIVERY)):
+                if not counts:
+                    continue
+                entry = next((e for e in queue if e["day"] <= up["day"] and e[side] > 0), None)
+                if entry is None:
+                    continue
+                entry[side] -= 1
+                if entry["left_b"] == 0 and entry["left_d"] == 0 and entry["at"] is None:
+                    entry["at"] = up["last_at"]
+
     out: dict[str, dict[str, Any]] = {}
     for item in items:
         key = (item["outlet_id"], item["for_date"])
-        got = uploaded.get(key, {"bookings": 0, "deliveries": 0, "last_at": None})
-        asked = received.get(key)
-        counts = dict(asked["input_values"] or {}) if asked else {}
-        if asked is None or (asked["status"] == "DONE"
-                             and not {"bookingFiles", "deliveryFiles"} <= counts.keys()):
+        got = day_sum.get(key, {"bookings": 0, "deliveries": 0, "updated": 0})
+        entry = matched.get(key)
+        if entry is None:
             out[str(item["item_id"])] = _answer(
-                "NOTHING", f"Uploaded: {got['bookings']} bookings, {got['deliveries']} deliveries")
+                "NOTHING", f"Uploaded on {_label(item['for_date'])}: {got['bookings']} new bookings, "
+                           f"{got['deliveries']} new deliveries, {got['updated']} Journeys updated")
             continue
-        if asked["status"] != "DONE":
-            out[str(item["item_id"])] = _answer("PENDING", "Enter the files received first")
-            continue
-        want_b, want_d = int(counts["bookingFiles"]), int(counts["deliveryFiles"])
-        done = min(got["bookings"], want_b) + min(got["deliveries"], want_d)
-        note = (f"Bookings {got['bookings']} of {want_b}, deliveries {got['deliveries']} of {want_d} uploaded")
-        if got["bookings"] >= want_b and got["deliveries"] >= want_d:
-            out[str(item["item_id"])] = _answer("DONE", note, done=done, total=want_b + want_d, at=got["last_at"])
+        done_b = entry["bookings"] - entry["left_b"]
+        done_d = entry["deliveries"] - entry["left_d"]
+        note = (f"Bookings {done_b} of {entry['bookings']}, deliveries {done_d} of {entry['deliveries']} uploaded")
+        total = entry["bookings"] + entry["deliveries"]
+        if entry["left_b"] == 0 and entry["left_d"] == 0:
+            out[str(item["item_id"])] = _answer("DONE", note, done=total, total=total, at=entry["at"])
         else:
-            out[str(item["item_id"])] = _answer("PENDING", note, done=done, total=want_b + want_d)
+            out[str(item["item_id"])] = _answer("PENDING", note, done=done_b + done_d, total=total)
     return out
 
 
@@ -352,7 +375,8 @@ CHECKERS: dict[str, dict[str, Any]] = {
     },
     "UPLOADS": {
         "label": "Files received are uploaded", "check": check_uploads, "final": False,
-        "hint": "This ticks itself when the bookings and deliveries uploaded match the files received.",
+        "hint": ("This ticks itself when the new bookings and deliveries uploaded match the files received; "
+                 "uploads of the next days count too."),
         "nilLabel": "Everything received is uploaded",
     },
     "VEHICLE_PHOTOS": {

@@ -577,7 +577,7 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
                     "updated": sum(person_flow.get(a, {}).get(d, {}).get("updated", 0) for d in iso),
                     "filesClosed": int(total(v, "journeysClosed")), "tasksClosed": int(total(v, "tasksClosed")),
                     "notUploaded": _n(c, "deliveriesNotUploaded"), "filesOpen": _n(c, "deliveryFilesOpen"),
-                    "overdue": _n(c, "tasksOverdue"), "dutiesMissed": len(missed_dates(a)),
+                    "openTasks": _n(c, "tasksOpen"), "dutiesMissed": len(missed_dates(a)),
                     "firstTime": _pct(pages - rejected, pages),
                     "inTime": _pct(int(e.get("tasksInTime", 0)), due), "hours": active_hours(a)}})
             cards.append({"key": "pcs", "title": "PCs", "sort": "deliveries", "spark": "Journeys uploaded, day by day",
@@ -589,7 +589,8 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
                               ("tasksClosed", "Tasks closed", "num", "tasksClosed"),
                               ("notUploaded", "Deliveries not uploaded", "alert", None),
                               ("filesOpen", "Files not closed", "warn", None),
-                              ("overdue", "Overdue tasks", "alert", None),
+                              # All open tasks, not only those past their due time (product owner 2026-11-24).
+                              ("openTasks", "Open tasks", "warn", None),
                               ("dutiesMissed", "Duty days missed", "alert", "duties"),
                               ("firstTime", "Pages right first time", "pct", "pagesRejected"),
                               ("inTime", "Tasks closed by due time", "pct", "tasksClosed"),
@@ -636,7 +637,7 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
                 "updated": flow_total("updated", only=ids),
                 "onRegister": flow_total("onRegister", only=ids), "notNotified": flow_total("notNotified", only=ids),
                 "notUploaded": _n(c, "deliveriesNotUploaded"), "filesOpen": _n(c, "deliveryFilesOpen"),
-                "overdue": _n(c, "tasksOverdue"), "payments": _n(c, "paymentsNotReconciled"),
+                "openTasks": _n(c, "tasksOpen"), "payments": _n(c, "paymentsNotReconciled"),
                 "awaitingReview": _n(c, "awaitingReview"), "registersMissed": flow_total("registerMissing", only=ids)}}
 
         unit_columns = columns(
@@ -644,7 +645,7 @@ def build(part: Any, data: dict[str, Any], *, view: str, actor_id: str, visible:
             ("updated", "Journeys updated", "num", "journeysUploaded"),
             ("onRegister", "On gate register", "num", None), ("notNotified", "Not intimated to PC", "warn", None),
             ("notUploaded", "Deliveries not uploaded", "alert", None), ("filesOpen", "Files not closed", "warn", None),
-            ("overdue", "Overdue tasks", "alert", None), ("payments", "Payments not reconciled", "warn", None),
+            ("openTasks", "Open tasks", "warn", None), ("payments", "Payments not reconciled", "warn", None),
             ("awaitingReview", "Awaiting Reviewer", "num", None), ("registersMissed", "Registers missed", "alert", None))
         if outlets:
             cards.append({"key": "outlets", "title": "Outlets", "sort": "deliveries", "spark": "New deliveries, day by day",
