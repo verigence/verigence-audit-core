@@ -487,6 +487,47 @@ def test_service_audit_projects_are_left_out_of_the_sales_master_jobs(tenant) ->
     assert tenant_id not in oem_master_reload.mahindra_tenants(engine)
 
 
+def test_the_deal_check_after_a_reload_is_asked_for_through_the_work_queue() -> None:
+    """Until 24 Nov 2026 the reload ran the deal check itself, one booking after
+    another: close to two hours on the live Project, and ended part way by any
+    worker restart (5 Nov, twice on 23 Nov). It now asks for each booking priced
+    from the reload's first date to be checked again, forced, as RULES_RERUN does."""
+    from conftest import delete_tenant_data
+    from p2_support import create_p2_journey, database_engine
+
+    from audit_core.db import set_tenant_context
+
+    engine = database_engine()
+    created = create_p2_journey(engine, prefix="mrq")
+    try:
+        with engine.begin() as c:
+            set_tenant_context(c, created.tenant_id)
+            c.execute(text("INSERT INTO auditcore.bookings (tenant_id, journey_id, booking_date) "
+                           "VALUES (:t, :j, '2026-09-10') ON CONFLICT (tenant_id, journey_id) "
+                           "DO UPDATE SET booking_date = EXCLUDED.booking_date"),
+                      {"t": created.tenant_id, "j": created.journey_id})
+        tag = f"{created.tenant_id}:bulletin-consumerreread-commit"
+
+        # priced before the reload's first date: its offers did not move
+        none = oem_master_reload.reprice_deals(engine, tenant_id=created.tenant_id, start=date(2026, 9, 11), tag=tag)
+        assert none == {"from": "2026-09-11", "journeys": 0, "queued": 0, "units": 0, "failed": []}
+
+        asked = oem_master_reload.reprice_deals(engine, tenant_id=created.tenant_id, start=date(2026, 9, 3), tag=tag)
+        assert asked == {"from": "2026-09-03", "journeys": 1, "queued": 1, "units": 1, "failed": []}
+        with engine.begin() as c:
+            set_tenant_context(c, created.tenant_id)
+            work = c.execute(text(
+                "SELECT work_key, payload, correlation_id FROM auditcore.p2_work_queue "
+                "WHERE tenant_id=:t AND journey_id=:j AND work_type='CONTROL_EVALUATE'"),
+                {"t": created.tenant_id, "j": created.journey_id}).mappings().all()
+        assert [w["work_key"] for w in work] == [f"unit:{created.journey_id}:NATIVE:BOOKING"]
+        assert work[0]["payload"]["force"] is True
+        assert "masters:bulletin-consumerreread-commit" in work[0]["correlation_id"]
+    finally:
+        delete_tenant_data(engine, created.tenant_id)
+        engine.dispose()
+
+
 def test_a_reprice_tag_runs_only_the_deal_check_again_and_once(tenant, monkeypatch) -> None:
     """For a reload whose reprice a worker restart cut short (5 Nov 2026)."""
     engine, tenant_id = tenant
