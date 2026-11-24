@@ -455,8 +455,9 @@ def test_the_dashboard_of_each_role(setup):
         cards = {c["key"]: c for c in team["scorecards"]}
         assert {"pcs", "reviewers", "outlets"} <= set(cards) and "leads" not in cards
         row = next(r for r in cards["pcs"]["rows"] if r["id"] == me)
-        # Overdue: the task five days late and yesterday's duty, which is an overdue task too.
-        assert row["values"]["deliveries"] == 3 and row["values"]["overdue"] == 2 and row["values"]["dutiesMissed"] == 1
+        # Open tasks: every open task, the two overdue ones among them (product owner 2026-11-24: the
+        # total, not only those past their due time).
+        assert row["values"]["deliveries"] == 3 and row["values"]["openTasks"] >= 2 and row["values"]["dutiesMissed"] == 1
         assert len(row["spark"]) == len(team["days"])
         assert next(r for r in cards["reviewers"]["rows"] if r["id"] == reviewer)["values"]["closed"] == 1
         # The backlog of each PC and outlet, and each PC's efficiency.

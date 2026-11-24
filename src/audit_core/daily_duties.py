@@ -753,6 +753,31 @@ def _sync_auto(connection: Connection, *, tenant_id: str, items: list[dict[str, 
                         done_by_name=answer.get("name"), done_source="SYSTEM", comment=answer.get("note"))
 
 
+def sync_open_items(connection: Connection, *, tenant_id: str, now: datetime | None = None) -> int:
+    """Ask the checkers about every open system-checked item still in (or just past) its carry
+    days, and tick those whose work is done -- without anyone opening a list (product owner
+    2026-11-24: the duties were "not synced well"; an item was only checked when someone read
+    it, so the Project Tracker could count a duty done in Verigence as missed). Run by the
+    worker every few minutes; returns the items ticked."""
+    now = now or datetime.now(UTC)
+    settings = _settings(connection, tenant_id)
+    if not settings["enabled"]:
+        return 0
+    today = ist_today(now)
+    items = [dict(r) for r in connection.execute(
+        text(f"""
+            SELECT {_ITEM_FIELDS} FROM auditcore.p2_duty_items i
+            WHERE i.tenant_id = :t AND i.status = 'PENDING' AND i.close_mode = 'AUTO'
+              AND i.duty_date <= :today AND i.duty_date + i.carry_days >= :since
+        """),
+        {"t": tenant_id, "today": today, "since": today - timedelta(days=2)},
+    ).mappings().all()]
+    if not items:
+        return 0
+    _sync_auto(connection, tenant_id=tenant_id, items=items, now=now)
+    return sum(1 for i in items if i["status"] == "DONE")
+
+
 def _progress(item: dict[str, Any]) -> dict[str, Any] | None:
     answer = item.get("progress")
     if answer is None or item["status"] != "PENDING":
