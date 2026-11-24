@@ -46,6 +46,10 @@ jobs:
       OUTLET: ${{ inputs.outlet || 'aditya motors' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Use the deployed dev code
+        run: git checkout origin/dev -- src migrations pyproject.toml
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
