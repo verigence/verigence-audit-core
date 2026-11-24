@@ -46,6 +46,7 @@ def main() -> None:
     p.add_argument("--name", required=True)
     p.add_argument("--since", required=True, type=date.fromisoformat)
     p.add_argument("--until", required=True, type=date.fromisoformat)
+    p.add_argument("--outlet", default="")
     a = p.parse_args()
     start = datetime.combine(a.since, time(0), IST).astimezone(UTC)
     end = datetime.combine(a.until, time(0), IST).astimezone(UTC)
@@ -73,9 +74,22 @@ def main() -> None:
         tid = t["tenant_id"]
         with _ro(engine, tid) as c:
             people = [dict(r) for r in c.execute(text(
-                "SELECT DISTINCT pn.actor_id, pn.display_name FROM auditcore.people_names pn "
-                "JOIN auditcore.business_assignments ba ON ba.security_actor_id=pn.actor_id AND ba.tenant_id=:t "
-                "WHERE pn.display_name ILIKE :n"), {"t": tid, "n": f"%{a.name}%"}).mappings()]
+                "SELECT DISTINCT actor_id, display_name FROM ("
+                " SELECT pn.actor_id, pn.display_name FROM auditcore.people_names pn WHERE pn.display_name ILIKE :n"
+                " UNION SELECT u.uploaded_by_actor_id, u.uploaded_by_name FROM auditcore.p2_bulk_uploads u"
+                "  WHERE u.tenant_id=:t AND u.uploaded_by_name ILIKE :n"
+                " UNION SELECT dp.actor_id, dp.google_email FROM auditcore.p2_drive_people dp"
+                "  WHERE dp.tenant_id=:t AND dp.google_email ILIKE :n) x"), {"t": tid, "n": f"%{a.name}%"}).mappings()]
+            print(f"\n[{t['project_name']}] people matching {a.name!r}: {people}")
+            if a.outlet:
+                outlet_pcs = [dict(r) for r in c.execute(text(
+                    "SELECT DISTINCT ba.security_actor_id AS actor_id, o.outlet_name AS display_name "
+                    "FROM auditcore.dealer_outlets o JOIN auditcore.business_assignments ba ON ba.tenant_id=o.tenant_id "
+                    "AND ba.outlet_id=o.outlet_id AND upper(ba.business_role_code)='PC' "
+                    "WHERE o.tenant_id=:t AND o.outlet_name ILIKE :o"), {"t": tid, "o": f"%{a.outlet}%"}).mappings()]
+                print(f"[{t['project_name']}] PCs of outlets matching {a.outlet!r}: {outlet_pcs}")
+                ids = {p["actor_id"] for p in outlet_pcs}
+                people = [p for p in people if p["actor_id"] in ids] or people
             if not people:
                 continue
             print(f"\n================ Project {t['project_name']} ({tid})")

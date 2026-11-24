@@ -17,6 +17,9 @@ on:
       until:
         description: Day after the last (IST), YYYY-MM-DD
         required: true
+      outlet:
+        description: Part of the outlet's name (optional)
+        required: false
   push:
     branches: ['claude/drive-files-diagnose']
     paths:
@@ -37,6 +40,7 @@ jobs:
       PC_NAME: ${{ inputs.name || 'aditya' }}
       SINCE: ${{ inputs.since || '2026-11-22' }}
       UNTIL: ${{ inputs.until || '2026-11-25' }}
+      OUTLET: ${{ inputs.outlet || 'cuttack' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -79,4 +83,4 @@ jobs:
                   env.write(f"{key}={v[key]}\n")
           PY
       - name: Diagnose
-        run: python tools/drive_files_diagnose.py --name "$PC_NAME" --since "$SINCE" --until "$UNTIL"
+        run: python tools/drive_files_diagnose.py --name "$PC_NAME" --since "$SINCE" --until "$UNTIL" --outlet "$OUTLET"
