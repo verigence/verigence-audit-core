@@ -50,30 +50,33 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: DMS rows without a date, read-only
+      - name: Utkal delivery dumps compared, read-only
         shell: bash
         run: |
           python - <<'PY'
-          import os, psycopg
+          import os, psycopg, json, collections
           with psycopg.connect(os.environ["DB"], options="-c statement_timeout=60000") as c:
               c.execute("SET TRANSACTION READ ONLY")
               t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
               c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
-              base = """FROM auditcore.p2_dms_dump_rows r
-                  JOIN auditcore.p2_dms_dumps u ON u.tenant_id=r.tenant_id AND u.dump_id=r.dump_id
-                  LEFT JOIN auditcore.dealers d ON d.tenant_id=r.tenant_id AND d.dealer_id=r.dealer_id
-                  LEFT JOIN auditcore.dealer_outlets o ON o.tenant_id=r.tenant_id AND o.outlet_id=r.outlet_id
-                  WHERE r.tenant_id=%s AND u.status='ACTIVE'"""
-              for r in c.execute(f"""SELECT d.dealer_name, u.file_name, r.dump_kind, u.uploaded_by_name,
-                    to_char(u.uploaded_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI'),
-                    count(*) FILTER (WHERE r.event_date IS NULL) no_date, count(*) total
-                  {base} GROUP BY 1,2,3,4,5 HAVING count(*) FILTER (WHERE r.event_date IS NULL) > 0 ORDER BY 1""", (t,)):
-                  print("FILE", r)
-              for r in c.execute(f"""SELECT d.dealer_name, coalesce(o.outlet_name, r.outlet_label), count(*)
-                  {base} AND r.event_date IS NULL GROUP BY 1,2 ORDER BY 1,3 DESC""", (t,)):
-                  print("OUTLET", r)
-              for r in c.execute(f"""SELECT r.row_no, r.raw {base} AND r.event_date IS NULL ORDER BY r.row_no LIMIT 3""", (t,)):
-                  print("SAMPLE", r[0], {k: v for k, v in (r[1] or {}).items() if 'DATE' in k.upper() or 'DT' in k.upper()})
-              for r in c.execute(f"""SELECT r.row_no, r.raw {base} AND r.event_date IS NOT NULL AND u.file_name LIKE 'ALL BRANCH DELIVERY SHEET 24.11.26%%' ORDER BY r.row_no LIMIT 2""", (t,)):
-                  print("GOOD", r[0], {k: v for k, v in (r[1] or {}).items() if 'DATE' in k.upper() or 'DT' in k.upper()})
+              dumps = c.execute("""SELECT u.dump_id, u.file_name, u.file_format, u.sheet_name, u.status, u.business_date,
+                    u.period_month, u.row_count, to_char(u.uploaded_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI'),
+                    (SELECT count(*) FROM auditcore.p2_dms_dump_rows r WHERE r.tenant_id=u.tenant_id AND r.dump_id=u.dump_id AND r.event_date IS NULL)
+                  FROM auditcore.p2_dms_dumps u JOIN auditcore.dealers d ON d.tenant_id=u.tenant_id AND d.dealer_id=u.dealer_id
+                  WHERE u.tenant_id=%s AND d.dealer_name='Utkal Mahindra' AND u.dump_kind='DELIVERY'
+                  ORDER BY u.uploaded_at_utc DESC LIMIT 6""", (t,)).fetchall()
+              for d in dumps:
+                  print("DUMP", d[1:])
+                  keys = collections.Counter()
+                  for (raw,) in c.execute("SELECT raw FROM auditcore.p2_dms_dump_rows WHERE tenant_id=%s AND dump_id=%s", (t, d[0])):
+                      keys.update((raw or {}).keys())
+                  print("   KEYS", dict(keys))
+                  for col in ("DELIVERY DATE", "DATE OF DELIVERY", "DATE", "TIMESTAMP", "BOOKING DATE"):
+                      vals = collections.Counter()
+                      for (v,) in c.execute("SELECT raw->>%s FROM auditcore.p2_dms_dump_rows WHERE tenant_id=%s AND dump_id=%s", (col, t, d[0])):
+                          vals[(v or "<none>")[:19]] += 1
+                      if set(vals) != {"<none>"}:
+                          print("   VALUES", col, vals.most_common(8), "distinct", len(vals))
+                  ev = c.execute("SELECT min(event_date), max(event_date), count(event_date) FROM auditcore.p2_dms_dump_rows WHERE tenant_id=%s AND dump_id=%s", (t, d[0])).fetchone()
+                  print("   EVENT_DATE", ev)
           PY
