@@ -50,43 +50,49 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Weak booking matches sized, read-only
+      - name: New booking ladder on the newest dumps, read-only
         shell: bash
         run: |
+          git fetch -q --depth=1 origin claude/dms-booking-match-ladder && git checkout -q FETCH_HEAD -- src pyproject.toml
+          python -m pip install -q -e . 2>&1 | tail -1
           python - <<'PY'
-          import os, psycopg, collections
-          with psycopg.connect(os.environ["DB"], options="-c statement_timeout=180000") as c:
-              c.execute("SET TRANSACTION READ ONLY")
-              for (t,) in c.execute("SELECT DISTINCT tenant_id FROM auditcore.tenant_rule_config").fetchall():
-                  c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
-                  # The newest active booking dump per dealer: its matched rows by basis, with the gap
-                  # between the DMS booking date and the journey's own booking date, and whether the
-                  # journey's own OTF is another row (cancelled or not) of that dump.
-                  rows = c.execute("""
-                    WITH latest AS (
-                      SELECT DISTINCT ON (dealer_id) dump_id, dealer_id FROM auditcore.p2_dms_dumps
-                      WHERE tenant_id=%s AND status='ACTIVE' AND dump_kind='BOOKING' ORDER BY dealer_id, business_date DESC, uploaded_at_utc DESC)
-                    SELECT d.dealer_name, r.match_basis, r.customer_name, r.event_date, r.booking_number, b.booking_date AS j_date,
-                           b.booking_reference, COALESCE(NULLIF(cu.legal_name,''), cu.display_name) AS j_name,
-                           EXISTS (SELECT 1 FROM auditcore.p2_dms_dump_rows o WHERE o.tenant_id=r.tenant_id AND o.dump_id=r.dump_id
-                                   AND o.row_no<>r.row_no AND o.outcome='CANCELLED'
-                                   AND regexp_replace(o.mobile,'\D','','g')=regexp_replace(r.mobile,'\D','','g')) AS cancelled_same_mobile
-                    FROM latest l JOIN auditcore.p2_dms_dump_rows r ON r.tenant_id=%s AND r.dump_id=l.dump_id
-                    JOIN auditcore.dealers d ON d.tenant_id=r.tenant_id AND d.dealer_id=l.dealer_id
-                    LEFT JOIN auditcore.journeys j ON j.tenant_id=r.tenant_id AND j.journey_id=r.journey_id
-                    LEFT JOIN auditcore.customers cu ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
-                    LEFT JOIN auditcore.bookings b ON b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
-                    WHERE r.outcome='MATCHED'""", (t, t)).fetchall()
-                  if not rows: continue
-                  print("TENANT", t[:8], "matched", len(rows), dict(collections.Counter(r[1] for r in rows)))
-                  for basis in ("MOBILE", "NAME_MODEL", "NAME_NEAR_ID", "NAME_DATE"):
-                      gaps = collections.Counter()
-                      for r in rows:
-                          if r[1] != basis: continue
-                          g = "no j_date" if not (r[3] and r[5]) else abs((r[3]-r[5]).days)
-                          gaps["none" if g == "no j_date" else "0-2" if g<=2 else "3-7" if g<=7 else "8-15" if g<=15 else "16-30" if g<=30 else ">30"] += 1
-                      if gaps: print("  GAPS", basis, dict(gaps))
-                  for r in rows:
-                      if r[1] in ("MOBILE", "NAME_MODEL", "NAME_NEAR_ID") and ((r[3] and r[5] and abs((r[3]-r[5]).days) > 7) or r[8]):
-                          print("  SUSPECT", r[0], r[1], "| DMS:", r[2], r[3], r[4], "| journey:", r[7], r[5], r[6], "| DMS cancelled same mobile:", r[8])
+          import os
+          from sqlalchemy import create_engine, text
+          from audit_core import uc03_p2_dms_dumps as m
+          url = os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1)
+          engine = create_engine(url)
+          t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
+          with engine.connect() as c:
+              tx = c.begin()
+              c.execute(text("SET TRANSACTION READ ONLY"))
+              c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": t})
+              dumps = c.execute(text("""SELECT DISTINCT ON (u.dealer_id) u.dump_id, d.dealer_name FROM auditcore.p2_dms_dumps u
+                  JOIN auditcore.dealers d ON d.tenant_id=u.tenant_id AND d.dealer_id=u.dealer_id
+                  WHERE u.tenant_id=:t AND u.status='ACTIVE' AND u.dump_kind='BOOKING' ORDER BY u.dealer_id, u.business_date DESC, u.uploaded_at_utc DESC"""), {"t": t}).all()
+              refs = dict(c.execute(text("SELECT CAST(journey_id AS text), journey_reference FROM auditcore.journeys WHERE tenant_id=:t"), {"t": t}).all())
+              for dump_id, dealer in dumps:
+                  stored = {r.row_no: r for r in c.execute(text("""SELECT row_no, outcome, match_basis, CAST(journey_id AS text) j, customer_name,
+                      event_date, dms_booking_number, mobile FROM auditcore.p2_dms_dump_rows WHERE tenant_id=:t AND dump_id=:d"""), {"t": t, "d": dump_id})}
+                  plan = m.plan_dump(c, tenant_id=t, dump_id=dump_id)
+                  index = m.build_index(c, tenant_id=t, dealer_id=c.execute(text("SELECT dealer_id FROM auditcore.p2_dms_dumps WHERE tenant_id=:t AND dump_id=:d"), {"t": t, "d": dump_id}).scalar_one())
+                  print("DUMP", dealer)
+                  for u in plan.updates:
+                      r = stored[u["n"]]
+                      if (u["o"], u["j"]) != (r.outcome, r.j):
+                          def j(jid):
+                              if not jid: return "-"
+                              jj = index.journeys.get(jid, {})
+                              return f"{refs.get(jid)} {sorted(jj.get('names') or [])[:2]} days={sorted(str(x) for x in jj.get('bookingDays') or [])} refs={sorted(jj.get('refs') or [])[:2]}"
+                          print(f"  CHANGE row {u['n']} {r.customer_name} | {r.event_date} {r.dms_booking_number} {r.mobile} | was {r.outcome}/{r.match_basis} {j(r.j)} | now {u['o']}/{u['b']} {j(u['j'])}")
+                  for f in plan.date_fixes:
+                      ds = next(x for x in plan.updates if x["n"] == f["rowNo"])["ds"] or {}
+                      if ds.get("digitOff"):
+                          print(f"  DATEFIX row {f['rowNo']} {stored[f['rowNo']].customer_name} {refs.get(f['journeyId'])} {f['documentType']} {f['was']} -> {f['dms']}")
+                  for f in plan.field_fixes:
+                      ds = next(x for x in plan.updates if x["n"] == f["rowNo"])["ds"] or {}
+                      flds = [x for x in ds.get("fields") or [] if x.get("digitOff") and x["was"] == f["was"]]
+                      if flds:
+                          print(f"  OTFFIX row {f['rowNo']} {stored[f['rowNo']].customer_name} {refs.get(f['journeyId'])} {f['was']} -> {f['dms']}")
+                  print("  COUNTS dates", len(plan.date_fixes), "fields", len(plan.field_fixes))
+              tx.rollback()
           PY
