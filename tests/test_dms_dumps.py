@@ -375,3 +375,84 @@ def test_a_dump_is_compared_up_to_the_last_day_its_rows_reach(journey) -> None:
         window_end = m.dump_window(dump["period_month"], dump["business_date"])[1]
         assert m.compared_until(connection, journey.tenant_id, dump) == min(
             window_end, dump["business_date"] - timedelta(days=3))
+
+
+# --------------------------------------------------------------------------- 24 Nov 2026: sheet checks
+# Utkal's "ALL BRANCH DELIVERY SHEET 24.11.26.xlsx" came with its LOCATION column headed
+# "Delivery Date": all 348 rows were taken with no date and no outlet.
+
+UTKAL = ["Timestamp", "Location", "SALES MANAGER", "FSC", "CUSTOMER NAME", "CONT NO", "MODEL", "CHASSIS NO",
+         "BOOKING DATE", "DELIVERY DATE"]
+
+
+def _utkal(headers: list[str], rows: list[list]) -> bytes:
+    return _book({"Form Responses 1": [headers, *rows]})
+
+
+def _line(location: object = "CDA", booked: object = datetime(2026, 10, 23), delivered: object = datetime(2026, 11, 6),
+          chassis: str = "T6K14763", name: str = "Tridev Associates") -> list:
+    return [datetime(2026, 11, 7, 9, 51), location, "SM", "FSC", name, 9437033732, "XUV 3XO", chassis, booked, delivered]
+
+
+def _refused(data: bytes) -> str:
+    try:
+        m.parse_workbook(data)
+    except m.HTTPException as exc:
+        assert exc.status_code == 422
+        return str(exc.detail)
+    raise AssertionError("the sheet was taken")
+
+
+def test_a_location_column_headed_like_the_date_is_refused_naming_both_columns() -> None:
+    headers = ["Timestamp", "Delivery Date", *UTKAL[2:]]  # LOCATION's heading typed over as "Delivery Date"
+    detail = _refused(_utkal(headers, [_line("CDA", chassis=f"T6K1476{i}") for i in range(4)]))
+    assert "'Delivery Date' column (column B) has no readable delivery date in 4 of 4 rows" in detail
+    assert "'CDA'" in detail
+    assert "Two columns are headed 'Delivery Date' (columns B and J)" in detail and "Location" in detail
+    assert "No location column was found" in detail
+
+
+def test_a_sheet_without_its_location_column_is_refused() -> None:
+    headers = [h for h in UTKAL if h != "Location"]
+    rows = [[v for k, v in enumerate(_line()) if k != 1]]
+    assert "No location column was found ('Branch' / 'Location' / 'Dealer Location')" in _refused(_utkal(headers, rows))
+
+
+def test_a_sheet_with_most_dates_unreadable_or_locations_empty_is_refused() -> None:
+    rows = [_line(delivered="pending", chassis=f"T6K1476{i}") for i in range(3)] + [_line(chassis="T6K14769")]
+    assert "no readable delivery date in 3 of 4 rows" in _refused(_utkal(UTKAL, rows))
+    rows = [_line(location=None, chassis=f"T6K1476{i}") for i in range(3)] + [_line(chassis="T6K14769")]
+    assert "'Location' column (column B) is empty in 3 of 4 rows" in _refused(_utkal(UTKAL, rows))
+
+
+def test_wrong_dates_in_a_good_sheet_are_left_empty_and_listed_never_guessed() -> None:
+    rows = [_line(chassis="T6K14760", booked="9/30/0026", name="RENU DUNGDUNG"),
+            _line(chassis="T6K14761", delivered="11/3/0026", name="Asha Das"),
+            _line(chassis="T6K14762", booked=datetime(2026, 11, 23), delivered=datetime(2026, 11, 1),
+                  name="M/s.Tridev Associates"),
+            _line(chassis="T6K14763"), _line(chassis="T6K14764")]
+    parsed = m.parse_workbook(_utkal(UTKAL, rows))
+    by_chassis = {r["chassis"]: r for r in parsed.rows}
+    assert by_chassis["T6K14760"]["booking_date"] is None and by_chassis["T6K14760"]["event_date"] == date(2026, 11, 6)
+    assert by_chassis["T6K14761"]["event_date"] is None  # not 11 March of the year 26
+    assert by_chassis["T6K14763"]["event_date"] == date(2026, 11, 6)
+    assert parsed.row_issues == [
+        {"sheetRow": 2, "customer": "RENU DUNGDUNG", "chassis": "T6K14760", "field": "BOOKING DATE",
+         "value": "9/30/0026", "issue": "is not a date"},
+        {"sheetRow": 3, "customer": "Asha Das", "chassis": "T6K14761", "field": "DELIVERY DATE",
+         "value": "11/3/0026", "issue": "has the year 0026"},
+        {"sheetRow": 4, "customer": "M/s.Tridev Associates", "chassis": "T6K14762", "field": "BOOKING DATE",
+         "value": "23 Nov 2026", "issue": "is after the DELIVERY DATE 01 Nov 2026"},
+    ]
+
+
+def test_the_sheet_date_reads_a_date_and_says_what_is_wrong() -> None:
+    assert m.sheet_date(datetime(2026, 11, 6)) == (date(2026, 11, 6), None)
+    assert m.sheet_date("06-11-2026") == (date(2026, 11, 6), None)
+    assert m.sheet_date(None) == (None, None) and m.sheet_date("") == (None, None)
+    assert m.sheet_date("pending") == (None, "is not a date")
+    assert m.sheet_date(datetime(26, 3, 11)) == (None, "has the year 0026")
+
+
+def test_excel_column_letters() -> None:
+    assert [m._letter(i) for i in (0, 1, 25, 26, 27, 51, 52)] == ["A", "B", "Z", "AA", "AB", "AZ", "BA"]
