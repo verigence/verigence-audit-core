@@ -1267,7 +1267,8 @@ def _batches(journey: P2Journey) -> list[dict]:
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         return [dict(r) for r in connection.execute(
-            text("SELECT batch_id, client_upload_id, original_filename FROM auditcore.p2_upload_batches "
+            text("SELECT batch_id, client_upload_id, original_filename, uploaded_by_actor_id "
+                 "FROM auditcore.p2_upload_batches "
                  "WHERE tenant_id=:t AND journey_id=:j"), {"t": journey.tenant_id, "j": journey.journey_id},
         ).mappings().all()]
 
@@ -1297,7 +1298,15 @@ def test_a_page_only_the_copy_holds_goes_to_the_earlier_journey_before_the_delet
     _same_pages(old, new, n=2)
     # The earlier journey's own receipt: as many documents on each, so the earlier one is kept.
     _page(old, sha=uuid4().hex, kind="dealer_receipt")
-    extra_queue = _page(new, sha=uuid4().hex, kind=kind)[1]
+    extra_batch, extra_queue, _doc = _page(new, sha=uuid4().hex, kind=kind)
+    # The earlier booking was made by another PC of the outlet (2026-11-24).
+    with old.engine.begin() as connection:
+        set_tenant_context(connection, old.tenant_id)
+        connection.execute(text("UPDATE auditcore.journeys SET created_by_actor_id='another-pc' "
+                                "WHERE tenant_id=:t AND journey_id=:j"), {"t": old.tenant_id, "j": old.journey_id})
+        uploader = connection.execute(text("SELECT uploaded_by_actor_id FROM auditcore.p2_upload_batches "
+                                           "WHERE tenant_id=:t AND batch_id=:b"),
+                                      {"t": new.tenant_id, "b": extra_batch}).scalar_one()
     _quiet(new)
     storage = CopyStorage()
     monkeypatch.setattr(uc03_p2_storage, "get_p2_document_storage", lambda: storage)
@@ -1308,6 +1317,9 @@ def test_a_page_only_the_copy_holds_goes_to_the_earlier_journey_before_the_delet
     assert not _exists(new) and _exists(old)
     [copied] = [b for b in _batches(old) if b["client_upload_id"] == f"dup-merge-{extra_queue}"]
     assert copied["original_filename"].startswith(f"{kind} from ")
+    # Under the person who put the page in, not the earlier booking's creator (product owner
+    # 2026-11-24: a Drive file joined to another PC's booking was missing from its PC's day).
+    assert uploader and copied["uploaded_by_actor_id"] == uploader != "another-pc"
     assert len(storage.put) == 1
     [alert] = _alerts(new)
     assert alert["outcome"] == "DELETED" and f"after its {kind.replace('_', ' ')} was added to" in alert["body"]

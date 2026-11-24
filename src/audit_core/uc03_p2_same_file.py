@@ -1514,8 +1514,12 @@ def carry_documents(engine: Engine, *, tenant_id: str, new_journey_id: UUID, exi
     copy = {"journey_id": new_journey_id, "journey_reference": new.reference}
     now = datetime.now(UTC)
     for unit in plan.units:
-        # Uploaded on the earlier journey by its PC; by whoever uploaded the page when it has none.
-        uploader = keep["created_by_actor_id"] or unit.get("uploaded_by_actor_id")
+        # Under the person who put the page in, not the earlier journey's creator (product owner
+        # 2026-11-24: Bodhisundar's Drive file of 23 Nov for Swagatika Rout, carried to a booking
+        # Radhakanta Das made in October, counted as Radhakanta's delivery and was missing from
+        # Bodhisundar's day; uc03_p2_upload_kind counts "under the person who uploaded"). The
+        # earlier journey's creator only when the page records no uploader.
+        uploader = unit.get("uploaded_by_actor_id") or keep["created_by_actor_id"]
         _copy_unit(engine, tenant_id, {**dict(keep), "created_by_actor_id": uploader}, copy, unit,
                    tag=f"same-file:{new_journey_id}", now=now)
     logger.info("p2_same_file_documents_carried", tenant_id=tenant_id, journey_id=str(new_journey_id),
