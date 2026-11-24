@@ -63,7 +63,7 @@ jobs:
           from audit_core import uc03_p2_dms_dumps as m
           with psycopg.connect(os.environ["DB"], options="-c statement_timeout=60000") as c:
               c.execute("SET TRANSACTION READ ONLY")
-              print("ALEMBIC", c.execute("SELECT version_num FROM auditcore.alembic_version").fetchall())
+              print("ALEMBIC", c.execute("SELECT version_num FROM public.alembic_version").fetchall() if c.execute("SELECT to_regclass(%s)", ("public.alembic_version",)).fetchone()[0] else "n/a")
               print("COLUMN", c.execute("""SELECT data_type, column_default FROM information_schema.columns WHERE table_schema='auditcore'
                   AND table_name='p2_dms_dumps' AND column_name='row_issues'""").fetchall())
               t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
