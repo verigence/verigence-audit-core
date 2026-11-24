@@ -548,3 +548,52 @@ def test_each_pc_against_the_dms_month_shared_locations_count_for_every_pc(setup
     assert rows[second]["bookingPending"] == 1 and rows[s.journey.actor_id]["deliveryPending"] == 1
     assert view["dms"]["month"] == month.strftime("%Y-%m")
     assert [p["actorId"] for p in own["dms"]["people"]] == [second] and own["dms"]["people"][0]["bookingDms"] == 2
+
+
+def test_a_refused_sheet_is_not_taken_and_a_taken_one_keeps_its_rows_to_correct(setup) -> None:
+    """24 Nov 2026: Utkal's delivery sheet with its LOCATION column headed "Delivery Date" was taken
+    with no date and no outlet on any row. It is refused now; a good sheet is taken and lists the
+    rows to correct."""
+    from openpyxl import Workbook
+
+    s = setup
+    today = _today()
+    on_day = datetime.combine(today, datetime.min.time())
+
+    def upload(headers: list[str], rows: list[list]) -> object:
+        book = Workbook()
+        sheet = book.active
+        sheet.append(headers)
+        for row in rows:
+            sheet.append(row)
+        out = io.BytesIO()
+        book.save(out)
+        s.acting["subject"] = s.reviewer
+        return s.client.post(f"{s.base}/dms-dumps", data={"dealerId": str(s.journey.dealer_id)},
+                             files={"file": ("delivery.xlsx", out.getvalue(),
+                                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+
+    refused = upload(["Timestamp", "Delivery Date", "CUSTOMER NAME", "CONT NO", "BOOKING DATE", "MODEL", "CHASSIS NO",
+                      "Delivery Date"], [[on_day, "CDA", "Asha Das", 9437033732, on_day, "XUV 3XO", "T2K55617", on_day]])
+    assert refused.status_code == 422
+    assert "Two columns are headed 'Delivery Date' (columns B and H)" in refused.json()["detail"]
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        assert connection.execute(text("SELECT count(*) FROM auditcore.p2_dms_dumps WHERE tenant_id = :t"),
+                                  {"t": s.journey.tenant_id}).scalar_one() == 0
+
+    later = datetime.combine(date(today.year + 1, 1, 2), datetime.min.time())
+    made = upload(["Timestamp", "Location", "CUSTOMER NAME", "CONT NO", "BOOKING DATE", "MODEL", "CHASSIS NO",
+                   "DELIVERY DATE"],
+                  [[on_day, "CDA", "Asha Das", 9437033732, "7/20/0025", "XUV 3XO", "T2K55617", on_day],
+                   [on_day, "CDA", "Ravi Sahu", 9437033733, on_day, "XUV 3XO", "T2K55618", later]])
+    assert made.status_code == 201, made.text
+    body = made.json()
+    assert body["sheetIssues"] == 2
+    assert [(i["sheetRow"], i["customer"], i["issue"]) for i in body["sheetIssueRows"]] == [
+        (2, "Asha Das", "is not a date"),
+        (3, "Ravi Sahu", f"is after the dump's date {today:%d %b %Y}"),
+    ]
+    listed = s.client.get(f"{s.base}/dms-dumps").json()["items"]
+    assert [d["sheetIssues"] for d in listed] == [2]
+    assert s.client.get(f"{s.base}/dms-dumps/{body['dumpId']}").json()["sheetIssueRows"] == body["sheetIssueRows"]
