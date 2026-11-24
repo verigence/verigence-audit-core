@@ -327,8 +327,10 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
     # recurring Daily Gate Pass task (product owner 2026-11-23: "duty days missed are not being
     # populated" -- the Tracker still read only the recurring tasks, stopped on 19 Nov). Each duty
     # item is an outlet's, on the day it was due; it counts for every PC mapped to the outlet (or to
-    # its dealership). Its state is the Daily duties board's (daily_duties._state_on): done that day,
-    # done late within its carry days, not done once the carry days are over, else pending.
+    # its dealership). Its state: done that day, done late, not done once its day is over (product
+    # owner 2026-11-24: "duty days missed is for sure wrong" -- it waited for the carry days to end,
+    # so nothing could be missed for a week), else pending; "not received" from the dealership is
+    # not a miss.
     by_outlet_pcs: dict[str, set[str]] = defaultdict(set)
     by_dealer_pcs: dict[str, set[str]] = defaultdict(set)
     for actor, person in people.items():
@@ -343,7 +345,10 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
                i.duty_date AS day,
                CASE WHEN i.status = 'DONE' AND i.done_on <= i.duty_date THEN 'onTime'
                     WHEN i.status = 'DONE' THEN 'late'
-                    WHEN i.duty_date + i.carry_days < :today THEN 'notDone'
+                    WHEN EXISTS (SELECT 1 FROM auditcore.p2_duty_reasons r
+                                 WHERE r.tenant_id = i.tenant_id AND r.item_id = i.item_id
+                                   AND r.category = 'NOT_RECEIVED') THEN 'pending'
+                    WHEN i.duty_date < :today THEN 'notDone'
                     ELSE 'pending' END AS state,
                count(*) AS n
         FROM auditcore.p2_duty_items i
