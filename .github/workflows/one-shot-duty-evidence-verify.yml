@@ -114,7 +114,11 @@ jobs:
           def walk(v, path=""):
               if isinstance(v, dict):
                   for k, x in v.items():
-                      if k == "dutiesMissed" and isinstance(x, (int, float)):
+                      if k in ("notDone", "due") and isinstance(x, (int, float)):
+                          found.append((path + "/" + k, x))
+                      elif k == "missedDates" and isinstance(x, list):
+                          found.append((path + "/missedDays", len(x)))
+                      if False:
                           found.append((path, x))
                       walk(x, path + "/" + k)
               elif isinstance(v, list):
@@ -125,5 +129,5 @@ jobs:
           for path, x in found:
               by.setdefault(path, []).append(x)
           for path, xs in by.items():
-              print("DUTIES_MISSED", path, "rows", len(xs), "sum", sum(xs), "nonzero", sum(1 for x in xs if x))
+              print("DUTIES_MISSED", path.replace("[]", ""), "rows", len(xs), "sum", sum(xs), "nonzero", sum(1 for x in xs if x))
           PY
