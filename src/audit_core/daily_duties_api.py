@@ -225,6 +225,17 @@ def duties_team(tenant_id: str, principal: Principal, client: Client, connection
     return _run(lambda: team_view(connection, tenant_id=tenant_id, caller=caller, start=start, end=end))
 
 
+@router.get("/evidence")
+def duties_evidence(tenant_id: str, principal: Principal, client: Client, connection: Db, start: From = None,
+                    end: To = None) -> dict[str, Any]:
+    """Each PC, day by day: gate register, cash register, bank statements and photos
+    (product owner 2026-11-24)."""
+    from audit_core.daily_duty_evidence import evidence_view
+
+    caller = _project_caller(connection, tenant_id=tenant_id, principal=principal, client=client)
+    return _run(lambda: evidence_view(connection, tenant_id=tenant_id, caller=caller, start=start, end=end))
+
+
 @router.get("/settings")
 def duties_settings(tenant_id: str, principal: Principal, client: Client, connection: Db) -> dict[str, Any]:
     caller = _project_caller(connection, tenant_id=tenant_id, principal=principal, client=client)
@@ -276,6 +287,14 @@ Admin = Annotated[HumanAdminRequest, Depends(require_super_admin_request)]
 def admin_team(tenant_id: str, admin: Admin, connection: Db, start: From = None, end: To = None) -> dict[str, Any]:
     caller = _admin_caller(connection, tenant_id=tenant_id, admin=admin)
     return _run(lambda: team_view(connection, tenant_id=tenant_id, caller=caller, start=start, end=end))
+
+
+@admin_router.get("/evidence")
+def admin_evidence(tenant_id: str, admin: Admin, connection: Db, start: From = None, end: To = None) -> dict[str, Any]:
+    from audit_core.daily_duty_evidence import evidence_view
+
+    caller = _admin_caller(connection, tenant_id=tenant_id, admin=admin)
+    return _run(lambda: evidence_view(connection, tenant_id=tenant_id, caller=caller, start=start, end=end))
 
 
 @admin_router.get("/settings")

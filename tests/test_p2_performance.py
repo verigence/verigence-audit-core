@@ -698,6 +698,18 @@ def test_duty_days_missed_come_from_the_daily_duties(setup):
     item(old_day, carry=1)                         # never done, carry days over: missed
     item(late_day, carry=5, done_on=today)         # done two days late
     item(today, carry=5, done_on=today)            # done the same day
+    # Not done yesterday, still inside its carry days: missed all the same (product owner
+    # 2026-11-24: "duty days missed is for sure wrong" -- it waited for the carry days to end).
+    yesterday = today - timedelta(days=1)
+    item(yesterday, carry=5)
+    # Not received from the dealership: not a miss.
+    received_day = today - timedelta(days=3)
+    item(received_day, carry=5)
+    tt._exec(s, """
+        INSERT INTO auditcore.p2_duty_reasons (tenant_id, item_id, on_date, actor_id, category, side)
+        SELECT tenant_id, item_id, duty_date, 'pc', 'NOT_RECEIVED', 'DEALERSHIP' FROM auditcore.p2_duty_items
+        WHERE tenant_id = :t AND duty_id = :duty AND duty_date = :day
+    """, duty=duty, day=received_day)
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
         data = perf._aggregate(connection, tenant_id=s.journey.tenant_id, first=old_day, last=today,
@@ -706,6 +718,8 @@ def test_duty_days_missed_come_from_the_daily_duties(setup):
     assert mine[old_day.isoformat()]["notDone"] == 1
     assert mine[late_day.isoformat()]["late"] == 1
     assert mine[today.isoformat()]["onTime"] == 1
+    assert mine[yesterday.isoformat()]["notDone"] == 1
+    assert mine[received_day.isoformat()]["notDone"] == 0
     assert data["outlet_duties"][str(s.journey.outlet_id)][duty][old_day.isoformat()]["notDone"] == 1
     assert any(x["scheduleId"] == duty and x["title"] == "Cash ledger" for x in data["schedules"])
 
@@ -714,7 +728,7 @@ def test_duty_days_missed_come_from_the_daily_duties(setup):
     report = _build(s, tl, section="dashboard")
     pcs = next(c for c in report["dashboard"]["scorecards"] if c["key"] == "pcs")
     row = next(r for r in pcs["rows"] if r["id"] == me)
-    assert row["values"]["dutiesMissed"] == 1
+    assert row["values"]["dutiesMissed"] == 2  # the old day and yesterday
 
 
 def test_a_drive_file_joined_to_another_pcs_booking_counts_for_its_pc_as_drive(setup):
