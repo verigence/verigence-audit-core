@@ -25,6 +25,7 @@ on:
     paths:
       - '.github/workflows/drive-files-diagnose.yml'
       - 'tools/drive_files_diagnose.py'
+      - 'tools/carried_uploader_dryrun.py'
 
 permissions:
   contents: read
@@ -82,5 +83,7 @@ jobs:
                   print(f"::add-mask::{v[key]}")
                   env.write(f"{key}={v[key]}\n")
           PY
+      - name: Dry run 0259
+        run: python tools/carried_uploader_dryrun.py
       - name: Diagnose
         run: python tools/drive_files_diagnose.py --name "$PC_NAME" --since "$SINCE" --until "$UNTIL" --outlet "$OUTLET"
