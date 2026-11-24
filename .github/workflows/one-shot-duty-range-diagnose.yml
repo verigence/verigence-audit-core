@@ -1,0 +1,99 @@
+name: One-shot Duty range diagnose (read-only)
+
+# Read-only: the figures behind the Tracker's "Who is doing what" PCs table and the
+# daily duties (duty days missed, cash register, bank statement, photos). Counts only,
+# people as short hashes: this repository is public. Never writes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/duty-range-diagnose]
+    paths:
+      - '.github/workflows/one-shot-duty-range-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install -e . 'psycopg[binary]>=3.2,<4'
+          npm install --global @railway/cli@5.70.0
+      - name: Reach the live database
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/vars.json
+          url="$(python - <<'PY'
+          import json
+          from urllib.parse import urlparse
+          v = json.load(open('/tmp/vars.json'))
+          for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
+              value = (v.get(key) or '').replace('postgresql+psycopg://', 'postgresql://', 1)
+              host = (urlparse(value).hostname or '').lower()
+              if value and host and not host.endswith('.railway.internal'):
+                  print(value)
+                  break
+          PY
+          )"
+          test -n "$url"
+          echo "::add-mask::$url"
+          echo "DB=$url" >> "$GITHUB_ENV"
+      - name: Gate register and cash ledger sources, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, os
+          from sqlalchemy import create_engine
+          from audit_core.db import set_tenant_context
+          T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
+          h = lambda s: hashlib.sha256(str(s).encode()).hexdigest()[:8]
+          e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
+          with e.connect() as c:
+              c.exec_driver_sql("SET TRANSACTION READ ONLY")
+              set_tenant_context(c, T)
+              rows = lambda sql: c.exec_driver_sql(sql, {"t": T}).mappings().all()
+              for r in rows("SELECT enabled, enabled_from, working_weekdays, default_carry_days FROM auditcore.p2_duty_settings WHERE tenant_id=%(t)s"):
+                  print("SETTINGS", dict(r))
+              for r in rows("SELECT standard_code, status, weekdays, day_offset, effective_from, outlet_scope FROM auditcore.p2_duties WHERE tenant_id=%(t)s ORDER BY sort_order"):
+                  print("DUTY", dict(r))
+              print("GATEPASS by business_date (all outlets): date | registers | counts entered | uploaded later than next day")
+              for r in rows("""SELECT business_date d, count(*) n, count(completed_at_utc) done,
+                     count(*) FILTER (WHERE (created_at_utc AT TIME ZONE 'Asia/Kolkata')::date > business_date + 1) late
+                     FROM auditcore.p2_gate_passes WHERE tenant_id=%(t)s AND status='ACTIVE'
+                     AND business_date BETWEEN '2026-11-01' AND '2026-11-24' GROUP BY 1 ORDER BY 1"""):
+                  print("  GP", r["d"], r["n"], r["done"], r["late"])
+              print("GATE duty items: duty_date | for_date | n | done")
+              for r in rows("""SELECT i.duty_date, i.for_date, count(*) n, count(*) FILTER (WHERE i.status='DONE') done
+                     FROM auditcore.p2_duty_items i JOIN auditcore.p2_duties d ON d.tenant_id=i.tenant_id AND d.duty_id=i.duty_id
+                     WHERE i.tenant_id=%(t)s AND d.standard_code='GATE_REGISTER' AND i.status<>'CANCELLED' GROUP BY 1,2 ORDER BY 1,2"""):
+                  print("  GI", r["duty_date"], r["for_date"], r["n"], r["done"])
+              print("CASH duty items: duty_date | for_date | n | done | with amount")
+              for r in rows("""SELECT i.duty_date, i.for_date, count(*) n, count(*) FILTER (WHERE i.status='DONE') done,
+                     count(*) FILTER (WHERE i.input_values ? 'amount') amt
+                     FROM auditcore.p2_duty_items i JOIN auditcore.p2_duties d ON d.tenant_id=i.tenant_id AND d.duty_id=i.duty_id
+                     WHERE i.tenant_id=%(t)s AND d.standard_code='CASH_LEDGER' AND i.status<>'CANCELLED' GROUP BY 1,2 ORDER BY 1,2"""):
+                  print("  CI", r["duty_date"], r["for_date"], r["n"], r["done"], r["amt"])
+              print("Per outlet 1-23 Nov: outlet | gate registers uploaded | with counts | gate duty items (by duty_date) | done")
+              for r in rows("""WITH g AS (SELECT outlet_id, count(*) n, count(completed_at_utc) done FROM auditcore.p2_gate_passes
+                       WHERE tenant_id=%(t)s AND status='ACTIVE' AND business_date BETWEEN '2026-11-01' AND '2026-11-23' GROUP BY 1),
+                     i AS (SELECT i.outlet_id, count(*) n, count(*) FILTER (WHERE i.status='DONE') done FROM auditcore.p2_duty_items i
+                       JOIN auditcore.p2_duties d ON d.tenant_id=i.tenant_id AND d.duty_id=i.duty_id
+                       WHERE i.tenant_id=%(t)s AND d.standard_code='GATE_REGISTER' AND i.status<>'CANCELLED'
+                       AND i.duty_date BETWEEN '2026-11-01' AND '2026-11-24' GROUP BY 1)
+                     SELECT COALESCE(g.outlet_id,i.outlet_id) o, g.n gn, g.done gd, i.n inn, i.done idn FROM g FULL JOIN i ON i.outlet_id=g.outlet_id ORDER BY 2 DESC NULLS LAST"""):
+                  print("  OUT", h(r["o"]), r["gn"], r["gd"], r["inn"], r["idn"])
+              c.rollback()
+          PY
