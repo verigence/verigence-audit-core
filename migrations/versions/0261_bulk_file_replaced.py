@@ -1,4 +1,4 @@
-"""0260_bulk_file_replaced -- a bulk file uploaded again is REPLACED, not FAILED (2026-11-24).
+"""0261_bulk_file_replaced -- a bulk file uploaded again is REPLACED, not FAILED (2026-11-24).
 
 Product owner, 24 Nov 2026: radhabpd98 (Aditya Motors - Cuttack) submitted a bulk upload of 37
 files; 14 showed "Failed -- Not uploaded before submit". None was lost: the browser's first put
@@ -16,8 +16,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0260_bulk_file_replaced"
-down_revision = "0259_carried_pages_keep_uploader"
+revision = "0261_bulk_file_replaced"
+down_revision = "0260_file_tasks_to_uploader"
 branch_labels = None
 depends_on = None
 
