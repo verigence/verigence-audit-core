@@ -415,3 +415,113 @@ def test_a_join_finished_before_a_restart_is_recorded_on_the_booking_not_the_del
     [file] = _files(s, bulk_id)
     assert file["outcome"] == "ADDED_TO_BOOKING" and file["placed_journey_id"] == s.journey.journey_id
     assert file["placed_reference"] == ref
+
+
+# --------------------------------------------------------------------------- 24 Nov 2026: retries
+# radhabpd98's drop of 37 files: 14 first puts broke off, each retry was added as a "(2)" copy
+# and read, and the 14 first records were failed at submit ("Not uploaded before submit").
+
+
+def _open(s) -> str:
+    created = s.client.post(s.base, json={"outletId": str(s.journey.outlet_id)})
+    assert created.status_code == 201, created.text
+    return created.json()["bulkId"]
+
+
+def _add(s, bulk_id: str, files: dict[str, int]) -> list[dict]:
+    added = s.client.post(f"{s.base}/{bulk_id}/files", json={"files": [
+        {"filename": name, "contentType": "application/pdf", "sizeBytes": size} for name, size in files.items()]})
+    assert added.status_code == 200, added.text
+    return added.json()["files"]
+
+
+def _put(s, bulk_id: str, item: dict, data: bytes, *, complete: bool = True) -> None:
+    s.bucket.objects[item["objectKey"]] = data
+    if complete:
+        done = s.client.post(f"{s.base}/{bulk_id}/files/{item['fileId']}/complete")
+        assert done.status_code == 200, done.text
+
+
+def test_a_file_picked_again_reuses_its_own_record_not_a_numbered_copy(s):
+    bulk_id = _open(s)
+    [first, other] = _add(s, bulk_id, {"Abit Khan.pdf": 13, "Babul Khan.pdf": 14})
+    assert first["alreadyUploaded"] is False and first["uploadUrl"]
+    _put(s, bulk_id, other, b"%PDF babul 014")  # the put of Abit Khan broke off
+    # The PC retries (or reloads the page and picks both files again).
+    [again, babul] = _add(s, bulk_id, {"Abit Khan.pdf": 13, "Babul Khan.pdf": 14})
+    assert (again["fileId"], again["filename"], again["objectKey"]) == (
+        first["fileId"], "Abit Khan.pdf", first["objectKey"])
+    assert again["alreadyUploaded"] is False and again["uploadUrl"]
+    assert babul["fileId"] == other["fileId"] and babul["alreadyUploaded"] is True and babul["uploadUrl"] is None
+    _put(s, bulk_id, again, b"%PDF abit 013")
+    assert s.client.post(f"{s.base}/{bulk_id}/submit").status_code == 200
+    rows = _files(s, bulk_id)
+    assert sorted(r["original_filename"] for r in rows) == ["Abit Khan.pdf", "Babul Khan.pdf"]
+    assert {r["upload_status"] for r in rows} == {"UPLOADED"} and {r["outcome"] for r in rows} == {"PENDING"}
+
+
+def test_a_different_file_of_the_same_name_still_gets_a_numbered_name(s):
+    bulk_id = _open(s)
+    [a] = _add(s, bulk_id, {"Asha Das.pdf": 10})
+    [b] = _add(s, bulk_id, {"Asha Das.pdf": 11})  # not the same size: not the same file
+    assert b["fileId"] != a["fileId"] and b["filename"] == "Asha Das (2).pdf"
+
+
+def test_a_file_in_storage_whose_uploaded_call_was_lost_is_taken_at_submit(s):
+    bulk_id = _open(s)
+    [a, b] = _add(s, bulk_id, {"Asha Das KYC.pdf": 10, "Ravi Sahu.pdf": 11})
+    _put(s, bulk_id, a, b"%PDF asha!")
+    _put(s, bulk_id, b, b"%PDF ravi!!", complete=False)  # put done, the connection then dropped
+    submitted = s.client.post(f"{s.base}/{bulk_id}/submit")
+    assert submitted.status_code == 200, submitted.text
+    assert submitted.json()["fileCount"] == 2
+    assert {r["original_filename"]: (r["upload_status"], r["outcome"]) for r in _files(s, bulk_id)} == {
+        "Asha Das KYC.pdf": ("UPLOADED", "PENDING"), "Ravi Sahu.pdf": ("UPLOADED", "PENDING")}
+
+
+def test_a_file_still_waiting_but_uploaded_again_is_replaced_not_failed(s):
+    from audit_core.uc03_p2_notifications import upload_status
+
+    bulk_id = _open(s)
+    # Two records of one file (as the retries of 24 Nov left them): only the copy reached storage.
+    [first, usman] = _add(s, bulk_id, {"Abit Khan.pdf": 13, "Usman Khan.pdf": 20})
+    with s.journey.engine.begin() as c:
+        set_tenant_context(c, s.journey.tenant_id)
+        copy_id = c.execute(text(
+            "INSERT INTO auditcore.p2_bulk_files (tenant_id, bulk_id, original_filename, content_type, size_bytes, "
+            "object_key) VALUES (:t, :b, 'Abit Khan (2).pdf', 'application/pdf', 13, :k) RETURNING file_id"),
+            {"t": s.journey.tenant_id, "b": bulk_id, "k": first["objectKey"].replace(".pdf", " (2).pdf")}).scalar_one()
+    s.bucket.objects[first["objectKey"].replace(".pdf", " (2).pdf")] = b"%PDF abit 013"
+    assert s.client.post(f"{s.base}/{bulk_id}/files/{copy_id}/complete").status_code == 200
+    # Usman Khan never reached storage, in any form.
+    submitted = s.client.post(f"{s.base}/{bulk_id}/submit")
+    assert submitted.status_code == 200, submitted.text
+    rows = {r["original_filename"]: r for r in _files(s, bulk_id)}
+    assert (rows["Abit Khan.pdf"]["outcome"], rows["Abit Khan.pdf"]["detail"]) == (
+        "REPLACED", "Uploaded again as Abit Khan (2).pdf")
+    assert (rows["Usman Khan.pdf"]["outcome"], rows["Usman Khan.pdf"]["detail"]) == (
+        "FAILED", "Not uploaded before submit")
+    assert rows["Abit Khan (2).pdf"]["outcome"] == "PENDING"
+    # The PC sees the copy and the real failure, not the replaced record; and is notified of the
+    # real failure only.
+    listed = {f["filename"]: f["outcome"] for f in s.client.get(s.base).json()["items"][0]["files"]}
+    assert listed == {"Abit Khan (2).pdf": "PENDING", "Usman Khan.pdf": "FAILED"}
+    assert usman["filename"] == "Usman Khan.pdf"
+    with s.journey.engine.begin() as c:
+        set_tenant_context(c, s.journey.tenant_id)
+        status = upload_status(c, tenant_id=s.journey.tenant_id, actor_id=str(s.journey.actor_id))
+    assert [i.name for i in status.items if i.source == "BULK"] == ["Usman Khan.pdf"]
+    # The replaced record does not hold the drop open, and is not counted in its summary.
+    with s.journey.engine.begin() as c:
+        set_tenant_context(c, s.journey.tenant_id)
+        c.execute(text("UPDATE auditcore.p2_bulk_files SET outcome='NEW_BOOKING' WHERE tenant_id=:t AND bulk_id=:b "
+                       "AND outcome='PENDING'"), {"t": s.journey.tenant_id, "b": bulk_id})
+    assert bulk_upload._finish_if_settled(s.journey.engine, s.journey.tenant_id, UUID(bulk_id)) is True
+    drop = s.client.get(s.base).json()["items"][0]
+    assert drop["status"] == "DONE" and drop["summary"] == {"NEW_BOOKING": 1, "FAILED": 1}
+
+
+def test_unnumbered_matches_the_names_numbered_gives():
+    for name in ("Abit Khan.pdf", "Anjana Mishra Booking .pdf", "Usman Khan,Doc.pdf", "scan", "a.b.pdf"):
+        assert bulk_upload.unnumbered(bulk_upload.numbered(name, 2)) == name
+        assert bulk_upload.unnumbered(name) == name
