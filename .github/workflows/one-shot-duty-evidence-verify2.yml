@@ -1,0 +1,96 @@
+name: One-shot Duty evidence verify 2 (read-only)
+
+# Read-only: the "What each PC did" duty evidence and the duty days missed, as built, on the
+# live data. Counts only, people as short hashes: this repository is public. Never writes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/duty-evidence-verify2]
+    paths:
+      - '.github/workflows/one-shot-duty-evidence-verify2.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install -e . 'psycopg[binary]>=3.2,<4'
+          npm install --global @railway/cli@5.70.0
+      - name: Reach the live database
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/vars.json
+          url="$(python - <<'PY'
+          import json
+          from urllib.parse import urlparse
+          v = json.load(open('/tmp/vars.json'))
+          for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
+              value = (v.get(key) or '').replace('postgresql+psycopg://', 'postgresql://', 1)
+              host = (urlparse(value).hostname or '').lower()
+              if value and host and not host.endswith('.railway.internal'):
+                  print(value)
+                  break
+          PY
+          )"
+          test -n "$url"
+          echo "::add-mask::$url"
+          echo "DB=$url" >> "$GITHUB_ENV"
+      - name: The evidence view as built, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, os
+          from datetime import date, timedelta
+          from sqlalchemy import create_engine
+          from audit_core.db import set_tenant_context
+          from audit_core.daily_duty_evidence import evidence_view
+          from audit_core.task_manager import Caller
+          T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
+          h = lambda s: hashlib.sha256(str(s).encode()).hexdigest()[:8]
+          e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
+          with e.connect() as c:
+              c.exec_driver_sql("SET TRANSACTION READ ONLY")
+              set_tenant_context(c, T)
+              end = date(2026, 11, 24)
+              r = evidence_view(c, tenant_id=T, caller=Caller(actor_id="verify", role="PM"), start=date(2026, 11, 1), end=end)
+              c.rollback()
+          print("RANGE", r["from"], r["to"], "PCS", len(r["pcs"]), "CASH_FROM", r["cashFrom"])
+          tot = {"gateDone": 0, "gateNotDone": 0, "cashDone": 0, "cashNotRecv": 0, "cashNotDone": 0, "statements": 0, "drive": 0, "camera": 0, "unread": 0}
+          for p in r["pcs"]:
+              s = p["summary"]
+              g, k, ph = s["gate"], s["cash"], s["photos"]
+              print("PC", h(p["actorId"]), "outlets", len(p["outlets"]), "| gate days", g["days"], "done", g["done"], "late", g["late"], "noCounts", g["noCounts"], "notDone", g["notDone"], "pending", g["pending"],
+                    "| cash days", k["days"], "done", k["done"], "notRecv", k["notReceived"], "notDone", k["notDone"], "txns", k["transactions"],
+                    "| stmts", s["statements"], "| photos", ph["drive"], ph["camera"], ph["unread"], "| days", len(p["days"]))
+              tot["gateDone"] += g["done"]; tot["gateNotDone"] += g["notDone"]; tot["cashDone"] += k["done"]
+              tot["cashNotRecv"] += k["notReceived"]; tot["cashNotDone"] += k["notDone"]; tot["statements"] += s["statements"]
+              tot["drive"] += ph["drive"]; tot["camera"] += ph["camera"]; tot["unread"] += ph["unread"]
+              dsum = sum(d["photos"]["drive"] + d["photos"]["camera"] + d["photos"]["unread"] for d in p["days"])
+              assert dsum == ph["drive"] + ph["camera"] + ph["unread"], "day photos do not add up"
+              assert sum(d["statements"] for d in p["days"]) == s["statements"], "day statements do not add up"
+          print("TOTALS", tot)
+          # Cross-check against the raw tables for the same IST window.
+          with e.connect() as c:
+              c.exec_driver_sql("SET TRANSACTION READ ONLY")
+              set_tenant_context(c, T)
+              q = lambda sql: c.exec_driver_sql(sql, (T,)).scalar()
+              w = "BETWEEN (DATE '2026-11-01' - INTERVAL '5 hours 30 minutes') AND (DATE '2026-11-25' - INTERVAL '5 hours 30 minutes')"
+              print("RAW statements", q(f"SELECT count(*) FROM auditcore.p2_bank_statements WHERE tenant_id=%s AND uploaded_at_utc {w}"))
+              print("RAW duty items", q("SELECT count(*) FROM auditcore.p2_duty_items i JOIN auditcore.p2_duties d ON d.duty_id=i.duty_id WHERE d.tenant_id=%s AND d.standard_code IN ('GATE_REGISTER','CASH_LEDGER') AND i.for_date BETWEEN DATE '2026-11-01' AND DATE '2026-11-24' AND d.standard_code='CASH_LEDGER'"))
+              c.rollback()
+          PY
