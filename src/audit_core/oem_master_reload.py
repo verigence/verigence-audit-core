@@ -1569,15 +1569,24 @@ def _job_starts(tag: str) -> date | None:
 
 
 def reprice_deals(engine: Engine, *, tenant_id: str, start: date, tag: str) -> dict[str, Any]:
-    """Run the deal check again for every Journey priced on or after ``start``.
-    Returns counts and the Journeys whose discount entitlements changed."""
-    from audit_core.uc03_deal_reconciliation import sync_deal_reconciliation
+    """Ask for every Journey priced on or after ``start`` to be checked again,
+    through the work queue (a forced CONTROL_EVALUATE per booking, as
+    RULES_RERUN asks). Returns how many were asked for.
 
-    def entitlements(connection: Connection, journey_id: UUID) -> dict[str, tuple[str, str]]:
-        return {str(k): (str(a), str(r)) for k, a, r in connection.execute(text(
-            "SELECT discount_key, standard_eligible_amount, eligibility_result FROM auditcore.discount_applications "
-            "WHERE tenant_id = :t AND journey_id = :j"), {"t": tenant_id, "j": journey_id}).all()}
+    Until 24 Nov 2026 the deal check ran here, one Journey after another inside
+    the job. On the live Project that took close to two hours for 2,123
+    bookings, and a worker restart (any deploy) ended it part way: 5 Nov, and
+    twice on 23 Nov, the masters were committed and the bookings were not all
+    checked again. Work in the queue survives a restart and runs on every
+    lane. It also runs the booking's rules, so a discount now above the new
+    entitlement gets its task; the loop here ran only the deal check, and the
+    task waited for the booking's next change. Each booking whose standards
+    change is logged where they are written (``deal_standards_changed``,
+    uc03_deal_reconciliation), which also marks its Excess discount rows to be
+    built again."""
+    from audit_core.uc03_audit_task_cleanup import _rerun_native
 
+    label = f"masters:{(tag or '').partition(':')[2] or tag}"[:90]
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
         journeys = connection.execute(text(
@@ -1588,30 +1597,21 @@ def reprice_deals(engine: Engine, *, tenant_id: str, start: date, tag: str) -> d
             ORDER BY j.created_at_utc, j.journey_id
             """
         ), {"t": tenant_id, "start": start}).all()
-    changed: list[dict[str, Any]] = []
+    queued = units = 0
     failed: list[str] = []
     for journey_id, reference in journeys:
         try:
             with engine.begin() as connection:
                 set_tenant_context(connection, tenant_id)
-                before = entitlements(connection, journey_id)
-                result = sync_deal_reconciliation(connection, tenant_id=tenant_id, journey_id=journey_id,
-                                                  correlation_id=f"masters:{tag}"[:120])
-                after = entitlements(connection, journey_id)
-            if result.get("error"):
-                failed.append(str(reference))
-            elif before != after:
-                changed.append({"journey": reference, "before": before, "after": after})
-                logger.info("oem_master_reprice_changed", tenant_id=tenant_id, tag=tag, journey=reference,
-                            before=str(before), after=str(after))
+                units += len(_rerun_native(connection, tenant_id, journey_id, label))
+                queued += 1
         except Exception:  # one Journey never stops the others
             failed.append(str(reference))
             logger.warning("oem_master_reprice_failed", tenant_id=tenant_id, tag=tag, journey=reference,
                            exc_info=True)
-    summary = {"from": str(start), "journeys": len(journeys), "entitlementsChanged": len(changed),
-               "failed": failed, "changed": changed[:200]}
-    logger.info("oem_master_reprice_finished", tenant_id=tenant_id, tag=tag, journeys=len(journeys),
-                changed=len(changed), failed=len(failed))
+    summary = {"from": str(start), "journeys": len(journeys), "queued": queued, "units": units, "failed": failed}
+    logger.info("oem_master_reprice_queued", tenant_id=tenant_id, tag=tag, journeys=len(journeys),
+                queued=queued, units=units, failed=len(failed))
     return summary
 
 
@@ -1620,9 +1620,9 @@ REPRICE_FROM = date(2026, 9, 3)
 
 def _run_reprice_only(engine: Engine, tag: str, *, commit: bool,
                       tenant_ids: list[str] | None) -> list[dict[str, Any]]:
-    """Run the deal check again on the masters already loaded, nothing else.
-    For a reload whose reprice was cut short (a worker restart mid-way): the
-    masters committed, the Journeys were not all checked again. The deal check
+    """Ask for the deal check again on the masters already loaded, nothing else
+    (``reprice_deals``: through the work queue). For a reload whose masters
+    committed and whose Journeys were not all checked again. The deal check
     is idempotent, so running it twice on a Journey changes nothing.
     A dry run only counts the Journeys."""
     results: list[dict[str, Any]] = []
