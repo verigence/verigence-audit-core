@@ -154,6 +154,9 @@ def _delivery_scope_rows(connection: Connection, tenant_id: str, dealers: list[d
 
 
 _BASIS_WORDS = {"BOOKING_NUMBER": "Booking number / OTF", "CHASSIS": "Chassis", "MOBILE": "Mobile",
+                # A booking matched on two things agreeing (2026-11-24).
+                "NEAR_BOOKING_NUMBER": "OTF a digit or two off + name", "MOBILE_NAME": "Mobile + name",
+                "MOBILE_DATE": "Mobile + booking date",
                 "ENQUIRY_NUMBER": "Enquiry number",
                 "NAME_DATE": "Name + booking date", "NAME_MODEL": "Name + model",
                 "NAME_NEAR_ID": "Name + mobile / booking no. a digit or two off"}

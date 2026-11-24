@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import io
 import json
-from datetime import date
+from datetime import date, timedelta
 from uuid import uuid4
 
 from openpyxl import load_workbook
@@ -120,11 +120,13 @@ def test_the_dms_date_wins_over_a_hand_correction_and_keeps_it_in_the_log(setup)
 
 def test_a_mobile_or_name_match_changes_no_date(setup) -> None:  # noqa: F811
     s = setup
-    form = _document(s, "booking_form", booking_date="2020-11-07", customer_phone="9000000077")
-    dump_id = _dump(s, dumps.BOOKING, [{"booking_number": "B-99999999", "name": "X", "mobile": "9000000077",
-                                       "model": "THAR"}])
+    # A booking matched on the mobile and the name (2026-11-24: never the mobile alone).
+    form = _document(s, "booking_form", booking_date="2020-11-07", customer_phone="9000000077",
+                     customer_name="ASHA KUMARI DAS")
+    dump_id = _dump(s, dumps.BOOKING, [{"booking_number": "B-99999999", "name": "Asha Kumari Das",
+                                       "mobile": "9000000077", "model": "THAR"}])
     row = _row(s, dump_id)
-    assert row["match_basis"] == "MOBILE"
+    assert row["match_basis"] == "MOBILE_NAME"
     assert row["date_sync"] is None and row["model_differs"] is None
     assert _value(s, form, "booking_date") == "2020-11-07"
     assert not [e for e in _log(s) if e["change_reason"] == "DMS_SYNC"]
@@ -240,3 +242,140 @@ def test_an_older_dump_does_not_write_over_the_date_a_newer_dump_gives(setup) ->
     assert _value(s, gate, "delivery_date") == newer_date
     assert _row(s, older)["date_sync"]["status"] == "NEWER_DUMP"
     assert [e["new_value"] for e in _log(s) if e["field_key"] == "delivery_date"][-1] == newer_date
+
+
+# --------------------------------------------------------------------------- 24 Nov 2026: a digit off
+
+def _dump_rows(s, rows: list[dict]) -> str:
+    """A booking dump of today with rows dated ``back`` days ago, a stage per row; matched."""
+    dump_id = str(uuid4())
+    today = _today()
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        connection.execute(text("""
+            INSERT INTO auditcore.p2_dms_dumps (tenant_id, dump_id, dump_kind, dealer_id, business_date, period_month,
+              file_name, file_format, row_count, uploaded_by)
+            VALUES (:t, :id, 'BOOKING', :d, :today, date_trunc('month', CAST(:today AS date))::date, 'f.xlsx', 'X', :n,
+                    'rv')"""), {"t": s.journey.tenant_id, "id": dump_id, "d": str(s.journey.dealer_id), "n": len(rows),
+                                "today": today})
+        for n, row in enumerate(rows, start=1):
+            connection.execute(text("""
+                INSERT INTO auditcore.p2_dms_dump_rows (tenant_id, dump_id, row_no, dump_kind, dealer_id, booking_number,
+                  dms_booking_number, customer_name, mobile, event_date, model, stage, raw)
+                VALUES (:t, :id, :n, 'BOOKING', :d, :b, :o, :c, :m, CAST(:today AS date) - CAST(:back AS integer),
+                        :model, :stage, '{}')"""),
+                {"t": s.journey.tenant_id, "id": dump_id, "n": n, "d": str(s.journey.dealer_id),
+                 "b": row.get("booking_number"), "o": row.get("otf"), "c": row.get("name"), "m": row.get("mobile"),
+                 "back": row.get("back", 0), "today": today, "model": row.get("model"), "stage": row.get("stage")})
+        dumps.match_dump(connection, tenant_id=s.journey.tenant_id, dump_id=dump_id)
+    return dump_id
+
+
+def _rows(s, dump_id: str) -> list[dict]:
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        return [dict(r) for r in connection.execute(text(
+            "SELECT row_no, outcome, match_basis, CAST(journey_id AS text) AS journey_id, date_sync "
+            "FROM auditcore.p2_dms_dump_rows WHERE tenant_id = :t AND dump_id = :d ORDER BY row_no"),
+            {"t": s.journey.tenant_id, "d": dump_id}).mappings()]
+
+
+def _reviewed(s, document: str, field_key: str) -> bool:
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        return connection.execute(text(
+            "SELECT bool_and(reviewed_at_utc IS NOT NULL) FROM auditcore.journey_document_extracted_fields "
+            "WHERE tenant_id = :t AND di_document_id = CAST(:d AS uuid) AND field_key = :f"),
+            {"t": s.journey.tenant_id, "d": document, "f": field_key}).scalar_one()
+
+
+def test_a_rebooking_is_left_over_and_the_cancelled_bookings_misread_otf_corrected(setup) -> None:  # noqa: F811
+    """N.Santosh Kumar Choudhury (Utkal, 24 Nov): his booking of 14 Nov (OTF27C053725, read on the
+    form as OTF2705372) was cancelled in the DMS and rebooked on 19 Nov (OTF27C054617); the rebooking
+    took the Journey on the mobile and stood synced, though no file was uploaded for it."""
+    s = setup
+    today = _today()
+    gap = min(5, today.day - 1)
+    if gap == 0:
+        import pytest
+        pytest.skip("needs two booking days in the month")
+    form = _document(s, "booking_form", booking_date=(today - timedelta(days=gap)).isoformat(),
+                     customer_phone="6371500265", customer_name="NARAYANSINTI SANTOSH KUMAR CHHOUDHURY",
+                     booking_reference_number="OTF2705372")
+    dump_id = _dump_rows(s, [
+        {"booking_number": "B-13536610", "otf": "OTF27C054617", "name": "N.Santosh Kumar Choudhury",
+         "mobile": "6371500265", "model": "XUV3XO"},
+        {"booking_number": "B-13512229", "otf": "OTF27C053725", "name": "NARAYANSINTI SONTOSH KUMAR CHOUDHARY",
+         "mobile": "6371500265", "model": "XUV3XO", "back": gap, "stage": "Cancelled"},
+    ])
+    rebooking, cancelled = _rows(s, dump_id)
+    assert (rebooking["outcome"], rebooking["journey_id"]) == ("MISSING", None)
+    assert (cancelled["outcome"], cancelled["match_basis"]) == ("MATCHED", "MOBILE_NAME")
+    # the form's OTF a digit or two off the cancelled booking's: corrected, the field reviewed
+    assert _value(s, form, "booking_reference_number") == "OTF27C053725"
+    assert _reviewed(s, form, "booking_reference_number")
+    assert [(e["field_key"], e["previous_value"], e["new_value"]) for e in _log(s) if e["change_reason"] == "DMS_SYNC"] \
+        == [("booking_reference_number", "OTF2705372", "OTF27C053725")]
+
+
+def test_a_booking_date_one_digit_off_is_corrected_two_digits_off_is_not(setup) -> None:  # noqa: F811
+    s = setup
+    today = _today()
+    misread = today.replace(year=today.year - 2)  # 2024 read for 2026: one digit
+    form = _document(s, "booking_form", booking_date=misread.isoformat(), customer_phone="9437000077",
+                     customer_name="RASMITA NAYAK", booking_reference_number="BRMM/2627/04905")
+    dump_id = _dump_rows(s, [{"booking_number": "B-13457905", "otf": "OTF27C051111", "name": "RASMITA NAYAK",
+                              "mobile": "9437000077", "model": "THAR"}])
+    [row] = _rows(s, dump_id)
+    assert row["match_basis"] == "MOBILE_NAME"
+    assert _value(s, form, "booking_date") == today.isoformat()
+    assert _reviewed(s, form, "booking_date")
+    assert row["date_sync"]["status"] == "APPLIED" and row["date_sync"]["digitOff"] is True
+    # the receipt number on the form is no OTF a digit off: left as it is
+    assert _value(s, form, "booking_reference_number") == "BRMM/2627/04905"
+
+
+def test_a_booking_date_more_than_a_digit_off_is_left_on_a_two_thing_match(setup) -> None:  # noqa: F811
+    s = setup
+    today = _today()
+    other = today.replace(year=today.year - 6) - timedelta(days=1)  # several digits apart
+    form = _document(s, "booking_form", booking_date=other.isoformat(), customer_phone="9437000078",
+                     customer_name="SUBHASINI PANDA")
+    dump_id = _dump_rows(s, [{"booking_number": "B-13497418", "name": "SUBHASINI PANDA", "mobile": "9437000078",
+                              "model": "THAR"}])
+    [row] = _rows(s, dump_id)
+    assert row["match_basis"] == "MOBILE_NAME"
+    assert _value(s, form, "booking_date") == other.isoformat()
+    assert not [e for e in _log(s) if e["change_reason"] == "DMS_SYNC"]
+
+
+def test_the_manual_verification_task_on_a_corrected_field_closes(setup) -> None:  # noqa: F811
+    """"close the manual task if any for these attributes" (2026-11-24): the booking date read at
+    low confidence raised a manual verification task; the DMS correcting it closes the task."""
+    from audit_core.uc03_p2_task_producer import sync_field_review_tasks
+
+    s = setup
+    today = _today()
+    _, _, document = add_page(s.journey, page_number=77, status="READY")
+    add_evidence(s.journey, di_document_id=document, document_type_key="booking_form", process_area="BOOKING")
+    add_extracted_field(s.journey, di_document_id=document, field_key="booking_date",
+                        value=today.replace(year=today.year - 2).isoformat(), document_type="booking_form",
+                        confidence=55.0)
+    for key, value in (("customer_phone", "9437000079"), ("customer_name", "MENAKA BEHERA")):
+        add_extracted_field(s.journey, di_document_id=document, field_key=key, value=value,
+                            document_type="booking_form", confidence=97.0)
+
+    def open_tasks() -> int:
+        with s.journey.engine.begin() as connection:
+            set_tenant_context(connection, s.journey.tenant_id)
+            sync_field_review_tasks(connection, tenant_id=s.journey.tenant_id, journey_id=s.journey.journey_id)
+            return connection.execute(text(
+                "SELECT count(*) FROM auditcore.p2_tasks WHERE tenant_id = :t AND journey_id = :j "
+                "AND task_type = 'MANUAL_VERIFICATION_REVIEW' "
+                "AND task_status NOT IN ('VERIFIED_COMPLETE', 'CANCELLED', 'FAILED', 'DEAD_LETTER')"),
+                {"t": s.journey.tenant_id, "j": s.journey.journey_id}).scalar_one()
+
+    assert open_tasks() == 1
+    _dump_rows(s, [{"booking_number": "B-13495813", "name": "MENAKA BEHERA", "mobile": "9437000079", "model": "THAR"}])
+    assert _value(s, str(document), "booking_date") == today.isoformat()
+    assert open_tasks() == 0

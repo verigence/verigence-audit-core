@@ -213,6 +213,36 @@ def _differs_at_a_word_start(left: list[str], right: list[str]) -> bool:
     return False
 
 
+def same_name_word_for_word(left: Any, right: Any) -> bool:
+    """Whether two printed names agree word for word: the same number of words, each word the
+    same however spelt (Sahu / Sahoo, Mallik / Mallick: alike in sound, or one letter apart but
+    not in its first letter), in any order -- or the same letters spaced differently
+    ("RASMIRANJAN" / "RASMI RANJAN"). A company: the same company (same_organisation).
+
+    Stricter than same_person, which also takes a word missing ("Chitta Ranjan Patra" and
+    "Ranjana Patra") and a first letter differing ("Sitendra" / "Jitendra"): that suits one
+    Journey's own papers, not finding a Journey among hundreds by a name alone (DMS booking
+    matching, product owner 2026-11-24)."""
+    if _is_company(left) or _is_company(right):
+        return same_organisation(left, right)
+    a, b = person_tokens(left), person_tokens(right)
+    if not a or not b:
+        return False
+    if "".join(a) == "".join(b):
+        return True
+    if len(a) != len(b):
+        return False
+    rest = list(b)
+    for word in a:
+        found = next((i for i, other in enumerate(rest)
+                      if sound_key(word) == sound_key(other)
+                      or (len(word) >= _MISREAD_MIN and word[0] == other[0] and _one_letter_apart(word, other))), None)
+        if found is None:
+            return False
+        rest.pop(found)
+    return True
+
+
 def same_person(left: Any, right: Any) -> bool:
     """Whether two printed names are the same customer (see _same_person). Every rule reads a
     name only as str(value or ""), so the answer is memoised on that text: a DMS booking dump

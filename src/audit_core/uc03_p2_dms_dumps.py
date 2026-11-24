@@ -79,7 +79,7 @@ from audit_core.uc03_enquiry_number import enquiry_key, is_enquiry_number
 from audit_core.uc03_p2_access import authorize_p2_any
 from audit_core.uc03_p2_dms_field_sync import apply_field_fixes, plan_field_fixes
 from audit_core.uc03_p2_dms_field_sync import trusted as trusted_for_fields
-from audit_core.uc03_p2_names import same_person
+from audit_core.uc03_p2_names import same_name_word_for_word, same_person
 
 logger = structlog.get_logger(__name__)
 
@@ -667,6 +667,8 @@ _INDEX_SQL = """
            AND f.source_document_type_key IN ('booking_form', 'dealer_receipt', 'customer_kyc'))
        OR (f.field_key IN ('vin_number', 'chassis_number') AND f.source_document_type_key = ANY(:chassis_types))
        OR (f.field_key = 'customer_name' AND f.source_document_type_key IN ('customer_kyc', 'booking_form'))
+       -- the booking form's own date (2026-11-24): tells a rebooking from the booking it replaced
+       OR (f.field_key = 'booking_date' AND f.source_document_type_key IN ('booking_form', 'booking_docket'))
        OR f.field_key = 'buyer_customer_id'
        OR (f.field_key IN ('registration_number', 'vehicle_registration_number')
            AND f.source_document_type_key = ANY(:registration_types))
@@ -726,6 +728,12 @@ def build_index(connection: Connection, *, tenant_id: str, dealer_id: UUID) -> J
                 index.by_chassis[key].add(jid)
         elif field_key == "customer_name":
             journey["names"].add(value)
+        elif field_key == "booking_date" and r["doc"] in ("booking_form", "booking_docket"):
+            # The booking form's own date is the booking date (2026-11-22) even where the
+            # Journey's booking row has none yet: two DMS bookings of one customer are told
+            # apart by it (2026-11-24, a rebooking and the booking it replaced).
+            if (day := parse_date(value)) is not None and 2000 <= day.year <= 2100:
+                journey["bookingDays"].add(day)
         elif field_key == "buyer_customer_id":
             if (key := customer_code_key(value)) is not None:
                 index.by_customer_code[key].add(jid)
@@ -793,6 +801,8 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any], taken: frozen
 
     # Journeys cancelled in Verigence take no match but by their chassis (2026-11-22).
     cancelled = {jid for jid, j in index.journeys.items() if j.get("cancelled")}
+    if kind == BOOKING:
+        return _match_booking(index, row, set(taken) | cancelled)
 
     # A delivery row: the chassis first. It is the vehicle itself, printed on the gate pass,
     # invoice, insurance and RTO papers; the booking number comes from one booking form, the
@@ -850,9 +860,105 @@ def match_row(index: JourneyIndex, kind: str, row: dict[str, Any], taken: frozen
     return None, None
 
 
-# The order rows claim Journeys in: the surest match first (2026-11-19).
-_BASIS_RANK = {"CHASSIS": 0, "BOOKING_NUMBER": 1, "ENQUIRY_NUMBER": 2, "MOBILE": 3, "NAME_DATE": 4, "NAME_MODEL": 5,
-               "NAME_NEAR_ID": 6}
+# A booking row (product owner 2026-11-24): the OTF first; without it, two things must agree --
+# never the mobile alone or the name alone.
+MOBILE_DATE_DAYS = 7   # mobile + booking date: the DMS often enters a booking days after the form
+NAME_MODEL_DAYS = 45   # name + model: the booking within this many days (Menaka Behera: 31)
+
+
+def days_apart(index: JourneyIndex, jid: str, day: Any) -> int | None:
+    """Days between the DMS booking date and the nearest of the Journey's booking days (the
+    booking form's, the first receipt's); None when either is unknown."""
+    if not isinstance(day, date):
+        return None
+    gaps = [abs((d - day).days) for d in index.journeys[jid].get("bookingDays") or ()]
+    return min(gaps) if gaps else None
+
+
+def _nearest(index: JourneyIndex, found: set[str], day: Any) -> str | None:
+    """The one Journey booked nearest the DMS booking date (2026-11-24: N.Santosh Kumar
+    Choudhury's 19 Nov rebooking took his 14 Nov booking's Journey on the mobile)."""
+    gaps = {j: g for j in found if (g := days_apart(index, j, day)) is not None}
+    if not gaps:
+        return None
+    best = min(gaps.values())
+    nearest = [j for j, g in gaps.items() if g == best]
+    return nearest[0] if len(nearest) == 1 else None
+
+
+def _choose(index: JourneyIndex, found: set[str], row: dict[str, Any]) -> str | None:
+    """One of the Journeys a booking row agrees with: the only one; else the only one of the
+    same model; else the one booked nearest the DMS date; else the earliest of several alike
+    (a fleet buyer's identical vehicles, 2026-11-22)."""
+    if (jid := _one(found)) is not None:
+        return jid
+    same = {j for j in found if same_model(index.journeys[j]["model"], row.get("model"))}
+    if (jid := _one(same)) is not None:
+        return jid
+    if (jid := _nearest(index, same or found, row.get("event_date"))) is not None:
+        return jid
+    return _earliest_alike(index, same)
+
+
+def _named(index: JourneyIndex, jid: str, name: Any) -> bool:
+    return bool(name) and any(same_person(name, n) for n in index.journeys[jid]["names"])
+
+
+def _match_booking(index: JourneyIndex, row: dict[str, Any], unavailable: set[str]) -> tuple[str | None, str | None]:
+    """A booking dump row's Journey (product owner 2026-11-24): the OTF / B-number, the enquiry
+    number; else two things that agree -- the OTF a digit or two off and the name, the mobile and
+    the name, the mobile and the booking date (MOBILE_DATE_DAYS), the name and the booking date
+    (NAME_DATE_DAYS), the name word for word and the model (booked within NAME_MODEL_DAYS), the
+    name and a mobile a digit or two off. The mobile alone and the name alone match nothing:
+    "Prajnaraj Pradhan" took MANORAMA CONSTRUCTIONS' Journey on a mobile, "Chitta Ranjan Patra"
+    RANJANA PATRA's (booked two months earlier) on a name and a model."""
+
+    def free(found: Any) -> set[str]:
+        return set(found) - unavailable
+
+    def one(found: Any) -> str | None:
+        return _one(free(found))
+
+    strong = strong_booking_keys(row.get("booking_number"), row.get("dms_booking_number"))
+    keys = booking_keys(row.get("booking_number"), row.get("dms_booking_number"))
+    for key in sorted(keys, key=lambda k: k not in strong):
+        if (jid := one(index.by_ref.get(key, set()))) is not None and (key in strong or _same_customer(index, jid, row)):
+            return jid, "BOOKING_NUMBER"
+    if (key := enquiry_key(dms_enquiry_number(row))) is not None \
+            and (jid := one(index.by_enquiry.get(key, set()))) is not None:
+        return jid, "ENQUIRY_NUMBER"
+    name, day, mobile = row.get("customer_name"), row.get("event_date"), row.get("mobile")
+    candidates = free(index.journeys)
+    if name:
+        near = {j for j in candidates if near_booking(keys, index.journeys[j].get("refs", set())) and _named(index, j, name)}
+        if (jid := _choose(index, near, row)) is not None:
+            return jid, "NEAR_BOOKING_NUMBER"
+    if mobile and (by_mobile := free(index.by_mobile.get(mobile, set()))):
+        if (jid := _choose(index, {j for j in by_mobile if _named(index, j, name)}, row)) is not None:
+            return jid, "MOBILE_NAME"
+        dated = {j for j in by_mobile if (g := days_apart(index, j, day)) is not None and g <= MOBILE_DATE_DAYS}
+        if (jid := _choose(index, dated, row)) is not None:
+            return jid, "MOBILE_DATE"
+    if not name:
+        return None, None
+    named = {j for j in candidates if _named(index, j, name)}
+    dated = {j for j in named if (g := days_apart(index, j, day)) is not None and g <= NAME_DATE_DAYS}
+    if (jid := _choose(index, dated, row)) is not None:
+        return jid, "NAME_DATE"
+    word_for_word = {j for j in named if any(same_name_word_for_word(name, n) for n in index.journeys[j]["names"])}
+    modelled = {j for j in word_for_word if same_model(index.journeys[j]["model"], row.get("model"))
+                and ((g := days_apart(index, j, day)) is None or g <= NAME_MODEL_DAYS)}
+    if (jid := _one(modelled)) is not None:
+        return jid, "NAME_MODEL"
+    if (jid := _one({j for j in named if near_mobile(mobile_key(mobile), index.journeys[j].get("mobiles", set()))})) is not None:
+        return jid, "NAME_NEAR_ID"
+    return None, None
+
+
+# The order rows claim Journeys in: the surest match first (2026-11-19). MOBILE is the delivery
+# rows' (and the earlier booking matches'); a booking row's mobile match names its second thing.
+_BASIS_RANK = {"CHASSIS": 0, "BOOKING_NUMBER": 1, "ENQUIRY_NUMBER": 2, "NEAR_BOOKING_NUMBER": 3, "MOBILE": 4,
+               "MOBILE_NAME": 4, "MOBILE_DATE": 5, "NAME_DATE": 6, "NAME_MODEL": 7, "NAME_NEAR_ID": 8}
 
 
 def _line_key(kind: str, row: dict[str, Any]) -> str | None:
@@ -1214,13 +1320,110 @@ _NEWER_DUMP_DATE_SQL = """
 
 
 def _dated_by_newer_dump(connection: Connection, tenant_id: str, dump: dict[str, Any],
-                         journeys: list[str]) -> set[str]:
+                         journeys: list[str], *, any_basis: bool = False) -> set[str]:
     if not journeys or not dump.get("dump_id") or not dump.get("business_date"):
         return set()
     basis = "CHASSIS" if dump["dump_kind"] == DELIVERY else "BOOKING_NUMBER"
-    return {r[0] for r in connection.execute(text(_NEWER_DUMP_DATE_SQL), {
+    sql = _NEWER_DUMP_DATE_SQL.replace("AND r.match_basis = :basis", "") if any_basis else _NEWER_DUMP_DATE_SQL
+    return {r[0] for r in connection.execute(text(sql), {
         "t": tenant_id, "k": dump["dump_kind"], "id": str(dump["dump_id"]), "bd": dump["business_date"],
         "ua": dump.get("uploaded_at_utc"), "basis": basis, "js": journeys})}
+
+
+# --------------------------------------------------------------------------- a digit off
+
+# Product owner 2026-11-24: "once we find the date of booking or OTF number is mismatching by a
+# digit, pls correct in verigence as well, and close the manual task if any for these attributes".
+# On a booking match of two things agreeing (not the OTF itself: that has its own path, the
+# sure match above and uc03_p2_dms_field_sync), the booking form's OTF a digit or two off the
+# DMS's, and its booking date one digit off, are corrected through the field correction path.
+# The correction marks the field reviewed, so the manual verification task on it settles
+# (uc03_p2_task_producer: it closes once no field of the document is left unreviewed).
+OTF_MISREAD_CHARACTERS = NEAR_DIGITS  # 2: "OTF2705372" read for OTF27C053725
+
+
+def _bare_booking_number(value: Any) -> str:
+    raw = _alnum(value)
+    raw = re.sub(r"^(OTFNO|OTF|BOOKINGNO|BKNO)", "", raw)
+    return raw[1:] if re.fullmatch(r"B\d{5,}", raw) else raw
+
+
+def otf_digit_target(read: Any, row: dict[str, Any], dms_numbers: set[str]) -> str | None:
+    """The DMS number (the B-number or the full OTF) when the read one is a digit or two off
+    it -- and is not a booking the DMS holds (``dms_numbers``: every OTF and B-number of the
+    dump, cancelled ones included): two bookings' OTFs are often one digit apart (OTF27C054286 /
+    OTF27C054289)."""
+    mine = _bare_booking_number(read)
+    if len(mine) < 6 or mine in dms_numbers or is_enquiry_number(read):
+        return None
+    for dms in (row.get("dms_booking_number"), row.get("booking_number")):
+        theirs = _bare_booking_number(dms)
+        if len(theirs) >= 6 and 0 < _edits(mine, theirs) <= OTF_MISREAD_CHARACTERS:
+            return str(dms).strip()
+    return None
+
+
+def one_digit_off(a: date, b: date) -> bool:
+    """The same date with one digit misread (2024-11-03 for 2026-11-03, 14-11 for 19-11)."""
+    x, y = a.strftime("%d%m%Y"), b.strftime("%d%m%Y")
+    return sum(p != q for p, q in zip(x, y, strict=True)) == 1
+
+
+def plan_digit_fixes(connection: Connection, tenant_id: str, dump: dict[str, Any],
+                     matched: list[tuple[dict[str, Any], str]], updates: dict[int, dict[str, Any]],
+                     planned: list[dict[str, Any]], dms_numbers: set[str]
+                     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """(date fixes, field fixes) for booking rows matched on two things agreeing: the booking
+    form's booking date one digit off the DMS's, its OTF a digit or two off. Reads only. A
+    Journey a newer booking dump also matched is left to that dump; a value another path
+    already corrects is left to it."""
+    from audit_core.uc03_p2_dates import parse_extracted_date, programme_today
+    from audit_core.uc03_p2_dms_field_sync import _COPIES_SQL, BOOKING_DOCS
+
+    if dump["dump_kind"] != BOOKING or not matched:
+        return [], []
+    newer = _dated_by_newer_dump(connection, tenant_id, dump, sorted({jid for _, jid in matched}), any_basis=True)
+    journeys = sorted({jid for _, jid in matched} - newer)
+    if not journeys:
+        return [], []
+    done = {(f["journeyId"], f["documentId"], f["fieldKey"]) for f in planned}
+    copies: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for r in connection.execute(text(_COPIES_SQL), {
+            "t": tenant_id, "js": journeys, "fks": ["booking_date", "booking_reference_number"],
+            "docs": list(BOOKING_DOCS)}).mappings():
+        copies[(r["journey_id"], r["field_key"])].append(dict(r))
+    date_fixes: list[dict[str, Any]] = []
+    field_fixes: list[dict[str, Any]] = []
+    for row, jid in matched:
+        if jid in newer:
+            continue
+        u = updates[row["row_no"]]
+
+        def fix(copy: dict[str, Any], new: str, row: dict[str, Any] = row, jid: str = jid) -> dict[str, Any]:
+            return {"journeyId": jid, "documentId": copy["document_id"], "documentType": copy["doc"],
+                    "canonicalFieldId": copy["source_canonical_field_id"],
+                    "sourceFactVersion": copy["source_fact_version"], "fieldKey": copy["field_key"],
+                    "was": copy["value"], "dms": new, "rowNo": row["row_no"]}
+
+        day = row.get("event_date")
+        if isinstance(day, date) and day <= programme_today():
+            wrong = [c for c in copies.get((jid, "booking_date"), [])
+                     if (jid, c["document_id"], "booking_date") not in done
+                     and (read := parse_extracted_date(c["value"])) is not None and read != day and one_digit_off(read, day)]
+            if wrong:
+                u["ds"] = {**(u["ds"] or {}), "status": "TO_APPLY", "field": "booking_date", "dms": day.isoformat(),
+                           "was": sorted({str(c["value"]) for c in wrong}), "digitOff": True}
+                date_fixes += [{**fix(c, day.isoformat()), "dms": day.isoformat()} for c in wrong]
+        for c in copies.get((jid, "booking_reference_number"), []):
+            if (jid, c["document_id"], "booking_reference_number") in done:
+                continue
+            if (new := otf_digit_target(c["value"], row, dms_numbers)) is None:
+                continue
+            field_fixes.append(fix(c, new))
+            u["ds"] = {**(u["ds"] or {}), "fields": [*((u["ds"] or {}).get("fields") or []),
+                                                    {"field": "booking_reference_number", "was": c["value"], "dms": new,
+                                                     "status": "TO_APPLY", "digitOff": True}]}
+    return date_fixes, field_fixes
 
 
 def _sure_match_sync(connection: Connection, tenant_id: str, kind: str,
@@ -1361,7 +1564,12 @@ def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpP
             jid0, basis0 = match_row(index, kind, dict(row))
             agrees0 = bool(jid0) and bool(row["customer_name"]) and any(
                 same_person(row["customer_name"], n) for n in index.journeys[jid0]["names"])
+            # Of two rows wanting one Journey on the same footing, the one booked nearest the
+            # Journey's own date claims it, a cancelled one included (2026-11-24: a 19 Nov
+            # rebooking took the Journey of the customer's cancelled 14 Nov booking).
+            gap0 = days_apart(index, jid0, row["event_date"]) if jid0 and kind == BOOKING else None
             first_choice[row["row_no"]] = (_BASIS_RANK.get(basis0 or "", 9), not agrees0,
+                                           gap0 if gap0 is not None else 10_000,
                                            "CANCEL" in str(row.get("stage") or "").upper(), row["row_no"])
             compared.append(row["row_no"])
     order = {n: i for i, n in enumerate(sorted(compared, key=lambda n: first_choice[n]))}
@@ -1370,6 +1578,7 @@ def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpP
     seen_lines: dict[str, int] = {}
     sure: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
     trusted_rows: list[tuple[dict[str, Any], str]] = []
+    two_things: list[tuple[dict[str, Any], str]] = []  # booking matches not on the OTF itself
     for row in rows:
         if (model := row_out_of_scope(dict(row))) is not None:
             updates.append({"t": tenant_id, "id": str(dump_id), "n": row["row_no"], "j": None, "b": model,
@@ -1411,6 +1620,8 @@ def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpP
             synced.append(jid)
             if sure_match(kind, dict(row), basis, journey):
                 sure.append((dict(row), jid, journey))
+            elif kind == BOOKING:
+                two_things.append((dict(row), jid))
             if trusted_for_fields(kind, dict(row), journey):
                 trusted_rows.append((dict(row), jid))
     for u in updates:
@@ -1422,7 +1633,15 @@ def plan_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> DumpP
     # The other fields the DMS corrects, on a match the product owner trusts (2026-11-23).
     newer = _dated_by_newer_dump(connection, tenant_id, dict(dump), sorted({jid for _, jid in trusted_rows}))
     field_fixes = plan_field_fixes(connection, tenant_id, kind, trusted_rows, by_row, newer)
-    return DumpPlan(dict(dump), updates, synced, counts, date_fixes, field_fixes)
+    # The booking date one digit off, the OTF a digit or two off (2026-11-24). The other DMS
+    # numbers of the dump, cancelled bookings included: a Journey's OTF that is one of them is
+    # another booking, never corrected into this one.
+    # (A row's own number is never "a digit off" itself, so the dump's every number will do.)
+    numbers = {k for r in rows for k in (_bare_booking_number(r["dms_booking_number"]),
+                                         _bare_booking_number(r["booking_number"])) if len(k) >= 6}
+    digit_dates, digit_fields = plan_digit_fixes(connection, tenant_id, dict(dump), two_things, by_row,
+                                                 date_fixes + field_fixes, numbers)
+    return DumpPlan(dict(dump), updates, synced, counts, date_fixes + digit_dates, field_fixes + digit_fields)
 
 
 def match_dump(connection: Connection, *, tenant_id: str, dump_id: UUID) -> dict[str, int]:

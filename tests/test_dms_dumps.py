@@ -314,18 +314,24 @@ def test_the_name_and_a_mobile_or_booking_number_a_digit_or_two_off_find_the_cus
                       "j2": journey("j2", "Anita Sahoo", {"9337359361"}, set())}
     row = {"customer_name": "Sujit Kumar bastia", "mobile": "9337359361", "booking_number": "B-13486428",
            "dms_booking_number": "OTF27A092698", "model": "XEV 9S", "event_date": date(2026, 11, 7)}
-    # j2 holds the DMS mobile but is another customer: the mobile alone takes it -- so the
-    # misread case is tested with the exact mobile on no Journey.
+    # j2 holds the DMS mobile but is another customer: the mobile alone takes nothing
+    # (2026-11-24), so the booking number a digit or two off with the name finds j1.
+    index.by_mobile["9337359361"] = {"j2"}
+    assert m.match_row(index, m.BOOKING, row) == ("j1", "NEAR_BOOKING_NUMBER")
+    assert m.match_row(index, m.BOOKING, {**row, "mobile": "7000000000"}) == ("j1", "NEAR_BOOKING_NUMBER")
+    # the mobile alone a digit or two off, with the name
     del index.journeys["j2"]
-    assert m.match_row(index, m.BOOKING, row) == ("j1", "NAME_NEAR_ID")
-    # the booking number alone a digit or two off
-    assert m.match_row(index, m.BOOKING, {**row, "mobile": "7000000000"}) == ("j1", "NAME_NEAR_ID")
+    index.by_mobile.clear()
+    assert m.match_row(index, m.BOOKING, {**row, "booking_number": "B-13999999", "dms_booking_number": None}) \
+        == ("j1", "NAME_NEAR_ID")
     # the same name, a mobile and booking number far off: another customer, not taken
     assert m.match_row(index, m.BOOKING, {**row, "mobile": "7000000000", "booking_number": "B-13999999",
                                           "dms_booking_number": None}) == (None, None)
-    # two Journeys of that name, both near: not decided on the name
+    # two Journeys of that name: the one whose booking number is a digit or two off is it
+    # (2026-11-24); both only a mobile a digit or two off: not decided on the name
     index.journeys["j3"] = journey("j3", "SUJIT KUMAR BASTIA", {"9337359362"}, set())
-    assert m.match_row(index, m.BOOKING, row) == (None, None)
+    assert m.match_row(index, m.BOOKING, row) == ("j1", "NEAR_BOOKING_NUMBER")
+    assert m.match_row(index, m.BOOKING, {**row, "booking_number": None, "dms_booking_number": None}) == (None, None)
     assert m.near_mobile("9337359361", {"9337354361"}) and not m.near_mobile("9337359361", {"9437000361"})
     assert m.near_booking({"13486428"}, {"1348698"}) and not m.near_booking({"21913"}, {"21914"})
 
@@ -456,3 +462,88 @@ def test_the_sheet_date_reads_a_date_and_says_what_is_wrong() -> None:
 
 def test_excel_column_letters() -> None:
     assert [m._letter(i) for i in (0, 1, 25, 26, 27, 51, 52)] == ["A", "B", "Z", "AA", "AB", "AZ", "BA"]
+
+
+# --------------------------------------------------------------------------- 24 Nov 2026: booking ladder
+
+def _ladder_index(*journeys: dict) -> m.JourneyIndex:
+    index = m.JourneyIndex()
+    for j in journeys:
+        index.journeys[j["journeyId"]] = j
+        for mobile in j["mobiles"]:
+            index.by_mobile[mobile].add(j["journeyId"])
+        for ref in j["refs"]:
+            index.by_ref[ref].add(j["journeyId"])
+    return index
+
+
+def _j(jid: str, name: str, model: str, booked: date | None, mobiles: set[str] = frozenset(),
+       refs: set[str] = frozenset()) -> dict:
+    return {"journeyId": jid, "model": model, "names": {name}, "hasDelivery": False, "outletId": None,
+            "bookingDate": booked, "bookingDays": {booked} if booked else set(), "mobiles": set(mobiles),
+            "refs": set(refs), "reference": jid}
+
+
+def test_the_mobile_alone_or_the_name_alone_matches_nothing() -> None:
+    # Prajnaraj Pradhan's DMS booking took MANORAMA CONSTRUCTIONS' Journey on a mobile.
+    index = _ladder_index(_j("j1", "MANORAMA CONSTRUCTIONS", "SCORPIO N", date(2026, 10, 13), {"9437000001"}))
+    row = {"customer_name": "Prajnaraj Pradhan", "mobile": "9437000001", "model": "THAR",
+           "booking_number": "B-13478700", "event_date": date(2026, 11, 6)}
+    assert m.match_row(index, m.BOOKING, row) == (None, None)
+    # the mobile and the booking date (within a week) are two things: a company and its owner
+    assert m.match_row(index, m.BOOKING, {**row, "event_date": date(2026, 10, 18)}) == ("j1", "MOBILE_DATE")
+    # the mobile and the name
+    assert m.match_row(index, m.BOOKING, {**row, "customer_name": "Manorama Constructions"}) == ("j1", "MOBILE_NAME")
+
+
+def test_a_rebooking_does_not_take_the_cancelled_bookings_journey() -> None:
+    """N.Santosh Kumar Choudhury: OTF27C053725 of 14 Nov (cancelled in the DMS) and his 19 Nov
+    rebooking OTF27C054617, one mobile; the Journey (its OTF read OTF2705372) is the 14 Nov one."""
+    index = _ladder_index(_j("j1", "NARAYANSINTI SANTOSH KUMAR CHHOUDHURY", "XUV3XO", date(2026, 11, 14),
+                             {"6371500265"}, m.journey_ref_keys("OTF2705372")))
+    new = {"customer_name": "N.Santosh Kumar Choudhury", "mobile": "6371500265", "model": "XUV3XO",
+           "booking_number": "B-13536610", "dms_booking_number": "OTF27C054617", "event_date": date(2026, 11, 19)}
+    old = {"customer_name": "NARAYANSINTI SONTOSH KUMAR CHOUDHARY", "mobile": "6371500265", "model": "XUV3XO",
+           "booking_number": "B-13512229", "dms_booking_number": "OTF27C053725", "event_date": date(2026, 11, 14),
+           "stage": "Cancelled"}
+    # each alone would take the Journey on the mobile and the name ...
+    assert m.match_row(index, m.BOOKING, new) == ("j1", "MOBILE_NAME")
+    assert m.match_row(index, m.BOOKING, old) == ("j1", "MOBILE_NAME")
+    # ... the one booked nearest the Journey's date claims it first, cancelled or not
+    assert m.days_apart(index, "j1", old["event_date"]) == 0 and m.days_apart(index, "j1", new["event_date"]) == 5
+    assert m.match_row(index, m.BOOKING, new, {"j1"}) == (None, None)
+
+
+def test_a_name_and_model_match_needs_the_name_word_for_word_and_a_booking_within_45_days() -> None:
+    """Chitta Ranjan Patra's 19 Nov booking took RANJANA PATRA's (12 Sep) on a name and a model."""
+    index = _ladder_index(_j("j1", "RANJANA PATRA", "XUV 7XO", date(2026, 9, 12)))
+    row = {"customer_name": "Chitta Ranjan Patra", "mobile": "8847871001", "model": "XUV 7XO",
+           "booking_number": "B-13537274", "dms_booking_number": "OTF27C054649", "event_date": date(2026, 11, 19)}
+    assert m.match_row(index, m.BOOKING, row) == (None, None)
+    # the same name word for word, two months apart: still not
+    assert m.match_row(index, m.BOOKING, {**row, "customer_name": "Ranjana Patra"}) == (None, None)
+    # word for word and within 45 days (Menaka Behera: 31 days): matched
+    index = _ladder_index(_j("j2", "MENAKA BEHERA", "BOLERO NEO", date(2026, 10, 11)))
+    menaka = {"customer_name": "MENAKA BEHERA", "model": "BOLERO NEO", "booking_number": "B-13495813",
+              "event_date": date(2026, 11, 11)}
+    assert m.match_row(index, m.BOOKING, menaka) == ("j2", "NAME_MODEL")
+    # a name the tolerant check takes with a word missing is not word for word
+    index = _ladder_index(_j("j3", "PRAKASH KUMAR DASH", "XUV 3XO", date(2026, 10, 20)))
+    assert m.match_row(index, m.BOOKING, {"customer_name": "PRAKASH DAS", "model": "XUV 3XO",
+                                          "event_date": date(2026, 11, 13)}) == (None, None)
+
+
+def test_the_otf_a_digit_or_two_off_with_the_name_comes_before_the_mobile() -> None:
+    index = _ladder_index(
+        _j("j1", "SOMANATH MAHANTA", "XUV 3XO", date(2026, 10, 30), refs=m.journey_ref_keys("B-13339384")),
+        _j("j2", "SOMANATH MAHANTA", "XUV 3XO", date(2026, 10, 2), {"9000000001"}))
+    row = {"customer_name": "Somanath Mahanta", "mobile": "9000000001", "model": "XUV 3XO",
+           "booking_number": "B-13539384", "event_date": date(2026, 11, 20)}
+    assert m.match_row(index, m.BOOKING, row) == ("j1", "NEAR_BOOKING_NUMBER")
+
+
+def test_the_delivery_ladder_is_unchanged() -> None:
+    # a delivery row still matches on the mobile alone (insurance, scheme dumps rely on it)
+    index = _ladder_index(_j("j1", "ASHA DAS", "THAR", date(2026, 10, 1), {"9437000009"}))
+    assert m.match_row(index, m.DELIVERY, {"customer_name": "Someone Else", "mobile": "9437000009",
+                                           "model": "THAR"}) == ("j1", "MOBILE")
