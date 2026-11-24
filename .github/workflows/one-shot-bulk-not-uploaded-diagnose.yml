@@ -50,36 +50,47 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: All dealers' dumps profile, read-only
+      - name: Deployed DMS checks against today's Utkal rows, read-only
         shell: bash
         run: |
+          git fetch -q --depth=1 origin dev && git checkout -q FETCH_HEAD -- src pyproject.toml
+          python -m pip install -q -e . 2>&1 | tail -1
           python - <<'PY'
-          import os, psycopg
-          with psycopg.connect(os.environ["DB"], options="-c statement_timeout=120000") as c:
+          import io, os, psycopg
+          from datetime import datetime
+          from openpyxl import Workbook
+          from fastapi import HTTPException
+          from audit_core import uc03_p2_dms_dumps as m
+          with psycopg.connect(os.environ["DB"], options="-c statement_timeout=60000") as c:
               c.execute("SET TRANSACTION READ ONLY")
-              tenants = [r[0] for r in c.execute("SELECT DISTINCT tenant_id FROM auditcore.tenant_rule_config")]
-              for t in tenants:
-                  c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
-                  for r in c.execute("""SELECT d.dealer_name, u.dump_kind, u.file_format, count(DISTINCT u.dump_id) dumps,
-                        count(*) rows_, round(100.0*count(*) FILTER (WHERE r.event_date IS NULL)/count(*),1) pct_no_date,
-                        round(100.0*count(*) FILTER (WHERE r.outlet_label IS NULL)/count(*),1) pct_no_label,
-                        count(*) FILTER (WHERE r.event_date < DATE '2000-01-01') bad_year,
-                        count(*) FILTER (WHERE r.booking_date > r.event_date) booked_after,
-                        count(*) FILTER (WHERE r.dump_kind='DELIVERY' AND r.booking_date IS NULL) no_bdate,
-                        min(u.business_date), max(u.business_date)
-                      FROM auditcore.p2_dms_dumps u JOIN auditcore.p2_dms_dump_rows r ON r.tenant_id=u.tenant_id AND r.dump_id=u.dump_id
-                      JOIN auditcore.dealers d ON d.tenant_id=u.tenant_id AND d.dealer_id=u.dealer_id
-                      WHERE u.tenant_id=%s GROUP BY 1,2,3 ORDER BY 1,2,3""", (t,)):
-                      print("PROFILE", t[:8], r)
-                  for r in c.execute("""SELECT d.dealer_name, u.file_name, u.status, u.business_date, u.row_count,
-                        count(*) FILTER (WHERE r.event_date IS NULL) no_date, count(*) FILTER (WHERE r.outlet_label IS NULL) no_label
-                      FROM auditcore.p2_dms_dumps u JOIN auditcore.p2_dms_dump_rows r ON r.tenant_id=u.tenant_id AND r.dump_id=u.dump_id
-                      JOIN auditcore.dealers d ON d.tenant_id=u.tenant_id AND d.dealer_id=u.dealer_id
-                      WHERE u.tenant_id=%s GROUP BY 1,2,3,4,5
-                      HAVING count(*) FILTER (WHERE r.event_date IS NULL) > 0 OR count(*) FILTER (WHERE r.outlet_label IS NULL) > 0
-                      ORDER BY 4""", (t,)):
-                      print("GAPS", t[:8], r)
-                  for r in c.execute("""SELECT d.dealer_name, count(*) FROM auditcore.dealer_outlets o JOIN auditcore.dealers d
-                      ON d.tenant_id=o.tenant_id AND d.dealer_id=o.dealer_id WHERE o.tenant_id=%s GROUP BY 1""", (t,)):
-                      print("OUTLETS", t[:8], r)
+              print("ALEMBIC", c.execute("SELECT version_num FROM auditcore.alembic_version").fetchall())
+              print("COLUMN", c.execute("""SELECT data_type, column_default FROM information_schema.columns WHERE table_schema='auditcore'
+                  AND table_name='p2_dms_dumps' AND column_name='row_issues'""").fetchall())
+              t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
+              c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
+              rows = c.execute("""SELECT r.raw, coalesce(o.outlet_name, 'Utkal Mahindra - CDA') FROM auditcore.p2_dms_dump_rows r
+                  JOIN auditcore.p2_dms_dumps u ON u.tenant_id=r.tenant_id AND u.dump_id=r.dump_id
+                  LEFT JOIN auditcore.dealer_outlets o ON o.tenant_id=r.tenant_id AND o.outlet_id=r.outlet_id
+                  WHERE r.tenant_id=%s AND u.file_name='ALL BRANCH DELIVERY SHEET 24.11.26.xlsx' ORDER BY r.row_no""", (t,)).fetchall()
+          def iso(v):
+              try: return datetime.fromisoformat(v)
+              except Exception: return v
+          cols = ["TIMESTAMP", "SALES MANAGER", "FSC", "CUSTOMER NAME", "CONT NO", "MODEL", "CHASSIS NO", "BOOKING DATE", "DELIVERY DATE"]
+          def book(location_heading):
+              wb = Workbook(); ws = wb.active; ws.title = "Form Responses 1"
+              ws.append(["Timestamp", location_heading, "Sales Manager", "FSC", "Customer Name", "Cont No", "Model", "Chassis No", "Booking Date", "Delivery Date"])
+              for raw, outlet in rows:
+                  v = [iso(raw.get(k)) for k in cols]
+                  ws.append([v[0], outlet.replace("Utkal Mahindra - ", "")] + v[1:])
+              b = io.BytesIO(); wb.save(b); return b.getvalue()
+          print("ROWS", len(rows))
+          try:
+              m.parse_workbook(book("Delivery Date")); print("TODAY_LAYOUT taken (unexpected)")
+          except HTTPException as e:
+              print("TODAY_LAYOUT refused", e.status_code, e.detail)
+          p = m.parse_workbook(book("Location"))
+          print("CORRECTED_LAYOUT taken", len(p.rows), "dated", sum(1 for r in p.rows if r["event_date"]),
+                "with outlet", sum(1 for r in p.rows if r["outlet_label"]), "to correct", len(p.row_issues))
+          for i in p.row_issues[:10]:
+              print("   ISSUE", i)
           PY
