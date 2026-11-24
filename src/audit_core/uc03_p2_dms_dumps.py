@@ -886,10 +886,12 @@ def _nearest(index: JourneyIndex, found: set[str], day: Any) -> str | None:
     return nearest[0] if len(nearest) == 1 else None
 
 
-def _choose(index: JourneyIndex, found: set[str], row: dict[str, Any]) -> str | None:
+def _choose(index: JourneyIndex, found: set[str], row: dict[str, Any], *, alike: bool = False) -> str | None:
     """One of the Journeys a booking row agrees with: the only one; else the only one of the
-    same model; else the one booked nearest the DMS date; else the earliest of several alike
-    (a fleet buyer's identical vehicles, 2026-11-22)."""
+    same model; else the one booked nearest the DMS date; on the mobile (``alike``), else the
+    earliest of several alike -- a fleet buyer's identical vehicles (2026-11-22). Never on a
+    name: two customers' papers can share one Journey's names (2026-11-24, PRASANTA KUMAR SAHU
+    and BHARAT NAIK, both booked 17 Nov) and the earliest would take the other's."""
     if (jid := _one(found)) is not None:
         return jid
     same = {j for j in found if same_model(index.journeys[j]["model"], row.get("model"))}
@@ -897,7 +899,7 @@ def _choose(index: JourneyIndex, found: set[str], row: dict[str, Any]) -> str | 
         return jid
     if (jid := _nearest(index, same or found, row.get("event_date"))) is not None:
         return jid
-    return _earliest_alike(index, same)
+    return _earliest_alike(index, same) if alike else None
 
 
 def _named(index: JourneyIndex, jid: str, name: Any) -> bool:
@@ -934,10 +936,10 @@ def _match_booking(index: JourneyIndex, row: dict[str, Any], unavailable: set[st
         if (jid := _choose(index, near, row)) is not None:
             return jid, "NEAR_BOOKING_NUMBER"
     if mobile and (by_mobile := free(index.by_mobile.get(mobile, set()))):
-        if (jid := _choose(index, {j for j in by_mobile if _named(index, j, name)}, row)) is not None:
+        if (jid := _choose(index, {j for j in by_mobile if _named(index, j, name)}, row, alike=True)) is not None:
             return jid, "MOBILE_NAME"
         dated = {j for j in by_mobile if (g := days_apart(index, j, day)) is not None and g <= MOBILE_DATE_DAYS}
-        if (jid := _choose(index, dated, row)) is not None:
+        if (jid := _choose(index, dated, row, alike=True)) is not None:
             return jid, "MOBILE_DATE"
     if not name:
         return None, None

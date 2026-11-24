@@ -547,3 +547,17 @@ def test_the_delivery_ladder_is_unchanged() -> None:
     index = _ladder_index(_j("j1", "ASHA DAS", "THAR", date(2026, 10, 1), {"9437000009"}))
     assert m.match_row(index, m.DELIVERY, {"customer_name": "Someone Else", "mobile": "9437000009",
                                            "model": "THAR"}) == ("j1", "MOBILE")
+
+
+def test_two_customers_on_one_journeys_papers_are_not_decided_on_the_name() -> None:
+    """PRASANTA KUMAR SAHU and BHARAT NAIK, both booked 17 Nov: Bharat's Journey also carries
+    Prasanta's name. Prasanta's row is not decided between the two on the name; once Bharat's
+    row has his Journey, Prasanta's finds its own."""
+    index = _ladder_index(_j("j2", "BHARAT NAIK", "BOLERO", date(2026, 11, 16)),
+                          _j("j3", "PRASANTA KUMAR SAHU", "BOLERO", date(2026, 11, 16)))
+    index.journeys["j2"]["names"].add("Prasanta Kumar Sahu")
+    prasanta = {"customer_name": "PRASANTA KUMAR SAHU", "model": "BOLERO", "event_date": date(2026, 11, 17)}
+    bharat = {"customer_name": "BHARAT NAIK", "model": "BOLERO", "event_date": date(2026, 11, 17)}
+    assert m.match_row(index, m.BOOKING, prasanta) == (None, None)
+    assert m.match_row(index, m.BOOKING, bharat) == ("j2", "NAME_DATE")
+    assert m.match_row(index, m.BOOKING, prasanta, {"j2"}) == ("j3", "NAME_DATE")
