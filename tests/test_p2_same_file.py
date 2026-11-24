@@ -1925,6 +1925,10 @@ def test_a_multi_page_document_moves_whole_and_keeps_its_page_fingerprints(tenan
             "'SYSTEM', :d, 'tax_invoice_tally') RETURNING queue_id"),
             {"t": new.tenant_id, "b": first[0], "j": new.journey_id, "sha": uuid4().hex, "c": f"grp-{uuid4()}",
              "d": group_doc}).scalar_one()
+        # The document's two pages: pages 1 and 2 of one upload.
+        connection.execute(text(
+            "UPDATE auditcore.p2_document_queue SET batch_id=:b, page_number=2, page_numbers=ARRAY[2] "
+            "WHERE tenant_id=:t AND queue_id=:q"), {"t": new.tenant_id, "b": first[0], "q": second[1]})
         connection.execute(text(
             "UPDATE auditcore.p2_document_queue SET queue_status='MERGED', merged_into_queue_id=:g "
             "WHERE tenant_id=:t AND queue_id = ANY(:q)"), {"t": new.tenant_id, "g": group, "q": [first[1], second[1]]})
