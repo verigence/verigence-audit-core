@@ -714,3 +714,44 @@ def test_duty_days_missed_come_from_the_daily_duties(setup):
     pcs = next(c for c in report["dashboard"]["scorecards"] if c["key"] == "pcs")
     row = next(r for r in pcs["rows"] if r["id"] == me)
     assert row["values"]["dutiesMissed"] == 1
+
+
+def test_a_drive_file_joined_to_another_pcs_booking_counts_for_its_pc_as_drive(setup):
+    """Product owner 2026-11-24: Bodhisundar's Drive file of 23 Nov for Swagatika Rout was read on
+    a Journey of its own and its pages carried to the booking Radhakanta Das made in October; it
+    counted as Radhakanta's direct delivery and was missing from Bodhisundar's day. A carried
+    page counts under the person who put it in and by the channel of the file it came from."""
+    from audit_core.uc03_p2_upload_kind import upload_days
+
+    s = setup
+    outlet = str(s.journey.outlet_id)
+    me = s.journey.actor_id
+    now = datetime.now(UTC)
+    today = datetime.now(IST).date()
+    booking = tt._journey(s, outlet, "other-pc")             # booked earlier by another PC
+    tt._exec(s, "UPDATE auditcore.journeys SET created_at_utc=:at WHERE tenant_id=:t AND journey_id=:j",
+             at=now - timedelta(days=20), j=booking)
+    _uploads(s, "other-pc", booking, 1, at=now - timedelta(days=20))
+    # The Drive file, read on its own Journey (since deleted), its page carried to the booking.
+    read_journey = str(uuid4())
+    bulk = tt._exec(s, "INSERT INTO auditcore.p2_bulk_uploads (tenant_id, dealer_id, outlet_id, uploaded_by_actor_id, "
+                       "uploaded_by_name, folder, status, source) VALUES (:t, :d, :o, :a, 'Me', 'f', 'DONE', 'DRIVE') "
+                       "RETURNING bulk_id", d=s.journey.dealer_id, o=outlet, a=me).scalar_one()
+    tt._exec(s, "INSERT INTO auditcore.p2_bulk_files (tenant_id, bulk_id, original_filename, content_type, object_key, "
+                "upload_status, outcome, journey_id, placed_journey_id) VALUES (:t, :b, 'Delivery File.pdf', "
+                "'application/pdf', 'k', 'UPLOADED', 'ADDED_TO_BOOKING', :r, :j)", b=bulk, r=read_journey, j=booking)
+    batch, _rows = add_batch_pages(SimpleNamespace(**{**s.journey.__dict__, "journey_id": booking, "actor_id": me}),
+                                   [("gate_pass", "READY")])
+    tt._exec(s, "UPDATE auditcore.p2_document_queue SET business_stage='DELIVERY' WHERE tenant_id=:t AND batch_id=:b",
+             b=batch)
+    tt._exec(s, "INSERT INTO auditcore.p2_activity_events (tenant_id, journey_id, event_type, subject_type, subject_id, "
+                "details) VALUES (:t, :j, 'DOCUMENT_COPIED_FROM_DUPLICATE', 'UPLOAD_BATCH', :b, CAST(:d AS jsonb))",
+             j=booking, b=str(batch), d=f'{{"job": "same-file:{read_journey}"}}')
+
+    with s.journey.engine.begin() as connection:
+        set_tenant_context(connection, s.journey.tenant_id)
+        start = datetime.combine(today, datetime.min.time(), IST)
+        days = {d["journey_id"]: d for d in upload_days(
+            connection, tenant_id=s.journey.tenant_id, start=start, end=start + timedelta(days=1),
+            tz="Asia/Kolkata", actor_id=me)}
+    assert days[booking]["kind"] == "delivery" and days[booking]["channel"] == "drive"
