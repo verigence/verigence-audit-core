@@ -323,6 +323,48 @@ def _aggregate(connection: Connection, *, tenant_id: str, first: date, last: dat
             person["dealers"].add(str(r["dealer_id"]))
         else:
             person["outlets"].add(str(r["outlet_id"]))
+    # The PCs' daily duties (daily_duties, from 19 Nov 2026), which replaced the Task Manager's
+    # recurring Daily Gate Pass task (product owner 2026-11-23: "duty days missed are not being
+    # populated" -- the Tracker still read only the recurring tasks, stopped on 19 Nov). Each duty
+    # item is an outlet's, on the day it was due; it counts for every PC mapped to the outlet (or to
+    # its dealership). Its state is the Daily duties board's (daily_duties._state_on): done that day,
+    # done late within its carry days, not done once the carry days are over, else pending.
+    by_outlet_pcs: dict[str, set[str]] = defaultdict(set)
+    by_dealer_pcs: dict[str, set[str]] = defaultdict(set)
+    for actor, person in people.items():
+        if person["role"] == "PC":
+            for o in person["outlets"]:
+                by_outlet_pcs[o].add(actor)
+            for d in person["dealers"]:
+                by_dealer_pcs[d].add(actor)
+    today = now.astimezone(_zone(tz)).date()
+    for r in connection.execute(text("""
+        SELECT i.duty_id, CAST(i.outlet_id AS text) AS outlet, CAST(i.dealer_id AS text) AS dealer,
+               i.duty_date AS day,
+               CASE WHEN i.status = 'DONE' AND i.done_on <= i.duty_date THEN 'onTime'
+                    WHEN i.status = 'DONE' THEN 'late'
+                    WHEN i.duty_date + i.carry_days < :today THEN 'notDone'
+                    ELSE 'pending' END AS state,
+               count(*) AS n
+        FROM auditcore.p2_duty_items i
+        WHERE i.tenant_id = :t AND i.status <> 'CANCELLED' AND i.duty_date BETWEEN :first AND :last
+        GROUP BY 1, 2, 3, 4, 5
+    """), {"t": tenant_id, "first": first, "last": last, "today": today}).mappings():
+        owners = [(outlet_duties, r["outlet"])] + [
+            (duties, a) for a in by_outlet_pcs.get(r["outlet"], set()) | by_dealer_pcs.get(r["dealer"], set())]
+        for owner, key in owners:
+            cell = owner[str(key)][str(r["duty_id"])].setdefault(
+                r["day"].isoformat(), {"due": 0, "onTime": 0, "late": 0, "notDone": 0, "pending": 0})
+            cell["due"] += int(r["n"])
+            cell[r["state"]] += int(r["n"])
+    schedules += [
+        {"scheduleId": str(r["duty_id"]), "title": r["title"], "frequency": "DAILY", "status": r["status"],
+         "assignedRole": "PC"}
+        for r in connection.execute(text("""
+            SELECT duty_id, title, status FROM auditcore.p2_duties
+            WHERE tenant_id = :t ORDER BY sort_order, lower(title)
+        """), {"t": tenant_id}).mappings()
+    ]
     return {"values": values, "duties": duties, "by_outlet": by_outlet, "outlet_duties": outlet_duties,
             "schedules": schedules, "people": people,
             "names": known_names(connection, tenant_id=tenant_id)}
