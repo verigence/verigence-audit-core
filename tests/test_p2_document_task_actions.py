@@ -459,3 +459,33 @@ def test_the_resend_job_skips_pages_whose_task_the_pc_closed(journey):
         set_tenant_context(connection, journey.tenant_id)
         picked = {str(r["queue_id"]) for r in _candidates(connection, journey.tenant_id)}
     assert str(open_["queue_id"]) in picked and str(closed["queue_id"]) not in picked
+
+
+# ---------------------------------------------------------------- 2026-11-24: the file's uploader
+
+def test_a_failed_page_of_another_pcs_file_goes_to_that_pc(journey):
+    """Product owner 2026-11-24: a Drive file joined to a booking another PC made -- its
+    failed page is for the PC who sent the file, not the booking's creator. The booking PC's
+    own files keep the PC role as before."""
+    _sql(journey, "UPDATE auditcore.journeys SET created_by_actor_id='booking-pc' WHERE journey_id=:j")
+    theirs, _rows = add_batch_pages(journey, [("gate_pass", "READY")], grouping_status="NOT_NEEDED")
+    _sql(journey, "UPDATE auditcore.p2_upload_batches SET uploaded_by_actor_id='drive-pc' WHERE batch_id=:b", b=theirs)
+    own, _rows = add_batch_pages(journey, [("gate_pass", "READY")], grouping_status="NOT_NEEDED")
+    _sql(journey, "UPDATE auditcore.p2_upload_batches SET uploaded_by_actor_id='booking-pc' WHERE batch_id=:b", b=own)
+    for batch in (theirs, own):
+        _sql(journey, "UPDATE auditcore.p2_document_queue SET queue_status='FAILED', last_error=:e, "
+                      "status_reason=:r WHERE batch_id=:b", b=batch, e=NOT_READ[0], r=NOT_READ[1])
+    _sync(journey)
+
+    def assignee(batch):
+        [row] = _sql(journey, "SELECT assigned_actor_id, assigned_role_code FROM auditcore.p2_tasks "
+                              "WHERE tenant_id=:t AND dedupe_key=:k", k=f"resubmit:{journey.journey_id}:{batch}")
+        return row["assigned_actor_id"], row["assigned_role_code"]
+
+    assert assignee(theirs) == ("drive-pc", "PC")
+    assert assignee(own) == (None, "PC")
+    # An open task raised before the rule follows the uploader on its next refresh.
+    _sql(journey, "UPDATE auditcore.p2_tasks SET assigned_actor_id=NULL WHERE tenant_id=:t AND dedupe_key=:k",
+         k=f"resubmit:{journey.journey_id}:{theirs}")
+    _sync(journey)
+    assert assignee(theirs) == ("drive-pc", "PC")

@@ -1492,11 +1492,13 @@ def identical_documents(connection: Connection, *, tenant_id: str, new: FileIden
 
 
 def carry_documents(engine: Engine, *, tenant_id: str, new_journey_id: UUID, existing_journey_id: UUID) -> list[str]:
-    """Copy the documents only the copy holds to the earlier journey, as new uploads there
-    (uc03_duplicate_merge._copy_unit; idempotent: one fixed upload per unit). Returns the
-    kinds carried; nothing when there is nothing to carry or it is not all the customer's."""
+    """Carry the documents only the copy holds to the earlier journey, as new uploads there:
+    a document already read moves with its reading (uc03_duplicate_merge._move_unit), one
+    never read is split and read there (_copy_unit); idempotent, one fixed upload per unit.
+    Returns the kinds carried; nothing when there is nothing to carry or it is not all the
+    customer's."""
     from audit_core.db import set_tenant_context
-    from audit_core.uc03_duplicate_merge import _copy_unit
+    from audit_core.uc03_duplicate_merge import NotHeldAtDi, _copy_unit, _move_unit
 
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
@@ -1520,8 +1522,18 @@ def carry_documents(engine: Engine, *, tenant_id: str, new_journey_id: UUID, exi
         # Bodhisundar's day; uc03_p2_upload_kind counts "under the person who uploaded"). The
         # earlier journey's creator only when the page records no uploader.
         uploader = unit.get("uploaded_by_actor_id") or keep["created_by_actor_id"]
-        _copy_unit(engine, tenant_id, {**dict(keep), "created_by_actor_id": uploader}, copy, unit,
-                   tag=f"same-file:{new_journey_id}", now=now)
+        target = {**dict(keep), "created_by_actor_id": uploader}
+        tag = f"same-file:{new_journey_id}"
+        # Moved with its reading, never read twice (product owner 2026-11-24: "no double
+        # reading"); split and read here only when it was never read or DI no longer holds it.
+        if unit.get("di_document_id"):
+            try:
+                _move_unit(engine, tenant_id, target, copy, unit, tag=tag, now=now)
+                continue
+            except NotHeldAtDi:
+                logger.warning("p2_carried_unit_not_held_at_di", tenant_id=tenant_id,
+                               queue_id=str(unit["queue_id"]), di_document_id=str(unit["di_document_id"]))
+        _copy_unit(engine, tenant_id, target, copy, unit, tag=tag, now=now)
     logger.info("p2_same_file_documents_carried", tenant_id=tenant_id, journey_id=str(new_journey_id),
                 existing_journey_id=str(existing_journey_id), kinds=list(plan.kinds), units=len(plan.units))
     return list(plan.kinds)
