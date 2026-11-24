@@ -50,42 +50,35 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Mancheswar not-received bookings, read-only
+      - name: The four matched journeys, read-only
         shell: bash
         run: |
           python - <<'PY'
           import os, psycopg
-          mobiles = ['9437100895', '9861085546', '7988166504', '6371500265', '8847871001']
-          names = ['MAHESWAR ROUT', 'BABUL RAY', 'Sambit Swarup Sahani', 'Santosh Kumar Choudhury', 'Chitta Ranjan Patra']
+          jids = ['586da94e-9afa-4fad-a8dd-3e5e9c2b76a1', '6dff58f6-ac73-477c-9a7b-d3b255a93c75',
+                  'b46e15c0-c280-43cb-8255-6174a6284d71', 'c0ff0e18-e4c7-4056-8e91-c521a1415769']
           with psycopg.connect(os.environ["DB"], options="-c statement_timeout=120000") as c:
               c.execute("SET TRANSACTION READ ONLY")
               t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
               c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
-              for r in c.execute("""SELECT d.dealer_name, u.file_name, u.status, u.business_date, to_char(u.uploaded_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI'),
-                    r.row_no, r.customer_name, r.mobile, r.event_date, r.outlet_label, r.booking_number, r.dms_booking_number, r.model,
-                    r.outcome, r.match_basis, r.journey_id
-                  FROM auditcore.p2_dms_dump_rows r JOIN auditcore.p2_dms_dumps u ON u.tenant_id=r.tenant_id AND u.dump_id=r.dump_id
-                  JOIN auditcore.dealers d ON d.tenant_id=u.tenant_id AND d.dealer_id=u.dealer_id
-                  WHERE r.tenant_id=%s AND r.dump_kind='BOOKING'
-                    AND (regexp_replace(coalesce(r.mobile,''),'\D','','g') = ANY(%s) OR r.customer_name ILIKE ANY(%s))
-                  ORDER BY r.customer_name, u.business_date""", (t, mobiles, ['%' + n.split()[-1] + '%' + '' for n in names][:0] + ['%MAHESWAR ROUT%', '%BABUL RAY%', '%Sambit Swarup%', '%Santosh Kumar Choudhury%', '%Chitta Ranjan Patra%'])):
-                  print("ROW", r)
-              for r in c.execute("""SELECT customer_name, dump_kind, outlet_label, event_date, claimed_by_name,
-                    to_char(claimed_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI'), withdrawn_at_utc, row_key
-                  FROM auditcore.p2_dms_intimations WHERE tenant_id=%s AND customer_name ILIKE ANY(%s)""",
-                  (t, ['%MAHESWAR ROUT%', '%BABUL RAY%', '%Sambit Swarup%', '%Santosh Kumar Choudhury%', '%Chitta Ranjan Patra%'])):
-                  print("INTIMATION", r)
-              jids = [r[0] for r in c.execute("""SELECT DISTINCT r.journey_id FROM auditcore.p2_dms_dump_rows r
-                  WHERE r.tenant_id=%s AND r.journey_id IS NOT NULL AND r.dump_kind='BOOKING'
-                    AND regexp_replace(coalesce(r.mobile,''),'\D','','g') = ANY(%s)""", (t, mobiles))]
-              cols = [x[0] for x in c.execute("""SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore' AND table_name='journeys'""")]
-              want = [x for x in ("journey_id","customer_name","display_name","otf_number","booking_number","outlet_id","stage","status","created_at_utc","created_by_name","deleted_at_utc") if x in cols]
               for j in jids:
-                  row = c.execute(f"SELECT {', '.join(want)} FROM auditcore.journeys WHERE tenant_id=%s AND journey_id=%s", (t, j)).fetchone()
-                  print("JOURNEY", dict(zip(want, row)) if row else (j, "not found"))
-                  print("   DOCS", c.execute("SELECT count(*) FROM auditcore.p2_upload_batches WHERE tenant_id=%s AND journey_id=%s", (t, j)).fetchone())
-              for r in c.execute("""SELECT report_date, to_char(generated_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI'), generated_by_name,
-                    position('MAHESWAR' in upper(report::text))>0, position('CHITTA RANJAN' in upper(report::text))>0
-                  FROM auditcore.p2_dms_reports WHERE tenant_id=%s ORDER BY generated_at_utc DESC LIMIT 6""", (t,)):
-                  print("REPORT", r)
+                  r = c.execute("""SELECT COALESCE(NULLIF(cu.legal_name,''), cu.display_name), cu.mobile_number, b.booking_reference, b.booking_date,
+                        jp.model_name_snapshot, o.outlet_name, to_char(j.created_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI'),
+                        (SELECT string_agg(cs.stage_code||':'||cs.business_status, ', ') FROM auditcore.journey_stage_states cs
+                           WHERE cs.tenant_id=j.tenant_id AND cs.journey_id=j.journey_id)
+                      FROM auditcore.journeys j
+                      LEFT JOIN auditcore.customers cu ON cu.tenant_id=j.tenant_id AND cu.customer_id=j.customer_id
+                      LEFT JOIN auditcore.bookings b ON b.tenant_id=j.tenant_id AND b.journey_id=j.journey_id
+                      LEFT JOIN auditcore.journey_products jp ON jp.tenant_id=j.tenant_id AND jp.journey_id=j.journey_id
+                      LEFT JOIN auditcore.dealer_outlets o ON o.tenant_id=j.tenant_id AND o.outlet_id=j.outlet_id
+                      WHERE j.tenant_id=%s AND j.journey_id=%s""", (t, j)).fetchone()
+                  print("JOURNEY", j[:8], r)
+                  for f in c.execute("""SELECT f.source_document_type_key, f.field_key, f.effective_value #>> '{}'
+                      FROM auditcore.journey_document_extracted_fields f WHERE f.tenant_id=%s AND f.journey_id=%s
+                        AND f.field_key IN ('customer_name','booking_number','otf_number','booking_reference','mobile_number','mobile','booking_date','model','model_name')
+                      ORDER BY 1,2""", (t, j)):
+                      print("   FIELD", f)
+                  for u in c.execute("""SELECT original_filename, batch_status, to_char(created_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI')
+                      FROM auditcore.p2_upload_batches WHERE tenant_id=%s AND journey_id=%s""", (t, j)):
+                      print("   UPLOAD", u)
           PY
