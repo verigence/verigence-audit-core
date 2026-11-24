@@ -5,9 +5,9 @@ just the names": the PC sees their own mapped outlets, the Team Lead (and PM,
 Executive) the whole Project, with the count of each missing document type.
 
     Journey with deliveries   at least one page uploaded as DELIVERY
-    Missing document          an open DOCUMENT_MISSING task (DOCUMENT_MISSING or
-                              BOOKING_FORM_MISSING); its name is the task title
-                              without the leading "Upload (the)"
+    Missing document          each document an open DOCUMENT_MISSING task (DOCUMENT_MISSING or
+                              BOOKING_FORM_MISSING) names: the task's items (one task a
+                              Journey since 15 Nov), else the title without "Upload (the)"
     The day                   the delivery date on the vehicle's gate pass, when it
                               is a valid date 60 days before to 1 day after the first
                               delivery upload; otherwise the IST day of that upload
@@ -148,7 +148,8 @@ def _missing_by_journey(connection: Connection, tenant_id: str,
     for r in connection.execute(
         text(
             """
-            SELECT t.journey_id, t.title, t.reference ->> 'requirementKey' AS requirement_key
+            SELECT t.journey_id, t.title, t.reference ->> 'requirementKey' AS requirement_key,
+                   t.reference -> 'items' AS items
             FROM auditcore.p2_tasks t
             WHERE t.tenant_id = :t AND t.journey_id = ANY(CAST(:ids AS uuid[]))
               AND t.task_type = 'DOCUMENT_MISSING' AND t.source_code = ANY(:sources)
@@ -158,12 +159,21 @@ def _missing_by_journey(connection: Connection, tenant_id: str,
         ),
         {"t": tenant_id, "ids": journey_ids, "sources": list(_SOURCES), "closed": list(_CLOSED)},
     ).mappings().all():
-        name = document_name(r["title"])
-        key = r["requirement_key"] or name
-        if (str(r["journey_id"]), key) in seen:
-            continue
-        seen.add((str(r["journey_id"]), key))
-        out.setdefault(str(r["journey_id"]), []).append({"name": name, "requirementKey": key})
+        # One task carries all a Journey's missing documents since 15 Nov ("Upload 3 missing
+        # documents: A, B, C"): each document is its own entry, named as in the requirement list
+        # (product owner 2026-11-24: "we have defined list of documents.. aggregate as per our
+        # list"). A task of before then names one document in its title.
+        items = r["items"] if isinstance(r["items"], list) else []
+        entries = [(str(i.get("key") or i.get("label")), str(i.get("label") or i.get("key")))
+                   for i in items if isinstance(i, dict) and (i.get("key") or i.get("label"))]
+        if not entries:
+            name = document_name(r["title"])
+            entries = [(r["requirement_key"] or name, name)]
+        for key, name in entries:
+            if (str(r["journey_id"]), key) in seen:
+                continue
+            seen.add((str(r["journey_id"]), key))
+            out.setdefault(str(r["journey_id"]), []).append({"name": name, "requirementKey": key})
     return out
 
 
@@ -278,8 +288,13 @@ def build_missing_documents(connection: Connection, *, tenant_id: str, outlets: 
         })
         for d in documents:
             entry = by_document.setdefault(d["requirementKey"], {"name": d["name"], "requirementKey": d["requirementKey"],
-                                                                 "count": 0})
+                                                                 "count": 0, "byOutlet": {}})
             entry["count"] += 1
+            # Where it is missing, dealership and outlet (product owner 2026-11-24).
+            place = entry["byOutlet"].setdefault(str(j["outlet_id"]), {
+                "dealerId": str(j["dealer_id"]), "dealerName": j["dealer_name"],
+                "outletId": str(j["outlet_id"]), "outletName": j["outlet_name"], "count": 0})
+            place["count"] += 1
         dealer = by_dealer.setdefault(str(j["dealer_id"]), {"dealerId": str(j["dealer_id"]),
                                                             "dealerName": j["dealer_name"],
                                                             "journeys": 0, "documents": 0})
@@ -302,7 +317,9 @@ def build_missing_documents(connection: Connection, *, tenant_id: str, outlets: 
     return {
         "from": first.isoformat(), "to": last.isoformat(),
         "totals": {"journeys": total_journeys, "documents": sum(e["count"] for e in by_document.values())},
-        "byDocument": sorted(by_document.values(), key=lambda e: (-e["count"], e["name"].lower())),
+        "byDocument": sorted(({**e, "byOutlet": sorted(e["byOutlet"].values(), key=lambda o: (
+                                   str(o["dealerName"] or "").lower(), -o["count"], str(o["outletName"] or "").lower()))}
+                              for e in by_document.values()), key=lambda e: (-e["count"], e["name"].lower())),
         "byDealer": sorted(by_dealer.values(), key=lambda e: (-e["documents"], str(e["dealerName"] or "").lower())),
         "byOutlet": sorted(by_outlet.values(), key=lambda e: (str(e["dealerName"] or "").lower(),
                                                                -e["documents"], str(e["outletName"] or "").lower())),
