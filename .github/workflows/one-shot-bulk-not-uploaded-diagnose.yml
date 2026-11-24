@@ -50,33 +50,31 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Utkal delivery dumps compared, read-only
+      - name: Effects of the 24 Nov Utkal delivery dump, read-only
         shell: bash
         run: |
           python - <<'PY'
-          import os, psycopg, json, collections
+          import os, psycopg
           with psycopg.connect(os.environ["DB"], options="-c statement_timeout=60000") as c:
               c.execute("SET TRANSACTION READ ONLY")
               t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
               c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
-              dumps = c.execute("""SELECT u.dump_id, u.file_name, u.file_format, u.sheet_name, u.status, u.business_date,
-                    u.period_month, u.row_count, to_char(u.uploaded_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI'),
-                    (SELECT count(*) FROM auditcore.p2_dms_dump_rows r WHERE r.tenant_id=u.tenant_id AND r.dump_id=u.dump_id AND r.event_date IS NULL)
-                  FROM auditcore.p2_dms_dumps u JOIN auditcore.dealers d ON d.tenant_id=u.tenant_id AND d.dealer_id=u.dealer_id
-                  WHERE u.tenant_id=%s AND d.dealer_name='Utkal Mahindra' AND u.dump_kind='DELIVERY'
-                  ORDER BY u.uploaded_at_utc DESC LIMIT 6""", (t,)).fetchall()
-              for d in dumps:
-                  print("DUMP", d[1:])
-                  keys = collections.Counter()
-                  for (raw,) in c.execute("SELECT raw FROM auditcore.p2_dms_dump_rows WHERE tenant_id=%s AND dump_id=%s", (t, d[0])):
-                      keys.update((raw or {}).keys())
-                  print("   KEYS", dict(keys))
-                  for col in ("DELIVERY DATE", "DATE OF DELIVERY", "DATE", "TIMESTAMP", "BOOKING DATE"):
-                      vals = collections.Counter()
-                      for (v,) in c.execute("SELECT raw->>%s FROM auditcore.p2_dms_dump_rows WHERE tenant_id=%s AND dump_id=%s", (col, t, d[0])):
-                          vals[(v or "<none>")[:19]] += 1
-                      if set(vals) != {"<none>"}:
-                          print("   VALUES", col, vals.most_common(8), "distinct", len(vals))
-                  ev = c.execute("SELECT min(event_date), max(event_date), count(event_date) FROM auditcore.p2_dms_dump_rows WHERE tenant_id=%s AND dump_id=%s", (t, d[0])).fetchone()
-                  print("   EVENT_DATE", ev)
+              base = """FROM auditcore.p2_dms_dump_rows r JOIN auditcore.p2_dms_dumps u ON u.tenant_id=r.tenant_id AND u.dump_id=r.dump_id
+                  JOIN auditcore.dealers d ON d.tenant_id=u.tenant_id AND d.dealer_id=u.dealer_id
+                  WHERE r.tenant_id=%s AND d.dealer_name='Utkal Mahindra' AND u.dump_kind='DELIVERY'"""
+              for r in c.execute(f"""SELECT u.file_name, count(*) FILTER (WHERE r.outlet_label IS NULL) no_label,
+                    count(*) FILTER (WHERE r.outlet_id IS NULL) no_outlet, count(*) FILTER (WHERE r.journey_id IS NOT NULL) matched, count(*)
+                  {base} AND u.status='ACTIVE' AND u.business_date >= DATE '2026-11-23' GROUP BY 1 ORDER BY 1""", (t,)):
+                  print("EFFECT", r)
+              for r in c.execute(f"""SELECT r.outcome, count(*) {base} AND u.file_name LIKE 'ALL BRANCH DELIVERY SHEET 24.11.26%%' GROUP BY 1""", (t,)):
+                  print("OUTCOME", r)
+              for r in c.execute(f"""SELECT u.file_name, r.row_no, r.event_date, r.raw->>'DELIVERY DATE', r.raw->>'TIMESTAMP', r.raw->>'BOOKING DATE'
+                  {base} AND u.status='ACTIVE' AND r.event_date < DATE '2026-09-01' ORDER BY 1,2""", (t,)):
+                  print("ODD", r)
+              for r in c.execute(f"""SELECT u.file_name, count(*) {base} AND u.status='ACTIVE' AND r.booking_date > r.event_date GROUP BY 1""", (t,)):
+                  print("BOOKED_AFTER_DELIVERY", r)
+              for r in c.execute(f"""SELECT r.row_no, r.raw->>'CUSTOMER NAME', r.raw->>'BOOKING DATE', r.raw->>'DELIVERY DATE', r.raw->>'TIMESTAMP'
+                  {base} AND u.file_name LIKE 'ALL BRANCH DELIVERY SHEET 24.11.26%%'
+                  AND (r.raw->>'BOOKING DATE') > (r.raw->>'DELIVERY DATE') ORDER BY 1 LIMIT 5""", (t,)):
+                  print("TODAY_BOOKED_AFTER", r)
           PY
