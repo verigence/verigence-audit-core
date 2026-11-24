@@ -61,6 +61,20 @@ AADHAAR = "2345 6789 1234"
 BOOKING_REF = "BK/0012"
 
 
+@pytest.fixture(autouse=True)
+def _di_moves_read_documents(monkeypatch):
+    """Carrying a read document moves it at DI (2026-11-24, no double reading): DI faked."""
+    from audit_core import uc03_document_capture_v2, uc03_duplicate_merge
+
+    class _Di:
+        def move_document(self, **_kwargs):
+            return {"outcome": "moved"}
+
+    monkeypatch.setattr(uc03_document_capture_v2, "get_di_capture_v2_client", _Di)
+    monkeypatch.setattr(uc03_duplicate_merge, "_di_context_refs",
+                        lambda _e, _t, ids: ("token", [f"ctx-{i}" for i in ids]))
+
+
 # ── doubles ───────────────────────────────────────────────────────────────────
 class FakeSecurity:
     def get_service_token(self, *, audience: str) -> str:
@@ -1288,11 +1302,39 @@ def test_the_same_set_of_documents_is_deleted_without_copying(tenant, monkeypatc
     assert storage.put == {} and len(_batches(old)) == before
 
 
-@pytest.mark.parametrize("kind", ["tax_invoice_tally", "dealer_receipt"])
-def test_a_page_only_the_copy_holds_goes_to_the_earlier_journey_before_the_delete(tenant, monkeypatch, kind):
+class MovingDi:
+    """DI's move of a read document to another Journey's context (2026-11-24)."""
+    def __init__(self, *, holds: bool = True) -> None:
+        self.holds = holds
+        self.moved: list[tuple[str, str, str]] = []
+
+    def move_document(self, *, token, tenant_id, external_context_ref, document_id, target_external_context_ref):
+        from audit_core.di_capture_v2_client import DiCaptureV2Error
+
+        if not self.holds:
+            raise DiCaptureV2Error(status_code=404, detail="DOCUMENT_NOT_FOUND")
+        self.moved.append((external_context_ref, document_id, target_external_context_ref))
+        return {"outcome": "moved"}
+
+
+@pytest.mark.parametrize(("kind", "held_at_di"), [("tax_invoice_tally", True), ("dealer_receipt", True),
+                                                  ("tax_invoice_tally", False)])
+def test_a_page_only_the_copy_holds_goes_to_the_earlier_journey_before_the_delete(tenant, monkeypatch, kind,
+                                                                                  held_at_di):
     """A Tally invoice the earlier journey lacks -- or a second receipt, a kind it already
-    holds, which comparing kinds would have lost -- is copied to it, then the copy goes."""
-    from audit_core import uc03_p2_storage
+    holds, which comparing kinds would have lost -- is carried to it, then the copy goes.
+    Product owner 2026-11-24, "no double reading": it moves with its reading, and is read
+    on the earlier journey only when DI no longer holds that reading."""
+    from audit_core import (
+        uc03_document_capture_v2,
+        uc03_duplicate_merge,
+        uc03_p2_storage,
+    )
+
+    di = MovingDi(holds=held_at_di)
+    monkeypatch.setattr(uc03_document_capture_v2, "get_di_capture_v2_client", lambda: di)
+    monkeypatch.setattr(uc03_duplicate_merge, "_di_context_refs",
+                        lambda _e, _t, ids: ("token", [f"ctx-{i}" for i in ids]))
 
     old, new = _pair(tenant)
     _same_pages(old, new, n=2)
@@ -1323,13 +1365,31 @@ def test_a_page_only_the_copy_holds_goes_to_the_earlier_journey_before_the_delet
     assert len(storage.put) == 1
     [alert] = _alerts(new)
     assert alert["outcome"] == "DELETED" and f"after its {kind.replace('_', ' ')} was added to" in alert["body"]
-    # The copied upload is split and read on the earlier journey like any upload.
     with old.engine.begin() as connection:
         set_tenant_context(connection, old.tenant_id)
-        assert connection.execute(
+        split = connection.execute(
             text("SELECT count(*) FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
                  "AND work_type='SPLIT_BATCH' AND work_key=:k"),
-            {"t": old.tenant_id, "j": old.journey_id, "k": str(copied["batch_id"])}).scalar_one() == 1
+            {"t": old.tenant_id, "j": old.journey_id, "k": str(copied["batch_id"])}).scalar_one()
+        units = connection.execute(
+            text("SELECT queue_status, di_document_id, unit_kind FROM auditcore.p2_document_queue "
+                 "WHERE tenant_id=:t AND batch_id=:b"), {"t": old.tenant_id, "b": copied["batch_id"]},
+        ).mappings().all()
+        capture = connection.execute(
+            text("SELECT count(*) FROM auditcore.document_capture_v2_documents WHERE tenant_id=:t "
+                 "AND journey_id=:j AND di_document_id=:d"), {"t": old.tenant_id, "j": old.journey_id, "d": _doc},
+        ).scalar_one()
+        reconcile = connection.execute(
+            text("SELECT count(*) FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
+                 "AND work_type='JOURNEY_RECONCILE'"), {"t": old.tenant_id, "j": old.journey_id}).scalar_one()
+    if held_at_di:
+        # Moved at DI to the earlier journey's context and copied from there: no split, no reading.
+        assert di.moved == [(f"ctx-{new.journey_id}", str(_doc), f"ctx-{old.journey_id}")]
+        assert split == 0 and reconcile >= 1 and capture == 1
+        assert [(u["queue_status"], u["di_document_id"]) for u in units] == [("CLASSIFYING", _doc)]
+    else:
+        # DI no longer holds the reading: the upload is split and read there like any upload.
+        assert di.moved == [] and split == 1 and units == []
 
 
 def test_a_copy_holding_another_customers_file_is_deleted_without_carrying_it(tenant):
@@ -1831,3 +1891,61 @@ def test_an_enquiry_number_is_no_booking_reference():
     assert normalize_booking_reference("ENQ-38100019") is None
     assert normalize_booking_reference("0038100003") is None
     assert normalize_booking_reference("B-13100014") is not None
+
+
+def test_a_multi_page_document_moves_whole_and_keeps_its_page_fingerprints(tenant, monkeypatch):
+    """A document put together from pages (a GROUP unit) is moved with its reading as one
+    document, and its pages' fingerprints go with it: a later file repeating those pages is
+    known to be on the earlier booking already (product owner 2026-11-24)."""
+    from audit_core import (
+        uc03_document_capture_v2,
+        uc03_duplicate_merge,
+        uc03_p2_storage,
+    )
+
+    di = MovingDi()
+    monkeypatch.setattr(uc03_document_capture_v2, "get_di_capture_v2_client", lambda: di)
+    monkeypatch.setattr(uc03_duplicate_merge, "_di_context_refs",
+                        lambda _e, _t, ids: ("token", [f"ctx-{i}" for i in ids]))
+    storage = CopyStorage()
+    monkeypatch.setattr(uc03_p2_storage, "get_p2_document_storage", lambda: storage)
+    old, new = _pair(tenant)
+    _same_pages(old, new, n=2)
+    _page(old, sha=uuid4().hex, kind="dealer_receipt")
+    shas = [uuid4().hex, uuid4().hex]
+    first = _page(new, sha=shas[0], kind="tax_invoice_tally")
+    second = _page(new, sha=shas[1], kind="tax_invoice_tally")
+    group_doc = uuid4()
+    with new.engine.begin() as connection:
+        set_tenant_context(connection, new.tenant_id)
+        group = connection.execute(text(
+            "INSERT INTO auditcore.p2_document_queue (tenant_id, batch_id, journey_id, page_number, page_numbers, "
+            "page_sha256, page_object_key, client_upload_id, queue_status, unit_kind, group_source, di_document_id, "
+            "classified_document_type) VALUES (:t, :b, :j, 1, ARRAY[1,2], :sha, 'grp.pdf', :c, 'READY', 'GROUP', "
+            "'SYSTEM', :d, 'tax_invoice_tally') RETURNING queue_id"),
+            {"t": new.tenant_id, "b": first[0], "j": new.journey_id, "sha": uuid4().hex, "c": f"grp-{uuid4()}",
+             "d": group_doc}).scalar_one()
+        connection.execute(text(
+            "UPDATE auditcore.p2_document_queue SET queue_status='MERGED', merged_into_queue_id=:g "
+            "WHERE tenant_id=:t AND queue_id = ANY(:q)"), {"t": new.tenant_id, "g": group, "q": [first[1], second[1]]})
+        connection.execute(text("DELETE FROM auditcore.evidence WHERE tenant_id=:t AND di_document_id=:d"),
+                           {"t": new.tenant_id, "d": second[2]})
+        connection.execute(text("UPDATE auditcore.evidence SET di_document_id=:d WHERE tenant_id=:t "
+                                "AND di_document_id=:old"), {"t": new.tenant_id, "d": group_doc, "old": first[2]})
+    _quiet(new)
+
+    assert _detect(new)["outcomes"] == ["PENDING_DELETE"]
+    assert _delete(new) == "DELETED"
+    assert di.moved == [(f"ctx-{new.journey_id}", str(group_doc), f"ctx-{old.journey_id}")]
+    [copied] = [b for b in _batches(old) if b["client_upload_id"] == f"dup-merge-{group}"]
+    with old.engine.begin() as connection:
+        set_tenant_context(connection, old.tenant_id)
+        units = connection.execute(text(
+            "SELECT unit_kind, queue_status, page_numbers, page_sha256, merged_into_queue_id, di_document_id "
+            "FROM auditcore.p2_document_queue WHERE tenant_id=:t AND batch_id=:b ORDER BY unit_kind, page_number"),
+            {"t": old.tenant_id, "b": copied["batch_id"]}).mappings().all()
+    [whole] = [u for u in units if u["unit_kind"] == "GROUP"]
+    pages = [u for u in units if u["unit_kind"] == "PAGE"]
+    assert (whole["queue_status"], whole["di_document_id"], whole["page_numbers"]) == ("CLASSIFYING", group_doc, [1, 2])
+    assert [p["page_sha256"] for p in pages] == shas
+    assert all(p["queue_status"] == "MERGED" and p["di_document_id"] is None for p in pages)

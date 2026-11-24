@@ -32,6 +32,20 @@ from audit_core.security_authorization import get_security_authorization_client
 PAN = "ABCPE1234F"
 
 
+@pytest.fixture(autouse=True)
+def _di_moves_read_documents(monkeypatch):
+    """Carrying a read document moves it at DI (2026-11-24, no double reading): DI faked."""
+    from audit_core import uc03_document_capture_v2, uc03_duplicate_merge
+
+    class _Di:
+        def move_document(self, **_kwargs):
+            return {"outcome": "moved"}
+
+    monkeypatch.setattr(uc03_document_capture_v2, "get_di_capture_v2_client", _Di)
+    monkeypatch.setattr(uc03_duplicate_merge, "_di_context_refs",
+                        lambda _e, _t, ids: ("token", [f"ctx-{i}" for i in ids]))
+
+
 class BucketDouble:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}

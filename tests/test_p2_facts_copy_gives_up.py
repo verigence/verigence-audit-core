@@ -135,3 +135,24 @@ def test_a_failure_that_has_not_given_up_still_waits():
     )
     assert outcome.status == "SYNCING_TO_AUDIT_CORE"
     assert outcome.status not in worker._PAGE_SETTLED_STATES
+
+
+def test_a_reading_moved_here_waits_while_the_journey_it_came_from_holds_it(journey, failing_sync):
+    """A file joined to this booking moves its reading here (2026-11-24, no double reading);
+    the journey it was read on is deleted right after, and until then its evidence still holds
+    the document. The copy waits -- it is neither linked there nor copied as an extra -- and
+    goes ahead once that journey is gone."""
+    page = _page(journey)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        # The journey the reading came from: a second journey of the tenant.
+        other_id = connection.execute(text(
+            "INSERT INTO auditcore.journeys (tenant_id, dealer_id, outlet_id, customer_id, journey_reference, "
+            "created_by_actor_id) SELECT tenant_id, dealer_id, outlet_id, customer_id, :r, created_by_actor_id "
+            "FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j RETURNING journey_id"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "r": f"SRC-{uuid4().hex[:6]}"}).scalar_one()
+        connection.execute(text("UPDATE auditcore.evidence SET journey_id=:o WHERE tenant_id=:t AND di_document_id=:d"),
+                           {"o": other_id, "t": journey.tenant_id, "d": page["di_document_id"]})
+    failing_sync["exc"] = AssertionError("must not copy while another journey holds the document")
+    assert _copy(journey, page) is None
+    assert _attempts(journey, page["queue_id"]) == 0  # waiting is not a failure
