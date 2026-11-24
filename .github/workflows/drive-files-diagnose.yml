@@ -37,10 +37,10 @@ jobs:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
-      PC_NAME: ${{ inputs.name || 'aditya' }}
+      PC_NAME: ${{ inputs.name || 'mohanty' }}
       SINCE: ${{ inputs.since || '2026-11-22' }}
       UNTIL: ${{ inputs.until || '2026-11-25' }}
-      OUTLET: ${{ inputs.outlet || 'cuttack' }}
+      OUTLET: ${{ inputs.outlet || 'aditya motors' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
