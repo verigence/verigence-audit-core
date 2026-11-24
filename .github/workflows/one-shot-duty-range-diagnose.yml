@@ -51,7 +51,7 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Gate register and cash ledger sources, read-only
+      - name: Who uploaded the bank statements, read-only
         shell: bash
         run: |
           python - <<'PY'
@@ -64,36 +64,16 @@ jobs:
           with e.connect() as c:
               c.exec_driver_sql("SET TRANSACTION READ ONLY")
               set_tenant_context(c, T)
-              rows = lambda sql: c.exec_driver_sql(sql, {"t": T}).mappings().all()
-              for r in rows("SELECT enabled, enabled_from, working_weekdays, default_carry_days FROM auditcore.p2_duty_settings WHERE tenant_id=%(t)s"):
-                  print("SETTINGS", dict(r))
-              for r in rows("SELECT standard_code, status, weekdays, day_offset, effective_from, outlet_scope FROM auditcore.p2_duties WHERE tenant_id=%(t)s ORDER BY sort_order"):
-                  print("DUTY", dict(r))
-              print("GATEPASS by business_date (all outlets): date | registers | counts entered | uploaded later than next day")
-              for r in rows("""SELECT business_date d, count(*) n, count(completed_at_utc) done,
-                     count(*) FILTER (WHERE (created_at_utc AT TIME ZONE 'Asia/Kolkata')::date > business_date + 1) late
-                     FROM auditcore.p2_gate_passes WHERE tenant_id=%(t)s AND status='ACTIVE'
-                     AND business_date BETWEEN '2026-11-01' AND '2026-11-24' GROUP BY 1 ORDER BY 1"""):
-                  print("  GP", r["d"], r["n"], r["done"], r["late"])
-              print("GATE duty items: duty_date | for_date | n | done")
-              for r in rows("""SELECT i.duty_date, i.for_date, count(*) n, count(*) FILTER (WHERE i.status='DONE') done
-                     FROM auditcore.p2_duty_items i JOIN auditcore.p2_duties d ON d.tenant_id=i.tenant_id AND d.duty_id=i.duty_id
-                     WHERE i.tenant_id=%(t)s AND d.standard_code='GATE_REGISTER' AND i.status<>'CANCELLED' GROUP BY 1,2 ORDER BY 1,2"""):
-                  print("  GI", r["duty_date"], r["for_date"], r["n"], r["done"])
-              print("CASH duty items: duty_date | for_date | n | done | with amount")
-              for r in rows("""SELECT i.duty_date, i.for_date, count(*) n, count(*) FILTER (WHERE i.status='DONE') done,
-                     count(*) FILTER (WHERE i.input_values ? 'amount') amt
-                     FROM auditcore.p2_duty_items i JOIN auditcore.p2_duties d ON d.tenant_id=i.tenant_id AND d.duty_id=i.duty_id
-                     WHERE i.tenant_id=%(t)s AND d.standard_code='CASH_LEDGER' AND i.status<>'CANCELLED' GROUP BY 1,2 ORDER BY 1,2"""):
-                  print("  CI", r["duty_date"], r["for_date"], r["n"], r["done"], r["amt"])
-              print("Per outlet 1-23 Nov: outlet | gate registers uploaded | with counts | gate duty items (by duty_date) | done")
-              for r in rows("""WITH g AS (SELECT outlet_id, count(*) n, count(completed_at_utc) done FROM auditcore.p2_gate_passes
-                       WHERE tenant_id=%(t)s AND status='ACTIVE' AND business_date BETWEEN '2026-11-01' AND '2026-11-23' GROUP BY 1),
-                     i AS (SELECT i.outlet_id, count(*) n, count(*) FILTER (WHERE i.status='DONE') done FROM auditcore.p2_duty_items i
-                       JOIN auditcore.p2_duties d ON d.tenant_id=i.tenant_id AND d.duty_id=i.duty_id
-                       WHERE i.tenant_id=%(t)s AND d.standard_code='GATE_REGISTER' AND i.status<>'CANCELLED'
-                       AND i.duty_date BETWEEN '2026-11-01' AND '2026-11-24' GROUP BY 1)
-                     SELECT COALESCE(g.outlet_id,i.outlet_id) o, g.n gn, g.done gd, i.n inn, i.done idn FROM g FULL JOIN i ON i.outlet_id=g.outlet_id ORDER BY 2 DESC NULLS LAST"""):
-                  print("  OUT", h(r["o"]), r["gn"], r["gd"], r["inn"], r["idn"])
+              for r in c.exec_driver_sql("""
+                  SELECT s.uploaded_by, (s.uploaded_at_utc AT TIME ZONE 'Asia/Kolkata')::date AS day,
+                         (SELECT string_agg(DISTINCT upper(ba.business_role_code), ',') FROM auditcore.business_assignments ba
+                           WHERE ba.tenant_id = s.tenant_id AND ba.security_actor_id = s.uploaded_by AND ba.assignment_status = 'ACTIVE') AS roles,
+                         (SELECT count(*) FROM auditcore.business_assignments ba
+                           WHERE ba.tenant_id = s.tenant_id AND CAST(ba.security_actor_id AS text) = CAST(s.uploaded_by AS text)) AS any_match,
+                         length(CAST(s.uploaded_by AS text)) AS id_len
+                  FROM auditcore.p2_bank_statements s
+                  WHERE s.tenant_id = %(t)s AND s.uploaded_at_utc >= '2026-10-25'
+                  ORDER BY s.uploaded_at_utc""", {"t": T}).mappings():
+                  print("STMT", h(r["uploaded_by"]), r["day"], "roles", r["roles"], "assignments", r["any_match"], "idlen", r["id_len"])
               c.rollback()
           PY
