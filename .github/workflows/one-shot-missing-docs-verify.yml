@@ -50,6 +50,7 @@ jobs:
           )"
           test -n "$url"
           echo "::add-mask::$url"
+          echo "DB=$url" >> "$GITHUB_ENV"
       - name: The report as built, read-only
         shell: bash
         run: |
