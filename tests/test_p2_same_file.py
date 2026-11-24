@@ -1928,6 +1928,10 @@ def test_a_multi_page_document_moves_whole_and_keeps_its_page_fingerprints(tenan
         connection.execute(text(
             "UPDATE auditcore.p2_document_queue SET queue_status='MERGED', merged_into_queue_id=:g "
             "WHERE tenant_id=:t AND queue_id = ANY(:q)"), {"t": new.tenant_id, "g": group, "q": [first[1], second[1]]})
+        # The document's pages 1 and 2 (each test page is made as page 1 of its own file; left
+        # so, their order fell to random ids and the test failed one run in three).
+        connection.execute(text("UPDATE auditcore.p2_document_queue SET page_number=2, page_numbers=ARRAY[2] "
+                                "WHERE tenant_id=:t AND queue_id=:q"), {"t": new.tenant_id, "q": second[1]})
         connection.execute(text("DELETE FROM auditcore.evidence WHERE tenant_id=:t AND di_document_id=:d"),
                            {"t": new.tenant_id, "d": second[2]})
         connection.execute(text("UPDATE auditcore.evidence SET di_document_id=:d WHERE tenant_id=:t "
