@@ -119,7 +119,7 @@ _NUMBERED = re.compile(r" \(\d+\)(\.[^.]*)?$")
 
 def unnumbered(name: str) -> str:
     """The name before ``numbered``: ``scan (2).pdf`` -> ``scan.pdf`` (the SQL in migration
-    0260 is the same pattern)."""
+    0261 is the same pattern)."""
     return _NUMBERED.sub(lambda m: m.group(1) or "", str(name or ""))
 
 
