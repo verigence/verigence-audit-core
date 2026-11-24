@@ -417,6 +417,32 @@ def _follow_up_when_settled(connection: Connection, *, tenant_id: str, journey_i
                                delay_seconds=_SETTLE_FOLLOW_UP_SECONDS, force=True)
 
 
+def file_uploader(connection: Connection, *, tenant_id: str, journey_id: UUID, reference: dict[str, Any],
+                  owner: str) -> str | None:
+    """Who a PC's task about one uploaded file goes to when it is not the booking's own PC:
+    the person who uploaded that file (product owner 2026-11-24: a Drive file joined to a
+    booking another PC made -- its failed page must be resubmitted by the PC who sent it,
+    not left with the booking's creator). None when the file is the booking PC's own, or
+    the task is not a PC's or not about one file; such a task stays with the PC role."""
+    batch_id = reference.get("batchId")
+    if str(owner or "").upper() != "PC" or not batch_id:
+        return None
+    row = connection.execute(
+        text(
+            """
+            SELECT b.uploaded_by_actor_id AS uploader, j.created_by_actor_id AS booking_pc
+            FROM auditcore.p2_upload_batches b
+            JOIN auditcore.journeys j ON j.tenant_id=b.tenant_id AND j.journey_id=b.journey_id
+            WHERE b.tenant_id=:t AND b.journey_id=:j AND CAST(b.batch_id AS text)=:b
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "b": str(batch_id)},
+    ).mappings().one_or_none()
+    if row is None or not row["uploader"] or row["uploader"] in ("SYSTEM", row["booking_pc"]):
+        return None
+    return str(row["uploader"])
+
+
 def raise_or_refresh(
     connection: Connection,
     *,
@@ -454,6 +480,8 @@ def raise_or_refresh(
     priority = _PRIORITY_BY_SEVERITY.get(severity, "NORMAL")
     reference = {**reference, "issueHash": _issue_hash(reference)}
     existing = _existing(connection, tenant_id=tenant_id, dedupe_key=dedupe_key)
+    assignee = file_uploader(connection, tenant_id=tenant_id, journey_id=journey_id, reference=reference,
+                             owner=template.owner)
     now = datetime.now(UTC)
     would_raise = existing is None or (
         str(existing["task_status"]) == "VERIFIED_COMPLETE"
@@ -471,11 +499,11 @@ def raise_or_refresh(
                 INSERT INTO auditcore.p2_tasks (
                     tenant_id, journey_id, task_type, category, origin_kind, source_type, source_code,
                     dedupe_key, title, description, reference, severity, priority,
-                    assigned_role_code, allowed_actions, completion_protocol, due_at_utc
+                    assigned_role_code, assigned_actor_id, allowed_actions, completion_protocol, due_at_utc
                 ) VALUES (
                     :t, :j, :type, :category, 'SYSTEM', :source_type, :source_code,
                     :key, :title, :description, CAST(:reference AS jsonb), :severity, :priority,
-                    :owner, CAST(:actions AS jsonb), 'MACHINE_VERIFIED', :due
+                    :owner, :assignee, CAST(:actions AS jsonb), 'MACHINE_VERIFIED', :due
                 ) RETURNING task_id
                 """
             ),
@@ -483,7 +511,7 @@ def raise_or_refresh(
                 "t": tenant_id, "j": journey_id, "type": task_type, "category": template.category,
                 "source_type": source_type, "source_code": source_code, "key": dedupe_key,
                 "title": title[:300], "description": description, "reference": _json(reference),
-                "severity": severity, "priority": priority, "owner": template.owner,
+                "severity": severity, "priority": priority, "owner": template.owner, "assignee": assignee,
                 "actions": _json(list(template.actions)), "due": now + timedelta(hours=_SLA_HOURS[priority]),
             },
         ).scalar_one()
@@ -544,7 +572,10 @@ def raise_or_refresh(
         # open tasks on Mahindra Orissa pointed at replaced copies).
         or document_pointers(existing["reference"]) != document_pointers(reference)
     )
-    if outcome == "UNCHANGED" and not content_changed:
+    # An open task about another PC's file follows its uploader once (a task a person has
+    # assigned keeps its assignee).
+    reassign = assignee is not None and existing["assigned_actor_id"] is None
+    if outcome == "UNCHANGED" and not content_changed and not reassign:
         return task_id, "UNCHANGED"
     connection.execute(
         text(
@@ -553,6 +584,7 @@ def raise_or_refresh(
             SET title=:title, description=:description, reference=CAST(:reference AS jsonb),
                 severity=:severity, priority=:priority, task_status=:status,
                 task_type=:type, category=:category, assigned_role_code=:owner,
+                assigned_actor_id=COALESCE(assigned_actor_id, :assignee),
                 allowed_actions=CASE WHEN :retyped THEN CAST(:actions AS jsonb) ELSE allowed_actions END,
                 round_number=round_number + CASE WHEN :reopened THEN 1 ELSE 0 END,
                 due_at_utc=CASE WHEN :reopened THEN :due ELSE due_at_utc END,
@@ -569,7 +601,7 @@ def raise_or_refresh(
             "type": task_type if retyped else existing["task_type"],
             "category": template.category if retyped else existing["category"],
             "owner": template.owner if retyped else existing["assigned_role_code"],
-            "retyped": retyped, "actions": _json(list(template.actions)),
+            "retyped": retyped, "actions": _json(list(template.actions)), "assignee": assignee,
         },
     )
     record_task_event(

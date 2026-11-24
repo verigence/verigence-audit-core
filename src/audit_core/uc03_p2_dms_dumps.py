@@ -154,6 +154,11 @@ class ParsedDump:
     file_format: str
     sheet_name: str
     rows: list[dict[str, Any]] = field(default_factory=list)
+    # Why the file cannot be taken (the upload is refused, naming the column), and the rows the
+    # dealership is to correct in its sheet (the upload is taken) -- 24 Nov 2026, see check_sheet.
+    problems: list[str] = field(default_factory=list)
+    row_issues: list[dict[str, Any]] = field(default_factory=list)
+    sheet_rows: list[int | None] = field(default_factory=list)  # each row's row number in Excel
 
 
 def detect_kind(headers: list[str]) -> str | None:
@@ -301,8 +306,11 @@ def parse_workbook(data: bytes) -> ParsedDump:
                 kind = detect_kind(headers)
                 if kind is None:
                     continue
-                body = [r for r in values[at + 1:] if any(v not in (None, "") for v in r)]
-                parsed = _rows(kind, headers, body, sheet.title)
+                # Each line with its row number in Excel (the heading is row at + 1).
+                lines = [(at + 2 + k, r) for k, r in enumerate(values[at + 1:]) if any(v not in (None, "") for v in r)]
+                parsed = _rows(kind, headers, [r for _, r in lines], sheet.title,
+                               written=[re.sub(r"\s+", " ", str(v or "")).strip() for v in values[at]],
+                               sheet_rows=[n for n, _ in lines])
                 if parsed.rows and (best is None or len(parsed.rows) > len(best.rows)):
                     best = parsed
                 break
@@ -312,20 +320,30 @@ def parse_workbook(data: bytes) -> ParsedDump:
         raise HTTPException(status_code=422, detail=(
             "No DMS booking or delivery report was found in this file: a booking report has a "
             "'DMS Booking Number' column; a delivery report a chassis / VIN and a delivery date."))
+    if best.problems:
+        raise HTTPException(status_code=422, detail=" ".join(best.problems))
     return best
 
 
-def _rows(kind: str, headers: list[str], body: list[tuple[Any, ...]], sheet: str) -> ParsedDump:
+def _rows(kind: str, headers: list[str], body: list[tuple[Any, ...]], sheet: str, *,
+          written: list[str] | None = None, sheet_rows: list[int] | None = None) -> ParsedDump:
     columns = _columns(headers, _BOOKING_COLUMNS if kind == BOOKING else _DELIVERY_COLUMNS, body)
     out = ParsedDump(kind=kind, file_format=_format_name(kind, headers), sheet_name=sheet[:120])
-    for r in body[:MAX_ROWS]:
+    written = written or [h.title() for h in headers]
+    issues: list[dict[str, Any]] = []
+    readable = {"event_date": 0, "outlet_label": 0}
+    unreadable: list[str] = []
+    for n, r in enumerate(body[:MAX_ROWS]):
         def cell(key: str, r: tuple[Any, ...] = r) -> Any:
             i = columns.get(key)
             return r[i] if i is not None and i < len(r) else None
 
+        event_date, event_issue = sheet_date(cell("event_date"))
+        booking_cell = cell("booking_date") if kind == DELIVERY else None
+        booking_date, booking_issue = sheet_date(booking_cell)
         row = {
-            "event_date": parse_date(cell("event_date")),
-            "booking_date": parse_date(cell("booking_date")) if kind == DELIVERY else None,
+            "event_date": event_date,
+            "booking_date": booking_date,
             "booking_number": _text(cell("booking_number"), 60),
             "dms_booking_number": _text(cell("dms_booking_number"), 60),
             "customer_name": _text(cell("customer_name"), 300),
@@ -340,15 +358,119 @@ def _rows(kind: str, headers: list[str], body: list[tuple[Any, ...]], sheet: str
             "consultant": _text(cell("consultant"), 200),
             "raw": {h: _jsonable(v) for h, v in zip(headers, r, strict=False) if h and v not in (None, "")},
         }
-        if kind == DELIVERY and row["booking_date"] is None:
+        if kind == DELIVERY and row["booking_date"] is None and booking_issue is None and booking_cell in (None, ""):
             # The sheet's BOOKING DATE, however its columns were laid out: it decides Inscope /
             # Outscope (product owner 2026-11-19).
-            row["booking_date"] = parse_date(row["raw"].get("BOOKING DATE"))
+            booking_cell = row["raw"].get("BOOKING DATE")
+            row["booking_date"], booking_issue = sheet_date(booking_cell)
         keyed = row["chassis"] if kind == DELIVERY else (row["booking_number"] or row["dms_booking_number"])
         if not keyed and not (row["customer_name"] and (row["mobile"] or row["event_date"])):
             continue  # a blank or total line
         out.rows.append(row)
+        at = sheet_rows[n] if sheet_rows and n < len(sheet_rows) else None
+        out.sheet_rows.append(at)
+        readable["event_date"] += row["event_date"] is not None
+        readable["outlet_label"] += row["outlet_label"] is not None
+        if cell("event_date") not in (None, "") and row["event_date"] is None and len(unreadable) < 3:
+            shown = _shown(cell("event_date"))
+            if shown not in unreadable:
+                unreadable.append(shown)
+        date_heading = written[columns["event_date"]] if "event_date" in columns else ""
+        if event_issue:
+            issues.append(_issue(at, row, date_heading, cell("event_date"), event_issue))
+        if booking_issue:
+            heading = written[columns["booking_date"]] if "booking_date" in columns else "Booking Date"
+            issues.append(_issue(at, row, heading, booking_cell, booking_issue))
+        if row["booking_date"] and row["event_date"] and row["booking_date"] > row["event_date"]:
+            heading = written[columns["booking_date"]] if "booking_date" in columns else "Booking Date"
+            issues.append(_issue(at, row, heading, row["booking_date"],
+                                 f"is after the {date_heading or 'delivery date'} {row['event_date']:%d %b %Y}"))
+    out.problems = check_sheet(kind, headers, written, columns, body, len(out.rows), readable, unreadable)
+    out.row_issues = issues[:MAX_ROW_ISSUES]
     return out
+
+
+MAX_ROW_ISSUES = 500
+_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _letter(i: int) -> str:
+    """Excel's column letter of a 0-based column (0 -> A, 26 -> AA)."""
+    out = ""
+    i += 1
+    while i:
+        i, rest = divmod(i - 1, 26)
+        out = _LETTERS[rest] + out
+    return out
+
+
+def _shown(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.strftime("%d %b %Y") if value.year >= 1000 else f"{value.day}/{value.month}/{value.year:04d}"
+    if isinstance(value, date):
+        return value.strftime("%d %b %Y") if value.year >= 1000 else f"{value.day}/{value.month}/{value.year:04d}"
+    return re.sub(r"\s+", " ", str(value)).strip()[:60]
+
+
+def sheet_date(value: Any) -> tuple[date | None, str | None]:
+    """A dump row's date and what is wrong with it. A date that is not one, or has an impossible
+    year (11/3/0026: typed in a Google Form), is left empty and flagged, never guessed
+    (product owner 2026-11-24)."""
+    if value is None or value == "":
+        return None, None
+    day = parse_date(value)
+    if day is None:
+        return None, "is not a date"
+    if not 2000 <= day.year <= 2100:
+        return None, f"has the year {day.year:04d}"
+    return day, None
+
+
+def _issue(at: int | None, row: dict[str, Any], heading: str, value: Any, issue: str) -> dict[str, Any]:
+    return {"sheetRow": at, "customer": row.get("customer_name"), "chassis": row.get("chassis"),
+            "field": heading, "value": _shown(value) if value not in (None, "") else "", "issue": issue}
+
+
+def check_sheet(kind: str, headers: list[str], written: list[str], columns: dict[str, int],
+                body: list[tuple[Any, ...]], rows: int, readable: dict[str, int], unreadable: list[str]) -> list[str]:
+    """Why a sheet cannot be taken: its date or its location cannot be read. 24 Nov 2026: Utkal's
+    delivery sheet came with its LOCATION column headed "Delivery Date"; the first of the two
+    "Delivery Date" columns (the outlets) was read as the date, every row lost its date and its
+    outlet, and the upload was taken. Every earlier dump of every dealership had both on every row."""
+    if not rows:
+        return []
+    names = _BOOKING_COLUMNS if kind == BOOKING else _DELIVERY_COLUMNS
+    what = "booking" if kind == BOOKING else "delivery"
+    problems: list[str] = []
+
+    def same_heading(i: int) -> list[int]:
+        return [j for j, h in enumerate(headers) if h == headers[i]
+                and any(j < len(r) and r[j] not in (None, "") for r in body)]
+
+    if "event_date" not in columns:
+        listed = " / ".join(f"'{a.title()}'" for a in names["event_date"])
+        problems.append(f"No {what} date column was found ({listed}). Add it and upload again.")
+    elif readable["event_date"] * 2 < rows:
+        i = columns["event_date"]
+        twin = same_heading(i)
+        seen = f" It holds values such as {', '.join(repr(v) for v in unreadable)}." if unreadable else ""
+        problems.append(
+            f"The '{written[i]}' column (column {_letter(i)}) has no readable {what} date in "
+            f"{rows - readable['event_date']} of {rows} rows.{seen}"
+            + (f" Two columns are headed '{written[i]}' (columns {' and '.join(_letter(j) for j in twin)}):"
+               " if one of them should have another heading (such as Location), correct it" if len(twin) > 1
+               else " Correct the column")
+            + " and upload again.")
+    if "outlet_label" not in columns:
+        listed = " / ".join(f"'{a.title()}'" for a in names["outlet_label"])
+        problems.append(f"No location column was found ({listed}): each row's outlet comes from it. "
+                        "Add it and upload again.")
+    elif readable["outlet_label"] * 2 < rows:
+        i = columns["outlet_label"]
+        problems.append(f"The '{written[i]}' column (column {_letter(i)}) is empty in "
+                        f"{rows - readable['outlet_label']} of {rows} rows: each row's outlet comes from it. "
+                        "Fill it and upload again.")
+    return problems
 
 
 # --------------------------------------------------------------------------- matching
@@ -1370,6 +1492,8 @@ def _dump_json(r: Any) -> dict[str, Any]:
         # Sure matches whose model differs, and dates taken from the DMS (2026-11-21).
         "modelDiffers": int(r.get("model_differs_count") or 0),
         "datesFromDms": int(r.get("dates_from_dms_count") or 0),
+        # Rows the dealership is to correct in its sheet (2026-11-24); the list is on the upload's own read.
+        "sheetIssues": len(r.get("row_issues") or []),
     }
 
 
@@ -1420,6 +1544,14 @@ def upload_dms_dump(
         raise HTTPException(status_code=422, detail="The dump's date cannot be in the future.")
     if business_date < today - timedelta(days=62):
         raise HTTPException(status_code=422, detail="The dump's date is more than two months back.")
+    # A row dated after the dump's own date: the sheet is to be corrected (product owner 2026-11-24).
+    row_issues = list(parsed.row_issues)
+    date_heading = "Booking Date" if parsed.kind == BOOKING else "Delivery Date"
+    for row, at in zip(parsed.rows, parsed.sheet_rows or [None] * len(parsed.rows), strict=False):
+        if row["event_date"] and row["event_date"] > business_date and len(row_issues) < MAX_ROW_ISSUES:
+            row_issues.append({"sheetRow": at, "customer": row.get("customer_name"), "chassis": row.get("chassis"),
+                               "field": date_heading, "value": f"{row['event_date']:%d %b %Y}",
+                               "issue": f"is after the dump's date {business_date:%d %b %Y}"})
     dated = [r["event_date"] for r in parsed.rows if r["event_date"]]
     # The month the dump is for: its rows' latest date (a dump of 1 Nov may still be October's).
     period = (max(dated) if dated else business_date).replace(day=1)
@@ -1434,15 +1566,14 @@ def upload_dms_dump(
     connection.execute(
         text("""
             INSERT INTO auditcore.p2_dms_dumps (tenant_id, dump_id, dump_kind, dealer_id, business_date, period_month,
-              file_name, file_format, sheet_name, row_count, uploaded_by, uploaded_by_name)
-            VALUES (:t, :id, :k, :d, :b, :p, :f, :fmt, :s, :n, :by, :byn)
+              file_name, file_format, sheet_name, row_count, uploaded_by, uploaded_by_name, row_issues)
+            VALUES (:t, :id, :k, :d, :b, :p, :f, :fmt, :s, :n, :by, :byn, CAST(:ri AS jsonb))
         """),
         {"t": tenant_id, "id": str(dump_id), "k": parsed.kind, "d": str(dealerId), "b": business_date, "p": period,
          "f": name, "fmt": parsed.file_format, "s": parsed.sheet_name, "n": len(parsed.rows),
-         "by": principal.subject, "byn": _name_of(connection, principal.subject)},
+         "by": principal.subject, "byn": _name_of(connection, principal.subject),
+         "ri": json.dumps(row_issues, default=str)},
     )
-    import json
-
     connection.execute(
         text("""
             INSERT INTO auditcore.p2_dms_dump_rows (tenant_id, dump_id, row_no, dump_kind, dealer_id, outlet_label,
@@ -1488,7 +1619,7 @@ def _read_dump(connection: Connection, tenant_id: str, dump_id: UUID) -> dict[st
     ).mappings().one_or_none()
     if row is None:
         raise HTTPException(status_code=404, detail="No such upload.")
-    return _dump_json(row)
+    return {**_dump_json(row), "sheetIssueRows": list(row.get("row_issues") or [])}
 
 
 @router.get("/dms-dumps")
@@ -1801,7 +1932,10 @@ def publish_model_alert(connection: Connection, *, tenant_id: str, dump_id: UUID
     word = "booking" if kind == BOOKING else "delivery"
     payload = {"audienceActorIds": [uploader], "dumpId": str(dump_id), "dumpKind": kind,
                "dealerName": dealer_name, "count": int(count),
-               "link": f"/p2/data-uploads?dumpId={dump_id}",
+               # Data uploads opens the dump under its own section, on its "Model differs" rows
+               # (product owner 2026-11-24).
+               "link": (f"/p2/data-uploads?{'' if kind == BOOKING else 'type=delivery&'}"
+                        f"dumpId={dump_id}&view=model"),
                "download": f"/dms-dumps/{dump_id}/model-differences/file"}
     connection.execute(
         text("""

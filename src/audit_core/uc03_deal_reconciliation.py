@@ -1853,6 +1853,52 @@ def _close_total_variance(
     return True
 
 
+def _standards_written(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str:
+    """One value for everything this check writes for the Journey: its discount
+    lines and its priced lines, without the times they were written."""
+    return str(connection.execute(
+        text(
+            """
+            SELECT md5(
+              coalesce((SELECT string_agg(r.line, '|' ORDER BY r.line)
+                        FROM (SELECT (to_jsonb(d) - 'created_at_utc' - 'updated_at_utc')::text AS line
+                              FROM auditcore.discount_applications d
+                              WHERE d.tenant_id = :t AND d.journey_id = :j) r), '')
+              || '#' ||
+              coalesce((SELECT string_agg(r.line, '|' ORDER BY r.line)
+                        FROM (SELECT (to_jsonb(c) - 'created_at_utc' - 'updated_at_utc')::text AS line
+                              FROM auditcore.commercial_lines c
+                              WHERE c.tenant_id = :t AND c.journey_id = :j) r), ''))
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    ).scalar_one())
+
+
+def _screen_copy_is_stale(connection: Connection, *, tenant_id: str, journey_id: UUID, correlation_id: str) -> None:
+    """The Journey's stored price variance and Excess discount rows
+    (``p2_journey_runtime.price_variance`` / ``discount_variance``) were built
+    from the standards as they were: marked to be built again by the sweep
+    (``uc03_p2_price_variance.backfill_price_variance``).
+
+    That copy is rebuilt when the Journey's facts move. A standard that moves
+    because a master changed is not a fact of the Journey, so the copy stayed
+    as it was. Live 23 Nov 2026: three consumer bulletins were read again and
+    721 bookings were checked again -- their discount lines read the new
+    offers, and the Excess discount screen still listed the old rows (537
+    "entitlement not known") until a job rebuilt every booking's copy."""
+    connection.execute(
+        text(
+            """
+            UPDATE auditcore.p2_journey_runtime SET price_variance_fact_version = NULL
+            WHERE tenant_id = :t AND journey_id = :j AND price_variance_fact_version IS NOT NULL
+            """
+        ),
+        {"t": tenant_id, "j": journey_id},
+    )
+    logger.info("deal_standards_changed tenant=%s journey=%s correlation=%s", tenant_id, journey_id, correlation_id)
+
+
 def sync_deal_reconciliation(
     connection: Connection,
     *,
@@ -1879,10 +1925,15 @@ def sync_deal_reconciliation(
         # A savepoint: a failure here rolls back only this reconciliation,
         # never the caller's transaction.
         with connection.begin_nested():
-            return _reconcile(
+            before = _standards_written(connection, tenant_id=tenant_id, journey_id=journey_id)
+            result = _reconcile(
                 connection, tenant_id=tenant_id, journey_id=journey_id, correlation_id=correlation_id,
                 raise_findings=raise_findings,
             )
+            if _standards_written(connection, tenant_id=tenant_id, journey_id=journey_id) != before:
+                _screen_copy_is_stale(connection, tenant_id=tenant_id, journey_id=journey_id,
+                                      correlation_id=correlation_id)
+            return result
     except Exception as exc:
         raise_if_worker_transient(exc)  # retried, not skipped (uc03_db_transient)
         logger.warning("sync_deal_reconciliation failed", exc_info=True)

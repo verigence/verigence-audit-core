@@ -493,6 +493,61 @@ def test_idempotent(journey) -> None:
     assert apps == 1
 
 
+def _screen_copy_current(c) -> bool:
+    """The stored price variance / Excess discount rows count as built for the facts as they stand."""
+    return bool(c.execute(
+        text("SELECT price_variance_fact_version IS NOT DISTINCT FROM fact_version "
+             "FROM auditcore.p2_journey_runtime WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).scalar_one())
+
+
+def _mark_screen_copy_built(c) -> None:
+    done = c.execute(
+        text("UPDATE auditcore.p2_journey_runtime SET price_variance_fact_version = fact_version "
+             "WHERE tenant_id=:t AND journey_id=:j"),
+        {"t": c.tenant_id, "j": c.journey_id},
+    ).rowcount
+    if not done:
+        c.execute(
+            text("INSERT INTO auditcore.p2_journey_runtime (tenant_id, journey_id, current_stage) "
+                 "VALUES (:t, :j, 'BOOKING_VERIFY_DOCUMENTS')"),
+            {"t": c.tenant_id, "j": c.journey_id},
+        )
+        c.execute(
+            text("UPDATE auditcore.p2_journey_runtime SET price_variance_fact_version = fact_version "
+                 "WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": c.tenant_id, "j": c.journey_id},
+        )
+
+
+def test_a_standard_a_master_change_moves_marks_the_excess_discount_rows_to_be_built_again(journey) -> None:
+    """Live 23 Nov 2026: three consumer bulletins were read again and 721 bookings
+    checked again. Their discount lines read the new offers; the Excess discount
+    screen kept the rows built before, because that copy is rebuilt only when the
+    booking's own facts move. A deal check that changes nothing leaves the copy alone."""
+    c = journey
+    seeded = _seed_pinned_sku(c, model="MAXX HD", variant="1.7 LX", components={"EX_SHOWROOM": "900000"})
+    _seed_reviewed_booking(c, sales_discount_amount="23000")
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    _mark_screen_copy_built(c)
+
+    # the same masters, the same documents: nothing this check writes moves
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _screen_copy_current(c)
+
+    # the bulletin is loaded: the booking's own facts are as they were, its entitlement is not
+    _seed_scheme(c, category="CONSUMER", benefit_key="CASH_DISCOUNT", amount="25000", model_id=seeded["model_id"])
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="masters:test")
+    assert _discount(c, "CASH_DISCOUNT")["standard_eligible_amount"] == Decimal(25000)
+    assert not _screen_copy_current(c)
+
+    # built again (the sweep), and the next check with nothing new leaves it built
+    _mark_screen_copy_built(c)
+    dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+    assert _screen_copy_current(c)
+
+
 def _invoice_doc(document_type: str, fields: dict[str, object]):
     return SimpleNamespace(
         documentId=uuid4(),

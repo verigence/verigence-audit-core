@@ -150,6 +150,26 @@ class DiCaptureV2Client:
             params={"force": "true"} if force else None,
         )
 
+    def move_document(
+        self,
+        *,
+        token: str,
+        tenant_id: str,
+        external_context_ref: str,
+        document_id: str,
+        target_external_context_ref: str,
+    ) -> dict[str, Any]:
+        """Move a document DI already read to another Journey's context, with
+        its classification and reading: nothing is read again (product owner
+        2026-11-24, "no double reading"). Outcome moved or already_there."""
+        return self._request(
+            "POST",
+            f"/v2/tenants/{tenant_id}/audit-storage-contexts/"
+            f"{external_context_ref}/capture-documents/{document_id}:move",
+            token=token,
+            json={"targetExternalContextRef": target_external_context_ref},
+        )
+
     def delete_document(
         self,
         *,

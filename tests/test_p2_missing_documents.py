@@ -82,6 +82,23 @@ def _task(s, jny, title, key, *, status="READY", source="DOCUMENT_MISSING"):
              "ref": json.dumps({"requirementKey": key})})
 
 
+def _grouped_task(s, jny, items):
+    """The one task a Journey has since 15 Nov, carrying every missing document."""
+    labels = [label for _, label in items]
+    with s.journey.engine.begin() as c:
+        set_tenant_context(c, s.journey.tenant_id)
+        c.execute(
+            text("INSERT INTO auditcore.p2_tasks (tenant_id, journey_id, task_type, category, origin_kind, source_type, "
+                 "source_code, title, description, dedupe_key, assigned_role_code, task_status, completion_protocol, "
+                 "reference) VALUES (:t, :j, 'DOCUMENT_MISSING', 'MISSING_DOCUMENT', 'SYSTEM', 'DOCUMENT', "
+                 "'DOCUMENT_MISSING', :title, 'x', :k, 'PC', 'READY', 'MACHINE_VERIFIED', CAST(:ref AS jsonb))"),
+            {"t": s.journey.tenant_id, "j": jny.journey_id,
+             "title": f"Upload {len(labels)} missing documents: {', '.join(labels)}",
+             "k": f"document-missing:{jny.journey_id}",
+             "ref": json.dumps({"items": [{"key": k, "label": label} for k, label in items],
+                                "requirementKeys": [k for k, _ in items]})})
+
+
 def _gate_pass(s, jny, delivery_date):
     document = uuid4()
     with s.journey.engine.begin() as c:
@@ -161,10 +178,13 @@ def test_delivered_journeys_listed_by_day_with_names_and_counts(setup):
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["totals"] == {"journeys": 2, "documents": 3}
-    assert body["byDocument"] == [
+    assert [{k: e[k] for k in ("name", "requirementKey", "count")} for e in body["byDocument"]] == [
         {"name": "RSA Invoice", "requirementKey": "rsa_invoice", "count": 2},
         {"name": "Booking Docket", "requirementKey": "booking_docket", "count": 1},
     ]
+    # Where each is missing, by outlet.
+    assert [o["count"] for o in body["byDocument"][0]["byOutlet"]] == [2]
+    assert body["byDocument"][0]["byOutlet"][0]["outletId"] == str(delivered.outlet_id)
     assert [d["date"] for d in body["days"]] == [(today - timedelta(days=1)).isoformat(),
                                                  (today - timedelta(days=2)).isoformat()]
     [upload_row] = body["days"][0]["journeys"]
@@ -256,3 +276,21 @@ def test_close_to_completion_lists_files_held_up_by_missing_documents_alone(setu
     everyone = s.client.get(s.url).json()["closeToCompletion"]["journeys"]
     assert [j["customer"] for j in everyone] == ["Asha Das", "Bimal Sahu", "Chitra Nayak"]
     assert s.client.get(s.url, params={"top": 0}).status_code == 400
+
+
+def test_one_task_with_several_documents_counts_each_document_on_its_own(setup):
+    """Product owner 2026-11-24: the report showed "3 missing documents: A, B, C" as a type of
+    its own; it counts each document of the list."""
+    s = setup
+    first, second = _journey(s, customer="Asha Das"), _journey(s, customer="Bimal Sahu")
+    for jny in (first, second):
+        _pages(s, jny, "DELIVERY")
+    _grouped_task(s, first, [("gate_pass", "Gate pass"), ("rto_challan", "RTO Challan"),
+                             ("insurance", "Insurance Cover Note or Policy")])
+    _grouped_task(s, second, [("gate_pass", "Gate pass")])
+    body = s.client.get(s.url).json()
+    assert {e["name"]: e["count"] for e in body["byDocument"]} == {
+        "Gate pass": 2, "RTO Challan": 1, "Insurance Cover Note or Policy": 1}
+    assert body["totals"] == {"journeys": 2, "documents": 4}
+    row = next(j for d in body["days"] for j in d["journeys"] if j["journeyId"] == str(first.journey_id))
+    assert row["documents"] == ["Gate pass", "RTO Challan", "Insurance Cover Note or Policy"]

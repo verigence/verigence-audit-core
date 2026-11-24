@@ -2301,6 +2301,16 @@ def _copy_page_facts(
             ).scalar_one()
             if int(held or 0) > 0:
                 return "COPIED"
+            # A reading moved here from the journey it was first read on (a file joined to this
+            # booking, uc03_duplicate_merge._move_unit, 2026-11-24): that journey is deleted
+            # right after, and until it is its evidence still holds the document (one evidence
+            # row per DI document). Wait for it, never link it there or copy it as an extra.
+            if connection.execute(
+                text("SELECT 1 FROM auditcore.evidence WHERE tenant_id=:t AND di_document_id=:d "
+                     "AND journey_id<>:j LIMIT 1"),
+                {"t": work.tenant_id, "j": work.journey_id, "d": document_id},
+            ).scalar_one_or_none():
+                return None
             if requirement_ref is not None:
                 linked = _ensure_evidence_link_for_resync(
                     connection, tenant_id=work.tenant_id, journey_id=work.journey_id,

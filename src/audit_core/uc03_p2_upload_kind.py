@@ -23,7 +23,11 @@ came in: one still awaiting its bytes, or cancelled on arrival as the same file 
 
 Each Journey-day also carries the channel its first file came in on (direct, bulk upload or
 Google Drive), so the Tracker's channel table counts each Journey once a day, as new or as an
-update (product owner 2026-11-23: "new journey and updates to existing journey").
+update (product owner 2026-11-23: "new journey and updates to existing journey"). Pages carried
+from a file read on a Journey of its own to the customer's earlier booking (a Drive or bulk file
+joined to it, uc03_p2_same_file.carry_documents) count under the person who put the file in and
+by that file's channel (product owner 2026-11-24: a Drive file joined to an older booking was
+missing from the PC's day, counted as the booking creator's direct upload).
 """
 from __future__ import annotations
 
@@ -75,12 +79,22 @@ _SQL = f"""
     JOIN firsts f ON f.journey_id = up.journey_id
     JOIN auditcore.journeys j ON j.tenant_id = :t AND j.journey_id = up.journey_id
     -- The channel of the day's first file to the Journey: a bulk or Drive file read on it, else
-    -- direct (by the bulk files' index on the upload, 0258).
+    -- direct (by the bulk files' index on the upload, 0258). A page carried from a file read on a
+    -- Journey of its own (the copy's activity names it: job "same-file:<that journey>") goes by
+    -- the bulk or Drive file read there.
     LEFT JOIN LATERAL (
         SELECT CASE WHEN bool_or(bu.source = 'DRIVE') THEN 'drive' ELSE 'bulk' END AS channel
         FROM auditcore.p2_bulk_files bf
         JOIN auditcore.p2_bulk_uploads bu ON bu.tenant_id = bf.tenant_id AND bu.bulk_id = bf.bulk_id
-        WHERE bf.tenant_id = :t AND bf.batch_id = up.first_batch
+        WHERE bf.tenant_id = :t
+          AND (bf.batch_id = up.first_batch
+               OR bf.journey_id IN (
+                   SELECT CAST(substr(a.details->>'job', 11) AS uuid)
+                   FROM auditcore.p2_activity_events a
+                   WHERE a.tenant_id = :t AND a.journey_id = up.journey_id
+                     AND a.subject_id = CAST(up.first_batch AS text)
+                     AND a.event_type = 'DOCUMENT_COPIED_FROM_DUPLICATE'
+                     AND a.details->>'job' ~ '^same-file:[0-9a-fA-F-]{{36}}$'))
         HAVING count(*) > 0
     ) c ON true
 """
