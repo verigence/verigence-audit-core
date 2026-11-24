@@ -1,0 +1,105 @@
+name: One-shot Project Tracker figures diagnose (read-only)
+
+# Read-only: the figures behind the Tracker's "Who is doing what" PCs table and the
+# daily duties (duty days missed, cash register, bank statement, photos). Counts only,
+# people as short hashes: this repository is public. Never writes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/tracker-figures-diagnose]
+    paths:
+      - '.github/workflows/one-shot-tracker-figures-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install 'psycopg[binary]>=3.2,<4'
+          npm install --global @railway/cli@5.70.0
+      - name: Reach the live database
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/vars.json
+          url="$(python - <<'PY'
+          import json
+          from urllib.parse import urlparse
+          v = json.load(open('/tmp/vars.json'))
+          for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
+              value = (v.get(key) or '').replace('postgresql+psycopg://', 'postgresql://', 1)
+              host = (urlparse(value).hostname or '').lower()
+              if value and host and not host.endswith('.railway.internal'):
+                  print(value)
+                  break
+          PY
+          )"
+          test -n "$url"
+          echo "::add-mask::$url"
+          echo "DB=$url" >> "$GITHUB_ENV"
+      - name: Tracker figures, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, psycopg
+          T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
+          IST = "Asia/Kolkata"
+          def q(c, label, sql, args=()):
+              for r in c.execute(sql, args):
+                  print(label, tuple(r))
+          with psycopg.connect(os.environ["DB"], options="-c statement_timeout=120000") as c:
+              c.execute("SET TRANSACTION READ ONLY")
+              c.execute("SELECT set_config('app.tenant_id', %s, true)", (T,))
+              q(c, "DUTY", """SELECT title, checker_code, close_mode, carry_days, day_offset, mandatory, status,
+                    allow_not_received, weekdays FROM auditcore.p2_duties WHERE tenant_id=%s ORDER BY sort_order""", (T,))
+              q(c, "ITEMS", """SELECT title, duty_date, status, coalesce(done_source,'-'),
+                    count(*) FILTER (WHERE status='DONE' AND done_on <= duty_date) on_day,
+                    count(*) FILTER (WHERE status='DONE' AND done_on > duty_date) late, count(*)
+                  FROM auditcore.p2_duty_items WHERE tenant_id=%s AND duty_date BETWEEN DATE '2026-11-17' AND DATE '2026-11-24'
+                  GROUP BY 1,2,3,4 ORDER BY 1,2,3,4""", (T,))
+              q(c, "CASH_VALUES", """SELECT duty_date, status, input_values <> '{}'::jsonb AS has_values,
+                    (SELECT string_agg(DISTINCT k, ',') FROM jsonb_object_keys(input_values) k) keys, count(*)
+                  FROM auditcore.p2_duty_items WHERE tenant_id=%s AND duty_date BETWEEN DATE '2026-11-17' AND DATE '2026-11-24'
+                    AND (title ILIKE '%%cash%%' OR checker_code ILIKE '%%cash%%') GROUP BY 1,2,3,4 ORDER BY 1,2,3""", (T,))
+              q(c, "REASONS", """SELECT on_date, category, side, count(*) FROM auditcore.p2_duty_reasons
+                  WHERE tenant_id=%s AND on_date BETWEEN DATE '2026-11-17' AND DATE '2026-11-24' GROUP BY 1,2,3 ORDER BY 1,2,3""", (T,))
+              q(c, "NEW_JOURNEYS_24", """SELECT left(md5(created_by_actor_id),6), count(*) FROM auditcore.journeys
+                  WHERE tenant_id=%s AND (created_at_utc AT TIME ZONE %s)::date = DATE '2026-11-24'
+                  GROUP BY 1 ORDER BY 2 DESC""", (T, IST))
+              q(c, "PC_TASKS", """SELECT left(md5(COALESCE(t.assigned_actor_id, j.created_by_actor_id)),6) person,
+                    count(*) open_, count(*) FILTER (WHERE t.due_at_utc < now()) overdue,
+                    count(DISTINCT t.journey_id) journeys,
+                    count(*) FILTER (WHERE t.due_at_utc < now() - interval '7 days') overdue_7d,
+                    min((t.created_at_utc AT TIME ZONE %s)::date) oldest
+                  FROM auditcore.p2_tasks t LEFT JOIN auditcore.journeys j ON j.tenant_id=t.tenant_id AND j.journey_id=t.journey_id
+                  WHERE t.tenant_id=%s AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')
+                    AND upper(COALESCE(t.assigned_role_code,''))='PC' AND t.action_completed_at_utc IS NULL
+                    AND t.created_at_utc >= now() - interval '120 days'
+                  GROUP BY 1 ORDER BY 3 DESC LIMIT 15""", (IST, T))
+              q(c, "OVERDUE_TYPES", """SELECT t.task_type, t.task_status, count(*) FROM auditcore.p2_tasks t
+                  WHERE t.tenant_id=%s AND t.task_status NOT IN ('VERIFIED_COMPLETE','CANCELLED','FAILED','DEAD_LETTER')
+                    AND upper(COALESCE(t.assigned_role_code,''))='PC' AND t.action_completed_at_utc IS NULL
+                    AND t.created_at_utc >= now() - interval '120 days' AND t.due_at_utc < now()
+                  GROUP BY 1,2 ORDER BY 3 DESC LIMIT 20""", (T,))
+              q(c, "STATEMENTS", """SELECT (uploaded_at_utc AT TIME ZONE %s)::date, left(md5(uploaded_by),6), status, count(*)
+                  FROM auditcore.p2_bank_statements WHERE tenant_id=%s AND uploaded_at_utc >= TIMESTAMPTZ '2026-11-10'
+                  GROUP BY 1,2,3 ORDER BY 1,2""", (IST, T))
+              q(c, "PHOTOS", """SELECT (uploaded_at_utc AT TIME ZONE %s)::date, capture_source, left(md5(uploaded_by_actor_id),6),
+                    count(*), count(DISTINCT journey_id)
+                  FROM auditcore.delivery_vehicle_photos WHERE tenant_id=%s AND deleted_at_utc IS NULL
+                    AND uploaded_at_utc >= TIMESTAMPTZ '2026-11-17' GROUP BY 1,2,3 ORDER BY 1,2,3""", (IST, T))
+          PY
