@@ -1,0 +1,84 @@
+name: One-shot bulk upload "Not uploaded before submit" diagnose (DEV, read-only)
+
+# Read-only: the 24 Nov bulk drops and their file rows, to find why files were
+# marked "Not uploaded before submit". Never writes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/bulk-not-uploaded-diagnose]
+    paths:
+      - '.github/workflows/one-shot-bulk-not-uploaded-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install 'psycopg[binary]>=3.2,<4'
+          npm install --global @railway/cli@5.70.0
+      - name: Reach the live database
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/vars.json
+          url="$(python - <<'PY'
+          import json
+          from urllib.parse import urlparse
+          v = json.load(open('/tmp/vars.json'))
+          for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
+              value = (v.get(key) or '').replace('postgresql+psycopg://', 'postgresql://', 1)
+              host = (urlparse(value).hostname or '').lower()
+              if value and host and not host.endswith('.railway.internal'):
+                  print(value)
+                  break
+          PY
+          )"
+          test -n "$url"
+          echo "::add-mask::$url"
+          echo "DB=$url" >> "$GITHUB_ENV"
+      - name: Bulk drops, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, psycopg
+          with psycopg.connect(os.environ["DB"], options="-c statement_timeout=60000") as c:
+              c.execute("SET TRANSACTION READ ONLY")
+              tenants = [r[0] for r in c.execute("SELECT DISTINCT tenant_id FROM auditcore.tenant_rule_config")]
+              print("tenants:", tenants)
+              for t in tenants:
+                  c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
+                  drops = c.execute("""SELECT bulk_id, uploaded_by_name, outlet_id, status, source, folder, file_count,
+                        created_at_utc, submitted_at_utc, finished_at_utc
+                      FROM auditcore.p2_bulk_uploads WHERE tenant_id=%s AND created_at_utc > now() - interval '3 days'
+                      ORDER BY created_at_utc""", (t,)).fetchall()
+                  for d in drops:
+                      print("\nDROP", t[:8], d)
+                      rows = c.execute("""SELECT original_filename, upload_status, outcome, detail, size_bytes,
+                            to_char(created_at_utc AT TIME ZONE 'Asia/Kolkata','HH24:MI:SS') AS created_ist,
+                            to_char(updated_at_utc AT TIME ZONE 'Asia/Kolkata','HH24:MI:SS') AS updated_ist
+                          FROM auditcore.p2_bulk_files WHERE tenant_id=%s AND bulk_id=%s
+                          ORDER BY created_at_utc, original_filename""", (t, d[0])).fetchall()
+                      for r in rows:
+                          print("   ", r)
+                  # every 'Not uploaded before submit' ever, by drop
+                  for r in c.execute("""SELECT f.bulk_id, b.uploaded_by_name, b.source, to_char(b.submitted_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI') s,
+                        count(*) FILTER (WHERE f.detail='Not uploaded before submit') nub, count(*) total
+                      FROM auditcore.p2_bulk_files f JOIN auditcore.p2_bulk_uploads b ON b.tenant_id=f.tenant_id AND b.bulk_id=f.bulk_id
+                      WHERE f.tenant_id=%s GROUP BY 1,2,3,4 HAVING count(*) FILTER (WHERE f.detail='Not uploaded before submit')>0
+                      ORDER BY 4""", (t,)):
+                      print("NUB-HISTORY", r)
+          PY
