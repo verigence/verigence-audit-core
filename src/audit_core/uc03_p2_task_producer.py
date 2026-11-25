@@ -2018,7 +2018,10 @@ def _named_documents(connection: Connection, *, tenant_id: str, journey_id: UUID
 
 
 def _gst_trade_names(connection: Connection, *, tenant_id: str, journey_id: UUID, document_id: str | None) -> list[str]:
-    """The trade name the GST certificate prints, if any."""
+    """The names the GST certificate prints: its trade name, if any, and its
+    legal name. A sole proprietor's customer is named by the trade name
+    (2026-11-25, uc03_p2_customer.proprietor_trade_name); the legal name, the
+    owner's own, is still the customer's name on their documents."""
     if not document_id:
         return []
     return [str(v) for v in connection.execute(
@@ -2026,7 +2029,7 @@ def _gst_trade_names(connection: Connection, *, tenant_id: str, journey_id: UUID
             """
             SELECT DISTINCT f.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields f
             WHERE f.tenant_id=:t AND f.journey_id=:j AND f.di_document_id=CAST(:d AS uuid)
-              AND f.field_key IN ('organisation_trade_name', 'trade_name')
+              AND f.field_key IN ('organisation_trade_name', 'trade_name', 'organisation_legal_name', 'legal_name')
               AND f.effective_value IS NOT NULL AND f.effective_value <> 'null'::jsonb
             """
         ),

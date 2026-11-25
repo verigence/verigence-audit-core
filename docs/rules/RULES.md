@@ -118,6 +118,12 @@ rule once, with what it replaced and where it is read, is what stops that.
 | A date one DMS dump gives a Journey is not written over by an older dump of the same kind that gives it another date: the newest dump's date stands. | 23 Nov 2026 | each re-match wrote every dump's date in turn | `uc03_p2_dms_dumps._dated_by_newer_dump` | DMS_REMATCH |
 | A booking's enquiry number is shown on Journey 360's booking card and in the Excel export (last column, Enquiry No): the booking form / docket's, else the newest DMS booking dump's for the same booking (matched on its booking or enquiry number), marked "(from DMS)" on Journey 360. Beside it, the DMS PIN: the customer's mailing PIN in the same DMS booking dump row (Journey 360 booking card; export last column, DMS PIN); the Pincode column stays the KYC's. | 23 Nov 2026 | not shown | `uc03_p2_journey360.vehicle` (booking), `uc03_p2_journey_export` | — (read live) |
 
+## Customer name
+
+| Rule | Since | Replaces | Read by | Job for bookings before |
+|---|---|---|---|---|
+| With a GST certificate carrying a GSTIN on file, the customer is named as per the GST certificate. A sole proprietor's certificate (the GSTIN's PAN is an individual's: its sixth character is P) prints the owner's own name as its legal name and the business as its trade name, the customer is named by the trade name when it is printed, is not the owner's own name, and the booking's own papers (receipts, invoices, insurance, booking papers) are mostly in it -- the name follows the papers (product owner's choice, 25 Nov 2026: a live check found 134 of 280 such bookings with papers mostly in the trade name, 132 mostly in the owner's name). Papers mostly in the owner's name, a tie, or none yet: the owner's name stands. A company's, firm's, trust's or HUF's GSTIN names the organisation as its legal name, as before. | 25 Nov 2026 | the GST legal name for every GSTIN (27 Oct), which named every sole proprietor by the owner's name, also where the receipts and invoices carry the business's | `uc03_p2_customer.sync_customer_name` (`proprietor_trade_name`); the customer-name check (`uc03_p2_task_producer.customer_name_check`: the certificate's legal and trade names both count as the customer's); everywhere the customer's name is shown or searched (journey lists, Journey 360, exports) and the DMS matching index | `GST_TRADE_NAME` (names again and settles each sole-proprietor booking) |
+
 ## Duplicate bookings
 
 | Rule | Since | Replaces | Read by | Job for bookings before |
