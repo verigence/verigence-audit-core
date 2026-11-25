@@ -1,0 +1,122 @@
+name: One-shot GST trade name preview (read-only)
+
+# Read-only: how many sole-proprietor bookings the GST trade-name rule would rename, and whether
+# their receipts / invoices / insurance carry the trade name. Counts only (public repository). Never writes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/gst-trade-preview]
+    paths:
+      - '.github/workflows/one-shot-gst-trade-preview.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install -e . 'psycopg[binary]>=3.2,<4'
+          npm install --global @railway/cli@5.70.0
+      - name: Reach the live database
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/vars.json
+          url="$(python - <<'PY'
+          import json
+          from urllib.parse import urlparse
+          v = json.load(open('/tmp/vars.json'))
+          for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
+              value = (v.get(key) or '').replace('postgresql+psycopg://', 'postgresql://', 1)
+              host = (urlparse(value).hostname or '').lower()
+              if value and host and not host.endswith('.railway.internal'):
+                  print(value)
+                  break
+          PY
+          )"
+          test -n "$url"
+          echo "::add-mask::$url"
+          echo "DB=$url" >> "$GITHUB_ENV"
+      - name: Preview, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from collections import Counter, defaultdict
+          from sqlalchemy import create_engine
+          from audit_core.db import set_tenant_context
+          from audit_core.uc03_p2_customer import is_individual_gstin, proprietor_trade_name
+          from audit_core.uc03_p2_names import same_organisation, same_person
+          T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
+          e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
+          with e.connect() as c:
+              c.exec_driver_sql("SET TRANSACTION READ ONLY")
+              set_tenant_context(c, T)
+              certs = c.exec_driver_sql("""
+                  SELECT e.journey_id, e.linked_at_utc, c.legal_name AS customer,
+                         max(f.effective_value #>> '{}') FILTER (WHERE f.field_key='gstin') AS gstin,
+                         max(f.effective_value #>> '{}') FILTER (WHERE f.field_key='organisation_legal_name') AS legal,
+                         max(f.effective_value #>> '{}') FILTER (WHERE f.field_key IN ('organisation_trade_name','trade_name')) AS trade
+                  FROM auditcore.evidence e
+                  JOIN auditcore.journeys j ON j.tenant_id=e.tenant_id AND j.journey_id=e.journey_id
+                  JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+                  JOIN auditcore.journey_document_extracted_fields f
+                    ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
+                  WHERE e.tenant_id=%(t)s AND e.document_type_key='gst_certificate' AND e.association_status='ACTIVE'
+                  GROUP BY e.evidence_id, e.journey_id, e.linked_at_utc, c.legal_name
+                  ORDER BY e.linked_at_utc DESC""", {"t": T}).mappings().all()
+              names = defaultdict(list)
+              for r in c.exec_driver_sql("""
+                  SELECT e.journey_id, e.document_type_key AS doc, f.effective_value #>> '{}' AS name
+                  FROM auditcore.evidence e JOIN auditcore.journey_document_extracted_fields f
+                    ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
+                  WHERE e.tenant_id=%(t)s AND e.association_status='ACTIVE'
+                    AND e.document_type_key IN ('dealer_receipt','payment_receipt','customer_invoice_dms','tax_invoice_tally',
+                                                'insurance_cover','booking_form','booking_docket','delivery_order_cover')
+                    AND f.field_key IN ('customer_name','buyer_name','insured_name')""", {"t": T}).mappings():
+                  if r["name"]:
+                      names[r["journey_id"]].append((r["doc"], r["name"]))
+              c.rollback()
+          seen, stats, docs = set(), Counter(), Counter()
+          for r in certs:
+              if r["journey_id"] in seen:
+                  continue
+              seen.add(r["journey_id"])
+              if not is_individual_gstin(r["gstin"]):
+                  continue
+              trade = proprietor_trade_name(gstin=r["gstin"], legal_name=r["legal"], trade_name=r["trade"])
+              if trade is None:
+                  stats["proprietor: no separate trade name (keeps owner's name)"] += 1
+                  continue
+              if r["customer"] and " ".join(r["customer"].split()).upper() == trade.upper():
+                  stats["proprietor: already named by trade name"] += 1
+                  continue
+              stats["proprietor: WOULD RENAME to trade name"] += 1
+              t_hits = o_hits = other = 0
+              for doc, n in names[r["journey_id"]]:
+                  if same_organisation(n, trade) or same_person(n, trade):
+                      t_hits += 1; docs[(doc, "trade name")] += 1
+                  elif r["legal"] and same_person(n, r["legal"]):
+                      o_hits += 1; docs[(doc, "owner's name")] += 1
+                  else:
+                      other += 1; docs[(doc, "other")] += 1
+              stats["  of these, documents mostly in trade name" if t_hits > o_hits else
+                    ("  of these, documents mostly in owner's name" if o_hits > t_hits else "  of these, mixed / none")] += 1
+          for k, n in stats.items():
+              print("PREVIEW", n, "|", k)
+          for (doc, who), n in sorted(docs.items()):
+              print("DOCS", doc, "|", who, "|", n)
+          PY
