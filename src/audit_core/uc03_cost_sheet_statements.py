@@ -13,8 +13,10 @@ cost_sheet schema 1.1 reads the title printed at the top (``document_title``).
 This job lists the cost sheets whose title is a statement's ("Vehicle Account
 Statement", "Final Vehicle Accounts Statement", "Account(s) Statement",
 "Offer Letter / Payment Details") and reads each page again as the NDC, the
-same path as a PC's "Set the document type" (uc03_page_retype). A quotation
-("Quotation", "Quotation cum Proforma Invoice", "Cost Sheet") stays a cost sheet.
+same path as a PC's "Set the document type" (uc03_page_retype). A page titled
+"Cost Sheet" stays a cost sheet; a quotation ("Quotation", "Quotation cum
+Proforma Invoice", "Proforma Invoice") is neither the cost sheet nor the NDC
+and is set aside as a supporting document (2026-11-25, uc03_quotation).
 
 A COST SHEET READ BEFORE SCHEMA 1.1 HAS NO TITLE (2026-11-10). The job above
 judged only pages whose title had been read, so the 93 live cost sheets read
