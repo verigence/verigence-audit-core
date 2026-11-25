@@ -50,50 +50,35 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Booking day gaps on two-thing matches, read-only
+      - name: After the re-match, read-only
         shell: bash
         run: |
-          git fetch -q --depth=1 origin claude/dms-booking-match-ladder && git checkout -q FETCH_HEAD -- src pyproject.toml
-          python -m pip install -q -e . 2>&1 | tail -1
           python - <<'PY'
-          import os, json
-          from sqlalchemy import create_engine, text
-          from audit_core import uc03_p2_dms_dumps as m
-          from audit_core.uc03_p2_dates import parse_extracted_date
-          from audit_core.uc03_p2_dms_field_sync import _COPIES_SQL, BOOKING_DOCS
-          engine = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
-          t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
-          out = []
-          with engine.connect() as c:
-              tx = c.begin()
-              c.execute(text("SET TRANSACTION READ ONLY"))
-              c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": t})
-              dumps = c.execute(text("""SELECT DISTINCT ON (u.dealer_id) u.dump_id, d.dealer_name, u.business_date, u.file_name FROM auditcore.p2_dms_dumps u
-                  JOIN auditcore.dealers d ON d.tenant_id=u.tenant_id AND d.dealer_id=u.dealer_id
-                  WHERE u.tenant_id=:t AND u.status='ACTIVE' AND u.dump_kind='BOOKING' ORDER BY u.dealer_id, u.business_date DESC, u.uploaded_at_utc DESC"""), {"t": t}).all()
-              journeys = {str(r[0]): (r[1], r[2]) for r in c.execute(text("""SELECT j.journey_id, j.journey_reference, o.outlet_name FROM auditcore.journeys j
-                  LEFT JOIN auditcore.dealer_outlets o ON o.tenant_id=j.tenant_id AND o.outlet_id=j.outlet_id WHERE j.tenant_id=:t"""), {"t": t})}
-              for dump_id, dealer, bdate, fname in dumps:
-                  rows = {r.row_no: r for r in c.execute(text("SELECT * FROM auditcore.p2_dms_dump_rows WHERE tenant_id=:t AND dump_id=:d"), {"t": t, "d": dump_id})}
-                  plan = m.plan_dump(c, tenant_id=t, dump_id=dump_id)
-                  pairs = [(u, rows[u["n"]]) for u in plan.updates if u["j"] and u["o"] == "MATCHED" and u["b"] != "BOOKING_NUMBER"]
-                  copies = {}
-                  for r in c.execute(text(_COPIES_SQL), {"t": t, "js": sorted({u["j"] for u, _ in pairs}), "fks": ["booking_date"], "docs": list(BOOKING_DOCS)}).mappings():
-                      copies.setdefault(r["journey_id"], []).append(dict(r))
-                  for u, r in pairs:
-                      day = r.event_date
-                      for cp in copies.get(u["j"], []):
-                          read = parse_extracted_date(cp["value"])
-                          if read and day and read != day:
-                              x, y = read.strftime("%d%m%Y"), day.strftime("%d%m%Y")
-                              diff = [i for i in range(8) if x[i] != y[i]]
-                              if len(diff) == 1 and diff[0] < 2:
-                                  ref, outlet = journeys.get(u["j"], (None, None))
-                                  out.append({"dealer": dealer, "dump": f"{fname} ({bdate:%d %b})", "row": u["n"], "customer": r.customer_name,
-                                              "otf": r.dms_booking_number or r.booking_number, "mobile": r.mobile, "dmsOutlet": r.outlet_label,
-                                              "journey": ref, "journeyOutlet": outlet, "matchedOn": u["b"], "document": cp["doc"],
-                                              "formDate": read.isoformat(), "dmsDate": day.isoformat(), "days": (day - read).days})
-              tx.rollback()
-          print("GAPCOUNT", len(out))
-          print("GAPJSON " + json.dumps(out))
+          import os, psycopg
+          with psycopg.connect(os.environ["DB"], options="-c statement_timeout=120000") as c:
+              c.execute("SET TRANSACTION READ ONLY")
+              t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
+              c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
+              latest = """SELECT DISTINCT ON (dealer_id) dump_id FROM auditcore.p2_dms_dumps WHERE tenant_id=%s AND status='ACTIVE'
+                          AND dump_kind='BOOKING' ORDER BY dealer_id, business_date DESC, uploaded_at_utc DESC"""
+              for r in c.execute(f"""SELECT r.customer_name, r.dms_booking_number, r.outcome, r.match_basis,
+                    (SELECT journey_reference FROM auditcore.journeys j WHERE j.tenant_id=r.tenant_id AND j.journey_id=r.journey_id),
+                    EXISTS (SELECT 1 FROM auditcore.p2_dms_intimations i WHERE i.tenant_id=r.tenant_id AND i.withdrawn_at_utc IS NULL
+                            AND i.row_key = 'OTF:' || r.dms_booking_number)
+                  FROM auditcore.p2_dms_dump_rows r WHERE r.tenant_id=%s AND r.dump_id IN ({latest})
+                    AND r.dms_booking_number IN ('OTF27C054617','OTF27C054649','OTF27C053725','OTF27C054286','OTF27C054352','OTF27C053164')
+                  ORDER BY 1""", (t, t)):
+                  print("ROW", r)
+              for r in c.execute("""SELECT field_key, previous_value, new_value, to_char(changed_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI')
+                  FROM auditcore.journey_field_change_log WHERE tenant_id=%s AND change_reason='DMS_SYNC'
+                    AND changed_at_utc > now() - interval '3 hours' ORDER BY field_key, changed_at_utc""", (t,)):
+                  print("LOG", r)
+              print("LOGCOUNT", c.execute("""SELECT field_key, count(*) FROM auditcore.journey_field_change_log WHERE tenant_id=%s
+                  AND change_reason='DMS_SYNC' AND changed_at_utc > now() - interval '3 hours' GROUP BY 1""", (t,)).fetchall())
+              jids = [r[0] for r in c.execute("""SELECT DISTINCT journey_id FROM auditcore.journey_field_change_log WHERE tenant_id=%s
+                  AND change_reason='DMS_SYNC' AND changed_at_utc > now() - interval '3 hours'""", (t,))]
+              print("TASKS", c.execute("""SELECT task_status, count(*) FROM auditcore.p2_tasks WHERE tenant_id=%s AND journey_id = ANY(%s)
+                  AND task_type='MANUAL_VERIFICATION_REVIEW' AND updated_at_utc > now() - interval '3 hours' GROUP BY 1""", (t, jids)).fetchall())
+              print("RECOMPUTE_PENDING", c.execute("""SELECT count(*) FROM auditcore.p2_journey_runtime WHERE tenant_id=%s AND journey_id = ANY(%s)
+                  AND recompute_requested_version > COALESCE(recompute_completed_version, 0)""", (t, jids)).fetchone() if False else "n/a")
           PY
