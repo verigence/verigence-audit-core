@@ -50,7 +50,7 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Banita Sasmal — insurance type, read-only
+      - name: Banita Sasmal — insurance sources, read-only
         shell: bash
         run: |
           python - <<'PY'
@@ -61,55 +61,32 @@ jobs:
                   try:
                       return list(self.conn.execute(sql, params))
                   except Exception as exc:
-                      print("QUERYERR", type(exc).__name__, str(exc).splitlines()[0][:200])
-                      return []
+                      print("QUERYERR", type(exc).__name__, str(exc).splitlines()[0][:200]); return []
           with psycopg.connect(os.environ["DB"], autocommit=True, options="-c statement_timeout=120000 -c default_transaction_read_only=on") as raw:
-              t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
+              t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'; j = '93b5ad09-3b2a-4dda-a313-9ede8ec61ced'
               raw.execute("SELECT set_config('app.tenant_id', %s, false)", (t,))
               c = Safe(raw)
-              jcols = [r[0] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore' AND table_name='journeys'")]
-              namecol = next((x for x in ("customer_name", "customer_display_name") if x in jcols), None)
-              ids = set()
-              if namecol:
-                  ids |= {r[0] for r in c.execute(f"SELECT journey_id FROM auditcore.journeys WHERE tenant_id=%s AND {namecol} ILIKE '%%BANITA%%' AND {namecol} ILIKE '%%SASMAL%%'", (t,))}
-              ids |= {r[0] for r in c.execute("""SELECT DISTINCT journey_id FROM auditcore.journey_document_extracted_fields WHERE tenant_id=%s
-                   AND field_key IN ('customer_name','insured_name','buyer_name') AND effective_value #>> '{}' ILIKE '%%BANITA%%' AND effective_value #>> '{}' ILIKE '%%SASMAL%%'""", (t,))}
-              print("JOURNEYS", len(ids))
-              for j in ids:
-                  r = (c.execute(f"SELECT journey_reference, {namecol or 'NULL'}, dealer_id FROM auditcore.journeys WHERE tenant_id=%s AND journey_id=%s", (t, j)) or [(None, None, None)])[0]
-                  print("\n==== JOURNEY", j, r)
-                  ccols = [x[0] for x in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore' AND table_name='journey_classifications' AND column_name LIKE 'insurance%%'")]
-                  rows = c.execute(f"SELECT {', '.join(ccols)} FROM auditcore.journey_classifications WHERE tenant_id=%s AND journey_id=%s", (t, j))
-                  print("CLASS", dict(zip(ccols, rows[0])) if rows else None)
-                  icols = [x[0] for x in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore' AND table_name='insurance_records' ORDER BY ordinal_position")]
-                  for row in c.execute("SELECT * FROM auditcore.insurance_records WHERE tenant_id=%s AND journey_id=%s", (t, j)):
-                      print("INSREC", {k: str(v)[:120] for k, v in zip(icols, row) if v is not None and k not in ('tenant_id',)})
-                  for row in c.execute("""SELECT document_type_key, association_status, di_document_id FROM auditcore.evidence WHERE tenant_id=%s AND journey_id=%s
-                       ORDER BY document_type_key""", (t, j)):
-                      print("EVID", row)
-                  for row in c.execute("""SELECT e.document_type_key, f.field_key, left(f.effective_value #>> '{}', 160), f.confidence
-                       FROM auditcore.journey_document_extracted_fields f JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id
-                         AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
-                       WHERE f.tenant_id=%s AND f.journey_id=%s AND (e.document_type_key ILIKE '%%insur%%' OR e.document_type_key ILIKE '%%policy%%'
-                         OR f.field_key ~* 'insur|policy|misp|agent|premium|cover|idv|add_on|addon|zero|nil_dep|od_|tp_')
-                       ORDER BY 1,2""", (t, j)):
-                      print("FIELD", row)
-                  for row in c.execute("""SELECT e.document_type_key, f.effective_value FROM auditcore.journey_document_extracted_fields f
-                       JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
-                       WHERE f.tenant_id=%s AND f.journey_id=%s AND f.field_key='line_items'""", (t, j)):
-                      items = row[1] if isinstance(row[1], list) else []
-                      for it in items:
-                          if isinstance(it, dict) and 'INSUR' in json.dumps(it).upper():
-                              print("LINE", row[0], json.dumps(it)[:300])
-                  for row in c.execute("""SELECT task_type, task_status, left(coalesce(title,''),120) FROM auditcore.p2_tasks WHERE tenant_id=%s AND journey_id=%s
-                       AND (task_type ILIKE '%%INSUR%%' OR title ILIKE '%%insur%%')""", (t, j)):
-                      print("TASK", row)
-                  for row in c.execute("""SELECT d.policy_number, d.insurer, d.misp_code, d.dealer_id, u.status FROM auditcore.p2_insurance_dump_rows d
-                       JOIN auditcore.p2_insurance_dumps u ON u.tenant_id=d.tenant_id AND u.dump_id=d.dump_id WHERE d.tenant_id=%s AND d.journey_id=%s""", (t, j)):
-                      print("DUMP", row)
-                  for row in c.execute("""SELECT field_key, left(coalesce(old_value::text,''),80), left(coalesce(new_value::text,''),80), change_reason, changed_at_utc
-                       FROM auditcore.journey_field_change_log WHERE tenant_id=%s AND journey_id=%s AND field_key ~* 'insur|policy|misp|agent'
-                       ORDER BY changed_at_utc""", (t, j)):
-                      print("CHANGE", row)
-                  print("DEALERCODES", c.execute("SELECT normalized_code FROM auditcore.dealer_insurance_codes WHERE tenant_id=%s AND dealer_id=%s", (t, r[2])))
+              for k in ("misp_code", "agent_intermediary_code", "agent_intermediary_name", "insurance_source", "insurance_by",
+                        "insurance_source_set_at_utc", "policy_type", "cover_type", "actual_premium_amount", "updated_at_utc"):
+                  print("INSREC", k, c.execute(f"SELECT {k} FROM auditcore.insurance_records WHERE tenant_id=%s AND journey_id=%s", (t, j)))
+              for r in c.execute("""SELECT s.line_kind, s.component_key, s.source_document_type, s.amount, s.source_document_id, s.updated_at_utc,
+                       (SELECT e.association_status FROM auditcore.evidence e WHERE e.tenant_id=s.tenant_id AND e.evidence_id=s.source_evidence_id)
+                  FROM auditcore.commercial_line_source_values s WHERE s.tenant_id=%s AND s.journey_id=%s AND s.component_key ILIKE '%%insur%%'
+                  ORDER BY s.updated_at_utc""", (t, j)):
+                  print("SRC", r)
+              for r in c.execute("""SELECT e.document_type_key, e.di_document_id, f.field_key, left(f.effective_value #>> '{}', 200)
+                  FROM auditcore.journey_document_extracted_fields f JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id
+                    AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
+                  WHERE f.tenant_id=%s AND f.journey_id=%s AND (e.document_type_key='insurance_cover'
+                    OR f.field_key ~* 'insur|misp|agent|premium|document_title|statement_date|ledger_date|quotation|valid')
+                  ORDER BY 1,2,3""", (t, j)):
+                  print("FIELD", r)
+              for r in c.execute("""SELECT e.document_type_key, e.di_document_id, f.effective_value FROM auditcore.journey_document_extracted_fields f
+                  JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
+                  WHERE f.tenant_id=%s AND f.journey_id=%s AND f.field_key='line_items' AND e.document_type_key IN ('cost_sheet','customer_ledger')""", (t, j)):
+                  items = r[2] if isinstance(r[2], list) else []
+                  print("ITEMS", r[0], r[1], len(items))
+                  for it in items:
+                      if isinstance(it, dict) and 'INSUR' in json.dumps(it).upper():
+                          print("   LINE", json.dumps(it)[:300])
           PY
