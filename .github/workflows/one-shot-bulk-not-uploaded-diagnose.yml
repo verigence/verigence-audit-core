@@ -50,7 +50,7 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: After the re-match, read-only
+      - name: Failed reads and upload errors, read-only
         shell: bash
         run: |
           python - <<'PY'
@@ -59,26 +59,46 @@ jobs:
               c.execute("SET TRANSACTION READ ONLY")
               t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
               c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
-              latest = """SELECT DISTINCT ON (dealer_id) dump_id FROM auditcore.p2_dms_dumps WHERE tenant_id=%s AND status='ACTIVE'
-                          AND dump_kind='BOOKING' ORDER BY dealer_id, business_date DESC, uploaded_at_utc DESC"""
-              for r in c.execute(f"""SELECT r.customer_name, r.dms_booking_number, r.outcome, r.match_basis,
-                    (SELECT journey_reference FROM auditcore.journeys j WHERE j.tenant_id=r.tenant_id AND j.journey_id=r.journey_id),
-                    EXISTS (SELECT 1 FROM auditcore.p2_dms_intimations i WHERE i.tenant_id=r.tenant_id AND i.withdrawn_at_utc IS NULL
-                            AND i.row_key = 'OTF:' || r.dms_booking_number)
-                  FROM auditcore.p2_dms_dump_rows r WHERE r.tenant_id=%s AND r.dump_id IN ({latest})
-                    AND r.dms_booking_number IN ('OTF27C054617','OTF27C054649','OTF27C053725','OTF27C054286','OTF27C054352','OTF27C053164')
-                  ORDER BY 1""", (t, t)):
-                  print("ROW", r)
-              for r in c.execute("""SELECT field_key, previous_value, new_value, to_char(changed_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI')
-                  FROM auditcore.journey_field_change_log WHERE tenant_id=%s AND change_reason='DMS_SYNC'
-                    AND changed_at_utc > now() - interval '3 hours' ORDER BY field_key, changed_at_utc""", (t,)):
-                  print("LOG", r)
-              print("LOGCOUNT", c.execute("""SELECT field_key, count(*) FROM auditcore.journey_field_change_log WHERE tenant_id=%s
-                  AND change_reason='DMS_SYNC' AND changed_at_utc > now() - interval '3 hours' GROUP BY 1""", (t,)).fetchall())
-              jids = [r[0] for r in c.execute("""SELECT DISTINCT journey_id FROM auditcore.journey_field_change_log WHERE tenant_id=%s
-                  AND change_reason='DMS_SYNC' AND changed_at_utc > now() - interval '3 hours'""", (t,))]
-              print("TASKS", c.execute("""SELECT task_status, count(*) FROM auditcore.p2_tasks WHERE tenant_id=%s AND journey_id = ANY(%s)
-                  AND task_type='MANUAL_VERIFICATION_REVIEW' AND updated_at_utc > now() - interval '3 hours' GROUP BY 1""", (t, jids)).fetchall())
-              print("RECOMPUTE_PENDING", c.execute("""SELECT count(*) FROM auditcore.p2_journey_runtime WHERE tenant_id=%s AND journey_id = ANY(%s)
-                  AND recompute_requested_version > COALESCE(recompute_completed_version, 0)""", (t, jids)).fetchone() if False else "n/a")
+              print("== the file")
+              for r in c.execute("""SELECT b.original_filename, b.batch_status, to_char(b.created_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI'),
+                    q.page_number, q.queue_status, q.di_state, q.di_processing_status, q.attempt_count, q.last_error, q.status_reason,
+                    q.di_document_id, to_char(q.di_submitted_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI:SS'),
+                    to_char(q.updated_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI:SS'), q.classified_document_type
+                  FROM auditcore.p2_upload_batches b JOIN auditcore.p2_document_queue q ON q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id
+                  JOIN auditcore.journeys j ON j.tenant_id=b.tenant_id AND j.journey_id=b.journey_id
+                  WHERE b.tenant_id=%s AND j.journey_reference='UTK-SR-261104-004' AND b.original_filename ILIKE 'C1R27F00000090%%'
+                  ORDER BY b.created_at_utc, q.page_number""", (t,)):
+                  print("FILE", r)
+              print("== pages failed per day (IST) by code, last 10 days")
+              for r in c.execute("""SELECT to_char(created_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD') d, coalesce(last_error,'-'), count(*)
+                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND unit_kind='PAGE' AND queue_status IN ('FAILED','DEAD_LETTER')
+                    AND created_at_utc > now() - interval '10 days' GROUP BY 1,2 ORDER BY 1,3 DESC""", (t,)):
+                  print("FAILDAY", r)
+              print("== all pages per day by status")
+              for r in c.execute("""SELECT to_char(created_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD') d, queue_status, count(*)
+                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND unit_kind='PAGE' AND created_at_utc > now() - interval '10 days'
+                  GROUP BY 1,2 ORDER BY 1,2""", (t,)):
+                  print("PAGEDAY", r)
+              print("== today's AI failures by hour (IST)")
+              for r in c.execute("""SELECT to_char(updated_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD HH24') h, last_error, count(*)
+                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND unit_kind='PAGE' AND queue_status IN ('FAILED','DEAD_LETTER','RETRY_WAIT')
+                    AND updated_at_utc > now() - interval '3 days' GROUP BY 1,2 ORDER BY 1""", (t,)):
+                  print("FAILHOUR", r)
+              print("== reasons today")
+              for r in c.execute("""SELECT left(status_reason,140), count(*) FROM auditcore.p2_document_queue WHERE tenant_id=%s
+                  AND queue_status IN ('FAILED','DEAD_LETTER') AND created_at_utc > now() - interval '2 days' GROUP BY 1 ORDER BY 2 DESC""", (t,)):
+                  print("REASON", r)
+              print("== batches per day by status (upload side)")
+              for r in c.execute("""SELECT to_char(created_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), batch_status, count(*)
+                  FROM auditcore.p2_upload_batches WHERE tenant_id=%s AND created_at_utc > now() - interval '10 days' GROUP BY 1,2 ORDER BY 1,2""", (t,)):
+                  print("BATCHDAY", r)
+              print("== bulk files per day by outcome")
+              for r in c.execute("""SELECT to_char(created_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), outcome, left(coalesce(detail,''),80), count(*)
+                  FROM auditcore.p2_bulk_files WHERE tenant_id=%s AND created_at_utc > now() - interval '5 days' GROUP BY 1,2,3 ORDER BY 1,2""", (t,)):
+                  print("BULKDAY", r)
+              print("== work queue failures per day")
+              for r in c.execute("""SELECT to_char(updated_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), work_type, work_status, left(coalesce(last_error,''),160), count(*)
+                  FROM auditcore.p2_work_queue WHERE tenant_id=%s AND work_status IN ('FAILED','DEAD_LETTER','RETRY_WAIT')
+                    AND updated_at_utc > now() - interval '4 days' GROUP BY 1,2,3,4 ORDER BY 1, 5 DESC LIMIT 80""", (t,)):
+                  print("WORK", r)
           PY
