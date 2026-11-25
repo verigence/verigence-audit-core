@@ -29,6 +29,7 @@ on:
       - 'tools/file_tasks_dryrun.py'
       - 'tools/carried_channel_probe.py'
       - 'tools/carry_move_verify.py'
+      - 'tools/carry_cancel_probe.py'
 
 permissions:
   contents: read
@@ -98,5 +99,7 @@ jobs:
         run: python tools/carried_channel_probe.py
       - name: Carry move verify
         run: python tools/carry_move_verify.py
+      - name: Carry cancel probe
+        run: python tools/carry_cancel_probe.py
       - name: Diagnose
         run: python tools/drive_files_diagnose.py --name "$PC_NAME" --since "$SINCE" --until "$UNTIL" --outlet "$OUTLET"
