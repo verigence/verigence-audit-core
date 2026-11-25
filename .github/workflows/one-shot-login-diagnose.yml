@@ -53,9 +53,8 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          railway logs --help | grep -E "since|until|filter|lines|json" || true
           railway logs --service security --environment dev --since 2026-11-24T00:00:00Z --until 2026-11-25T00:00:00Z \
-            --filter "security_request_validation_failed" --lines 200 --json > /tmp/v.jsonl 2>/tmp/v.err || cat /tmp/v.err
+            --filter "@level:warn" --lines 500 --json > /tmp/v.jsonl 2>/tmp/v.err || cat /tmp/v.err
           python - <<'PY'
           import json
           from collections import Counter
@@ -65,6 +64,10 @@ jobs:
               if not line.startswith('{'):
                   continue
               r = json.loads(line)
+              flat = {**r, **(r.get('attributes') or {})}
+              if 'validation' not in json.dumps(r):
+                  continue
+              print("KEYS", sorted(k for k in flat if k not in ('message',)))
               issues = r.get('validation_issues') or (r.get('attributes') or {}).get('validation_issues')
               route = r.get('http_route') or (r.get('attributes') or {}).get('http_route')
               print("V", r.get('timestamp'), route, issues)
