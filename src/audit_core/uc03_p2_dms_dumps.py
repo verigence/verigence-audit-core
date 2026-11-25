@@ -1366,9 +1366,13 @@ def otf_digit_target(read: Any, row: dict[str, Any], dms_numbers: set[str]) -> s
 
 
 def one_digit_off(a: date, b: date) -> bool:
-    """The same date with one digit misread (2024-11-03 for 2026-11-03, 14-11 for 19-11)."""
+    """The same date with one digit of its month or year misread (2024-11-03 for 2026-11-03,
+    10-10 for 10-11). Not a day one digit off: on the live dumps 82 of 112 such were the DMS
+    entry made a day or a few after the booking form (18 Nov on the form, 19 Nov in the DMS) --
+    a real gap, left as the form says until the product owner decides (2026-11-25)."""
     x, y = a.strftime("%d%m%Y"), b.strftime("%d%m%Y")
-    return sum(p != q for p, q in zip(x, y, strict=True)) == 1
+    differ = [i for i, (p, q) in enumerate(zip(x, y, strict=True)) if p != q]
+    return len(differ) == 1 and differ[0] >= 2
 
 
 def plan_digit_fixes(connection: Connection, tenant_id: str, dump: dict[str, Any],

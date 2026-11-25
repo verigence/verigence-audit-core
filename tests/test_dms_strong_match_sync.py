@@ -379,3 +379,20 @@ def test_the_manual_verification_task_on_a_corrected_field_closes(setup) -> None
     _dump_rows(s, [{"booking_number": "B-13495813", "name": "MENAKA BEHERA", "mobile": "9437000079", "model": "THAR"}])
     assert _value(s, str(document), "booking_date") == today.isoformat()
     assert open_tasks() == 0
+
+
+def test_a_booking_day_one_digit_off_is_a_real_gap_and_left(setup) -> None:  # noqa: F811
+    """18 Nov on the booking docket, 19 Nov in the DMS: the DMS entry a day later, not a misread
+    (product owner 2026-11-25: the year and month misreads are corrected, the day gaps listed)."""
+    s = setup
+    today = _today()
+    if today.day < 2:
+        import pytest
+        pytest.skip("needs the day before in the month")
+    day_before = today - timedelta(days=1)
+    form = _document(s, "booking_form", booking_date=day_before.isoformat(), customer_phone="9437000080",
+                     customer_name="SAGUN RANI PATRA")
+    _dump_rows(s, [{"booking_number": "B-13530001", "name": "SAGUN RANI PATRA", "mobile": "9437000080",
+                    "model": "THAR"}])
+    assert _value(s, form, "booking_date") == day_before.isoformat()
+    assert not [e for e in _log(s) if e["change_reason"] == "DMS_SYNC"]
