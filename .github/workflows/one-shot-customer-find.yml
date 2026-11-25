@@ -1,0 +1,107 @@
+name: One-shot Customer locate (read-only, encrypted)
+
+# Read-only. Journeys, DMS dump rows and Drive folders/files of the live Project, written to a file
+# encrypted with a public key whose private half is held only by the person who ran it, and kept as
+# a one-day artifact. Nothing about a customer is printed (this repository is public). Never writes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/customer-find]
+    paths:
+      - '.github/workflows/one-shot-customer-find.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install -e . 'psycopg[binary]>=3.2,<4'
+          npm install --global @railway/cli@5.70.0
+      - name: Reach the live database
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/vars.json
+          url="$(python - <<'PY'
+          import json
+          from urllib.parse import urlparse
+          v = json.load(open('/tmp/vars.json'))
+          for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
+              value = (v.get(key) or '').replace('postgresql+psycopg://', 'postgresql://', 1)
+              host = (urlparse(value).hostname or '').lower()
+              if value and host and not host.endswith('.railway.internal'):
+                  print(value)
+                  break
+          PY
+          )"
+          test -n "$url"
+          echo "::add-mask::$url"
+          echo "DB=$url" >> "$GITHUB_ENV"
+      - name: Collect, read-only, and encrypt
+        shell: bash
+        run: |
+          cat > /tmp/pub.pem <<'KEY'
+          -----BEGIN PUBLIC KEY-----
+          MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAvX1fr00xilftuYCpEEzo
+          zrG+E6MkhecyQzQ8QaoJz0DuM6/mmd/06dGb1mlbz1VGHLGJZxWk43E02EiEB7H0
+          z2lHWhCJ35LzoPrg1FhYH/Yl5c9TJz9yOHzAMGLAKMuHfPnQ9pEdOcyEFX8OsGI2
+          ZkQo6TRd41ZVq1bhJTnp5LKlDzvJPMKZvA3UWoUpGD1SvUnQXjz3NRtfugQVHmMz
+          ulMF65yvfn01H0/aR74s3sScdp5Gwep/30yOZGxg+Po38A0o2t452Q6U3aEIzNFa
+          gBjr54VnKAMZuAWxsYJ41huKrmwYrmvo4FxLARsZh0iJS2MxR79aiR69fG8ZbzWN
+          TiQu8ZdL3HWeejs0Eh8MfjMgpOFiVWREzn0XZ5ZCxIb6TBWG5dyQCUHLJd907oxH
+          ww3JNBNAGFI0f8c2LUwDdYnD4wIU7aUHSc/K+DqyBApb5hhRQNLrRmFgpLmcbjlL
+          l5tcJ5K8MqyF3qloZ700KuJts4SUXI7kNE62R7lYE3LDAgMBAAE=
+          -----END PUBLIC KEY-----
+          KEY
+          sed -i 's/^ *//' /tmp/pub.pem
+          python - <<'PY'
+          import json, os
+          from sqlalchemy import create_engine
+          from audit_core.db import set_tenant_context
+          T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
+          e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
+          out = {}
+          with e.connect() as c:
+              c.exec_driver_sql("SET TRANSACTION READ ONLY")
+              set_tenant_context(c, T)
+              q = lambda sql: [dict(r) for r in c.exec_driver_sql(sql, {"t": T}).mappings().all()]
+              out["journeys"] = q("""
+                  SELECT to_jsonb(j) - 'tenant_id' AS j, c.display_name, c.legal_name, o.outlet_name, d.dealer_name
+                  FROM auditcore.journeys j
+                  JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+                  LEFT JOIN auditcore.dealer_outlets o ON o.tenant_id=j.tenant_id AND o.outlet_id=j.outlet_id
+                  LEFT JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+                  WHERE j.tenant_id=%(t)s""")
+              out["dms"] = q("SELECT to_jsonb(r) - 'raw' - 'tenant_id' AS r FROM auditcore.p2_dms_dump_rows r WHERE r.tenant_id=%(t)s")
+              out["drive_folders"] = q("SELECT to_jsonb(f) - 'tenant_id' AS f FROM auditcore.p2_drive_folders f WHERE f.tenant_id=%(t)s")
+              out["drive_files"] = q("SELECT to_jsonb(f) - 'tenant_id' AS f FROM auditcore.p2_drive_files f WHERE f.tenant_id=%(t)s")
+              c.rollback()
+          print("COUNTS", {k: len(v) for k, v in out.items()})
+          json.dump(out, open("/tmp/data.json", "w"), default=str)
+          PY
+          set -euo pipefail
+          mkdir -p /tmp/out
+          openssl rand -hex 32 > /tmp/k
+          openssl enc -aes-256-cbc -pbkdf2 -salt -in /tmp/data.json -out /tmp/out/data.enc -pass file:/tmp/k
+          openssl pkeyutl -encrypt -pubin -inkey /tmp/pub.pem -pkeyopt rsa_padding_mode:oaep -in /tmp/k -out /tmp/out/key.enc
+          rm -f /tmp/data.json /tmp/k
+          ls -la /tmp/out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: customer-find
+          path: /tmp/out
+          retention-days: 1
