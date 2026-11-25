@@ -28,6 +28,7 @@ on:
       - 'tools/carried_uploader_dryrun.py'
       - 'tools/file_tasks_dryrun.py'
       - 'tools/carried_channel_probe.py'
+      - 'tools/carry_move_verify.py'
 
 permissions:
   contents: read
@@ -95,5 +96,7 @@ jobs:
         run: python tools/file_tasks_dryrun.py
       - name: Channel probe
         run: python tools/carried_channel_probe.py
+      - name: Carry move verify
+        run: python tools/carry_move_verify.py
       - name: Diagnose
         run: python tools/drive_files_diagnose.py --name "$PC_NAME" --since "$SINCE" --until "$UNTIL" --outlet "$OUTLET"
