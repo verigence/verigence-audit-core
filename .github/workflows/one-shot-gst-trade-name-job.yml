@@ -54,7 +54,6 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Enqueue DMS_REMATCH (commit) and wait for it
       - name: Enqueue GST_TRADE_NAME and wait for it
         shell: bash
         run: |
