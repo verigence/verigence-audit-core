@@ -1,0 +1,111 @@
+name: One-shot GST name rule diagnose (read-only)
+
+# Read-only: why one journey's customer name came from where it did. Prints document types, field keys and
+# yes/no comparisons only -- no names, numbers or references (public repository). Never writes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/gst-name-diagnose]
+    paths:
+      - '.github/workflows/one-shot-gst-name-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install -e . 'psycopg[binary]>=3.2,<4'
+          npm install --global @railway/cli@5.70.0
+      - name: Reach the live database
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/vars.json
+          url="$(python - <<'PY'
+          import json
+          from urllib.parse import urlparse
+          v = json.load(open('/tmp/vars.json'))
+          for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
+              value = (v.get(key) or '').replace('postgresql+psycopg://', 'postgresql://', 1)
+              host = (urlparse(value).hostname or '').lower()
+              if value and host and not host.endswith('.railway.internal'):
+                  print(value)
+                  break
+          PY
+          )"
+          test -n "$url"
+          echo "::add-mask::$url"
+          echo "DB=$url" >> "$GITHUB_ENV"
+      - name: The journey's naming documents, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, os, re
+          from collections import Counter
+          from sqlalchemy import create_engine
+          from audit_core.db import set_tenant_context
+          from audit_core.uc03_p2_customer import is_gstin
+          from audit_core.uc03_p2_names import is_masked, same_person
+          T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
+          REF_SHA = "402f2c9ddb3253cda2067b7539ca77084145131bfc83fd2bb784e9b50fe4d14b"
+          norm = lambda s: re.sub(r"[^A-Z0-9]", "", str(s or "").upper())
+          e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
+          with e.connect() as c:
+              c.exec_driver_sql("SET TRANSACTION READ ONLY")
+              set_tenant_context(c, T)
+              j = c.exec_driver_sql("""SELECT j.journey_id, c.legal_name, c.legal_name_status, c.display_name,
+                       (SELECT e.document_type_key FROM auditcore.evidence e WHERE e.tenant_id=c.tenant_id AND e.evidence_id=c.legal_name_source_evidence_id) AS source_type,
+                       c.legal_name_verified_by_actor_id AS by, c.legal_name_verified_at_utc AS at
+                    FROM auditcore.journeys j JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+                    WHERE j.tenant_id=%(t)s AND encode(sha256(convert_to(j.journey_reference,'UTF8')),'hex')=%(h)s""",
+                    {"t": T, "h": REF_SHA}).mappings().first()
+              print("FOUND", j is not None)
+              if j:
+                  print("NAME status", j["legal_name_status"], "| source document", j["source_type"], "| set by", j["by"], "at", j["at"],
+                        "| masked", is_masked(j["legal_name"] or ""), "| entered name = legal name", norm(j["display_name"]) == norm(j["legal_name"]))
+                  ev = c.exec_driver_sql("""SELECT e.evidence_id, e.document_type_key, e.association_status, e.identity_check_status, e.void_reason
+                       FROM auditcore.evidence e WHERE e.tenant_id=%(t)s AND e.journey_id=%(j)s ORDER BY e.linked_at_utc""",
+                       {"t": T, "j": j["journey_id"]}).mappings().all()
+                  print("DOCUMENTS", Counter((r["document_type_key"], r["association_status"]) for r in ev))
+                  fields = c.exec_driver_sql("""SELECT e.evidence_id, e.document_type_key, e.association_status, e.identity_check_status,
+                         f.field_key, f.effective_value
+                       FROM auditcore.evidence e JOIN auditcore.journey_document_extracted_fields f
+                         ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
+                       WHERE e.tenant_id=%(t)s AND e.journey_id=%(j)s""", {"t": T, "j": j["journey_id"]}).mappings().all()
+                  legal = j["legal_name"] or ""
+                  names = {}
+                  for f in fields:
+                      k = f["field_key"]
+                      if "gst" in k or k in ("pan_name", "aadhaar_name", "customer_name", "buyer_name", "organisation_legal_name",
+                                             "organisation_trade_name", "legal_name", "trade_name", "insured_name"):
+                          v = f["effective_value"]
+                          extra = ""
+                          if "gstin" in k:
+                              extra = f" valid_gstin={is_gstin(v)}"
+                          elif isinstance(v, str) and v:
+                              names[(f["document_type_key"], k)] = v
+                              extra = f" equals_customer_name={norm(v) == norm(legal)} same_person={same_person(legal, v) if legal else None} masked={is_masked(v)}"
+                          print("FIELD", f["document_type_key"], f["association_status"], f["identity_check_status"], k,
+                                "has_value", bool(v), extra)
+                  gl = [v for (d, k), v in names.items() if d == "gst_certificate" and k in ("organisation_legal_name", "legal_name")]
+                  gt = [v for (d, k), v in names.items() if d == "gst_certificate" and k in ("organisation_trade_name", "trade_name")]
+                  pn = [v for (d, k), v in names.items() if d == "pan_card" and k == "pan_name"]
+                  print("GST legal name = PAN name:", [norm(a) == norm(b) or same_person(a, b) for a in gl for b in pn])
+                  print("GST legal name = GST trade name:", [norm(a) == norm(b) for a in gl for b in gt])
+                  print("Trade name looks like a business:", [bool(re.search(r"(?i)catering|tent|house|enterprise|traders|store", t)) for t in gt])
+              c.rollback()
+          PY
