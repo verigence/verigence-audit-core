@@ -50,43 +50,51 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Banita Sasmal — insurance sources, read-only
+      - name: Insurance decided by a cost sheet's premium — how many, read-only
         shell: bash
         run: |
           python - <<'PY'
-          import os, json, psycopg
-          class Safe:
-              def __init__(self, conn): self.conn = conn
-              def execute(self, sql, params=None):
-                  try:
-                      return list(self.conn.execute(sql, params))
-                  except Exception as exc:
-                      print("QUERYERR", type(exc).__name__, str(exc).splitlines()[0][:200]); return []
-          with psycopg.connect(os.environ["DB"], autocommit=True, options="-c statement_timeout=120000 -c default_transaction_read_only=on") as raw:
-              t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'; j = '93b5ad09-3b2a-4dda-a313-9ede8ec61ced'
-              raw.execute("SELECT set_config('app.tenant_id', %s, false)", (t,))
-              c = Safe(raw)
-              for k in ("misp_code", "agent_intermediary_code", "agent_intermediary_name", "insurance_source", "insurance_by",
-                        "insurance_source_set_at_utc", "policy_type", "cover_type", "actual_premium_amount", "updated_at_utc"):
-                  print("INSREC", k, c.execute(f"SELECT {k} FROM auditcore.insurance_records WHERE tenant_id=%s AND journey_id=%s", (t, j)))
-              for r in c.execute("""SELECT s.line_kind, s.component_key, s.source_document_type, s.amount, s.source_document_id, s.updated_at_utc,
-                       (SELECT e.association_status FROM auditcore.evidence e WHERE e.tenant_id=s.tenant_id AND e.evidence_id=s.source_evidence_id)
-                  FROM auditcore.commercial_line_source_values s WHERE s.tenant_id=%s AND s.journey_id=%s AND s.component_key ILIKE '%%insur%%'
-                  ORDER BY s.updated_at_utc""", (t, j)):
-                  print("SRC", r)
-              for r in c.execute("""SELECT e.document_type_key, e.di_document_id, f.field_key, left(f.effective_value #>> '{}', 200)
-                  FROM auditcore.journey_document_extracted_fields f JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id
-                    AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
-                  WHERE f.tenant_id=%s AND f.journey_id=%s AND (e.document_type_key='insurance_cover'
-                    OR f.field_key ~* 'insur|misp|agent|premium|document_title|statement_date|ledger_date|quotation|valid')
-                  ORDER BY 1,2,3""", (t, j)):
-                  print("FIELD", r)
-              for r in c.execute("""SELECT e.document_type_key, e.di_document_id, f.effective_value FROM auditcore.journey_document_extracted_fields f
-                  JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
-                  WHERE f.tenant_id=%s AND f.journey_id=%s AND f.field_key='line_items' AND e.document_type_key IN ('cost_sheet','customer_ledger')""", (t, j)):
-                  items = r[2] if isinstance(r[2], list) else []
-                  print("ITEMS", r[0], r[1], len(items))
-                  for it in items:
-                      if isinstance(it, dict) and 'INSUR' in json.dumps(it).upper():
-                          print("   LINE", json.dumps(it)[:300])
+          import os, psycopg
+          with psycopg.connect(os.environ["DB"], autocommit=True, options="-c statement_timeout=180000 -c default_transaction_read_only=on") as c:
+              t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
+              c.execute("SELECT set_config('app.tenant_id', %s, false)", (t,))
+              rows = list(c.execute("""
+                WITH dec AS (
+                  SELECT jc.journey_id, jc.insurance_basis FROM auditcore.journey_classifications jc
+                  WHERE jc.tenant_id=%s AND jc.insurance_decided_by='DOCUMENT' AND jc.insurance_basis LIKE 'The NDC charges%%'),
+                src AS (
+                  SELECT s.journey_id, s.source_document_type, max(s.amount) amt FROM auditcore.commercial_line_source_values s
+                  JOIN auditcore.evidence e ON e.tenant_id=s.tenant_id AND e.evidence_id=s.source_evidence_id AND e.association_status='ACTIVE'
+                  WHERE s.tenant_id=%s AND s.component_key='insurance_amount' AND s.amount > 0 GROUP BY 1,2)
+                SELECT d.journey_id, j.journey_reference,
+                  (SELECT string_agg(source_document_type||'='||amt::int, ', ' ORDER BY source_document_type) FROM src WHERE src.journey_id=d.journey_id) srcs,
+                  (SELECT string_agg(DISTINCT e.document_type_key, ',') FROM auditcore.evidence e WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id
+                     AND e.association_status='ACTIVE' AND e.document_type_key IN ('customer_ledger','customer_ledger_tally','erp_settlement')) ndc,
+                  (SELECT upper(f.effective_value #>> '{}') FROM auditcore.journey_document_extracted_fields f JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id
+                     AND e.journey_id=f.journey_id AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
+                     WHERE f.tenant_id=j.tenant_id AND f.journey_id=j.journey_id AND e.document_type_key='cost_sheet' AND f.field_key='document_title' LIMIT 1) cs_title,
+                  (SELECT f.effective_value #>> '{}' FROM auditcore.journey_document_extracted_fields f JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id
+                     AND e.journey_id=f.journey_id AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
+                     WHERE f.tenant_id=j.tenant_id AND f.journey_id=j.journey_id AND e.document_type_key='booking_docket' AND f.field_key='insurance_by' LIMIT 1) docket_by,
+                  r.agent_intermediary_code, r.misp_code,
+                  EXISTS (SELECT 1 FROM auditcore.dealer_insurance_codes k WHERE k.tenant_id=j.tenant_id AND k.dealer_id=j.dealer_id
+                     AND k.normalized_code IN (upper(regexp_replace(coalesce(r.agent_intermediary_code,''),'[^A-Za-z0-9]','','g')),
+                                               upper(regexp_replace(coalesce(r.misp_code,''),'[^A-Za-z0-9]','','g')))) dealer_code
+                FROM dec d JOIN auditcore.journeys j ON j.tenant_id=%s AND j.journey_id=d.journey_id
+                LEFT JOIN auditcore.insurance_records r ON r.tenant_id=j.tenant_id AND r.journey_id=j.journey_id
+              """, (t, t, t)))
+              from collections import Counter
+              tally = Counter()
+              for r in rows:
+                  only_cs = bool(r[2]) and all(x.startswith('cost_sheet=') for x in r[2].split(', '))
+                  key = ("only cost sheet" if only_cs else "NDC/other has amount", "NDC on file" if r[3] else "no NDC",
+                         "QUOTATION" if (r[4] or '').find('QUOT') >= 0 else (r[4] or '-')[:20],
+                         "docket Self" if (r[5] or '').strip().upper() in ('SELF','OWN','CUSTOMER') else "docket " + str(r[5])[:12],
+                         "policy dealer code" if r[8] else ("policy other code" if (r[6] or r[7]) else "no policy code"))
+                  tally[key] += 1
+                  if only_cs and not r[8]:
+                      print("SUSPECT", r[1], r[2], r[3], r[4], r[5], r[6], r[7])
+              print("TOTAL", len(rows))
+              for k, n in tally.most_common():
+                  print("TALLY", n, k)
           PY
