@@ -333,10 +333,67 @@ def test_a_gst_certificate_with_a_gstin_names_the_customer(journey):
     per the GSTIN (the PAN is often masked, Aadhaar is optional)."""
     add_ready_document(journey, "pan_card", pan_number="AXXXX1234F", pan_name="AXXXA KXXXR SXXXO")
     assert _named(journey) == ("VERIFIED", "AXXXA KXXXR SXXXO")
-    add_ready_document(journey, "gst_certificate", gstin="21ARPPS0866A1ZX", organisation_legal_name="ANAYA KUMAR SAHOO",
-                       organisation_trade_name="M/S SHREE KRISHNA TRADERS")
-    assert _named(journey) == ("VERIFIED", "ANAYA KUMAR SAHOO")
-    assert _named(journey) == ("UNCHANGED", "ANAYA KUMAR SAHOO")
+    add_ready_document(journey, "gst_certificate", gstin="21ARPCS0866A1ZX", organisation_legal_name="ANAYA TRADING PVT LTD",
+                       organisation_trade_name="ANAYA TRADERS")
+    assert _named(journey) == ("VERIFIED", "ANAYA TRADING PVT LTD")
+    assert _named(journey) == ("UNCHANGED", "ANAYA TRADING PVT LTD")
+
+
+def test_a_sole_proprietors_gst_certificate_names_the_business(journey):
+    """Product owner 2026-11-25: a proprietor's GST legal name is the owner's own
+    (the name on their personal PAN); the purchases are in the trade name, so the
+    trade name names the customer. The GSTIN's sixth character P says the PAN is
+    an individual's."""
+    add_ready_document(journey, "pan_card", pan_number="ARPPS0866A", pan_name="TEST OWNER NAME")
+    assert _named(journey) == ("VERIFIED", "TEST OWNER NAME")
+    add_ready_document(journey, "gst_certificate", gstin="21ARPPS0866A1ZX", organisation_legal_name="TEST OWNER NAME",
+                       organisation_trade_name="M/S TEST CATERERS AND DECORATORS")
+    # No papers yet: the owner's name stands.
+    assert _named(journey) == ("UNCHANGED", "TEST OWNER NAME")
+    # The papers in the business's name: the name follows them.
+    add_ready_document(journey, "dealer_receipt", customer_name="TEST CATERERS & DECORATORS")
+    add_ready_document(journey, "customer_invoice_dms", buyer_name="M/S TEST CATERERS AND DECORATORS")
+    assert _named(journey) == ("VERIFIED", "M/S TEST CATERERS AND DECORATORS")
+    assert _named(journey) == ("UNCHANGED", "M/S TEST CATERERS AND DECORATORS")
+
+
+def test_a_proprietor_whose_papers_are_in_their_own_name_keeps_it(journey):
+    """2026-11-25, follow the papers: receipts and invoices in the owner's own name
+    keep the owner's name, whatever trade name the GST certificate prints."""
+    add_ready_document(journey, "gst_certificate", gstin="21ARPPS0866A1ZX", organisation_legal_name="TEST OWNER NAME",
+                       organisation_trade_name="TEST CATERERS AND DECORATORS")
+    add_ready_document(journey, "dealer_receipt", customer_name="TEST OWNER NAME")
+    add_ready_document(journey, "customer_invoice_dms", buyer_name="Mr. Test Owner Name")
+    add_ready_document(journey, "insurance_cover", insured_name="TEST CATERERS AND DECORATORS")
+    assert _named(journey)[1] == "TEST OWNER NAME"
+
+
+@pytest.mark.parametrize(("gstin", "trade", "named"), [
+    ("21ARPPS0866A1ZX", None, "TEST OWNER NAME"),                          # no trade name printed
+    ("21ARPPS0866A1ZX", "Name Owner Test", "TEST OWNER NAME"),             # the trade name is the owner's own
+    ("21ARPPS0866A1ZX", "TXXT OXXXR", "TEST OWNER NAME"),                  # a masked read is no name
+    ("21ARPFS0866A1ZX", "TEST FIRM TRADING", "TEST OWNER NAME"),           # a firm's GSTIN: its legal name
+])
+def test_a_trade_name_names_the_customer_only_for_a_proprietor(journey, gstin, trade, named):
+    add_ready_document(journey, "gst_certificate", gstin=gstin, organisation_legal_name="TEST OWNER NAME",
+                       **({"organisation_trade_name": trade} if trade else {}))
+    if trade:
+        add_ready_document(journey, "dealer_receipt", customer_name=trade)
+    assert _named(journey)[1] == named
+
+
+def test_under_a_proprietors_trade_name_their_own_documents_still_match(journey, strict):
+    """Named by the trade name, the owner's KYC and documents in the owner's own
+    name are still the customer's, as are documents in the business's name."""
+    add_ready_document(journey, "gst_certificate", gstin="21ARPPS0866A1ZX", organisation_legal_name="TEST OWNER NAME",
+                       organisation_trade_name="TEST CATERERS AND DECORATORS")
+    add_ready_document(journey, "pan_card", pan_number="ARPPS0866A", pan_name="TEST OWNER NAME")
+    add_ready_document(journey, "booking_form", customer_name="M/S TEST CATERERS AND DECORATORS",
+                       dealer_name="Sarthak Motors")
+    add_ready_document(journey, "dealer_receipt", customer_name="TEST CATERERS AND DECORATORS")
+    add_ready_document(journey, "insurance_cover", insured_name="TEST OWNER NAME")
+    assert _named(journey)[1] == "TEST CATERERS AND DECORATORS"
+    assert _sync(journey) == {}
 
 
 def test_a_gst_certificate_without_a_gstin_does_not_name_the_customer(journey):
@@ -390,7 +447,7 @@ def test_under_a_gst_certificate_another_persons_kyc_is_not_the_proprietors(jour
     task by itself (with file identity enforced his file leaves the booking)."""
     add_ready_document(journey, "gst_certificate", gstin="21AHOPR2948B2ZE", organisation_legal_name="AZIZUR REHAMAN",
                        organisation_trade_name="RIDA INFRASTRUCTURE")
-    assert _named(journey) == ("VERIFIED", "AZIZUR REHAMAN")
+    assert _named(journey) == ("VERIFIED", "AZIZUR REHAMAN")  # no papers in the trade name (2026-11-25)
     tapan = add_ready_document(journey, "pan_card", pan_number="AVFPP9596G", pan_name="TAPAN KUMAR PATRA")
     tapan_aadhaar = add_ready_document(journey, "aadhaar", aadhaar_number="5845 3895 7247",
                                        aadhaar_name="TAPAN KUMAR PATRA")
@@ -414,7 +471,8 @@ def test_under_a_gst_certificate_the_proprietors_pan_is_the_one_in_the_gstin(jou
     add_ready_document(journey, "pan_card", pan_number="AHOPR2948B", pan_name="MD AZIJUR RAHMAN")
     add_ready_document(journey, "aadhaar", aadhaar_number="7760 9413 4320", aadhaar_name="Azizur Rehaman")
     add_ready_document(journey, "booking_form", customer_name="M/S RIDA INFRASTRUCTURE", dealer_name="Sarthak Motors")
-    assert _named(journey)[1] == "AZIZUR REHAMAN"
+    # A sole proprietor (GSTIN on an individual's PAN): named by the trade name (2026-11-25).
+    assert _named(journey)[1] == "RIDA INFRASTRUCTURE"
     assert _sync(journey) == {}
 
 

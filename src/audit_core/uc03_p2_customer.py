@@ -12,6 +12,19 @@ often not fully readable (masked) and Aadhaar is optional and personal. Only
 when a GST certificate carrying a GSTIN is uploaded; otherwise the KYC rule
 stands.
 
+Product owner 2026-11-25: a sole proprietor's GST certificate prints the
+owner's own name as its legal name (the GST legal name is the name on the
+PAN behind the GSTIN, and a proprietor's PAN is their personal one) and the
+business as its trade name. When the GSTIN is an individual's (its PAN's
+fourth letter P), the certificate prints a trade name that is not the owner's
+own name, and the booking's own papers (receipts, invoices, insurance, booking
+papers) are mostly in that trade name, the customer is named by the trade name:
+the name follows the papers. Papers mostly in the owner's name, as many as
+each, or none yet: the owner's name stands (product owner's choice 2026-11-25,
+after a live check found half the proprietors' papers in the owner's name). A
+company's, firm's or trust's GSTIN already names the organisation as its legal
+name.
+
 Product owner 2026-10-28: a PAN read with its letters masked ("PXXXXJ KXXXR
 NXXXX") does not name the customer when an Aadhaar (or Customer KYC) gives the
 full name; with a GSTIN on file the GSTIN still names them. A masked name is
@@ -52,6 +65,7 @@ _KYC_NAME_FIELDS = {"pan_card": ("pan_name",), "aadhaar": ("aadhaar_name",), "cu
                     "gst_certificate": ("organisation_legal_name", "legal_name")}
 _KYC_PRECEDENCE = ("gst_certificate", "pan_card", "aadhaar", "customer_kyc")
 _GSTIN = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
+_GST_TRADE_NAME_FIELDS = ("organisation_trade_name", "trade_name")
 # Where the booking's own documents name the customer, in the order they are
 # trusted to unmask a masked PAN name (2026-11-01).
 _NAMING_DOCUMENTS = ("booking_docket", "booking_form", "customer_invoice_dms", "tax_invoice_tally",
@@ -66,6 +80,26 @@ _ENTERED_NAME_SETTING = "auditcore.entered_name_follows_customer"
 def is_gstin(value: object) -> bool:
     """A GSTIN as printed: 15 characters, state code, PAN, entity, Z, check."""
     return bool(_GSTIN.match(re.sub(r"\s", "", str(value or "")).upper()))
+
+
+def is_individual_gstin(value: object) -> bool:
+    """A GSTIN held on an individual's PAN, a sole proprietor's: the PAN's
+    fourth letter (the GSTIN's sixth character) is P."""
+    code = re.sub(r"\s", "", str(value or "")).upper()
+    return is_gstin(code) and code[5] == "P"
+
+
+def proprietor_trade_name(*, gstin: object, legal_name: object, trade_name: object) -> str | None:
+    """The business a sole proprietor's GST certificate names (2026-11-25):
+    the trade name, when the GSTIN is an individual's and the trade name is not
+    the owner's own name; else None (the legal name stands)."""
+    trade = " ".join(str(trade_name).split()) if isinstance(trade_name, str) else ""
+    if not trade or is_masked(trade) or not is_individual_gstin(gstin):
+        return None
+    legal = " ".join(str(legal_name).split()) if isinstance(legal_name, str) else ""
+    if legal and (trade.upper() == legal.upper() or same_person(trade, legal)):
+        return None
+    return trade
 
 
 def sync_customer_name(connection: Connection, *, tenant_id: str, journey_id: UUID) -> str:
@@ -131,14 +165,28 @@ def sync_customer_name(connection: Connection, *, tenant_id: str, journey_id: UU
         {"t": tenant_id, "j": journey_id, "types": sorted(_KYC_NAME_FIELDS), "replaced": list(_REPLACED)},
     ).mappings().all()
     # A GST certificate names the customer only when it carries a GSTIN.
-    with_gstin = {r["evidence_id"] for r in rows if r["field_key"] == "gstin" and is_gstin(r["effective_value"])}
+    gstins: dict[object, object] = {}
+    trade_names: dict[object, object] = {}
+    for r in rows:
+        if r["field_key"] == "gstin" and is_gstin(r["effective_value"]):
+            gstins.setdefault(r["evidence_id"], r["effective_value"])
+        elif r["field_key"] in _GST_TRADE_NAME_FIELDS and isinstance(r["effective_value"], str) \
+                and r["effective_value"].strip():
+            trade_names.setdefault(r["evidence_id"], r["effective_value"])
     for row in rows:
         value = row["effective_value"]
         name = " ".join(str(value).split()) if isinstance(value, str) else ""
         doc_type = str(row["document_type_key"])
-        if doc_type == "gst_certificate" and row["evidence_id"] not in with_gstin:
+        if doc_type == "gst_certificate" and row["evidence_id"] not in gstins:
             continue
         if str(row["field_key"]) in _KYC_NAME_FIELDS.get(doc_type, ()) and name and doc_type not in best:
+            if doc_type == "gst_certificate":
+                # A sole proprietor's certificate names the business when the papers do (2026-11-25).
+                trade = proprietor_trade_name(gstin=gstins[row["evidence_id"]], legal_name=name,
+                                              trade_name=trade_names.get(row["evidence_id"]))
+                if trade is not None and _papers_in_trade_name(connection, tenant_id=tenant_id,
+                                                               journey_id=journey_id, trade=trade, owner=name):
+                    name = trade
             best[doc_type] = {"name": name, "evidence": row["evidence_id"]}
     kyc = next((best[t] for t in _KYC_PRECEDENCE if t in best and not is_masked(best[t]["name"])), None) or next(
         (best[t] for t in _KYC_PRECEDENCE if t in best), None)
@@ -174,6 +222,35 @@ def sync_customer_name(connection: Connection, *, tenant_id: str, journey_id: UU
          "actor": _MACHINE_ACTOR},
     )
     return "VERIFIED"
+
+
+def _papers_in_trade_name(connection: Connection, *, tenant_id: str, journey_id: UUID, trade: str,
+                          owner: str) -> bool:
+    """Whether the booking's own papers (booking papers, invoices, receipts,
+    insurance, cost sheet) name the business more often than the owner."""
+    from audit_core.uc03_p2_names import same_organisation
+
+    trade_count = owner_count = 0
+    for value in connection.execute(
+        text(
+            """
+            SELECT f.effective_value #>> '{}'
+            FROM auditcore.evidence e
+            JOIN auditcore.journey_document_extracted_fields f
+              ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
+            WHERE e.tenant_id=:t AND e.journey_id=:j AND e.association_status='ACTIVE'
+              AND e.document_type_key = ANY(:types) AND f.field_key = ANY(:fields)
+            """
+        ),
+        {"t": tenant_id, "j": journey_id, "types": list(_NAMING_DOCUMENTS), "fields": list(_NAMING_FIELDS)},
+    ).scalars():
+        if not value or not str(value).strip():
+            continue
+        if same_organisation(value, trade) or same_person(value, trade):
+            trade_count += 1
+        elif same_person(value, owner):
+            owner_count += 1
+    return trade_count > owner_count
 
 
 def _full_name_fitting(connection: Connection, *, tenant_id: str, journey_id: UUID, masked: str) -> str | None:
