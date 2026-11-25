@@ -196,6 +196,9 @@ def test_at_most_so_many_in_one_run(journey, monkeypatch):
     ("DOCUMENT_AI_RESPONSE_INVALID", AI_REFUSED),
     ("DiClientError (at audit_core/di_client.py:212)", "A system problem stopped this page — tried 3 times."),
     ("GROUPING_FAILED", "The pages of this document could not be put together and read."),
+    # The AI service could not take it after its retries (25 Nov 2026: the 24 Nov outage).
+    ("DOCUMENT_AI_UNAVAILABLE", "AI reading failed — tried 3 times. Please upload this page again."),
+    ("DOCUMENT_AI_RATE_LIMITED", "AI reading failed — tried 3 times. Please upload this page again."),
 ])
 def test_a_page_never_read_has_its_file_uploaded_again(journey, code, reason):
     batch_id, ids = _file(journey, "Booking file.pdf")
