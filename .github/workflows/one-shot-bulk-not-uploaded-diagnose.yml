@@ -50,7 +50,7 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Audit Core — the 24 Nov AI-unavailable failures, read-only
+      - name: Audit Core — resend runs and the refused pages, read-only
         shell: bash
         run: |
           python - <<'PY'
@@ -59,25 +59,20 @@ jobs:
               c.execute("SET TRANSACTION READ ONLY")
               t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
               c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
-              for r in c.execute("""SELECT to_char(di_submitted_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD HH24') h, coalesce(last_error,'-'), queue_status, count(*)
-                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND di_submitted_at_utc > now() - interval '2 days'
-                  AND (last_error LIKE 'DOCUMENT_AI%%' OR queue_status IN ('FAILED','RETRY_WAIT'))
-                  GROUP BY 1,2,3 ORDER BY 1""", (t,)):
-                  print("SUBHOUR", r)
-              for r in c.execute("""SELECT to_char(di_submitted_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD HH24') h, count(*)
-                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND di_submitted_at_utc > now() - interval '2 days'
-                  GROUP BY 1 ORDER BY 1""", (t,)):
-                  print("SENTHOUR", r)
-              for r in c.execute("""SELECT q.queue_status, left(coalesce(q.status_reason,''),90),
-                    (SELECT n.queue_status FROM auditcore.p2_document_queue n WHERE n.tenant_id=q.tenant_id AND n.batch_id=q.batch_id
-                       AND n.page_numbers && q.page_numbers AND n.created_at_utc > q.created_at_utc AND n.queue_status NOT IN ('CANCELLED')
-                       ORDER BY n.created_at_utc DESC LIMIT 1) AS later, count(*)
-                  FROM auditcore.p2_document_queue q WHERE q.tenant_id=%s AND q.last_error='DOCUMENT_AI_UNAVAILABLE'
-                    AND q.updated_at_utc > now() - interval '2 days' GROUP BY 1,2,3 ORDER BY 4 DESC""", (t,)):
-                  print("UNAVAIL", r)
-              for r in c.execute("""SELECT task_type, task_status, count(*) FROM auditcore.p2_tasks WHERE tenant_id=%s
-                  AND task_status NOT IN ('VERIFIED_COMPLETE','CLOSED','CANCELLED','DONE','RESOLVED') GROUP BY 1,2 ORDER BY 3 DESC LIMIT 30""", (t,)):
-                  print("OPENTASK", r)
+              cols = [r[0] for r in c.execute("""SELECT column_name FROM information_schema.columns
+                  WHERE table_schema='auditcore' AND table_name='p2_worker_jobs' ORDER BY ordinal_position""")]
+              print("JOBCOLS", cols)
+              for r in c.execute("""SELECT * FROM auditcore.p2_worker_jobs WHERE job_kind='FAILED_RESEND'
+                  AND created_at_utc > now() - interval '3 days' ORDER BY created_at_utc"""):
+                  d = dict(zip(cols, r))
+                  print("RESEND", {k: (str(v)[:400] if v is not None else None) for k, v in d.items() if k not in ('tenant_id',)})
+              for r in c.execute("""SELECT q.last_error, q.queue_status, count(*) FROM auditcore.p2_document_queue q WHERE q.tenant_id=%s
+                  AND q.last_error IN ('DOCUMENT_AI_UNAVAILABLE','DOCUMENT_AI_RESPONSE_INVALID','DOCUMENT_AI_RATE_LIMITED')
+                  AND q.queue_status IN ('FAILED','DEAD_LETTER','CANCELLED') AND q.updated_at_utc > now() - interval '3 days' GROUP BY 1,2""", (t,)):
+                  print("OURSIDE", r)
+              for r in c.execute("""SELECT t.task_status, count(*) FROM auditcore.p2_tasks t WHERE t.tenant_id=%s AND t.task_type='DOCUMENT_RESUBMIT'
+                  AND t.created_at_utc > now() - interval '2 days' GROUP BY 1""", (t,)):
+                  print("RESUBMIT", r)
           PY
       - name: Check out Document Intelligence (dev)
         uses: actions/checkout@v4
@@ -135,42 +130,21 @@ jobs:
                     WHERE i.tenant_id=%s AND i.started_at_utc > now() - interval '2 days' AND i.capability <> 'OCR'
                     GROUP BY 1,2,3,4 ORDER BY 1,2,3,5 DESC""", (t,)):
                   print("DIDAY", r)
+              for r in c.execute("""SELECT dt.document_type_key, i.usage_metrics->>'finish_reason',
+                    CASE WHEN (i.usage_metrics->>'response_tokens')::int <= 3 THEN '<=3' WHEN (i.usage_metrics->>'response_tokens')::int < 50 THEN '<50'
+                         ELSE '>=50' END, count(DISTINCT d.document_id), count(*)
+                    FROM docintel.documents d JOIN docintel.document_types dt ON dt.document_type_id=d.document_type_id
+                    JOIN docintel.processing_runs pr ON pr.tenant_id=d.tenant_id AND pr.document_id=d.document_id
+                    JOIN docintel.processor_invocations i ON i.tenant_id=pr.tenant_id AND i.processing_run_id=pr.processing_run_id
+                    WHERE d.tenant_id=%s AND d.processing_status='FAILED' AND d.processing_failure_code='DOCUMENT_AI_RESPONSE_INVALID'
+                      AND i.capability='VISION_EXTRACTION' AND i.outcome='FAILED' AND d.registered_at_utc > now() - interval '14 days'
+                    GROUP BY 1,2,3 ORDER BY 4 DESC""", (t,)):
+                  print("REFUSEDTOK", r)
               for r in c.execute("""SELECT to_char(d.registered_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), d.processing_status,
                     coalesce(d.processing_failure_code,'-'), count(*) FROM docintel.documents d
                     WHERE d.tenant_id=%s AND d.registered_at_utc > now() - interval '12 days'
                     GROUP BY 1,2,3 ORDER BY 1,2,4 DESC""", (t,)):
                   print("DIDOCDAY", r)
-          PY
-      - name: DI worker log — why answers were refused (content-free fields only)
-        shell: bash
-        run: |
-          set +e
-          railway logs --service di-worker --since 30h --filter "gemini_parse_failure" --json --lines 3000 >/tmp/dilog.jsonl 2>/tmp/dilog.err
-          echo "logs exit $? lines $(wc -l </tmp/dilog.jsonl)"; head -c 300 /tmp/dilog.err
-          python - <<'PY'
-          import json
-          from collections import Counter
-          keep = ("timestamp", "document_type_key", "attempt", "will_retry", "parse_reason", "finish_reason",
-                  "response_chars", "response_tokens", "duration_ms", "exception_type")
-          tally = Counter()
-          for line in open('/tmp/dilog.jsonl'):
-              try:
-                  e = json.loads(line)
-              except ValueError:
-                  continue
-              m = e.get("message") or ""
-              try:
-                  inner = json.loads(m) if m.startswith("{") else {}
-              except ValueError:
-                  inner = {}
-              e = {**e.get("attributes", {}) if isinstance(e.get("attributes"), dict) else {}, **e, **inner}
-              if "gemini_parse_failure" not in json.dumps(e.get("event", m))[:200] and e.get("event") != "gemini_parse_failure":
-                  continue
-              row = {k: e.get(k) for k in keep if k in e}
-              print("PARSEFAIL", json.dumps(row, sort_keys=True))
-              tally[(e.get("document_type_key"), str(e.get("parse_reason"))[:70], e.get("finish_reason"))] += 1
-          for k, n in tally.most_common():
-              print("PARSETALLY", n, k)
           PY
       - name: Read each refused document once more and describe the answer (nothing stored)
         shell: bash
