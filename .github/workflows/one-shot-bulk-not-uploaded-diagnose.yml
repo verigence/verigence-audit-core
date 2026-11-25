@@ -50,49 +50,50 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: New booking ladder on the newest dumps, read-only
+      - name: Booking day gaps on two-thing matches, read-only
         shell: bash
         run: |
           git fetch -q --depth=1 origin claude/dms-booking-match-ladder && git checkout -q FETCH_HEAD -- src pyproject.toml
           python -m pip install -q -e . 2>&1 | tail -1
           python - <<'PY'
-          import os
+          import os, json
           from sqlalchemy import create_engine, text
           from audit_core import uc03_p2_dms_dumps as m
-          url = os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1)
-          engine = create_engine(url)
+          from audit_core.uc03_p2_dates import parse_extracted_date
+          from audit_core.uc03_p2_dms_field_sync import _COPIES_SQL, BOOKING_DOCS
+          engine = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
           t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
+          out = []
           with engine.connect() as c:
               tx = c.begin()
               c.execute(text("SET TRANSACTION READ ONLY"))
               c.execute(text("SELECT set_config('app.tenant_id', :t, true)"), {"t": t})
-              dumps = c.execute(text("""SELECT DISTINCT ON (u.dealer_id) u.dump_id, d.dealer_name FROM auditcore.p2_dms_dumps u
+              dumps = c.execute(text("""SELECT DISTINCT ON (u.dealer_id) u.dump_id, d.dealer_name, u.business_date, u.file_name FROM auditcore.p2_dms_dumps u
                   JOIN auditcore.dealers d ON d.tenant_id=u.tenant_id AND d.dealer_id=u.dealer_id
                   WHERE u.tenant_id=:t AND u.status='ACTIVE' AND u.dump_kind='BOOKING' ORDER BY u.dealer_id, u.business_date DESC, u.uploaded_at_utc DESC"""), {"t": t}).all()
-              refs = dict(c.execute(text("SELECT CAST(journey_id AS text), journey_reference FROM auditcore.journeys WHERE tenant_id=:t"), {"t": t}).all())
-              for dump_id, dealer in dumps:
-                  stored = {r.row_no: r for r in c.execute(text("""SELECT row_no, outcome, match_basis, CAST(journey_id AS text) j, customer_name,
-                      event_date, dms_booking_number, mobile FROM auditcore.p2_dms_dump_rows WHERE tenant_id=:t AND dump_id=:d"""), {"t": t, "d": dump_id})}
+              journeys = {str(r[0]): (r[1], r[2]) for r in c.execute(text("""SELECT j.journey_id, j.journey_reference, o.outlet_name FROM auditcore.journeys j
+                  LEFT JOIN auditcore.dealer_outlets o ON o.tenant_id=j.tenant_id AND o.outlet_id=j.outlet_id WHERE j.tenant_id=:t"""), {"t": t})}
+              for dump_id, dealer, bdate, fname in dumps:
+                  rows = {r.row_no: r for r in c.execute(text("SELECT * FROM auditcore.p2_dms_dump_rows WHERE tenant_id=:t AND dump_id=:d"), {"t": t, "d": dump_id})}
                   plan = m.plan_dump(c, tenant_id=t, dump_id=dump_id)
-                  index = m.build_index(c, tenant_id=t, dealer_id=c.execute(text("SELECT dealer_id FROM auditcore.p2_dms_dumps WHERE tenant_id=:t AND dump_id=:d"), {"t": t, "d": dump_id}).scalar_one())
-                  print("DUMP", dealer)
-                  for u in plan.updates:
-                      r = stored[u["n"]]
-                      if (u["o"], u["j"]) != (r.outcome, r.j):
-                          def j(jid):
-                              if not jid: return "-"
-                              jj = index.journeys.get(jid, {})
-                              return f"{refs.get(jid)} {sorted(jj.get('names') or [])[:2]} days={sorted(str(x) for x in jj.get('bookingDays') or [])} refs={sorted(jj.get('refs') or [])[:2]}"
-                          print(f"  CHANGE row {u['n']} {r.customer_name} | {r.event_date} {r.dms_booking_number} {r.mobile} | was {r.outcome}/{r.match_basis} {j(r.j)} | now {u['o']}/{u['b']} {j(u['j'])}")
-                  for f in plan.date_fixes:
-                      ds = next(x for x in plan.updates if x["n"] == f["rowNo"])["ds"] or {}
-                      if ds.get("digitOff"):
-                          print(f"  DATEFIX row {f['rowNo']} {stored[f['rowNo']].customer_name} {refs.get(f['journeyId'])} {f['documentType']} {f['was']} -> {f['dms']}")
-                  for f in plan.field_fixes:
-                      ds = next(x for x in plan.updates if x["n"] == f["rowNo"])["ds"] or {}
-                      flds = [x for x in ds.get("fields") or [] if x.get("digitOff") and x["was"] == f["was"]]
-                      if flds:
-                          print(f"  OTFFIX row {f['rowNo']} {stored[f['rowNo']].customer_name} {refs.get(f['journeyId'])} {f['was']} -> {f['dms']}")
-                  print("  COUNTS dates", len(plan.date_fixes), "fields", len(plan.field_fixes))
+                  pairs = [(u, rows[u["n"]]) for u in plan.updates if u["j"] and u["o"] == "MATCHED" and u["b"] != "BOOKING_NUMBER"]
+                  copies = {}
+                  for r in c.execute(text(_COPIES_SQL), {"t": t, "js": sorted({u["j"] for u, _ in pairs}), "fks": ["booking_date"], "docs": list(BOOKING_DOCS)}).mappings():
+                      copies.setdefault(r["journey_id"], []).append(dict(r))
+                  for u, r in pairs:
+                      day = r.event_date
+                      for cp in copies.get(u["j"], []):
+                          read = parse_extracted_date(cp["value"])
+                          if read and day and read != day:
+                              x, y = read.strftime("%d%m%Y"), day.strftime("%d%m%Y")
+                              diff = [i for i in range(8) if x[i] != y[i]]
+                              if len(diff) == 1 and diff[0] < 2:
+                                  ref, outlet = journeys.get(u["j"], (None, None))
+                                  out.append({"dealer": dealer, "dump": f"{fname} ({bdate:%d %b})", "row": u["n"], "customer": r.customer_name,
+                                              "otf": r.dms_booking_number or r.booking_number, "mobile": r.mobile, "dmsOutlet": r.outlet_label,
+                                              "journey": ref, "journeyOutlet": outlet, "matchedOn": u["b"], "document": cp["doc"],
+                                              "formDate": read.isoformat(), "dmsDate": day.isoformat(), "days": (day - read).days})
               tx.rollback()
+          print("GAPCOUNT", len(out))
+          print("GAPJSON " + json.dumps(out))
           PY
