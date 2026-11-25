@@ -180,8 +180,25 @@ def _copy_unit(engine: Engine, tenant_id: str, keep: dict[str, Any], copy: dict[
     return batch_id
 
 
-class NotHeldAtDi(RuntimeError):
+class NoReadingToMove(RuntimeError):
+    """The unit has no good reading to move: it is read on the kept booking instead."""
+
+
+class NotHeldAtDi(NoReadingToMove):
     """Document Intelligence no longer holds the unit's reading: there is nothing to move."""
+
+
+# A unit whose reading failed carries nothing worth moving (25 Nov 2026, live: 40 units read
+# in the 14:00 UTC AI outage of 24 Nov had failed for good on the journey they were read on;
+# moved, they arrived failed and waited for the PC, where a reading on the booking -- the
+# AI was back -- would have read them). Read on the booking: their first good reading.
+_FAILED_STATUSES = frozenset({"FAILED", "DEAD_LETTER", "CANCELLED"})
+
+
+def _reading_failed(source: Any) -> bool:
+    return (str(source["queue_status"] or "").upper() in _FAILED_STATUSES
+            or str(source["di_state"] or "").upper() == "FAILED"
+            or str(source["di_processing_status"] or "").upper() == "FAILED")
 
 
 def _di_context_refs(engine: Engine, tenant_id: str, journey_ids: list[UUID]) -> tuple[str, list[str]]:
@@ -212,7 +229,8 @@ def _move_unit(engine: Engine, tenant_id: str, keep: dict[str, Any], copy: dict[
     classification and reading -- to the kept booking's context; the kept booking gets the
     stored file as an upload of its own with the unit already submitted, and its reconcile
     copies the values DI holds (no model call). Same upload id as _copy_unit, so either is
-    idempotent against the other. NotHeldAtDi when DI no longer holds the reading."""
+    idempotent against the other. NoReadingToMove when the unit's reading failed or DI no
+    longer holds it (NotHeldAtDi): nothing is moved and it is read on the booking."""
     from audit_core.di_capture_v2_client import DiCaptureV2Error
     from audit_core.uc03_document_capture_v2 import get_di_capture_v2_client
     from audit_core.uc03_p2_object_keys import original_key, upload_labels
@@ -229,7 +247,7 @@ def _move_unit(engine: Engine, tenant_id: str, keep: dict[str, Any], copy: dict[
             text(
                 """
                 SELECT q.queue_id, q.unit_kind, q.page_number, q.page_numbers, q.page_sha256, q.page_object_key,
-                       q.di_document_id, q.classified_document_type, q.template_key, q.business_stage,
+                       q.queue_status, q.di_document_id, q.classified_document_type, q.template_key, q.business_stage,
                        q.di_state, q.di_processing_status, q.group_source, q.display_name, q.quality_confirmed,
                        d.stage_code, d.classified_document_type_key, d.capture_status, d.classified_at_utc
                 FROM auditcore.p2_document_queue q
@@ -246,6 +264,8 @@ def _move_unit(engine: Engine, tenant_id: str, keep: dict[str, Any], copy: dict[
             {"t": tenant_id, "q": unit["queue_id"]},
         ).mappings().all() if source["unit_kind"] == "GROUP" else []
     document_id = str(source["di_document_id"])
+    if _reading_failed(source):
+        raise NoReadingToMove(document_id)
 
     token, (copy_ref, keep_ref) = _di_context_refs(engine, tenant_id, [copy["journey_id"], keep["journey_id"]])
     try:

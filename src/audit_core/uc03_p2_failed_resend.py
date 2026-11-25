@@ -21,6 +21,9 @@ unless the label ends with "-commit"). What failed on our side:
 - a system error stopped it after its retries (the code is the error's name);
 - the AI's answer was refused by our reader after its retries:
   DOCUMENT_AI_RESPONSE_INVALID;
+- the AI service could not take it after its retries (an outage, a rate
+  limit, a provider error): DOCUMENT_AI_UNAVAILABLE, DOCUMENT_AI_RATE_LIMITED,
+  CLASSIFICATION_PROVIDER_ERROR, EXTRACTION_PROVIDER_ERROR (25 Nov 2026);
 - a file never split into pages, or whose upload the browser never confirmed.
 
 A page refused for what it is -- scan quality, a duplicate, content the AI will

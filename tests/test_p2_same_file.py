@@ -1317,10 +1317,14 @@ class MovingDi:
         return {"outcome": "moved"}
 
 
-@pytest.mark.parametrize(("kind", "held_at_di"), [("tax_invoice_tally", True), ("dealer_receipt", True),
-                                                  ("tax_invoice_tally", False)])
+@pytest.mark.parametrize(("kind", "held_at_di", "reading"), [
+    ("tax_invoice_tally", True, "READY"), ("dealer_receipt", True, "READY"),
+    ("tax_invoice_tally", False, "READY"),
+    # 25 Nov 2026: its reading failed in an AI outage -- nothing to move, it is read on the booking.
+    ("tax_invoice_tally", True, "FAILED"),
+])
 def test_a_page_only_the_copy_holds_goes_to_the_earlier_journey_before_the_delete(tenant, monkeypatch, kind,
-                                                                                  held_at_di):
+                                                                                  held_at_di, reading):
     """A Tally invoice the earlier journey lacks -- or a second receipt, a kind it already
     holds, which comparing kinds would have lost -- is carried to it, then the copy goes.
     Product owner 2026-11-24, "no double reading": it moves with its reading, and is read
@@ -1341,6 +1345,12 @@ def test_a_page_only_the_copy_holds_goes_to_the_earlier_journey_before_the_delet
     # The earlier journey's own receipt: as many documents on each, so the earlier one is kept.
     _page(old, sha=uuid4().hex, kind="dealer_receipt")
     extra_batch, extra_queue, _doc = _page(new, sha=uuid4().hex, kind=kind)
+    if reading == "FAILED":
+        with new.engine.begin() as connection:
+            set_tenant_context(connection, new.tenant_id)
+            connection.execute(text("UPDATE auditcore.p2_document_queue SET queue_status='FAILED', "
+                                    "di_processing_status='FAILED', last_error='DOCUMENT_AI_UNAVAILABLE' "
+                                    "WHERE tenant_id=:t AND queue_id=:q"), {"t": new.tenant_id, "q": extra_queue})
     # The earlier booking was made by another PC of the outlet (2026-11-24).
     with old.engine.begin() as connection:
         set_tenant_context(connection, old.tenant_id)
@@ -1382,13 +1392,13 @@ def test_a_page_only_the_copy_holds_goes_to_the_earlier_journey_before_the_delet
         reconcile = connection.execute(
             text("SELECT count(*) FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
                  "AND work_type='JOURNEY_RECONCILE'"), {"t": old.tenant_id, "j": old.journey_id}).scalar_one()
-    if held_at_di:
+    if held_at_di and reading == "READY":
         # Moved at DI to the earlier journey's context and copied from there: no split, no reading.
         assert di.moved == [(f"ctx-{new.journey_id}", str(_doc), f"ctx-{old.journey_id}")]
         assert split == 0 and reconcile >= 1 and capture == 1
         assert [(u["queue_status"], u["di_document_id"]) for u in units] == [("CLASSIFYING", _doc)]
     else:
-        # DI no longer holds the reading: the upload is split and read there like any upload.
+        # No good reading to move (DI no longer holds it, or it failed): split and read there.
         assert di.moved == [] and split == 1 and units == []
 
 

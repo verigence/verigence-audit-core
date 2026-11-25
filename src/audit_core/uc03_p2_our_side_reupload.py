@@ -58,7 +58,13 @@ _PER_RUN = int(os.environ.get("AUDIT_CORE_OUR_SIDE_REUPLOAD_PER_RUN", "8"))
 # Pages and documents that failed on our side, not the page's. An AI answer our
 # reader refused after its retries is one of them (product owner 22 Nov 2026:
 # "pls send 48 AI refused pages from storage"): a fresh read may be answered well.
-OUR_SIDE_CODES = ("NOT_READ_IN_30_MIN", "GROUPING_FAILED", "DOCUMENT_AI_RESPONSE_INVALID")
+# So did a page the AI service could not take after its retries -- unavailable, rate
+# limited, a provider error (25 Nov 2026, live: an AI outage of 24 Nov, 14:00-15:00 UTC,
+# failed 204 pages of the Drive run and 40 joined documents, all left for the PCs to upload
+# again; product owner 22 Nov: the 8:15 am job "handles all the failed transactions").
+OUR_SIDE_CODES = ("NOT_READ_IN_30_MIN", "GROUPING_FAILED", "DOCUMENT_AI_RESPONSE_INVALID",
+                  "DOCUMENT_AI_UNAVAILABLE", "DOCUMENT_AI_RATE_LIMITED",
+                  "CLASSIFICATION_PROVIDER_ERROR", "EXTRACTION_PROVIDER_ERROR")
 # So did a page a system error stopped after its retries (22 Nov 2026: 15 pages of
 # 3 files from 17 Nov waited for the PC with "A system problem stopped this page").
 # Such a page's code is the error's own name -- "DiClientError (at ...)",
