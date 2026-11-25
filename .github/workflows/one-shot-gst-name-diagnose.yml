@@ -1,7 +1,7 @@
 name: One-shot GST name rule diagnose (read-only)
 
 # Read-only: why one journey's customer name came from where it did. Prints document types, field keys and
-# yes/no comparisons only -- no names, numbers or references (public repository). Never writes.
+# yes/no comparisons only (rerun after GST_TRADE_NAME) -- no names, numbers or references (public repository). Never writes.
 on:
   workflow_dispatch:
   push:
@@ -89,7 +89,7 @@ jobs:
               g = re.sub(r"\s", "", str(r["gstin"] or "")).upper()
               kind = KIND.get(g[5], "other") if is_gstin(g) else "no valid GSTIN"
               has_trade = bool(r["trade"]) and norm(r["trade"]) != norm(r["legal"])
-              cust = "customer = legal name" if r["customer"] and r["legal"] and (norm(r["customer"]) == norm(r["legal"]) or same_person(r["customer"], r["legal"])) else (
+              cust = "customer = trade name" if r["customer"] and r["trade"] and norm(r["customer"]) == norm(r["trade"]) else "customer = legal name" if r["customer"] and r["legal"] and (norm(r["customer"]) == norm(r["legal"]) or same_person(r["customer"], r["legal"])) else (
                      "customer = trade name" if r["customer"] and r["trade"] and norm(r["customer"]) == norm(r["trade"]) else "customer = other")
               stats[(kind, "separate trade name" if has_trade else "no separate trade name", cust)] += 1
               if r["target"]:
