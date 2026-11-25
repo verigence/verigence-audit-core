@@ -1,0 +1,88 @@
+name: One-shot DMS re-match after the booking ladder (DEV, writes)
+
+# After PR #967 (a booking matches on the OTF or two things agreeing; year / month misreads of
+# the booking date and OTFs a digit or two off corrected): the DMS_REMATCH worker job, committed,
+# for every current dump of Mahindra Orissa -- the Rematch button for every dump. Then waits for
+# the job and prints its result.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/bulk-not-uploaded-diagnose]
+    paths:
+      - '.github/workflows/one-shot-dms-rematch-ladder.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  rematch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+      TENANT: afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
+      LABEL: dms-booking-ladder-2026-11-25-commit
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install 'psycopg[binary]>=3.2,<4'
+          npm install --global @railway/cli@5.70.0
+      - name: Reach the live database
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/vars.json
+          url="$(python - <<'PY'
+          import json
+          from urllib.parse import urlparse
+          v = json.load(open('/tmp/vars.json'))
+          for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
+              value = (v.get(key) or '').replace('postgresql+psycopg://', 'postgresql://', 1)
+              host = (urlparse(value).hostname or '').lower()
+              if value and host and not host.endswith('.railway.internal'):
+                  print(value)
+                  break
+          PY
+          )"
+          rm -f /tmp/vars.json
+          test -n "$url"
+          echo "::add-mask::$url"
+          echo "DB=$url" >> "$GITHUB_ENV"
+      - name: Enqueue DMS_REMATCH (commit) and wait for it
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, time, psycopg
+          tag = f"{os.environ['TENANT']}:{os.environ['LABEL']}"
+          with psycopg.connect(os.environ["DB"], autocommit=True) as c:
+              done = c.execute("SELECT job_id, status FROM auditcore.p2_worker_jobs WHERE job_kind='DMS_REMATCH' AND tag=%s", (tag,)).fetchone()
+              if done:
+                  job_id = done[0]
+                  print("ALREADY", done)
+              else:
+                  job_id = c.execute("INSERT INTO auditcore.p2_worker_jobs (job_kind, tag, reports, requested_by) "
+                                     "VALUES ('DMS_REMATCH', %s, '{}', 'claude-github-actions') RETURNING job_id", (tag,)).fetchone()[0]
+                  print("ENQUEUED", job_id)
+              for _ in range(200):
+                  status, detail = c.execute("SELECT status, detail FROM auditcore.p2_worker_jobs WHERE job_id=%s", (job_id,)).fetchone()
+                  if status in ("DONE", "FAILED"):
+                      break
+                  time.sleep(10)
+              print("STATUS", status)
+              try:
+                  result = json.loads(detail or "{}")
+              except ValueError:
+                  print("DETAIL", (detail or "")[:3000]); raise SystemExit(0)
+              print("SUMMARY", {k: result.get(k) for k in ("commit", "dumps", "failed", "retried")})
+              for e in result.get("errors") or []:
+                  print("ERROR", e)
+              for i in result.get("items") or []:
+                  print("DUMP", i["day"], i["dealer"], i["kind"], "before", i["before"], "after", i["after"],
+                        "newlyFound", i["newlyFound"], "fields", i.get("fieldFixes"))
+          PY
