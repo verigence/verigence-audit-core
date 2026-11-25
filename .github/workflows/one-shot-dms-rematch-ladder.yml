@@ -23,7 +23,7 @@ jobs:
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
       TENANT: afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
-      LABEL: dms-booking-ladder-2026-11-25-commit
+      LABEL: dms-booking-ladder-2026-11-25-dry
     steps:
       - uses: actions/setup-python@v5
         with:
