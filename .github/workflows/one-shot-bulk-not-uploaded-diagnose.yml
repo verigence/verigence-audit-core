@@ -15,7 +15,7 @@ permissions:
 jobs:
   diagnose:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 40
     env:
       RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
@@ -50,7 +50,7 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Failed reads and upload errors, read-only
+      - name: Audit Core — failed reads by day, read-only
         shell: bash
         run: |
           python - <<'PY'
@@ -59,46 +59,128 @@ jobs:
               c.execute("SET TRANSACTION READ ONLY")
               t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
               c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
-              print("== the file")
-              for r in c.execute("""SELECT b.original_filename, b.batch_status, to_char(b.created_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI'),
-                    q.page_number, q.queue_status, q.di_state, q.di_processing_status, q.attempt_count, q.last_error, q.status_reason,
-                    q.di_document_id, to_char(q.di_submitted_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI:SS'),
-                    to_char(q.updated_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI:SS'), q.classified_document_type
-                  FROM auditcore.p2_upload_batches b JOIN auditcore.p2_document_queue q ON q.tenant_id=b.tenant_id AND q.batch_id=b.batch_id
-                  JOIN auditcore.journeys j ON j.tenant_id=b.tenant_id AND j.journey_id=b.journey_id
-                  WHERE b.tenant_id=%s AND j.journey_reference='UTK-SR-261104-004' AND b.original_filename ILIKE 'C1R27F00000090%%'
-                  ORDER BY b.created_at_utc, q.page_number""", (t,)):
-                  print("FILE", r)
-              print("== pages failed per day (IST) by code, last 10 days")
-              for r in c.execute("""SELECT to_char(created_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD') d, coalesce(last_error,'-'), count(*)
-                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND unit_kind='PAGE' AND queue_status IN ('FAILED','DEAD_LETTER')
-                    AND created_at_utc > now() - interval '10 days' GROUP BY 1,2 ORDER BY 1,3 DESC""", (t,)):
+              for r in c.execute("""SELECT to_char(updated_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD') d, unit_kind, coalesce(last_error,'-'), count(*)
+                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND queue_status IN ('FAILED','DEAD_LETTER')
+                    AND updated_at_utc > now() - interval '12 days' GROUP BY 1,2,3 ORDER BY 1,4 DESC""", (t,)):
                   print("FAILDAY", r)
-              print("== all pages per day by status")
-              for r in c.execute("""SELECT to_char(created_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD') d, queue_status, count(*)
-                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND unit_kind='PAGE' AND created_at_utc > now() - interval '10 days'
-                  GROUP BY 1,2 ORDER BY 1,2""", (t,)):
-                  print("PAGEDAY", r)
-              print("== today's AI failures by hour (IST)")
-              for r in c.execute("""SELECT to_char(updated_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD HH24') h, last_error, count(*)
-                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND unit_kind='PAGE' AND queue_status IN ('FAILED','DEAD_LETTER','RETRY_WAIT')
-                    AND updated_at_utc > now() - interval '3 days' GROUP BY 1,2 ORDER BY 1""", (t,)):
-                  print("FAILHOUR", r)
-              print("== reasons today")
-              for r in c.execute("""SELECT left(status_reason,140), count(*) FROM auditcore.p2_document_queue WHERE tenant_id=%s
-                  AND queue_status IN ('FAILED','DEAD_LETTER') AND created_at_utc > now() - interval '2 days' GROUP BY 1 ORDER BY 2 DESC""", (t,)):
-                  print("REASON", r)
-              print("== batches per day by status (upload side)")
-              for r in c.execute("""SELECT to_char(created_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), batch_status, count(*)
-                  FROM auditcore.p2_upload_batches WHERE tenant_id=%s AND created_at_utc > now() - interval '10 days' GROUP BY 1,2 ORDER BY 1,2""", (t,)):
-                  print("BATCHDAY", r)
-              print("== bulk files per day by outcome")
-              for r in c.execute("""SELECT to_char(created_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), outcome, left(coalesce(detail,''),80), count(*)
-                  FROM auditcore.p2_bulk_files WHERE tenant_id=%s AND created_at_utc > now() - interval '5 days' GROUP BY 1,2,3 ORDER BY 1,2""", (t,)):
-                  print("BULKDAY", r)
-              print("== work queue failures per day")
-              for r in c.execute("""SELECT to_char(updated_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), work_type, work_status, left(coalesce(last_error,''),160), count(*)
-                  FROM auditcore.p2_work_queue WHERE tenant_id=%s AND work_status IN ('FAILED','DEAD_LETTER','RETRY_WAIT')
-                    AND updated_at_utc > now() - interval '4 days' GROUP BY 1,2,3,4 ORDER BY 1, 5 DESC LIMIT 80""", (t,)):
-                  print("WORK", r)
+              for r in c.execute("""SELECT to_char(updated_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD') d, count(*)
+                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND di_submitted_at_utc IS NOT NULL
+                    AND updated_at_utc > now() - interval '12 days' GROUP BY 1 ORDER BY 1""", (t,)):
+                  print("SENTDAY", r)
+              for r in c.execute("""SELECT q.last_error, q.classified_document_type, count(*), count(DISTINCT q.journey_id)
+                  FROM auditcore.p2_document_queue q WHERE q.tenant_id=%s AND q.queue_status='FAILED'
+                  GROUP BY 1,2 ORDER BY 3 DESC LIMIT 40""", (t,)):
+                  print("FAILEDNOW", r)
+              for r in c.execute("""SELECT to_char(t.created_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), t.task_type, t.task_status, count(*)
+                  FROM auditcore.p2_tasks t WHERE t.tenant_id=%s AND t.created_at_utc > now() - interval '8 days'
+                    AND t.task_type ILIKE '%%FAIL%%' GROUP BY 1,2,3 ORDER BY 1,2,3""", (t,)):
+                  print("TASKDAY", r)
+              for r in c.execute("""SELECT to_char(q.updated_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD HH24:MI'), j.journey_reference, b.original_filename,
+                    q.page_numbers, q.last_error, q.classified_document_type, q.attempt_count, q.di_document_id
+                  FROM auditcore.p2_document_queue q JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
+                  JOIN auditcore.journeys j ON j.tenant_id=q.tenant_id AND j.journey_id=q.journey_id
+                  WHERE q.tenant_id=%s AND q.queue_status IN ('FAILED','DEAD_LETTER','CANCELLED') AND q.updated_at_utc > now() - interval '3 days'
+                    AND coalesce(q.last_error,'') NOT IN ('SUPERSEDED_PAGE') ORDER BY q.updated_at_utc""", (t,)):
+                  print("FAILROW", r)
           PY
+      - name: Check out Document Intelligence (dev)
+        uses: actions/checkout@v4
+        with:
+          repository: verigence/verigence-di
+          ref: dev
+          path: di-src
+      - name: Install Document Intelligence and read the DI worker's variables
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/di"
+          "$RUNNER_TEMP/di/bin/pip" install --quiet --upgrade pip
+          "$RUNNER_TEMP/di/bin/pip" install --quiet -e di-src/backend 'psycopg[binary]>=3.2,<4'
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service di-worker --json >/dev/null
+          railway variable list --service di-worker --json >"$RUNNER_TEMP/di-vars.json"
+          python - "$RUNNER_TEMP/di-vars.json" <<'PY'
+          import json, re, sys
+          from pathlib import Path
+          for key, value in json.loads(Path(sys.argv[1]).read_text()).items():
+              value = str(value or "")
+              if re.search(r"KEY|SECRET|TOKEN|PASSWORD|URL|DSN", key) and len(value) >= 8 and "\n" not in value:
+                  print(f"::add-mask::{value}")
+          PY
+      - name: DI — the failing documents and failures by day, read-only
+        shell: bash
+        run: |
+          "$RUNNER_TEMP/di/bin/python" - "$RUNNER_TEMP/di-vars.json" <<'PY'
+          import json, sys, psycopg
+          v = json.load(open(sys.argv[1]))
+          url = v["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://", 1)
+          t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
+          docs = ['b7c75165-62bb-4bcd-ae7e-790dbf3e9849', '8308b9a0-e6f1-452a-9425-5a1978c86bc5',
+                  'd8929da9-cd84-431f-8a4c-1dc65f4df8a7', '31fc9fbc-d96a-44e9-af76-112821978683']
+          with psycopg.connect(url, options="-c statement_timeout=120000") as c:
+              c.execute("SET TRANSACTION READ ONLY")
+              c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
+              for r in c.execute("""SELECT d.document_id, dt.document_type_key, d.processing_status, d.processing_failure_code,
+                    to_char(d.registered_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI') FROM docintel.documents d
+                    LEFT JOIN docintel.document_types dt ON dt.document_type_id=d.document_type_id
+                    WHERE d.tenant_id=%s AND d.document_id = ANY(%s::uuid[])""", (t, docs)):
+                  print("DIDOC", r)
+              for r in c.execute("""SELECT pr.document_id, i.capability, i.outcome, i.error_code,
+                    to_char(i.started_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI:SS'),
+                    i.usage_metrics->>'finish_reason', i.usage_metrics->>'response_tokens', i.usage_metrics->>'thoughts_tokens',
+                    i.usage_metrics->>'fields_requested', i.usage_metrics->>'fields_found', i.usage_metrics->>'provider_calls'
+                    FROM docintel.processor_invocations i JOIN docintel.processing_runs pr
+                      ON pr.tenant_id=i.tenant_id AND pr.processing_run_id=i.processing_run_id
+                    WHERE i.tenant_id=%s AND pr.document_id = ANY(%s::uuid[]) ORDER BY i.started_at_utc""", (t, docs)):
+                  print("DIINV", r)
+              for r in c.execute("""SELECT to_char(i.started_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), i.capability, i.outcome,
+                    coalesce(i.error_code,'-'), count(*) FROM docintel.processor_invocations i
+                    WHERE i.tenant_id=%s AND i.started_at_utc > now() - interval '12 days' AND i.capability <> 'OCR'
+                    GROUP BY 1,2,3,4 ORDER BY 1,2,3,5 DESC""", (t,)):
+                  print("DIDAY", r)
+              for r in c.execute("""SELECT to_char(d.registered_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), d.processing_status,
+                    coalesce(d.processing_failure_code,'-'), count(*) FROM docintel.documents d
+                    WHERE d.tenant_id=%s AND d.registered_at_utc > now() - interval '12 days'
+                    GROUP BY 1,2,3 ORDER BY 1,2,4 DESC""", (t,)):
+                  print("DIDOCDAY", r)
+          PY
+      - name: DI worker log — why answers were refused (content-free fields only)
+        shell: bash
+        run: |
+          set +e
+          railway logs --service di-worker --since 30h --filter "gemini_parse_failure" --json --lines 3000 >/tmp/dilog.jsonl 2>/tmp/dilog.err
+          echo "logs exit $? lines $(wc -l </tmp/dilog.jsonl)"; head -c 300 /tmp/dilog.err
+          python - <<'PY'
+          import json
+          from collections import Counter
+          keep = ("timestamp", "document_type_key", "attempt", "will_retry", "parse_reason", "finish_reason",
+                  "response_chars", "response_tokens", "duration_ms", "exception_type")
+          tally = Counter()
+          for line in open('/tmp/dilog.jsonl'):
+              try:
+                  e = json.loads(line)
+              except ValueError:
+                  continue
+              m = e.get("message") or ""
+              try:
+                  inner = json.loads(m) if m.startswith("{") else {}
+              except ValueError:
+                  inner = {}
+              e = {**e.get("attributes", {}) if isinstance(e.get("attributes"), dict) else {}, **e, **inner}
+              if "gemini_parse_failure" not in json.dumps(e.get("event", m))[:200] and e.get("event") != "gemini_parse_failure":
+                  continue
+              row = {k: e.get(k) for k in keep if k in e}
+              print("PARSEFAIL", json.dumps(row, sort_keys=True))
+              tally[(e.get("document_type_key"), str(e.get("parse_reason"))[:70], e.get("finish_reason"))] += 1
+          for k, n in tally.most_common():
+              print("PARSETALLY", n, k)
+          PY
+      - name: Read each refused document once more and describe the answer (nothing stored)
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/di/bin/python" tools/statement_reread_experiment/di_refused.py \
+            "$RUNNER_TEMP/di-vars.json" afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
+      - name: Remove the variables from the runner
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/di-vars.json"
