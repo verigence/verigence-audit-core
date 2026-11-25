@@ -49,30 +49,25 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Failed sign-ins, read-only
+      - name: Why sign-ins were refused (422), from the sign-in service logs, read-only
         shell: bash
         run: |
+          set -uo pipefail
+          railway logs --help | grep -E "since|until|filter|lines|json" || true
+          railway logs --service security --environment dev --since 2026-11-24T00:00:00Z --until 2026-11-25T00:00:00Z \
+            --filter "security_request_validation_failed" --lines 200 --json > /tmp/v.jsonl 2>/tmp/v.err || cat /tmp/v.err
           python - <<'PY'
-          import hashlib, os
+          import json
           from collections import Counter
-          from sqlalchemy import create_engine
-          h = lambda s: hashlib.sha256(str(s).encode()).hexdigest()[:8] if s else "-"
-          e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
-          with e.connect() as c:
-              c.exec_driver_sql("SET TRANSACTION READ ONLY")
-              rows = c.exec_driver_sql("""
-                  SELECT (attempted_at_utc AT TIME ZONE 'Asia/Kolkata') AS at_ist, identifier, user_id, outcome, reason,
-                         device_type, platform, app_version
-                  FROM security.login_attempts
-                  WHERE attempted_at_utc >= TIMESTAMP '2026-11-23 18:30' AND attempted_at_utc < TIMESTAMP '2026-11-25 02:30'
-                  ORDER BY attempted_at_utc""").mappings().all()
-              print("ATTEMPTS", len(rows), Counter((r["outcome"], r["reason"]) for r in rows))
-              for r in rows:
-                  if r["outcome"] != "SUCCEEDED" and r["outcome"] != "SUCCESS":
-                      print("FAIL", r["at_ist"].strftime("%d %H:%M:%S"), h(r["identifier"]), "user", h(r["user_id"]), r["outcome"], r["reason"], r["device_type"], r["platform"], r["app_version"])
-              who = [r for r in rows if h(r["identifier"]) == "dd96cf54"]
-              print("TARGET rows", len(who))
-              for r in who:
-                  print("TARGET", r["at_ist"].strftime("%d %H:%M:%S"), r["outcome"], r["reason"], r["device_type"], r["platform"], r["app_version"], "user", h(r["user_id"]))
-              c.rollback()
+          seen = Counter()
+          for line in open('/tmp/v.jsonl'):
+              line = line.strip()
+              if not line.startswith('{'):
+                  continue
+              r = json.loads(line)
+              issues = r.get('validation_issues') or (r.get('attributes') or {}).get('validation_issues')
+              route = r.get('http_route') or (r.get('attributes') or {}).get('http_route')
+              print("V", r.get('timestamp'), route, issues)
+              seen[(route, issues)] += 1
+          print("SUMMARY", dict(seen))
           PY
