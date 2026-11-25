@@ -50,7 +50,7 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Audit Core — failed reads by day, read-only
+      - name: Audit Core — the 24 Nov AI-unavailable failures, read-only
         shell: bash
         run: |
           python - <<'PY'
@@ -59,29 +59,25 @@ jobs:
               c.execute("SET TRANSACTION READ ONLY")
               t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
               c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
-              for r in c.execute("""SELECT to_char(updated_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD') d, unit_kind, coalesce(last_error,'-'), count(*)
-                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND queue_status IN ('FAILED','DEAD_LETTER')
-                    AND updated_at_utc > now() - interval '12 days' GROUP BY 1,2,3 ORDER BY 1,4 DESC""", (t,)):
-                  print("FAILDAY", r)
-              for r in c.execute("""SELECT to_char(updated_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD') d, count(*)
-                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND di_submitted_at_utc IS NOT NULL
-                    AND updated_at_utc > now() - interval '12 days' GROUP BY 1 ORDER BY 1""", (t,)):
-                  print("SENTDAY", r)
-              for r in c.execute("""SELECT q.last_error, q.classified_document_type, count(*), count(DISTINCT q.journey_id)
-                  FROM auditcore.p2_document_queue q WHERE q.tenant_id=%s AND q.queue_status='FAILED'
-                  GROUP BY 1,2 ORDER BY 3 DESC LIMIT 40""", (t,)):
-                  print("FAILEDNOW", r)
-              for r in c.execute("""SELECT to_char(t.created_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), t.task_type, t.task_status, count(*)
-                  FROM auditcore.p2_tasks t WHERE t.tenant_id=%s AND t.created_at_utc > now() - interval '8 days'
-                    AND t.task_type ILIKE '%%FAIL%%' GROUP BY 1,2,3 ORDER BY 1,2,3""", (t,)):
-                  print("TASKDAY", r)
-              for r in c.execute("""SELECT to_char(q.updated_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD HH24:MI'), j.journey_reference, b.original_filename,
-                    q.page_numbers, q.last_error, q.classified_document_type, q.attempt_count, q.di_document_id
-                  FROM auditcore.p2_document_queue q JOIN auditcore.p2_upload_batches b ON b.tenant_id=q.tenant_id AND b.batch_id=q.batch_id
-                  JOIN auditcore.journeys j ON j.tenant_id=q.tenant_id AND j.journey_id=q.journey_id
-                  WHERE q.tenant_id=%s AND q.queue_status IN ('FAILED','DEAD_LETTER','CANCELLED') AND q.updated_at_utc > now() - interval '3 days'
-                    AND coalesce(q.last_error,'') NOT IN ('SUPERSEDED_PAGE') ORDER BY q.updated_at_utc""", (t,)):
-                  print("FAILROW", r)
+              for r in c.execute("""SELECT to_char(di_submitted_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD HH24') h, coalesce(last_error,'-'), queue_status, count(*)
+                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND di_submitted_at_utc > now() - interval '2 days'
+                  AND (last_error LIKE 'DOCUMENT_AI%%' OR queue_status IN ('FAILED','RETRY_WAIT'))
+                  GROUP BY 1,2,3 ORDER BY 1""", (t,)):
+                  print("SUBHOUR", r)
+              for r in c.execute("""SELECT to_char(di_submitted_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD HH24') h, count(*)
+                  FROM auditcore.p2_document_queue WHERE tenant_id=%s AND di_submitted_at_utc > now() - interval '2 days'
+                  GROUP BY 1 ORDER BY 1""", (t,)):
+                  print("SENTHOUR", r)
+              for r in c.execute("""SELECT q.queue_status, left(coalesce(q.status_reason,''),90),
+                    (SELECT n.queue_status FROM auditcore.p2_document_queue n WHERE n.tenant_id=q.tenant_id AND n.batch_id=q.batch_id
+                       AND n.page_numbers && q.page_numbers AND n.created_at_utc > q.created_at_utc AND n.queue_status NOT IN ('CANCELLED')
+                       ORDER BY n.created_at_utc DESC LIMIT 1) AS later, count(*)
+                  FROM auditcore.p2_document_queue q WHERE q.tenant_id=%s AND q.last_error='DOCUMENT_AI_UNAVAILABLE'
+                    AND q.updated_at_utc > now() - interval '2 days' GROUP BY 1,2,3 ORDER BY 4 DESC""", (t,)):
+                  print("UNAVAIL", r)
+              for r in c.execute("""SELECT task_type, task_status, count(*) FROM auditcore.p2_tasks WHERE tenant_id=%s
+                  AND task_status NOT IN ('VERIFIED_COMPLETE','CLOSED','CANCELLED','DONE','RESOLVED') GROUP BY 1,2 ORDER BY 3 DESC LIMIT 30""", (t,)):
+                  print("OPENTASK", r)
           PY
       - name: Check out Document Intelligence (dev)
         uses: actions/checkout@v4
@@ -112,7 +108,9 @@ jobs:
           "$RUNNER_TEMP/di/bin/python" - "$RUNNER_TEMP/di-vars.json" <<'PY'
           import json, sys, psycopg
           v = json.load(open(sys.argv[1]))
-          url = v["DATABASE_URL"].replace("postgresql+asyncpg://", "postgresql://", 1)
+          print("DIKEYS", sorted(k for k in v if "DATA" in k or "PG" in k or "DB" in k))
+          key = next(k for k in ("DI_DATABASE_PUBLIC_URL", "DI_DATABASE_URL", "DATABASE_PUBLIC_URL", "DATABASE_URL") if v.get(k))
+          url = v[key].replace("postgresql+asyncpg://", "postgresql://", 1)
           t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
           docs = ['b7c75165-62bb-4bcd-ae7e-790dbf3e9849', '8308b9a0-e6f1-452a-9425-5a1978c86bc5',
                   'd8929da9-cd84-431f-8a4c-1dc65f4df8a7', '31fc9fbc-d96a-44e9-af76-112821978683']
@@ -132,9 +130,9 @@ jobs:
                       ON pr.tenant_id=i.tenant_id AND pr.processing_run_id=i.processing_run_id
                     WHERE i.tenant_id=%s AND pr.document_id = ANY(%s::uuid[]) ORDER BY i.started_at_utc""", (t, docs)):
                   print("DIINV", r)
-              for r in c.execute("""SELECT to_char(i.started_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), i.capability, i.outcome,
+              for r in c.execute("""SELECT to_char(i.started_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD HH24'), i.capability, i.outcome,
                     coalesce(i.error_code,'-'), count(*) FROM docintel.processor_invocations i
-                    WHERE i.tenant_id=%s AND i.started_at_utc > now() - interval '12 days' AND i.capability <> 'OCR'
+                    WHERE i.tenant_id=%s AND i.started_at_utc > now() - interval '2 days' AND i.capability <> 'OCR'
                     GROUP BY 1,2,3,4 ORDER BY 1,2,3,5 DESC""", (t,)):
                   print("DIDAY", r)
               for r in c.execute("""SELECT to_char(d.registered_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), d.processing_status,
