@@ -59,7 +59,7 @@ jobs:
           e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
           with e.connect() as c:
               c.exec_driver_sql("SET TRANSACTION READ ONLY")
-              for r in c.exec_driver_sql("""SELECT status, count(*) FROM auditcore.p2_work_queue
+              for r in c.exec_driver_sql("""SELECT work_status, count(*) FROM auditcore.p2_work_queue
                      WHERE correlation_id LIKE 'gst_trade_name:%%' GROUP BY 1 ORDER BY 1""").all():
                   print("SETTLE", r[0], r[1])
               c.rollback()
