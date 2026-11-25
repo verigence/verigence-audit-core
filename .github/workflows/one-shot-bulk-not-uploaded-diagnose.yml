@@ -50,109 +50,66 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Audit Core — resend runs and the refused pages, read-only
+      - name: Banita Sasmal — insurance type, read-only
         shell: bash
         run: |
           python - <<'PY'
-          import os, psycopg
-          with psycopg.connect(os.environ["DB"], options="-c statement_timeout=120000") as c:
-              c.execute("SET TRANSACTION READ ONLY")
+          import os, json, psycopg
+          class Safe:
+              def __init__(self, conn): self.conn = conn
+              def execute(self, sql, params=None):
+                  try:
+                      return list(self.conn.execute(sql, params))
+                  except Exception as exc:
+                      print("QUERYERR", type(exc).__name__, str(exc).splitlines()[0][:200])
+                      return []
+          with psycopg.connect(os.environ["DB"], autocommit=True, options="-c statement_timeout=120000 -c default_transaction_read_only=on") as raw:
               t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
-              c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
-              cols = [r[0] for r in c.execute("""SELECT column_name FROM information_schema.columns
-                  WHERE table_schema='auditcore' AND table_name='p2_worker_jobs' ORDER BY ordinal_position""")]
-              print("JOBCOLS", cols)
-              for r in c.execute("""SELECT * FROM auditcore.p2_worker_jobs WHERE job_kind='FAILED_RESEND'
-                  AND requested_at_utc > now() - interval '3 days' ORDER BY requested_at_utc"""):
-                  d = dict(zip(cols, r))
-                  print("RESEND", {k: (str(v)[:400] if v is not None else None) for k, v in d.items() if k not in ('tenant_id',)})
-              for r in c.execute("""SELECT q.last_error, q.queue_status, count(*) FROM auditcore.p2_document_queue q WHERE q.tenant_id=%s
-                  AND q.last_error IN ('DOCUMENT_AI_UNAVAILABLE','DOCUMENT_AI_RESPONSE_INVALID','DOCUMENT_AI_RATE_LIMITED')
-                  AND q.queue_status IN ('FAILED','DEAD_LETTER','CANCELLED') AND q.updated_at_utc > now() - interval '3 days' GROUP BY 1,2""", (t,)):
-                  print("OURSIDE", r)
-              for r in c.execute("""SELECT t.task_status, count(*) FROM auditcore.p2_tasks t WHERE t.tenant_id=%s AND t.task_type='DOCUMENT_RESUBMIT'
-                  AND t.created_at_utc > now() - interval '2 days' GROUP BY 1""", (t,)):
-                  print("RESUBMIT", r)
+              raw.execute("SELECT set_config('app.tenant_id', %s, false)", (t,))
+              c = Safe(raw)
+              jcols = [r[0] for r in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore' AND table_name='journeys'")]
+              namecol = next((x for x in ("customer_name", "customer_display_name") if x in jcols), None)
+              ids = set()
+              if namecol:
+                  ids |= {r[0] for r in c.execute(f"SELECT journey_id FROM auditcore.journeys WHERE tenant_id=%s AND {namecol} ILIKE '%%BANITA%%' AND {namecol} ILIKE '%%SASMAL%%'", (t,))}
+              ids |= {r[0] for r in c.execute("""SELECT DISTINCT journey_id FROM auditcore.journey_document_extracted_fields WHERE tenant_id=%s
+                   AND field_key IN ('customer_name','insured_name','buyer_name') AND effective_value #>> '{}' ILIKE '%%BANITA%%' AND effective_value #>> '{}' ILIKE '%%SASMAL%%'""", (t,))}
+              print("JOURNEYS", len(ids))
+              for j in ids:
+                  r = (c.execute(f"SELECT journey_reference, {namecol or 'NULL'}, dealer_id FROM auditcore.journeys WHERE tenant_id=%s AND journey_id=%s", (t, j)) or [(None, None, None)])[0]
+                  print("\n==== JOURNEY", j, r)
+                  ccols = [x[0] for x in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore' AND table_name='journey_classifications' AND column_name LIKE 'insurance%%'")]
+                  rows = c.execute(f"SELECT {', '.join(ccols)} FROM auditcore.journey_classifications WHERE tenant_id=%s AND journey_id=%s", (t, j))
+                  print("CLASS", dict(zip(ccols, rows[0])) if rows else None)
+                  icols = [x[0] for x in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore' AND table_name='insurance_records' ORDER BY ordinal_position")]
+                  for row in c.execute("SELECT * FROM auditcore.insurance_records WHERE tenant_id=%s AND journey_id=%s", (t, j)):
+                      print("INSREC", {k: str(v)[:120] for k, v in zip(icols, row) if v is not None and k not in ('tenant_id',)})
+                  for row in c.execute("""SELECT document_type_key, association_status, di_document_id FROM auditcore.evidence WHERE tenant_id=%s AND journey_id=%s
+                       ORDER BY document_type_key""", (t, j)):
+                      print("EVID", row)
+                  for row in c.execute("""SELECT e.document_type_key, f.field_key, left(f.effective_value #>> '{}', 160), f.confidence
+                       FROM auditcore.journey_document_extracted_fields f JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id
+                         AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
+                       WHERE f.tenant_id=%s AND f.journey_id=%s AND (e.document_type_key ILIKE '%%insur%%' OR e.document_type_key ILIKE '%%policy%%'
+                         OR f.field_key ~* 'insur|policy|misp|agent|premium|cover|idv|add_on|addon|zero|nil_dep|od_|tp_')
+                       ORDER BY 1,2""", (t, j)):
+                      print("FIELD", row)
+                  for row in c.execute("""SELECT e.document_type_key, f.effective_value FROM auditcore.journey_document_extracted_fields f
+                       JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id AND e.di_document_id=f.di_document_id AND e.association_status='ACTIVE'
+                       WHERE f.tenant_id=%s AND f.journey_id=%s AND f.field_key='line_items'""", (t, j)):
+                      items = row[1] if isinstance(row[1], list) else []
+                      for it in items:
+                          if isinstance(it, dict) and 'INSUR' in json.dumps(it).upper():
+                              print("LINE", row[0], json.dumps(it)[:300])
+                  for row in c.execute("""SELECT task_type, task_status, left(coalesce(title,''),120) FROM auditcore.p2_tasks WHERE tenant_id=%s AND journey_id=%s
+                       AND (task_type ILIKE '%%INSUR%%' OR title ILIKE '%%insur%%')""", (t, j)):
+                      print("TASK", row)
+                  for row in c.execute("""SELECT d.policy_number, d.insurer, d.misp_code, d.dealer_id, u.status FROM auditcore.p2_insurance_dump_rows d
+                       JOIN auditcore.p2_insurance_dumps u ON u.tenant_id=d.tenant_id AND u.dump_id=d.dump_id WHERE d.tenant_id=%s AND d.journey_id=%s""", (t, j)):
+                      print("DUMP", row)
+                  for row in c.execute("""SELECT field_key, left(coalesce(old_value::text,''),80), left(coalesce(new_value::text,''),80), change_reason, changed_at_utc
+                       FROM auditcore.journey_field_change_log WHERE tenant_id=%s AND journey_id=%s AND field_key ~* 'insur|policy|misp|agent'
+                       ORDER BY changed_at_utc""", (t, j)):
+                      print("CHANGE", row)
+                  print("DEALERCODES", c.execute("SELECT normalized_code FROM auditcore.dealer_insurance_codes WHERE tenant_id=%s AND dealer_id=%s", (t, r[2])))
           PY
-      - name: Check out Document Intelligence (dev)
-        uses: actions/checkout@v4
-        with:
-          repository: verigence/verigence-di
-          ref: dev
-          path: di-src
-      - name: Install Document Intelligence and read the DI worker's variables
-        shell: bash
-        run: |
-          set -euo pipefail
-          python -m venv "$RUNNER_TEMP/di"
-          "$RUNNER_TEMP/di/bin/pip" install --quiet --upgrade pip
-          "$RUNNER_TEMP/di/bin/pip" install --quiet -e di-src/backend 'psycopg[binary]>=3.2,<4'
-          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service di-worker --json >/dev/null
-          railway variable list --service di-worker --json >"$RUNNER_TEMP/di-vars.json"
-          python - "$RUNNER_TEMP/di-vars.json" <<'PY'
-          import json, re, sys
-          from pathlib import Path
-          for key, value in json.loads(Path(sys.argv[1]).read_text()).items():
-              value = str(value or "")
-              if re.search(r"KEY|SECRET|TOKEN|PASSWORD|URL|DSN", key) and len(value) >= 8 and "\n" not in value:
-                  print(f"::add-mask::{value}")
-          PY
-      - name: DI — the failing documents and failures by day, read-only
-        shell: bash
-        run: |
-          "$RUNNER_TEMP/di/bin/python" - "$RUNNER_TEMP/di-vars.json" <<'PY'
-          import json, sys, psycopg
-          v = json.load(open(sys.argv[1]))
-          print("DIKEYS", sorted(k for k in v if "DATA" in k or "PG" in k or "DB" in k))
-          key = next(k for k in ("DI_DATABASE_PUBLIC_URL", "DI_DATABASE_URL", "DATABASE_PUBLIC_URL", "DATABASE_URL") if v.get(k))
-          url = v[key].replace("postgresql+asyncpg://", "postgresql://", 1)
-          t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
-          docs = ['b7c75165-62bb-4bcd-ae7e-790dbf3e9849', '8308b9a0-e6f1-452a-9425-5a1978c86bc5',
-                  'd8929da9-cd84-431f-8a4c-1dc65f4df8a7', '31fc9fbc-d96a-44e9-af76-112821978683']
-          with psycopg.connect(url, options="-c statement_timeout=120000") as c:
-              c.execute("SET TRANSACTION READ ONLY")
-              c.execute("SELECT set_config('app.tenant_id', %s, true)", (t,))
-              for r in c.execute("""SELECT d.document_id, dt.document_type_key, d.processing_status, d.processing_failure_code,
-                    to_char(d.registered_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI') FROM docintel.documents d
-                    LEFT JOIN docintel.document_types dt ON dt.document_type_id=d.document_type_id
-                    WHERE d.tenant_id=%s AND d.document_id = ANY(%s::uuid[])""", (t, docs)):
-                  print("DIDOC", r)
-              for r in c.execute("""SELECT pr.document_id, i.capability, i.outcome, i.error_code,
-                    to_char(i.started_at_utc AT TIME ZONE 'Asia/Kolkata','DD Mon HH24:MI:SS'),
-                    i.usage_metrics->>'finish_reason', i.usage_metrics->>'response_tokens', i.usage_metrics->>'thoughts_tokens',
-                    i.usage_metrics->>'fields_requested', i.usage_metrics->>'fields_found', i.usage_metrics->>'provider_calls'
-                    FROM docintel.processor_invocations i JOIN docintel.processing_runs pr
-                      ON pr.tenant_id=i.tenant_id AND pr.processing_run_id=i.processing_run_id
-                    WHERE i.tenant_id=%s AND pr.document_id = ANY(%s::uuid[]) ORDER BY i.started_at_utc""", (t, docs)):
-                  print("DIINV", r)
-              for r in c.execute("""SELECT to_char(i.started_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD HH24'), i.capability, i.outcome,
-                    coalesce(i.error_code,'-'), count(*) FROM docintel.processor_invocations i
-                    WHERE i.tenant_id=%s AND i.started_at_utc > now() - interval '2 days' AND i.capability <> 'OCR'
-                    GROUP BY 1,2,3,4 ORDER BY 1,2,3,5 DESC""", (t,)):
-                  print("DIDAY", r)
-              for r in c.execute("""SELECT dt.document_type_key, i.usage_metrics->>'finish_reason',
-                    CASE WHEN (i.usage_metrics->>'response_tokens')::int <= 3 THEN '<=3' WHEN (i.usage_metrics->>'response_tokens')::int < 50 THEN '<50'
-                         ELSE '>=50' END, count(DISTINCT d.document_id), count(*)
-                    FROM docintel.documents d JOIN docintel.document_types dt ON dt.document_type_id=d.document_type_id
-                    JOIN docintel.processing_runs pr ON pr.tenant_id=d.tenant_id AND pr.document_id=d.document_id
-                    JOIN docintel.processor_invocations i ON i.tenant_id=pr.tenant_id AND i.processing_run_id=pr.processing_run_id
-                    WHERE d.tenant_id=%s AND d.processing_status='FAILED' AND d.processing_failure_code='DOCUMENT_AI_RESPONSE_INVALID'
-                      AND i.capability='VISION_EXTRACTION' AND i.outcome='FAILED' AND d.registered_at_utc > now() - interval '14 days'
-                    GROUP BY 1,2,3 ORDER BY 4 DESC""", (t,)):
-                  print("REFUSEDTOK", r)
-              for r in c.execute("""SELECT to_char(d.registered_at_utc AT TIME ZONE 'Asia/Kolkata','MM-DD'), d.processing_status,
-                    coalesce(d.processing_failure_code,'-'), count(*) FROM docintel.documents d
-                    WHERE d.tenant_id=%s AND d.registered_at_utc > now() - interval '12 days'
-                    GROUP BY 1,2,3 ORDER BY 1,2,4 DESC""", (t,)):
-                  print("DIDOCDAY", r)
-          PY
-      - name: Read each refused document once more and describe the answer (nothing stored)
-        shell: bash
-        run: |
-          set -euo pipefail
-          "$RUNNER_TEMP/di/bin/python" tools/statement_reread_experiment/di_refused.py \
-            "$RUNNER_TEMP/di-vars.json" afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
-      - name: Remove the variables from the runner
-        if: always()
-        shell: bash
-        run: rm -f "$RUNNER_TEMP/di-vars.json"
