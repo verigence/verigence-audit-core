@@ -79,7 +79,7 @@ def capture(args) -> None:
         for dump in dumps:
             started = time.monotonic()
             rows: dict[str, list[Any]] = {}
-            dates = models = 0
+            dates = models = fields = 0
             if planned:
                 plan = m.plan_dump(connection, tenant_id=args.tenant, dump_id=dump["dump_id"])
                 for u in plan.updates:
@@ -87,6 +87,7 @@ def capture(args) -> None:
                 # What the change would write (2026-11-21): DMS dates onto papers, models listed.
                 dates = len({(f["journeyId"], f["documentId"]) for f in getattr(plan, "date_fixes", [])})
                 models = sum(1 for u in plan.updates if u.get("md"))
+                fields = len(getattr(plan, "field_fixes", []))
             else:
                 for r in connection.execute(text(
                         "SELECT row_no, outcome, match_basis, CAST(journey_id AS text) AS j, deal_type "
@@ -96,7 +97,8 @@ def capture(args) -> None:
                                               r["deal_type"]]
             out["dumps"][dump["dump_id"]] = {
                 "label": f"{dump['business_date']:%d %b} · {dump['dealer']} · {dump['dump_kind'].title()}",
-                "rows": rows, "seconds": round(time.monotonic() - started, 1), "dates": dates, "models": models}
+                "rows": rows, "seconds": round(time.monotonic() - started, 1), "dates": dates, "models": models,
+                "fields": fields}
             print(f"{out['dumps'][dump['dump_id']]['label']}: {len(rows)} rows "
                   f"in {out['dumps'][dump['dump_id']]['seconds']} s", file=sys.stderr)
     finally:
@@ -123,18 +125,28 @@ def diff(args) -> None:
         lines += [("_The base code cannot replay a dump (no `plan_dump`): its side is the outcome stored at each "
                    "dump's last match, so Journeys uploaded since then also show as changes._"), ""]
     changed_rows: list[tuple[str, str, list[Any] | None, list[Any] | None]] = []
-    summary = ["| Dump | Rows | Changed | Matched before → after | DMS dates to write | Model differs | Seconds |",
-               "|---|---:|---:|---|---:|---:|---:|"]
+    basis_only = 0
+    summary = ["| Dump | Rows | Changed | Matched before → after | DMS dates to write | Values to write | Model differs | Seconds |",
+               "|---|---:|---:|---|---:|---:|---:|---:|"]
     for dump_id, a in after["dumps"].items():
         b = before["dumps"].get(dump_id, {"rows": {}})
         keys = sorted(set(a["rows"]) | set(b["rows"]), key=int)
         moved = [k for k in keys if a["rows"].get(k) != b["rows"].get(k)]
+        # The same outcome, Journey and deal type under a renamed basis (2026-11-24: a booking's
+        # MOBILE became MOBILE_NAME / MOBILE_DATE) is counted, not listed: the listed rows are the
+        # ones whose result changed.
+        renamed = [k for k in moved if a["rows"].get(k) and b["rows"].get(k)
+                   and [x for i, x in enumerate(a["rows"][k]) if i != 1] == [x for i, x in enumerate(b["rows"][k]) if i != 1]]
+        basis_only += len(renamed)
+        moved = [k for k in moved if k not in renamed]
         matched_b = sum(1 for v in b["rows"].values() if v[0] == "MATCHED")
         matched_a = sum(1 for v in a["rows"].values() if v[0] == "MATCHED")
         summary.append(f"| {a['label']} | {len(keys)} | {len(moved)} | {matched_b} → {matched_a} | "
-                       f"{a.get('dates', 0)} | {a.get('models', 0)} | {a.get('seconds', '')} |")
+                       f"{a.get('dates', 0)} | {a.get('fields', 0)} | {a.get('models', 0)} | {a.get('seconds', '')} |")
         changed_rows += [(a["label"], k, b["rows"].get(k), a["rows"].get(k)) for k in moved]
     lines += summary + [""]
+    if basis_only:
+        lines += [f"_{basis_only} row(s) keep their outcome and Journey under a renamed basis (not listed)._", ""]
     if not changed_rows:
         lines.append("**No row of any dump comes out differently.**")
     else:

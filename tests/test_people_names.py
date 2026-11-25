@@ -50,3 +50,19 @@ def test_assigned_people_are_found_in_every_project():
     finally:
         delete_tenant_data(engine, journey.tenant_id)
         engine.dispose()
+
+
+def test_same_name_word_for_word() -> None:
+    """DMS booking matching on a name with no number (2026-11-24): every word agrees, spelling
+    aside; no word missing, no first letter differing."""
+    from audit_core.uc03_p2_names import same_name_word_for_word as same
+
+    assert not same("Chitta Ranjan Patra", "RANJANA PATRA")
+    assert not same("PRAKASH DAS", "PRAKASH KUMAR DASH")
+    assert not same("SITENDRA NAYAK", "JITENDRA NAYAK")
+    assert same("RASMITA MALLIK", "RASMITA MALLICK")
+    assert same("BISWANATH SAHOO", "BISWANATH SAHU")
+    assert same("RASMIRANJAN DAS", "RASMI RANJAN DAS")
+    assert same("JENA SWADHIN", "Mr. Swadhin Jena")
+    assert same("DINESHCHANDRA R AGRAWAL INFRACON PVT LTD", "DINESHCHANDRA R AGRAWAL INFRACON PRIVATE LIMITED")
+    assert not same("ABC MOTORS PVT LTD", "XYZ MOTORS PVT LTD")

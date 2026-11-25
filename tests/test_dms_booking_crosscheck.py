@@ -85,8 +85,8 @@ def test_alike_journeys_take_alike_rows_one_each():
         index.by_mobile["9000012345"].add(jid)
     row = {"customer_name": "CUSTOMER K", "mobile": "9000012345", "model": "MAXX HD",
            "event_date": date(2026, 11, 6)}
-    assert match_row(index, BOOKING, row) == ("j1", "MOBILE")
-    assert match_row(index, BOOKING, row, {"j1"}) == ("j2", "MOBILE")
+    assert match_row(index, BOOKING, row) == ("j1", "MOBILE_NAME")
+    assert match_row(index, BOOKING, row, {"j1"}) == ("j2", "MOBILE_NAME")
     # Another customer on the same mobile: not alike, no guess.
     index.journeys["j2"]["names"] = {"Someone Else"}
     assert match_row(index, BOOKING, {**row, "customer_name": "Third Name"}) == (None, None)
