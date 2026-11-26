@@ -79,14 +79,23 @@ jobs:
               print("QUOTATIONS_STILL_ACTIVE", len(left))
               for r in left:
                   print("  LEFT", r)
+              rtcols = [x[0] for x in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore' AND table_name='p2_journey_runtime'")]
+              print("RTCOLS", rtcols)
+              for ref in ('UTK-JP-261031-006', 'UTK-JP-261102-014', 'UTK-JP-261104-003'):
+                  for r in c.execute("""SELECT q.queue_id, q.queue_status, q.type_overridden_by_actor_id, q.retired_at_utc, q.template_key, e.di_document_id, e.evidence_id
+                      FROM auditcore.evidence e JOIN auditcore.journeys j ON j.tenant_id=e.tenant_id AND j.journey_id=e.journey_id
+                      LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id=e.tenant_id AND q.di_document_id=e.di_document_id AND q.journey_id=e.journey_id
+                      WHERE e.tenant_id=%s AND j.journey_reference=%s AND e.document_type_key='cost_sheet' AND e.association_status='ACTIVE'""", (t, ref)):
+                      print("LEFTQ", ref, r)
+                  for r in c.execute("SELECT rt.* FROM auditcore.p2_journey_runtime rt JOIN auditcore.journeys j ON j.tenant_id=rt.tenant_id AND j.journey_id=rt.journey_id WHERE rt.tenant_id=%s AND j.journey_reference=%s", (t, ref)):
+                      print("LEFTRT", ref, dict(zip(rtcols, [str(x)[:40] for x in r])))
               ids = [r[0] for r in aside]
               tally = Counter()
               for r in c.execute("""SELECT j.journey_reference, jc.insurance_type, jc.insurance_decided_by, left(coalesce(jc.insurance_basis,''),110),
                     EXISTS (SELECT 1 FROM auditcore.evidence n WHERE n.tenant_id=j.tenant_id AND n.journey_id=j.journey_id AND n.association_status='ACTIVE'
                       AND n.document_type_key IN ('customer_ledger','customer_ledger_tally','erp_settlement','cost_sheet')) has_statement,
-                    rt.processed_version >= rt.fact_version AS settled
+                    NULL AS settled
                   FROM auditcore.journeys j LEFT JOIN auditcore.journey_classifications jc ON jc.tenant_id=j.tenant_id AND jc.journey_id=j.journey_id
-                  LEFT JOIN auditcore.p2_journey_runtime rt ON rt.tenant_id=j.tenant_id AND rt.journey_id=j.journey_id
                   WHERE j.tenant_id=%s AND j.journey_id = ANY(%s) ORDER BY 1""", (t, ids)):
                   tally[(r[1], r[2], r[3][:60])] += 1
                   if not r[4]:
