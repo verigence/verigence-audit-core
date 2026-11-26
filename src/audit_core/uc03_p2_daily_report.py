@@ -74,6 +74,7 @@ from audit_core.security_authorization import (
     SecurityAuthorizationClient,
     get_security_authorization_client,
 )
+from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
 from audit_core.uc03_p2_access import authorize_p2
 from audit_core.uc03_p2_runtime import LARGE_UPLOAD_PAGES, swept_pending_sql
 
@@ -218,7 +219,7 @@ def _journey_names(connection: Connection, *, tenant_id: str) -> dict[str, str]:
 _WORK_NOTE = ("Work done counts what people did on tasks that day (comments, reviews, uploads, closing). The "
               "system's own task updates are not work. Tasks closed = worked by that person and closed on the day. "
               "A Team Lead's name is not stored with the task, so the account id shows unless a name is known.")
-_CLOSED_NOTE = ("Delivery files closed: journeys with a delivery upload whose mandatory delivery documents are in "
+_CLOSED_NOTE = ("Delivery files closed: deliveries (the vehicle's VIN or chassis on file) whose mandatory delivery documents are in "
                 "(or whose 'Upload the ...' task the PC closed) and whose document tasks are all closed, counted on "
                 "the day the last of those closed (or the last delivery page was uploaded), under the journey's PC. "
                 "A task reopened later takes the file out until it closes again.")
@@ -998,6 +999,9 @@ def delivery_files_closed(
                     AND mt.task_type='DOCUMENT_MISSING' AND mt.task_status='VERIFIED_COMPLETE'
                     AND mt.reference->>'requirementKey' = m->>'key'))
               AND {"true" if whole_project else _SCOPE}
+              -- A delivery by the one delivery rule (uc03_delivery_start), not any Journey with a
+              -- page filed under the delivery (product owner 2026-11-27: the same rule everywhere).
+              AND {DELIVERY_STARTED_SQL.format(t=":t", j="j.journey_id")}
             ORDER BY closed_at
             """
         ),

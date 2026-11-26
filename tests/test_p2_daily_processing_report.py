@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 from conftest import delete_tenant_data
-from p2_support import add_page, create_p2_journey, database_engine
+from p2_support import add_evidence, add_page, create_p2_journey, database_engine
 from sqlalchemy import text
 
 from audit_core.authorization import AuthorizationError
@@ -207,11 +207,14 @@ def test_how_the_pages_became_documents_is_shown(journey):
 # Delivery files closed (product owner 2026-11-02): a delivery file is closed
 # when its mandatory documents are in and the PC's document tasks are closed.
 
-def _delivery_file(journey, *, missing=(), uploaded_days_ago: int = 2):
+def _delivery_file(journey, *, missing=(), uploaded_days_ago: int = 2, vehicle: bool = True):
     """Make the journey a delivery file: one DELIVERY page, uploaded
     ``uploaded_days_ago`` days ago, and the stage engine's stored DELIVERY
-    REQUIRED_DOCUMENTS gate with ``missing`` requirement keys."""
+    REQUIRED_DOCUMENTS gate with ``missing`` requirement keys. Its vehicle's chassis is on the
+    gate pass: what makes the Journey a delivery (uc03_delivery_start)."""
     _b, page, _ = add_page(journey, page_number=9, status="READY")
+    if vehicle:
+        add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
     with journey.engine.begin() as c:
         set_tenant_context(c, journey.tenant_id)
         c.execute(
@@ -250,6 +253,16 @@ def _report_on(journey, tl, days_ago: int):
         set_tenant_context(c, journey.tenant_id)
         return build_daily_processing_report(c, tenant_id=journey.tenant_id, actor_id=tl,
                                              day=_today(journey) - timedelta(days=days_ago))
+
+
+def test_a_booking_with_a_page_filed_under_the_delivery_is_no_delivery_file(journey):
+    """Product owner 2026-11-27: the same booking / delivery rule everywhere. Without its vehicle's
+    VIN or chassis on file the Journey is a booking, whatever stage its pages were filed under."""
+    tl = _tl(journey)
+    _delivery_file(journey, uploaded_days_ago=1, vehicle=False)
+    assert _report_on(journey, tl, 1)["deliveryFilesClosed"]["total"] == 0
+    add_evidence(journey, di_document_id=uuid4(), document_type_key="gate_pass", process_area="DELIVERY")
+    assert _report_on(journey, tl, 1)["deliveryFilesClosed"]["total"] == 1
 
 
 def test_a_delivery_file_closes_on_the_day_its_last_document_task_closes(journey):
