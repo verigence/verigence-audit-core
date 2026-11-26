@@ -945,7 +945,8 @@ def test_a_pc_sees_which_of_their_drive_files_are_safe_to_delete_and_they_leave_
     assert [i["fileName"] for i in checked["mine"]["items"]] == ["pan.pdf"]
     assert _files(s)["docket.pdf"]["gone_from_drive_at_utc"] is not None
     # deleting it from Drive changes nothing in Verigence: the copy and the booking stay
-    assert s.bucket.objects[[f for f in _bulk_files(s) if f["original_filename"] == "docket.pdf"][0]["object_key"]]
+    kept = next(f for f in _bulk_files(s) if f["original_filename"] == "docket.pdf")
+    assert s.bucket.objects[kept["object_key"]]
 
 
 def test_the_owner_of_files_seen_before_is_learnt_in_a_run_and_a_lead_sees_each_pc(s):
