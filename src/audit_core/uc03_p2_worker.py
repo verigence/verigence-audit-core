@@ -3522,6 +3522,23 @@ def _set_aside_receipts_not_from_the_dealership(connection, *, tenant_id: str, j
         logger.warning("p2_receipt_issuer_failed", tenant_id=tenant_id, journey_id=str(journey_id), exc_info=True)
 
 
+def _set_aside_quotations(connection, *, tenant_id: str, journey_id: UUID) -> None:
+    """As _apply_file_identity: a failure is logged and the recompute goes on;
+    a deadlock fails the item so it is retried."""
+    from audit_core.uc03_db_transient import raise_if_worker_transient
+    from audit_core.uc03_quotation import set_aside_quotations
+
+    try:
+        with connection.begin_nested():
+            aside = set_aside_quotations(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if aside:
+            logger.info("p2_quotations_set_aside", tenant_id=tenant_id, journey_id=str(journey_id),
+                        quotations=[item["name"] for item in aside])
+    except Exception as exc:
+        raise_if_worker_transient(exc)
+        logger.warning("p2_quotation_set_aside_failed", tenant_id=tenant_id, journey_id=str(journey_id), exc_info=True)
+
+
 def _count_delivery_receipt_as_gate_pass(connection, *, tenant_id: str, journey_id: UUID) -> None:
     """As _apply_file_identity: a failure is logged and the recompute goes on;
     a deadlock fails the item so it is retried."""
@@ -3570,6 +3587,10 @@ def settle_journey(connection, *, tenant_id: str, journey_id: UUID,
     # premium receipt, or another dealership's, leaves the booking's payments
     # before they are rebuilt and stays on file as a supporting document.
     _set_aside_receipts_not_from_the_dealership(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # A quotation is not the cost sheet or the NDC (2026-11-25): filed as the
+    # cost sheet, it leaves the booking before the Deal, the insurance and the
+    # charged items are rebuilt, and stays on file as a supporting document.
+    _set_aside_quotations(connection, tenant_id=tenant_id, journey_id=journey_id)
     # A Vehicle Delivery Receipt carrying the delivery date is the gate pass
     # (2026-11-12): typed so before the delivery is built from it.
     _count_delivery_receipt_as_gate_pass(connection, tenant_id=tenant_id, journey_id=journey_id)
@@ -5895,8 +5916,12 @@ def _sweep_cost_sheet_statements_every(engine: Engine) -> None:
     was is read again first (2026-11-10, uc03_cost_sheet_statements). The
     classifier files most statements as the NDC since 3 Nov, but not all: on
     10 Nov two Utkal Vehicle Account Statements uploaded that day were read as
-    cost sheets, and a one-off job cannot catch what comes later."""
+    cost sheets, and a one-off job cannot catch what comes later.
+
+    Then every booking still holding a quotation as its cost sheet is
+    recomputed, which sets the quotation aside (2026-11-25, uc03_quotation)."""
     from audit_core.uc03_cost_sheet_statements import run_cost_sheet_statements
+    from audit_core.uc03_quotation import request_quotation_recomputes
 
     _stopping.wait(300)  # let the worker settle after a start
     while not _stopping.is_set():
@@ -5907,6 +5932,10 @@ def _sweep_cost_sheet_statements_every(engine: Engine) -> None:
                 run_cost_sheet_statements(engine, f"{tenant_id}:hourly-sweep-commit", [])
             except Exception:
                 logger.warning("cost_sheet_statements_sweep_failed", tenant_id=tenant_id, exc_info=True)
+            try:
+                request_quotation_recomputes(engine, tenant_id)
+            except Exception:
+                logger.warning("quotation_sweep_failed", tenant_id=tenant_id, exc_info=True)
         _stopping.wait(_COST_SHEET_SWEEP_SECONDS)
 
 
