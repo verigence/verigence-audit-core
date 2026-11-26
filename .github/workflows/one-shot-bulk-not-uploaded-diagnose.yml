@@ -61,7 +61,7 @@ jobs:
           with psycopg.connect(os.environ["DB"], autocommit=True, options="-c statement_timeout=180000 -c default_transaction_read_only=on") as c:
               t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
               c.execute("SELECT set_config('app.tenant_id', %s, false)", (t,))
-              print("BANITA", list(c.execute("""SELECT j.journey_reference, jc.insurance_source, jc.insurance_decided_by, jc.insurance_basis
+              print("BANITA", list(c.execute("""SELECT j.journey_reference, jc.insurance_type, jc.insurance_decided_by, jc.insurance_basis
                   FROM auditcore.journeys j JOIN auditcore.journey_classifications jc ON jc.tenant_id=j.tenant_id AND jc.journey_id=j.journey_id
                   WHERE j.tenant_id=%s AND j.journey_reference='UTK-JP-261031-001'""", (t,))))
               aside = list(c.execute("""SELECT e.journey_id, count(*), min(e.voided_at_utc AT TIME ZONE 'Asia/Kolkata')
@@ -81,7 +81,7 @@ jobs:
                   print("  LEFT", r)
               ids = [r[0] for r in aside]
               tally = Counter()
-              for r in c.execute("""SELECT j.journey_reference, jc.insurance_source, jc.insurance_decided_by, left(coalesce(jc.insurance_basis,''),110),
+              for r in c.execute("""SELECT j.journey_reference, jc.insurance_type, jc.insurance_decided_by, left(coalesce(jc.insurance_basis,''),110),
                     EXISTS (SELECT 1 FROM auditcore.evidence n WHERE n.tenant_id=j.tenant_id AND n.journey_id=j.journey_id AND n.association_status='ACTIVE'
                       AND n.document_type_key IN ('customer_ledger','customer_ledger_tally','erp_settlement','cost_sheet')) has_statement,
                     rt.processed_version >= rt.fact_version AS settled
