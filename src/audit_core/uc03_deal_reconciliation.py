@@ -1020,13 +1020,17 @@ def _grid_tier(connection: Connection, *, tenant_id: str, journey_id: UUID) -> s
     ).mappings().one()
     source = str(row["insurance_source"] or "").upper()
     if not source:
-        # Not confirmed by the PC: in-house only when the documents show it
-        # (the dealer's Agent / MISP code, or the premium on the dealer invoice).
-        from audit_core.uc03_insurance_source import document_decision, ndc_says_own
+        # Not confirmed by the PC: what the documents show, read where the Deal
+        # reads it (uc03_insurance_source.document_verdict) -- in-house on the
+        # dealer's Agent / MISP code or the NDC's premium; the customer's own
+        # when the NDC says so, or is read and charges no premium. Until
+        # 2026-11-26 the last case was not read here, so a premium written on
+        # the booking form put the deal in the with-insurance tier while the
+        # Deal itself said Self (live: ADI-BM-261114-009).
+        from audit_core.uc03_insurance_source import document_verdict
 
-        decided = document_decision(connection, tenant_id=tenant_id, journey_id=journey_id)
-        source = "INHOUSE" if decided is not None else (
-            "SELF" if ndc_says_own(connection, tenant_id=tenant_id, journey_id=journey_id) is not None else "")
+        verdict = document_verdict(connection, tenant_id=tenant_id, journey_id=journey_id)
+        source = str(verdict["source"]) if verdict is not None else ""
     inhouse = source == "INHOUSE" or (source != "SELF" and (_to_decimal(row["insurance"]) or 0) > 0)
     ew = (_to_decimal(row["ew"]) or 0) > 0
     if inhouse and ew:

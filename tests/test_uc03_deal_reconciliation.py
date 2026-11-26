@@ -1373,7 +1373,7 @@ def _grid(c, *, model_id, effective_from, rows: list[dict]) -> None:
         )
 
 
-def test_the_dealer_discount_is_entitled_up_to_the_grid_tier(journey) -> None:
+def test_the_dealer_discount_is_entitled_up_to_the_grid_tier(journey, monkeypatch) -> None:
     c = journey
     seeded = _seed_pinned_sku(c, model="XUV 3XO", variant="AX5 PM MT", effective_from=date(2026, 10, 1),
                               components={"EX_SHOWROOM": "999901.32"})
@@ -1392,6 +1392,16 @@ def test_the_dealer_discount_is_entitled_up_to_the_grid_tier(journey) -> None:
                        "VALUES (:t, :j, 'insurance_amount', 45225)"), {"t": c.tenant_id, "j": c.journey_id})
         dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
         assert _discount(c, "ADDITIONAL_DISCOUNT")["standard_eligible_amount"] == Decimal(7000)
+
+        # 2026-11-26 (ADI-BM-261114-009): the NDC is read and charges no premium, so the
+        # Deal says the customer's own insurance; the tier reads the same decision, and a
+        # premium written on the booking form no longer makes it the with-insurance tier.
+        import audit_core.uc03_insurance_source as insurance_source
+
+        monkeypatch.setattr(insurance_source, "ndc_without_premium", lambda *a, **k: True)
+        dr.sync_deal_reconciliation(c, tenant_id=c.tenant_id, journey_id=c.journey_id, correlation_id="")
+        assert _discount(c, "ADDITIONAL_DISCOUNT")["standard_eligible_amount"] == Decimal(5000)
+        assert _details(c, "ADDITIONAL_DISCOUNT")["grid"]["tier"] == "BASE"
     finally:
         c.execute(text("DELETE FROM auditcore.dealer_discount_grid_rows WHERE tenant_id=:t"), {"t": c.tenant_id})
         c.execute(text("DELETE FROM auditcore.dealer_discount_grid_versions WHERE tenant_id=:t"), {"t": c.tenant_id})
