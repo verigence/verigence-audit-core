@@ -522,7 +522,8 @@ def test_the_gate_register_ticks_itself(project):
 
 
 def _delivery(p, day: date, *, photo_at: datetime | None = None) -> UUID:
-    """A Journey of the outlet with its vehicle gate pass dated ``day``, and a vehicle photo when asked."""
+    """A Journey of the outlet with its vehicle gate pass dated ``day`` (the vehicle's chassis on it:
+    what makes the Journey a delivery, uc03_delivery_start), and a vehicle photo when asked."""
     document = uuid4()
     with _Db(p) as c:
         journey = c.execute(
@@ -541,6 +542,12 @@ def _delivery(p, day: date, *, photo_at: datetime | None = None) -> UUID:
                  "VALUES (:t, :j, :d, 'delivery_date', 'DELIVERY', 'gate_pass', CAST(:v AS jsonb), CAST(:v AS jsonb), "
                  "false)"),
             {"t": p.tenant, "j": journey, "d": str(document), "v": json.dumps(day.isoformat())})
+        c.execute(
+            text("INSERT INTO auditcore.journey_document_extracted_fields (tenant_id, journey_id, di_document_id, "
+                 "field_key, stage_code, source_document_type_key, extracted_value, effective_value, is_modified) "
+                 "VALUES (:t, :j, :d, 'chassis_number', 'DELIVERY', 'gate_pass', CAST(:v AS jsonb), CAST(:v AS jsonb), "
+                 "false)"),
+            {"t": p.tenant, "j": journey, "d": str(document), "v": json.dumps(f"MA1{uuid4().hex[:14].upper()}")})
     if photo_at is not None:
         _photo(p, journey, photo_at)
     return UUID(str(journey))
