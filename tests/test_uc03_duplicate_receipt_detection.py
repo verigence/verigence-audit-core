@@ -424,3 +424,69 @@ def test_copies_read_with_different_dates_are_each_still_counted():
     assert "read with different dates (20 Oct 2026, 21 Oct 2026)" in text_
     assert "Each copy is still counted" in text_
     assert drd.duplicate_receipt_finding([]) == {}
+
+
+# ---------------------------------------------------------------- 2026-11-26: a copy read differently
+
+def _copy(receipt_number=None, *, amount="199000.00", receipt_date="2026-10-26", reference=None):
+    return drd.ReceiptRecord(
+        document_id=uuid4(), stage_code="BOOKING", document_type_key="receipt", receipt_number=receipt_number,
+        amount=Decimal(amount), receipt_date=receipt_date, reference=drd.normalize_bank_reference(reference))
+
+
+def test_a_copy_with_its_number_read_differently_or_not_read_is_the_same_receipt():
+    """Product owner 2026-11-26 (UTK-JP-261031-007: "1,99,000 is coming duplicate
+    why"): the receipts uploaded on 31 Oct were uploaded again on 10 Nov. The
+    cash receipt was read once with no number and once as CRBM/2627/00927; the
+    RTGS receipt as SM/2627/04806 and as BRBM/2627/04806. Each was counted twice."""
+    cash_unread, cash = _copy(None), _copy("CRBM/2627/00927")
+    rtgs_first, rtgs_again = _copy("SM/2627/04806", amount="500000"), _copy("BRBM/2627/04806", amount="500000")
+    other = _copy("RBM/2627/04802", amount="500000", reference="SBIN326299553270")
+    found = drd.repeated_receipts_basis([cash_unread, rtgs_first, other, cash, rtgs_again])
+    assert found == {
+        # The numbered copy is the one counted, whichever was uploaded first.
+        cash_unread.document_id: (cash.document_id, drd.BASIS_NOT_READ),
+        rtgs_again.document_id: (rtgs_first.document_id, drd.BASIS_LETTERS),
+    }
+    assert drd.repeated_receipts([cash_unread, rtgs_first, other, cash, rtgs_again]) == {
+        cash_unread.document_id: cash.document_id, rtgs_again.document_id: rtgs_first.document_id}
+
+
+def test_the_running_digits_of_a_receipt_number():
+    assert drd.receipt_digits("BRBM/2627/04806") == drd.receipt_digits("SM/2627/4806") == "2627/4806"
+    assert drd.receipt_digits("CRBM/2627/00927") != drd.receipt_digits("CRBM/2627/00928")
+    assert drd.receipt_digits("A-12") is None and drd.receipt_digits(None) is None  # too few digits to match on
+
+
+def test_separate_payments_are_not_joined():
+    # Two numbered receipts of the same amount and day: a copy with no number is left counted.
+    a, b, unread = _copy("CRBM/2627/00927"), _copy("CRBM/2627/00931"), _copy(None)
+    assert drd.repeated_receipts([a, b, unread]) == {}
+    # Another day, or another amount: not the same receipt.
+    assert drd.repeated_receipts([_copy("CRBM/2627/00927"), _copy(None, receipt_date="2026-10-27")]) == {}
+    assert drd.repeated_receipts([_copy("SM/2627/04806"), _copy("BRBM/2627/04806", amount="5000")]) == {}
+    assert drd.repeated_receipts([_copy("SM/2627/04806"), _copy("BRBM/2627/04806", receipt_date="2026-10-27")]) == {}
+    # Bank references read on both and different: two payments, whatever the numbers.
+    first = _copy("SM/2627/04806", reference="SBIN326299553270")
+    assert drd.repeated_receipts([first, _copy("BRBM/2627/04806", reference="UTIB426299001122")]) == {}
+    assert drd.repeated_receipts([first, _copy(None, reference="UTIB426299001122")]) == {}
+
+
+def test_the_same_bank_reference_is_one_payment_here_too():
+    """Decided in this module since 2026-11-26, so the booking / delivery split
+    reads it as the money totals do (live 2026-11-04, UTK-SA-261103-008)."""
+    a = _copy("CDAM/2627/02127", amount="75000", reference="CR/828411245393 TILOTTAM")
+    b = _copy("CDAM/2026/0212", amount="75000", reference="CR/828411245393 TILOTTAM")
+    assert drd.repeated_receipts_basis([a, b]) == {b.document_id: (a.document_id, drd.BASIS_REFERENCE)}
+    # A reference too short to name one payment does not join anything.
+    c, d = _copy("X/1", amount="75000", reference="12345"), _copy("X/2", amount="75000", reference="12345")
+    assert drd.repeated_receipts([c, d]) == {}
+
+
+def test_the_notice_says_how_a_copy_was_recognised():
+    cash_unread, cash = _copy(None), _copy("CRBM/2627/00927")
+    rtgs_first, rtgs_again = _copy("SM/2627/04806", amount="500000"), _copy("BRBM/2627/04806", amount="500000")
+    texts = {g.match_basis: drd._notice_text(g)
+             for g in drd.compute_duplicate_groups([cash_unread, cash, rtgs_first, rtgs_again])}
+    assert "the number on the other was not read" in texts[drd.BASIS_NOT_READ]
+    assert "SM/2627/04806, BRBM/2627/04806" in texts[drd.BASIS_LETTERS]

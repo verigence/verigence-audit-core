@@ -561,6 +561,39 @@ def test_one_bank_transfer_read_as_two_receipt_numbers_counts_once(journey):
     assert Decimal(client.get(base).json()["money"]["paid"]["receipts"]) == 85000
 
 
+def test_a_receipt_uploaded_again_with_its_number_misread_counts_once(journey):
+    """Product owner 2026-11-26 (UTK-JP-261031-007: "1,99,000 is coming duplicate
+    why"): the same receipts uploaded on 31 Oct and again on 10 Nov. The cash
+    receipt was read once with no number and once as CRBM/2627/00927, the RTGS
+    receipt as SM/2627/04806 and as BRBM/2627/04806: Rs 6,99,000 counted twice
+    on the Payments tab, the Deal and the Audit Summary."""
+    add_receipt_payment(journey, amount="199000", receipt_number=None, receipt_date="2026-10-26")
+    add_receipt_payment(journey, amount="500000", receipt_number="SM/2627/04806", receipt_date="2026-10-26")
+    add_receipt_payment(journey, amount="199000", receipt_number="CRBM/2627/00927", receipt_date="2026-10-26")
+    add_receipt_payment(journey, amount="500000", receipt_number="BRBM/2627/04806", receipt_date="2026-10-26")
+    add_receipt_payment(journey, amount="200000", receipt_number="BRBM/2627/04839", receipt_date="2026-10-26")
+    client = TestClient(app, raise_server_exceptions=False)
+    base = f"/p2/v1/tenants/{journey.tenant_id}/journeys/{journey.journey_id}/360"
+    view = client.get(f"{base}/payments").json()
+    unread = next(i for i in view["items"] if i["receiptNumber"] is None)
+    assert unread["counted"] is False and unread["notCountedReason"] == (
+        "Duplicate: the same amount and date as receipt CRBM/2627/00927; the number on this copy was not read")
+    again = next(i for i in view["items"] if i["receiptNumber"] == "BRBM/2627/04806")
+    assert again["counted"] is False and again["notCountedReason"] == (
+        "Duplicate: the same receipt as SM/2627/04806 (same amount and date; the letters of its number read "
+        "as BRBM/2627/04806 on this copy)")
+    assert view["duplicates"] == 2 and Decimal(view["receiptsTotal"]) == 899000
+    # The Deal and the Audit Summary count the same money.
+    assert Decimal(client.get(base).json()["money"]["paid"]["receipts"]) == 899000
+    # The booking / delivery split reads the same rule: no copy is in it.
+    from audit_core.uc03_p2_stage import receipt_split
+
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        split = receipt_split(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert sum(Decimal(str(e["amount"])) for stage in ("BOOKING", "DELIVERY") for e in split[stage]) == 899000
+
+
 def _finance_record(journey, *, linked_receipt: str | None = None, amount: str | None = None) -> None:
     """A financed deal; its loan disbursement linked to the receipt with this
     number, or entered with no receipt (``amount``)."""

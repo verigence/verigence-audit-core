@@ -45,6 +45,7 @@ to apply), or it cancels itself if a correction breaks the match.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -72,7 +73,24 @@ _RECEIPT_DOCUMENT_TYPES = ("dealer_receipt", "payment_receipt")
 _RECEIPT_NUMBER_FIELD = "receipt_number"
 _AMOUNT_FIELD = "amount_paid"
 _DATE_FIELD = "receipt_date"
-_FIELD_KEYS = (_RECEIPT_NUMBER_FIELD, _AMOUNT_FIELD, _DATE_FIELD)
+_REFERENCE_FIELD = "payment_reference_no"
+_FIELD_KEYS = (_RECEIPT_NUMBER_FIELD, _AMOUNT_FIELD, _DATE_FIELD, _REFERENCE_FIELD)
+
+# How a later copy was recognised as a receipt already on the booking.
+BASIS_NUMBER = "RECEIPT_NUMBER_AND_AMOUNT"
+BASIS_NO_NUMBER = "AMOUNT_AND_DATE_NO_RECEIPT_NUMBER"
+BASIS_REFERENCE = "BANK_REFERENCE_AMOUNT_AND_DATE"
+BASIS_LETTERS = "RECEIPT_NUMBER_LETTERS_DIFFER"
+BASIS_NOT_READ = "RECEIPT_NUMBER_NOT_READ"
+
+# A bank reference (UTR) names one payment: two receipts with the same
+# reference, amount and date are the one payment read twice, whatever their
+# receipt numbers (live 2026-11-04, UTK-SA-261103-008: one Rs 75,000 transfer
+# read as receipt "CDAM/2627/02127" and as "CDAM/2026/0212", counted twice).
+_MIN_REFERENCE = re.compile(r"(?=(.*\d){6})[A-Z0-9]{8,}")
+# The running part of a receipt number has at least this many digits
+# ("2627/04806"); fewer is no identity to match on.
+_MIN_DIGITS = 5
 
 
 def _to_decimal(value: Any) -> Decimal | None:
@@ -98,6 +116,23 @@ def normalize_receipt_date(value: Any) -> str | None:
     return text_value[:10] or None
 
 
+def normalize_bank_reference(value: Any) -> str | None:
+    """A bank reference as read, letters and digits only; None when it is too
+    short or has too few digits to name one payment."""
+    cleaned = "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+    return cleaned if _MIN_REFERENCE.fullmatch(cleaned) else None
+
+
+def receipt_digits(value: Any) -> str | None:
+    """The running part of a receipt number: its groups of digits, leading
+    zeros apart ("BRBM/2627/04806" and "SM/2627/4806" -> "2627/4806"). The
+    letters before them are the dealer's series and are what gets misread."""
+    groups = re.findall(r"\d+", str(value or ""))
+    if sum(len(g) for g in groups) < _MIN_DIGITS:
+        return None
+    return "/".join(str(int(g)) for g in groups)
+
+
 @dataclass(frozen=True)
 class ReceiptRecord:
     """One receipt document's identity + the three fields duplicate detection
@@ -112,6 +147,9 @@ class ReceiptRecord:
     receipt_number: str | None
     amount: Decimal | None
     receipt_date: str | None
+    # The bank reference read on it (normalize_bank_reference), when the
+    # caller has it: one reference, amount and date is one payment.
+    reference: str | None = None
 
 
 
@@ -216,6 +254,7 @@ def _receipt_documents(
             receipt_number=normalize_receipt_number(entry.get(_RECEIPT_NUMBER_FIELD)),
             amount=_to_decimal(entry.get(_AMOUNT_FIELD)),
             receipt_date=normalize_receipt_date(entry.get(_DATE_FIELD)),
+            reference=normalize_bank_reference(entry.get(_REFERENCE_FIELD)),
         )
         for document_id, entry in by_document.items()
     ]
@@ -274,7 +313,79 @@ def compute_duplicate_groups(documents: list[ReceiptRecord]) -> list[DuplicateGr
                 )
             )
 
+        groups.extend(_read_differently(document_type_key, type_documents, groups))
+
     return groups
+
+
+def _read_differently(document_type_key: str, documents: list[ReceiptRecord],
+                      found: list[DuplicateGroup]) -> list[DuplicateGroup]:
+    """The same receipt on file twice with its number read differently on the
+    second copy, or not read at all -- among the receipts the groups in
+    ``found`` still count (their first members and every receipt in none).
+
+    Product owner 2026-11-26 (UTK-JP-261031-007: "1,99,000 is coming duplicate
+    why"). The receipts of 24-26 Oct were uploaded on 31 Oct and again on
+    10 Nov. A copy read with the same number was counted once; the cash receipt
+    read once with no number and once as "CRBM/2627/00927", and the RTGS receipt
+    read as "SM/2627/04806" and as "BRBM/2627/04806", were each counted twice
+    (Rs 6,99,000 more than was paid). Read only on live that day: 19 such copies
+    on 16 bookings, Rs 14.96 lakh.
+
+    In this order, each on the receipts the one before still counts:
+
+    * the same bank reference, amount and date -- one payment, whatever the
+      receipt numbers read (2026-11-04; decided here since 2026-11-26, so the
+      booking / delivery split and the notice read it as the totals do);
+    * the same digits of the receipt number, amount and date, only the letters
+      before them differing ("SM/..." for "BRBM/...") -- the series misread;
+    * a copy with no number read, with the same amount and date as exactly one
+      numbered receipt: that receipt. With two numbered receipts of that amount
+      and date it is left counted (which one it repeats cannot be told).
+
+    Two receipts whose bank references were both read and differ are two
+    payments and are never joined by the last two."""
+    out: list[DuplicateGroup] = []
+    later = {d.document_id for g in found for d in g.documents[1:]}
+    counted = [d for d in documents if d.document_id not in later and d.amount is not None]
+
+    def add(basis: str, key: str, members: list[ReceiptRecord]) -> None:
+        dates = {m.receipt_date for m in members if m.receipt_date}
+        out.append(DuplicateGroup(
+            rule_key=f"{_RULE_PREFIX}:{document_type_key}:{key}", stage_code=members[0].stage_code,
+            document_type_key=document_type_key, match_basis=basis, amount=members[0].amount,
+            dates_match=len(dates) <= 1, documents=tuple(members)))
+        dropped = {m.document_id for m in members[1:]}
+        counted[:] = [d for d in counted if d.document_id not in dropped]
+
+    def references_differ(a: ReceiptRecord, b: ReceiptRecord) -> bool:
+        return a.reference is not None and b.reference is not None and a.reference != b.reference
+
+    by_reference: dict[tuple[str, Decimal, str | None], list[ReceiptRecord]] = {}
+    for document in counted:
+        if document.reference is not None:
+            by_reference.setdefault((document.reference, document.amount, document.receipt_date), []).append(document)
+    for (reference, amount, receipt_date), members in by_reference.items():
+        if len(members) > 1:
+            add(BASIS_REFERENCE, f"REF:{reference}:{amount}:{receipt_date}", members)
+
+    by_digits: dict[tuple[str, Decimal, str], list[ReceiptRecord]] = {}
+    for document in counted:
+        digits = receipt_digits(document.receipt_number)
+        if digits is not None and document.receipt_date is not None:
+            by_digits.setdefault((digits, document.amount, document.receipt_date), []).append(document)
+    for (digits, amount, receipt_date), members in by_digits.items():
+        same = [members[0]] + [m for m in members[1:] if not references_differ(members[0], m)]
+        if len(same) > 1:
+            add(BASIS_LETTERS, f"DIGITS:{digits}:{amount}:{receipt_date}", same)
+
+    for document in [d for d in counted if not d.receipt_number and d.receipt_date is not None]:
+        numbered = [d for d in counted if d.receipt_number and d.amount == document.amount
+                    and d.receipt_date == document.receipt_date and not references_differ(d, document)]
+        if len(numbered) == 1:
+            add(BASIS_NOT_READ, f"UNREAD:{numbered[0].receipt_number}:{document.amount}:{document.receipt_date}",
+                [numbered[0], document])
+    return out
 
 
 
@@ -287,10 +398,18 @@ def repeated_receipts(documents: list[ReceiptRecord]) -> dict[Any, Any]:
     PB/26-27/0824 for Rs 45,837 read as 22 Oct and as 23 Oct, counted twice on
     the payments tab while its duplicate task said only one was counted).
     ``documents`` in the order the earliest should win."""
-    out: dict[Any, Any] = {}
+    return {later: first for later, (first, _) in repeated_receipts_basis(documents).items()}
+
+
+def repeated_receipts_basis(documents: list[ReceiptRecord]) -> dict[Any, tuple[Any, str]]:
+    """``repeated_receipts`` with how each copy was recognised (the group's
+    ``match_basis``), for the screens that say why a receipt is not counted.
+    A copy also covers a number read differently or not read, and the same
+    bank reference (``_read_differently``, 2026-11-26)."""
+    out: dict[Any, tuple[Any, str]] = {}
     for group in compute_duplicate_groups(documents):
         for later in group.documents[1:]:
-            out[later.document_id] = group.documents[0].document_id
+            out[later.document_id] = (group.documents[0].document_id, group.match_basis)
     return out
 
 
@@ -385,6 +504,18 @@ def _notice_text(group: DuplicateGroup) -> str:
             "most likely with one date misread. Only the earliest one is counted toward what the "
             "customer paid; the other(s) are excluded automatically."
         )
+    if group.match_basis == BASIS_REFERENCE:
+        return (f"{base} with the same bank reference and date -- one payment, on file more than once. Only "
+                "one is counted toward what the customer paid; the other(s) are excluded automatically.")
+    if group.match_basis == BASIS_LETTERS:
+        numbers = ", ".join(str(d.receipt_number) for d in group.documents)
+        return (f"{base} on the same date with the same number, its letters read differently ({numbers}) -- the "
+                "same receipt on file more than once. Only one is counted toward what the customer paid. If "
+                "these are separate payments, correct the receipt numbers.")
+    if group.match_basis == BASIS_NOT_READ:
+        return (f"{base} on the same date; one is receipt {group.documents[0].receipt_number} and the number on "
+                "the other was not read -- taken as the same receipt on file twice, counted once. If it is a "
+                "separate payment, enter its receipt number on the document.")
     return (
         f"{base} and the same date, with no receipt number legible on either -- flagged as a "
         "likely duplicate and only the earliest is counted toward what the customer paid. If "
