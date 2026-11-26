@@ -34,9 +34,9 @@ with engine.connect() as c:
         for e in c.execute(text("""
             SELECT to_jsonb(x) AS x FROM auditcore.rule_executions x
             WHERE x.tenant_id=:t AND x.journey_id=:j AND x.rule_code='EXCESS_DISCOUNT'
-            ORDER BY x.executed_at_utc DESC LIMIT 3"""), p).mappings():
+            ORDER BY x.evaluated_at_utc DESC LIMIT 3"""), p).mappings():
             x = e["x"]
-            print("  execution:", json.dumps({k: x.get(k) for k in ("executed_at_utc", "outcome", "triggering_event", "audit_finding_id")}, default=str),
+            print("  execution:", json.dumps({k: x.get(k) for k in ("evaluated_at_utc", "outcome", "triggering_event", "audit_finding_id")}, default=str),
                   "|", str(x.get("reason") or "")[:200])
     print()
     print("EXCESS_DISCOUNT control tasks by status:", c.execute(text("""
