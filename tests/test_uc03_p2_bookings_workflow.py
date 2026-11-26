@@ -95,7 +95,10 @@ def test_booking_completion_closes_the_existing_stage_and_lists_split(journey):
     assert row["booking_completed_at"] is not None and row["delivery_reviewed_at"] is None
     assert client.get(f"{base}/journeys", params={"state": "closed"}).json()["items"] == []
     summary = client.get(f"{base}/journeys:summary").json()
-    assert summary["week"]["bookingsCompleted"] == 1 and summary["open"]["bookings"] == 0
+    # Its booking papers are complete; with no delivery paper it is still an open booking, not a
+    # delivery (product owner 2026-11-26: one delivery rule, not the stage).
+    assert summary["week"]["bookingsCompleted"] == 1
+    assert summary["open"] == {"bookings": 1, "deliveries": 0}
     assert summary["closed"] == {"bookings": 1, "deliveries": 0} and summary["tasks"]["open"] >= 0
     timeline = client.get(f"{base}/journeys/{journey.journey_id}/360/timeline").json()
     assert timeline["stages"]["BOOKING"]["status"] == "BOOKING_CLOSED"

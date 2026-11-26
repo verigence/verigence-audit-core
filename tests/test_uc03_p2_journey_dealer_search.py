@@ -287,16 +287,19 @@ def test_bookings_only_and_deliveries_only_agree_with_the_month_figures(uc03_cre
 
     september = {"month": "2026-09", "month_basis": "business"}
     figures = counted(**september)
-    assert listed(**september, kind="booking") == {booking, booking_complete}
-    assert counted(**september, kind="booking")["all"] == figures["bookings_in_month"] == 2
+    # booking_complete was booked in September and its delivery started in October: a delivery
+    # of October, no longer a booking of September (product owner 2026-11-26).
+    assert listed(**september, kind="booking") == {booking}
+    assert counted(**september, kind="booking")["all"] == figures["bookings_in_month"] == 1
+    assert figures["all"] == figures["bookings_in_month"] + figures["deliveries_in_month"]
     assert listed(**september, kind="delivery") == {delivery}
     assert counted(**september, kind="delivery")["all"] == figures["deliveries_in_month"] == 1
     # October: the delivery started that month is a delivery of October, not a booking.
     october = {"month": "2026-10", "month_basis": "business"}
     assert listed(**october, kind="delivery") == {booking_complete}
     assert listed(**october, kind="booking") == set()
-    # All months: every journey is a booking; deliveries are those with a delivery date.
-    assert listed(kind="booking") == set(ids)
+    # All months: the bookings are the journeys with no delivery date, the deliveries the rest.
+    assert listed(kind="booking") == set(ids) - {booking_complete, delivery, ids[3]}
     # (_seed's closed journey was delivered: its delivery stage started today.)
     assert listed(kind="delivery") == {booking_complete, delivery, ids[3]}
     # Anything else is both.

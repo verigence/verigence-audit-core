@@ -149,6 +149,14 @@ def _vehicle_gate_pass(s, journey_id, read_date, *, corrected_to=None):
              "x": json.dumps(str(read_date)), "m": json.dumps(str(corrected_to)) if corrected_to else None,
              "a": s.journey.actor_id if corrected_to else None,
              "e": json.dumps(str(corrected_to or read_date)), "im": corrected_to is not None})
+        # The vehicle's chassis, as a gate pass prints it: what makes the Journey a delivery
+        # (product owner 2026-11-21, uc03_delivery_start).
+        connection.execute(
+            text("INSERT INTO auditcore.journey_document_extracted_fields (tenant_id, journey_id, di_document_id, "
+                 "field_key, stage_code, source_document_type_key, extracted_value, effective_value) "
+                 "VALUES (:t, :j, :d, 'chassis_number', 'DELIVERY', 'gate_pass', CAST(:v AS jsonb), CAST(:v AS jsonb))"),
+            {"t": s.journey.tenant_id, "j": str(journey_id), "d": str(document),
+             "v": json.dumps(f"MA1{uuid4().hex[:14].upper()}")})
 
 
 def _delivery_file(s, journeys=1, *, stage="DELIVERY", pages=1, fresh=False, gate_pass_dated=_TODAY):
