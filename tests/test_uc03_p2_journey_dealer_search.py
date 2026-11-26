@@ -292,6 +292,10 @@ def test_bookings_only_and_deliveries_only_agree_with_the_month_figures(uc03_cre
     assert listed(**september, kind="booking") == {booking}
     assert counted(**september, kind="booking")["all"] == figures["bookings_in_month"] == 1
     assert figures["all"] == figures["bookings_in_month"] + figures["deliveries_in_month"]
+    assert figures["converted_in_month"] == 0
+    # Booked and delivered in the same period: a delivery, shown as converted beside the bookings.
+    both = counted(**{"from": "2026-09-01", "to": "2026-10-31"})
+    assert (both["bookings_in_month"], both["deliveries_in_month"], both["converted_in_month"]) == (1, 2, 1)
     assert listed(**september, kind="delivery") == {delivery}
     assert counted(**september, kind="delivery")["all"] == figures["deliveries_in_month"] == 1
     # October: the delivery started that month is a delivery of October, not a booking.

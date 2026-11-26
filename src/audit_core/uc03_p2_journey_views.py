@@ -291,6 +291,10 @@ SCOPED_SQL = f"""
                to_char(bm.delivery_date, 'YYYY-MM') AS delivery_month,
                (bm.delivery_date IS NULL AND {_in_period("bm.booking_date")}) AS booking_in_period,
                {_in_period("bm.delivery_date")} AS delivery_in_period,
+               -- Booked and delivered in the period: among its deliveries, not its bookings.
+               -- Shown beside the bookings so they can be set against the DMS, whose booking
+               -- dump lists every booking made in the month, delivered or not (2026-11-26).
+               ({_in_period("bm.booking_date")} AND {_in_period("bm.delivery_date")}) AS converted_in_period,
                (fin.journey_id IS NOT NULL) AS is_closed,
                COALESCE(ot.pc_task, false) AS pc_task,
                COALESCE(ot.tl_task, false) AS tl_task,
@@ -379,7 +383,8 @@ COUNTS_SQL = "WITH " + SCOPED_SQL + """
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.overdue) AS overdue,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.stuck) AS stuck,
       COUNT(*) FILTER (WHERE s.booking_in_period) AS bookings_in_month,
-      COUNT(*) FILTER (WHERE s.delivery_in_period) AS deliveries_in_month
+      COUNT(*) FILTER (WHERE s.delivery_in_period) AS deliveries_in_month,
+      COUNT(*) FILTER (WHERE s.converted_in_period) AS converted_in_month
     FROM scoped s
 """
 
@@ -436,6 +441,7 @@ COUNTS_WITH_BREAKDOWN_SQL = "WITH " + SCOPED_SQL + """
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.stuck) AS stuck,
       COUNT(*) FILTER (WHERE s.booking_in_period) AS bookings_in_month,
       COUNT(*) FILTER (WHERE s.delivery_in_period) AS deliveries_in_month,
+      COUNT(*) FILTER (WHERE s.converted_in_period) AS converted_in_month,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND (s.overdue OR s.high_risk)) AS attention
     FROM scoped s
     GROUP BY GROUPING SETS ((), (s.dealer_id), (s.outlet_id), (s.created_by_actor_id))
@@ -456,7 +462,7 @@ def split_counts_with_breakdown(rows: list[Any]) -> dict[str, Any]:
                 **{key: data[key] for key in (
                     "closed", "open", "booking_open", "delivery_open", "needs_action", "processing",
                     "with_tl", "needs_tl", "high_risk", "overdue", "stuck",
-                    "bookings_in_month", "deliveries_in_month")},
+                    "bookings_in_month", "deliveries_in_month", "converted_in_month")},
             })
             continue
         figures = {key: int(data[key] or 0) for key in BREAKDOWN_FIGURES}
