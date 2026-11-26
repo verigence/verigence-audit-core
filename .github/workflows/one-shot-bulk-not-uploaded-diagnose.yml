@@ -50,20 +50,20 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: Drive files per PC, read-only
+      - name: After the Drive storage change (PR 971), read-only
         shell: bash
         run: |
           python - <<'PY'
           import os, psycopg
-          with psycopg.connect(os.environ["DB"], autocommit=True, options="-c statement_timeout=180000 -c default_transaction_read_only=on") as c:
+          with psycopg.connect(os.environ["DB"], autocommit=True, options="-c statement_timeout=120000 -c default_transaction_read_only=on") as c:
+              print("ALEMBIC", list(c.execute("SELECT version_num FROM public.alembic_version")))
+              print("FILECOLS", [r[0] for r in c.execute("""SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore'
+                  AND table_name='p2_drive_files' AND column_name IN ('owner_email','gone_from_drive_at_utc','drive_checked_at_utc','handed_over_at_utc','handover_error')""")])
+              print("PEOPLECOLS", [r[0] for r in c.execute("""SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore'
+                  AND table_name='p2_drive_people' AND column_name IN ('refresh_token_sealed','linked_google_email','link_status')""")])
               for t, in list(c.execute("SELECT tenant_id FROM auditcore.p2_drive_connections")):
                   c.execute("SELECT set_config('app.tenant_id', %s, false)", (t,))
-                  print("TENANT", t, list(c.execute("SELECT google_email, connected_at_utc FROM auditcore.p2_drive_connections WHERE tenant_id=%s", (t,))))
-                  print("PEOPLE", list(c.execute("SELECT count(*), min(asked_at_utc) FROM auditcore.p2_drive_people WHERE tenant_id=%s", (t,))))
-                  for r in c.execute("""SELECT coalesce(p.google_email, f.pc_actor_id, '-') who, f.file_status, f.lane, count(*), round(sum(f.size_bytes)/1048576.0) mb,
-                        min(f.upload_date), max(f.upload_date)
-                      FROM auditcore.p2_drive_files f LEFT JOIN auditcore.p2_drive_people p ON p.tenant_id=f.tenant_id AND p.actor_id=f.pc_actor_id
-                      WHERE f.tenant_id=%s GROUP BY 1,2,3 ORDER BY 1,2,3""", (t,)):
-                      print("PC", r)
-                  print("TOTAL", list(c.execute("SELECT count(*), round(sum(size_bytes)/1048576.0) FROM auditcore.p2_drive_files WHERE tenant_id=%s", (t,))))
+                  print("STATE", t, list(c.execute("""SELECT count(*) FILTER (WHERE owner_email IS NOT NULL), count(*) FILTER (WHERE handed_over_at_utc IS NOT NULL),
+                      count(*) FROM auditcore.p2_drive_files WHERE tenant_id=%s""", (t,))),
+                      list(c.execute("SELECT count(*) FILTER (WHERE link_status='LINKED') FROM auditcore.p2_drive_people WHERE tenant_id=%s", (t,))))
           PY
