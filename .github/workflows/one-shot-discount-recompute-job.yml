@@ -76,6 +76,8 @@ jobs:
                       break
                   time.sleep(10)
               print("STATUS", status)
+              print("TIMES", c.execute("SELECT requested_at_utc, started_at_utc, heartbeat_at_utc, finished_at_utc, now() "
+                                       "FROM auditcore.p2_worker_jobs WHERE job_id=%s", (job_id,)).fetchone())
               try:
                   result = json.loads(detail or "{}")
               except ValueError:
