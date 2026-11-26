@@ -2038,6 +2038,9 @@ def free_up_overview(connection: Connection, tenant_id: str, link: dict[str, Any
         return []
     people = _people(connection, tenant_id)
     by_email = {email.strip().lower(): actor for actor, email in people.items() if email}
+    links = {str(r["actor_id"]): r["link_status"] for r in connection.execute(
+        text("SELECT actor_id, link_status FROM auditcore.p2_drive_people WHERE tenant_id=:t"), {"t": tenant_id},
+    ).mappings()}
     rows = connection.execute(
         text(
             f"""
@@ -2056,7 +2059,8 @@ def free_up_overview(connection: Connection, tenant_id: str, link: dict[str, Any
             continue
         actor = by_email.get(r["email"])
         node = out.setdefault(r["email"], {"actorId": actor, "name": names.get(actor) if actor else None,
-                                           "googleEmail": r["email"], "files": 0, "bytes": 0})
+                                           "googleEmail": r["email"], "files": 0, "bytes": 0,
+                                           "linkStatus": (links.get(actor) if actor else None) or "NOT_LINKED"})
         node["files"] += int(r["files"])
         node["bytes"] += int(r["bytes"])
     return sorted(out.values(), key=lambda p: -p["bytes"])
