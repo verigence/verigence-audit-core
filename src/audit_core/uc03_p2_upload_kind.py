@@ -12,8 +12,13 @@ deliveries in November for 76 Journeys whose delivery first came in that month.
 For each Journey and day it was uploaded to (in the Project's time zone), under the person
 who uploaded:
 
-    delivery   the first day a delivery page came for the Journey (a new delivery), whether
-               the Journey is new that day or was booked earlier
+    delivery   the first day a delivery page came for a Journey that is a delivery (a new
+               delivery), whether the Journey is new that day or was booked earlier. A
+               delivery by the one delivery rule (uc03_delivery_start, product owner
+               2026-11-21: the vehicle's own VIN / chassis on file, or delivered): a page
+               filed under the delivery of a Journey that is still a booking -- a receipt, a
+               bank approval letter -- is no new delivery (2026-11-26: November showed 1,412
+               new deliveries against 831 Journeys that were deliveries at all)
     booking    the Journey's first day (a new Journey) when no delivery page came that day
     updated    any other day: documents added to a Journey already booked or delivered
 
@@ -36,6 +41,8 @@ from typing import Any
 
 from sqlalchemy import Connection, text
 
+from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
+
 BOOKING, DELIVERY, UPDATED = "booking", "delivery", "updated"
 KINDS = (BOOKING, DELIVERY, UPDATED)
 
@@ -55,6 +62,11 @@ _SQL = f"""
           AND {_UPLOADED}
         GROUP BY 1, 2, 3
     ),
+    -- Those of them that are deliveries, by the one delivery rule (2026-11-26).
+    deliveries AS (
+        SELECT u.journey_id FROM (SELECT DISTINCT journey_id FROM up) u
+        WHERE {DELIVERY_STARTED_SQL.format(t=":t", j="u.journey_id")}
+    ),
     -- Each of those Journeys' first upload day and first delivery-page day, ever (not only in
     -- the window: a Journey booked last month and added to today is updated, not new).
     firsts AS (
@@ -63,7 +75,8 @@ _SQL = f"""
                min(CAST(ub.created_at_utc AT TIME ZONE :tz AS date)) FILTER (WHERE EXISTS (
                    SELECT 1 FROM auditcore.p2_document_queue q
                    WHERE q.tenant_id = ub.tenant_id AND q.batch_id = ub.batch_id
-                     AND q.business_stage = 'DELIVERY')) AS first_delivery
+                     AND q.business_stage = 'DELIVERY')
+                 AND ub.journey_id IN (SELECT journey_id FROM deliveries)) AS first_delivery
         FROM auditcore.p2_upload_batches ub
         WHERE ub.tenant_id = :t AND ub.journey_id IN (SELECT journey_id FROM up) AND {_UPLOADED}
         GROUP BY ub.journey_id
