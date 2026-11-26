@@ -299,14 +299,15 @@ def test_the_recompute_job_rebuilds_old_rows_only_on_commit(journey):
                              "WHERE tenant_id=:t AND journey_id=:j").scalar_one()
 
     def rechecks():
+        # Forced, as RULES_RERUN asks: a stage recompute runs no check while the facts stand (2026-11-26).
         return _sql(journey, "SELECT count(*) FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
-                             "AND work_type='STAGE_RECOMPUTE'").scalar_one()
+                             "AND work_type='CONTROL_EVALUATE' AND payload->>'force'='true'").scalar_one()
 
     asked = rechecks()
     dry = run_discount_variance_recompute(journey.engine, "xd-1", [journey.tenant_id])
     assert cached() == stale and rechecks() == asked
     # 2026-11-26: the task follows the list. The booking's excess rows change, so it is
-    # named for a recheck by the dry run and given one stage recompute on commit.
+    # named for a recheck by the dry run and its checks are run again on commit.
     counted = dry["tenants"][journey.tenant_id]
     assert dry["commit"] is False and (counted["changed"], counted["recheck"]) == (1, 1)
     assert counted["rechecked"][0]["excessBefore"] == [] and counted["rechecked"][0]["excessAfter"] == [
