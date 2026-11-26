@@ -285,6 +285,36 @@ def test_neither_before_the_ndc_is_read_still_asks_the_pc(engine, monkeypatch) -
     assert _sync(journey)["decidedBy"] == "UNCONFIRMED" and _task(journey) is not None
 
 
+def test_what_the_documents_show_is_known_whatever_the_pc_confirmed(engine, monkeypatch) -> None:
+    """2026-11-26 (UTK-SR-261030-001): the PC confirmed Self; the NDC charging no
+    premium and an outside agent's code on the policy show the same, so the
+    dealer discount's grid tier no longer depends on anything."""
+    journey = create_p2_journey(engine, prefix="inssrc")
+    _policy(journey, agent_code="PS0000041087", agent="SASWATI DHAR")
+    with engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.insurance_records SET insurance_source = 'SELF', insurance_source_set_at_utc = now() "
+                 "WHERE tenant_id = :t AND journey_id = :j"), {"t": journey.tenant_id, "j": journey.journey_id})
+
+    def verdict():
+        with engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            decided = rule.resolve(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+            assert (decided["source"], decided["decidedBy"]) == ("SELF", "PC")  # the PC's word still decides the Deal
+            return rule.document_verdict(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+    monkeypatch.setattr(rule, "premium_on_dealer_statement", lambda *a, **k: None)
+    monkeypatch.setattr(rule, "ndc_without_premium", lambda *a, **k: False)
+    assert verdict() is None  # the NDC is not read yet: still in question
+    monkeypatch.setattr(rule, "ndc_without_premium", lambda *a, **k: True)
+    shown = verdict()
+    assert shown["source"] == "SELF" and "NDC charges no insurance premium" in shown["basis"]
+    # The NDC charging the premium shows the opposite of what the PC marked.
+    monkeypatch.setattr(rule, "premium_on_dealer_statement", lambda *a, **k: 27505.0)
+    assert verdict() == {"source": "INHOUSE", "basis": "The NDC charges the insurance premium (Rs 27,505)."}
+
+
 # The NDC's insurance row saying the customer arranged it (product owner
 # 2026-11-17: "own means self and not dealership"); labels as read on live NDCs.
 @pytest.mark.parametrize(("label", "own"), [

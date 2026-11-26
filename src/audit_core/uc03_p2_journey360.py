@@ -1912,6 +1912,8 @@ def deal(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[st
                     component["ndcNote"] = " ".join(free_notes[component["key"]])
         split_free_accessories(all_rows, discount_rows,
                                as_value=any(f["key"] == "accessories_cost" and f.get("asValue") for f in free_rows))
+    _settle_grid_tier(connection, tenant_id=tenant_id, journey_id=journey_id, discount_rows=discount_rows,
+                      insurance=insurance)
     for group in groups:
         group["totals"] = {
             c: _column_total([r for r in group["components"] if not r.get("partOf") and not r.get("notTaken")], c)
@@ -2821,6 +2823,39 @@ def _benefit_row(
             ["INVOICES_DISAGREE"] if key in disagreeing or invoice_disagrees else []),
         "sources": _source_list(per_source + own),
     }
+
+
+def _settle_grid_tier(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                      discount_rows: list[dict[str, Any]], insurance: dict[str, Any]) -> None:
+    """A dealer discount judged at the grid's base tier whose insurance the
+    documents show was not in-house: nothing is left for a higher tier to
+    depend on, so the row carries why (``grid.insuranceNotInhouse``) and the
+    Excess Discount check reads it as excess, not "over unless in-house".
+
+    Product owner 2026-11-26 ("excess discount given Rs 2000, not in the excess
+    discount list"): UTK-SR-261030-001 gave "Other Discount" Rs 7,000 on a MAXX
+    City (base Rs 5,000, with insurance Rs 7,000). Its NDC charges Rs 0
+    insurance, the policy carries an outside agent's code and the PC confirmed
+    Self -- yet the row sat on the "depends on in-house insurance" list, because
+    every dealer discount within a higher tier went there (2026-11-14) whether
+    or not the insurance was still in question. That list stays for the cases
+    it was made for: the documents show in-house while the PC marked Self, or
+    the NDC is not read yet. Only the documents settle it (the PC's Self alone
+    does not: that was the misreading of 2026-11-14)."""
+    for row in discount_rows:
+        grid = row.get("grid")
+        if row.get("key") != "ADDITIONAL_DISCOUNT" or not grid or grid.get("tier") != "BASE" \
+                or row.get("billed") is None:
+            continue
+        verdict: dict[str, Any] | None = None
+        if insurance.get("decidedBy") == "DOCUMENT":
+            verdict = insurance
+        elif insurance.get("decidedBy") == "PC":
+            from audit_core.uc03_insurance_source import document_verdict
+
+            verdict = document_verdict(connection, tenant_id=tenant_id, journey_id=journey_id)
+        if verdict is not None and verdict.get("source") == "SELF" and verdict.get("basis"):
+            grid["insuranceNotInhouse"] = verdict["basis"]
 
 
 def _grid_tiers(row: dict[str, Any]) -> dict[str, Any] | None:

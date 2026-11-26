@@ -242,6 +242,11 @@ def higher_tier_covering(row: dict[str, Any], amount: Decimal) -> tuple[str, Dec
     tier = grid.get("tier")
     if tier not in _TIER_ORDER:
         return None
+    if tier == "BASE" and grid.get("insuranceNotInhouse"):
+        # Every higher tier needs in-house insurance, and the documents show it
+        # was not (uc03_p2_journey360._settle_grid_tier, product owner
+        # 2026-11-26): nothing to depend on, the amount above the base is excess.
+        return None
     for higher in _TIER_ORDER[_TIER_ORDER.index(tier) + 1:]:
         allowance = _dec(tiers.get(higher))
         if allowance is not None and amount - allowance <= LINE_TOLERANCE:
@@ -327,7 +332,9 @@ def assess(discounts: list[dict[str, Any]], in_doubt: dict[str, str] | None = No
     * OVER_UNLESS_INHOUSE: a dealer discount above the grid tier it was
       judged at but within a higher tier of its grid line -- over only if
       the insurance / EW were not in-house, never counted as excess
-      (2026-11-14);
+      (2026-11-14); not when the documents already show the insurance was not
+      in-house (``grid.insuranceNotInhouse``): that is excess, with why
+      (2026-11-26);
     (a Tally ledger giving another amount than the NDC is carried as
     ``ledger`` on the row: the NDC decides, 2026-11-15);
     * OVER_ENTITLEMENT: given above the entitlement (the kit, when it was
@@ -386,6 +393,10 @@ def assess(discounts: list[dict[str, Any]], in_doubt: dict[str, str] | None = No
             continue
         if extra > LINE_TOLERANCE:
             status = OVER
+            not_inhouse = (row.get("grid") or {}).get("insuranceNotInhouse") if row.get("key") == DEALER_DISCOUNT_KEY else None
+            if not_inhouse:
+                # Why the grid's higher tier does not cover it (2026-11-26).
+                base = {**base, "reason": f"the insurance was not in-house: {not_inhouse}"}
         elif -extra > LINE_TOLERANCE:
             status = UNDER
         else:
