@@ -298,11 +298,26 @@ def test_the_recompute_job_rebuilds_old_rows_only_on_commit(journey):
         return _sql(journey, "SELECT discount_variance FROM auditcore.p2_journey_runtime "
                              "WHERE tenant_id=:t AND journey_id=:j").scalar_one()
 
-    run_discount_variance_recompute(journey.engine, "xd-1", [journey.tenant_id])
-    assert cached() == stale
-    run_discount_variance_recompute(journey.engine, "xd-1-commit", [journey.tenant_id])
+    def rechecks():
+        return _sql(journey, "SELECT count(*) FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
+                             "AND work_type='STAGE_RECOMPUTE'").scalar_one()
+
+    asked = rechecks()
+    dry = run_discount_variance_recompute(journey.engine, "xd-1", [journey.tenant_id])
+    assert cached() == stale and rechecks() == asked
+    # 2026-11-26: the task follows the list. The booking's excess rows change, so it is
+    # named for a recheck by the dry run and given one stage recompute on commit.
+    counted = dry["tenants"][journey.tenant_id]
+    assert dry["commit"] is False and (counted["changed"], counted["recheck"]) == (1, 1)
+    assert counted["rechecked"][0]["excessBefore"] == [] and counted["rechecked"][0]["excessAfter"] == [
+        ("ADDITIONAL_DISCOUNT", "5000.00")]
+    done = run_discount_variance_recompute(journey.engine, "xd-1-commit", [journey.tenant_id])
     # The corporate line has no reconciliation row: entitlement unknown (2026-11-06).
     assert {r["key"]: r["status"] for r in cached()} == {"ADDITIONAL_DISCOUNT": OVER, "CORPORATE_PRIVILEGE": UNKNOWN}
+    assert done["commit"] is True and done["tenants"][journey.tenant_id]["recheck"] == 1 and rechecks() >= max(asked, 1)
+    # Nothing left to change: a second commit asks for nothing.
+    again = run_discount_variance_recompute(journey.engine, "xd-1-commit", [journey.tenant_id])
+    assert (again["tenants"][journey.tenant_id]["changed"], again["tenants"][journey.tenant_id]["recheck"]) == (0, 0)
 
 
 # ---------------------------------------------------------------- 2026-11-06 re-evaluation
