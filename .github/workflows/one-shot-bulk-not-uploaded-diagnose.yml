@@ -50,104 +50,20 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
-      - name: The 3 quotations left, read-only
+      - name: Drive files per PC, read-only
         shell: bash
         run: |
           python - <<'PY'
           import os, psycopg
           with psycopg.connect(os.environ["DB"], autocommit=True, options="-c statement_timeout=180000 -c default_transaction_read_only=on") as c:
-              t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
-              c.execute("SELECT set_config('app.tenant_id', %s, false)", (t,))
-              docs = ['0b22201d-ddc6-43eb-aab5-9a5d9dc2b69b', '220d8505-d124-4649-a89b-b19c9a855fbf', '004d86f5-dcf9-4136-b150-4cf2b10b766c']
-              for r in c.execute("""SELECT f.di_document_id, f.journey_id, f.field_key, f.effective_value, f.updated_at_utc
-                  FROM auditcore.journey_document_extracted_fields f WHERE f.tenant_id=%s AND f.di_document_id = ANY(%s::uuid[]) AND f.field_key='document_title'""", (t, docs)):
-                  print("TITLEROW", r)
-              for r in c.execute("""SELECT e.di_document_id, e.journey_id, e.evidence_id, e.association_status, e.document_type_key
-                  FROM auditcore.evidence e WHERE e.tenant_id=%s AND e.di_document_id = ANY(%s::uuid[])""", (t, docs)):
-                  print("EVROW", r)
-              for r in c.execute("""SELECT q.di_document_id, q.journey_id, q.queue_status, q.retired_at_utc, q.type_overridden_by_actor_id
-                  FROM auditcore.p2_document_queue q WHERE q.tenant_id=%s AND q.di_document_id = ANY(%s::uuid[])""", (t, docs)):
-                  print("QROW", r)
-              wcols = [x[0] for x in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore' AND table_name='p2_work_queue' ORDER BY ordinal_position")]
-              for r in c.execute("""SELECT w.* FROM auditcore.p2_work_queue w JOIN auditcore.journeys j ON j.tenant_id=w.tenant_id AND j.journey_id=w.journey_id
-                  WHERE w.tenant_id=%s AND j.journey_reference IN ('UTK-JP-261031-006','UTK-JP-261102-014','UTK-JP-261104-003')
-                    AND w.updated_at_utc > now() - interval '3 hours'""", (t,)):
-                  print("WQ", {k: str(v)[:160] for k, v in zip(wcols, r) if v is not None and k not in ('tenant_id',)})
-              for r in c.execute("""SELECT work_status, count(*) FROM auditcore.p2_work_queue WHERE tenant_id=%s AND updated_at_utc > now() - interval '1 hour' GROUP BY 1""", (t,)):
-                  print("WQSTATUS", r)
-              for r in c.execute("""SELECT j.journey_reference, a.event_type, a.details::text, a.created_at_utc FROM auditcore.p2_activity_events a
-                  JOIN auditcore.journeys j ON j.tenant_id=a.tenant_id AND j.journey_id=a.journey_id
-                  WHERE a.tenant_id=%s AND j.journey_reference IN ('UTK-JP-261031-006','UTK-JP-261102-014','UTK-JP-261104-003')
-                    AND a.created_at_utc > now() - interval '3 hours' ORDER BY a.created_at_utc""", (t,)):
-                  print("ACT", str(r)[:300])
-          PY
-      - name: After the quotation rule (PR 970), read-only
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os, psycopg
-          from collections import Counter
-          QUOT = r"(QUOTATION|PRO\s*-?\s*FORMA|PERFORMA)"
-          SHEET = r"(COST\s*SHEET|ACCOUNTS?\s+STATEMENT|OFFER\s+LETTER|PAYMENT\s+DETAILS)"
-          with psycopg.connect(os.environ["DB"], autocommit=True, options="-c statement_timeout=180000 -c default_transaction_read_only=on") as c:
-              t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
-              c.execute("SELECT set_config('app.tenant_id', %s, false)", (t,))
-              print("BANITA", list(c.execute("""SELECT j.journey_reference, jc.insurance_type, jc.insurance_decided_by, jc.insurance_basis
-                  FROM auditcore.journeys j JOIN auditcore.journey_classifications jc ON jc.tenant_id=j.tenant_id AND jc.journey_id=j.journey_id
-                  WHERE j.tenant_id=%s AND j.journey_reference='UTK-JP-261031-001'""", (t,))))
-              aside = list(c.execute("""SELECT e.journey_id, count(*), min(e.voided_at_utc AT TIME ZONE 'Asia/Kolkata')
-                  FROM auditcore.evidence e WHERE e.tenant_id=%s AND e.voided_by_actor_id='SYSTEM:QUOTATION' GROUP BY 1""", (t,)))
-              print("SET_ASIDE documents", sum(r[1] for r in aside), "bookings", len(aside), "first", min((r[2] for r in aside), default=None))
-              left = list(c.execute(f"""SELECT j.journey_reference, f.effective_value #>> '{{}}',
-                    EXISTS (SELECT 1 FROM auditcore.p2_document_queue q WHERE q.tenant_id=e.tenant_id AND q.di_document_id=e.di_document_id
-                      AND q.type_overridden_by_actor_id IS NOT NULL AND q.type_overridden_by_actor_id NOT LIKE 'SYSTEM%%'
-                      AND q.queue_status NOT IN ('MERGED','CANCELLED') AND q.retired_at_utc IS NULL)
-                  FROM auditcore.evidence e JOIN auditcore.journeys j ON j.tenant_id=e.tenant_id AND j.journey_id=e.journey_id
-                  JOIN auditcore.journey_document_extracted_fields f ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id
-                    AND f.di_document_id=e.di_document_id AND f.field_key='document_title'
-                  WHERE e.tenant_id=%s AND e.association_status='ACTIVE' AND e.document_type_key='cost_sheet'
-                    AND upper(f.effective_value #>> '{{}}') ~ '{QUOT}' AND upper(f.effective_value #>> '{{}}') !~ '{SHEET}'""", (t,)))
-              print("QUOTATIONS_STILL_ACTIVE", len(left))
-              for r in left:
-                  print("  LEFT", r)
-              rtcols = [x[0] for x in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore' AND table_name='p2_journey_runtime'")]
-              print("RTCOLS", rtcols)
-              for ref in ('UTK-JP-261031-006', 'UTK-JP-261102-014', 'UTK-JP-261104-003'):
-                  for r in c.execute("""SELECT q.queue_id, q.queue_status, q.type_overridden_by_actor_id, q.retired_at_utc, q.template_key, e.di_document_id, e.evidence_id
-                      FROM auditcore.evidence e JOIN auditcore.journeys j ON j.tenant_id=e.tenant_id AND j.journey_id=e.journey_id
-                      LEFT JOIN auditcore.p2_document_queue q ON q.tenant_id=e.tenant_id AND q.di_document_id=e.di_document_id AND q.journey_id=e.journey_id
-                      WHERE e.tenant_id=%s AND j.journey_reference=%s AND e.document_type_key='cost_sheet' AND e.association_status='ACTIVE'""", (t, ref)):
-                      print("LEFTQ", ref, r)
-                  for r in c.execute("SELECT rt.* FROM auditcore.p2_journey_runtime rt JOIN auditcore.journeys j ON j.tenant_id=rt.tenant_id AND j.journey_id=rt.journey_id WHERE rt.tenant_id=%s AND j.journey_reference=%s", (t, ref)):
-                      print("LEFTRT", ref, dict(zip(rtcols, [str(x)[:40] for x in r])))
-              ids = [r[0] for r in aside]
-              tally = Counter()
-              for r in c.execute("""SELECT j.journey_reference, jc.insurance_type, jc.insurance_decided_by, left(coalesce(jc.insurance_basis,''),110),
-                    EXISTS (SELECT 1 FROM auditcore.evidence n WHERE n.tenant_id=j.tenant_id AND n.journey_id=j.journey_id AND n.association_status='ACTIVE'
-                      AND n.document_type_key IN ('customer_ledger','customer_ledger_tally','erp_settlement','cost_sheet')) has_statement,
-                    NULL AS settled
-                  FROM auditcore.journeys j LEFT JOIN auditcore.journey_classifications jc ON jc.tenant_id=j.tenant_id AND jc.journey_id=j.journey_id
-                  WHERE j.tenant_id=%s AND j.journey_id = ANY(%s) ORDER BY 1""", (t, ids)):
-                  tally[(r[1], r[2], r[3][:60])] += 1
-                  if not r[4]:
-                      print("NO_NDC", r[0])
-                  print("BOOKING", r)
-              for k, n in tally.most_common():
-                  print("INSURANCE_NOW", n, k)
-              for r in c.execute("""SELECT j.journey_reference, left(jc.insurance_basis,70),
-                    EXISTS (SELECT 1 FROM auditcore.evidence e WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id AND e.voided_by_actor_id='SYSTEM:QUOTATION') quotation_aside,
-                    (SELECT string_agg(DISTINCT s.component_key||':'||s.source_document_type||':'||coalesce(e.association_status,'?')||':'||s.amount::int, ' ')
-                       FROM auditcore.commercial_line_source_values s LEFT JOIN auditcore.evidence e ON e.tenant_id=s.tenant_id AND e.evidence_id=s.source_evidence_id
-                       WHERE s.tenant_id=j.tenant_id AND s.journey_id=j.journey_id AND s.component_key ILIKE '%%insur%%') srcs
-                  FROM auditcore.journey_classifications jc JOIN auditcore.journeys j ON j.tenant_id=jc.tenant_id AND j.journey_id=jc.journey_id
-                  WHERE jc.tenant_id=%s AND jc.insurance_basis LIKE 'The NDC charges%%' AND NOT EXISTS (
-                    SELECT 1 FROM auditcore.commercial_line_source_values s JOIN auditcore.evidence e ON e.tenant_id=s.tenant_id
-                      AND e.evidence_id=s.source_evidence_id AND e.association_status='ACTIVE'
-                    WHERE s.tenant_id=jc.tenant_id AND s.journey_id=jc.journey_id AND s.component_key='insurance_amount' AND s.amount>0)""", (t,)):
-                  print("STALE", str(r)[:300])
-              print("STILL_NDC_CHARGES_ON_QUOTATION_ONLY", list(c.execute("""SELECT count(*) FROM auditcore.journey_classifications jc
-                  WHERE jc.tenant_id=%s AND jc.insurance_basis LIKE 'The NDC charges%%' AND NOT EXISTS (
-                    SELECT 1 FROM auditcore.commercial_line_source_values s JOIN auditcore.evidence e ON e.tenant_id=s.tenant_id
-                      AND e.evidence_id=s.source_evidence_id AND e.association_status='ACTIVE'
-                    WHERE s.tenant_id=jc.tenant_id AND s.journey_id=jc.journey_id AND s.component_key='insurance_amount' AND s.amount>0)""", (t,))))
+              for t, in list(c.execute("SELECT tenant_id FROM auditcore.p2_drive_connections")):
+                  c.execute("SELECT set_config('app.tenant_id', %s, false)", (t,))
+                  print("TENANT", t, list(c.execute("SELECT google_email, created_at_utc FROM auditcore.p2_drive_connections WHERE tenant_id=%s", (t,))))
+                  print("PEOPLE", list(c.execute("SELECT count(*), min(asked_at_utc) FROM auditcore.p2_drive_people WHERE tenant_id=%s", (t,))))
+                  for r in c.execute("""SELECT coalesce(p.google_email, f.pc_actor_id, '-') who, f.file_status, f.lane, count(*), round(sum(f.size_bytes)/1048576.0) mb,
+                        min(f.upload_date), max(f.upload_date)
+                      FROM auditcore.p2_drive_files f LEFT JOIN auditcore.p2_drive_people p ON p.tenant_id=f.tenant_id AND p.actor_id=f.pc_actor_id
+                      WHERE f.tenant_id=%s GROUP BY 1,2,3 ORDER BY 1,2,3""", (t,)):
+                      print("PC", r)
+                  print("TOTAL", list(c.execute("SELECT count(*), round(sum(size_bytes)/1048576.0) FROM auditcore.p2_drive_files WHERE tenant_id=%s", (t,))))
           PY
