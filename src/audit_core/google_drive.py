@@ -110,11 +110,13 @@ def _unb64(value: str) -> bytes:
     return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
-def sign_state(settings: DriveSettings, *, tenant_id: str, actor_id: str, now: float | None = None) -> str:
-    """What Google hands back with the approval: which Project asked, who, and until when --
+def sign_state(settings: DriveSettings, *, tenant_id: str, actor_id: str, now: float | None = None,
+               purpose: str = "project") -> str:
+    """What Google hands back with the approval: which Project asked, who, for what (the
+    Project's own account, or a PC's own -- ``purpose`` "pc", 2026-11-26) and until when --
     signed, so the callback (which carries no Verigence login) trusts nothing else."""
-    body = _b64(json.dumps({"t": tenant_id, "a": actor_id, "e": int((now or time.time()) + _STATE_SECONDS)},
-                           separators=(",", ":")).encode())
+    body = _b64(json.dumps({"t": tenant_id, "a": actor_id, "p": purpose,
+                            "e": int((now or time.time()) + _STATE_SECONDS)}, separators=(",", ":")).encode())
     mac = hmac.new(f"drive-state:{settings.client_secret}".encode(), body.encode(), hashlib.sha256).digest()
     return f"{body}.{_b64(mac)}"
 
@@ -133,7 +135,8 @@ def read_state(settings: DriveSettings, state: str, *, now: float | None = None)
         return None
     if not isinstance(data, dict) or int(data.get("e") or 0) < (now or time.time()):
         return None
-    return {"tenant_id": str(data.get("t") or ""), "actor_id": str(data.get("a") or "")}
+    return {"tenant_id": str(data.get("t") or ""), "actor_id": str(data.get("a") or ""),
+            "purpose": str(data.get("p") or "project")}
 
 
 def consent_url(settings: DriveSettings, state: str) -> str:
@@ -301,6 +304,27 @@ class DriveClient:
             return False
         self._request("PATCH", f"/files/{folder_id}", params={"fields": "id,trashed"}, body={"trashed": True})
         return True
+
+    def offer_ownership(self, file_id: str, email: str) -> str:
+        """As the file's owner: offer its ownership to another plain Google account (Google:
+        between consumer accounts the owner makes the new owner's permission a writer with
+        pendingOwner, and the new owner accepts). Returns that permission's id."""
+        body = {"type": "user", "role": "writer", "emailAddress": email, "pendingOwner": True}
+        try:
+            response = self._request("POST", f"/files/{file_id}/permissions",
+                                     params={"sendNotificationEmail": "false", "fields": "id"}, body=body)
+        except DriveError as exc:
+            if exc.status != 400 or "notification" not in str(exc).lower():
+                raise
+            # Google may insist on telling the new owner: then it is told.
+            response = self._request("POST", f"/files/{file_id}/permissions", params={"fields": "id"}, body=body)
+        return str(response.json()["id"])
+
+    def accept_ownership(self, file_id: str, permission_id: str) -> None:
+        """As the account the ownership was offered to: take it. The file stays where it is;
+        the former owner keeps editing it as a writer."""
+        self._request("PATCH", f"/files/{file_id}/permissions/{permission_id}",
+                      params={"transferOwnership": "true", "fields": "id,role"}, body={"role": "owner"})
 
     def download(self, file_id: str) -> bytes:
         return self._request("GET", f"/files/{file_id}", params={"alt": "media"}).content
