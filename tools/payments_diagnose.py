@@ -1,5 +1,5 @@
-"""Read-only: the Team Lead screen's November figures beside the DMS report's and the Project
-Tracker's, per dealership. Counts only; no customer details."""
+"""Read-only: the Team Lead screen's and the Project Tracker's November figures with the one
+delivery rule (this branch's code), per dealership. Counts only; no customer details."""
 from __future__ import annotations
 
 import json
@@ -49,55 +49,11 @@ with engine.connect() as c:
             print(r["part"], r["dealer_name"] if r["part"] == "dealer" else "PROJECT", j({k: r[k] for k in (
                 "total", "bookings_in_month", "deliveries_in_month", "booking_open", "delivery_open", "closed")}))
 
-    print("\n=== A2. What the screen's journeys are ===")
-    rows = c.execute(text("WITH " + SCOPED_SQL + f"""
-        SELECT s.dealer_name, s.booking_in_period, s.delivery_in_period, s.booking_month, s.delivery_month,
-               s.in_delivery, s.is_closed,
-               (SELECT {_DELIVERED_J} FROM auditcore.journeys j
-                 WHERE j.tenant_id = s.tenant_id AND j.journey_id = s.journey_id) AS vin_delivery,
-               EXISTS (SELECT 1 FROM auditcore.journey_stage_states bs WHERE bs.tenant_id = s.tenant_id
-                       AND bs.journey_id = s.journey_id AND bs.stage_code = 'BOOKING'
-                       AND (bs.business_status IN ('BOOKING_CANCELLED', 'DUPLICATE_BOOKING')
-                            OR bs.closure_disposition = 'NO_DELIVERY')) AS cancelled
-        FROM scoped s"""), params).mappings().all()
-    print("journeys on the screen:", len(rows))
-    print("booking date in Nov / delivery date in Nov:", dict(Counter(
-        ("booking" if r["booking_in_period"] else "-") + "+" + ("delivery" if r["delivery_in_period"] else "-") for r in rows)))
-    print("booked in Nov, by delivery month:", dict(Counter(r["delivery_month"] or "no delivery date" for r in rows if r["booking_in_period"])))
-    print("delivered in Nov, by booking month:", dict(Counter(r["booking_month"] for r in rows if r["delivery_in_period"])))
-    print("stage says delivery x VIN rule says delivery x has delivery date:", dict(Counter(
-        ("stage" if r["in_delivery"] else "-") + "/" + ("vin" if r["vin_delivery"] else "-") + "/" + ("date" if r["delivery_month"] else "-")
-        for r in rows)))
-    print("closed:", dict(Counter(("cancelled or duplicate" if r["cancelled"] else "delivery file closed") for r in rows if r["is_closed"])))
-    print("cancelled or duplicate among 'Bookings in Nov':", sum(1 for r in rows if r["booking_in_period"] and r["cancelled"]))
-    per = {}
-    for r in rows:
-        d = per.setdefault(r["dealer_name"], Counter())
-        if r["cancelled"]:
-            d["cancelled or duplicate"] += 1
-            continue
-        delivery = bool(r["vin_delivery"] or r["delivery_month"])
-        if r["booking_in_period"]:
-            d["booked in Nov"] += 1
-            d["booked in Nov, now a delivery" if delivery else "booked in Nov, still a booking"] += 1
-        if r["delivery_in_period"]:
-            d["delivery date in Nov"] += 1
-        if delivery and not r["delivery_in_period"]:
-            d["a delivery, date not in Nov"] += 1
-    for name, d in sorted(per.items()):
-        print("  ", name, dict(d))
-
-    print("\n=== B. DMS report (as of today) ===")
-    report = build_outlet_report(c, tenant_id=T, dealers=dealers, day=today, today=today)
-    keep = ("bookingDms", "bookingSynced", "bookingNotInVerigence", "bookingCancelled", "bookingInVerigence", "bookingNotInDms",
-            "bookingInDmsElsewhere", "bookingAfterDump", "bookingNotCompared", "bookingDatedByReceipt", "bookingDateNotRead",
-            "deliveryDump", "deliverySynced", "deliveryNotUploaded", "deliveryNotInVerigence", "deliveryInVerigence",
-            "deliveryNotInDms", "deliveryNotCompared", "deliveryDatedWithoutGatePass", "gateRegister")
-    for d in report["dealers"]:
-        print(d["dealerName"], "| booking dump", d["bookingDumpDate"], "bookings to", d["bookingsTo"],
-              "| delivery dump", d["deliveryDumpDate"], "deliveries to", d["deliveriesTo"])
-        print("   ", j({k: d["figures"].get(k) for k in keep}))
-    print("PROJECT", j({k: report["figures"].get(k) for k in keep}))
+    kinds = {}
+    for kind in ("booking", "delivery"):
+        kinds[kind] = c.execute(text("WITH " + SCOPED_SQL + " SELECT count(*) FROM scoped s"),
+                                {**params, "kind": kind}).scalar_one()
+    print("Bookings only / Deliveries only lists:", kinds)
 
     print("\n=== C. Project Tracker, month ===")
     tracker = build_project_tracker(c, tenant_id=T, actor_id=actor, period="MONTH", day=today, admin=True)
