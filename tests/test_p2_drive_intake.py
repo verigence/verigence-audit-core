@@ -127,6 +127,20 @@ class FakeDrive:
         self.bin(folder_id)
         return True
 
+    def offer_ownership(self, file_id: str, email: str) -> str:
+        if file_id not in self.items or self.items[file_id]["trashed"]:
+            raise DriveNotFound(404, "not found")
+        self.items[file_id]["pendingOwner"] = email
+        return f"perm-{email}"
+
+    def accept_ownership(self, file_id: str, permission_id: str) -> None:
+        email = self.items[file_id].pop("pendingOwner")
+        assert permission_id == f"perm-{email}"
+        self.items[file_id]["owners"] = [{"emailAddress": email}]
+
+    def close(self) -> None:
+        return None
+
     def download(self, file_id: str) -> bytes:
         self.downloads.append(file_id)
         return self.data[file_id]
@@ -304,7 +318,8 @@ def test_the_end_of_the_day_is_nine_in_the_evening_india_time():
 
 def test_the_approval_state_is_signed_and_expires_and_the_token_is_sealed():
     state = google_drive.sign_state(SETTINGS, tenant_id="t1", actor_id="admin", now=1000.0)
-    assert google_drive.read_state(SETTINGS, state, now=1100.0) == {"tenant_id": "t1", "actor_id": "admin"}
+    assert google_drive.read_state(SETTINGS, state, now=1100.0) == {"tenant_id": "t1", "actor_id": "admin",
+                                                                    "purpose": "project"}
     assert google_drive.read_state(SETTINGS, state, now=1000.0 + 901) is None
     assert google_drive.read_state(SETTINGS, state[:-2] + "xx", now=1100.0) is None
     assert google_drive.read_state(DriveSettings("client", "other"), state, now=1100.0) is None
@@ -985,3 +1000,94 @@ def test_the_clock_still_never_looks_at_drive_for_the_owners(s, monkeypatch):
     monkeypatch.setattr(drive, "connected_client", no_drive)
     noon = datetime(2026, 11, 13, 6, 30, tzinfo=UTC)
     assert "checked" not in drive.drive_round(s.engine, [s.t], worker_id="w1", now=noon)[s.t]
+
+
+
+# --------------------------------------------------------------------------- moved to the Project's account
+
+def _link(s, actor_id, email="ravi@gmail.com") -> None:
+    _exec(s, "INSERT INTO auditcore.p2_drive_people (tenant_id, actor_id, google_email, refresh_token_sealed, "
+             "linked_google_email, linked_at_utc, link_status) VALUES (:t, :a, :e, :sealed, :e, now(), 'LINKED') "
+             "ON CONFLICT (tenant_id, actor_id) DO UPDATE SET refresh_token_sealed=EXCLUDED.refresh_token_sealed, "
+             "linked_google_email=EXCLUDED.linked_google_email, link_status='LINKED'",
+          a=actor_id, e=email, sealed=google_drive.seal(SETTINGS, "pc-refresh"))
+
+
+def test_a_linked_pcs_taken_files_move_to_the_projects_account_and_stay_in_their_folder(s):
+    """Product owner 26 Nov, "lets go with b) ... from verigence App itself they should be able to free
+    up their storage, and files are retained in JBR space"."""
+    outlet = _tree(s)
+    customer = s.fake.folder("Bimal-778899", outlet)
+    docket = s.fake.put("docket.pdf", customer, b"%PDF bimal docket", owner="ravi@gmail.com")
+    s.fake.put("pan.pdf", customer, b"%PDF bimal pan", owner="ravi@gmail.com")
+    _link(s, s.journey.actor_id)
+    run = _run(s)       # the run takes them, and then hands them over
+    assert run["documents"] == 2
+    assert s.fake.items[docket]["owners"] == [{"emailAddress": "project@example.com"}]
+    assert s.fake.items[docket]["parents"] == [customer] and not s.fake.items[docket]["trashed"]
+    files = _files(s)
+    assert files["docket.pdf"]["owner_email"] == "project@example.com"
+    assert files["docket.pdf"]["handed_over_at_utc"] is not None
+    body = s.client.get(f"{s.base}/drive/free-up").json()
+    assert body["mine"]["files"] == 0                     # nothing left in the PC's own storage
+    assert body["myLink"]["status"] == "LINKED"
+    assert body["myLink"]["handedOver"]["files"] == 2
+
+
+def test_free_up_my_storage_moves_now_what_was_taken_and_waits_for_what_was_not(s):
+    outlet = _tree(s)
+    customer = s.fake.folder("Bimal-778899", outlet)
+    s.fake.put("docket.pdf", customer, b"%PDF bimal docket", owner="ravi@gmail.com")
+    _exec(s, "INSERT INTO auditcore.p2_drive_people (tenant_id, actor_id, google_email) VALUES (:t, :a, 'ravi@gmail.com')",
+          a=s.journey.actor_id)
+    _run(s)                                              # not linked yet: taken, still the PC's
+    assert _files(s)["docket.pdf"]["owner_email"] == "ravi@gmail.com"
+    assert s.client.post(f"{s.base}/drive/my-google/free-up").status_code == 409
+    _link(s, s.journey.actor_id)
+    waiting = s.fake.put("receipt.pdf", customer, b"%PDF bimal receipt", owner="ravi@gmail.com")
+    _sync(s)
+    done = s.client.post(f"{s.base}/drive/my-google/free-up").json()
+    assert (done["handedOver"], done["left"]) == (1, 0)
+    assert s.fake.items[waiting]["owners"] == [{"emailAddress": "ravi@gmail.com"}]   # not taken yet: stays
+    assert done["myLink"]["handedOver"]["bytes"] == len(b"%PDF bimal docket")
+
+
+def test_a_pc_connects_their_google_account_from_verigence(s, monkeypatch):
+    connect = s.client.post(f"{s.base}/drive/my-google/connect").json()
+    state = dict(part.split("=", 1) for part in connect["authUrl"].split("?", 1)[1].split("&"))["state"]
+    from urllib.parse import unquote
+    state = unquote(state)
+    assert google_drive.read_state(SETTINGS, state)["purpose"] == "pc"
+    monkeypatch.setattr(google_drive, "exchange_code", lambda settings, code: {"refresh_token": "pc-token"})
+    monkeypatch.setattr(s.fake, "account_email", lambda: "Ravi@gmail.com")
+    monkeypatch.setattr(drive, "_settings_or_503", lambda: SETTINGS)
+    back = s.client.get("/p2/v1/integrations/google-drive/callback", params={"code": "c", "state": state},
+                        follow_redirects=False)
+    assert back.status_code == 303 and "drive=pc-connected" in back.headers["location"]
+    assert "view=storage" in back.headers["location"]
+    [person] = _rows(s, "SELECT * FROM auditcore.p2_drive_people WHERE tenant_id=:t AND actor_id=:a", a=s.journey.actor_id)
+    assert (person["linked_google_email"], person["link_status"]) == ("ravi@gmail.com", "LINKED")
+    assert google_drive.unseal(SETTINGS, person["refresh_token_sealed"]) == "pc-token"
+    # the Project's own account is not a PC's
+    monkeypatch.setattr(s.fake, "account_email", lambda: "project@example.com")
+    back = s.client.get("/p2/v1/integrations/google-drive/callback", params={"code": "c", "state": state},
+                        follow_redirects=False)
+    assert "drive=pc-project-account" in back.headers["location"]
+    # and forgotten again
+    assert s.client.delete(f"{s.base}/drive/my-google").json()["status"] == "NOT_LINKED"
+
+
+def test_a_lost_approval_is_kept_and_nothing_else_breaks(s, monkeypatch):
+    outlet = _tree(s)
+    s.fake.put("docket.pdf", s.fake.folder("Bimal-778899", outlet), b"%PDF bimal docket", owner="ravi@gmail.com")
+    _link(s, s.journey.actor_id)
+
+    def refused(*args, **kwargs):
+        raise google_drive.DriveAuthorizationLost(400, "invalid_grant")
+
+    monkeypatch.setattr(s.fake, "offer_ownership", refused)
+    run = _run(s)
+    assert run["documents"] == 1
+    [person] = _rows(s, "SELECT * FROM auditcore.p2_drive_people WHERE tenant_id=:t AND actor_id=:a", a=s.journey.actor_id)
+    assert person["link_status"] == "LOST" and "invalid_grant" in person["link_error"]
+    assert s.client.get(f"{s.base}/drive/free-up").json()["myLink"]["status"] == "LOST"

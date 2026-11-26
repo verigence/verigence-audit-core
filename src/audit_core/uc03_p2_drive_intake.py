@@ -1472,6 +1472,14 @@ def run_drive_intake(engine: Engine, tag: str, tenant_ids: list[str] | None = No
         counts["failed"] += did["failed"]
     _set_run(engine, tenant_id, run_id, run_status="READING", summary={"found": found, "taken": counts})
     settle(engine, tenant_id, client)
+    try:
+        handed = hand_over(engine, tenant_id, client)
+        if handed["handedOver"] or handed["failed"] or handed["lost"]:
+            logger.info("p2_drive_handed_over", tenant_id=tenant_id, **handed)
+    except DriveAuthorizationLost:
+        raise
+    except Exception:
+        logger.warning("p2_drive_handover_round_failed", tenant_id=tenant_id, exc_info=True)
     result = {"runId": str(run_id), "found": found, **counts}
     if run["run_trigger"] == "END_OF_DAY":
         # Once a day, with the daily run: the folders of journeys closed long enough go to
@@ -2054,6 +2062,151 @@ def free_up_overview(connection: Connection, tenant_id: str, link: dict[str, Any
     return sorted(out.values(), key=lambda p: -p["bytes"])
 
 
+# Product owner 26 Nov, "lets go with b) ... PC dont need to do anything externally, from
+# verigence App itself they should be able to free up their storage, and files are retained
+# in JBR space": the PC approves once, on Google's own screen opened from Verigence ("Connect
+# my Google account"), and Verigence then moves the ownership of each file it has taken to the
+# Project's account. The file stays in its folder (the record in Drive is kept, nothing is
+# deleted) and its storage is the Project's from then on. It runs in every run, and when the
+# PC presses "Free up my storage" -- never on the worker's clock.
+
+_HAND_OVER_IN_A_RUN = 2000
+_HAND_OVER_ON_ASKING = 150
+
+
+def _linked_people(connection: Connection, tenant_id: str, actor_id: str | None = None) -> list[dict[str, Any]]:
+    return [dict(r) for r in connection.execute(
+        text("SELECT actor_id, google_email, linked_google_email, refresh_token_sealed FROM auditcore.p2_drive_people "
+             "WHERE tenant_id=:t AND link_status='LINKED' AND refresh_token_sealed IS NOT NULL "
+             "AND (CAST(:a AS text) IS NULL OR actor_id=:a)"), {"t": tenant_id, "a": actor_id},
+    ).mappings().all()]
+
+
+def _lose_link(engine: Engine, tenant_id: str, actor_id: str, error: str) -> None:
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_drive_people SET link_status='LOST', link_error=:e, updated_at_utc=now() "
+                 "WHERE tenant_id=:t AND actor_id=:a"), {"t": tenant_id, "a": actor_id, "e": error[:500]},
+        )
+
+
+def hand_over(engine: Engine, tenant_id: str, project_client: DriveClient | None = None, *,
+              actor_id: str | None = None, limit: int = _HAND_OVER_IN_A_RUN) -> dict[str, int]:
+    """Move to the Project's account the ownership of every file a linked PC owns that
+    Verigence has taken (safe: its copy is in storage). ``actor_id``: one PC only (they pressed
+    "Free up my storage"). Returns what it did, and how many are left for the next call."""
+    done = {"handedOver": 0, "bytes": 0, "failed": 0, "left": 0, "lost": 0}
+    settings = google_drive.drive_settings()
+    if settings is None:
+        return done
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        link = _connection_row(connection, tenant_id)
+        people = _linked_people(connection, tenant_id, actor_id)
+    if link is None or not people:
+        return done
+    account = _account(link)
+    if project_client is None:
+        linked = connected_client(engine, tenant_id)
+        if linked is None:
+            return done
+        project_client = linked[0]
+    for person in people:
+        email = str(person["linked_google_email"] or "").strip().lower()
+        if not email or email == account:
+            continue
+        # whose each file is, first (files seen before the owner was kept)
+        check_files(engine, tenant_id, project_client, limit=limit, google_email=email, actor_id=person["actor_id"])
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            files = [dict(r) for r in connection.execute(
+                text(f"""
+                    SELECT f.file_row_id, f.drive_file_id, f.size_bytes FROM auditcore.p2_drive_files f
+                    WHERE f.tenant_id=:t AND lower(f.owner_email)=:e AND {_SAFE_CONDITION}
+                    ORDER BY f.handover_error NULLS FIRST, f.seen_at_utc
+                """),
+                {"t": tenant_id, "e": email, "account": account},
+            ).mappings().all()]
+        done["left"] += max(0, len(files) - limit)
+        try:
+            pc_client = open_client(settings, google_drive.unseal(settings, str(person["refresh_token_sealed"])))
+        except Exception as exc:  # noqa: BLE001 -- a token that no longer opens is a lost link, whatever the cause
+            _lose_link(engine, tenant_id, person["actor_id"], str(exc))
+            done["lost"] += 1
+            continue
+        for file in files[:limit]:
+            file_id = str(file["drive_file_id"])
+            error: str | None = None
+            try:
+                try:
+                    permission_id = pc_client.offer_ownership(file_id, account)
+                except DriveAuthorizationLost as exc:
+                    # the PC took the approval back (or it lapsed): they connect again
+                    _lose_link(engine, tenant_id, person["actor_id"], str(exc))
+                    done["lost"] += 1
+                    break
+                project_client.accept_ownership(file_id, permission_id)   # the Project's own: lost is raised
+            except DriveAuthorizationLost:
+                raise
+            except DriveNotFound:
+                with engine.begin() as connection:
+                    set_tenant_context(connection, tenant_id)
+                    connection.execute(
+                        text("UPDATE auditcore.p2_drive_files SET gone_from_drive_at_utc=COALESCE(gone_from_drive_at_utc, "
+                             "now()), updated_at_utc=now() WHERE tenant_id=:t AND drive_file_id=:f"),
+                        {"t": tenant_id, "f": file_id},
+                    )
+                continue
+            except DriveError as exc:
+                error = str(exc)
+            with engine.begin() as connection:
+                set_tenant_context(connection, tenant_id)
+                if error is None:
+                    connection.execute(
+                        text("UPDATE auditcore.p2_drive_files SET owner_email=:account, handed_over_at_utc=now(), "
+                             "handover_error=NULL, drive_checked_at_utc=now(), updated_at_utc=now() "
+                             "WHERE tenant_id=:t AND drive_file_id=:f"),
+                        {"t": tenant_id, "f": file_id, "account": account},
+                    )
+                    done["handedOver"] += 1
+                    done["bytes"] += int(file["size_bytes"] or 0)
+                else:
+                    logger.warning("p2_drive_handover_failed", tenant_id=tenant_id, file=file_id, error=error)
+                    connection.execute(
+                        text("UPDATE auditcore.p2_drive_files SET handover_error=:e, updated_at_utc=now() "
+                             "WHERE tenant_id=:t AND file_row_id=:r"),
+                        {"t": tenant_id, "r": file["file_row_id"], "e": error[:500]},
+                    )
+                    done["failed"] += 1
+        pc_client.close()
+    return done
+
+
+def my_link(connection: Connection, tenant_id: str, actor_id: str) -> dict[str, Any]:
+    """The PC's own Google account as Verigence holds it: linked or not, with what has been
+    moved to the Project's account so far."""
+    row = connection.execute(
+        text("SELECT google_email, linked_google_email, linked_at_utc, link_status, link_error "
+             "FROM auditcore.p2_drive_people WHERE tenant_id=:t AND actor_id=:a"), {"t": tenant_id, "a": actor_id},
+    ).mappings().first()
+    linked_email = str((row or {}).get("linked_google_email") or "").strip().lower() or None
+    moved = connection.execute(
+        text("SELECT count(*) AS files, COALESCE(sum(size_bytes), 0) AS bytes FROM auditcore.p2_drive_files "
+             "WHERE tenant_id=:t AND handed_over_at_utc IS NOT NULL AND pc_actor_id=:a"), {"t": tenant_id, "a": actor_id},
+    ).mappings().one()
+    folders_email = str((row or {}).get("google_email") or "").strip().lower() or None
+    return {
+        "status": (row or {}).get("link_status") or "NOT_LINKED",
+        "googleEmail": linked_email,
+        "linkedAtUtc": row["linked_at_utc"].isoformat() if row and row["linked_at_utc"] else None,
+        "problem": (row or {}).get("link_error") if (row or {}).get("link_status") == "LOST" else None,
+        # the folders are shared with another account than the one approved
+        "otherAccount": folders_email if linked_email and folders_email and folders_email != linked_email else None,
+        "handedOver": {"files": int(moved["files"]), "bytes": int(moved["bytes"])},
+    }
+
+
 # --------------------------------------------------------------------------- API
 
 class DriveRunCommand(BaseModel):
@@ -2276,6 +2429,44 @@ def connect_drive(
     return {"authUrl": google_drive.consent_url(settings, state)}
 
 
+def _link_pc(engine: Engine, settings: DriveSettings, tenant_id: str, actor_id: str, code: str) -> str:
+    """A PC's own approval (2026-11-26): their refresh token sealed and kept, so Verigence can
+    move to the Project's account the files they put in Drive. Returns the outcome word."""
+    try:
+        tokens = google_drive.exchange_code(settings, code)
+        refresh_token = str(tokens.get("refresh_token") or "")
+        if not refresh_token:
+            return "pc-no-offline-access"
+        own = open_client(settings, refresh_token)
+        email = str(own.account_email() or "").strip().lower()
+        own.close()
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            link = _connection_row(connection, tenant_id)
+            if link is None or not actor_id:
+                return "pc-failed"
+            if email and email == _account(link):
+                return "pc-project-account"
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO auditcore.p2_drive_people (tenant_id, actor_id, google_email, refresh_token_sealed,
+                        linked_google_email, linked_at_utc, link_status, link_error)
+                    VALUES (:t, :a, :e, :sealed, :e, now(), 'LINKED', NULL)
+                    ON CONFLICT (tenant_id, actor_id) DO UPDATE SET
+                        refresh_token_sealed=EXCLUDED.refresh_token_sealed, linked_google_email=EXCLUDED.linked_google_email,
+                        linked_at_utc=now(), link_status='LINKED', link_error=NULL, updated_at_utc=now()
+                    """
+                ),
+                {"t": tenant_id, "a": actor_id, "e": email, "sealed": google_drive.seal(settings, refresh_token)},
+            )
+    except Exception:
+        logger.warning("p2_drive_pc_link_failed", tenant_id=tenant_id, actor=actor_id, exc_info=True)
+        return "pc-failed"
+    logger.info("p2_drive_pc_linked", tenant_id=tenant_id, actor=actor_id, account=email)
+    return "pc-connected"
+
+
 @router.get("/integrations/google-drive/callback", include_in_schema=False)
 def drive_callback(
     engine: Annotated[Engine, Depends(get_engine)],
@@ -2293,15 +2484,18 @@ def drive_callback(
     def back(outcome: str) -> RedirectResponse:
         # The page the browser lands on shows the Project the person has open in Verigence,
         # which need not be the one that asked: the answer says which Project it is about.
-        about = {"drive": outcome, **({"project": asked["tenant_id"]} if asked and asked["tenant_id"] else {})}
+        about = {"drive": outcome, **({"project": asked["tenant_id"]} if asked and asked["tenant_id"] else {}),
+                 **({"view": "storage"} if outcome.startswith("pc-") else {})}
         separator = "&" if "?" in settings.return_url else "?"
         return RedirectResponse(f"{settings.return_url}{separator}{urlencode(about)}", status_code=303)
 
     if asked is None or not asked["tenant_id"]:
         return back("expired")
     if error or not code:
-        return back("declined")
+        return back("declined" if asked.get("purpose") != "pc" else "pc-declined")
     tenant_id = asked["tenant_id"]
+    if asked.get("purpose") == "pc":
+        return back(_link_pc(engine, settings, tenant_id, asked["actor_id"], code))
     try:
         tokens = google_drive.exchange_code(settings, code)
         refresh_token = str(tokens.get("refresh_token") or "")
@@ -2514,7 +2708,8 @@ def drive_free_up(
     link = _connection_row(connection, tenant_id)
     people = _people(connection, tenant_id)
     mine = free_up(connection, tenant_id, link, google_email=people.get(principal.subject))
-    body: dict[str, Any] = {"connected": link is not None, "account": _account(link) or None, "mine": mine}
+    body: dict[str, Any] = {"connected": link is not None, "account": _account(link) or None, "mine": mine,
+                            "myLink": my_link(connection, tenant_id, principal.subject)}
     if who["lead"]:
         body["pcs"] = free_up_overview(connection, tenant_id, link, who["outlets"])
         if actor_id:
@@ -2544,3 +2739,55 @@ def drive_free_up_check(
         raise HTTPException(status_code=503, detail="The Project's Google Drive needs to be connected again.") from exc
     link = _connection_row(connection, tenant_id)
     return {"checked": checked, "mine": free_up(connection, tenant_id, link, google_email=email)}
+
+
+@router.post("/tenants/{tenant_id}/drive/my-google/connect")
+def connect_my_google(
+    tenant_id: str,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """Where to send the browser for the PC's own one-time approval (2026-11-26)."""
+    _caller(connection, tenant_id, principal, client, _READ)
+    if _connection_row(connection, tenant_id) is None:
+        raise HTTPException(status_code=409, detail="The Project's Google Drive is not connected.")
+    settings = _settings_or_503()
+    state = google_drive.sign_state(settings, tenant_id=tenant_id, actor_id=principal.subject, purpose="pc")
+    return {"authUrl": google_drive.consent_url(settings, state)}
+
+
+@router.post("/tenants/{tenant_id}/drive/my-google/free-up")
+def free_up_my_storage(
+    tenant_id: str,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    engine: Annotated[Engine, Depends(get_engine)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """"Free up my storage": move to the Project's account, now, the next files of the caller's
+    that Verigence has taken (a batch a call; ``left`` says whether to call again)."""
+    _caller(connection, tenant_id, principal, client, _READ)
+    if my_link(connection, tenant_id, principal.subject)["status"] != "LINKED":
+        raise HTTPException(status_code=409, detail="Connect your Google account first.")
+    try:
+        done = hand_over(engine, tenant_id, actor_id=principal.subject, limit=_HAND_OVER_ON_ASKING)
+    except DriveAuthorizationLost as exc:
+        raise HTTPException(status_code=503, detail="The Project's Google Drive needs to be connected again.") from exc
+    return {**done, "myLink": my_link(connection, tenant_id, principal.subject)}
+
+
+@router.delete("/tenants/{tenant_id}/drive/my-google")
+def disconnect_my_google(
+    tenant_id: str,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """The PC's own approval forgotten: Verigence no longer acts on their Google account."""
+    _caller(connection, tenant_id, principal, client, _READ)
+    connection.execute(
+        text("UPDATE auditcore.p2_drive_people SET refresh_token_sealed=NULL, link_status=NULL, link_error=NULL, "
+             "updated_at_utc=now() WHERE tenant_id=:t AND actor_id=:a"), {"t": tenant_id, "a": principal.subject},
+    )
+    return my_link(connection, tenant_id, principal.subject)
