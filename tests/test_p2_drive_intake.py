@@ -906,3 +906,81 @@ def test_a_folder_whose_journey_was_joined_to_the_customers_booking_follows_it(s
     [folder] = _rows(s, "SELECT * FROM auditcore.p2_drive_folders WHERE tenant_id=:t AND drive_folder_id=:f", f=customer)
     assert folder["journey_id"] == s.journey.journey_id
     assert _files(s)["photo.jpg"]["journey_id"] == s.journey.journey_id
+
+
+# --------------------------------------------------------------------------- the PCs' own Google storage
+
+def test_a_pc_sees_which_of_their_drive_files_are_safe_to_delete_and_they_leave_the_list_once_deleted(s):
+    """Product owner 26 Nov ("lets go with 2"): files a PC puts in the outlet's folder with their own
+    Google account use their own storage; Verigence keeps its own copy of each file it takes, so it
+    tells the PC which are safe to delete (it cannot delete them: only the owner can)."""
+    outlet = _tree(s)
+    _exec(s, "INSERT INTO auditcore.p2_drive_people (tenant_id, actor_id, google_email) VALUES (:t, :a, 'Ravi@gmail.com')",
+          a=s.journey.actor_id)
+    customer = s.fake.folder("Bimal-778899", outlet)
+    docket = s.fake.put("docket.pdf", customer, b"%PDF bimal docket", owner="ravi@gmail.com")
+    s.fake.put("pan.pdf", customer, b"%PDF bimal pan", owner="ravi@gmail.com")
+    s.fake.put("form.pdf", customer, b"%PDF bimal form")                 # put there by the Project's account
+    run = _run(s)
+    assert run["documents"] == 3
+    files = _files(s)
+    assert files["docket.pdf"]["owner_email"] == "ravi@gmail.com" and files["form.pdf"]["owner_email"] is None
+
+    mine = s.client.get(f"{s.base}/drive/free-up").json()["mine"]
+    assert (mine["files"], mine["bytes"]) == (2, len(b"%PDF bimal docket") + len(b"%PDF bimal pan"))
+    assert [i["fileName"] for i in mine["items"]] == ["docket.pdf", "pan.pdf"]
+    assert {i["customerFolder"] for i in mine["items"]} == {"Bimal-778899"}
+    assert mine["items"][0]["url"] == f"https://drive.google.com/file/d/{docket}/view"
+
+    # a file still waiting is not safe yet
+    s.fake.put("receipt.pdf", customer, b"%PDF bimal receipt", owner="ravi@gmail.com")
+    _sync(s)
+    mine = s.client.get(f"{s.base}/drive/free-up").json()["mine"]
+    assert (mine["files"], mine["notYet"]["files"]) == (2, 1)
+
+    # the PC deletes the docket in Drive; "Check again" takes it off the list
+    s.fake.bin(docket)
+    checked = s.client.post(f"{s.base}/drive/free-up/check").json()
+    assert checked["checked"] >= 1
+    assert [i["fileName"] for i in checked["mine"]["items"]] == ["pan.pdf"]
+    assert _files(s)["docket.pdf"]["gone_from_drive_at_utc"] is not None
+    # deleting it from Drive changes nothing in Verigence: the copy and the booking stay
+    assert s.bucket.objects[[f for f in _bulk_files(s) if f["original_filename"] == "docket.pdf"][0]["object_key"]]
+
+
+def test_the_owner_of_files_seen_before_is_learnt_in_a_run_and_a_lead_sees_each_pc(s):
+    outlet = _tree(s)
+    _exec(s, "INSERT INTO auditcore.p2_drive_people (tenant_id, actor_id, google_email) VALUES (:t, :a, 'ravi@gmail.com')",
+          a=s.journey.actor_id)
+    customer = s.fake.folder("Bimal-778899", outlet)
+    s.fake.put("docket.pdf", customer, b"%PDF bimal docket", owner="ravi@gmail.com")
+    _run(s)
+    # as the files seen before the owner was kept
+    _exec(s, "UPDATE auditcore.p2_drive_files SET owner_email=NULL, drive_checked_at_utc=NULL WHERE tenant_id=:t")
+    assert s.client.get(f"{s.base}/drive/free-up").json()["mine"]["files"] == 0
+    client, _ = drive.connected_client(s.engine, s.t)
+    assert drive.check_files(s.engine, s.t, client) == 1
+    assert _files(s)["docket.pdf"]["owner_email"] == "ravi@gmail.com"
+    assert drive.check_files(s.engine, s.t, client) == 0            # asked again only after an hour
+
+    _as(s, "team-lead", "TL")
+    _exec(s, "INSERT INTO auditcore.business_assignments (tenant_id, security_actor_id, business_role_code, dealer_id, "
+             "outlet_id) VALUES (:t, 'team-lead', 'TL', :d, :o)", d=s.journey.dealer_id, o=s.journey.outlet_id)
+    body = s.client.get(f"{s.base}/drive/free-up", params={"actorId": s.journey.actor_id}).json()
+    assert [(p["actorId"], p["googleEmail"], p["files"]) for p in body["pcs"]] == [
+        (s.journey.actor_id, "ravi@gmail.com", 1)]
+    assert body["pc"]["files"] == 1 and body["mine"]["files"] == 0
+
+
+def test_the_clock_still_never_looks_at_drive_for_the_owners(s, monkeypatch):
+    outlet = _tree(s)
+    s.fake.put("docket.pdf", s.fake.folder("Akansh-456909", outlet), b"%PDF docket", owner="ravi@gmail.com")
+    _sync(s)
+    _exec(s, "UPDATE auditcore.p2_drive_files SET owner_email=NULL WHERE tenant_id=:t")
+
+    def no_drive(*args, **kwargs):
+        raise AssertionError("the clock opened Google Drive")
+
+    monkeypatch.setattr(drive, "connected_client", no_drive)
+    noon = datetime(2026, 11, 13, 6, 30, tzinfo=UTC)
+    assert "checked" not in drive.drive_round(s.engine, [s.t], worker_id="w1", now=noon)[s.t]

@@ -231,6 +231,11 @@ def _when(value: Any) -> datetime | None:
 
 # --------------------------------------------------------------------------- the connection
 
+def _owner(meta: dict[str, Any]) -> str | None:
+    """The Google account that owns a Drive file: the one whose storage it takes."""
+    return str(((meta.get("owners") or [{}])[0] or {}).get("emailAddress") or "").strip().lower() or None
+
+
 def open_client(settings: DriveSettings, refresh_token: str) -> DriveClient:
     """The Drive of the connected account (a seam: the tests put a double here)."""
     return DriveClient(settings, refresh_token)
@@ -764,9 +769,16 @@ def register_file(engine: Engine, tenant_id: str, places: _Places, meta: dict[st
         "outlet": parent["outlet_id"], "day": created.astimezone(IST).date() if created else ist_today(),
         "pc": parent["pc_actor_id"], "lane": lane, "status": "SET_ASIDE" if reason else "NEW", "detail": reason,
     }
-    owner = str(((meta.get("owners") or [{}])[0] or {}).get("emailAddress") or "").strip().lower()
+    owner = _owner(meta)
+    values["owner"] = owner
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
+        # Whose storage it takes, and that it is in Drive (again), whatever became of it.
+        connection.execute(
+            text("UPDATE auditcore.p2_drive_files SET owner_email=COALESCE(:owner, owner_email), "
+                 "gone_from_drive_at_utc=NULL, drive_checked_at_utc=now() "
+                 "WHERE tenant_id=:t AND drive_file_id=:id"), values,
+        )
         if owner:
             # Whose Google account put it in Drive: that PC's file (two PCs can share an outlet's folder).
             values["pc"] = connection.execute(
@@ -786,9 +798,9 @@ def register_file(engine: Engine, tenant_id: str, places: _Places, meta: dict[st
                 INSERT INTO auditcore.p2_drive_files (
                     tenant_id, drive_file_id, content_md5, file_name, mime_type, size_bytes, drive_created_at_utc,
                     drive_modified_at_utc, parent_folder_id, customer_folder_id, dealer_id, outlet_id, upload_date,
-                    pc_actor_id, lane, file_status, detail
+                    pc_actor_id, lane, file_status, detail, owner_email, drive_checked_at_utc
                 ) VALUES (:t, :id, :md5, :name, :mime, :size, :created, :modified, :parent, :customer, :dealer,
-                          :outlet, :day, :pc, :lane, :status, :detail)
+                          :outlet, :day, :pc, :lane, :status, :detail, :owner, now())
                 ON CONFLICT (tenant_id, drive_file_id, content_md5) DO UPDATE SET
                     file_name=EXCLUDED.file_name, parent_folder_id=EXCLUDED.parent_folder_id,
                     customer_folder_id=EXCLUDED.customer_folder_id, dealer_id=EXCLUDED.dealer_id,
@@ -807,9 +819,17 @@ def register_file(engine: Engine, tenant_id: str, places: _Places, meta: dict[st
 
 def _removed(engine: Engine, tenant_id: str, file_id: str) -> None:
     """A file or folder taken out of Drive: what was still waiting is no longer to be taken
-    (what was taken stays as it is -- the record and the copy in storage do not depend on Drive)."""
+    (what was taken stays as it is -- the record and the copy in storage do not depend on Drive).
+    The file, or every file of the folder, is noted as gone from Drive: it no longer takes
+    anyone's Google storage (2026-11-26)."""
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
+        connection.execute(
+            text("UPDATE auditcore.p2_drive_files SET gone_from_drive_at_utc=now(), updated_at_utc=now() "
+                 "WHERE tenant_id=:t AND gone_from_drive_at_utc IS NULL "
+                 "AND (drive_file_id=:f OR parent_folder_id=:f OR customer_folder_id=:f)"),
+            {"t": tenant_id, "f": file_id},
+        )
         connection.execute(
             text("UPDATE auditcore.p2_drive_files SET file_status='SET_ASIDE', updated_at_utc=now(), "
                  "detail='Removed from Drive before it was taken' "
@@ -1403,6 +1423,13 @@ def run_drive_intake(engine: Engine, tag: str, tenant_ids: list[str] | None = No
         # PCs' mapping here, and what came into Drive is recorded here.
         ensure_shares(engine, tenant_id, client)
         found = sync(engine, tenant_id, client, link)
+        try:
+            # whose storage each file takes, and the PCs' files still in Drive (details only)
+            found["checked"] = check_files(engine, tenant_id, client, limit=_CHECK_IN_A_RUN)
+        except DriveAuthorizationLost:
+            raise
+        except Exception:
+            logger.warning("p2_drive_files_check_failed", tenant_id=tenant_id, exc_info=True)
     except Exception as exc:
         _set_run(engine, tenant_id, run_id, run_status="FAILED", finished_at_utc=datetime.now(UTC),
                  detail=f"{type(exc).__name__}: {exc}"[:1000])
@@ -1851,6 +1878,182 @@ def drive_round(engine: Engine, tenant_ids: list[str], *, worker_id: str | None 
     return out
 
 
+# --------------------------------------------------------------------------- the PCs' own Google storage
+
+# In a plain Google account a file takes the storage of its owner -- whoever put it in Drive
+# -- not the owner of the folder (Google: files you add to a folder someone shared with you
+# use your storage). Since the PCs upload with their own Google account ("option B", 12 Nov),
+# what they put in their outlet's folder fills their own 15 GB (26 Nov: one PC's phone showed
+# 4.26 GB of Drive; his Drive uploads were about 3.5 GB). Product owner 26 Nov, "lets go with
+# 2": Verigence keeps its own copy of every file it takes, so it tells each PC which of their
+# files in Drive are safe to delete. Verigence cannot delete them itself: only a file's owner
+# can, and it does not hold the PCs' accounts.
+
+_CHECK_IN_A_RUN = 3000      # a run (a PC's Submit, the day's run, a lead's "take files now")
+_CHECK_ON_ASKING = 1000     # a person's "Check again" for their own files
+_CHECK_AGAIN_AFTER = timedelta(hours=1)
+DRIVE_FILE_URL = "https://drive.google.com/file/d/{id}/view"
+
+# A file is safe to delete from Drive when Verigence holds its copy: taken (its copy is in
+# storage), or set aside as the same content as a file taken. A file still waiting, failed,
+# or held (a closed journey's, for the Team Lead) is not.
+_SAFE_CONDITION = """
+    f.gone_from_drive_at_utc IS NULL AND f.owner_email IS NOT NULL AND lower(f.owner_email) <> :account
+    AND ((f.file_status = 'TAKEN' AND f.object_key IS NOT NULL)
+         OR (f.file_status = 'SET_ASIDE' AND COALESCE(f.content_md5, '') <> '' AND EXISTS (
+                SELECT 1 FROM auditcore.p2_drive_files g
+                WHERE g.tenant_id = f.tenant_id AND g.content_md5 = f.content_md5
+                  AND g.file_status = 'TAKEN' AND g.object_key IS NOT NULL)))
+"""
+
+
+def _account(link: dict[str, Any] | None) -> str:
+    return str((link or {}).get("google_email") or "").strip().lower()
+
+
+def check_files(engine: Engine, tenant_id: str, client: DriveClient | None = None, *,
+                limit: int = _CHECK_IN_A_RUN, now: datetime | None = None,
+                google_email: str | None = None, actor_id: str | None = None) -> int:
+    """Ask Drive whose each file is and whether it is still there: a file whose owner is not
+    known yet (seen before the owner was kept), and the files a PC owns not asked about in
+    the last hour. Only the files' details are asked for, never their content. It runs in a
+    run, and when a person presses "Check again" on their own list (``google_email`` /
+    ``actor_id``: only their files) -- never on the worker's clock (product owner 13 Nov:
+    Drive is looked at on demand or at the set time). Returns how many were checked."""
+    now = now or datetime.now(UTC)
+    with engine.begin() as connection:
+        set_tenant_context(connection, tenant_id)
+        link = _connection_row(connection, tenant_id)
+        if link is None:
+            return 0
+        due = [dict(r) for r in connection.execute(
+            text(
+                """
+                SELECT file_row_id, drive_file_id FROM auditcore.p2_drive_files
+                WHERE tenant_id=:t AND gone_from_drive_at_utc IS NULL
+                  AND (owner_email IS NULL
+                       OR (lower(owner_email) <> :account
+                           AND (drive_checked_at_utc IS NULL OR drive_checked_at_utc < :again)))
+                  AND (CAST(:email AS text) IS NULL OR lower(owner_email) = :email
+                       OR (owner_email IS NULL AND pc_actor_id = :actor))
+                ORDER BY drive_checked_at_utc NULLS FIRST, seen_at_utc
+                LIMIT :n
+                """
+            ),
+            {"t": tenant_id, "account": _account(link), "n": limit,
+             "again": now - (timedelta(0) if google_email else _CHECK_AGAIN_AFTER),
+             "email": (google_email or "").strip().lower() or None, "actor": actor_id},
+        ).mappings().all()]
+    if not due:
+        return 0
+    if client is None:
+        linked = connected_client(engine, tenant_id)
+        if linked is None:
+            return 0
+        client = linked[0]
+    checked = 0
+    for row in due:
+        gone, owner = False, None
+        try:
+            meta = client.get(str(row["drive_file_id"]))
+            gone, owner = bool(meta.get("trashed")), _owner(meta)
+        except DriveNotFound:
+            gone = True
+        except DriveAuthorizationLost:
+            raise
+        except DriveError:
+            logger.warning("p2_drive_file_check_failed", tenant_id=tenant_id, file=str(row["drive_file_id"]),
+                           exc_info=True)
+        with engine.begin() as connection:
+            set_tenant_context(connection, tenant_id)
+            connection.execute(
+                text("UPDATE auditcore.p2_drive_files SET owner_email=COALESCE(:owner, owner_email), "
+                     "drive_checked_at_utc=now(), "
+                     "gone_from_drive_at_utc=CASE WHEN :gone THEN COALESCE(gone_from_drive_at_utc, now()) END "
+                     "WHERE tenant_id=:t AND drive_file_id=:f"),
+                {"owner": owner, "gone": gone, "t": tenant_id, "f": row["drive_file_id"]},
+            )
+        checked += 1
+    return checked
+
+
+def free_up(connection: Connection, tenant_id: str, link: dict[str, Any] | None, *,
+            google_email: str | None, outlets: set[str] | None = None) -> dict[str, Any]:
+    """One Google account's files in the Project's Drive: those safe to delete (Verigence
+    holds its copy), each with its Drive link, and how much space they take; and what is
+    not safe yet. ``outlets``: only files of these outlets (a lead looking at a PC)."""
+    email = str(google_email or "").strip().lower()
+    out: dict[str, Any] = {"googleEmail": email or None, "files": 0, "bytes": 0, "items": [],
+                           "notYet": {"files": 0, "bytes": 0}, "lastCheckedAtUtc": None}
+    if not email or link is None:
+        return out
+    params = {"t": tenant_id, "e": email, "account": _account(link)}
+    rows = [dict(r) for r in connection.execute(
+        text(
+            f"""
+            SELECT f.drive_file_id, f.file_name, f.lane, f.size_bytes, f.upload_date, f.taken_at_utc, f.outlet_id,
+                   f.drive_checked_at_utc, cf.folder_name AS customer_folder, ({_SAFE_CONDITION}) AS safe
+            FROM auditcore.p2_drive_files f
+            LEFT JOIN auditcore.p2_drive_folders cf ON cf.tenant_id=f.tenant_id AND cf.drive_folder_id=f.customer_folder_id
+            WHERE f.tenant_id=:t AND lower(f.owner_email)=:e AND f.gone_from_drive_at_utc IS NULL
+            ORDER BY cf.folder_name NULLS LAST, f.file_name
+            """
+        ),
+        params,
+    ).mappings().all()]
+    if outlets is not None:
+        rows = [r for r in rows if str(r["outlet_id"]) in outlets]
+    for r in rows:
+        size = int(r["size_bytes"] or 0)
+        if not r["safe"]:
+            out["notYet"]["files"] += 1
+            out["notYet"]["bytes"] += size
+            continue
+        out["files"] += 1
+        out["bytes"] += size
+        out["items"].append({
+            "fileName": r["file_name"], "kind": r["lane"], "customerFolder": r["customer_folder"], "bytes": size,
+            "uploadDate": r["upload_date"].isoformat() if r["upload_date"] else None,
+            "takenAtUtc": r["taken_at_utc"].isoformat() if r["taken_at_utc"] else None,
+            "url": DRIVE_FILE_URL.format(id=r["drive_file_id"]),
+        })
+    checked = [r["drive_checked_at_utc"] for r in rows if r["drive_checked_at_utc"]]
+    out["lastCheckedAtUtc"] = min(checked).isoformat() if checked else None
+    return out
+
+
+def free_up_overview(connection: Connection, tenant_id: str, link: dict[str, Any] | None,
+                     outlets: set[str]) -> list[dict[str, Any]]:
+    """For a lead: each PC of their outlets with files in the Project's Drive -- how many are
+    safe to delete and the space they take."""
+    if link is None:
+        return []
+    people = _people(connection, tenant_id)
+    by_email = {email.strip().lower(): actor for actor, email in people.items() if email}
+    rows = connection.execute(
+        text(
+            f"""
+            SELECT lower(f.owner_email) AS email, f.outlet_id, count(*) AS files, COALESCE(sum(f.size_bytes), 0) AS bytes
+            FROM auditcore.p2_drive_files f
+            WHERE f.tenant_id=:t AND {_SAFE_CONDITION}
+            GROUP BY 1, 2
+            """
+        ),
+        {"t": tenant_id, "account": _account(link)},
+    ).mappings().all()
+    names = {pc["actor_id"]: pc["name"] for o in outlets_with_pcs(connection, tenant_id) for pc in o["pcs"]}
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        if str(r["outlet_id"]) not in outlets:
+            continue
+        actor = by_email.get(r["email"])
+        node = out.setdefault(r["email"], {"actorId": actor, "name": names.get(actor) if actor else None,
+                                           "googleEmail": r["email"], "files": 0, "bytes": 0})
+        node["files"] += int(r["files"])
+        node["bytes"] += int(r["bytes"])
+    return sorted(out.values(), key=lambda p: -p["bytes"])
+
+
 # --------------------------------------------------------------------------- API
 
 class DriveRunCommand(BaseModel):
@@ -2294,3 +2497,50 @@ def list_drive_files(
             **_public_file(r),
         } for r in rows],
     }
+
+
+@router.get("/tenants/{tenant_id}/drive/free-up")
+def drive_free_up(
+    tenant_id: str,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    connection: Annotated[Connection, Depends(get_connection)],
+    actor_id: Annotated[str | None, Query(alias="actorId")] = None,
+) -> dict[str, Any]:
+    """The caller's own files in the Project's Drive that are safe to delete, to free their
+    Google storage (2026-11-26); for a lead, also each PC of their outlets, and one PC's list
+    (``actorId``)."""
+    who = _caller(connection, tenant_id, principal, client, _READ)
+    link = _connection_row(connection, tenant_id)
+    people = _people(connection, tenant_id)
+    mine = free_up(connection, tenant_id, link, google_email=people.get(principal.subject))
+    body: dict[str, Any] = {"connected": link is not None, "account": _account(link) or None, "mine": mine}
+    if who["lead"]:
+        body["pcs"] = free_up_overview(connection, tenant_id, link, who["outlets"])
+        if actor_id:
+            body["pc"] = {"actorId": actor_id, **free_up(connection, tenant_id, link,
+                                                         google_email=people.get(actor_id), outlets=who["outlets"])}
+    return body
+
+
+@router.post("/tenants/{tenant_id}/drive/free-up/check")
+def drive_free_up_check(
+    tenant_id: str,
+    principal: Annotated[HumanPrincipal, Depends(get_human_principal)],
+    client: Annotated[SecurityAuthorizationClient, Depends(get_security_authorization_client)],
+    engine: Annotated[Engine, Depends(get_engine)],
+    connection: Annotated[Connection, Depends(get_connection)],
+) -> dict[str, Any]:
+    """"Check again": ask Drive now about the caller's own files (whose they are, and which
+    the caller has deleted since), then their list as it stands."""
+    _caller(connection, tenant_id, principal, client, _READ)
+    email = _people(connection, tenant_id).get(principal.subject)
+    if not email:
+        raise HTTPException(status_code=409, detail="Ask for your Drive folders first: no Google account is on record.")
+    try:
+        checked = check_files(engine, tenant_id, limit=_CHECK_ON_ASKING, google_email=email,
+                              actor_id=principal.subject)
+    except DriveAuthorizationLost as exc:
+        raise HTTPException(status_code=503, detail="The Project's Google Drive needs to be connected again.") from exc
+    link = _connection_row(connection, tenant_id)
+    return {"checked": checked, "mine": free_up(connection, tenant_id, link, google_email=email)}
