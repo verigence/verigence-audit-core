@@ -50,6 +50,30 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
+      - name: The 3 quotations left, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, psycopg
+          with psycopg.connect(os.environ["DB"], autocommit=True, options="-c statement_timeout=180000 -c default_transaction_read_only=on") as c:
+              t = 'afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572'
+              c.execute("SELECT set_config('app.tenant_id', %s, false)", (t,))
+              docs = ['0b22201d-ddc6-43eb-aab5-9a5d9dc2b69b', '220d8505-d124-4649-a89b-b19c9a855fbf', '004d86f5-dcf9-4136-b150-4cf2b10b766c']
+              for r in c.execute("""SELECT f.di_document_id, f.journey_id, f.field_key, f.effective_value, f.updated_at_utc
+                  FROM auditcore.journey_document_extracted_fields f WHERE f.tenant_id=%s AND f.di_document_id = ANY(%s::uuid[]) AND f.field_key='document_title'""", (t, docs)):
+                  print("TITLEROW", r)
+              for r in c.execute("""SELECT e.di_document_id, e.journey_id, e.evidence_id, e.association_status, e.document_type_key
+                  FROM auditcore.evidence e WHERE e.tenant_id=%s AND e.di_document_id = ANY(%s::uuid[])""", (t, docs)):
+                  print("EVROW", r)
+              for r in c.execute("""SELECT q.di_document_id, q.journey_id, q.queue_status, q.retired_at_utc, q.type_overridden_by_actor_id
+                  FROM auditcore.p2_document_queue q WHERE q.tenant_id=%s AND q.di_document_id = ANY(%s::uuid[])""", (t, docs)):
+                  print("QROW", r)
+              for r in c.execute("""SELECT j.journey_reference, a.event_type, a.details::text, a.created_at_utc FROM auditcore.p2_activity_events a
+                  JOIN auditcore.journeys j ON j.tenant_id=a.tenant_id AND j.journey_id=a.journey_id
+                  WHERE a.tenant_id=%s AND j.journey_reference IN ('UTK-JP-261031-006','UTK-JP-261102-014','UTK-JP-261104-003')
+                    AND a.created_at_utc > now() - interval '3 hours' ORDER BY a.created_at_utc""", (t,)):
+                  print("ACT", str(r)[:300])
+          PY
       - name: After the quotation rule (PR 970), read-only
         shell: bash
         run: |
