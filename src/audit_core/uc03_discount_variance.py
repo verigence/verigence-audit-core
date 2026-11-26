@@ -122,7 +122,8 @@ def discount_variance_rows(view: dict[str, Any], in_doubt: dict[str, str] | None
             "givenFrom": item["column"], "givenDocument": dg.given_document(row, item["column"]),
             **({"kit": str(item["kit"])} if item["kit"] is not None else {}),
             **({"reason": item["reason"]} if item["status"] in (UNKNOWN, IF_NOT_INHOUSE, FIGURES_DISAGREE,
-                                                                 READING_IN_DOUBT) else {}),
+                                                                 READING_IN_DOUBT)
+               or (item["status"] == OVER and item["reason"]) else {}),
             **({"ifInhouse": str(item["ifInhouse"])} if item.get("ifInhouse") is not None else {}),
             **({"ledger": str(item["ledger"])} if item.get("ledger") is not None else {}),
             # What each document gives for this benefit and what the master

@@ -406,6 +406,39 @@ def ndc_without_premium(connection: Connection, *, tenant_id: str, journey_id: U
         and premium_on_dealer_statement(connection, tenant_id=tenant_id, journey_id=journey_id) is None
 
 
+def document_verdict(connection: Connection, *, tenant_id: str, journey_id: UUID,
+                     policy: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """What the documents alone say about who arranged the insurance, whatever
+    the PC confirmed: in-house (``document_decision``), the customer's own (the
+    NDC's insurance row says so, or the NDC is read and charges no premium with
+    no dealer code on the policy), or None while they do not decide. ``resolve``
+    reads it after the PC's confirmation; the Excess Discount check reads it to
+    know whether a dealer discount's grid tier still depends on anything
+    (product owner 2026-11-26, uc03_p2_journey360._settle_grid_tier)."""
+    policy = policy if policy is not None else _policy(connection, tenant_id=tenant_id, journey_id=journey_id)
+    decided = document_decision(connection, tenant_id=tenant_id, journey_id=journey_id, policy=policy)
+    if decided is not None:
+        return {"source": INHOUSE, "basis": decided["basis"]}
+    # The NDC's insurance row says the customer arranged it ("Insurance amount
+    # OWN"): Self, policy on file or not (product owner 2026-11-17: "own means
+    # self and not dealership").
+    own_row = ndc_says_own(connection, tenant_id=tenant_id, journey_id=journey_id)
+    if own_row is not None:
+        return {"source": "SELF",
+                "basis": f"The NDC's insurance row says \"{own_row}\": the customer's own insurance."}
+    # Neither the dealer's code on the policy nor an insurance amount on the NDC
+    # on file: the customer's own insurance (product owner 2026-11-16), policy
+    # on file or not (2026-11-17). Until the NDC is read, the PC is asked as before.
+    if ndc_without_premium(connection, tenant_id=tenant_id, journey_id=journey_id):
+        has_policy = bool(policy) and bool(policy["insurer_name"] or policy["policy_reference"])
+        return {"source": "SELF",
+                "basis": ("The policy does not carry the dealer's MISP / Agent code and the NDC charges no "
+                          "insurance premium: the customer's own insurance.") if has_policy else
+                         ("The NDC charges no insurance premium and no policy with the dealer's code is on file: "
+                          "the customer's own insurance.")}
+    return None
+
+
 def resolve(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     """The insurance source and who decided it: PC, DOCUMENT, UNCONFIRMED (a
     policy is on file and the PC is asked) or DEFAULT (no policy yet). Only
@@ -415,27 +448,10 @@ def resolve(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict
         return {"source": str(policy["insurance_source"]), "decidedBy": "PC",
                 "decidedAt": policy["insurance_source_set_at_utc"],
                 "actorId": policy["insurance_source_set_by_actor_id"], "basis": None}
-    decided = document_decision(connection, tenant_id=tenant_id, journey_id=journey_id, policy=policy)
-    if decided is not None:
-        return {"source": INHOUSE, "decidedBy": "DOCUMENT", "decidedAt": None, "actorId": None,
-                "basis": decided["basis"]}
-    # The NDC's insurance row says the customer arranged it ("Insurance amount
-    # OWN"): Self, policy on file or not (product owner 2026-11-17: "own means
-    # self and not dealership").
-    own_row = ndc_says_own(connection, tenant_id=tenant_id, journey_id=journey_id)
-    if own_row is not None:
-        return {"source": "SELF", "decidedBy": "DOCUMENT", "decidedAt": None, "actorId": None,
-                "basis": f"The NDC's insurance row says \"{own_row}\": the customer's own insurance."}
-    # Neither the dealer's code on the policy nor an insurance amount on the NDC
-    # on file: the customer's own insurance (product owner 2026-11-16), policy
-    # on file or not (2026-11-17). Until the NDC is read, the PC is asked as before.
-    if ndc_without_premium(connection, tenant_id=tenant_id, journey_id=journey_id):
-        has_policy = bool(policy) and bool(policy["insurer_name"] or policy["policy_reference"])
-        return {"source": "SELF", "decidedBy": "DOCUMENT", "decidedAt": None, "actorId": None,
-                "basis": ("The policy does not carry the dealer's MISP / Agent code and the NDC charges no "
-                          "insurance premium: the customer's own insurance.") if has_policy else
-                         ("The NDC charges no insurance premium and no policy with the dealer's code is on file: "
-                          "the customer's own insurance.")}
+    verdict = document_verdict(connection, tenant_id=tenant_id, journey_id=journey_id, policy=policy)
+    if verdict is not None:
+        return {"source": verdict["source"], "decidedBy": "DOCUMENT", "decidedAt": None, "actorId": None,
+                "basis": verdict["basis"]}
     # Meanwhile the booking docket's own word stands, when it plainly says the
     # customer arranged it (2026-10-28).
     said_self = bool(policy) and booking_says_self(policy.get("insurance_by"))

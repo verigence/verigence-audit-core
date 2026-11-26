@@ -298,11 +298,26 @@ def test_the_recompute_job_rebuilds_old_rows_only_on_commit(journey):
         return _sql(journey, "SELECT discount_variance FROM auditcore.p2_journey_runtime "
                              "WHERE tenant_id=:t AND journey_id=:j").scalar_one()
 
-    run_discount_variance_recompute(journey.engine, "xd-1", [journey.tenant_id])
-    assert cached() == stale
-    run_discount_variance_recompute(journey.engine, "xd-1-commit", [journey.tenant_id])
+    def rechecks():
+        return _sql(journey, "SELECT count(*) FROM auditcore.p2_work_queue WHERE tenant_id=:t AND journey_id=:j "
+                             "AND work_type='STAGE_RECOMPUTE'").scalar_one()
+
+    asked = rechecks()
+    dry = run_discount_variance_recompute(journey.engine, "xd-1", [journey.tenant_id])
+    assert cached() == stale and rechecks() == asked
+    # 2026-11-26: the task follows the list. The booking's excess rows change, so it is
+    # named for a recheck by the dry run and given one stage recompute on commit.
+    counted = dry["tenants"][journey.tenant_id]
+    assert dry["commit"] is False and (counted["changed"], counted["recheck"]) == (1, 1)
+    assert counted["rechecked"][0]["excessBefore"] == [] and counted["rechecked"][0]["excessAfter"] == [
+        ("ADDITIONAL_DISCOUNT", "5000.00")]
+    done = run_discount_variance_recompute(journey.engine, "xd-1-commit", [journey.tenant_id])
     # The corporate line has no reconciliation row: entitlement unknown (2026-11-06).
     assert {r["key"]: r["status"] for r in cached()} == {"ADDITIONAL_DISCOUNT": OVER, "CORPORATE_PRIVILEGE": UNKNOWN}
+    assert done["commit"] is True and done["tenants"][journey.tenant_id]["recheck"] == 1 and rechecks() >= max(asked, 1)
+    # Nothing left to change: a second commit asks for nothing.
+    again = run_discount_variance_recompute(journey.engine, "xd-1-commit", [journey.tenant_id])
+    assert (again["tenants"][journey.tenant_id]["changed"], again["tenants"][journey.tenant_id]["recheck"]) == (0, 0)
 
 
 # ---------------------------------------------------------------- 2026-11-06 re-evaluation
@@ -429,6 +444,71 @@ def test_a_dealer_discount_within_a_higher_grid_tier_is_over_only_if_not_inhouse
     # Only the dealer discount reads the grid.
     cash = {**_d("CASH_DISCOUNT", "5000", "7000"), "grid": grid}
     assert discount_variance_rows(_view([cash]))[0]["status"] == OVER
+
+
+def test_a_dealer_discount_above_the_base_tier_is_excess_once_the_documents_show_own_insurance():
+    """Product owner 2026-11-26 ("excess discount given Rs 2000, not in the excess
+    discount list"): UTK-SR-261030-001 gave "Other Discount" Rs 7,000 on a MAXX
+    City judged at the base tier (Rs 5,000; with insurance Rs 7,000). Its NDC
+    charges Rs 0 insurance and the policy is an outside agent's: nothing is left
+    to depend on, so the Rs 2,000 is excess, with why."""
+    from audit_core.uc03_discount_variance import IF_NOT_INHOUSE
+
+    tiers = {"BASE": "5000.00", "WITH_INSURANCE": "7000.00", "WITH_EW_INSURANCE": "7000.00"}
+    why = "The policy does not carry the dealer's MISP / Agent code and the NDC charges no insurance premium."
+    dealer = {**_d("ADDITIONAL_DISCOUNT", "5000", "7000", billed_from="document", eligibility="ELIGIBLE"),
+              "grid": {"tier": "BASE", "tiers": tiers, "insuranceNotInhouse": why}}
+    row = discount_variance_rows(_view([dealer]))[0]
+    assert (row["status"], row["entitled"], row["variance"]) == (OVER, "5000", "2000")
+    assert row["reason"] == f"the insurance was not in-house: {why}" and "ifInhouse" not in row
+    # Still in question (the documents do not show it): listed apart, as before.
+    open_ = {**dealer, "grid": {"tier": "BASE", "tiers": tiers}}
+    assert discount_variance_rows(_view([open_]))[0]["status"] == IF_NOT_INHOUSE
+    # Judged with in-house insurance already: the EW tier still depends on the EW.
+    with_insurance = {**dealer, "entitled": "5000", "grid": {
+        "tier": "WITH_INSURANCE", "tiers": {"BASE": "3000", "WITH_INSURANCE": "5000", "WITH_EW_INSURANCE": "7000"},
+        "insuranceNotInhouse": why}}
+    assert discount_variance_rows(_view([with_insurance]))[0]["status"] == IF_NOT_INHOUSE
+    # An excess with no such grid note carries no reason, as before.
+    plain = discount_variance_rows(_view([{k: v for k, v in dealer.items() if k != "grid"}]))[0]
+    assert plain["status"] == OVER and "reason" not in plain
+
+
+def test_the_deal_marks_a_base_tier_dealer_discount_whose_insurance_the_documents_show_is_own(monkeypatch):
+    """2026-11-26: the documents settle it, the PC's Self alone does not (that
+    was the misreading the "depends" list was made for on 2026-11-14)."""
+    from uuid import uuid4
+
+    import audit_core.uc03_insurance_source as source
+    from audit_core.uc03_p2_journey360 import _settle_grid_tier
+
+    def rows(tier="BASE", billed="7000.00"):
+        return [{"key": "ADDITIONAL_DISCOUNT", "billed": billed, "grid": {"tier": tier, "tiers": {"BASE": "5000.00"}}},
+                {"key": "CASH_DISCOUNT", "billed": "28000.00"}]
+
+    def settle(insurance, discount_rows):
+        _settle_grid_tier(None, tenant_id="t", journey_id=uuid4(), discount_rows=discount_rows, insurance=insurance)
+        return discount_rows[0]["grid"].get("insuranceNotInhouse")
+
+    own = {"source": "SELF", "basis": "The NDC charges no insurance premium."}
+    asked: list[int] = []
+    monkeypatch.setattr(source, "document_verdict", lambda *a, **k: asked.append(1) or own)
+    # Decided by the documents: the Deal's own decision is the verdict, nothing is read again.
+    assert settle({"source": "SELF", "decidedBy": "DOCUMENT", "basis": "The NDC's insurance row says OWN."},
+                  rows()) == "The NDC's insurance row says OWN."
+    assert settle({"source": "INHOUSE", "decidedBy": "DOCUMENT", "basis": "The NDC charges the premium."}, rows()) is None
+    assert asked == []
+    # The PC confirmed Self: only what the documents show settles it.
+    assert settle({"source": "SELF", "decidedBy": "PC", "basis": None}, rows()) == own["basis"]
+    monkeypatch.setattr(source, "document_verdict", lambda *a, **k: {"source": "INHOUSE", "basis": "MISP code."})
+    assert settle({"source": "SELF", "decidedBy": "PC", "basis": None}, rows()) is None
+    monkeypatch.setattr(source, "document_verdict", lambda *a, **k: None)
+    assert settle({"source": "SELF", "decidedBy": "PC", "basis": None}, rows()) is None
+    # Not asked of the PC yet, another tier, or no figure given: left as it is.
+    monkeypatch.setattr(source, "document_verdict", lambda *a, **k: own)
+    assert settle({"source": "SELF", "decidedBy": "UNCONFIRMED", "basis": "asked"}, rows()) is None
+    assert settle({"source": "SELF", "decidedBy": "PC", "basis": None}, rows(tier="WITH_INSURANCE")) is None
+    assert settle({"source": "SELF", "decidedBy": "PC", "basis": None}, rows(billed=None)) is None
 
 
 def test_the_ndc_decides_and_the_tally_figure_is_shown_beside_it():
