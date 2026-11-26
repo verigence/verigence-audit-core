@@ -1,54 +1,74 @@
-"""Read-only: why two bookings' grid tier and insurance decision disagree. Nothing is written."""
+"""Read-only: bookings whose stored dealer-grid tier differs from the tier the insurance
+decision gives now (this branch's code). Nothing is written. References and figures only."""
 from __future__ import annotations
 
 import json
 import os
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy import create_engine, text
 
-from audit_core import uc03_insurance_source as ins
 from audit_core.db import set_tenant_context
-from audit_core.uc03_account_statement import statement_reading
 from audit_core.uc03_deal_reconciliation import _grid_tier
-from audit_core.uc03_deal_source_history import active_source_rows
 
 T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
-engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=120000"})
-
-
-def j(value):
-    return json.dumps(value, default=str, sort_keys=True)
-
-
+engine = create_engine(os.environ["DATABASE_URL"], pool_size=8, max_overflow=2,
+                       connect_args={"options": "-c statement_timeout=120000"})
 with engine.connect() as c:
     c.execute(text("SET TRANSACTION READ ONLY"))
     set_tenant_context(c, T)
-    for ref in ("ADI-BM-261114-009", "UTK-PP-261023-009"):
-        jid = UUID(str(c.execute(text("SELECT journey_id FROM auditcore.journeys WHERE tenant_id = :t AND journey_reference = :r"),
-                                 {"t": T, "r": ref}).scalar_one()))
-        params = {"t": T, "j": jid}
-        print("\n####", ref)
-        policy = ins._policy(c, tenant_id=T, journey_id=jid)
-        print("policy:", j({k: v for k, v in (policy or {}).items() if k != "policy_reference"}))
-        print("resolve:", j(ins.resolve(c, tenant_id=T, journey_id=jid)))
-        print("document_verdict:", j(ins.document_verdict(c, tenant_id=T, journey_id=jid)))
-        print("ndc_says_own:", ins.ndc_says_own(c, tenant_id=T, journey_id=jid),
-              "| ndc_without_premium:", ins.ndc_without_premium(c, tenant_id=T, journey_id=jid),
-              "| premium_on_statement:", ins.premium_on_dealer_statement(c, tenant_id=T, journey_id=jid),
-              "| premium_on_invoice:", ins.premium_on_dealer_invoice(c, tenant_id=T, journey_id=jid))
-        print("statement_reading:", j({k: v for k, v in statement_reading(c, tenant_id=T, journey_id=jid).items()
-                                       if k in ("read", "onFile", "status")}))
-        print("grid tier now:", _grid_tier(c, tenant_id=T, journey_id=jid))
-        print("commercial lines:", j([dict(x) for x in c.execute(text("""
-            SELECT component_key, actual_amount, actual_source_kind FROM auditcore.commercial_lines
-            WHERE tenant_id = :t AND journey_id = :j
-              AND component_key IN ('insurance_amount', 'additional_warranty_amount')"""), params).mappings()]))
-        for s in active_source_rows(c, tenant_id=T, journey_id=jid):
-            if str(s["component_key"]) in ("insurance_amount", "additional_warranty_amount"):
-                print("  source value:", j({k: s[k] for k in ("component_key", "source_document_type", "amount")}))
-        print("discount application:", j([dict(x) for x in c.execute(text("""
-            SELECT standard_eligible_amount, actual_discount_amount, eligibility_result,
-                   COALESCE(details->'reconciliation'->'grid', details->'grid') AS grid, updated_at_utc
-            FROM auditcore.discount_applications
-            WHERE tenant_id = :t AND journey_id = :j AND discount_key = 'ADDITIONAL_DISCOUNT'"""), params).mappings()]))
+    rows = [dict(r) for r in c.execute(text("""
+        SELECT j.journey_id, j.journey_reference, da.actual_discount_amount AS given,
+               g.grid->>'tier' AS tier, g.grid->'tiers' AS tiers, j.review_completed_at_utc IS NULL AS under_review,
+               EXISTS (SELECT 1 FROM auditcore.journey_stage_states bs
+                       WHERE bs.tenant_id = j.tenant_id AND bs.journey_id = j.journey_id AND bs.stage_code = 'BOOKING'
+                         AND (bs.business_status IN ('BOOKING_CANCELLED', 'DUPLICATE_BOOKING')
+                              OR bs.closure_disposition = 'NO_DELIVERY')) AS cancelled
+        FROM auditcore.discount_applications da
+        JOIN auditcore.journeys j ON j.tenant_id = da.tenant_id AND j.journey_id = da.journey_id
+        CROSS JOIN LATERAL (SELECT COALESCE(da.details->'reconciliation'->'grid', da.details->'grid') AS grid) g
+        WHERE da.tenant_id = :t AND da.discount_key = 'ADDITIONAL_DISCOUNT' AND g.grid->>'tier' IS NOT NULL
+          AND da.actual_discount_amount > 0
+        ORDER BY j.journey_reference"""), {"t": T}).mappings()]
+rows = [r for r in rows if not r["cancelled"]]
+print("bookings with a dealer discount given and a tiered grid line:", len(rows),
+      "| stored tiers:", dict(Counter(r["tier"] for r in rows)))
+
+
+def tier_now(row):
+    try:
+        with engine.connect() as c:
+            c.execute(text("SET TRANSACTION READ ONLY"))
+            set_tenant_context(c, T)
+            return row, _grid_tier(c, tenant_id=T, journey_id=UUID(str(row["journey_id"]))), None
+    except Exception as exc:  # noqa: BLE001
+        return row, None, repr(exc)
+
+
+moves = Counter()
+newly_over = 0
+newly_over_rupees = Decimal(0)
+with ThreadPoolExecutor(max_workers=8) as pool:
+    for row, now, error in pool.map(tier_now, rows):
+        if error:
+            moves["FAILED"] += 1
+            print("FAILED", row["journey_reference"], error)
+            continue
+        if now == row["tier"]:
+            moves["same"] += 1
+            continue
+        moves[f"{row['tier']} -> {now}"] += 1
+        tiers = row["tiers"] if isinstance(row["tiers"], dict) else json.loads(row["tiers"] or "{}")
+        before, after = Decimal(str(tiers.get(row["tier"]) or 0)), Decimal(str(tiers.get(now) or 0))
+        given = Decimal(str(row["given"]))
+        was_over, is_over = given - before > 100, given - after > 100
+        if is_over and not was_over:
+            newly_over += 1
+            newly_over_rupees += given - after
+        print(row["journey_reference"], "|", row["tier"], "->", now, "| given", given, "| allowed", before, "->", after,
+              "| over before", was_over, "now", is_over, "| under review", row["under_review"])
+print("tier moves:", dict(moves))
+print("dealer discounts that become above their tier:", newly_over, "extra rupees", newly_over_rupees)
