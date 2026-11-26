@@ -35,10 +35,15 @@ from audit_core.uc03_deal_source_policy import (
 )
 from audit_core.uc03_duplicate_booking_detection import _BASIS_LABEL
 from audit_core.uc03_duplicate_receipt_detection import (
+    BASIS_LETTERS,
+    BASIS_NOT_READ,
+    BASIS_REFERENCE,
     ReceiptRecord,
+    normalize_bank_reference,
     normalize_receipt_date,
     normalize_receipt_number,
     repeated_receipts,
+    repeated_receipts_basis,
 )
 from audit_core.uc03_invoice_materialization import (
     CUSTOMER_FAMILIES,
@@ -389,42 +394,34 @@ def journey_etag(connection: Connection, *, tenant_id: str, journey_id: UUID) ->
 
 
 # ── money helpers ────────────────────────────────────────────────────────────
-# A bank reference (UTR) names one payment: two receipts with the same
-# reference, amount and date are the one payment read twice, whatever their
-# receipt numbers (live 2026-11-04, UTK-SA-261103-008: one Rs 75,000 transfer
-# read as receipt "CDAM/2627/02127" and as "CDAM/2026/0212", counted twice).
-_MIN_REFERENCE = re.compile(r"(?=(.*\d){6})[A-Z0-9]{8,}")
-
-
 def _payment_reference(row: Any) -> str | None:
-    value = "".join(ch for ch in str(row.get("payment_reference") or "").upper() if ch.isalnum())
-    return value if _MIN_REFERENCE.fullmatch(value) else None
+    return normalize_bank_reference(row.get("payment_reference"))
 
 
-def _duplicate_receipts(rows: list[Any]) -> dict[Any, Any]:
-    """payment_id -> the earlier payment it repeats: the same receipt number
-    and amount whatever the dates read (repeated_receipts, the rule every
-    money total uses), or the same bank reference, amount and date."""
-    records = [
+def _receipt_records(rows: list[Any]) -> list[ReceiptRecord]:
+    return [
         ReceiptRecord(
             document_id=r["payment_id"], stage_code="BOOKING", document_type_key="receipt",
             receipt_number=normalize_receipt_number(r["receipt_number"]), amount=Decimal(str(r["amount"])),
-            receipt_date=normalize_receipt_date(r["receipt_date"]),
+            receipt_date=normalize_receipt_date(r["receipt_date"]), reference=_payment_reference(r),
         )
         for r in rows
     ]
-    out: dict[Any, Any] = repeated_receipts(records)
-    first: dict[tuple[str, Decimal, Any], Any] = {}
-    for r in rows:
-        reference = _payment_reference(r)
-        if reference is None or r["payment_id"] in out:
-            continue
-        key = (reference, Decimal(str(r["amount"])), normalize_receipt_date(r["receipt_date"]))
-        if key in first:
-            out[r["payment_id"]] = first[key]
-        else:
-            first[key] = r["payment_id"]
-    return out
+
+
+def _duplicate_receipts(rows: list[Any]) -> dict[Any, Any]:
+    """payment_id -> the receipt it repeats: the one rule every money total
+    uses (uc03_duplicate_receipt_detection.repeated_receipts) -- the same
+    receipt number and amount whatever the dates read; the same bank
+    reference, amount and date; the same amount and date with the number's
+    letters read differently, or with no number read on the copy
+    (2026-11-26)."""
+    return repeated_receipts(_receipt_records(rows))
+
+
+def _duplicate_receipts_basis(rows: list[Any]) -> dict[Any, tuple[Any, str]]:
+    """``_duplicate_receipts`` with how each copy was recognised."""
+    return repeated_receipts_basis(_receipt_records(rows))
 
 
 def _loan_received(connection: Connection, *, tenant_id: str, journey_id: UUID) -> Decimal:
@@ -3685,7 +3682,8 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
     # The same receipt again: same number and amount as an earlier one, whatever the dates
     # read (2026-11-16); same amount and date when neither prints a number.
     eligible = [r for r in rows if r["status_source"] == "EVIDENCE" and r["association_status"] == "ACTIVE"]
-    duplicate_of = _duplicate_receipts(eligible)
+    recognised = _duplicate_receipts_basis(eligible)
+    duplicate_of = {later: first for later, (first, _) in recognised.items()}
     number_of = {r["payment_id"]: r["receipt_number"] for r in rows}
     date_of = {r["payment_id"]: r["receipt_date"] for r in rows}
 
@@ -3712,8 +3710,15 @@ def payments(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dic
         stage = derived_stage.get(payment_id) if counted else None
         if counted and stage is not None:
             by_stage[stage] = by_stage.get(stage, Decimal(0)) + Decimal(r["amount"])
-        if original is not None and _normalize_ref(number_of.get(original)) != _normalize_ref(r["receipt_number"]) \
-                and _payment_reference(r) is not None:
+        basis = recognised[r["payment_id"]][1] if original is not None else None
+        if basis == BASIS_LETTERS:
+            # The same receipt on file twice, its number's letters read differently (2026-11-26).
+            reason = (f"Duplicate: the same receipt as {number_of.get(original)} (same amount and date; "
+                      f"the letters of its number read as {r['receipt_number']} on this copy)")
+        elif basis == BASIS_NOT_READ:
+            reason = (f"Duplicate: the same amount and date as receipt {number_of.get(original)}; "
+                      "the number on this copy was not read")
+        elif basis == BASIS_REFERENCE:
             reason = "Duplicate: the same bank reference, amount and date as " + (
                 f"receipt {number_of.get(original)}" if number_of.get(original) else "an earlier receipt")
         elif original is not None:
