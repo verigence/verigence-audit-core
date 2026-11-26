@@ -68,6 +68,13 @@ jobs:
               for r in c.execute("""SELECT q.di_document_id, q.journey_id, q.queue_status, q.retired_at_utc, q.type_overridden_by_actor_id
                   FROM auditcore.p2_document_queue q WHERE q.tenant_id=%s AND q.di_document_id = ANY(%s::uuid[])""", (t, docs)):
                   print("QROW", r)
+              wcols = [x[0] for x in c.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='auditcore' AND table_name='p2_work_queue' ORDER BY ordinal_position")]
+              for r in c.execute("""SELECT w.* FROM auditcore.p2_work_queue w JOIN auditcore.journeys j ON j.tenant_id=w.tenant_id AND j.journey_id=w.journey_id
+                  WHERE w.tenant_id=%s AND j.journey_reference IN ('UTK-JP-261031-006','UTK-JP-261102-014','UTK-JP-261104-003')
+                    AND w.updated_at_utc > now() - interval '3 hours'""", (t,)):
+                  print("WQ", {k: str(v)[:160] for k, v in zip(wcols, r) if v is not None and k not in ('tenant_id',)})
+              for r in c.execute("""SELECT work_status, count(*) FROM auditcore.p2_work_queue WHERE tenant_id=%s AND updated_at_utc > now() - interval '1 hour' GROUP BY 1""", (t,)):
+                  print("WQSTATUS", r)
               for r in c.execute("""SELECT j.journey_reference, a.event_type, a.details::text, a.created_at_utc FROM auditcore.p2_activity_events a
                   JOIN auditcore.journeys j ON j.tenant_id=a.tenant_id AND j.journey_id=a.journey_id
                   WHERE a.tenant_id=%s AND j.journey_reference IN ('UTK-JP-261031-006','UTK-JP-261102-014','UTK-JP-261104-003')
