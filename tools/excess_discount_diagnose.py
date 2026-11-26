@@ -90,3 +90,57 @@ with engine.connect() as c:
             print("  assess:", j({"key": item["row"].get("key"), "label": item["row"].get("label"),
                                   **{k: v for k, v in item.items() if k != "row"}}))
         print("rows computed now:", j(discount_variance_rows(view, doubt)))
+
+# Second pass: how the dealer grid tier (in-house insurance or not) was decided.
+from audit_core import uc03_insurance_source as ins  # noqa: E402
+from audit_core.uc03_account_statement import line_rows, load_ledger_documents  # noqa: E402
+from audit_core.uc03_deal_reconciliation import _grid_tier  # noqa: E402
+from audit_core.uc03_deal_source_history import active_source_rows  # noqa: E402
+
+with engine.connect() as c:
+    c.execute(text("SET TRANSACTION READ ONLY"))
+    set_tenant_context(c, T)
+    for row in journeys:
+        jid = UUID(str(row["journey_id"]))
+        params = {"t": T, "j": jid}
+        print("\n" + "#" * 100)
+        print("INSURANCE / TIER", row["journey_reference"])
+        policy = ins._policy(c, tenant_id=T, journey_id=jid)
+        if policy:
+            policy = {k: v for k, v in policy.items() if k not in ("policy_reference",)}
+        print("insurance record:", j(policy))
+        print("insurance record source_kind etc:", j([dict(x) for x in c.execute(text("""
+            SELECT insurance_source, source_kind, insurance_source_set_at_utc, insurance_source_set_by_actor_id,
+                   insurance_by, premium_amount, updated_at_utc
+            FROM auditcore.insurance_records WHERE tenant_id = :t AND journey_id = :j"""), params).mappings()]))
+        print("resolve:", j(ins.resolve(c, tenant_id=T, journey_id=jid)))
+        print("document_decision:", j(ins.document_decision(c, tenant_id=T, journey_id=jid)))
+        print("ndc_says_own:", j(ins.ndc_says_own(c, tenant_id=T, journey_id=jid)))
+        print("premium_on_dealer_statement:", ins.premium_on_dealer_statement(c, tenant_id=T, journey_id=jid))
+        print("premium_on_dealer_invoice:", ins.premium_on_dealer_invoice(c, tenant_id=T, journey_id=jid))
+        print("dealer_dump_policy:", j(ins.dealer_dump_policy(c, tenant_id=T, journey_id=jid)))
+        print("grid tier now:", _grid_tier(c, tenant_id=T, journey_id=jid))
+        print("commercial lines:", j([dict(x) for x in c.execute(text("""
+            SELECT component_key, actual_amount, standard_amount FROM auditcore.commercial_lines
+            WHERE tenant_id = :t AND journey_id = :j
+              AND component_key IN ('insurance_amount', 'additional_warranty_amount')"""), params).mappings()]))
+        for s in active_source_rows(c, tenant_id=T, journey_id=jid):
+            if str(s["component_key"]) in ("insurance_amount", "additional_warranty_amount", "ADDITIONAL_DISCOUNT"):
+                print("  source value:", j(dict(s)))
+        print("discount application:", j([dict(x) for x in c.execute(text("""
+            SELECT discount_key, standard_eligible_amount, actual_discount_amount, eligibility_result,
+                   details, updated_at_utc
+            FROM auditcore.discount_applications
+            WHERE tenant_id = :t AND journey_id = :j AND discount_key = 'ADDITIONAL_DISCOUNT'"""), params).mappings()]))
+        for document_type in sorted(ins._STATEMENT_TYPES):
+            for document in load_ledger_documents(c, tenant_id=T, journey_id=jid, document_type=document_type):
+                print("  statement copy:", document_type, document.get("document_id") or document.get("documentId"))
+                for line in line_rows(document["fields"].get("line_items")):
+                    print("    row:", j({k: line.get(k) for k in ("particulars_raw", "debit_amount", "credit_amount", "amount")}))
+        for t in c.execute(text("""
+            SELECT task_type, source_code, task_status, assigned_role_code, title, left(description, 400) AS description,
+                   created_at_utc, updated_at_utc
+            FROM auditcore.p2_tasks WHERE tenant_id = :t AND journey_id = :j
+              AND (task_type ILIKE '%INSURANCE%' OR source_code ILIKE '%INSURANCE%' OR title ILIKE '%insurance%')
+            ORDER BY created_at_utc"""), params).mappings():
+            print("  insurance task:", j(dict(t)))
