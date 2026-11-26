@@ -35,8 +35,16 @@ its delivery date falls in it (India time):
                  list shows), else the recorded delivery date, else the day the
                  delivery was started; none while the journey is at booking
 
-``bookings_in_month`` / ``deliveries_in_month`` count the journeys whose
-booking / delivery date is in the month.
+A journey is a booking until it is a delivery, and from then it is a delivery
+only (product owner 2026-11-26: "if booking has been converted to delivery then
+that count should get reduced.. it should no longer to be counted in booking").
+A delivery is decided by the one delivery rule (uc03_delivery_start: the
+vehicle's own VIN / chassis on file, or delivered) -- never by the stage record,
+whose Delivery stage opens as soon as the booking's papers are complete. So a
+journey is in a month by its delivery date once it is a delivery and by its
+booking date while it is still a booking; ``bookings_in_month`` /
+``deliveries_in_month`` count those, and add up to the month's journeys. The
+open tabs split the same way (``booking_open`` / ``delivery_open``).
 
 ``dealer_id``, ``outlet_id`` and ``pc_actor_id`` narrow the journeys in scope
 (an Executive or Project Manager sees every Dealership of the Project and picks
@@ -55,8 +63,8 @@ same dates as the month figures: a booking by its booking date, a delivery by it
 delivery date (the delivery started or delivered). With a calendar month (business
 basis) Bookings only are the journeys whose booking date is in the month and
 Deliveries only those whose delivery date is -- the bookings_in_month /
-deliveries_in_month figures; without one, every journey is a booking and the
-deliveries are the journeys with a delivery date. The tabs' counts follow it.
+deliveries_in_month figures; without one, the bookings are the journeys with no
+delivery date and the deliveries those with one. The tabs' counts follow it.
 
 journeys:suggest (SUGGEST_SQL) is search as you type: the same scope, filters and
 matching as the list, at most a few journeys, newest first.
@@ -135,7 +143,8 @@ def _business_dates_lateral(condition: str) -> str:
                      CASE WHEN CAST(dl.actual_delivered_at AS date) >= CAST(:date_floor AS date)
                           THEN CAST(dl.actual_delivered_at AS date) END,
                      CASE WHEN {_DELIVERED_J}
-                          THEN CAST(dst.first_started_at_utc AT TIME ZONE :timezone AS date) END) AS delivery_date
+                          THEN CAST(COALESCE(dst.first_started_at_utc, j.created_at_utc) AT TIME ZONE :timezone AS date)
+                          END) AS delivery_date
             FROM (SELECT 1) one
             LEFT JOIN auditcore.bookings bk ON bk.tenant_id = j.tenant_id AND bk.journey_id = j.journey_id
             LEFT JOIN auditcore.deliveries dl ON dl.tenant_id = j.tenant_id AND dl.journey_id = j.journey_id
@@ -175,18 +184,24 @@ _SCOPE_WHERE_SQL = f"""j.tenant_id = :tenant_id
           AND (CAST(:dealer_id AS uuid) IS NULL OR j.dealer_id = CAST(:dealer_id AS uuid))
           AND (CAST(:outlet_id AS uuid) IS NULL OR j.outlet_id = CAST(:outlet_id AS uuid))
           AND (CAST(:pc_actor_id AS varchar) IS NULL OR j.created_by_actor_id = CAST(:pc_actor_id AS varchar))
-          AND (NOT {_RANGE} OR {_in_period("bm.booking_date")} OR {_in_period("bm.delivery_date")})
+          -- A Journey is a booking until it is a delivery, and from then a delivery only
+          -- (product owner 2026-11-26): in a period by its delivery date once it has one,
+          -- by its booking date while it has none.
+          AND (NOT {_RANGE} OR {_in_period("bm.delivery_date")}
+               OR (bm.delivery_date IS NULL AND {_in_period("bm.booking_date")}))
           AND (CAST(:month AS varchar) IS NULL OR {_RANGE}
                OR (COALESCE(CAST(:month_basis AS varchar), '') <> 'business'
                    AND to_char(j.created_at_utc AT TIME ZONE :timezone, 'YYYY-MM') = CAST(:month AS varchar))
                OR (CAST(:month_basis AS varchar) = 'business'
-                   AND (to_char(bm.booking_date, 'YYYY-MM') = CAST(:month AS varchar)
-                        OR to_char(bm.delivery_date, 'YYYY-MM') = CAST(:month AS varchar))))
+                   AND (to_char(bm.delivery_date, 'YYYY-MM') = CAST(:month AS varchar)
+                        OR (bm.delivery_date IS NULL
+                            AND to_char(bm.booking_date, 'YYYY-MM') = CAST(:month AS varchar)))))
           -- Bookings only / Deliveries only (2026-11-09): a booking by its booking date, a
           -- delivery by its delivery date (delivery started or delivered) -- in the calendar
           -- month when one is chosen, the bookings_in_month / deliveries_in_month figures.
+          -- Bookings only are the Journeys still bookings (2026-11-26).
           AND (CAST(:kind AS varchar) IS NULL
-               OR (CAST(:kind AS varchar) = 'booking'
+               OR (CAST(:kind AS varchar) = 'booking' AND bm.delivery_date IS NULL
                    AND (NOT ({_BUSINESS_MONTH} OR {_RANGE}) OR {_in_period("bm.booking_date")}))
                OR (CAST(:kind AS varchar) = 'delivery' AND bm.delivery_date IS NOT NULL
                    AND (NOT ({_BUSINESS_MONTH} OR {_RANGE}) OR {_in_period("bm.delivery_date")})))
@@ -274,8 +289,12 @@ SCOPED_SQL = f"""
                j.created_by_display_name AS pc_name,
                to_char(bm.booking_date, 'YYYY-MM') AS booking_month,
                to_char(bm.delivery_date, 'YYYY-MM') AS delivery_month,
-               {_in_period("bm.booking_date")} AS booking_in_period,
+               (bm.delivery_date IS NULL AND {_in_period("bm.booking_date")}) AS booking_in_period,
                {_in_period("bm.delivery_date")} AS delivery_in_period,
+               -- Booked and delivered in the period: among its deliveries, not its bookings.
+               -- Shown beside the bookings so they can be set against the DMS, whose booking
+               -- dump lists every booking made in the month, delivered or not (2026-11-26).
+               ({_in_period("bm.booking_date")} AND {_in_period("bm.delivery_date")}) AS converted_in_period,
                (fin.journey_id IS NOT NULL) AS is_closed,
                COALESCE(ot.pc_task, false) AS pc_task,
                COALESCE(ot.tl_task, false) AS tl_task,
@@ -284,11 +303,15 @@ SCOPED_SQL = f"""
                COALESCE(pg.processing, false) AS processing,
                COALESCE(pg.stuck, false) AS stuck,
                (rk.journey_id IS NOT NULL) AS high_risk,
-               -- In delivery as the row's own Delivery chip and the Booking &
-               -- Delivery headline count it (journeys:summary): a Phase 2
-               -- journey by its stage record, a Phase 1 one by a delivery row.
+               -- A delivery by the one delivery rule (uc03_delivery_start, product owner
+               -- 2026-11-21: its own vehicle's VIN / chassis on file, or delivered), as the
+               -- row's kind, the DMS report and the Booking & Delivery headline read it.
+               -- Until 2026-11-26 this went by the stage record, and the Delivery stage
+               -- opens when the booking's papers are complete: live that day 663 of the
+               -- 1,330 "Deliveries open" of November were bookings with no delivery paper.
+               -- A Phase 1 journey has no such papers and keeps the delivery-row rule.
                CASE WHEN pr.journey_id IS NOT NULL
-                    THEN (pr.current_stage = 'BOOKING_COMPLETE' OR pr.current_stage LIKE 'DELIVERY%')
+                    THEN ({_DELIVERED_J} OR bm.delivery_date IS NOT NULL)
                     ELSE EXISTS (SELECT 1 FROM auditcore.deliveries dl
                                  WHERE dl.tenant_id = j.tenant_id AND dl.journey_id = j.journey_id)
                          OR EXISTS (SELECT 1 FROM auditcore.journey_stage_states ds
@@ -360,7 +383,8 @@ COUNTS_SQL = "WITH " + SCOPED_SQL + """
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.overdue) AS overdue,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.stuck) AS stuck,
       COUNT(*) FILTER (WHERE s.booking_in_period) AS bookings_in_month,
-      COUNT(*) FILTER (WHERE s.delivery_in_period) AS deliveries_in_month
+      COUNT(*) FILTER (WHERE s.delivery_in_period) AS deliveries_in_month,
+      COUNT(*) FILTER (WHERE s.converted_in_period) AS converted_in_month
     FROM scoped s
 """
 
@@ -417,6 +441,7 @@ COUNTS_WITH_BREAKDOWN_SQL = "WITH " + SCOPED_SQL + """
       COUNT(*) FILTER (WHERE NOT s.is_closed AND s.stuck) AS stuck,
       COUNT(*) FILTER (WHERE s.booking_in_period) AS bookings_in_month,
       COUNT(*) FILTER (WHERE s.delivery_in_period) AS deliveries_in_month,
+      COUNT(*) FILTER (WHERE s.converted_in_period) AS converted_in_month,
       COUNT(*) FILTER (WHERE NOT s.is_closed AND (s.overdue OR s.high_risk)) AS attention
     FROM scoped s
     GROUP BY GROUPING SETS ((), (s.dealer_id), (s.outlet_id), (s.created_by_actor_id))
@@ -437,7 +462,7 @@ def split_counts_with_breakdown(rows: list[Any]) -> dict[str, Any]:
                 **{key: data[key] for key in (
                     "closed", "open", "booking_open", "delivery_open", "needs_action", "processing",
                     "with_tl", "needs_tl", "high_risk", "overdue", "stuck",
-                    "bookings_in_month", "deliveries_in_month")},
+                    "bookings_in_month", "deliveries_in_month", "converted_in_month")},
             })
             continue
         figures = {key: int(data[key] or 0) for key in BREAKDOWN_FIGURES}

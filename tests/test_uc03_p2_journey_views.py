@@ -86,9 +86,11 @@ def test_tabs_page_and_count_the_journeys_in_scope(uc03_create_booking_setup):  
 
 def test_calendar_month_by_booking_date_and_delivery_date(uc03_create_booking_setup):  # noqa: F811
     """The Team Lead dashboard's calendar month (product owner 2026-11-07): with
-    month_basis=business a journey is in the month of its booking date or of its delivery
-    date; a misread booking date (before the programme's floor) falls back to the day the
-    journey was started."""
+    month_basis=business a journey is in the month of its delivery date once it is a
+    delivery, and of its booking date while it is still a booking (2026-11-26: "if booking
+    has been converted to delivery then that count should get reduced.. it should no longer
+    to be counted in booking"); a misread booking date (before the programme's floor) falls
+    back to the day the journey was started."""
     setup = uc03_create_booking_setup
     client, base, ids = _seed(setup)
     booking, booking_complete, delivery, _closed, booking_complete_two = ids
@@ -120,7 +122,8 @@ def test_calendar_month_by_booking_date_and_delivery_date(uc03_create_booking_se
 
     september = {"month": "2026-09", "month_basis": "business"}
     assert ids_of(**september) == {booking, booking_complete, delivery}
-    assert ids_of(month="2026-08", month_basis="business") == {delivery}
+    # Booked in August and since delivered: a delivery of September, no longer a booking of August.
+    assert ids_of(month="2026-08", month_basis="business") == set()
     counts = client.get(f"{base}/journeys:counts", params={**september, "breakdown": "true"}).json()
     assert counts["counts"]["all"] == 3
     assert (counts["counts"]["bookings_in_month"], counts["counts"]["deliveries_in_month"]) == (2, 1)
@@ -134,7 +137,51 @@ def test_calendar_month_by_booking_date_and_delivery_date(uc03_create_booking_se
     ranged = client.get(f"{base}/journeys:counts",
                         params={"from": "2026-08-15", "to": "2026-09-30", "breakdown": "true"}).json()
     assert ranged["counts"]["all"] == 3
-    assert (ranged["counts"]["bookings_in_month"], ranged["counts"]["deliveries_in_month"]) == (3, 1)
+    # The bookings and the deliveries add up to the journeys: the delivery is counted once.
+    assert (ranged["counts"]["bookings_in_month"], ranged["counts"]["deliveries_in_month"]) == (2, 1)
+    assert ids_of(**{"from": "2026-08-15", "to": "2026-09-30", "kind": "booking"}) == {booking, booking_complete}
+
+
+def test_a_booking_with_its_papers_complete_is_a_booking_until_the_vehicle_is_on_file(uc03_create_booking_setup):  # noqa: F811
+    """Product owner 2026-11-26 (the Team Lead dashboard against the DMS report): the open
+    journeys split into bookings and deliveries by the one delivery rule (its own vehicle's
+    VIN / chassis on file, 2026-11-21), not by the stage record -- the Delivery stage opens when
+    the booking's papers are complete. Live that day 663 of November's 1,330 "Deliveries open"
+    were bookings with no delivery paper."""
+    import json
+
+    setup = uc03_create_booking_setup
+    client, base, ids = _seed(setup)
+    _booking, booking_complete, delivery, _closed, _two = ids
+
+    def counted():
+        answer = client.get(f"{base}/journeys:counts", params={"breakdown": "true"}).json()
+        return answer["counts"], answer["byOutlet"][0]
+
+    counts, outlet = counted()
+    # Stages BOOKING_COMPLETE (twice) and DELIVERY_DOCUMENT_UPLOAD, no vehicle paper: all bookings.
+    assert (counts["booking_open"], counts["delivery_open"], counts["closed"]) == (4, 0, 1)
+    assert (outlet["booking_open"], outlet["delivery_open"]) == (4, 0)
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        for journey_id, chassis in ((delivery, "MA1TEST0000000011"), (booking_complete, "MA1TEST0000000012")):
+            customer = connection.execute(
+                text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+                {"t": setup["tenant_id"], "j": journey_id}).scalar_one()
+            document = uuid4()
+            connection.execute(text("""INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id,
+                    di_document_id, document_type_key, evidence_purpose, process_area, association_status)
+                    VALUES (:t, :j, :c, :s, :d, 'tax_invoice_dms', 'JOURNEY_DOCUMENT', 'DELIVERY', 'ACTIVE')"""),
+                               {"t": setup["tenant_id"], "j": journey_id, "c": customer, "s": uuid4(), "d": document})
+            connection.execute(text("""INSERT INTO auditcore.journey_document_extracted_fields (tenant_id, journey_id,
+                    di_document_id, source_fact_version, field_key, stage_code, source_document_type_key,
+                    extracted_value, effective_value)
+                    VALUES (:t, :j, :d, 1, 'chassis_number', 'DELIVERY', 'tax_invoice_dms', CAST(:v AS jsonb),
+                            CAST(:v AS jsonb))"""),
+                               {"t": setup["tenant_id"], "j": journey_id, "d": document, "v": json.dumps(chassis)})
+    counts, outlet = counted()
+    assert (counts["booking_open"], counts["delivery_open"], counts["closed"]) == (2, 2, 1)
+    assert counts["booking_open"] + counts["delivery_open"] + counts["closed"] == counts["all"] == 5
 
 
 def test_the_list_carries_the_observation_severity_and_filters_by_it(uc03_create_booking_setup):  # noqa: F811

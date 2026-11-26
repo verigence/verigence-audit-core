@@ -32,6 +32,7 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.task_closure_roles import roles_closable_by
+from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
 from audit_core.uc03_p2_access import (
     P2AccessContext,
     authorize_p2,
@@ -1062,12 +1063,13 @@ def journeys_summary(
                      ds.business_completed_at_utc AS delivery_completed,
                      COALESCE(bs.business_status IN ('BOOKING_CANCELLED','DUPLICATE_BOOKING')
                               OR bs.closure_disposition='NO_DELIVERY', false) AS cancelled,
-                     -- In delivery is the row's own Delivery chip: a Phase 2 journey by its
-                     -- stage record (booking complete, or a delivery stage); delivery rows
-                     -- alone never make a booking still being completed a delivery. A
-                     -- Phase 1 journey has no stage record and keeps the delivery-row rule.
+                     -- A delivery by the one delivery rule (uc03_delivery_start: the vehicle's
+                     -- own VIN / chassis on file, or delivered), as the journey list and the DMS
+                     -- report read it (product owner 2026-11-26; until then the stage record,
+                     -- whose Delivery stage opens when the booking's papers are complete). A
+                     -- Phase 1 journey has no such papers and keeps the delivery-row rule.
                      CASE WHEN pr.journey_id IS NOT NULL
-                          THEN (pr.current_stage = 'BOOKING_COMPLETE' OR pr.current_stage LIKE 'DELIVERY%')
+                          THEN """ + DELIVERY_STARTED_SQL.format(t="j.tenant_id", j="j.journey_id") + """
                           ELSE (ds.journey_id IS NOT NULL OR dl.journey_id IS NOT NULL) END
                        AS in_delivery,
                      (pr.journey_id IS NOT NULL) AS phase2,

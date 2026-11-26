@@ -16,6 +16,22 @@ from audit_core.uc03_p2_object_keys import IST
 setup = gate_pass_tests.setup
 
 
+def _chassis(s, journey) -> None:
+    """The vehicle's chassis on a delivery paper of ``journey``: what makes it a delivery
+    (product owner 2026-11-21, uc03_delivery_start). A page filed under the delivery of a
+    Journey with none is no new delivery (2026-11-26)."""
+    document = uuid4()
+    tt._exec(s, "INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id, di_document_id, "
+                "document_type_key, evidence_purpose, process_area, association_status) "
+                "SELECT tenant_id, journey_id, customer_id, :subject, :d, 'tax_invoice_dms', 'JOURNEY_DOCUMENT', 'DELIVERY', "
+                "'ACTIVE' FROM auditcore.journeys WHERE tenant_id = :t AND journey_id = :j",
+             j=str(journey), subject=str(uuid4()), d=str(document))
+    tt._exec(s, "INSERT INTO auditcore.journey_document_extracted_fields (tenant_id, journey_id, di_document_id, "
+                "field_key, stage_code, source_document_type_key, extracted_value, effective_value) "
+                "VALUES (:t, :j, :d, 'chassis_number', 'DELIVERY', 'tax_invoice_dms', CAST(:v AS jsonb), CAST(:v AS jsonb))",
+             j=str(journey), d=str(document), v=f'"MA1{uuid4().hex[:14].upper()}"')
+
+
 def _build(s, actor: str, *, own: bool = False, admin: bool = False, day: date | None = None,
            section: str | None = None):
     with s.journey.engine.begin() as connection:
@@ -238,6 +254,7 @@ def test_pending_work_efficiency_delinquencies_and_bookings_deliveries(setup):
     _uploads(s, me, tt._journey(s, outlet, me), 1)
     old = tt._journey(s, outlet, me)
     batch, _rows = add_batch_pages(SimpleNamespace(**{**s.journey.__dict__, "journey_id": old}), [("gate_pass", "READY")])
+    _chassis(s, old)
     tt._exec(s, "UPDATE auditcore.p2_document_queue SET business_stage='DELIVERY', created_at_utc=:at "
                 "WHERE tenant_id=:t AND batch_id=:b", at=now - timedelta(days=5), b=batch)
     tt._exec(s, "UPDATE auditcore.p2_upload_batches SET created_at_utc=:at WHERE tenant_id=:t AND batch_id=:b",
@@ -397,6 +414,7 @@ def test_the_dashboard_of_each_role(setup):
     _uploads(s, me, tt._journey(s, outlet, me), 1)                           # and a booking
     old = tt._journey(s, outlet, me)
     batch, _rows = add_batch_pages(SimpleNamespace(**{**s.journey.__dict__, "journey_id": old}), [("gate_pass", "READY")])
+    _chassis(s, old)
     tt._exec(s, "UPDATE auditcore.p2_document_queue SET business_stage='DELIVERY', created_at_utc=:at "
                 "WHERE tenant_id=:t AND batch_id=:b", at=now - timedelta(days=5), b=batch)
     tt._exec(s, "UPDATE auditcore.p2_upload_batches SET created_at_utc=:at WHERE tenant_id=:t AND batch_id=:b",
@@ -554,6 +572,7 @@ def test_new_bookings_new_deliveries_and_journeys_updated(setup):
                  b=batch)
         tt._exec(s, "UPDATE auditcore.p2_upload_batches SET created_at_utc=:at WHERE tenant_id=:t AND batch_id=:b",
                  at=at, b=batch)
+        _chassis(s, journey)
 
     new = tt._journey(s, outlet, me)                         # booked today: a new booking
     _uploads(s, me, new, 2)
@@ -596,6 +615,51 @@ def test_new_bookings_new_deliveries_and_journeys_updated(setup):
     assert (flow["bookings"], flow["deliveries"], flow["updated"]) == (1, 1, 2)
     mine = next(p for p in report["uploads"]["people"] if p["actorId"] == me)
     assert mine["duplicates"]["direct"] == 1
+
+
+def test_a_page_filed_under_the_delivery_of_a_booking_is_no_new_delivery(setup):
+    """Product owner 2026-11-26 ("these numbers ... differ massively from DMS report and
+    individual tracker report"): a Journey is a delivery by the one delivery rule -- its own
+    vehicle's VIN / chassis on file (2026-11-21) -- and until then a booking. The tracker counted
+    a new delivery on the first day any page was filed under the delivery: live, November showed
+    1,412 new deliveries against 831 Journeys that were deliveries at all."""
+    from audit_core.uc03_p2_upload_kind import upload_days
+
+    s = setup
+    outlet = str(s.journey.outlet_id)
+    me = s.journey.actor_id
+    now = datetime.now(UTC)
+    today = datetime.now(IST).date()
+    earlier = now - timedelta(days=3)
+
+    def page_under_delivery(journey):
+        batch, _rows = add_batch_pages(SimpleNamespace(**{**s.journey.__dict__, "journey_id": journey}),
+                                       [("bank_approval_letter", "READY")])
+        tt._exec(s, "UPDATE auditcore.p2_document_queue SET business_stage='DELIVERY' WHERE tenant_id=:t AND batch_id=:b",
+                 b=batch)
+
+    def kinds():
+        with s.journey.engine.begin() as connection:
+            set_tenant_context(connection, s.journey.tenant_id)
+            start = datetime.combine(today, datetime.min.time(), IST)
+            return {d["journey_id"]: d["kind"] for d in upload_days(
+                connection, tenant_id=s.journey.tenant_id, start=start, end=start + timedelta(days=1),
+                tz="Asia/Kolkata", actor_id=me)}
+
+    fresh = tt._journey(s, outlet, me)                       # booked today, a loan letter filed under the delivery
+    page_under_delivery(fresh)
+    booked = tt._journey(s, outlet, me)                      # booked three days ago, the same today
+    tt._exec(s, "UPDATE auditcore.journeys SET created_at_utc=:at WHERE tenant_id=:t AND journey_id=:j",
+             at=earlier, j=booked)
+    _uploads(s, me, booked, 1, at=earlier)
+    page_under_delivery(booked)
+    found = kinds()
+    assert found[fresh] == "booking" and found[booked] == "updated"
+    # The vehicle's chassis comes on file: from then each is a delivery, new on that day.
+    _chassis(s, fresh)
+    _chassis(s, booked)
+    found = kinds()
+    assert found[fresh] == "delivery" and found[booked] == "delivery"
 
 
 def test_new_journeys_and_updates_by_channel_and_every_pcs_day(setup):
@@ -759,6 +823,7 @@ def test_a_drive_file_joined_to_another_pcs_booking_counts_for_its_pc_as_drive(s
                                    [("gate_pass", "READY")])
     tt._exec(s, "UPDATE auditcore.p2_document_queue SET business_stage='DELIVERY' WHERE tenant_id=:t AND batch_id=:b",
              b=batch)
+    _chassis(s, booking)
     tt._exec(s, "INSERT INTO auditcore.p2_activity_events (tenant_id, journey_id, event_type, subject_type, subject_id, "
                 "details) VALUES (:t, :j, 'DOCUMENT_COPIED_FROM_DUPLICATE', 'UPLOAD_BATCH', :b, CAST(:d AS jsonb))",
              j=booking, b=str(batch), d=f'{{"job": "same-file:{read_journey}"}}')

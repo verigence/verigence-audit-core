@@ -1,6 +1,8 @@
-"""The Booking & Delivery Hero counts what the rows below it show:
-deliveries open follow each row's stage chip, and open tasks are the open
-journeys' tasks counted as the rows count them, by role (real Postgres)."""
+"""The Booking & Delivery Hero: an open journey is a booking until it is a
+delivery by the one delivery rule (its own vehicle's VIN / chassis on file,
+product owner 2026-11-21) -- whatever its stage (2026-11-26) -- and open tasks
+are the open journeys' tasks counted as the rows count them, by role (real
+Postgres)."""
 from __future__ import annotations
 
 import json
@@ -81,15 +83,31 @@ def _seed(setup):
 
 def test_hero_deliveries_and_tasks_agree_with_the_rows(uc03_create_booking_setup):  # noqa: F811
     setup = uc03_create_booking_setup
-    client, base, _ = _seed(setup)
+    client, base, ids = _seed(setup)
+    delivery = ids[2]
+    # The stage alone makes no delivery (2026-11-26: the Delivery stage opens when the booking's
+    # papers are complete -- live, 663 of November's 1,330 "Deliveries open" had no delivery
+    # paper): with no vehicle paper on file all four open journeys are bookings.
+    assert client.get(f"{base}/journeys:summary").json()["open"] == {"bookings": 4, "deliveries": 0}
+    # The vehicle's chassis on a delivery paper: that journey is a delivery, the others bookings.
+    with setup["engine"].begin() as connection:
+        set_tenant_context(connection, setup["tenant_id"])
+        customer = connection.execute(
+            text("SELECT customer_id FROM auditcore.journeys WHERE tenant_id=:t AND journey_id=:j"),
+            {"t": setup["tenant_id"], "j": delivery}).scalar_one()
+        document = uuid4()
+        connection.execute(text("""INSERT INTO auditcore.evidence (tenant_id, journey_id, customer_id, di_subject_id,
+                di_document_id, document_type_key, evidence_purpose, process_area, association_status)
+                VALUES (:t, :j, :c, :s, :d, 'gate_pass', 'JOURNEY_DOCUMENT', 'DELIVERY', 'ACTIVE')"""),
+                           {"t": setup["tenant_id"], "j": delivery, "c": customer, "s": uuid4(), "d": document})
+        connection.execute(text("""INSERT INTO auditcore.journey_document_extracted_fields (tenant_id, journey_id,
+                di_document_id, source_fact_version, field_key, stage_code, source_document_type_key,
+                extracted_value, effective_value)
+                VALUES (:t, :j, :d, 1, 'chassis_number', 'DELIVERY', 'gate_pass', CAST(:v AS jsonb), CAST(:v AS jsonb))"""),
+                           {"t": setup["tenant_id"], "j": delivery, "d": document, "v": json.dumps("MA1TEST0000000009")})
     summary = client.get(f"{base}/journeys:summary").json()
     rows = client.get(f"{base}/journeys", params={"state": "open"}).json()["items"]
-    by_chip = {"booking": 0, "delivery": 0}
-    for row in rows:
-        by_chip["delivery" if row["current_stage"] in ("BOOKING_COMPLETE", "DELIVERY_DOCUMENT_UPLOAD",
-                                                       "DELIVERY_VERIFY_DOCUMENTS") else "booking"] += 1
-    assert by_chip == {"booking": 1, "delivery": 3}
-    assert summary["open"] == {"bookings": by_chip["booking"], "deliveries": by_chip["delivery"]}
+    assert summary["open"] == {"bookings": 3, "deliveries": 1} and len(rows) == 4
 
     # Open journeys only (the closed one's tasks are not counted), and the same
     # numbers the rows carry, by role.
