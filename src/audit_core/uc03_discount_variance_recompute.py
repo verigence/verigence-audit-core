@@ -24,9 +24,10 @@ discount list"). The list and the "Discount given beyond the entitlement" task
 must move together, and so must the dealer-grid tier stored with the deal. A
 Journey still under review whose excess rows change, or whose stored grid tier
 is no longer the tier its insurance decision gives
-(``uc03_deal_reconciliation._grid_tier``), is given one stage recompute on
-commit: its deal is reconciled again and EXCESS_DISCOUNT runs again. The dry
-run counts them (``recheck``, ``tierMoved``) and names each.
+(``uc03_deal_reconciliation._grid_tier``), has its checks run again on commit,
+forced (``request_recheck``): its deal is reconciled again and EXCESS_DISCOUNT
+is decided again. The dry run counts them (``recheck``, ``tierMoved``) and
+names each.
 """
 from __future__ import annotations
 
@@ -104,12 +105,20 @@ def tier_moved(engine: Engine, *, tenant_id: str, journey_id: UUID, stored_tier:
     return now if now != stored_tier else None
 
 
-def request_recheck(engine: Engine, *, tenant_id: str, journey_id: UUID) -> None:
-    """One stage recompute: the deal is reconciled again and its checks run again."""
+def request_recheck(engine: Engine, *, tenant_id: str, journey_id: UUID, tag: str) -> None:
+    """The booking's checks run again, forced (as RULES_RERUN does): the deal is
+    reconciled again and EXCESS_DISCOUNT is decided again.
+
+    Until 26 Nov 2026 this asked for a stage recompute. That runs the checks only
+    when the booking's facts changed, and a reading that changed is not a fact:
+    live that day the job rebuilt the list (UTK-SR-261030-001 on it with Rs 2,000)
+    and its 96 rechecks ran no check, so no "Discount given beyond the
+    entitlement" task was raised until RULES_RERUN ran for those bookings."""
+    from audit_core.uc03_audit_task_cleanup import _rerun_native
+
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
-        connection.execute(text("SELECT auditcore.p2_request_stage_recompute(:t, :j)"),
-                           {"t": tenant_id, "j": journey_id})
+        _rerun_native(connection, tenant_id, journey_id, tag)
 
 
 def recompute_journey(engine: Engine, *, tenant_id: str, journey_id: UUID, commit: bool) -> list[dict[str, Any]]:
@@ -185,7 +194,7 @@ def run_discount_variance_recompute(engine: Engine, tag: str, tenant_ids: list[s
                                       "excessBefore": _excess(before), "excessAfter": _excess(after)})
                 if commit:
                     try:
-                        request_recheck(engine, tenant_id=tenant_id, journey_id=journey_id)
+                        request_recheck(engine, tenant_id=tenant_id, journey_id=journey_id, tag=tag)
                     except Exception:
                         totals["failed"] += 1
                         logger.warning("discount_variance_recompute_recheck_failed", tag=tag, tenant_id=tenant_id,
