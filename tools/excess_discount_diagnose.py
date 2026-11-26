@@ -109,10 +109,10 @@ with engine.connect() as c:
         if policy:
             policy = {k: v for k, v in policy.items() if k not in ("policy_reference",)}
         print("insurance record:", j(policy))
-        print("insurance record source_kind etc:", j([dict(x) for x in c.execute(text("""
-            SELECT insurance_source, source_kind, insurance_source_set_at_utc, insurance_source_set_by_actor_id,
-                   insurance_by, premium_amount, updated_at_utc
-            FROM auditcore.insurance_records WHERE tenant_id = :t AND journey_id = :j"""), params).mappings()]))
+        print("who set the source:", j([dict(x) for x in c.execute(text("""
+            SELECT a.business_role_code, a.assignment_status FROM auditcore.business_assignments a
+            WHERE a.tenant_id = :t AND a.security_actor_id = :actor"""), {"t": T, "actor": (policy or {}).get("insurance_source_set_by_actor_id")}).mappings()]))
+        print("dealer codes:", sorted(ins.dealer_codes(c, tenant_id=T, dealer_id=(policy or {}).get("dealer_id"))))
         print("resolve:", j(ins.resolve(c, tenant_id=T, journey_id=jid)))
         print("document_decision:", j(ins.document_decision(c, tenant_id=T, journey_id=jid)))
         print("ndc_says_own:", j(ins.ndc_says_own(c, tenant_id=T, journey_id=jid)))
