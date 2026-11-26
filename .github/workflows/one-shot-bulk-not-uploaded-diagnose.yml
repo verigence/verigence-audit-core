@@ -137,6 +137,6 @@ jobs:
               print("STILL_NDC_CHARGES_ON_QUOTATION_ONLY", list(c.execute("""SELECT count(*) FROM auditcore.journey_classifications jc
                   WHERE jc.tenant_id=%s AND jc.insurance_basis LIKE 'The NDC charges%%' AND NOT EXISTS (
                     SELECT 1 FROM auditcore.commercial_line_source_values s JOIN auditcore.evidence e ON e.tenant_id=s.tenant_id
-                      AND e.di_document_id=s.source_document_id AND e.journey_id=s.journey_id AND e.association_status='ACTIVE'
+                      AND e.evidence_id=s.source_evidence_id AND e.association_status='ACTIVE'
                     WHERE s.tenant_id=jc.tenant_id AND s.journey_id=jc.journey_id AND s.component_key='insurance_amount' AND s.amount>0)""", (t,))))
           PY
