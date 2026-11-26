@@ -39,6 +39,7 @@ from audit_core.uc03_deal_source_policy import (
 from audit_core.uc03_delivery_start import delivery_has_started
 from audit_core.uc03_duplicate_receipt_detection import (
     ReceiptRecord,
+    normalize_bank_reference,
     normalize_receipt_date,
     normalize_receipt_number,
     repeated_receipts,
@@ -211,7 +212,8 @@ def receipt_split(connection: Connection, *, tenant_id: str, journey_id: UUID,
     payments = connection.execute(
         text(
             """
-            SELECT p.payment_id, p.amount, p.receipt_date, p.receipt_number, p.source_di_document_id
+            SELECT p.payment_id, p.amount, p.receipt_date, p.receipt_number, p.source_di_document_id,
+                   p.payment_reference
             FROM auditcore.payments p
             WHERE p.tenant_id=:tenant_id
               AND p.journey_id=:journey_id
@@ -237,10 +239,12 @@ def receipt_split(connection: Connection, *, tenant_id: str, journey_id: UUID,
             receipt_number=normalize_receipt_number(payment["receipt_number"]),
             amount=Decimal(str(payment["amount"])),
             receipt_date=normalize_receipt_date(payment["receipt_date"]),
+            reference=normalize_bank_reference(payment["payment_reference"]),
         )
         for payment in payments
     ]
-    # The same receipt number and amount is the same receipt, whatever the dates read (2026-11-16).
+    # The same receipt number and amount is the same receipt, whatever the dates read (2026-11-16);
+    # the one rule the money totals use, bank reference and misread numbers included (2026-11-26).
     duplicates: set[Any] = set(repeated_receipts(records))
     booking: list[dict[str, Any]] = []
     delivery: list[dict[str, Any]] = []
