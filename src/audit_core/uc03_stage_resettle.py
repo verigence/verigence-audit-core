@@ -11,10 +11,16 @@ This job asks for each open delivery to be settled again, the usual way
 the worker, and closes the files that now meet the one closure rule (docs/rules/RULES.md,
 "Delivery file closed").
 
-Worker job ``STAGE_RESETTLE``: tag ``<tenant_id>:<label>``, reports the journey references,
-or none for every open delivery of the Project (a Journey that is a delivery by the one
-delivery rule, uc03_delivery_start, and whose delivery is not complete). A DRY RUN (counts
-only) unless the label ends with "-commit".
+Settling a Journey also rebuilds its one "Upload the missing documents" task from the
+documents now mandatory, so a document that stopped being mandatory comes off the task, and the
+task closes when nothing else is on it (product owner 2026-11-27: "existing debit notes tasks to
+be closed and no new task for the same").
+
+Worker job ``STAGE_RESETTLE``: tag ``<tenant_id>:<label>``, reports the journey references
+(settled again whatever their state), or none for every open delivery of the Project (a Journey
+that is a delivery by the one delivery rule, uc03_delivery_start, and whose delivery is not
+complete) and every Journey with an open missing-document task. A DRY RUN (counts only) unless
+the label ends with "-commit".
 """
 from __future__ import annotations
 
@@ -30,12 +36,18 @@ logger = structlog.get_logger(__name__)
 
 JOB = "STAGE_RESETTLE"
 
-_OPEN_DELIVERIES = """
-    SELECT j.journey_id, j.journey_reference
+_OPEN_TASK = ("VERIFIED_COMPLETE", "CANCELLED", "FAILED", "DEAD_LETTER")
+_OPEN_DELIVERY = ("COALESCE(r.delivery_completion_state, '') <> 'COMPLETE' AND "
+                  + DELIVERY_STARTED_SQL.format(t=":t", j="j.journey_id"))
+_MISSING_TASK = """EXISTS (SELECT 1 FROM auditcore.p2_tasks k WHERE k.tenant_id=j.tenant_id
+                  AND k.journey_id=j.journey_id AND k.task_type='DOCUMENT_MISSING'
+                  AND k.task_status <> ALL(:closed))"""
+_JOURNEYS = f"""
+    SELECT j.journey_id, j.journey_reference, ({_OPEN_DELIVERY}) AS open_delivery,
+           {_MISSING_TASK} AS missing_task
     FROM auditcore.journeys j
     LEFT JOIN auditcore.p2_journey_runtime r ON r.tenant_id=j.tenant_id AND r.journey_id=j.journey_id
-    WHERE j.tenant_id=:t AND COALESCE(r.delivery_completion_state, '') <> 'COMPLETE'
-      AND """ + DELIVERY_STARTED_SQL.format(t=":t", j="j.journey_id")
+    WHERE j.tenant_id=:t AND """
 
 
 def _parse(tag: str) -> tuple[str, str, bool]:
@@ -51,9 +63,10 @@ def run_stage_resettle(engine: Engine, tag: str, reports: list[str]) -> dict[str
     with engine.begin() as connection:
         set_tenant_context(connection, tenant_id)
         rows = connection.execute(
-            text(_OPEN_DELIVERIES + (" AND j.journey_reference = ANY(:r)" if references else "")
+            text(_JOURNEYS + ("j.journey_reference = ANY(:r)" if references
+                              else f"(({_OPEN_DELIVERY}) OR {_MISSING_TASK})")
                  + " ORDER BY j.journey_reference"),
-            {"t": tenant_id, "r": references},
+            {"t": tenant_id, "r": references, "closed": list(_OPEN_TASK)},
         ).mappings().all()
         queued = 0
         if commit and rows:
@@ -63,9 +76,11 @@ def run_stage_resettle(engine: Engine, tag: str, reports: list[str]) -> dict[str
                 {"t": tenant_id, "ids": [str(r["journey_id"]) for r in rows]},
             ).scalar_one() or 0)
     found = {str(r["journey_reference"]) for r in rows}
-    result = {"commit": commit, "openDeliveries": len(rows), "queued": queued,
-              "notOpenDeliveries": [r for r in references if r not in found]}
-    logger.info("stage_resettle_finished", tag=tag, **{k: v for k, v in result.items() if k != "notOpenDeliveries"})
+    result = {"commit": commit, "journeys": len(rows),
+              "openDeliveries": sum(1 for r in rows if r["open_delivery"]),
+              "withMissingDocumentTask": sum(1 for r in rows if r["missing_task"]),
+              "queued": queued, "notFound": [r for r in references if r not in found]}
+    logger.info("stage_resettle_finished", tag=tag, **{k: v for k, v in result.items() if k != "notFound"})
     return result
 
 

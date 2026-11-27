@@ -17,7 +17,7 @@ PC
                         same file uploaded again (product owner 2026-11-12; from that day)
     journeysCompleted   their Journeys whose delivery file closed in the period, by the one
                         closure rule (product owner 2026-11-27: all mandatory documents
-                        uploaded, the PC's document and manual verification tasks closed),
+                        uploaded, the manual verification tasks closed),
                         read from the stage engine's record as everywhere else
     gateRegister        per gate register day of the period: uploaded or not, total
                         on the register, intimated to the PC, uploaded in the tool,
@@ -325,7 +325,7 @@ def _completed(connection: Connection, *, tenant_id: str, actor_id: str, tz: str
     """The PC's Journeys whose delivery file closed in the period (product owner 2026-11-03:
     "journeys completed"), by the one closure rule every screen reads (2026-11-27;
     uc03_p2_daily_report.delivery_files_closed, the stage engine's record: all mandatory
-    documents uploaded, the PC's document and manual verification tasks closed), on the IST day
+    documents uploaded, the manual verification tasks closed), on the IST day
     it closed. Only the Journeys the PC opened."""
     from zoneinfo import ZoneInfo
 

@@ -228,7 +228,10 @@ def test_delivery_readiness_lists_missing_required_documents(journey):
     # The five mandatory delivery documents (product owner 2026-11-15); the vehicle
     # invoice and the gate pass are each one either-of line.
     assert {"VEHICLE_INVOICE", "insurance_cover", "GATE_PASS", "rto_challan",
-            "DEALER_STATEMENT", "payment_receipt", "vehicle_proof"} <= missing
+            "DEALER_STATEMENT", "payment_receipt"} <= missing
+    # Car photos are optional (product owner 2026-11-27): on the checklist, never among what holds the file.
+    assert "vehicle_proof" not in missing
+    assert result["delivery"]["gates"]["VEHICLE_PROOF"]["optional"] is True
     assert not {"customer_invoice_dms", "tax_invoice_tally", "gate_pass", "delivery_receipt"} & missing
     # not mandatory (product owner 2026-11-11): used when uploaded, never asked for
     assert not {"ew_invoice", "rsa_invoice", "purchase_order"} & missing

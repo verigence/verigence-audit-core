@@ -231,7 +231,7 @@ def test_a_satellite_has_no_gate_register_day_before_3_november(setup):
 def test_the_tracker_is_day_by_day_and_counts_journeys_completed(setup):
     """Each day of the period has its own row per outlet, newest first; a delivery file the stage
     engine closed today (the one closure rule, 2026-11-27: all mandatory documents uploaded, the
-    PC's document and manual verification tasks closed) is a journey completed today."""
+    manual verification tasks closed) is a journey completed today."""
     from audit_core.uc03_p2_workflow import mark_delivery_completed
 
     s = setup

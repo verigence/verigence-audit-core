@@ -40,7 +40,7 @@ Every figure is read from what Audit Core stores -- nothing is estimated:
   page's last DOCUMENT_STATUS_CHANGED to FAILED) and a link that opens it;
 - delivery files closed (``delivery_files_closed``): one closure rule everywhere
   (product owner 2026-11-27) -- a delivery file is closed when its mandatory
-  documents are uploaded and the PC's document and manual verification tasks
+  documents are uploaded and the manual verification tasks
   are closed. The stage engine decides it and records it on the Journey's
   Delivery stage (``journey_stage_states.business_completed_at_utc``); this
   report reads that record, as the Team Lead screen's Closed does, and counts
@@ -213,9 +213,9 @@ def _journey_names(connection: Connection, *, tenant_id: str) -> dict[str, str]:
 _WORK_NOTE = ("Work done counts what people did on tasks that day (comments, reviews, uploads, closing). The "
               "system's own task updates are not work. Tasks closed = worked by that person and closed on the day. "
               "A Team Lead's name is not stored with the task, so the account id shows unless a name is known.")
-_CLOSED_NOTE = ("Delivery files closed: deliveries whose mandatory documents are uploaded and whose document and manual "
-                "verification tasks the PC has closed -- the same rule and record as Closed on the Team Lead screen -- "
-                "counted on the day the file closed, under the journey's PC.")
+_CLOSED_NOTE = ("Delivery files closed: deliveries (the vehicle's VIN or chassis on the Journey) whose mandatory documents are "
+                "uploaded and whose manual verification tasks are closed -- the same rule and record as Closed on the "
+                "Team Lead screen -- counted on the day the file closed, under the journey's PC.")
 
 
 def build_daily_work_report(
@@ -926,7 +926,7 @@ def delivery_files_closed(
 
     One closure rule everywhere (product owner 2026-11-27: "we shouldnt have different rules
     applied"): a delivery file is closed when its mandatory documents are uploaded and the PC's
-    document and manual verification tasks are closed. The stage engine decides it once
+    manual verification tasks are closed. The stage engine decides it once
     (uc03_p2_stage.recompute_journey_stage) and records it on the Journey's Delivery stage; this
     reads that record, the same one the Team Lead screen's Closed reads, and counts the file on the
     day it closed. Until then this report worked the 2 Nov rule out on its own (documents and

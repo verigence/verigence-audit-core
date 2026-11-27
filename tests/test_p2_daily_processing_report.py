@@ -210,7 +210,7 @@ def test_how_the_pages_became_documents_is_shown(journey):
 def _close_delivery(journey, *, days_ago: int = 0) -> None:
     """The stage engine closed the Journey's delivery ``days_ago`` days ago: the one closure
     record (uc03_p2_workflow.mark_delivery_completed), written when the mandatory documents are
-    in and the PC's document and manual verification tasks are closed."""
+    in and the manual verification tasks are closed."""
     from audit_core.uc03_p2_workflow import mark_delivery_completed
 
     with journey.engine.begin() as c:

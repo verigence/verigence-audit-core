@@ -101,6 +101,12 @@ stages:
     - DELIVERY_VERIFY_DOCUMENTS
     - DELIVERY_COMPLETE
     completion_approved: true
+    # The one closure rule (product owner 2026-11-27): a delivery file is closed when the
+    # vehicle's VIN or chassis number is on the Journey (uc03_delivery_start: what makes it a
+    # delivery at all), every mandatory document is uploaded, and the manual verification
+    # tasks are closed. Car photos are optional: on the checklist, never holding the file open.
+    # The PC's other document tasks (a page to re-upload, a page not read) do not hold it either;
+    # a mandatory document still missing does, through REQUIRED_DOCUMENTS.
     gates:
     - key: REQUIRED_DOCUMENTS
       kind: REQUIRED_DOCUMENTS
@@ -108,16 +114,16 @@ stages:
       missing: Upload the delivery documents still missing.
     - key: VEHICLE_PROOF
       kind: VEHICLE_PROOF
-      label: Vehicle photos (or VIN / chassis) recorded
+      optional: true
+      label: Vehicle photos recorded (optional)
       missing: Upload pictures of the car being delivered, or enter the VIN / chassis number from the task.
     - key: PC_TASKS_CLOSED
       kind: OPEN_TASKS
       role: PC
       tabs:
-      - DOCUMENTS
       - MANUAL_VERIFICATION
-      label: Document, verification and duplicate tasks closed
-      missing: Close the open document and verification tasks.
+      label: Manual verification tasks closed
+      missing: Close the open manual verification tasks.
 document_types:
   booking_docket:
     display_name: Booking Docket
