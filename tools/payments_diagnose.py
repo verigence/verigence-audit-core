@@ -34,7 +34,7 @@ with engine.connect() as c:
     set_tenant_context(c, T)
     cross = Counter()
     for row in c.execute(text("""
-            SELECT journey_id, insurance_source FROM auditcore.insurance_policies
+            SELECT journey_id, insurance_source FROM auditcore.insurance_records
             WHERE tenant_id=:t AND insurance_source IS NOT NULL"""), {"t": T}).mappings().all():
         try:
             with c.begin_nested():
