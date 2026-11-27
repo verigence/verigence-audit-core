@@ -931,9 +931,11 @@ def test_the_action_belongs_to_the_image_quality_and_large_upload_tasks_only(jou
     # 2026-11-10: and corrections a page read again does not carry;
     # 2026-11-15: and the BH registration question;
     # 2026-11-18: and a FASTag row on the NDC above Rs 600, and a Deal line far from its standard;
-    # 2026-11-22: and NDC rows not used in the Deal.)
+    # 2026-11-22: and NDC rows not used in the Deal;
+    # 2026-11-27: and the pictures of the car, closed without them with a proper reason.)
     assert sorted(name for name, template in tasks.items() if CLOSE in template.actions) == [
-        "CORRECTIONS_RECHECK", "COST_SHEET_NDC_DIFFERENCE", "DEAL_LINE_VERIFY", "DOCUMENT_KEY_FIGURES_NOT_READ", "NDC_COPIES_DIFFERENCE",
+        "CORRECTIONS_RECHECK", "COST_SHEET_NDC_DIFFERENCE", "DEAL_LINE_VERIFY", "DELIVERY_VEHICLE_PHOTOS_MISSING",
+        "DOCUMENT_KEY_FIGURES_NOT_READ", "NDC_COPIES_DIFFERENCE",
         "NDC_FASTAG_ROW_VERIFY", "PC_LARGE_UPLOAD_REVIEW", "PC_PAGE_QUALITY_REJECTED", "REGISTRATION_BH_CONFIRM", "REVIEWER_CORRECTIONS_INFO",
         "SCRAPPAGE_REGISTRATION_CONCESSION", "STATEMENT_ROWS_DO_NOT_ADD_UP", "STATEMENT_ROWS_NOT_IN_DEAL"]
     # The file's other failed page keeps its own, unchanged task and cannot use it.
