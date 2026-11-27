@@ -48,7 +48,7 @@ with engine.connect() as c:
         JOIN auditcore.journeys j ON j.tenant_id=st.tenant_id AND j.journey_id=st.journey_id
         JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
         WHERE st.tenant_id=:t AND st.stage_code='DELIVERY' AND st.business_completed_at_utc IS NOT NULL
-        ORDER BY md5(CAST(j.journey_id AS text))"""), {"t": T}).mappings().all()
+        ORDER BY md5(CAST(j.journey_id AS text)) OFFSET 185"""), {"t": T}).mappings().all()
     print("Diagnose delivery files closed:", len(rows))
     counts = Counter()
     short = defaultdict(list)
