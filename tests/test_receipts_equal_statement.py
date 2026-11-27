@@ -81,11 +81,14 @@ def journey():
         engine.dispose()
 
 
-def _statement(journey, lines: list[dict]) -> None:
+def _statement(journey, lines: list[dict], **printed) -> None:
     document_id = uuid4()
     add_evidence(journey, di_document_id=document_id, document_type_key="customer_ledger", process_area="DELIVERY")
     add_extracted_field(journey, di_document_id=document_id, field_key="line_items", value=lines,
                         document_type="customer_ledger")
+    for key, value in printed.items():  # the form's printed totals (total_cost, total_receipts, ...)
+        add_extracted_field(journey, di_document_id=document_id, field_key=key, value=value,
+                            document_type="customer_ledger")
 
 
 def _delivered(journey, days_ago: int) -> None:
@@ -207,3 +210,63 @@ def test_a_net_value_already_net_of_the_discounts_stands_as_printed(journey) -> 
     add_receipt_payment(journey, amount="1145000", receipt_number="R-1", receipt_date="2026-09-01")
     result = _check(journey)
     assert result.outcome == "PASS" and result.details["statementDiscounts"] is None
+
+
+# Utkal's "Final Vehicle Accounts Statement": no net value; Total Cost, Total Receipts, a balance.
+# Its discounts are listed on the receipts side and counted in Total Receipts.
+UTKAL = [
+    {"particulars_raw": "EX-SHOW ROOM PRICE OF VEHICLE", "debit_amount": 1000000},
+    {"particulars_raw": "TCS ON INVOICE", "debit_amount": 10000},
+    {"particulars_raw": "INSURANCE COST", "debit_amount": 40000},
+    {"particulars_raw": "REGISTRATION COST", "debit_amount": 100000},
+    {"particulars_raw": "CASH DISCOUNT", "credit_amount": 5000},
+    {"particulars_raw": "BOOKING AMOUNT", "credit_amount": 21000},
+    {"particulars_raw": "MR NO BRBM/123", "credit_amount": 1124000},
+]
+
+
+def test_a_form_with_no_net_value_is_confirmed_on_its_total_receipts_less_the_discounts_in_it(journey) -> None:
+    """Product owner 2026-11-27: "for utkal you use total receipts for confirmation". The form counts
+    its discounts in Total Receipts (27 Nov live: 315 of 576); a discount is not money received."""
+    _statement(journey, UTKAL, total_cost=1150000, total_receipts=1150000, balance_amount=0)
+    _delivered(journey, 30)
+    add_receipt_payment(journey, amount="21000", receipt_number="R-1", receipt_date="2026-09-01")
+    add_receipt_payment(journey, amount="1114000", receipt_number="R-2", receipt_date="2026-09-20")
+    short = _check(journey)
+    assert short.outcome in {"FAIL", "SKIPPED"} and D(short.details["difference"]) == D(-10000)
+    assert short.details["comparedWith"] == "TOTAL_RECEIPTS"
+
+    add_receipt_payment(journey, amount="10000", receipt_number="R-3", receipt_date="2026-09-21")
+    result = _check(journey)
+    assert result.outcome == "PASS", result.reason
+    assert D(result.details["statementTotal"]) == D(1145000)
+    assert D(result.details["statementTotalReceiptsPrinted"]) == D(1150000)
+    assert D(result.details["statementDiscounts"]) == D(5000)
+    assert "Total Receipts printed on the account statement" in result.reason
+    assert "less the discounts counted in it" in result.reason
+
+
+def test_total_receipts_that_are_the_money_alone_stand_as_printed(journey) -> None:
+    _statement(journey, UTKAL, total_cost=1150000, total_receipts=1145000, balance_amount=0)
+    _delivered(journey, 30)
+    add_receipt_payment(journey, amount="1145000", receipt_number="R-1", receipt_date="2026-09-01")
+    result = _check(journey)
+    assert result.outcome == "PASS", result.reason
+    assert D(result.details["statementTotal"]) == D(1145000) and result.details["statementDiscounts"] is None
+
+
+def test_payment_lines_that_do_not_add_up_to_total_receipts_are_not_compared(journey) -> None:
+    """The reading is in doubt: one cause, one task (the rows that do not add up), no second finding."""
+    _statement(journey, UTKAL, total_cost=1150000, total_receipts=1210000, balance_amount=0)
+    _delivered(journey, 30)
+    add_receipt_payment(journey, amount="1145000", receipt_number="R-1", receipt_date="2026-09-01")
+    result = _check(journey)
+    assert result.outcome == "SKIPPED" and "do not add up to the Total Receipts" in result.reason
+
+
+def test_a_form_with_neither_a_net_value_nor_total_receipts_is_still_not_calculated(journey) -> None:
+    _statement(journey, UTKAL, total_cost=1150000)
+    _delivered(journey, 30)
+    add_receipt_payment(journey, amount="1145000", receipt_number="R-1", receipt_date="2026-09-01")
+    result = _check(journey)
+    assert result.outcome == "SKIPPED" and "no net value or final price" in result.reason
