@@ -80,12 +80,12 @@ def _tasks(journey, task_type):
         ).mappings().all()]
 
 
-def _act(journey, task_id, action, *, role="PC", details=None):
+def _act(journey, task_id, action, *, role="PC", details=None, comment=None):
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         return submit_action(connection, tenant_id=journey.tenant_id, task_id=task_id, action=action,
                              actor_id=journey.actor_id if role == "PC" else "tl-1", actor_role_code=role,
-                             comment=None, details=details)
+                             comment=comment, details=details)
 
 
 def _verify(journey, task_id):
@@ -303,6 +303,71 @@ def test_without_the_vehicles_vin_or_chassis_on_the_journey_nothing_closes(journ
     result = _settle(journey)
     assert result["delivery"]["started"] is False
     assert result["stage"] == "BOOKING_COMPLETE" and result["deliveryCompletionState"] == "IN_PROGRESS"
+
+
+def test_the_minimum_booking_amount_does_not_hold_a_journey_whose_vehicle_is_on_file(journey):
+    """Product owner 2026-11-27: "kyc docs and booking docket are mandatory, if they are not, then
+    not allowed, otherwise payment if VIN is there can be ignored"."""
+    add_ready_document(journey, "booking_form", customer_name="A", booking_date="2026-09-01")
+    add_receipt_payment(journey, amount="5000", receipt_number="R1", receipt_date="2026-09-01")  # short of 21,000
+    # No KYC, receipts short, no vehicle: a booking, and not a complete one.
+    result = _settle(journey)
+    assert result["bookingCompletionState"] == "IN_PROGRESS" and result["stage"].startswith("BOOKING_")
+
+    # KYC in; still short of the minimum booking amount, and no vehicle on file: the payment holds it.
+    add_ready_document(journey, "pan_card", pan_number="ABCDE1234F")
+    result = _settle(journey)
+    assert result["gates"]["MINIMUM_BOOKING_PAYMENT"]["passed"] is False
+    assert result["bookingCompletionState"] == "IN_PROGRESS"
+
+    # The vehicle's chassis is on file: the minimum booking amount is not what keeps the file
+    # open -- the booking is complete on its Docket and KYC, and the Journey is worked as a
+    # delivery. The amount's own check still says the receipts are short, and the delivery's
+    # payment receipt is still one of its mandatory documents.
+    for template in get_registry().documents.values():
+        if template.stage == "DELIVERY" and template.requirement == "REQUIRED" and template.key != "payment_receipt":
+            _delivery_document(journey, template.key)
+    result = _settle(journey)
+    assert result["delivery"]["started"] is True
+    assert result["gates"]["MINIMUM_BOOKING_PAYMENT"]["passed"] is False
+    assert result["gates"]["MINIMUM_BOOKING_PAYMENT"]["ignoredForDelivery"] is True
+    assert result["bookingCompletionState"] == "COMPLETE"
+    assert result["stage"] == "DELIVERY_DOCUMENT_UPLOAD"
+    assert [m["key"] for m in result["delivery"]["missing"]] == ["payment_receipt"]
+
+
+def test_without_the_kyc_a_delivery_does_not_close_whatever_else_is_in(journey):
+    add_ready_document(journey, "booking_form", customer_name="A", booking_date="2026-09-01")
+    add_receipt_payment(journey, amount="21000", receipt_number="R1", receipt_date="2026-09-01")
+    _mandatory_delivery_documents(journey)
+    result = _settle(journey)
+    assert result["delivery"]["started"] is True
+    assert result["gates"]["KYC_EXTRACTED"]["passed"] is False
+    assert result["bookingCompletionState"] == "IN_PROGRESS" and result["deliveryCompletionState"] == "IN_PROGRESS"
+
+
+def test_the_pc_closes_the_car_pictures_task_with_a_proper_reason(journey):
+    """Product owner 2026-11-27: "task should be raised for photos.. it has to be there.. but it
+    can be closed without upload by PC with a proper reason"."""
+    _complete_booking(journey)
+    _settle(journey)
+    _mandatory_delivery_documents(journey)
+    _settle(journey)
+    [photos] = _tasks(journey, "DELIVERY_VEHICLE_PHOTOS_MISSING")
+    assert photos["task_status"] == "READY" and "CLOSE_TASK" in photos["allowed_actions"]
+
+    with pytest.raises(ValueError, match="reason there are no pictures"):
+        _act(journey, photos["task_id"], "CLOSE_TASK", comment="na")
+    closed = _act(journey, photos["task_id"], "CLOSE_TASK",
+                  comment="Customer took delivery at night; the yard camera was not working.")
+    assert closed["status"] == "VERIFIED_COMPLETE"
+
+    # The next settle does not ask again: the reason stands, and it is on the task.
+    _settle(journey)
+    [photos] = _tasks(journey, "DELIVERY_VEHICLE_PHOTOS_MISSING")
+    assert photos["task_status"] == "VERIFIED_COMPLETE"
+    assert photos["completion_result"]["outcome"] == "CLOSED_BY_PC"
+    assert "yard camera" in photos["completion_result"]["reason"]
 
 
 def test_delivery_completes_from_rules_and_waits_for_the_tl_review(journey):

@@ -1249,7 +1249,9 @@ def recompute_journey_stage(
     number is on the Journey (the delivery has started), every mandatory and
     evidence-triggered conditional Delivery document is in, and the PC's
     manual verification tasks are closed. Pictures of the car are optional and
-    the PC's other document tasks hold nothing. It is then marked for TL
+    the PC's other document tasks hold nothing. Of the booking's own papers the
+    Booking Docket and the KYC must be in; the minimum booking amount is not
+    asked of a Journey whose vehicle is on file. It is then marked for TL
     review. ``transitions`` tells the worker what just happened.
     """
     registry = registry or get_registry()
@@ -1269,7 +1271,6 @@ def recompute_journey_stage(
 
     gates = _stage_gates(connection, registry, stage="BOOKING", tenant_id=tenant_id, journey_id=journey_id,
                          minimum=minimum, reasons=reasons)
-    booking_complete = all(item["passed"] for item in gates.values())
     in_flight = int(connection.execute(
         text(
             """
@@ -1280,6 +1281,15 @@ def recompute_journey_stage(
         {"tenant_id": tenant_id, "journey_id": journey_id, "states": list(_IN_FLIGHT)},
     ).scalar_one())
     delivery_started = delivery_has_started(connection, tenant_id=tenant_id, journey_id=journey_id)
+    # The Booking Docket and the KYC are mandatory, always. The minimum booking amount holds a
+    # booking only: once the vehicle's VIN or chassis number is on the Journey the payment is not
+    # what keeps the file open (product owner 2026-11-27: "kyc docs and booking docket are
+    # mandatory ... otherwise payment if VIN is there can be ignored"). The gate keeps its own
+    # answer -- the receipts are still short, and its check and task say so.
+    for item in gates.values():
+        if item.get("kind") == "PAYMENT_MINIMUM" and not item["passed"]:
+            item["ignoredForDelivery"] = delivery_started
+    booking_complete = all(item["passed"] or item.get("ignoredForDelivery") for item in gates.values())
     delivery_gates = _stage_gates(connection, registry, stage="DELIVERY", tenant_id=tenant_id,
                                   journey_id=journey_id, minimum=minimum, reasons=reasons)
     docs_gate = delivery_gates.get("REQUIRED_DOCUMENTS") or {"passed": False}
