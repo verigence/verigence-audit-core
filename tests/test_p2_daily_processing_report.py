@@ -207,24 +207,21 @@ def test_how_the_pages_became_documents_is_shown(journey):
 # Delivery files closed (product owner 2026-11-02): a delivery file is closed
 # when its mandatory documents are in and the PC's document tasks are closed.
 
-def _delivery_file(journey, *, missing=(), uploaded_days_ago: int = 2):
-    """Make the journey a delivery file: one DELIVERY page, uploaded
-    ``uploaded_days_ago`` days ago, and the stage engine's stored DELIVERY
-    REQUIRED_DOCUMENTS gate with ``missing`` requirement keys."""
-    _b, page, _ = add_page(journey, page_number=9, status="READY")
+def _close_delivery(journey, *, days_ago: int = 0) -> None:
+    """The stage engine closed the Journey's delivery ``days_ago`` days ago: the one closure
+    record (uc03_p2_workflow.mark_delivery_completed), written when the mandatory documents are
+    in and the manual verification tasks are closed."""
+    from audit_core.uc03_p2_workflow import mark_delivery_completed
+
     with journey.engine.begin() as c:
         set_tenant_context(c, journey.tenant_id)
-        c.execute(
-            text("UPDATE auditcore.p2_document_queue SET business_stage='DELIVERY', "
-                 "created_at_utc=now() - make_interval(days => :d) WHERE queue_id=:q"),
-            {"q": page, "d": uploaded_days_ago},
-        )
-        c.execute(
-            text("INSERT INTO auditcore.p2_stage_gate_state (tenant_id, journey_id, stage_code, gate_key, "
-                 "gate_status, details) VALUES (:t, :j, 'DELIVERY', 'REQUIRED_DOCUMENTS', :s, CAST(:d AS jsonb))"),
-            {"t": journey.tenant_id, "j": journey.journey_id, "s": "WAITING" if missing else "PASS",
-             "d": json.dumps({"missing": [{"key": k, "label": k} for k in missing]})},
-        )
+        mark_delivery_completed(c, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+        c.execute(text("UPDATE auditcore.journey_stage_states SET "
+                       "first_started_at_utc = first_started_at_utc - make_interval(days => :d), "
+                       "capture_completed_at_utc = capture_completed_at_utc - make_interval(days => :d), "
+                       "business_completed_at_utc = business_completed_at_utc - make_interval(days => :d) "
+                       "WHERE tenant_id=:t AND journey_id=:j AND stage_code='DELIVERY'"),
+                  {"d": days_ago, "t": journey.tenant_id, "j": journey.journey_id})
 
 
 def _doc_task(journey, *, task_type="PC_PAGE_QUALITY_REJECTED", status="READY", closed_days_ago=None,
@@ -252,71 +249,45 @@ def _report_on(journey, tl, days_ago: int):
                                              day=_today(journey) - timedelta(days=days_ago))
 
 
-def test_a_delivery_file_closes_on_the_day_its_last_document_task_closes(journey):
+def test_a_delivery_file_counts_on_the_day_the_stage_engine_closed_it(journey):
+    """Product owner 2026-11-27: one closure rule everywhere. The tracker reads the record the
+    Team Lead screen's Closed reads; it no longer works a rule of its own out."""
     tl = _tl(journey)
-    _delivery_file(journey, missing=("rsa_invoice",), uploaded_days_ago=3)
-    _doc_task(journey, status="VERIFIED_COMPLETE", closed_days_ago=2)
-    # The PC closed "Upload the RSA Invoice" ("Document not required to be uploaded").
-    _doc_task(journey, task_type="DOCUMENT_MISSING", status="VERIFIED_COMPLETE", closed_days_ago=1,
-              requirement_key="rsa_invoice")
+    add_page(journey, page_number=9, status="READY")
+    # Uploaded, every document task closed: by the old reading of this report a closed file. The
+    # stage engine has not closed it (a manual verification task, say, is open): not closed here.
+    _doc_task(journey, status="VERIFIED_COMPLETE", closed_days_ago=1)
+    assert _report_on(journey, tl, 1)["deliveryFilesClosed"]["total"] == 0
 
+    _close_delivery(journey, days_ago=1)
     closed = _report_on(journey, tl, 1)["deliveryFilesClosed"]
     assert closed["total"] == 1
     assert closed["files"][0]["journeyId"] == str(journey.journey_id)
     assert closed["files"][0]["customerName"] == "P2 Customer" and closed["files"][0]["outletName"] == "O"
-    for earlier in (2, 3):
-        assert _report_on(journey, tl, earlier)["deliveryFilesClosed"]["total"] == 0
-    assert _report_on(journey, tl, 0)["deliveryFilesClosed"]["total"] == 0
+    for other_day in (0, 2):
+        assert _report_on(journey, tl, other_day)["deliveryFilesClosed"]["total"] == 0
 
 
-def test_a_delivery_file_is_not_closed_while_a_document_task_is_open(journey):
+def test_a_task_opened_after_the_file_closed_does_not_reopen_it(journey):
+    """As on the Team Lead screen: a delivery the stage engine closed stays closed."""
     tl = _tl(journey)
-    _delivery_file(journey, uploaded_days_ago=1)
-    _doc_task(journey, status="VERIFIED_COMPLETE", closed_days_ago=1)
-    open_task = _doc_task(journey, task_type="DOCUMENT_RESUBMIT", status="RETURNED")
-    assert _report_on(journey, tl, 1)["deliveryFilesClosed"]["total"] == 0
-
-    with journey.engine.begin() as c:
-        set_tenant_context(c, journey.tenant_id)
-        c.execute(text("UPDATE auditcore.p2_tasks SET task_status='VERIFIED_COMPLETE', verified_at_utc=now() "
-                       "WHERE task_id=:id"), {"id": open_task})
-    assert _report_on(journey, tl, 0)["deliveryFilesClosed"]["total"] == 1
-    assert _report_on(journey, tl, 1)["deliveryFilesClosed"]["total"] == 0
-
-
-def test_a_missing_mandatory_document_keeps_the_file_open(journey):
-    """The tax invoice is not in and nothing closed its ask: not closed,
-    even with no open task."""
-    tl = _tl(journey)
-    _delivery_file(journey, missing=("tax_invoice_tally",), uploaded_days_ago=0)
-    assert _report_on(journey, tl, 0)["deliveryFilesClosed"]["total"] == 0
-
-
-def test_a_delivery_file_with_no_document_task_closes_on_its_last_delivery_upload(journey):
-    tl = _tl(journey)
-    _delivery_file(journey, uploaded_days_ago=1)
+    _close_delivery(journey, days_ago=1)
+    _doc_task(journey, task_type="DOCUMENT_RESUBMIT", status="RETURNED")
     assert _report_on(journey, tl, 1)["deliveryFilesClosed"]["total"] == 1
-    assert _report_on(journey, tl, 0)["deliveryFilesClosed"]["total"] == 0
 
 
 def test_a_booking_only_journey_never_counts(journey):
     tl = _tl(journey)
     add_page(journey, page_number=1, status="READY")  # a booking page, no delivery
     _doc_task(journey, status="VERIFIED_COMPLETE", closed_days_ago=0)
-    with journey.engine.begin() as c:
-        set_tenant_context(c, journey.tenant_id)
-        c.execute(
-            text("INSERT INTO auditcore.p2_stage_gate_state (tenant_id, journey_id, stage_code, gate_key, "
-                 "gate_status, details) VALUES (:t, :j, 'DELIVERY', 'REQUIRED_DOCUMENTS', 'PASS', '{}')"),
-            {"t": journey.tenant_id, "j": journey.journey_id},
-        )
     assert _report_on(journey, tl, 0)["deliveryFilesClosed"]["total"] == 0
 
 
 def test_a_closed_delivery_file_counts_under_the_journeys_own_pc(journey):
     """The journey's PC (who started it), not whoever uploaded or closed."""
     tl = _tl(journey)
-    _delivery_file(journey, uploaded_days_ago=0)
+    add_page(journey, page_number=9, status="READY")
+    _close_delivery(journey)
     # Someone else uploaded today; the journey's PC uploaded nothing today.
     other = f"pc-other-{uuid4().hex[:6]}"
     with journey.engine.begin() as c:

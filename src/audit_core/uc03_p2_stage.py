@@ -1212,7 +1212,7 @@ def _stage_gates(connection: Connection, registry: Registry, *, stage: str, tena
             connection, registry, gate, tenant_id=tenant_id, journey_id=journey_id, minimum=minimum,
             reasons=reasons, stage=stage,
         )
-        result.update({"label": gate.label, "kind": gate.kind})
+        result.update({"label": gate.label, "kind": gate.kind, "optional": gate.optional})
         if not result["passed"]:
             result["action"] = gate.missing
         gates[gate.key] = result
@@ -1244,10 +1244,12 @@ def recompute_journey_stage(
 
     Booking completes when the Booking Docket, the customer KYC (PAN or
     Aadhaar) and receipts reaching the minimum booking amount are in.
-    Delivery completes when every mandatory and evidence-triggered
-    conditional Delivery document is in, the vehicle is proven (pictures,
-    or the VIN / chassis / engine entered by the PC) and the PC's document,
-    verification and duplicate tasks are closed; it is then marked for TL
+    Delivery completes by the one closure rule (product owner 2026-11-27,
+    docs/rules/RULES.md "Delivery file closed"): the vehicle's VIN or chassis
+    number is on the Journey (the delivery has started), every mandatory and
+    evidence-triggered conditional Delivery document is in, and the PC's
+    manual verification tasks are closed. Pictures of the car are optional and
+    the PC's other document tasks hold nothing. It is then marked for TL
     review. ``transitions`` tells the worker what just happened.
     """
     registry = registry or get_registry()
@@ -1282,7 +1284,9 @@ def recompute_journey_stage(
                                   journey_id=journey_id, minimum=minimum, reasons=reasons)
     docs_gate = delivery_gates.get("REQUIRED_DOCUMENTS") or {"passed": False}
     already_delivered = bool(previous and previous["delivery_completion_state"] == "COMPLETE")
-    delivery_ready = delivery_started and all(item["passed"] for item in delivery_gates.values())
+    # An optional gate (the vehicle photos, 2026-11-27) is on the checklist and holds nothing.
+    delivery_ready = delivery_started and all(
+        item["passed"] for item in delivery_gates.values() if not item.get("optional"))
     can_complete_delivery = delivery_ready and complete_delivery
 
     if not booking_complete:
@@ -1367,8 +1371,10 @@ def recompute_journey_stage(
         "receivedCount": docs_gate.get("receivedCount", 0),
         "missing": list(docs_gate.get("missing") or [])
         + ([{"key": "vehicle_proof", "label": "Vehicle pictures (or VIN / chassis / engine number)"}]
-           if not (delivery_gates.get("VEHICLE_PROOF") or {}).get("passed") else [])
-        + ([{"key": "pc_tasks", "label": f"{delivery_gates['PC_TASKS_CLOSED']['pendingCount']} open PC task(s)"}]
+           if not (delivery_gates.get("VEHICLE_PROOF") or {"optional": True}).get("passed")
+           and not (delivery_gates.get("VEHICLE_PROOF") or {"optional": True}).get("optional") else [])
+        + ([{"key": "pc_tasks",
+             "label": f"{delivery_gates['PC_TASKS_CLOSED']['pendingCount']} open manual verification task(s)"}]
            if delivery_gates.get("PC_TASKS_CLOSED") and not delivery_gates["PC_TASKS_CLOSED"]["passed"] else []),
         "gates": delivery_gates,
     }
@@ -1450,14 +1456,15 @@ def read_booking_stage(
             {"passed": False, "label": gate.label, "kind": gate.kind, "action": gate.missing},
         )
     delivery_gates = {
-        gate.key: stored.get(("DELIVERY", gate.key), {"passed": False, "label": gate.label, "kind": gate.kind,
-                                                       "action": gate.missing})
+        # ``optional`` from the registry: a gate stored before it became optional says nothing.
+        gate.key: {**stored.get(("DELIVERY", gate.key), {"passed": False, "label": gate.label, "kind": gate.kind,
+                                                          "action": gate.missing}), "optional": gate.optional}
         for gate in registry.stages["DELIVERY"].gates
     }
     docs = delivery_gates.get("REQUIRED_DOCUMENTS") or {}
     delivered = runtime is not None and str(runtime["delivery_completion_state"]) == "COMPLETE"
     delivery = {
-        "passed": delivered or all(g.get("passed") for g in delivery_gates.values()),
+        "passed": delivered or all(g.get("passed") for g in delivery_gates.values() if not g.get("optional")),
         "requiredCount": docs.get("requiredCount", 0),
         "receivedCount": docs.get("receivedCount", 0),
         "missing": list(docs.get("missing") or []),

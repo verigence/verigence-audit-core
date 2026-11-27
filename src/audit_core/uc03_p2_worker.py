@@ -5578,6 +5578,11 @@ def _one_shot_target(kind: str, engine: Engine, tag: str, reports: list[str]):
         # see uc03_rules_rerun. A dry run unless the label ends with "-commit".
         from audit_core.uc03_rules_rerun import run_rules_rerun
         return run_rules_rerun, (engine, tag, reports)
+    if kind == "STAGE_RESETTLE":
+        # Open deliveries settled again after a closure rule changes (2026-11-27): see
+        # uc03_stage_resettle. A dry run unless the label ends with "-commit".
+        from audit_core.uc03_stage_resettle import run_stage_resettle
+        return run_stage_resettle, (engine, tag, reports)
     if kind == "DMS_REMATCH":
         # The current DMS dumps matched again after the matching changed (2026-11-18): see
         # uc03_dms_rematch. A dry run (rolled back) unless the label ends with "-commit".

@@ -92,6 +92,7 @@ def pc_backlog(connection: Connection, *, tenant_id: str, dealer_ids: list[str],
                ) -> dict[str, Any]:
     """``byPerson``: PC -> figures (each location they are tagged to, in full); ``dealers``: per
     dealership the dumps used and the rows naming no DMS location."""
+    from audit_core.uc03_delivery_start import delivery_started_ids
     from audit_core.uc03_p2_dms_dumps import BOOKING, DELIVERY, compared_until
     from audit_core.uc03_p2_dms_intimations import live_marks, row_key
     from audit_core.uc03_p2_dms_outlet_report import (
@@ -121,16 +122,9 @@ def pc_backlog(connection: Connection, *, tenant_id: str, dealer_ids: list[str],
     # A delivery whose file came after the dump was matched is synced (as in the DMS report).
     delivery_journeys = [r["journey_id"] for rows in rows_by_dealer.values() for r in rows
                          if r["dump_kind"] == DELIVERY and r["journey_id"]]
-    delivered: set[str] = set()
-    if delivery_journeys:
-        delivered = {str(x[0]) for x in connection.execute(
-            text("""
-                SELECT DISTINCT q.journey_id FROM auditcore.p2_document_queue q
-                WHERE q.tenant_id = :t AND CAST(q.journey_id AS text) = ANY(:ids) AND q.business_stage = 'DELIVERY'
-                  AND q.queue_status <> 'CANCELLED'
-            """),
-            {"t": tenant_id, "ids": delivery_journeys},
-        )}
+    # By the one delivery rule (uc03_delivery_start; product owner 2026-11-27: the same rule
+    # everywhere), not by a page filed under the delivery.
+    delivered = delivery_started_ids(connection, tenant_id=tenant_id, journey_ids=sorted(set(delivery_journeys)))
 
     dealer_names = {str(r[0]): r[1] for r in connection.execute(
         text("SELECT dealer_id, dealer_name FROM auditcore.dealers WHERE tenant_id = :t AND CAST(dealer_id AS text) = ANY(:ds)"),

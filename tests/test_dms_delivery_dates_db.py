@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
 from conftest import delete_tenant_data
@@ -331,7 +332,9 @@ def test_a_booking_is_dated_by_its_form_else_its_first_receipt_never_the_upload_
     date not read, not counted as a booking of any day."""
     from datetime import timedelta
 
-    today = date.today()  # noqa: DTZ011 -- the database dates receipts against CURRENT_DATE
+    # The India day: the report reads a Journey's upload day in India time, and from 18:30 UTC the
+    # machine's own day is still the day before (the run of 26 Nov 23:17 UTC failed on it).
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
     with dealer.engine.begin() as c:
         def journey(name: str, *, form: date | None, receipts: tuple[date, ...]) -> str:
             customer = c.execute(text("""INSERT INTO auditcore.customers (tenant_id, dealer_id, outlet_id,
