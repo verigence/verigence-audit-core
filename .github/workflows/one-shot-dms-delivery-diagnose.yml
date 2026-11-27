@@ -85,7 +85,7 @@ jobs:
                      WHERE j.tenant_id=%(t)s AND f.field_key IN ('booking_number','otf_number','order_number','booking_reference')""", {"t": T}):
                   if r[1]:
                       refs.setdefault(otf(r[1]), set()).add(str(r[0]))
-              rows = c.exec_driver_sql("""SELECT r.*, u.business_date, u.period_month, u.dealer_id AS dump_dealer, u.created_at_utc AS uploaded
+              rows = c.exec_driver_sql("""SELECT r.*, u.business_date, u.period_month, u.dealer_id AS dump_dealer
                      FROM auditcore.p2_dms_dump_rows r JOIN auditcore.p2_dms_dumps u ON u.tenant_id=r.tenant_id AND u.dump_id=r.dump_id
                      WHERE r.tenant_id=%(t)s""", {"t": T}).mappings().all()
               last = c.exec_driver_sql("""SELECT u.dealer_id, u.dump_kind, max(u.business_date) AS day, count(*) AS dumps
