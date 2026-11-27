@@ -99,7 +99,7 @@ with engine.connect() as c:
         if read.conflicts or read.unmapped:
             fallback[dealer]["lines in doubt"] += 1
             continue
-        if time.monotonic() - started > 900 or compared >= 400:
+        if time.monotonic() - started > 420 or compared >= 250:
             fallback[dealer]["not compared (time)"] += 1
             continue
         compared += 1
