@@ -229,18 +229,18 @@ def test_a_satellite_has_no_gate_register_day_before_3_november(setup):
 # --------------------------------------------------------------------------- the Tracker, day by day (2026-11-03)
 
 def test_the_tracker_is_day_by_day_and_counts_journeys_completed(setup):
-    """Each day of the period has its own row per outlet, newest first; a delivery file closed
-    today (every mandatory document in, no PC document task open) is a journey completed today."""
+    """Each day of the period has its own row per outlet, newest first; a delivery file the stage
+    engine closed today (the one closure rule, 2026-11-27: all mandatory documents uploaded, the
+    PC's document and manual verification tasks closed) is a journey completed today."""
+    from audit_core.uc03_p2_workflow import mark_delivery_completed
+
     s = setup
     _delivery_file(s)                                               # a delivery page uploaded today
     with s.journey.engine.begin() as connection:
         set_tenant_context(connection, s.journey.tenant_id)
         connection.execute(text("UPDATE auditcore.journeys SET created_by_actor_id=:a WHERE tenant_id=:t AND journey_id=:j"),
                            {"a": s.journey.actor_id, "t": s.journey.tenant_id, "j": str(s.journey.journey_id)})
-        connection.execute(
-            text("INSERT INTO auditcore.p2_stage_gate_state (tenant_id, journey_id, stage_code, gate_key, "
-                 "gate_status, details) VALUES (:t, :j, 'DELIVERY', 'REQUIRED_DOCUMENTS', 'PASS', '{\"missing\": []}')"),
-            {"t": s.journey.tenant_id, "j": str(s.journey.journey_id)})
+        mark_delivery_completed(connection, tenant_id=s.journey.tenant_id, journey_id=s.journey.journey_id)
     today = ist_day().date()
     data = _work(s, **{"from": (today - timedelta(days=6)).isoformat(), "to": today.isoformat()}).json()
     assert [d["date"] for d in data["periods"]] == [(today - timedelta(days=i)).isoformat() for i in range(7)]
@@ -258,6 +258,8 @@ def test_the_tracker_is_day_by_day_and_counts_journeys_completed(setup):
 
 
 def test_a_journey_with_a_document_task_open_is_not_completed(setup):
+    """Its documents are in, but a task is open: the stage engine has not closed it, so it is not
+    a journey completed -- whatever this report could work out on its own."""
     s = setup
     _delivery_file(s)
     with s.journey.engine.begin() as connection:
