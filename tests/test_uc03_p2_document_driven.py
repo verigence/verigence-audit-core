@@ -64,9 +64,14 @@ def _complete_booking(journey):
 def _mandatory_delivery_documents(journey, **invoice_fields):
     # the balance receipt after the booking amount is the Delivery receipt
     add_receipt_payment(journey, amount="480000", receipt_number="R2", receipt_date="2026-09-20")
+    # The money received equals what is billed (the closure rule of 2026-11-27): the booking
+    # amount of 21,000 and this receipt, against the invoice's total.
+    billed = {"invoice_number": "INV-1", "vin_number": "MA1VIN0001", "grand_total_amount": "501000"}
     for template in get_registry().documents.values():
         if template.stage == "DELIVERY" and template.requirement == "REQUIRED" and template.key != "payment_receipt":
-            fields = invoice_fields if template.key == "customer_invoice_dms" else {}
+            # the DMS and the Tally copy of the one sale
+            fields = ((invoice_fields or billed) if template.key == "customer_invoice_dms"
+                      else billed if template.key == "tax_invoice_tally" else {})
             _delivery_document(journey, template.key, **fields)
 
 
@@ -262,8 +267,7 @@ def test_a_delivery_file_closes_by_the_one_closure_rule(journey):
     Journey; car photos are optional; a missing mandatory document keeps the file open."""
     _complete_booking(journey)
     # A mandatory document missing: open, whatever else is done.
-    add_receipt_payment(journey, amount="480000", receipt_number="R2", receipt_date="2026-09-20")
-    _delivery_document(journey, "customer_invoice_dms")
+    _delivery_document(journey, "rto_challan")
     held = _settle(journey)
     assert held["deliveryCompletionState"] == "IN_PROGRESS"
     assert held["delivery"]["gates"]["REQUIRED_DOCUMENTS"]["passed"] is False
@@ -286,6 +290,41 @@ def test_a_delivery_file_closes_by_the_one_closure_rule(journey):
     closed = _settle(journey)
     assert closed["delivery"]["gates"]["VEHICLE_PROOF"]["passed"] is False
     assert closed["stage"] == "DELIVERY_COMPLETE" and closed["deliveryCompletionState"] == "COMPLETE"
+
+
+def test_a_delivery_closes_only_when_the_money_received_equals_what_is_billed(journey):
+    """Product owner 2026-11-27: "Money receipts of dealership should be present and it should be
+    equal to the sum of the NDC total... then it should be marked closed". The comparison is the
+    audit rule's own (RECEIPTS_EQUAL_INVOICES: the NDC where the account statement is the source of
+    truth, the invoices here), judged without its wait for the settlement window."""
+    _complete_booking(journey)
+    _settle(journey)
+    # Billed 5,01,000; received the booking amount of 21,000 and 4,70,000: short by 10,000.
+    billed = {"invoice_number": "INV-1", "vin_number": "MA1VIN0001", "grand_total_amount": "501000"}
+    add_receipt_payment(journey, amount="470000", receipt_number="R2", receipt_date="2026-09-20")
+    for template in get_registry().documents.values():
+        if template.stage == "DELIVERY" and template.requirement == "REQUIRED" and template.key != "payment_receipt":
+            _delivery_document(journey, template.key,
+                               **(billed if template.key in {"customer_invoice_dms", "tax_invoice_tally"} else {}))
+    held = _settle(journey)
+    money = held["delivery"]["gates"]["MONEY_EQUALS_BILLED"]
+    assert held["delivery"]["gates"]["REQUIRED_DOCUMENTS"]["passed"] is True
+    assert money["passed"] is False and money["state"] == "FAIL" and money["receiptCount"] == 2
+    assert "short of" in money["action"]
+    assert held["stage"] == "DELIVERY_VERIFY_DOCUMENTS" and held["deliveryCompletionState"] == "IN_PROGRESS"
+
+    # The remaining receipt comes in: the money agrees, and the file closes.
+    add_receipt_payment(journey, amount="10000", receipt_number="R3", receipt_date="2026-09-21")
+    closed = _settle(journey)
+    assert closed["delivery"]["gates"]["MONEY_EQUALS_BILLED"]["passed"] is True
+    assert closed["stage"] == "DELIVERY_COMPLETE" and closed["deliveryCompletionState"] == "COMPLETE"
+
+
+def test_the_money_is_not_asked_of_a_booking(journey):
+    _complete_booking(journey)
+    result = _settle(journey)
+    assert result["delivery"]["gates"]["MONEY_EQUALS_BILLED"] == {
+        **result["delivery"]["gates"]["MONEY_EQUALS_BILLED"], "passed": False, "state": "NOT_A_DELIVERY"}
 
 
 def test_without_the_vehicles_vin_or_chassis_on_the_journey_nothing_closes(journey):
@@ -443,7 +482,7 @@ def test_delivery_completes_from_rules_and_waits_for_the_tl_review(journey):
 
 def test_open_pc_tasks_hold_the_delivery(journey):
     _complete_booking(journey)
-    _mandatory_delivery_documents(journey)
+    _mandatory_delivery_documents(journey, marker="x")  # the invoice's total is read below, in doubt
     _delivery_document(journey, "gate_pass")
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)

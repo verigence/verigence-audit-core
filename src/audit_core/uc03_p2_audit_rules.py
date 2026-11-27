@@ -1096,7 +1096,7 @@ def _not_counted(facts: _Facts) -> list[dict[str, Any]]:
     return out
 
 
-def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
+def _receipts_equal_statement(facts: _Facts, *, judged_now: bool = False) -> RuleOutcome:
     """MAHINDRA ORISSA (product owner, 2026-10-26): the receipts are compared
     with the net value / final price printed on the dealer's account
     statement, used as printed -- not with the invoices. The statement's own received lines are not used."""
@@ -1110,6 +1110,8 @@ def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
     )
 
     code = "RECEIPTS_EQUAL_INVOICES"
+    # ``judged_now``: the same comparison without the wait for the settlement window -- what the
+    # stage engine's closure gate asks (money_equals_what_is_billed, product owner 2026-11-27).
     forms = []
     for document in load_ledger_documents(facts.connection, tenant_id=facts.tenant_id, journey_id=facts.journey_id):
         rows = line_rows(document["fields"].get("line_items"))
@@ -1145,10 +1147,10 @@ def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
     if less_discounts:
         billed = printed - given
     delivered = facts.delivery_date
-    if delivered is None:
+    if delivered is None and not judged_now:
         return RuleOutcome(code, "SKIPPED", _NO_DELIVERY_DATE)
-    settles = delivered + timedelta(days=_SETTLEMENT_DAYS)
-    if facts.today <= settles:
+    settles = delivered + timedelta(days=_SETTLEMENT_DAYS) if delivered else None
+    if settles is not None and facts.today <= settles and not judged_now:
         return RuleOutcome(code, "SKIPPED", (
             f"Receipts are compared with the account statement once the settlement window closes on "
             f"{_when(settles)} ({_SETTLEMENT_DAYS} days after delivery on {_when(delivered)})."
@@ -1189,11 +1191,11 @@ def _receipts_equal_statement(facts: _Facts) -> RuleOutcome:
     ), {**details, "findingTitle": "Receipts do not equal the account statement"})
 
 
-def receipts_equal_invoices(facts: _Facts) -> RuleOutcome:
+def receipts_equal_invoices(facts: _Facts, *, judged_now: bool = False) -> RuleOutcome:
     from audit_core.uc03_deal_source_policy import account_statement_is_source_of_truth
 
     if account_statement_is_source_of_truth(facts.connection, tenant_id=facts.tenant_id):
-        return _receipts_equal_statement(facts)
+        return _receipts_equal_statement(facts, judged_now=judged_now)
     code = "RECEIPTS_EQUAL_INVOICES"
     bills, unreadable = _invoice_bills(facts)
     if not any(b["vehicle"] for b in bills):
@@ -1201,10 +1203,10 @@ def receipts_equal_invoices(facts: _Facts) -> RuleOutcome:
     if unreadable:
         return RuleOutcome(code, "SKIPPED", "The total could not be read on: " + ", ".join(unreadable) + ".")
     delivered = facts.delivery_date
-    if delivered is None:
+    if delivered is None and not judged_now:
         return RuleOutcome(code, "SKIPPED", _NO_DELIVERY_DATE)
-    settles = delivered + timedelta(days=_SETTLEMENT_DAYS)
-    if facts.today <= settles:
+    settles = delivered + timedelta(days=_SETTLEMENT_DAYS) if delivered else None
+    if settles is not None and facts.today <= settles and not judged_now:
         return RuleOutcome(code, "SKIPPED", (
             f"Receipts are compared with the invoices once the settlement window closes on {_when(settles)} "
             f"({_SETTLEMENT_DAYS} days after delivery on {_when(delivered)})."
@@ -1228,6 +1230,29 @@ def receipts_equal_invoices(facts: _Facts) -> RuleOutcome:
         f"Receipts {_rupees(received)}{refund_text} are {_rupees(abs(gap))} {direction} the {counted} "
         f"totalling {_rupees(invoiced)}."
     ), {**details, "findingTitle": "Receipts do not equal the invoices"})
+
+
+def money_equals_what_is_billed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """For the stage engine's closure gate (product owner 2026-11-27: "Money receipts of dealership
+    should be present and it should be equal to the sum of the NDC total... then it should be
+    marked closed"): the dealership's payment receipts are on file, and the money received equals
+    what the customer was billed -- the NDC where the account statement is the source of truth
+    (Mahindra Orissa), the invoices elsewhere.
+
+    The one comparison of RECEIPTS_EQUAL_INVOICES, judged now: the rule waits for the settlement
+    window before it raises a finding; a file whose money already agrees need not wait to close.
+    ``passed`` only on its PASS; anything it cannot compare yet (no NDC read, lines in doubt, no
+    net value printed, the loan amount not on file) keeps the file open, with the rule's reason."""
+    facts = _Facts(connection, tenant_id, journey_id)
+    receipts = len(facts.receipts)
+    if not receipts:
+        return {"passed": False, "state": "NO_RECEIPTS", "receiptCount": 0,
+                "reason": "No payment receipt of the dealership is on file."}
+    outcome = receipts_equal_invoices(facts, judged_now=True)
+    details = outcome.details or {}
+    return {"passed": outcome.outcome == "PASS", "state": outcome.outcome, "receiptCount": receipts,
+            "reason": outcome.reason,
+            **{key: details[key] for key in ("statementTotal", "invoiced", "received", "difference") if key in details}}
 
 
 def _late_receipts(facts: _Facts, start: date, end: date | None) -> list[dict[str, Any]]:
