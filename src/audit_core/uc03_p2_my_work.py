@@ -15,9 +15,10 @@ PC
                         product owner 2026-11-23, uc03_p2_upload_kind)
     duplicatesDeleted   Journeys they uploaded in the period that the system deleted as the
                         same file uploaded again (product owner 2026-11-12; from that day)
-    journeysCompleted   their Journeys whose delivery file closed in the period, by the
-                        Daily processing report's rule (all mandatory delivery documents
-                        in, every document task of the PC closed)
+    journeysCompleted   their Journeys whose delivery file closed in the period, by the one
+                        closure rule (product owner 2026-11-27: all mandatory documents
+                        uploaded, the manual verification tasks closed),
+                        read from the stage engine's record as everywhere else
     gateRegister        per gate register day of the period: uploaded or not, total
                         on the register, intimated to the PC, uploaded in the tool,
                         pending with the PC and not intimated
@@ -322,9 +323,10 @@ def _reviews(connection: Connection, *, tenant_id: str, actor_id: str, tz: str, 
 def _completed(connection: Connection, *, tenant_id: str, actor_id: str, tz: str, start: date,
                end: date) -> list[dict[str, Any]]:
     """The PC's Journeys whose delivery file closed in the period (product owner 2026-11-03:
-    "journeys completed"), by the Daily processing report's own rule (uc03_p2_daily_report.
-    delivery_files_closed: every mandatory delivery document in, and every document task the
-    PC owns closed), on the IST day it last closed. Only the Journeys the PC opened."""
+    "journeys completed"), by the one closure rule every screen reads (2026-11-27;
+    uc03_p2_daily_report.delivery_files_closed, the stage engine's record: all mandatory
+    documents uploaded, the manual verification tasks closed), on the IST day
+    it closed. Only the Journeys the PC opened."""
     from zoneinfo import ZoneInfo
 
     from audit_core.uc03_p2_daily_report import delivery_files_closed

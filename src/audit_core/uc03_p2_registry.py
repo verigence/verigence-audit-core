@@ -121,6 +121,9 @@ class Gate:
     match: str = "ALL"
     role: str | None = None
     tabs: tuple[str, ...] = ()
+    # Shown on the checklist, never holds the stage open (the vehicle photos: product owner
+    # 2026-11-27, "car photos lets keep it optional").
+    optional: bool = False
 
 
 @dataclass(frozen=True)
@@ -365,6 +368,7 @@ def build_registry(
                     match=str(g.get("match", "ALL")),
                     role=g.get("role"),
                     tabs=_tuple(g.get("tabs")),
+                    optional=bool(g.get("optional", False)),
                 )
                 for g in raw.get("gates") or []
             ),

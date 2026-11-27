@@ -408,21 +408,19 @@ class _Facts:
             ORDER BY gate_key
             """
         )
+        optional = {g.key for g in get_registry().stages["DELIVERY"].gates if g.optional}
         for gate in gates:
             details = dict(gate["details"] or {})
             if gate["gate_key"] == "REQUIRED_DOCUMENTS":
                 continue  # named above
+            if gate["gate_key"] in optional:
+                continue  # holds nothing: the vehicle photos (product owner 2026-11-27)
             if gate["gate_key"] == "PC_TASKS_CLOSED":
-                titles = self._rows(
-                    """
-                    SELECT title FROM auditcore.p2_tasks WHERE tenant_id=:t AND journey_id=:j
-                      AND assigned_role_code='PC'
-                      AND task_status IN ('READY','IN_PROGRESS','RETURNED','ACTION_COMPLETED','VERIFYING')
-                    ORDER BY created_at_utc
-                    """
-                )
-                if titles:
-                    pending.append(f"{len(titles)} PC task(s) open: " + "; ".join(str(r["title"]) for r in titles))
+                # The tasks that hold the file: the gate's own (manual verification, 2026-11-27).
+                titles = [str(t.get("title")) for t in details.get("tasks") or []]
+                count = int(details.get("pendingCount") or len(titles))
+                if count:
+                    pending.append(f"{count} manual verification task(s) open: " + "; ".join(titles))
                 continue
             pending.append(str(details.get("action") or details.get("label") or gate["gate_key"]).rstrip("."))
         return pending

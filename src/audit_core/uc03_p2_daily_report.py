@@ -38,21 +38,16 @@ Every figure is read from what Audit Core stores -- nothing is estimated:
   every page now FAILED, and every file that failed before it was split,
   with the reason, the attempts, when it was uploaded and failed (the
   page's last DOCUMENT_STATUS_CHANGED to FAILED) and a link that opens it;
-- delivery files closed (2026-11-02, ``delivery_files_closed``): "a delivery
-  file is closed when all mandatory documents are uploaded and all the
-  document-related tasks are closed by the PC". A Journey counts when it has
-  a delivery (a ``p2_document_queue`` page with business_stage DELIVERY), no
-  open PC document task (``p2_tasks`` on the Task Queue's Documents tab,
-  assigned to the PC role or to the Journey's PC) and no open DOCUMENT_MISSING
-  task, and every document its stored DELIVERY REQUIRED_DOCUMENTS gate
-  (``p2_stage_gate_state``) still lists as missing has its DOCUMENT_MISSING
-  task closed (the PC's "Document uploaded" / "Document not required to be
-  uploaded"). A mandatory document with no such task (the invoice, insurance,
-  dealer statement, receipt) must be in. It closed at the later of the last
-  such task closing (verified / action completed / cancelled) and the last
-  delivery page uploaded; it counts on that day, under the Journey's PC
-  (``journeys.created_by_actor_id``), with the list of files. No delivery
-  stage is ever marked complete, so stage completion is not used.
+- delivery files closed (``delivery_files_closed``): one closure rule everywhere
+  (product owner 2026-11-27) -- a delivery file is closed when its mandatory
+  documents are uploaded and the manual verification tasks
+  are closed. The stage engine decides it and records it on the Journey's
+  Delivery stage (``journey_stage_states.business_completed_at_utc``); this
+  report reads that record, as the Team Lead screen's Closed does, and counts
+  the file on the day it closed, under the Journey's PC
+  (``journeys.created_by_actor_id``), with the list of files. (From 2026-11-02
+  to 2026-11-27 it worked the rule out on its own, without the manual
+  verification tasks, and disagreed with the screen.)
 
 Day boundaries are the Project's own timezone. Known gaps, stated in the
 response rather than guessed: the actor of a journey Re-sync is not stored,
@@ -218,10 +213,9 @@ def _journey_names(connection: Connection, *, tenant_id: str) -> dict[str, str]:
 _WORK_NOTE = ("Work done counts what people did on tasks that day (comments, reviews, uploads, closing). The "
               "system's own task updates are not work. Tasks closed = worked by that person and closed on the day. "
               "A Team Lead's name is not stored with the task, so the account id shows unless a name is known.")
-_CLOSED_NOTE = ("Delivery files closed: journeys with a delivery upload whose mandatory delivery documents are in "
-                "(or whose 'Upload the ...' task the PC closed) and whose document tasks are all closed, counted on "
-                "the day the last of those closed (or the last delivery page was uploaded), under the journey's PC. "
-                "A task reopened later takes the file out until it closes again.")
+_CLOSED_NOTE = ("Delivery files closed: deliveries (the vehicle's VIN or chassis on the Journey) whose mandatory documents are "
+                "uploaded and whose manual verification tasks are closed -- the same rule and record as Closed on the "
+                "Team Lead screen -- counted on the day the file closed, under the journey's PC.")
 
 
 def build_daily_work_report(
@@ -928,82 +922,40 @@ def delivery_files_closed(
     connection: Connection, *, tenant_id: str, actor_id: str, start: datetime, end: datetime,
     names: dict[str, str], whole_project: bool = False,
 ) -> dict[str, Any]:
-    """The delivery files (Journeys) that closed in [start, end), per PC, with
-    the list of files (product owner 2026-11-02: "a delivery file is closed
-    when all mandatory documents are uploaded and all the document-related
-    tasks are closed by the PC"). The rule is in the module docstring. One
-    statement for the whole Project, within the reader's dealers and
-    outlets; a file counts on the day it last closed, so a file whose task
-    is reopened drops out and counts again on the day it closes again. A
-    Journey the stage engine has not evaluated yet (no stored DELIVERY
-    REQUIRED_DOCUMENTS gate) is not counted. ``whole_project``: every outlet of the
-    Project (an administrator, who holds no business assignment; the Project
-    Tracker, 2026-11-07)."""
-    # The Task Queue's Documents tab (uc03_p2_tasks.task_queue_tab), in SQL.
-    from audit_core.uc03_p2_tasks import (
-        _DOCUMENT_CATEGORIES,
-        _DOCUMENT_TASKS,
-        _MANUAL_VERIFICATION_TASKS,
-    )
+    """The delivery files (Journeys) that closed in [start, end), per PC, with the list of files.
 
+    One closure rule everywhere (product owner 2026-11-27: "we shouldnt have different rules
+    applied"): a delivery file is closed when its mandatory documents are uploaded and the PC's
+    manual verification tasks are closed. The stage engine decides it once
+    (uc03_p2_stage.recompute_journey_stage) and records it on the Journey's Delivery stage; this
+    reads that record, the same one the Team Lead screen's Closed reads, and counts the file on the
+    day it closed. Until then this report worked the 2 Nov rule out on its own (documents and
+    document tasks, with no manual verification task) and the two disagreed: of November's 807
+    deliveries 97 were closed on the screen and 109 here, 78 of them the same files.
+
+    One statement for the whole Project, within the reader's dealers and outlets.
+    ``whole_project``: every outlet of the Project (an administrator, who holds no business
+    assignment; the Project Tracker, 2026-11-07)."""
     rows = connection.execute(
         text(
             f"""
-            WITH delivery AS (
-              SELECT q.journey_id, MAX(q.created_at_utc) AS last_upload
-              FROM auditcore.p2_document_queue q
-              WHERE q.tenant_id=:t AND q.business_stage='DELIVERY'
-              GROUP BY q.journey_id
-            ),
-            doc_tasks AS (
-              SELECT tk.journey_id,
-                     bool_or(tk.task_status <> ALL(:closed)) AS any_open,
-                     MAX(COALESCE(tk.verified_at_utc, tk.action_completed_at_utc, tk.updated_at_utc))
-                       FILTER (WHERE tk.task_status = ANY(:closed)) AS last_closed
-              FROM auditcore.p2_tasks tk
-              JOIN delivery dv ON dv.journey_id=tk.journey_id
-              JOIN auditcore.journeys j ON j.tenant_id=tk.tenant_id AND j.journey_id=tk.journey_id
-              WHERE tk.tenant_id=:t
-                AND (tk.task_type='DOCUMENT_MISSING'
-                     OR ((tk.task_type = ANY(:doc_types) OR tk.category = ANY(:doc_categories))
-                         AND tk.task_type <> ALL(:mv_types) AND tk.category <> 'CORRECTION_APPROVAL'
-                         AND (upper(tk.assigned_role_code)='PC' OR tk.assigned_actor_id=j.created_by_actor_id)))
-              GROUP BY tk.journey_id
-            )
             SELECT j.journey_id, j.journey_reference, j.created_by_actor_id AS pc_actor_id,
                    auditcore.shown_name(c.legal_name, c.display_name) AS customer_name,
                    d.dealer_name, j.outlet_id, o.outlet_name, o.outlet_code,
-                   GREATEST(dv.last_upload, dt.last_closed) AS closed_at
-            FROM delivery dv
-            JOIN auditcore.journeys j ON j.tenant_id=:t AND j.journey_id=dv.journey_id
-            JOIN auditcore.p2_stage_gate_state g
-              ON g.tenant_id=j.tenant_id AND g.journey_id=j.journey_id
-             AND g.stage_code='DELIVERY' AND g.gate_key='REQUIRED_DOCUMENTS'
-            LEFT JOIN doc_tasks dt ON dt.journey_id=dv.journey_id
+                   st.business_completed_at_utc AS closed_at
+            FROM auditcore.journey_stage_states st
+            JOIN auditcore.journeys j ON j.tenant_id=st.tenant_id AND j.journey_id=st.journey_id
             LEFT JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
             LEFT JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
             LEFT JOIN auditcore.dealer_outlets o
               ON o.tenant_id=j.tenant_id AND o.dealer_id=j.dealer_id AND o.outlet_id=j.outlet_id
-            WHERE NOT COALESCE(dt.any_open, false)
-              AND GREATEST(dv.last_upload, dt.last_closed) >= :s
-              AND GREATEST(dv.last_upload, dt.last_closed) < :e
-              -- Every mandatory delivery document still missing has its
-              -- "Upload the ..." task closed by the PC; one with no such task
-              -- (invoice, insurance, dealer statement, receipt) must be in.
-              AND NOT EXISTS (
-                SELECT 1 FROM jsonb_array_elements(COALESCE(g.details->'missing', '[]'::jsonb)) m
-                WHERE NOT EXISTS (
-                  SELECT 1 FROM auditcore.p2_tasks mt
-                  WHERE mt.tenant_id=j.tenant_id AND mt.journey_id=j.journey_id
-                    AND mt.task_type='DOCUMENT_MISSING' AND mt.task_status='VERIFIED_COMPLETE'
-                    AND mt.reference->>'requirementKey' = m->>'key'))
+            WHERE st.tenant_id=:t AND st.stage_code='DELIVERY'
+              AND st.business_completed_at_utc >= :s AND st.business_completed_at_utc < :e
               AND {"true" if whole_project else _SCOPE}
             ORDER BY closed_at
             """
         ),
-        {"t": tenant_id, "actor_id": actor_id, "s": start, "e": end, "closed": list(_CLOSED_TASK_STATUSES),
-         "doc_types": sorted(_DOCUMENT_TASKS), "doc_categories": sorted(_DOCUMENT_CATEGORIES),
-         "mv_types": sorted(_MANUAL_VERIFICATION_TASKS)},
+        {"t": tenant_id, "actor_id": actor_id, "s": start, "e": end},
     ).mappings().all()
     by_pc: dict[str, dict[str, Any]] = {}
     files: list[dict[str, Any]] = []

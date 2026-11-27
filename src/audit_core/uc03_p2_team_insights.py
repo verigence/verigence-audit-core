@@ -53,19 +53,23 @@ def _blank() -> dict[str, list[int]]:
 
 
 def _delivery_state(connection: Connection, tenant_id: str, now: datetime) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
-    """Every Journey with a delivery upload (its first one, outlet, PC, documents still missing) and
-    the delivery files closed so far (the PC's rule)."""
+    """Every delivery (the one delivery rule, uc03_delivery_start: a page filed under the delivery of
+    a booking is not one; product owner 2026-11-27) with its first delivery upload, outlet, PC and
+    documents still missing, and the delivery files closed so far (the PC's rule)."""
+    from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
     from audit_core.uc03_p2_daily_report import delivery_files_closed
 
-    delivery = {str(r["journey_id"]): dict(r) for r in connection.execute(text("""
-        SELECT q.journey_id, MIN(q.created_at_utc) AS first_upload, j.outlet_id, j.created_by_actor_id AS pc,
+    delivery = {str(r["journey_id"]): dict(r) for r in connection.execute(text(f"""
+        SELECT u.journey_id, u.first_upload, j.outlet_id, j.created_by_actor_id AS pc,
                COALESCE(jsonb_array_length(g.details->'missing'), 0) AS missing
-        FROM auditcore.p2_document_queue q
-        JOIN auditcore.journeys j ON j.tenant_id = q.tenant_id AND j.journey_id = q.journey_id
+        FROM (SELECT q.journey_id, MIN(q.created_at_utc) AS first_upload
+              FROM auditcore.p2_document_queue q
+              WHERE q.tenant_id = :t AND q.business_stage = 'DELIVERY'
+              GROUP BY q.journey_id) u
+        JOIN auditcore.journeys j ON j.tenant_id = :t AND j.journey_id = u.journey_id
         LEFT JOIN auditcore.p2_stage_gate_state g ON g.tenant_id = j.tenant_id AND g.journey_id = j.journey_id
              AND g.stage_code = 'DELIVERY' AND g.gate_key = 'REQUIRED_DOCUMENTS'
-        WHERE q.tenant_id = :t AND q.business_stage = 'DELIVERY'
-        GROUP BY q.journey_id, j.outlet_id, j.created_by_actor_id, g.details
+        WHERE {DELIVERY_STARTED_SQL.format(t=":t", j="u.journey_id")}
     """), {"t": tenant_id}).mappings()}
     closed_ever = delivery_files_closed(connection, tenant_id=tenant_id, actor_id="", names={},
                                         start=datetime(2000, 1, 1, tzinfo=UTC), end=now, whole_project=True)["files"]

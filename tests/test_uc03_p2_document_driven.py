@@ -167,16 +167,10 @@ def _delivery_requirements(journey):
     return reasons, {item["key"]: item for item in items}
 
 
-def test_dealer_insurance_expects_the_debit_note_without_raising_a_task(journey):
-    """Insurance through the dealership is billed to the customer by a debit
-    note, so the debit note is expected and belongs on the Delivery
-    checklist -- but it raises no Document Missing task. The dealership may
-    legitimately not have raised one, and its absence is not itself a
-    finding, so a HIGH overdue card is the wrong weight.
-
-    It was CONDITIONAL on `insuranceByDealer|registrationByDealer`, an OR,
-    so dealer-arranged insurance alone both made it mandatory and raised a
-    HIGH card that cited registration as well."""
+def test_the_debit_note_is_optional_whoever_arranges_the_insurance(journey):
+    """Product owner 2026-11-27: the debit note "can be optional but not mandatory". It was
+    expected (CONDITIONAL on dealer insurance, with no task), and so held the Delivery's
+    mandatory documents open with nothing telling the PC why."""
     add_ready_document(journey, "booking_form", customer_name="A", booking_date="2026-09-01",
                        insurance_by="Dealer")
     _settle(journey)
@@ -185,25 +179,15 @@ def test_dealer_insurance_expects_the_debit_note_without_raising_a_task(journey)
     assert "insuranceByDealer" in reasons
     # the insurance fact says nothing about who registers the vehicle
     assert "registrationByDealer" not in reasons
-
-    # expected on the checklist ...
-    assert items["debit_note"]["required"] is True
-    assert items["debit_note"]["raisesMissingTask"] is False
-    assert items["debit_note"]["conditions"] == ["insuranceByDealer"]
-    # ... and never a task
+    assert items["debit_note"]["required"] is False and items["debit_note"]["requirement"] == "OPTIONAL"
     assert "debit_note" not in missing_document_lines(journey)
-
-
-def test_self_insurance_does_not_expect_the_debit_note_at_all(journey):
-    """Insurance the customer arranged is billed by their own insurer, so
-    the dealership owes no debit note and the entry does not appear."""
-    add_ready_document(journey, "booking_form", customer_name="A", booking_date="2026-09-01",
-                       insurance_by="Self")
-    _settle(journey)
-
-    reasons, items = _delivery_requirements(journey)
-    assert "insuranceByDealer" not in reasons
-    assert "debit_note" not in items
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        gate = connection.execute(text(
+            "SELECT details FROM auditcore.p2_stage_gate_state WHERE tenant_id=:t AND journey_id=:j "
+            "AND stage_code='DELIVERY' AND gate_key='REQUIRED_DOCUMENTS'"),
+            {"t": journey.tenant_id, "j": journey.journey_id}).scalar_one()
+    assert "debit_note" not in [m["key"] for m in gate["missing"]]
 
 
 def test_a_conditional_document_without_the_flag_still_raises_its_task(journey):
@@ -260,13 +244,79 @@ def test_a_task_closes_when_the_evidence_no_longer_applies(journey):
     assert lines["DEALER_STATEMENT"]["taskStatus"] == "READY"
 
 
+def _pc_task(journey, task_type: str, category: str, status: str = "READY"):
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return connection.execute(
+            text("INSERT INTO auditcore.p2_tasks (tenant_id, journey_id, task_type, category, origin_kind, "
+                 "source_type, source_code, title, description, dedupe_key, assigned_role_code, task_status, "
+                 "completion_protocol) VALUES (:t, :j, :type, :category, 'SYSTEM', 'DOCUMENT', :type, 'x', 'x', "
+                 ":k, 'PC', :s, 'MACHINE_VERIFIED') RETURNING task_id"),
+            {"t": journey.tenant_id, "j": journey.journey_id, "type": task_type, "category": category,
+             "k": f"closure-rule-{uuid4().hex}", "s": status}).scalar_one()
+
+
+def test_a_delivery_file_closes_by_the_one_closure_rule(journey):
+    """Product owner 2026-11-27: "we can close a file if all the mandatory documents are uploaded
+    and all manual verification tasks closed", with the vehicle's VIN or chassis number on the
+    Journey; car photos are optional; a missing mandatory document keeps the file open."""
+    _complete_booking(journey)
+    # A mandatory document missing: open, whatever else is done.
+    add_receipt_payment(journey, amount="480000", receipt_number="R2", receipt_date="2026-09-20")
+    _delivery_document(journey, "customer_invoice_dms")
+    held = _settle(journey)
+    assert held["deliveryCompletionState"] == "IN_PROGRESS"
+    assert held["delivery"]["gates"]["REQUIRED_DOCUMENTS"]["passed"] is False
+
+    # Every mandatory document in, a manual verification task open: still open.
+    manual = _pc_task(journey, "PC_CONFIRMATION", "MANUAL_VERIFICATION")
+    _mandatory_delivery_documents(journey)
+    held = _settle(journey)
+    assert held["delivery"]["gates"]["REQUIRED_DOCUMENTS"]["passed"] is True
+    assert held["delivery"]["gates"]["PC_TASKS_CLOSED"]["passed"] is False
+    assert held["stage"] == "DELIVERY_VERIFY_DOCUMENTS" and held["deliveryCompletionState"] == "IN_PROGRESS"
+
+    # That task closed; a document task of the PC (a page to upload again) is open and there are
+    # no pictures of the car: neither holds the file. It closes.
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        connection.execute(text("UPDATE auditcore.p2_tasks SET task_status='VERIFIED_COMPLETE', verified_at_utc=now() "
+                                "WHERE task_id=:id"), {"id": manual})
+    _pc_task(journey, "PC_PAGE_QUALITY_REJECTED", "DOCUMENT_REUPLOAD")
+    closed = _settle(journey)
+    assert closed["delivery"]["gates"]["VEHICLE_PROOF"]["passed"] is False
+    assert closed["stage"] == "DELIVERY_COMPLETE" and closed["deliveryCompletionState"] == "COMPLETE"
+
+
+def test_without_the_vehicles_vin_or_chassis_on_the_journey_nothing_closes(journey):
+    """The VIN or chassis number must be on the Journey (2026-11-27): without it the Journey is a
+    booking (uc03_delivery_start), and no delivery file to close."""
+    _complete_booking(journey)
+    add_receipt_payment(journey, amount="480000", receipt_number="R2", receipt_date="2026-09-20")
+    for template in get_registry().documents.values():
+        if template.stage == "DELIVERY" and template.requirement == "REQUIRED" and template.key != "payment_receipt":
+            document_id = uuid4()
+            add_evidence(journey, di_document_id=document_id, document_type_key=template.key,
+                         process_area="DELIVERY", chassis=None)
+            add_extracted_field(journey, di_document_id=document_id, field_key="marker", value="x",
+                                document_type=template.key, confidence=99.0)
+    result = _settle(journey)
+    assert result["delivery"]["started"] is False
+    assert result["stage"] == "BOOKING_COMPLETE" and result["deliveryCompletionState"] == "IN_PROGRESS"
+
+
 def test_delivery_completes_from_rules_and_waits_for_the_tl_review(journey):
     _complete_booking(journey)
+    _settle(journey)  # the booking is settled when its papers come in, before the delivery's
     _mandatory_delivery_documents(journey)
     result = _settle(journey)
     assert result["bookingCompletionState"] == "COMPLETE"
     assert result["delivery"]["gates"]["REQUIRED_DOCUMENTS"]["passed"] is True
-    assert result["stage"] == "DELIVERY_VERIFY_DOCUMENTS"  # no pictures of the car yet
+    # The one closure rule (product owner 2026-11-27): the vehicle's chassis on file, every
+    # mandatory document uploaded, no manual verification task open -- the file is closed. Car
+    # photos are optional: still asked of the PC below, never holding the file.
+    assert result["stage"] == "DELIVERY_COMPLETE"
+    assert result["delivery"]["gates"]["VEHICLE_PROOF"]["passed"] is False
     assert "DELIVERY_DOCUMENTS_COMPLETE" in result["transitions"]
 
     [photos] = _tasks(journey, "DELIVERY_VEHICLE_PHOTOS_MISSING")
