@@ -22,7 +22,7 @@ jobs:
       PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
       AUDIT_SERVICE: verigence-audit-core
       TENANT: afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572
-      LABEL: closure-payment-2026-11-27
+      LABEL: closure-payment-2026-11-27-commit
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
