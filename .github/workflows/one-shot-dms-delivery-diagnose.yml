@@ -1,0 +1,121 @@
+name: One-shot DMS delivery diagnose (read-only)
+
+# Read-only: why some delivery Journeys show as not in the DMS delivery dump. The deliveries are
+# looked up by short hashes of their OTF and chassis; output is row numbers, dates, outlets and
+# match results only (public repository). Never writes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/dms-delivery-diagnose]
+    paths:
+      - '.github/workflows/one-shot-dms-delivery-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install -e . 'psycopg[binary]>=3.2,<4'
+          npm install --global @railway/cli@5.70.0
+      - name: Reach the live database
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/vars.json
+          url="$(python - <<'PY'
+          import json
+          from urllib.parse import urlparse
+          v = json.load(open('/tmp/vars.json'))
+          for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
+              value = (v.get(key) or '').replace('postgresql+psycopg://', 'postgresql://', 1)
+              host = (urlparse(value).hostname or '').lower()
+              if value and host and not host.endswith('.railway.internal'):
+                  print(value)
+                  break
+          PY
+          )"
+          test -n "$url"
+          echo "::add-mask::$url"
+          echo "DB=$url" >> "$GITHUB_ENV"
+      - name: Deliveries against the DMS delivery dumps, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, os, re
+          from datetime import date
+          from sqlalchemy import create_engine
+          from audit_core.db import set_tenant_context
+          from audit_core.uc03_p2_delivery_dates import deliveries
+          from audit_core.uc03_p2_dms_dumps import dump_window, out_of_scope_model
+          T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
+          ITEMS = [(1, 'b756adb459bb5d70', '01cf74d2b892b8bb'), (2, '6bef7acfab4db07a', '51c9e0faa01e2496'),
+                   (3, 'c0e777c614a73b15', '370e8e35bc05cb4e'), (4, '078c90422dd3d097', '75ba496ce7ea40f9'),
+                   (5, 'dbc9d20058e13fe2', '4fd5bf973a6c9624'), (6, 'efb56f92fb9414b4', '80146e7bb220ccf0'),
+                   (7, 'ff96167a8c11d02d', '610c362786838a1f')]
+          h = lambda s: hashlib.sha256(s.encode()).hexdigest()[:16]
+          otf = lambda v: h(re.sub(r"\D", "", str(v or ""))) if v else None
+          vin8 = lambda v: h(re.sub(r"[^A-Z0-9]", "", str(v or "").upper())[-8:]) if v else None
+          e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
+          with e.connect() as c:
+              c.exec_driver_sql("SET TRANSACTION READ ONLY")
+              set_tenant_context(c, T)
+              today = date(2026, 11, 27)
+              dealers = {str(r[0]): r[1] for r in c.exec_driver_sql("SELECT dealer_id, dealer_name FROM auditcore.dealers WHERE tenant_id=%(t)s", {"t": T})}
+              outlets = {str(r[0]): r[1] for r in c.exec_driver_sql("SELECT outlet_id, outlet_name FROM auditcore.dealer_outlets WHERE tenant_id=%(t)s", {"t": T})}
+              dels = {}
+              for d in dealers:
+                  dels.update(deliveries(c, tenant_id=T, today=today, dealer_id=d))
+              refs = {}
+              for r in c.exec_driver_sql("""SELECT j.journey_id, f.effective_value #>> '{}' AS v FROM auditcore.journeys j
+                     JOIN auditcore.journey_document_extracted_fields f ON f.tenant_id=j.tenant_id AND f.journey_id=j.journey_id
+                     WHERE j.tenant_id=%(t)s AND f.field_key IN ('booking_number','otf_number','order_number','booking_reference')""", {"t": T}):
+                  if r[1]:
+                      refs.setdefault(otf(r[1]), set()).add(str(r[0]))
+              rows = c.exec_driver_sql("""SELECT r.*, u.business_date, u.period_month, u.dealer_id AS dump_dealer, u.created_at_utc AS uploaded
+                     FROM auditcore.p2_dms_dump_rows r JOIN auditcore.p2_dms_dumps u ON u.tenant_id=r.tenant_id AND u.dump_id=r.dump_id
+                     WHERE r.tenant_id=%(t)s""", {"t": T}).mappings().all()
+              last = c.exec_driver_sql("""SELECT u.dealer_id, u.dump_kind, max(u.business_date) AS day, count(*) AS dumps
+                     FROM auditcore.p2_dms_dumps u WHERE u.tenant_id=%(t)s GROUP BY 1, 2""", {"t": T}).mappings().all()
+              c.rollback()
+          for r in last:
+              print("DUMPS", dealers.get(str(r["dealer_id"])), r["dump_kind"], "latest", r["day"], "count", r["dumps"])
+          for idx, ho, hv in ITEMS:
+              mine = [d for d in dels.values() if d.chassis and vin8(d.chassis) == hv] or \
+                     [dels[j] for j in refs.get(ho, set()) if j in dels]
+              print(f"--- {idx}: journeys found {len(mine)}")
+              for d in mine:
+                  print(f"  JOURNEY dealer={dealers.get(d.dealer_id)} outlet={outlets.get(d.outlet_id or '')} dated_by={d.source} "
+                        f"days={[str(x) for x in d.days]} model_out_of_scope={out_of_scope_model(d.model)} deal={d.deal_type} "
+                        f"chassis_on_file={bool(d.chassis)} chassis_matches={bool(d.chassis) and vin8(d.chassis) == hv}")
+              ids = {d.journey_id for d in mine}
+              hits = [r for r in rows if (r["chassis"] and vin8(r["chassis"]) == hv)
+                      or otf(r["booking_number"]) == ho or otf(r["dms_booking_number"]) == ho]
+              by_kind = {}
+              for r in hits:
+                  by_kind.setdefault(r["dump_kind"], []).append(r)
+              for kind, rs in by_kind.items():
+                  rs.sort(key=lambda r: r["business_date"])
+                  r = rs[-1]
+                  print(f"  DMS {kind}: rows {len(rs)} in dumps {sorted({str(x['business_date']) for x in rs})}; latest: "
+                        f"dump_dealer={dealers.get(str(r['dump_dealer']))} event_date={r['event_date']} outlet_mapped={outlets.get(str(r['outlet_id'])) if r['outlet_id'] else None} "
+                        f"outcome={r['outcome']} basis={r['match_basis']} matched_this_journey={str(r['journey_id']) in ids} "
+                        f"matched_other_journey={bool(r['journey_id']) and str(r['journey_id']) not in ids} "
+                        f"chassis_same={bool(r['chassis']) and vin8(r['chassis']) == hv} otf_same={otf(r['booking_number']) == ho or otf(r['dms_booking_number']) == ho} "
+                        f"window={dump_window(r['period_month'], r['business_date'])}")
+              if not hits:
+                  print("  DMS: no row in any dump carries this chassis or OTF")
+          PY
