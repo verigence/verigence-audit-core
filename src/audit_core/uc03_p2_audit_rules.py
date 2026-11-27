@@ -1096,6 +1096,66 @@ def _not_counted(facts: _Facts) -> list[dict[str, Any]]:
     return out
 
 
+# The form's own arithmetic agrees within this (uc03_statement_totals.ADDS_UP_TOLERANCE).
+_FORM_ADDS_UP = Decimal(10)
+
+
+def _total_receipts_to_confirm(fields: dict[str, Any], read: Any) -> dict[str, Any] | None:
+    """For an NDC form that prints no net value but a Total Cost and Total Receipts (Utkal's
+    "Final Vehicle Accounts Statement"): the money the form shows received, to set the money
+    received against (product owner 2026-11-27: "for utkal you use total receipts for
+    confirmation"). None when the form prints neither.
+
+    The form's Total Receipts is not money alone. Read only on live, 27 Nov, of 576 such NDCs:
+    on 315 it is the payment lines (the money receipts, the financier's D/O) PLUS the discount
+    rows -- the form lists its discounts on the receipts side -- with the old vehicle's value in
+    27 of them; on 129 the payment lines alone (151 carry no discount); on 132 it agrees with
+    neither. A discount is not money received, so it comes off -- only where the form's own
+    figures show it inside the total. Where the rows do not add up to the total either way, the
+    reading is in doubt: ``held`` says so and the rule raises no finding (one cause, one task: the
+    rows that do not add up), while the closure gate still compares the money receipts uploaded
+    with the printed total less the discount rows."""
+    from audit_core.uc03_account_statement import _amount
+
+    cost, printed = _amount(fields.get("total_cost")), _amount(fields.get("total_receipts"))
+    if cost is None or cost <= 0 or printed is None or printed <= 0:
+        return None
+    given = sum(read.discounts.values(), Decimal(0))
+    old = read.old_vehicle_value or Decimal(0)
+    loan = read.financer or Decimal(0)
+    lines = sum((amount for _, amount in read.received), Decimal(0))
+    # The financier's payment listed among the received lines too is one payment (uc03_ledger_receipts).
+    listed = bool(loan) and any(abs(amount - loan) <= 1 for _, amount in read.received)
+    money_lines = lines if listed else lines + loan
+
+    def agrees(*inside: Decimal) -> bool:
+        return abs(printed - money_lines - sum(inside, Decimal(0))) <= _FORM_ADDS_UP
+
+    held = None
+    if agrees() or (old > 0 and agrees(old)):
+        discounts_inside, old_inside = Decimal(0), not agrees()
+    elif given > 0 and (agrees(given) or (old > 0 and agrees(given, old))):
+        discounts_inside, old_inside = given, not agrees(given)
+    else:
+        # The form's own rows do not add up to its total: a row of it was misread. The rule
+        # raises no finding on such a reading (``held``). For closing a file the comparison is
+        # still made (product owner 2026-11-27: the money receipts uploaded against the NDC's
+        # Total Receipts, not the NDC against itself): the printed total and the discount rows
+        # are enough, by the form's convention -- its discounts are counted in Total Receipts.
+        discounts_inside, old_inside = given, True
+        held = (f"The account statement prints no net value, and its payment lines as read "
+                f"({_rupees(money_lines)}) do not add up to the Total Receipts it prints "
+                f"({_rupees(printed)}). The money is compared once its reading is corrected.")
+    # The Deal counts the old vehicle taken in kind as money received: on the form's side too.
+    money = printed - discounts_inside + (old if old > 0 and not old_inside else Decimal(0))
+    how = "the Total Receipts printed on the account statement"
+    if discounts_inside:
+        how += f" ({_rupees(printed)}) less the discounts counted in it ({_rupees(discounts_inside)})"
+    if old > 0 and not old_inside:
+        how += f" with the old vehicle's value ({_rupees(old)})"
+    return {"money": money, "printed": printed, "discounts": discounts_inside, "how": how, "held": held}
+
+
 def _receipts_equal_statement(facts: _Facts, *, judged_now: bool = False) -> RuleOutcome:
     """MAHINDRA ORISSA (product owner, 2026-10-26): the receipts are compared
     with the net value / final price printed on the dealer's account
@@ -1131,8 +1191,17 @@ def _receipts_equal_statement(facts: _Facts, *, judged_now: bool = False) -> Rul
             "the receipts are compared once they are cleared."
         ))
     billed = statement_total(document["fields"], read)
+    by_receipts: dict[str, Any] | None = None
     if billed is None:
-        return RuleOutcome(code, "SKIPPED", "The account statement shows no net value or final price.")
+        # A form that prints no net value: Total Cost, Total Receipts and a balance (Utkal's
+        # "Final Vehicle Accounts Statement"). Product owner 2026-11-27: "for utkal you use total
+        # receipts for confirmation".
+        by_receipts = _total_receipts_to_confirm(document["fields"], read)
+        if by_receipts is None:
+            return RuleOutcome(code, "SKIPPED", "The account statement shows no net value or final price.")
+        if by_receipts.get("held") and not judged_now:
+            return RuleOutcome(code, "SKIPPED", str(by_receipts["held"]))
+        billed = by_receipts["money"]
     # The NDC prints its discounts among the credits, beside the money received, and its
     # net value as the charges alone (2026-11-23, ADI-RD-261101-051: charges Rs 11,86,208 =
     # the printed net value; "CASH DISCOUNT Rs 3,000" in the credits; Total Receipts
@@ -1142,7 +1211,7 @@ def _receipts_equal_statement(facts: _Facts, *, judged_now: bool = False) -> Rul
     printed = billed
     given = sum(read.discounts.values(), Decimal(0))
     charges = sum(read.components.values(), Decimal(0))
-    less_discounts = (given > 0 and abs(printed - charges) <= _INVOICE_TOLERANCE
+    less_discounts = (by_receipts is None and given > 0 and abs(printed - charges) <= _INVOICE_TOLERANCE
                       and abs(printed - (charges - given)) > _INVOICE_TOLERANCE)
     if less_discounts:
         billed = printed - given
@@ -1171,8 +1240,13 @@ def _receipts_equal_statement(facts: _Facts, *, judged_now: bool = False) -> Rul
     refund_text = f" less {_rupees(refunded)} refunded" if refunded else ""
     how = ("the net value printed on the account statement (" + _rupees(printed) + ") less the discounts it "
            "prints (" + _rupees(given) + ")" if less_discounts else "the net value printed on the account statement")
-    details = {"statementTotal": str(billed), "statementNetPrinted": str(printed),
-               "statementDiscounts": str(given) if less_discounts else None,
+    if by_receipts is not None:
+        how = by_receipts["how"]
+    details = {"statementTotal": str(billed), "statementNetPrinted": str(printed) if by_receipts is None else None,
+               "statementTotalReceiptsPrinted": str(by_receipts["printed"]) if by_receipts is not None else None,
+               "comparedWith": "TOTAL_RECEIPTS" if by_receipts is not None else "NET_VALUE",
+               "statementDiscounts": (str(given) if less_discounts else
+                                      str(by_receipts["discounts"]) if by_receipts and by_receipts["discounts"] else None),
                "statementReceivedLines": str(read.receipts),
                "received": str(received), "refunded": str(refunded), "difference": str(gap),
                "receipts": str(money.get("receipts")), "loan": str(money.get("loan")),
@@ -1232,17 +1306,26 @@ def receipts_equal_invoices(facts: _Facts, *, judged_now: bool = False) -> RuleO
     ), {**details, "findingTitle": "Receipts do not equal the invoices"})
 
 
+# For closing a file the money may be more than the NDC, or short of it by less than this
+# (product owner 2026-11-27: "short by less than Rs 100, and more than NDC is ok").
+CLOSURE_SHORT_ALLOWED = Decimal(100)
+
+
 def money_equals_what_is_billed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     """For the stage engine's closure gate (product owner 2026-11-27: "Money receipts of dealership
     should be present and it should be equal to the sum of the NDC total... then it should be
-    marked closed"): the dealership's payment receipts are on file, and the money received equals
+    marked closed"): the dealership's payment receipts are on file, and the money received covers
     what the customer was billed -- the NDC where the account statement is the source of truth
-    (Mahindra Orissa), the invoices elsewhere.
+    (Mahindra Orissa; its net value, or its Total Receipts on a form that prints none), the
+    invoices elsewhere.
 
     The one comparison of RECEIPTS_EQUAL_INVOICES, judged now: the rule waits for the settlement
     window before it raises a finding; a file whose money already agrees need not wait to close.
-    ``passed`` only on its PASS; anything it cannot compare yet (no NDC read, lines in doubt, no
-    net value printed, the loan amount not on file) keeps the file open, with the rule's reason."""
+    For closing, money more than the NDC is accepted, and so is a shortfall under
+    CLOSURE_SHORT_ALLOWED ("short by less than Rs 100, and more than NDC is ok"); the rule's own
+    finding on such a difference is unchanged. Anything the rule cannot compare yet (no NDC read,
+    lines in doubt, no total printed, the loan amount not on file) keeps the file open, with the
+    rule's reason."""
     facts = _Facts(connection, tenant_id, journey_id)
     receipts = len(facts.receipts)
     if not receipts:
@@ -1250,9 +1333,17 @@ def money_equals_what_is_billed(connection: Connection, *, tenant_id: str, journ
                 "reason": "No payment receipt of the dealership is on file."}
     outcome = receipts_equal_invoices(facts, judged_now=True)
     details = outcome.details or {}
-    return {"passed": outcome.outcome == "PASS", "state": outcome.outcome, "receiptCount": receipts,
-            "reason": outcome.reason,
-            **{key: details[key] for key in ("statementTotal", "invoiced", "received", "difference") if key in details}}
+    difference = _dec(details.get("difference"))
+    accepted = outcome.outcome != "PASS" and difference is not None and difference > -CLOSURE_SHORT_ALLOWED
+    reason = outcome.reason
+    if accepted:
+        reason = (f"{reason} Accepted for closing the file: "
+                  + ("more than billed." if difference > 0
+                     else f"short by less than {_rupees(CLOSURE_SHORT_ALLOWED)}."))
+    return {"passed": outcome.outcome == "PASS" or accepted,
+            "state": "ACCEPTED" if accepted else outcome.outcome, "receiptCount": receipts, "reason": reason,
+            **{key: details[key] for key in ("statementTotal", "invoiced", "received", "difference", "comparedWith")
+               if details.get(key) is not None}}
 
 
 def _late_receipts(facts: _Facts, start: date, end: date | None) -> list[dict[str, Any]]:

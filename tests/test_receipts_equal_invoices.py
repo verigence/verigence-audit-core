@@ -217,4 +217,33 @@ def test_the_closure_gate_judges_the_same_comparison_without_the_settlement_wait
     with journey.engine.begin() as connection:
         set_tenant_context(connection, journey.tenant_id)
         equal = rules.money_equals_what_is_billed(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
-    assert equal["passed"] is True and equal["receiptCount"] == 3
+    assert equal["passed"] is True and equal["receiptCount"] == 3 and equal["state"] == "PASS"
+
+
+def _gate_with_last_receipt(journey, amount: str) -> dict:
+    _bill(journey)  # Rs 5,15,000
+    _delivered(journey, days_ago=30)
+    add_receipt_payment(journey, amount="11000", receipt_number="R-1", receipt_date="2026-09-01")
+    add_receipt_payment(journey, amount="400000", receipt_number="R-2", receipt_date="2026-09-20")
+    add_receipt_payment(journey, amount=amount, receipt_number="R-3", receipt_date="2026-09-21")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        return rules.money_equals_what_is_billed(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+
+def test_for_closing_a_shortfall_under_a_hundred_rupees_is_accepted(journey):
+    """Product owner 2026-11-27: "short by less than Rs 100, and more than NDC is ok". The rule's
+    own finding on the difference is unchanged."""
+    gate = _gate_with_last_receipt(journey, "103901")  # short by 99
+    assert gate["passed"] is True and gate["state"] == "ACCEPTED" and "short by less than" in gate["reason"]
+    assert _check(journey).outcome == "FAIL"
+
+
+def test_for_closing_a_shortfall_of_a_hundred_rupees_or_more_is_not(journey):
+    gate = _gate_with_last_receipt(journey, "103900")  # short by 100
+    assert gate["passed"] is False and gate["state"] == "FAIL"
+
+
+def test_for_closing_money_more_than_billed_is_accepted(journey):
+    gate = _gate_with_last_receipt(journey, "154000")  # 50,000 more
+    assert gate["passed"] is True and gate["state"] == "ACCEPTED" and "more than billed" in gate["reason"]
