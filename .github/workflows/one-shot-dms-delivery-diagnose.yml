@@ -116,6 +116,22 @@ jobs:
                         f"matched_other_journey={bool(r['journey_id']) and str(r['journey_id']) not in ids} "
                         f"chassis_same={bool(r['chassis']) and vin8(r['chassis']) == hv} otf_same={otf(r['booking_number']) == ho or otf(r['dms_booking_number']) == ho} "
                         f"window={dump_window(r['period_month'], r['business_date'])}")
+              # The Journey a row is matched to: its documents, delivery file and Deal Type.
+              with e.connect() as c2:
+                  c2.exec_driver_sql("SET TRANSACTION READ ONLY")
+                  set_tenant_context(c2, T)
+                  for jid in sorted({str(r["journey_id"]) for r in hits if r["journey_id"]}):
+                      x = c2.exec_driver_sql("""SELECT cl.deal_type, cl.deal_type_basis, o.outlet_name, j.created_at_utc::date AS created,
+                             (SELECT string_agg(e.document_type_key || ':' || e.association_status, ', ' ORDER BY e.document_type_key)
+                                FROM auditcore.evidence e WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id) AS docs
+                             FROM auditcore.journeys j
+                             LEFT JOIN auditcore.journey_classifications cl ON cl.tenant_id=j.tenant_id AND cl.journey_id=j.journey_id
+                             LEFT JOIN auditcore.dealer_outlets o ON o.tenant_id=j.tenant_id AND o.outlet_id=j.outlet_id
+                             WHERE j.tenant_id=%(t)s AND CAST(j.journey_id AS text)=%(j)s""", {"t": T, "j": jid}).mappings().first()
+                      print(f"  MATCHED JOURNEY outlet={x['outlet_name']} created={x['created']} deal={x['deal_type']} basis={x['deal_type_basis']} in_deliveries={jid in dels}")
+                      print(f"    DOCS {x['docs']}")
+                      print(f"    DMS deal type in dump row: {hits[-1].get('deal_type')}")
+                  c2.rollback()
               if not hits:
                   print("  DMS: no row in any dump carries this chassis or OTF")
           PY
