@@ -41,6 +41,19 @@ with engine.connect() as c:
         "WITH " + SCOPED_SQL + " SELECT CAST(s.journey_id AS text) AS id, s.is_closed FROM scoped s"), params).mappings()}
     print(f"Diagnose November deliveries: {len(november)} | closed now: {sum(november.values())}")
 
+    print("Diagnose stage recomputes in the queue:", j({r[0]: r[1] for r in c.execute(text(
+        "SELECT work_status, count(*) FROM auditcore.p2_work_queue WHERE tenant_id=:t AND work_type='STAGE_RECOMPUTE' "
+        "AND updated_at_utc > now() - interval '3 hours' GROUP BY 1"), {"t": T})}))
+    print("Diagnose delivery files closed, whole project:", c.execute(text(
+        "SELECT count(*) FROM auditcore.journey_stage_states WHERE tenant_id=:t AND stage_code='DELIVERY' "
+        "AND business_completed_at_utc IS NOT NULL"), {"t": T}).scalar_one(),
+        "| closed in the last 3 hours:", c.execute(text(
+        "SELECT count(*) FROM auditcore.journey_stage_states WHERE tenant_id=:t AND stage_code='DELIVERY' "
+        "AND business_completed_at_utc > now() - interval '3 hours'"), {"t": T}).scalar_one())
+    print("Diagnose open TL delivery review tasks:", c.execute(text(
+        "SELECT count(*) FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_type='DELIVERY_REVIEW' "
+        "AND task_status <> ALL(:closed)"), {"t": T, "closed": list(OPEN)}).scalar_one())
+
     # Every open delivery of the Project (the job's own scope).
     deliveries = {r["id"]: r["booking"] for r in c.execute(text(f"""
         SELECT CAST(j.journey_id AS text) AS id, r.booking_completion_state AS booking
