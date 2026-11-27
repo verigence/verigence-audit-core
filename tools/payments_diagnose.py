@@ -1,39 +1,40 @@
-"""Read-only: how the deliveries stand on "receipts equal the NDC" (the rule's own stored answer),
-closed and open. Counts only; no customer details, no journey references."""
+"""Read-only: why the NDC gives no net value on so many deliveries, by dealership, and what the
+closure gate of 27 Nov says. Counts and printed row names only; no customer details, no references."""
 from __future__ import annotations
 
 import json
 import os
 import re
-from collections import Counter
+import time
+from collections import Counter, defaultdict
+from decimal import Decimal
 
 from sqlalchemy import create_engine, text
 
+from audit_core import uc03_p2_audit_rules as rules
 from audit_core.db import set_tenant_context
+from audit_core.uc03_account_statement import (
+    KIND_FORM,
+    combine_statements,
+    line_rows,
+    load_ledger_documents,
+    statement_kind,
+    statement_total,
+)
 from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
 
 T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
 engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=300000"})
+TOTALISH = re.compile(r"TOTAL|NET|PRICE|GRAND|PAYABLE|RECEIVABLE|ON ?ROAD|FINAL|BALANCE")
 
 
 def j(value):
     return json.dumps(value, default=str, sort_keys=True)
 
 
-def why(status: str, reason: str) -> str:
-    reason = reason or ""
-    if status == "PASS":
-        return "PASS (receipts equal the NDC)"
-    if status == "FAIL":
-        return "FAIL: short of the NDC" if "short of" in reason else "FAIL: more than the NDC"
-    for needle, label in (("settlement window", "waiting: settlement window (7 days after delivery)"),
-                          ("No account statement", "no NDC read yet"), ("could not be read with certainty", "NDC lines in doubt"),
-                          ("no net value", "NDC shows no net value"), ("loan amount is not on file", "loan amount not on file"),
-                          ("no payment receipt on file", "waiting: receipts the NDC shows are not uploaded"),
-                          ("cannot be", "NDC payments cannot be read"), ("delivery date", "no delivery date")):
-        if needle in reason:
-            return label
-    return f"{status}: other" if status else "not evaluated"
+def label_of(row) -> str:
+    raw = str(row.get("particulars_raw") or row.get("label") or row.get("particulars") or "")
+    return re.sub(r"\s+", " ", re.sub(r"[^A-Za-z+()/& ]", " ", raw)).strip().upper()[:40]
 
 
 with engine.connect() as c:
@@ -41,43 +42,83 @@ with engine.connect() as c:
     set_tenant_context(c, T)
     print("Diagnose stage recomputes in the queue:", j({r[0]: r[1] for r in c.execute(text(
         "SELECT work_status, count(*) FROM auditcore.p2_work_queue WHERE tenant_id=:t AND work_type='STAGE_RECOMPUTE' "
-        "AND updated_at_utc > now() - interval '90 minutes' GROUP BY 1"), {"t": T})}))
+        "AND updated_at_utc > now() - interval '3 hours' GROUP BY 1"), {"t": T})}))
+    print("Diagnose delivery files closed, whole project:", c.execute(text(
+        "SELECT count(*) FROM auditcore.journey_stage_states WHERE tenant_id=:t AND stage_code='DELIVERY' "
+        "AND business_completed_at_utc IS NOT NULL"), {"t": T}).scalar_one())
     rows = c.execute(text(f"""
-        SELECT CAST(j.journey_id AS text) AS id,
-               COALESCE(r.delivery_completion_state, '') = 'COMPLETE' AS closed,
-               st.business_completed_at_utc > now() - interval '6 hours' AS closed_today,
-               cs.control_status AS status, cs.details->>'reason' AS reason, cs.details->>'difference' AS difference,
-               to_jsonb(cs) AS raw
+        SELECT j.journey_id, d.dealer_name, COALESCE(r.delivery_completion_state, '') = 'COMPLETE' AS closed
         FROM auditcore.journeys j
+        LEFT JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
         LEFT JOIN auditcore.p2_journey_runtime r ON r.tenant_id=j.tenant_id AND r.journey_id=j.journey_id
-        LEFT JOIN auditcore.journey_stage_states st ON st.tenant_id=j.tenant_id AND st.journey_id=j.journey_id
-             AND st.stage_code='DELIVERY'
-        LEFT JOIN auditcore.p2_control_state cs ON cs.tenant_id=j.tenant_id AND cs.journey_id=j.journey_id
-             AND cs.control_code='RECEIPTS_EQUAL_INVOICES'
         WHERE j.tenant_id=:t AND {DELIVERY_STARTED_SQL.format(t=":t", j="j.journey_id")}"""), {"t": T}).mappings().all()
-    print("Diagnose deliveries, whole project:", len(rows), "| closed:", sum(1 for r in rows if r["closed"]),
-          "| closed in the last 6 hours:", sum(1 for r in rows if r["closed_today"]))
-    sample = next((r["raw"] for r in rows if r["raw"]), None)
-    if sample:
-        print("Diagnose control state columns:", sorted(k for k in sample if k not in ("journey_id", "tenant_id")))
-        reason_key = next((k for k in ("status_reason", "reason") if k in sample), None)
-    else:
-        reason_key = None
+    print("Diagnose deliveries:", len(rows))
 
-    def reason_of(r):
-        raw = r["raw"] or {}
-        return str(raw.get(reason_key) or r["reason"] or "") if reason_key else str(r["reason"] or "")
+    by_dealer = defaultdict(Counter)
+    labels = defaultdict(Counter)
+    net_field = defaultdict(Counter)
+    fallback = defaultdict(Counter)
+    started = time.monotonic()
+    compared = 0
+    for row in rows:
+        dealer = str(row["dealer_name"] or "?").split()[0]
+        forms = []
+        for document in load_ledger_documents(c, tenant_id=T, journey_id=row["journey_id"]):
+            lines = line_rows(document["fields"].get("line_items"))
+            if statement_kind(lines) == KIND_FORM:
+                forms.append((document, lines))
+        if not forms:
+            by_dealer[dealer]["no NDC read"] += 1
+            continue
+        read, copies = combine_statements(forms)
+        document = copies.primary
+        if read is None or document is None:
+            by_dealer[dealer]["no NDC read"] += 1
+            continue
+        total = statement_total(document["fields"], read)
+        if total is not None:
+            by_dealer[dealer]["net value read"] += 1
+            continue
+        by_dealer[dealer]["NO NET VALUE"] += 1
+        net_field[dealer]["net_value field present" if document["fields"].get("net_value") not in (None, "", "null")
+                          else "no net_value field"] += 1
+        seen = set()
+        for _doc, lines in forms:
+            for line in lines:
+                label = label_of(line)
+                if label and TOTALISH.search(label) and label not in seen:
+                    seen.add(label)
+                    labels[dealer][label] += 1
+        if not seen:
+            labels[dealer]["(no total-like row at all)"] += 1
+        charges = sum(read.components.values(), Decimal(0))
+        given = sum(read.discounts.values(), Decimal(0))
+        if charges <= 0:
+            fallback[dealer]["no charge lines read"] += 1
+            continue
+        if read.conflicts or read.unmapped:
+            fallback[dealer]["lines in doubt"] += 1
+            continue
+        if time.monotonic() - started > 900 or compared >= 400:
+            fallback[dealer]["not compared (time)"] += 1
+            continue
+        compared += 1
+        try:
+            with c.begin_nested():
+                facts = rules._Facts(c, T, row["journey_id"])
+                if facts.money.get("loanUnknown"):
+                    fallback[dealer]["loan amount not on file"] += 1
+                    continue
+                gap = abs(rules._received_in_all(facts) - (charges - given))
+        except Exception as error:  # noqa: BLE001
+            fallback[dealer][f"error {type(error).__name__}"] += 1
+            continue
+        fallback[dealer]["sum of lines: equal (Re 1)" if gap <= 1 else "sum of lines: within Rs 100" if gap <= 100
+                         else "sum of lines: within Rs 1,000" if gap <= 1000 else "sum of lines: differs more"] += 1
 
-    for label, pick in (("closed before today", lambda r: r["closed"] and not r["closed_today"]),
-                        ("closed today by the re-settle", lambda r: r["closed_today"]),
-                        ("open", lambda r: not r["closed"])):
-        part = [r for r in rows if pick(r)]
-        print(f"Diagnose receipts against the NDC, {label} ({len(part)}):",
-              j(Counter(why(str(r["status"] or ""), reason_of(r)) for r in part)))
-    gaps = Counter()
-    for r in rows:
-        if str(r["status"] or "") == "FAIL" and r["difference"]:
-            amount = abs(float(re.sub(r"[^0-9.\\-]", "", r["difference"]) or 0))
-            gaps["up to Rs 100" if amount <= 100 else "Rs 100 to 1,000" if amount <= 1000
-                 else "Rs 1,000 to 10,000" if amount <= 10000 else "above Rs 10,000"] += 1
-    print("Diagnose size of the difference where it fails:", j(gaps))
+    for dealer in sorted(by_dealer):
+        print(f"Diagnose {dealer}:", j(by_dealer[dealer]))
+        if by_dealer[dealer]["NO NET VALUE"]:
+            print(f"Diagnose {dealer} net_value field:", j(net_field[dealer]))
+            print(f"Diagnose {dealer} total-like rows on those NDCs:", j(dict(labels[dealer].most_common(14))))
+            print(f"Diagnose {dealer} money received against the sum of the NDC's lines:", j(fallback[dealer]))
