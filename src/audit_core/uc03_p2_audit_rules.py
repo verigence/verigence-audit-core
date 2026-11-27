@@ -1112,7 +1112,9 @@ def _total_receipts_to_confirm(fields: dict[str, Any], read: Any) -> dict[str, A
     27 of them; on 129 the payment lines alone (151 carry no discount); on 132 it agrees with
     neither. A discount is not money received, so it comes off -- only where the form's own
     figures show it inside the total. Where the rows do not add up to the total either way, the
-    reading is in doubt and nothing is compared (one cause, one task: the rows that do not add up)."""
+    reading is in doubt: ``held`` says so and the rule raises no finding (one cause, one task: the
+    rows that do not add up), while the closure gate still compares the money receipts uploaded
+    with the printed total less the discount rows."""
     from audit_core.uc03_account_statement import _amount
 
     cost, printed = _amount(fields.get("total_cost")), _amount(fields.get("total_receipts"))
@@ -1129,14 +1131,21 @@ def _total_receipts_to_confirm(fields: dict[str, Any], read: Any) -> dict[str, A
     def agrees(*inside: Decimal) -> bool:
         return abs(printed - money_lines - sum(inside, Decimal(0))) <= _FORM_ADDS_UP
 
+    held = None
     if agrees() or (old > 0 and agrees(old)):
         discounts_inside, old_inside = Decimal(0), not agrees()
     elif given > 0 and (agrees(given) or (old > 0 and agrees(given, old))):
         discounts_inside, old_inside = given, not agrees(given)
     else:
-        return {"held": (f"The account statement prints no net value, and its payment lines as read "
-                         f"({_rupees(money_lines)}) do not add up to the Total Receipts it prints "
-                         f"({_rupees(printed)}). The money is compared once its reading is corrected.")}
+        # The form's own rows do not add up to its total: a row of it was misread. The rule
+        # raises no finding on such a reading (``held``). For closing a file the comparison is
+        # still made (product owner 2026-11-27: the money receipts uploaded against the NDC's
+        # Total Receipts, not the NDC against itself): the printed total and the discount rows
+        # are enough, by the form's convention -- its discounts are counted in Total Receipts.
+        discounts_inside, old_inside = given, True
+        held = (f"The account statement prints no net value, and its payment lines as read "
+                f"({_rupees(money_lines)}) do not add up to the Total Receipts it prints "
+                f"({_rupees(printed)}). The money is compared once its reading is corrected.")
     # The Deal counts the old vehicle taken in kind as money received: on the form's side too.
     money = printed - discounts_inside + (old if old > 0 and not old_inside else Decimal(0))
     how = "the Total Receipts printed on the account statement"
@@ -1144,7 +1153,7 @@ def _total_receipts_to_confirm(fields: dict[str, Any], read: Any) -> dict[str, A
         how += f" ({_rupees(printed)}) less the discounts counted in it ({_rupees(discounts_inside)})"
     if old > 0 and not old_inside:
         how += f" with the old vehicle's value ({_rupees(old)})"
-    return {"money": money, "printed": printed, "discounts": discounts_inside, "how": how}
+    return {"money": money, "printed": printed, "discounts": discounts_inside, "how": how, "held": held}
 
 
 def _receipts_equal_statement(facts: _Facts, *, judged_now: bool = False) -> RuleOutcome:
@@ -1190,7 +1199,7 @@ def _receipts_equal_statement(facts: _Facts, *, judged_now: bool = False) -> Rul
         by_receipts = _total_receipts_to_confirm(document["fields"], read)
         if by_receipts is None:
             return RuleOutcome(code, "SKIPPED", "The account statement shows no net value or final price.")
-        if by_receipts.get("held"):
+        if by_receipts.get("held") and not judged_now:
             return RuleOutcome(code, "SKIPPED", str(by_receipts["held"]))
         billed = by_receipts["money"]
     # The NDC prints its discounts among the credits, beside the money received, and its

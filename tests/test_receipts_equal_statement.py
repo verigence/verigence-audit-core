@@ -263,6 +263,18 @@ def test_payment_lines_that_do_not_add_up_to_total_receipts_are_not_compared(jou
     result = _check(journey)
     assert result.outcome == "SKIPPED" and "do not add up to the Total Receipts" in result.reason
 
+    # For closing the file the money receipts uploaded are still set against the NDC's Total
+    # Receipts less its discounts (product owner 2026-11-27): 12,10,000 - 5,000 = 12,05,000.
+    def gate() -> dict:
+        with journey.engine.begin() as connection:
+            set_tenant_context(connection, journey.tenant_id)
+            return rules.money_equals_what_is_billed(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+
+    short = gate()
+    assert short["passed"] is False and D(short["difference"]) == D(-60000)
+    add_receipt_payment(journey, amount="60000", receipt_number="R-2", receipt_date="2026-09-02")
+    assert gate()["passed"] is True
+
 
 def test_a_form_with_neither_a_net_value_nor_total_receipts_is_still_not_calculated(journey) -> None:
     _statement(journey, UTKAL, total_cost=1150000)
