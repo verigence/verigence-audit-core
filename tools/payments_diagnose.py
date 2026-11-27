@@ -59,7 +59,7 @@ with engine.connect() as c:
     out = defaultdict(Counter)
     started, done = time.monotonic(), 0
     for row in rows:
-        if time.monotonic() - started > 600:
+        if time.monotonic() - started > 430:
             break
         try:
             with c.begin_nested():
@@ -72,5 +72,52 @@ with engine.connect() as c:
         out["closed today" if row["today"] else "closed before today"][label] += 1
         out[row["dealer"]]["meets it" if gate["passed"] else "does not / cannot be compared"] += 1
     print("Diagnose closed files judged:", done)
+    # The form's convention: are the discounts ever OUTSIDE Total Receipts?
+    from decimal import Decimal
+
+    from audit_core.uc03_account_statement import (
+        KIND_FORM,
+        _amount,
+        combine_statements,
+        line_rows,
+        load_ledger_documents,
+        statement_kind,
+        statement_total,
+    )
+    from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
+
+    convention = Counter()
+    for row in c.execute(text(f"""
+            SELECT j.journey_id FROM auditcore.journeys j
+            WHERE j.tenant_id=:t AND {DELIVERY_STARTED_SQL.format(t=":t", j="j.journey_id")}"""), {"t": T}).mappings().all():
+        forms = []
+        for document in load_ledger_documents(c, tenant_id=T, journey_id=row["journey_id"]):
+            lines = line_rows(document["fields"].get("line_items"))
+            if statement_kind(lines) == KIND_FORM:
+                forms.append((document, lines))
+        if not forms:
+            continue
+        read, copies = combine_statements(forms)
+        document = copies.primary
+        if read is None or document is None or statement_total(document["fields"], read) is not None:
+            continue
+        cost, printed = _amount(document["fields"].get("total_cost")), _amount(document["fields"].get("total_receipts"))
+        if not cost or not printed:
+            continue
+        given = sum(read.discounts.values(), Decimal(0))
+        old = read.old_vehicle_value or Decimal(0)
+        loan = read.financer or Decimal(0)
+        lines_sum = sum((a for _, a in read.received), Decimal(0))
+        listed = bool(loan) and any(abs(a - loan) <= 1 for _, a in read.received)
+        base = lines_sum if listed else lines_sum + loan
+        if given <= 0:
+            convention["no discount rows"] += 1
+        elif abs(printed - base - given) <= 10 or abs(printed - base - given - old) <= 10:
+            convention["discounts INSIDE Total Receipts"] += 1
+        elif abs(printed - base) <= 10 or abs(printed - base - old) <= 10:
+            convention["discounts OUTSIDE Total Receipts"] += 1
+        else:
+            convention["with discounts, rows do not add up"] += 1
+    print("Diagnose the form's convention:", j(convention))
     for key in ("all closed", "closed today", "closed before today", "Aditya", "Shivnath", "Utkal"):
         print(f"Diagnose {key} ({sum(out[key].values())}):", j(dict(out[key].most_common())))
