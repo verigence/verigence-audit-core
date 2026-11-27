@@ -124,6 +124,14 @@ stages:
       - MANUAL_VERIFICATION
       label: Manual verification tasks closed
       missing: Close the open manual verification tasks.
+    # Product owner 2026-11-27: "Money receipts of dealership should be present and it should be
+    # equal to the sum of the NDC total... then it should be marked closed". The comparison of
+    # the audit rule RECEIPTS_EQUAL_INVOICES itself (the NDC where the account statement is the
+    # source of truth, the invoices elsewhere), judged without its wait for the settlement window.
+    - key: MONEY_EQUALS_BILLED
+      kind: MONEY_EQUALS_BILLED
+      label: Dealership's payment receipts on file and equal to the NDC total
+      missing: Upload the dealership's payment receipts; the money received must equal the NDC total.
 document_types:
   booking_docket:
     display_name: Booking Docket

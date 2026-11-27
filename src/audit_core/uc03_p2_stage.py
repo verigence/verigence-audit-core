@@ -26,6 +26,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
+import structlog
 from sqlalchemy import Connection, text
 
 from audit_core import job_reads
@@ -53,6 +54,8 @@ from audit_core.uc03_p2_registry import (
     get_registry,
 )
 from audit_core.uc03_p2_runtime import record_activity
+
+logger = structlog.get_logger(__name__)
 
 _OPEN_LEGACY_TASK_STATUSES = ("PENDING", "READY", "CLAIMED", "IN_PROGRESS", "RETRY_WAIT")
 _OPEN_P2_TASK_STATUSES = (
@@ -1147,7 +1150,30 @@ def _evaluate_gate(
         pending = _open_tasks_for(connection, tenant_id=tenant_id, journey_id=journey_id,
                                   role=gate.role, tabs=gate.tabs)
         return {"passed": not pending, "pendingCount": len(pending), "tasks": pending[:10]}
+    if gate.kind == "MONEY_EQUALS_BILLED":
+        return _money_equals_billed(connection, tenant_id=tenant_id, journey_id=journey_id)
     raise ValueError(f"Unsupported gate kind {gate.kind}")
+
+
+def _money_equals_billed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
+    """The dealership's payment receipts are on file and the money received equals the NDC total
+    (product owner 2026-11-27) -- the audit rule's own comparison
+    (uc03_p2_audit_rules.money_equals_what_is_billed), never a second working of it. Asked only of
+    a delivery: a booking has no NDC yet. A comparison that cannot be made -- or that fails on
+    this one Journey's papers -- keeps the file open and says so; it never stops the Journey from
+    being settled."""
+    if not delivery_has_started(connection, tenant_id=tenant_id, journey_id=journey_id):
+        return {"passed": False, "state": "NOT_A_DELIVERY"}
+    from audit_core.uc03_p2_audit_rules import money_equals_what_is_billed
+
+    try:
+        with connection.begin_nested():
+            return money_equals_what_is_billed(connection, tenant_id=tenant_id, journey_id=journey_id)
+    except Exception as error:  # noqa: BLE001 -- one Journey's papers must not stop its settling
+        logger.warning("money_equals_billed_gate_failed", tenant_id=tenant_id, journey_id=str(journey_id),
+                       error=f"{type(error).__name__}: {error}"[:300])
+        return {"passed": False, "state": "ERROR",
+                "reason": "The money received could not be compared with the NDC. Open the Deal and check its figures."}
 
 
 def _upsert_gate(
@@ -1214,7 +1240,8 @@ def _stage_gates(connection: Connection, registry: Registry, *, stage: str, tena
         )
         result.update({"label": gate.label, "kind": gate.kind, "optional": gate.optional})
         if not result["passed"]:
-            result["action"] = gate.missing
+            # What to do, and for the money gate why: the comparison's own words.
+            result["action"] = (f"{gate.missing} {result['reason']}" if result.get("reason") else gate.missing)
         gates[gate.key] = result
         _upsert_gate(
             connection, tenant_id=tenant_id, journey_id=journey_id, stage_code=stage,

@@ -65,6 +65,8 @@ def test_booking_gates_match_the_approved_contract():
     assert delivery.completion_approved is True
     assert {g.key: g.kind for g in delivery.gates} == {
         "REQUIRED_DOCUMENTS": "REQUIRED_DOCUMENTS", "VEHICLE_PROOF": "VEHICLE_PROOF", "PC_TASKS_CLOSED": "OPEN_TASKS",
+        # 2026-11-27: the dealership's payment receipts on file and equal to the NDC total.
+        "MONEY_EQUALS_BILLED": "MONEY_EQUALS_BILLED",
     }
 
 

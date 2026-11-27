@@ -192,3 +192,29 @@ def test_a_failing_check_is_one_team_lead_finding_resolved_once_it_passes(journe
     add_receipt_payment(journey, amount="40000", receipt_number="R-2", receipt_date="2026-09-05")
     run()
     assert findings() == ["RESOLVED"]
+
+
+def test_the_closure_gate_judges_the_same_comparison_without_the_settlement_wait(journey):
+    """Product owner 2026-11-27: a delivery file closes when the dealership's receipts are on file
+    and equal what is billed. The rule waits for the settlement window before it raises a finding;
+    the gate asks the same comparison now (money_equals_what_is_billed)."""
+    _bill(journey)
+    _delivered(journey, days_ago=1)
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        none = rules.money_equals_what_is_billed(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert none["passed"] is False and none["state"] == "NO_RECEIPTS"
+
+    add_receipt_payment(journey, amount="11000", receipt_number="R-1", receipt_date="2026-09-01")
+    add_receipt_payment(journey, amount="400000", receipt_number="R-2", receipt_date="2026-09-20")
+    assert _check(journey).outcome == "SKIPPED"  # the rule: inside the settlement window
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        short = rules.money_equals_what_is_billed(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert short["passed"] is False and short["state"] == "FAIL" and Decimal(short["difference"]) == Decimal(-104000)
+
+    add_receipt_payment(journey, amount="104000", receipt_number="R-3", receipt_date="2026-09-21")
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        equal = rules.money_equals_what_is_billed(connection, tenant_id=journey.tenant_id, journey_id=journey.journey_id)
+    assert equal["passed"] is True and equal["receiptCount"] == 3
