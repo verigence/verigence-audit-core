@@ -167,16 +167,10 @@ def _delivery_requirements(journey):
     return reasons, {item["key"]: item for item in items}
 
 
-def test_dealer_insurance_expects_the_debit_note_without_raising_a_task(journey):
-    """Insurance through the dealership is billed to the customer by a debit
-    note, so the debit note is expected and belongs on the Delivery
-    checklist -- but it raises no Document Missing task. The dealership may
-    legitimately not have raised one, and its absence is not itself a
-    finding, so a HIGH overdue card is the wrong weight.
-
-    It was CONDITIONAL on `insuranceByDealer|registrationByDealer`, an OR,
-    so dealer-arranged insurance alone both made it mandatory and raised a
-    HIGH card that cited registration as well."""
+def test_the_debit_note_is_optional_whoever_arranges_the_insurance(journey):
+    """Product owner 2026-11-27: the debit note "can be optional but not mandatory". It was
+    expected (CONDITIONAL on dealer insurance, with no task), and so held the Delivery's
+    mandatory documents open with nothing telling the PC why."""
     add_ready_document(journey, "booking_form", customer_name="A", booking_date="2026-09-01",
                        insurance_by="Dealer")
     _settle(journey)
@@ -185,25 +179,15 @@ def test_dealer_insurance_expects_the_debit_note_without_raising_a_task(journey)
     assert "insuranceByDealer" in reasons
     # the insurance fact says nothing about who registers the vehicle
     assert "registrationByDealer" not in reasons
-
-    # expected on the checklist ...
-    assert items["debit_note"]["required"] is True
-    assert items["debit_note"]["raisesMissingTask"] is False
-    assert items["debit_note"]["conditions"] == ["insuranceByDealer"]
-    # ... and never a task
+    assert items["debit_note"]["required"] is False and items["debit_note"]["requirement"] == "OPTIONAL"
     assert "debit_note" not in missing_document_lines(journey)
-
-
-def test_self_insurance_does_not_expect_the_debit_note_at_all(journey):
-    """Insurance the customer arranged is billed by their own insurer, so
-    the dealership owes no debit note and the entry does not appear."""
-    add_ready_document(journey, "booking_form", customer_name="A", booking_date="2026-09-01",
-                       insurance_by="Self")
-    _settle(journey)
-
-    reasons, items = _delivery_requirements(journey)
-    assert "insuranceByDealer" not in reasons
-    assert "debit_note" not in items
+    with journey.engine.begin() as connection:
+        set_tenant_context(connection, journey.tenant_id)
+        gate = connection.execute(text(
+            "SELECT details FROM auditcore.p2_stage_gate_state WHERE tenant_id=:t AND journey_id=:j "
+            "AND stage_code='DELIVERY' AND gate_key='REQUIRED_DOCUMENTS'"),
+            {"t": journey.tenant_id, "j": journey.journey_id}).scalar_one()
+    assert "debit_note" not in [m["key"] for m in gate["missing"]]
 
 
 def test_a_conditional_document_without_the_flag_still_raises_its_task(journey):

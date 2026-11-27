@@ -1342,32 +1342,19 @@ document_types:
     - CUSTOMER
     - DEAL
   debit_note:
-    # Insurance through the dealership is normally billed to the customer by
-    # a debit note, so when `insuranceByDealer` holds the debit note is
-    # expected and belongs on the Delivery checklist. Insurance the customer
-    # arranged themselves is billed by their own insurer, so nothing is
-    # expected from the dealership and the entry does not appear at all.
-    #
-    # Expected is not the same as demanded. `raises_missing_task: false`
-    # keeps it off the PC's task list: the dealership may legitimately not
-    # have raised one, and a HIGH overdue "Document Missing" card is the
-    # wrong weight for a document whose absence is not itself a finding.
-    # The checklist entry carries it instead.
-    #
-    # Registration is deliberately not a condition here. It was previously
-    # `insuranceByDealer|registrationByDealer` -- an OR -- which fused two
-    # unrelated processes into one requirement and made dealer-arranged
-    # insurance alone demand the document. Registration is evidenced by
-    # `rto_challan` (CONDITIONAL on registrationByDealer); insurance by
-    # `insurance_cover` (REQUIRED). This document evidences neither -- it is
-    # the commercial instrument that bills them.
+    # Optional, never mandatory (product owner 2026-11-27: "it can be optional but
+    # not mandatory"). It was CONDITIONAL on `insuranceByDealer` with no missing
+    # task: expected on the checklist, never asked of the PC -- and still counted
+    # by the Delivery REQUIRED_DOCUMENTS gate, so a delivery with dealer insurance
+    # and no debit note could not close and no task said why (November live: 386
+    # open deliveries listed it missing). When one is on file it is still read
+    # and compared (the insurance it bills against the cover note).
     display_name: Debit Note (insurance)
     di_types:
     - debit_note
     stage: DELIVERY
-    requirement: CONDITIONAL
-    condition: insuranceByDealer
-    raises_missing_task: false
+    requirement: OPTIONAL
+    condition: null
     accepted_early: true
     pages:
       shape: MULTI_PAGE
