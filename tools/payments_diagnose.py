@@ -1,23 +1,18 @@
-"""Read-only: what the closure rule of 27 Nov will close, and the debit note on open tasks.
-Counts only; no customer details, no journey references."""
+"""Read-only: how the deliveries stand on "receipts equal the NDC" (the rule's own stored answer),
+closed and open. Counts only; no customer details, no journey references."""
 from __future__ import annotations
 
 import json
 import os
+import re
 from collections import Counter
-from datetime import date
 
 from sqlalchemy import create_engine, text
 
 from audit_core.db import set_tenant_context
 from audit_core.uc03_delivery_start import DELIVERY_STARTED_SQL
-from audit_core.uc03_p2_dates import programme_date_floor
-from audit_core.uc03_p2_journey_views import SCOPED_SQL, scope_params
-from audit_core.uc03_p2_tasks import task_queue_tab
 
 T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
-MONTH = "2026-11"
-OPEN = ("VERIFIED_COMPLETE", "CANCELLED", "FAILED", "DEAD_LETTER")
 engine = create_engine(os.environ["DATABASE_URL"], connect_args={"options": "-c statement_timeout=300000"})
 
 
@@ -25,87 +20,64 @@ def j(value):
     return json.dumps(value, default=str, sort_keys=True)
 
 
+def why(status: str, reason: str) -> str:
+    reason = reason or ""
+    if status == "PASS":
+        return "PASS (receipts equal the NDC)"
+    if status == "FAIL":
+        return "FAIL: short of the NDC" if "short of" in reason else "FAIL: more than the NDC"
+    for needle, label in (("settlement window", "waiting: settlement window (7 days after delivery)"),
+                          ("No account statement", "no NDC read yet"), ("could not be read with certainty", "NDC lines in doubt"),
+                          ("no net value", "NDC shows no net value"), ("loan amount is not on file", "loan amount not on file"),
+                          ("no payment receipt on file", "waiting: receipts the NDC shows are not uploaded"),
+                          ("cannot be", "NDC payments cannot be read"), ("delivery date", "no delivery date")):
+        if needle in reason:
+            return label
+    return f"{status}: other" if status else "not evaluated"
+
+
 with engine.connect() as c:
     c.execute(text("SET TRANSACTION READ ONLY"))
     set_tenant_context(c, T)
-    tz = c.execute(text("SELECT timezone_name FROM auditcore.projects WHERE tenant_id=:t"), {"t": T}).scalar() or "Asia/Kolkata"
-    actor = c.execute(text("""
-        SELECT ba.security_actor_id FROM auditcore.business_assignments ba
-        WHERE ba.tenant_id=:t AND ba.assignment_status='ACTIVE' AND ba.dealer_id IS NULL
-          AND ba.effective_from <= now() AND (ba.effective_to IS NULL OR ba.effective_to >= now())
-        LIMIT 1"""), {"t": T}).scalar_one()
-    params = {"tenant_id": T, "actor_id": actor, **scope_params(search=""),
-              "date_floor": programme_date_floor() or date(1900, 1, 1), "month": MONTH,
-              "month_basis": "business", "timezone": tz, "kind": "delivery"}
-    november = {r["id"]: bool(r["is_closed"]) for r in c.execute(text(
-        "WITH " + SCOPED_SQL + " SELECT CAST(s.journey_id AS text) AS id, s.is_closed FROM scoped s"), params).mappings()}
-    print(f"Diagnose November deliveries: {len(november)} | closed now: {sum(november.values())}")
-
     print("Diagnose stage recomputes in the queue:", j({r[0]: r[1] for r in c.execute(text(
         "SELECT work_status, count(*) FROM auditcore.p2_work_queue WHERE tenant_id=:t AND work_type='STAGE_RECOMPUTE' "
-        "AND updated_at_utc > now() - interval '3 hours' GROUP BY 1"), {"t": T})}))
-    print("Diagnose delivery files closed, whole project:", c.execute(text(
-        "SELECT count(*) FROM auditcore.journey_stage_states WHERE tenant_id=:t AND stage_code='DELIVERY' "
-        "AND business_completed_at_utc IS NOT NULL"), {"t": T}).scalar_one(),
-        "| closed in the last 3 hours:", c.execute(text(
-        "SELECT count(*) FROM auditcore.journey_stage_states WHERE tenant_id=:t AND stage_code='DELIVERY' "
-        "AND business_completed_at_utc > now() - interval '3 hours'"), {"t": T}).scalar_one())
-    print("Diagnose open TL delivery review tasks:", c.execute(text(
-        "SELECT count(*) FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_type='DELIVERY_REVIEW' "
-        "AND task_status <> ALL(:closed)"), {"t": T, "closed": list(OPEN)}).scalar_one())
-
-    # Every open delivery of the Project (the job's own scope).
-    deliveries = {r["id"]: r["booking"] for r in c.execute(text(f"""
-        SELECT CAST(j.journey_id AS text) AS id, r.booking_completion_state AS booking
+        "AND updated_at_utc > now() - interval '90 minutes' GROUP BY 1"), {"t": T})}))
+    rows = c.execute(text(f"""
+        SELECT CAST(j.journey_id AS text) AS id,
+               COALESCE(r.delivery_completion_state, '') = 'COMPLETE' AS closed,
+               st.business_completed_at_utc > now() - interval '6 hours' AS closed_today,
+               cs.control_status AS status, cs.details->>'reason' AS reason, cs.details->>'difference' AS difference,
+               to_jsonb(cs) AS raw
         FROM auditcore.journeys j
         LEFT JOIN auditcore.p2_journey_runtime r ON r.tenant_id=j.tenant_id AND r.journey_id=j.journey_id
-        WHERE j.tenant_id=:t AND COALESCE(r.delivery_completion_state, '') <> 'COMPLETE'
-          AND {DELIVERY_STARTED_SQL.format(t=":t", j="j.journey_id")}"""), {"t": T}).mappings()}
-    ids = list(deliveries)
-    print("Diagnose open deliveries, whole project:", len(ids))
-    missing: dict[str, set[str]] = {}
-    for r in c.execute(text("""
-        SELECT CAST(journey_id AS text) AS id, gate_status, details FROM auditcore.p2_stage_gate_state
-        WHERE tenant_id=:t AND stage_code='DELIVERY' AND gate_key='REQUIRED_DOCUMENTS'
-          AND CAST(journey_id AS text) = ANY(:ids)"""), {"t": T, "ids": ids}).mappings():
-        missing[r["id"]] = {str(m.get("key")) for m in (r["details"] or {}).get("missing") or []}
-    manual = Counter()
-    for r in c.execute(text("""
-        SELECT CAST(journey_id AS text) AS id, task_type, category FROM auditcore.p2_tasks
-        WHERE tenant_id=:t AND CAST(journey_id AS text) = ANY(:ids) AND assigned_role_code='PC'
-          AND task_status <> ALL(:closed)"""), {"t": T, "ids": ids, "closed": list(OPEN)}).mappings():
-        if task_queue_tab(str(r["task_type"]), str(r["category"] or "")) == "MANUAL_VERIFICATION":
-            manual[r["id"]] += 1
+        LEFT JOIN auditcore.journey_stage_states st ON st.tenant_id=j.tenant_id AND st.journey_id=j.journey_id
+             AND st.stage_code='DELIVERY'
+        LEFT JOIN auditcore.p2_control_state cs ON cs.tenant_id=j.tenant_id AND cs.journey_id=j.journey_id
+             AND cs.control_code='RECEIPTS_EQUAL_INVOICES'
+        WHERE j.tenant_id=:t AND {DELIVERY_STARTED_SQL.format(t=":t", j="j.journey_id")}"""), {"t": T}).mappings().all()
+    print("Diagnose deliveries, whole project:", len(rows), "| closed:", sum(1 for r in rows if r["closed"]),
+          "| closed in the last 6 hours:", sum(1 for r in rows if r["closed_today"]))
+    sample = next((r["raw"] for r in rows if r["raw"]), None)
+    if sample:
+        print("Diagnose control state columns:", sorted(k for k in sample if k not in ("journey_id", "tenant_id")))
+        reason_key = next((k for k in ("status_reason", "reason") if k in sample), None)
+    else:
+        reason_key = None
 
-    def verdict(i: str) -> str:
-        if i not in missing:
-            return "not evaluated yet"
-        left = missing[i] - {"debit_note"}
-        if left:
-            return "mandatory document missing"
-        if manual[i]:
-            return "manual verification task open"
-        if deliveries[i] != "COMPLETE":
-            return "booking papers incomplete"
-        return "WILL CLOSE"
+    def reason_of(r):
+        raw = r["raw"] or {}
+        return str(raw.get(reason_key) or r["reason"] or "") if reason_key else str(r["reason"] or "")
 
-    whole = Counter(verdict(i) for i in ids)
-    nov = Counter(verdict(i) for i in ids if i in november)
-    print("Diagnose by the rule of 27 Nov, whole project:", j(whole))
-    print("Diagnose by the rule of 27 Nov, November deliveries:", j(nov))
-    print("Diagnose open deliveries whose only missing mandatory document is the debit note:",
-          sum(1 for i in ids if missing.get(i) == {"debit_note"}))
-    print("Diagnose open deliveries listing the debit note missing:", sum(1 for i in ids if "debit_note" in missing.get(i, ())))
-
-    print("Diagnose open tasks naming the debit note, by type:", j({r[0]: r[1] for r in c.execute(text("""
-        SELECT task_type, count(*) FROM auditcore.p2_tasks
-        WHERE tenant_id=:t AND task_status <> ALL(:closed)
-          AND (title ILIKE '%debit note%' OR description ILIKE '%debit note%' OR reference::text ILIKE '%debit_note%')
-        GROUP BY 1 ORDER BY 2 DESC"""), {"t": T, "closed": list(OPEN)})}))
-    row = c.execute(text("""
-        SELECT count(*) AS tasks,
-               count(*) FILTER (WHERE reference->'requirementKeys' ? 'debit_note') AS with_debit_note,
-               count(*) FILTER (WHERE reference->'requirementKeys' = '["debit_note"]'::jsonb) AS only_debit_note
-        FROM auditcore.p2_tasks WHERE tenant_id=:t AND task_type='DOCUMENT_MISSING' AND task_status <> ALL(:closed)"""),
-        {"t": T, "closed": list(OPEN)}).mappings().one()
-    print("Diagnose open missing-document tasks:", j(dict(row)))
+    for label, pick in (("closed before today", lambda r: r["closed"] and not r["closed_today"]),
+                        ("closed today by the re-settle", lambda r: r["closed_today"]),
+                        ("open", lambda r: not r["closed"])):
+        part = [r for r in rows if pick(r)]
+        print(f"Diagnose receipts against the NDC, {label} ({len(part)}):",
+              j(Counter(why(str(r["status"] or ""), reason_of(r)) for r in part)))
+    gaps = Counter()
+    for r in rows:
+        if str(r["status"] or "") == "FAIL" and r["difference"]:
+            amount = abs(float(re.sub(r"[^0-9.\\-]", "", r["difference"]) or 0))
+            gaps["up to Rs 100" if amount <= 100 else "Rs 100 to 1,000" if amount <= 1000
+                 else "Rs 1,000 to 10,000" if amount <= 10000 else "above Rs 10,000"] += 1
+    print("Diagnose size of the difference where it fails:", j(gaps))

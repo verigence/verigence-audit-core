@@ -641,6 +641,7 @@ task_types:
     actions:
     - ADD_EVIDENCE
     - PROVIDE_VEHICLE_ID
+    - CLOSE_TASK
     - ADD_COMMENT
   DELIVERY_VIN_MANUAL_ENTRY_REVIEW:
     category: CORRECTION_APPROVAL

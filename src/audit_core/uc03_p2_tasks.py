@@ -67,10 +67,18 @@ SCRAPPAGE_REGISTRATION_TASK = "SCRAPPAGE_REGISTRATION_CONCESSION"
 CORRECTIONS_RECHECK_TASK = "CORRECTIONS_RECHECK"
 # The PC's answer to "Is this a BH registration?" (2026-11-15, uc03_registration_closures).
 BH_QUESTION_TASK = "REGISTRATION_BH_CONFIRM"
+# "Add pictures of the car" (product owner 2026-11-27: "task should be raised for photos.. it has
+# to be there.. but it can be closed without upload by PC with a proper reason"): the PC closes
+# it by hand with the reason, at least VEHICLE_PHOTOS_REASON_LENGTH characters. Accepted whatever
+# the row's stored allowed_actions say, so the open rows need no backfill; the producer does not
+# reopen it (raise_or_refresh keeps acceptedIssueHash).
+VEHICLE_PHOTOS_TASK = "DELIVERY_VEHICLE_PHOTOS_MISSING"
+VEHICLE_PHOTOS_REASON_LENGTH = 10
 CLOSE_TASK_TYPES = frozenset({QUALITY_TASK, LARGE_UPLOAD_TASK, COST_SHEET_DIFFERENCE_TASK, COPIES_DIFFERENCE_TASK,
                               FASTAG_VERIFY_TASK, DEAL_LINE_VERIFY_TASK,
                               REVIEWER_CORRECTIONS_TASK, KEY_FIGURES_TASK, ADDS_UP_TASK, ROWS_NOT_IN_DEAL_TASK,
-                              SCRAPPAGE_REGISTRATION_TASK, CORRECTIONS_RECHECK_TASK, BH_QUESTION_TASK})
+                              SCRAPPAGE_REGISTRATION_TASK, CORRECTIONS_RECHECK_TASK, BH_QUESTION_TASK,
+                              VEHICLE_PHOTOS_TASK})
 # "Upload the ..." tasks (a conditional document, or the booking docket) close
 # by hand too (product owner 2026-11-02): a single page uploaded for them is
 # often refused for scan quality and never read, so the machine check cannot
@@ -454,6 +462,8 @@ def submit_action(
         allowed.append(action)
     if action == CLOSE_TASK and task["task_type"] == MISSING_DOCUMENT_TASK and closes_by_hand(task):
         allowed.append(CLOSE_TASK)
+    if action == CLOSE_TASK and task["task_type"] == VEHICLE_PHOTOS_TASK:
+        allowed.append(CLOSE_TASK)
     if action not in allowed:
         raise ValueError(f"Action {action} is not allowed for this task")
     status = str(task["task_status"])
@@ -515,6 +525,9 @@ def submit_action(
             if choice not in registration_closures.BH_CHOICES:
                 raise ValueError("Answer \"BH registration\" or \"Not a BH registration\".")
             comment = comment or choice
+        if task["task_type"] == VEHICLE_PHOTOS_TASK and len(comment) < VEHICLE_PHOTOS_REASON_LENGTH:
+            raise ValueError("Write the reason there are no pictures of the car (at least "
+                             f"{VEHICLE_PHOTOS_REASON_LENGTH} characters) to close this task without them.")
         if not comment:
             raise ValueError("Write a comment to close this task, for example that the document was uploaded.")
         if task["task_type"] == MISSING_DOCUMENT_TASK and choice and not consolidated:

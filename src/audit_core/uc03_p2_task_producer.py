@@ -2463,7 +2463,9 @@ def sync_vehicle_photo_task(
     """Once every other Delivery document is in but there is no proof of the
     vehicle, the PC is asked to upload pictures of the car being delivered
     (VIN, sides, interior) or enter the VIN / chassis / engine number. The
-    task closes itself on the first picture or entered identity."""
+    task closes itself on the first picture or entered identity; the PC may
+    also close it without them, with the reason (product owner 2026-11-27:
+    the task "has to be there", the pictures do not hold the file)."""
     from audit_core.uc03_p2_stage import vehicle_proof
 
     registry = registry or get_registry()
@@ -2488,7 +2490,8 @@ def sync_vehicle_photo_task(
             description=(
                 "Every other delivery document is in, but there is no proof of the vehicle. Upload pictures of the "
                 "car being delivered (VIN plate, sides, interior) from the booking's Vehicle photos tab, or enter "
-                "the VIN / chassis / engine number here. The Team Lead sees the entry in the delivery review."
+                "the VIN / chassis / engine number here. The Team Lead sees the entry in the delivery review. "
+                "If there are no pictures to upload, close the task with the reason."
             ),
             reference={"generatedBy": "SYSTEM", "sourceType": "EVIDENCE", "sourceCode": "VEHICLE_PHOTOS"},
             severity="HIGH", registry=registry, evaluation_started_at=evaluation_started_at,
