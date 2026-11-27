@@ -1297,17 +1297,26 @@ def receipts_equal_invoices(facts: _Facts, *, judged_now: bool = False) -> RuleO
     ), {**details, "findingTitle": "Receipts do not equal the invoices"})
 
 
+# For closing a file the money may be more than the NDC, or short of it by less than this
+# (product owner 2026-11-27: "short by less than Rs 100, and more than NDC is ok").
+CLOSURE_SHORT_ALLOWED = Decimal(100)
+
+
 def money_equals_what_is_billed(connection: Connection, *, tenant_id: str, journey_id: UUID) -> dict[str, Any]:
     """For the stage engine's closure gate (product owner 2026-11-27: "Money receipts of dealership
     should be present and it should be equal to the sum of the NDC total... then it should be
-    marked closed"): the dealership's payment receipts are on file, and the money received equals
+    marked closed"): the dealership's payment receipts are on file, and the money received covers
     what the customer was billed -- the NDC where the account statement is the source of truth
-    (Mahindra Orissa), the invoices elsewhere.
+    (Mahindra Orissa; its net value, or its Total Receipts on a form that prints none), the
+    invoices elsewhere.
 
     The one comparison of RECEIPTS_EQUAL_INVOICES, judged now: the rule waits for the settlement
     window before it raises a finding; a file whose money already agrees need not wait to close.
-    ``passed`` only on its PASS; anything it cannot compare yet (no NDC read, lines in doubt, no
-    net value printed, the loan amount not on file) keeps the file open, with the rule's reason."""
+    For closing, money more than the NDC is accepted, and so is a shortfall under
+    CLOSURE_SHORT_ALLOWED ("short by less than Rs 100, and more than NDC is ok"); the rule's own
+    finding on such a difference is unchanged. Anything the rule cannot compare yet (no NDC read,
+    lines in doubt, no total printed, the loan amount not on file) keeps the file open, with the
+    rule's reason."""
     facts = _Facts(connection, tenant_id, journey_id)
     receipts = len(facts.receipts)
     if not receipts:
@@ -1315,9 +1324,17 @@ def money_equals_what_is_billed(connection: Connection, *, tenant_id: str, journ
                 "reason": "No payment receipt of the dealership is on file."}
     outcome = receipts_equal_invoices(facts, judged_now=True)
     details = outcome.details or {}
-    return {"passed": outcome.outcome == "PASS", "state": outcome.outcome, "receiptCount": receipts,
-            "reason": outcome.reason,
-            **{key: details[key] for key in ("statementTotal", "invoiced", "received", "difference") if key in details}}
+    difference = _dec(details.get("difference"))
+    accepted = outcome.outcome != "PASS" and difference is not None and difference > -CLOSURE_SHORT_ALLOWED
+    reason = outcome.reason
+    if accepted:
+        reason = (f"{reason} Accepted for closing the file: "
+                  + ("more than billed." if difference > 0
+                     else f"short by less than {_rupees(CLOSURE_SHORT_ALLOWED)}."))
+    return {"passed": outcome.outcome == "PASS" or accepted,
+            "state": "ACCEPTED" if accepted else outcome.outcome, "receiptCount": receipts, "reason": reason,
+            **{key: details[key] for key in ("statementTotal", "invoiced", "received", "difference", "comparedWith")
+               if details.get(key) is not None}}
 
 
 def _late_receipts(facts: _Facts, start: date, end: date | None) -> list[dict[str, Any]]:
