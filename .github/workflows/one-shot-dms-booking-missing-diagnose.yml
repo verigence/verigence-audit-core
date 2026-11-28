@@ -51,6 +51,33 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
+      - name: Source document type of booking paper fields, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine
+          from audit_core.db import set_tenant_context
+          T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
+          e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
+          with e.connect() as c:
+              c.exec_driver_sql("SET TRANSACTION READ ONLY")
+              set_tenant_context(c, T)
+              for r in c.exec_driver_sql("""SELECT e.document_type_key d, f.source_document_type_key s, f.field_key k, count(*) n
+                     FROM auditcore.evidence e JOIN auditcore.journey_document_extracted_fields f
+                       ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
+                     WHERE e.tenant_id=%(t)s AND e.association_status='ACTIVE' AND e.document_type_key='booking_docket'
+                       AND f.field_key IN ('booking_reference_number','customer_phone','customer_name')
+                     GROUP BY 1,2,3 ORDER BY 3, 4 DESC""", {"t": T}).mappings():
+                  print("SRC", r["d"], "| source:", r["s"], "|", r["k"], "|", r["n"])
+              latest = [str(x[0]) for x in c.exec_driver_sql("""SELECT DISTINCT ON (dealer_id) dump_id FROM auditcore.p2_dms_dumps
+                     WHERE tenant_id=%(t)s AND dump_kind='BOOKING' ORDER BY dealer_id, business_date DESC""", {"t": T})]
+              for r in c.exec_driver_sql("""SELECT match_basis, count(*) FROM auditcore.p2_dms_dump_rows
+                     WHERE tenant_id=%(t)s AND CAST(dump_id AS text) = ANY(%(ids)s) AND outcome='MATCHED' GROUP BY 1 ORDER BY 2 DESC""",
+                     {"t": T, "ids": latest}):
+                  print("BASIS", r[0], r[1])
+              c.rollback()
+          PY
       - name: Booking dump misses, project-wide, read-only
         shell: bash
         run: |
