@@ -22,6 +22,7 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_deal_source_history import load_source_breakdown
+from audit_core.uc03_p2_journey_views import document_phone_sql, mobile_digits
 
 router = APIRouter(prefix="/v1/tenants/{tenant_id}/uc03", tags=["uc03-journey-search"])
 logger = structlog.get_logger(__name__)
@@ -195,7 +196,7 @@ def _search_query_parts(query: str) -> dict[str, Any]:
 
     upper = candidate.upper()
     lower = candidate.lower()
-    digits = "".join(character for character in candidate if character.isdigit())
+    digits = mobile_digits(candidate)
     mobile_candidate = bool(
         len(digits) >= 6
         and all(character.isdigit() or character in "+- ()." for character in candidate)
@@ -285,8 +286,15 @@ def search_journeys(
                         COALESCE(bs.latest_activity_at_utc, j.updated_at_utc),
                         COALESCE(ds.latest_activity_at_utc, j.updated_at_utc)
                     ) AS latest_activity_at_utc,
-                    regexp_replace(COALESCE(c.mobile_number, ''), '[^0-9]', '', 'g')
-                        AS customer_mobile_digits
+                    -- The customer record's mobile, or a customer phone read from the
+                    -- Journey's own papers that matches the search (2026-11-28).
+                    CASE
+                        WHEN :mobile_candidate
+                             AND regexp_replace(COALESCE(c.mobile_number, ''), '[^0-9]', '', 'g') NOT LIKE :mobile_suffix
+                             AND """ + document_phone_sql("j", ":mobile_suffix") + """
+                        THEN :q_digits
+                        ELSE regexp_replace(COALESCE(c.mobile_number, ''), '[^0-9]', '', 'g')
+                    END AS customer_mobile_digits
                 FROM auditcore.journeys j
                 JOIN auditcore.customers c
                   ON c.tenant_id = j.tenant_id
@@ -438,8 +446,8 @@ def search_journeys(
                     WHEN match_rank IN (10, 50) THEN booking_reference
                     WHEN match_rank = 20 THEN
                         CASE
-                            WHEN customer_mobile_last4 IS NULL THEN NULL
-                            ELSE :mask_prefix || customer_mobile_last4
+                            WHEN COALESCE(customer_mobile_last4, right(customer_mobile_digits, 4)) IS NULL THEN NULL
+                            ELSE :mask_prefix || COALESCE(customer_mobile_last4, right(customer_mobile_digits, 4))
                         END
                     WHEN match_rank IN (30, 51, 70) THEN vin
                     WHEN match_rank IN (31, 52, 71) THEN chassis_number
