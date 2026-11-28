@@ -51,6 +51,70 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
+      - name: Why each booking row is not matched, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from collections import Counter
+          from datetime import date
+          from sqlalchemy import create_engine
+          from audit_core.db import set_tenant_context
+          from audit_core.uc03_p2_dms_dumps import (NAME_DATE_DAYS, _named, booking_keys, build_index, days_apart,
+                                                   mobile_key)
+          T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
+          e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
+          with e.connect() as c:
+              c.exec_driver_sql("SET TRANSACTION READ ONLY")
+              set_tenant_context(c, T)
+              dumps = c.exec_driver_sql("""SELECT DISTINCT ON (u.dealer_id) u.dump_id, u.dealer_id, u.business_date, d.dealer_name
+                     FROM auditcore.p2_dms_dumps u JOIN auditcore.dealers d ON d.tenant_id=u.tenant_id AND d.dealer_id=u.dealer_id
+                     WHERE u.tenant_id=%(t)s AND u.dump_kind='BOOKING' ORDER BY u.dealer_id, u.business_date DESC""", {"t": T}).mappings().all()
+              created = {str(r[0]): r[1] for r in c.exec_driver_sql(
+                  "SELECT journey_id, (created_at_utc AT TIME ZONE 'Asia/Kolkata')::date FROM auditcore.journeys WHERE tenant_id=%(t)s", {"t": T})}
+              total = Counter()
+              for d in dumps:
+                  index = build_index(c, tenant_id=T, dealer_id=d["dealer_id"])
+                  rows = c.exec_driver_sql("""SELECT * FROM auditcore.p2_dms_dump_rows WHERE tenant_id=%(t)s AND dump_id=%(d)s""",
+                                           {"t": T, "d": d["dump_id"]}).mappings().all()
+                  taken = {str(r["journey_id"]) for r in rows if r["journey_id"]}
+                  why = Counter()
+                  for r in rows:
+                      if r["outcome"] != "MISSING":
+                          continue
+                      name, day = r["customer_name"], r["event_date"]
+                      named = {j for j in index.journeys if _named(index, j, name)}
+                      keys = booking_keys(r["booking_number"], r["dms_booking_number"])
+                      by_ref = set().union(*(index.by_ref.get(k, set()) for k in keys)) if keys else set()
+                      by_mob = index.by_mobile.get(mobile_key(r["mobile"]), set()) if r["mobile"] else set()
+                      after = [j for j in (named | by_ref | by_mob) if created.get(j) and created[j] > d["business_date"]]
+                      if by_ref and all(j in taken for j in by_ref):
+                          why["OTF on a journey matched to another DMS row"] += 1
+                      elif not named and not by_ref and not by_mob:
+                          why["no journey with this OTF, mobile or name in the dealership"] += 1
+                      elif after and len(after) == len(named | by_ref | by_mob):
+                          why["journey uploaded after this dump (matches on the next dump)"] += 1
+                      elif named and all(j in taken for j in named):
+                          why["same-name journey already matched to another DMS row"] += 1
+                      elif len({j for j in named if j not in taken}) > 1:
+                          why["two or more same-name journeys (duplicates) -- ambiguous"] += 1
+                      elif named:
+                          j = next(iter(named - taken))
+                          g = days_apart(index, j, day)
+                          why["same name, booking date unknown" if g is None else
+                              f"same name, booking dates {'within' if g <= NAME_DATE_DAYS else 'more than'} {NAME_DATE_DAYS} days apart"
+                              + ("" if g is None or g <= NAME_DATE_DAYS else f" (gap {'3-7' if g <= 7 else '8-30' if g <= 30 else '>30'})")] += 1
+                      elif by_mob:
+                          why["mobile matches, name differs"] += 1
+                      else:
+                          why["other"] += 1
+                  for k, n in why.most_common():
+                      print("WHY", d["dealer_name"], d["business_date"], "|", k, "|", n)
+                      total[k] += n
+              for k, n in total.most_common():
+                  print("TOTAL", k, "|", n)
+              c.rollback()
+          PY
       - name: Source document type of booking paper fields, read-only
         shell: bash
         run: |
