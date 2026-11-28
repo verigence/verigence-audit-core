@@ -51,6 +51,78 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
+      - name: The no-journey and taken rows in detail, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from collections import Counter
+          from sqlalchemy import create_engine
+          from audit_core.db import set_tenant_context
+          from audit_core.uc03_p2_dms_dumps import _named, booking_keys, build_index, mobile_key
+          T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
+          e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
+          with e.connect() as c:
+              c.exec_driver_sql("SET TRANSACTION READ ONLY")
+              set_tenant_context(c, T)
+              q = lambda sql, **k: c.exec_driver_sql(sql, {"t": T, **k}).mappings().all()
+              dumps = q("""SELECT DISTINCT ON (u.dealer_id) u.dump_id, u.dealer_id, u.business_date, d.dealer_name
+                     FROM auditcore.p2_dms_dumps u JOIN auditcore.dealers d ON d.tenant_id=u.tenant_id AND d.dealer_id=u.dealer_id
+                     WHERE u.tenant_id=%(t)s AND u.dump_kind='BOOKING' ORDER BY u.dealer_id, u.business_date DESC""")
+              indexes = {str(d["dealer_id"]): build_index(c, tenant_id=T, dealer_id=d["dealer_id"]) for d in dumps}
+              names = {str(d["dealer_id"]): d["dealer_name"] for d in dumps}
+              for d in dumps:
+                  me = str(d["dealer_id"]); index = indexes[me]
+                  rows = q("SELECT * FROM auditcore.p2_dms_dump_rows WHERE tenant_id=%(t)s AND dump_id=%(d)s", d=d["dump_id"])
+                  by_j = {}
+                  for r in rows:
+                      if r["journey_id"]:
+                          by_j.setdefault(str(r["journey_id"]), []).append(r)
+                  none_why, taken_why = Counter(), Counter()
+                  for r in rows:
+                      if r["outcome"] != "MISSING":
+                          continue
+                      name = r["customer_name"]
+                      keys = booking_keys(r["booking_number"], r["dms_booking_number"])
+                      mk = mobile_key(r["mobile"]) if r["mobile"] else None
+                      named = {j for j in index.journeys if _named(index, j, name)}
+                      by_ref = set().union(*(index.by_ref.get(k, set()) for k in keys)) if keys else set()
+                      by_mob = index.by_mobile.get(mk, set()) if mk else set()
+                      if not named and not by_ref and not by_mob:
+                          other = [o for o, ix in indexes.items() if o != me and (
+                              any(ix.by_ref.get(k) for k in keys) or (mk and ix.by_mob if False else False) or (mk and ix.by_mobile.get(mk))
+                              or any(_named(ix, j, name) for j in ix.journeys))]
+                          none_why["in another dealership's journeys" if other else "nowhere in Verigence"] += 1
+                          continue
+                      free = [j for j in named if j not in by_j]
+                      if named and not free:
+                          j = next(iter(named))
+                          o = by_j[j][0]
+                          same_mob = bool(mk) and mk == (mobile_key(o["mobile"]) if o["mobile"] else None)
+                          gap = abs((o["event_date"] - r["event_date"]).days) if o["event_date"] and r["event_date"] else None
+                          taken_why[("same mobile" if same_mob else "different mobile") + ", " +
+                                    ("same OTF" if set(keys) & set(booking_keys(o["booking_number"], o["dms_booking_number"])) else "different OTF") + ", " +
+                                    ("booked within 7 days" if gap is not None and gap <= 7 else "booked further apart")] += 1
+                  for k, n in none_why.most_common():
+                      print("NONE", d["dealer_name"], "|", k, "|", n)
+                  for k, n in taken_why.most_common():
+                      print("TAKEN", d["dealer_name"], "|", k, "|", n)
+              for r in q("""SELECT d.dealer_name, b.batch_status, count(*) n, sum(b.page_count) pages
+                     FROM auditcore.p2_upload_batches b JOIN auditcore.journeys j ON j.tenant_id=b.tenant_id AND j.journey_id=b.journey_id
+                     JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+                     WHERE b.tenant_id=%(t)s AND b.created_at_utc >= '2026-11-01' GROUP BY 1,2 ORDER BY 1,3 DESC"""):
+                  print("UPLOADS NOV", r["dealer_name"], "|", r["batch_status"], "|", r["n"], "files |", r["pages"], "pages")
+              for r in q("""SELECT d.dealer_name, count(*) n FROM auditcore.journeys j
+                     JOIN auditcore.dealers d ON d.tenant_id=j.tenant_id AND d.dealer_id=j.dealer_id
+                     WHERE j.tenant_id=%(t)s AND j.created_at_utc >= '2026-11-01'
+                       AND NOT EXISTS (SELECT 1 FROM auditcore.evidence e JOIN auditcore.journey_document_extracted_fields f
+                             ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
+                           WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id AND e.association_status='ACTIVE'
+                             AND f.field_key IN ('customer_name','pan_name','aadhaar_name'))
+                     GROUP BY 1"""):
+                  print("NO NAME READ", r["dealer_name"], "| Nov journeys with no customer name read on any paper |", r["n"])
+              c.rollback()
+          PY
       - name: Why each booking row is not matched, read-only
         shell: bash
         run: |
