@@ -59,59 +59,80 @@ jobs:
           from sqlalchemy import create_engine
           from audit_core.db import set_tenant_context
           T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
-          ITEMS = [(1, '1811dfc58173b8ab', '84205503f6959bf0'), (2, '4f3ff04ed574645e', 'e2f126bb38a68db6'),
-                   (3, 'fc3182b5f3bb4889', '6b44f6b9e7e22cc2')]
+          ITEMS = [(1, '1811dfc58173b8ab', '84205503f6959bf0', '6a6bc0f91a202cf6'),
+                   (2, '4f3ff04ed574645e', 'e2f126bb38a68db6', 'ecd5c5f14d3630f9'),
+                   (3, 'fc3182b5f3bb4889', '6b44f6b9e7e22cc2', '4e7998ee94ef6a1a'),
+                   (4, '07954601e72ed568', '2d66d7411500df57', '25f3de2ebbe54e96'),
+                   (5, '2077e30640c36172', 'b17be77c32ba15af', '954a59b5ce4bbfdf')]
           h = lambda s: hashlib.sha256(s.encode()).hexdigest()[:16]
           otf = lambda v: h(re.sub(r"\D", "", str(v or ""))) if v else None
           mob = lambda v: h(re.sub(r"\D", "", str(v or ""))[-10:]) if v and len(re.sub(r"\D", "", str(v))) >= 10 else None
+          nam = lambda v: h(re.sub(r"[^A-Z]", "", re.sub(r"(?i)^(MR|MRS|MS|M/S|SRI|SHRI)[ .]+", "", str(v or "").strip()).upper())) if v else None
           e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
           with e.connect() as c:
               c.exec_driver_sql("SET TRANSACTION READ ONLY")
               set_tenant_context(c, T)
-              dealers = {str(r[0]): r[1] for r in c.exec_driver_sql("SELECT dealer_id, dealer_name FROM auditcore.dealers WHERE tenant_id=%(t)s", {"t": T})}
-              outlets = {str(r[0]): r[1] for r in c.exec_driver_sql("SELECT outlet_id, outlet_name FROM auditcore.dealer_outlets WHERE tenant_id=%(t)s", {"t": T})}
-              rows = c.exec_driver_sql("""SELECT r.dump_kind, r.dealer_id, r.outlet_id, r.outlet_label, r.event_date, r.booking_number,
-                       r.dms_booking_number, r.mobile, r.model, r.outcome, r.match_basis, r.journey_id, u.business_date
+              q = lambda sql: c.exec_driver_sql(sql, {"t": T}).mappings().all()
+              dealers = {str(r["dealer_id"]): r["dealer_name"] for r in q("SELECT dealer_id, dealer_name FROM auditcore.dealers WHERE tenant_id=%(t)s")}
+              outlets = {str(r["outlet_id"]): r["outlet_name"] for r in q("SELECT outlet_id, outlet_name FROM auditcore.dealer_outlets WHERE tenant_id=%(t)s")}
+              rows = q("""SELECT r.dealer_id, r.outlet_id, r.event_date, r.booking_number, r.dms_booking_number, r.mobile, r.customer_name,
+                       r.model, r.outcome, r.match_basis, r.journey_id, u.business_date
                      FROM auditcore.p2_dms_dump_rows r JOIN auditcore.p2_dms_dumps u ON u.tenant_id=r.tenant_id AND u.dump_id=r.dump_id
-                     WHERE r.tenant_id=%(t)s AND r.dump_kind='BOOKING'""", {"t": T}).mappings().all()
-              fields = c.exec_driver_sql("""SELECT f.journey_id, f.field_key, f.effective_value #>> '{}' AS v, e.document_type_key, e.association_status
+                     WHERE r.tenant_id=%(t)s AND r.dump_kind='BOOKING'""")
+              fields = q("""SELECT f.journey_id, f.field_key, f.effective_value #>> '{}' AS v, e.document_type_key, e.association_status
                      FROM auditcore.journey_document_extracted_fields f
                      JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id AND e.di_document_id=f.di_document_id
                      WHERE f.tenant_id=%(t)s AND f.field_key IN ('booking_number','otf_number','order_number','booking_reference','customer_phone',
-                                                                 'dms_booking_number','enquiry_number')""", {"t": T}).mappings().all()
-              journeys = {str(r["journey_id"]): r for r in c.exec_driver_sql("""SELECT j.journey_id, j.dealer_id, j.outlet_id, j.created_at_utc::date AS created,
-                       NULL AS journey_status, c.mobile_number,
-                       (SELECT string_agg(DISTINCT e.document_type_key, ', ') FROM auditcore.evidence e
-                         WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id AND e.association_status='ACTIVE') AS docs
+                        'dms_booking_number','enquiry_number','customer_name','pan_name','aadhaar_name','buyer_name')""")
+              journeys = {str(r["journey_id"]): r for r in q("""SELECT j.journey_id, j.dealer_id, j.outlet_id, j.created_at_utc::date AS created,
+                       c.mobile_number, c.legal_name, c.display_name,
+                       (SELECT count(*) FROM auditcore.evidence e WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id) AS ev_all,
+                       (SELECT string_agg(DISTINCT e.document_type_key || ':' || e.association_status, ', ') FROM auditcore.evidence e
+                         WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id) AS docs
                      FROM auditcore.journeys j JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
-                     WHERE j.tenant_id=%(t)s""", {"t": T}).mappings()}
+                     WHERE j.tenant_id=%(t)s""")}
+              batches = q("SELECT to_jsonb(b) AS b FROM auditcore.p2_upload_batches b WHERE b.tenant_id=%(t)s AND b.created_at_utc >= '2026-11-01'")
               c.rollback()
-          for idx, ho, hm in ITEMS:
+          print("BATCH KEYS", sorted(k for k in (batches[0]["b"] if batches else {}) if not k.endswith("name") and k not in ("identity_reason",)))
+          for idx, ho, hm, hn in ITEMS:
               print(f"--- {idx}")
               hits = sorted((r for r in rows if otf(r["booking_number"]) == ho or otf(r["dms_booking_number"]) == ho or mob(r["mobile"]) == hm),
                             key=lambda r: r["business_date"])
-              if hits:
-                  r = hits[-1]
-                  print(f"  DMS rows {len(hits)} in dumps {sorted({str(x['business_date']) for x in hits})}; latest: dealer={dealers.get(str(r['dealer_id']))} "
-                        f"outlet_mapped={outlets.get(str(r['outlet_id'])) if r['outlet_id'] else None} event_date={r['event_date']} outcome={r['outcome']} "
-                        f"basis={r['match_basis']} matched={bool(r['journey_id'])} otf_same={otf(r['booking_number']) == ho or otf(r['dms_booking_number']) == ho} mobile_same={mob(r['mobile']) == hm}")
-              else:
+              for r in hits[-3:]:
+                  print(f"  DMS dump {r['business_date']}: dealer={dealers.get(str(r['dealer_id']))} outlet={outlets.get(str(r['outlet_id'])) if r['outlet_id'] else None} "
+                        f"booked={r['event_date']} outcome={r['outcome']} basis={r['match_basis']} matched={bool(r['journey_id'])} name_same={nam(r['customer_name']) == hn}")
+              if not hits:
                   print("  DMS: no booking row with this OTF or mobile")
               cand = {}
               for f in fields:
-                  k = f["field_key"]
-                  if (k == "customer_phone" and mob(f["v"]) == hm) or (k != "customer_phone" and otf(f["v"]) == ho):
+                  k, v = f["field_key"], f["v"]
+                  ok = (k == "customer_phone" and mob(v) == hm) or (k in ("customer_name","pan_name","aadhaar_name","buyer_name") and nam(v) == hn) \
+                       or (k not in ("customer_phone","customer_name","pan_name","aadhaar_name","buyer_name") and otf(v) == ho)
+                  if ok:
                       cand.setdefault(str(f["journey_id"]), set()).add(f"{f['document_type_key']}.{k}[{f['association_status']}]")
               for jid, js in journeys.items():
-                  if mob(js["mobile_number"]) == hm:
-                      cand.setdefault(jid, set()).add("customer.mobile_number")
+                  if mob(js["mobile_number"]) == hm or nam(js["legal_name"]) == hn or nam(js["display_name"]) == hn:
+                      cand.setdefault(jid, set()).add("customer record")
               for jid, how in cand.items():
                   js = journeys.get(jid)
                   if js is None:
-                      print(f"  CANDIDATE gone (journey deleted) via {sorted(how)}"); continue
+                      print(f"  CANDIDATE deleted journey via {sorted(how)}"); continue
+                  otfs = sorted({f"{f['document_type_key']}.{f['field_key']}={'SAME' if otf(f['v']) == ho else 'DIFFERENT'}"
+                                 for f in fields if str(f["journey_id"]) == jid and f["field_key"] in ('booking_number','otf_number','order_number','booking_reference','dms_booking_number','enquiry_number')})
                   print(f"  CANDIDATE dealer={dealers.get(str(js['dealer_id']))} outlet={outlets.get(str(js['outlet_id']))} created={js['created']} "
-                        f"status={js['journey_status']} found_by={sorted(how)} matched_by_dump={any(str(r['journey_id']) == jid for r in hits)}")
-                  print(f"    DOCS {js['docs']}")
+                        f"found_by={sorted(how)} matched_by_any_dump_row={any(str(r['journey_id']) == jid for r in hits)}")
+                  print(f"    OTF read: {otfs or 'none'}")
+                  print(f"    DOCS ({js['ev_all']}) {js['docs']}")
+                  for b in batches:
+                      bb = b["b"]
+                      if str(bb.get("journey_id")) == jid:
+                          print("    BATCH", {k: bb.get(k) for k in sorted(bb) if ("status" in k or k in ("created_at_utc", "identity_reason_code", "page_count", "file_count", "source"))})
+              for b in batches:
+                  bb = b["b"]
+                  if nam(bb.get("identity_person_name")) == hn and str(bb.get("journey_id")) not in cand:
+                      js = journeys.get(str(bb.get("journey_id")))
+                      print("  FILE NAMING THIS CUSTOMER in another journey:", {k: bb.get(k) for k in ("identity_status", "identity_reason_code", "created_at_utc")},
+                            "journey outlet", outlets.get(str(js["outlet_id"])) if js else "deleted")
               if not cand:
-                  print("  VERIGENCE: no journey with this OTF or mobile read from any document")
+                  print("  VERIGENCE: no journey with this OTF, mobile or name read from any document or customer record")
           PY
