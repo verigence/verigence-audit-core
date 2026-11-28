@@ -1,0 +1,117 @@
+name: One-shot DMS booking not-in-Verigence diagnose (read-only)
+
+# Read-only: why some DMS booking rows show as not in Verigence. Looked up by short hashes of their
+# OTF and mobile; output is row numbers, dates, outlets, document types and match results only
+# (public repository). Never writes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/dms-booking-missing-diagnose]
+    paths:
+      - '.github/workflows/one-shot-dms-booking-missing-diagnose.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      PLATFORM_PROJECT_ID: cf00a1cd-623e-4c72-8836-db95652c63db
+      AUDIT_SERVICE: verigence-audit-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install -e . 'psycopg[binary]>=3.2,<4'
+          npm install --global @railway/cli@5.70.0
+      - name: Reach the live database
+        shell: bash
+        run: |
+          set -euo pipefail
+          railway link --project "$PLATFORM_PROJECT_ID" --environment dev --service "$AUDIT_SERVICE" --json >/dev/null
+          railway variable list --service "$AUDIT_SERVICE" --json > /tmp/vars.json
+          url="$(python - <<'PY'
+          import json
+          from urllib.parse import urlparse
+          v = json.load(open('/tmp/vars.json'))
+          for key in ('DATABASE_PUBLIC_URL', 'DATABASE_URL'):
+              value = (v.get(key) or '').replace('postgresql+psycopg://', 'postgresql://', 1)
+              host = (urlparse(value).hostname or '').lower()
+              if value and host and not host.endswith('.railway.internal'):
+                  print(value)
+                  break
+          PY
+          )"
+          test -n "$url"
+          echo "::add-mask::$url"
+          echo "DB=$url" >> "$GITHUB_ENV"
+      - name: Booking rows against Verigence, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, os, re
+          from sqlalchemy import create_engine
+          from audit_core.db import set_tenant_context
+          T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
+          ITEMS = [(1, '1811dfc58173b8ab', '84205503f6959bf0'), (2, '4f3ff04ed574645e', 'e2f126bb38a68db6'),
+                   (3, 'fc3182b5f3bb4889', '6b44f6b9e7e22cc2')]
+          h = lambda s: hashlib.sha256(s.encode()).hexdigest()[:16]
+          otf = lambda v: h(re.sub(r"\D", "", str(v or ""))) if v else None
+          mob = lambda v: h(re.sub(r"\D", "", str(v or ""))[-10:]) if v and len(re.sub(r"\D", "", str(v))) >= 10 else None
+          e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
+          with e.connect() as c:
+              c.exec_driver_sql("SET TRANSACTION READ ONLY")
+              set_tenant_context(c, T)
+              dealers = {str(r[0]): r[1] for r in c.exec_driver_sql("SELECT dealer_id, dealer_name FROM auditcore.dealers WHERE tenant_id=%(t)s", {"t": T})}
+              outlets = {str(r[0]): r[1] for r in c.exec_driver_sql("SELECT outlet_id, outlet_name FROM auditcore.dealer_outlets WHERE tenant_id=%(t)s", {"t": T})}
+              rows = c.exec_driver_sql("""SELECT r.dump_kind, r.dealer_id, r.outlet_id, r.outlet_label, r.event_date, r.booking_number,
+                       r.dms_booking_number, r.mobile, r.model, r.outcome, r.match_basis, r.journey_id, u.business_date
+                     FROM auditcore.p2_dms_dump_rows r JOIN auditcore.p2_dms_dumps u ON u.tenant_id=r.tenant_id AND u.dump_id=r.dump_id
+                     WHERE r.tenant_id=%(t)s AND r.dump_kind='BOOKING'""", {"t": T}).mappings().all()
+              fields = c.exec_driver_sql("""SELECT f.journey_id, f.field_key, f.effective_value #>> '{}' AS v, e.document_type_key, e.association_status
+                     FROM auditcore.journey_document_extracted_fields f
+                     JOIN auditcore.evidence e ON e.tenant_id=f.tenant_id AND e.journey_id=f.journey_id AND e.di_document_id=f.di_document_id
+                     WHERE f.tenant_id=%(t)s AND f.field_key IN ('booking_number','otf_number','order_number','booking_reference','customer_phone',
+                                                                 'dms_booking_number','enquiry_number')""", {"t": T}).mappings().all()
+              journeys = {str(r["journey_id"]): r for r in c.exec_driver_sql("""SELECT j.journey_id, j.dealer_id, j.outlet_id, j.created_at_utc::date AS created,
+                       j.journey_status, c.mobile_number,
+                       (SELECT string_agg(DISTINCT e.document_type_key, ', ') FROM auditcore.evidence e
+                         WHERE e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id AND e.association_status='ACTIVE') AS docs
+                     FROM auditcore.journeys j JOIN auditcore.customers c ON c.tenant_id=j.tenant_id AND c.customer_id=j.customer_id
+                     WHERE j.tenant_id=%(t)s""", {"t": T}).mappings()}
+              c.rollback()
+          for idx, ho, hm in ITEMS:
+              print(f"--- {idx}")
+              hits = sorted((r for r in rows if otf(r["booking_number"]) == ho or otf(r["dms_booking_number"]) == ho or mob(r["mobile"]) == hm),
+                            key=lambda r: r["business_date"])
+              if hits:
+                  r = hits[-1]
+                  print(f"  DMS rows {len(hits)} in dumps {sorted({str(x['business_date']) for x in hits})}; latest: dealer={dealers.get(str(r['dealer_id']))} "
+                        f"outlet_mapped={outlets.get(str(r['outlet_id'])) if r['outlet_id'] else None} event_date={r['event_date']} outcome={r['outcome']} "
+                        f"basis={r['match_basis']} matched={bool(r['journey_id'])} otf_same={otf(r['booking_number']) == ho or otf(r['dms_booking_number']) == ho} mobile_same={mob(r['mobile']) == hm}")
+              else:
+                  print("  DMS: no booking row with this OTF or mobile")
+              cand = {}
+              for f in fields:
+                  k = f["field_key"]
+                  if (k == "customer_phone" and mob(f["v"]) == hm) or (k != "customer_phone" and otf(f["v"]) == ho):
+                      cand.setdefault(str(f["journey_id"]), set()).add(f"{f['document_type_key']}.{k}[{f['association_status']}]")
+              for jid, js in journeys.items():
+                  if mob(js["mobile_number"]) == hm:
+                      cand.setdefault(jid, set()).add("customer.mobile_number")
+              for jid, how in cand.items():
+                  js = journeys.get(jid)
+                  if js is None:
+                      print(f"  CANDIDATE gone (journey deleted) via {sorted(how)}"); continue
+                  print(f"  CANDIDATE dealer={dealers.get(str(js['dealer_id']))} outlet={outlets.get(str(js['outlet_id']))} created={js['created']} "
+                        f"status={js['journey_status']} found_by={sorted(how)} matched_by_dump={any(str(r['journey_id']) == jid for r in hits)}")
+                  print(f"    DOCS {js['docs']}")
+              if not cand:
+                  print("  VERIGENCE: no journey with this OTF or mobile read from any document")
+          PY
