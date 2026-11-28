@@ -89,10 +89,25 @@ jobs:
                       by_ref = set().union(*(index.by_ref.get(k, set()) for k in keys)) if keys else set()
                       by_mob = index.by_mobile.get(mk, set()) if mk else set()
                       if not named and not by_ref and not by_mob:
-                          other = [o for o, ix in indexes.items() if o != me and (
-                              any(ix.by_ref.get(k) for k in keys) or (mk and ix.by_mob if False else False) or (mk and ix.by_mobile.get(mk))
-                              or any(_named(ix, j, name) for j in ix.journeys))]
-                          none_why["in another dealership's journeys" if other else "nowhere in Verigence"] += 1
+                          how = set()
+                          for o, ix in indexes.items():
+                              if o == me:
+                                  continue
+                              if any(ix.by_ref.get(k) for k in keys):
+                                  how.add(f"OTF@{names[o]}")
+                              if mk and ix.by_mobile.get(mk):
+                                  how.add(f"mobile@{names[o]}")
+                              if any(_named(ix, j, name) for j in ix.journeys):
+                                  how.add(f"name@{names[o]}")
+                          strong = sorted(x for x in how if not x.startswith("name@"))
+                          if strong:
+                              none_why["in another dealership by " + ", ".join(strong)] += 1
+                          elif how:
+                              none_why["only a same-name customer in another dealership"] += 1
+                          else:
+                              age = (d["business_date"] - r["event_date"]).days if r["event_date"] else None
+                              none_why["nowhere in Verigence, booked " + ("?" if age is None else "0-3 days before the dump" if age <= 3
+                                       else "4-10 days before" if age <= 10 else "over 10 days before")] += 1
                           continue
                       free = [j for j in named if j not in by_j]
                       if named and not free:
