@@ -51,6 +51,73 @@ jobs:
           test -n "$url"
           echo "::add-mask::$url"
           echo "DB=$url" >> "$GITHUB_ENV"
+      - name: Booking dump misses, project-wide, read-only
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, re
+          from collections import Counter, defaultdict
+          from sqlalchemy import create_engine
+          from audit_core.db import set_tenant_context
+          T = "afa9e32b-e62f-4cbc-be2b-7ab7ad5ef572"
+          digits = lambda v: re.sub(r"\D", "", str(v or ""))
+          e = create_engine(os.environ["DB"].replace("postgresql://", "postgresql+psycopg://", 1))
+          with e.connect() as c:
+              c.exec_driver_sql("SET TRANSACTION READ ONLY")
+              set_tenant_context(c, T)
+              q = lambda sql: c.exec_driver_sql(sql, {"t": T}).mappings().all()
+              print("BOOKING PAPER FIELD KEYS (doc type | field | documents)")
+              for r in q("""SELECT e.document_type_key d, f.field_key k, count(DISTINCT e.evidence_id) n
+                     FROM auditcore.evidence e JOIN auditcore.journey_document_extracted_fields f
+                       ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
+                     WHERE e.tenant_id=%(t)s AND e.association_status='ACTIVE' AND e.document_type_key IN ('booking_docket','booking_form')
+                       AND (f.field_key ILIKE '%%book%%' OR f.field_key ILIKE '%%otf%%' OR f.field_key ILIKE '%%order%%' OR f.field_key ILIKE '%%phone%%'
+                            OR f.field_key ILIKE '%%mobile%%' OR f.field_key ILIKE '%%name%%' OR f.field_key ILIKE '%%enquiry%%')
+                     GROUP BY 1, 2 ORDER BY 1, 3 DESC"""):
+                  print("  KEY", r["d"], "|", r["k"], "|", r["n"])
+              print("BOOKING PAPERS BY TYPE", {r["d"]: r["n"] for r in q("""SELECT document_type_key d, count(*) n FROM auditcore.evidence
+                     WHERE tenant_id=%(t)s AND association_status='ACTIVE' AND document_type_key IN ('booking_docket','booking_form') GROUP BY 1""")})
+              latest = q("""SELECT DISTINCT ON (dealer_id) dump_id, dealer_id, business_date FROM auditcore.p2_dms_dumps
+                     WHERE tenant_id=%(t)s AND dump_kind='BOOKING' ORDER BY dealer_id, business_date DESC""")
+              ids = [str(r["dump_id"]) for r in latest]
+              rows = c.exec_driver_sql("""SELECT r.dealer_id, r.outcome, r.booking_number, r.dms_booking_number, r.mobile, d.dealer_name
+                     FROM auditcore.p2_dms_dump_rows r JOIN auditcore.dealers d ON d.tenant_id=r.tenant_id AND d.dealer_id=r.dealer_id
+                     WHERE r.tenant_id=%(t)s AND CAST(r.dump_id AS text) = ANY(%(ids)s)""", {"t": T, "ids": ids}).mappings().all()
+              vals = defaultdict(lambda: defaultdict(set))
+              for r in q("""SELECT j.dealer_id, e.document_type_key d, f.field_key k, f.effective_value #>> '{}' v
+                     FROM auditcore.journeys j JOIN auditcore.evidence e ON e.tenant_id=j.tenant_id AND e.journey_id=j.journey_id AND e.association_status='ACTIVE'
+                     JOIN auditcore.journey_document_extracted_fields f ON f.tenant_id=e.tenant_id AND f.journey_id=e.journey_id AND f.di_document_id=e.di_document_id
+                     WHERE j.tenant_id=%(t)s AND jsonb_typeof(f.effective_value) IN ('string','number')"""):
+                  dv = digits(r["v"])
+                  if len(dv) >= 7:
+                      vals[str(r["dealer_id"])][dv[-10:] if len(dv) >= 10 else dv].add((r["d"], r["k"]))
+              c.rollback()
+          for r in latest:
+              print("LATEST BOOKING DUMP", r["business_date"], str(r["dealer_id"])[:8])
+          stats = Counter(); where = Counter()
+          for r in rows:
+              dealer = r["dealer_name"]
+              stats[(dealer, r["outcome"])] += 1
+              if r["outcome"] != "MISSING":
+                  continue
+              otfs = {digits(x) for x in (r["booking_number"], r["dms_booking_number"]) if x and len(digits(x)) >= 7}
+              mob = digits(r["mobile"])[-10:] if len(digits(r["mobile"])) >= 10 else None
+              seen = vals[str(r["dealer_id"])]
+              hit_otf = set().union(*(seen.get(o, set()) for o in otfs)) if otfs else set()
+              hit_mob = seen.get(mob, set()) if mob else set()
+              if hit_otf:
+                  stats[(dealer, "MISSING but OTF on a Verigence paper")] += 1
+                  for x in hit_otf: where[("OTF", x)] += 1
+              elif hit_mob:
+                  stats[(dealer, "MISSING but mobile on a Verigence paper")] += 1
+                  for x in hit_mob: where[("MOBILE", x)] += 1
+              else:
+                  stats[(dealer, "MISSING, neither OTF nor mobile on any Verigence paper")] += 1
+          for k, n in sorted(stats.items()):
+              print("STAT", k[0], "|", k[1], "|", n)
+          for k, n in where.most_common(25):
+              print("WHERE", k[0], "found on", k[1][0], ".", k[1][1], "|", n)
+          PY
       - name: Booking rows against Verigence, read-only
         shell: bash
         run: |
