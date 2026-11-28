@@ -12,7 +12,7 @@ from uuid import uuid4
 import pytest
 from conftest import delete_tenant_data
 from fastapi import HTTPException
-from p2_support import AllowAllAuthorization, create_p2_journey, database_engine
+from p2_support import AllowAllAuthorization, add_ready_document, create_p2_journey, database_engine
 from sqlalchemy import text
 
 from audit_core.db import set_tenant_context
@@ -55,7 +55,7 @@ def board():
         add(second_outlet, "B-10", "2026-10-10 06:00:00+00")
     try:
         yield SimpleNamespace(engine=engine, tenant_id=created.tenant_id, reviewer=reviewer,
-                              outlet_a=created.outlet_id, outlet_b=second_outlet, fixture_ref=None)
+                              outlet_a=created.outlet_id, outlet_b=second_outlet, fixture_ref=None, journey=created)
     finally:
         delete_tenant_data(engine, created.tenant_id)
         engine.dispose()
@@ -139,6 +139,17 @@ def test_search_finds_a_journey_by_its_number_and_narrows_the_picker(board):
     assert _all_refs(result) == ["A-12"]
     assert result["filters"]["q"] == "a-12"
     assert {o["outletId"]: o["journeyCount"] for o in result["outletOptions"]} == {str(board.outlet_a): 1}
+
+
+def test_search_finds_a_journey_by_the_mobile_on_its_papers(board):
+    """Product owner 2026-11-28: a Reviewer's search by mobile found nothing -- the number is
+    on the Journey's papers, not on the customer record. Any part of it, typed with a +91,
+    spaces or dashes, finds the Journey; a number on no papers finds none."""
+    add_ready_document(board.journey, "booking_docket", customer_phone="+91 98765-43210")
+    for typed in ("9876543210", "+91 98765 43210", "43210", "098765 43210"):
+        rows = [j for o in _list(board, q=typed)["outlets"] for j in o["journeys"]]
+        assert [j["journeyId"] for j in rows] == [str(board.journey.journey_id)], typed
+    assert _list(board, q="9123456789")["journeyCount"] == 0
 
 
 def test_one_character_is_not_a_search(board):

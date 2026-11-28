@@ -44,6 +44,7 @@ from audit_core.security_authorization import (
     get_security_authorization_client,
 )
 from audit_core.uc03_p2_access import P2AccessContext, authorize_p2
+from audit_core.uc03_p2_journey_views import document_phone_sql, mobile_digits
 
 router = APIRouter(
     prefix="/p2/v1/tenants/{tenant_id}",
@@ -545,7 +546,8 @@ _SEARCH_PREDICATE = """
      OR lower(COALESCE(c.legal_name, '')) LIKE :name_contains
      OR upper(COALESCE(j.journey_reference, '')) LIKE :ref_contains
      OR (:mobile_candidate
-         AND regexp_replace(COALESCE(c.mobile_number, ''), '[^0-9]', '', 'g') LIKE :mobile_suffix)
+         AND (regexp_replace(COALESCE(c.mobile_number, ''), '[^0-9]', '', 'g') LIKE :mobile_suffix
+              OR """ + document_phone_sql("j", ":mobile_suffix") + """))
      OR EXISTS (SELECT 1 FROM auditcore.bookings sb
                  WHERE sb.tenant_id=j.tenant_id AND sb.journey_id=j.journey_id
                    AND upper(COALESCE(sb.booking_reference, '')) LIKE :ref_contains)
@@ -569,7 +571,7 @@ def _board_search(q: str | None) -> dict[str, Any]:
             "search_text": None, "name_contains": "", "ref_contains": "",
             "reg_contains": "", "mobile_candidate": False, "mobile_suffix": "",
         }
-    digits = "".join(ch for ch in text_ if ch.isdigit())
+    digits = mobile_digits(text_)
     escaped = text_.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return {
         "search_text": text_,

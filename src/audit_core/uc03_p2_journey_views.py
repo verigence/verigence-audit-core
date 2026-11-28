@@ -104,6 +104,32 @@ _PHONE_HITS_CTE = """phone_hits AS (
               LIKE CAST(:mobile_pattern AS varchar)
     )"""
 
+def document_phone_sql(journey: str, pattern: str) -> str:
+    """SQL true when a customer phone read from one of the Journey's own active documents
+    matches the LIKE ``pattern`` (a bind name, e.g. ":mobile_suffix") by its digits. The
+    customer record's own mobile is often not set on a Phase 2 Journey -- the number is on
+    its papers -- so every search by mobile looks here too (product owner 2026-11-28: the
+    Reviewer's mobile search found nothing; the list already searched the papers)."""
+    return f"""EXISTS (
+        SELECT 1 FROM auditcore.journey_document_extracted_fields pf
+        JOIN auditcore.evidence pe
+          ON pe.tenant_id = pf.tenant_id AND pe.journey_id = pf.journey_id
+         AND pe.di_document_id = pf.di_document_id AND pe.association_status = 'ACTIVE'
+        WHERE pf.tenant_id = {journey}.tenant_id AND pf.journey_id = {journey}.journey_id
+          AND pf.field_key = 'customer_phone'
+          AND regexp_replace(COALESCE(pf.effective_value #>> '{{}}', ''), '[^0-9]', '', 'g') LIKE {pattern})"""
+
+
+def mobile_digits(text_: str) -> str:
+    """A typed mobile number's digits, without a +91 / 91 country code or a leading 0."""
+    digits = "".join(ch for ch in text_ if ch.isdigit())
+    if (text_.strip().startswith("+") and len(digits) > 6 or len(digits) == 12) and digits.startswith("91"):
+        digits = digits[2:]
+    if len(digits) >= 6 and digits.startswith("0"):
+        digits = digits[1:]
+    return digits
+
+
 _VEHICLE_SQL = """NULLIF(concat_ws(' · ',
                  NULLIF(jp.model_name_snapshot,''),
                  NULLIF(jp.variant_name_snapshot,''),
